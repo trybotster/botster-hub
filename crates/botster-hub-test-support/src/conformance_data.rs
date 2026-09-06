@@ -47,7 +47,7 @@ pub(crate) const LATE_ATTACH_GHOSTSNP_PROTOCOL_CRATE: &str = "botster-terminal-p
 pub(crate) const LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT: &str =
     "https://github.com/trybotster/botster-core.git";
 /// Core revision that owns the consumed `botster-terminal-protocol` files.
-pub(crate) const LATE_ATTACH_GHOSTSNP_CORE_PIN: &str = "e0c07f9100955c9c32261afc42c4297e3cea54a0";
+pub(crate) const LATE_ATTACH_GHOSTSNP_CORE_PIN: &str = "b19cfb380e469bbcb47a5425d624b699c5fac565";
 /// Ghostty submodule pin resolved by the locked Core revision.
 pub(crate) const LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN: &str =
     "eb72ec61304ea256be1d86ed8fa961c84e43ecbd";
@@ -370,7 +370,10 @@ pub struct TerminalModeFlagsSupport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalStreamFixtureFrame {
     pub route: String,
+    /// Fixed attachment generation.
     pub generation: u64,
+    /// Core stream epoch captured when the frame was queued; 0 for a fresh attachment.
+    pub stream_epoch: u32,
     /// Core `TerminalKind` name, for readable ordering assertions.
     pub kind: String,
     pub terminal_body_base64: String,
@@ -1626,6 +1629,7 @@ fn fixture_frame(route: &str, frame: TerminalFrame) -> TerminalStreamFixtureFram
     TerminalStreamFixtureFrame {
         route: route.to_string(),
         generation: LATE_ATTACH_FIXTURE_GENERATION,
+        stream_epoch: 0,
         kind: frame.kind().name().to_string(),
         terminal_body_base64: base64::engine::general_purpose::STANDARD.encode(frame.as_bytes()),
         terminal_body_bytes: frame.len(),
@@ -1710,7 +1714,8 @@ pub fn late_attach_no_history_frames() -> Vec<TerminalStreamFixtureFrame> {
 }
 
 /// Post-READY capture failure: attached, MODES, SNAPSHOT_READY,
-/// HISTORY_UNAVAILABLE(capture_failed), OUTPUT. The route stays attached.
+/// HISTORY_UNAVAILABLE(capture_failed) in place of the remaining history
+/// pages, empty SNAPSHOT_FINISH, then live OUTPUT. The route stays attached.
 #[must_use]
 pub fn late_attach_history_unavailable_frames() -> Vec<TerminalStreamFixtureFrame> {
     let route = LATE_ATTACH_UNAVAILABLE_SUBSCRIPTION_ID;
@@ -1729,6 +1734,7 @@ pub fn late_attach_history_unavailable_frames() -> Vec<TerminalStreamFixtureFram
             encode_history_unavailable(HistoryUnavailableReason::CaptureFailed)
                 .expect("history unavailable encodes"),
         ),
+        fixture_frame(route, encode_snapshot_finish().expect("finish encodes")),
         fixture_frame(
             route,
             encode_output(LATE_ATTACH_LIVE_DATA.as_bytes()).expect("output encodes"),
@@ -1859,6 +1865,7 @@ pub fn local_webrtc_delivery_chunk_conformance_fixture_json() -> serde_json::Val
         chunk_count: 3,
         total_bytes: 30_000,
         generation: 11,
+        stream_epoch: 2,
     };
     let terminal_header_hex = terminal_header
         .encode()
@@ -1871,7 +1878,7 @@ pub fn local_webrtc_delivery_chunk_conformance_fixture_json() -> serde_json::Val
         "maximum_delivery_bytes": botster_hub_client::LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
         "control_delivery_kinds": ["server_frame"],
         "terminal_chunk": {
-            "layout": "[u8 version][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][12-byte nonce][ciphertext || 16-byte tag]",
+            "layout": "[u8 version][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][u32 LE stream_epoch][12-byte nonce][ciphertext || 16-byte tag]",
             "header_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES,
             "nonce_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES,
             "tag_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES,
@@ -1882,6 +1889,7 @@ pub fn local_webrtc_delivery_chunk_conformance_fixture_json() -> serde_json::Val
                 "chunk_count": terminal_header.chunk_count,
                 "total_bytes": terminal_header.total_bytes,
                 "generation": terminal_header.generation,
+                "stream_epoch": terminal_header.stream_epoch,
                 "header_hex": terminal_header_hex
             }
         },

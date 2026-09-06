@@ -84,7 +84,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     line(
         &mut output,
-        "// Terminal container payload: [u16 LE route_len][route UTF-8][u64 LE generation][body].",
+        "// Terminal container payload: [u16 LE route_len][route UTF-8][u64 LE generation][u32 LE stream_epoch][body].",
     );
     emit_const(
         &mut output,
@@ -122,7 +122,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     line(
         &mut output,
-        "// [u8 version=2][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][12-byte nonce][AES-GCM ciphertext || 16-byte tag].",
+        "// [u8 version=2][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][u32 LE stream_epoch][12-byte nonce][AES-GCM ciphertext || 16-byte tag].",
     );
     line(
         &mut output,
@@ -195,6 +195,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("chunk_count", "number"),
             ("total_bytes", "number"),
             ("generation", "number"),
+            ("stream_epoch", "number"),
         ],
     );
 

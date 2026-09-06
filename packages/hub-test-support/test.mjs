@@ -249,7 +249,7 @@ assert.match(protocol, /export type ServerFrame/);
 assert.match(protocol, /export const PROTOCOL_VERSION = 9;/);
 assert.match(protocol, /export const MAX_OUTSTANDING_REQUESTS = 32;/);
 assert.match(protocol, /export const UNIX_CONTAINER_TERMINAL = 2;/);
-assert.match(protocol, /export const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES = 29;/);
+assert.match(protocol, /export const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES = 33;/);
 assert.doesNotMatch(protocol, /terminal_output|DaemonUnixTerminalEnvelope|mode_generation/);
 assert.match(protocol, /export interface DaemonLocalWebrtcDeliveryChunk/);
 assert.match(protocol, /export interface DaemonPluginWorkerCounters/);
@@ -607,18 +607,19 @@ assert.equal(chunkFixture.version, 2);
 assert.equal(chunkFixture.maximum_frame_bytes_exclusive, 65536);
 assert.equal(chunkFixture.maximum_delivery_bytes, 16777216);
 assert.deepEqual(chunkFixture.control_delivery_kinds, ["server_frame"]);
-assert.equal(chunkFixture.terminal_chunk.header_bytes, 29);
 assert.equal(chunkFixture.terminal_chunk.nonce_bytes, 12);
 assert.equal(chunkFixture.terminal_chunk.tag_bytes, 16);
 {
   const header = Buffer.from(chunkFixture.terminal_chunk.example.header_hex, "hex");
-  assert.equal(header.length, 29);
+  assert.equal(header.length, 33);
+  assert.equal(chunkFixture.terminal_chunk.header_bytes, 33);
   assert.equal(header.readUInt8(0), 2);
   assert.equal(Number(header.readBigUInt64LE(1)), chunkFixture.terminal_chunk.example.message_id);
   assert.equal(header.readUInt32LE(9), chunkFixture.terminal_chunk.example.chunk_index);
   assert.equal(header.readUInt32LE(13), chunkFixture.terminal_chunk.example.chunk_count);
   assert.equal(header.readUInt32LE(17), chunkFixture.terminal_chunk.example.total_bytes);
   assert.equal(Number(header.readBigUInt64LE(21)), chunkFixture.terminal_chunk.example.generation);
+  assert.equal(header.readUInt32LE(29), chunkFixture.terminal_chunk.example.stream_epoch);
 }
 assert.equal(chunkFixture.scenarios.server_frame.length, 1);
 assert.equal(chunkFixture.scenarios.server_frame[0].delivery_kind, "server_frame");
@@ -673,6 +674,7 @@ const historyFrames = lateAttachFixture.history_then_live;
 for (const frame of historyFrames) {
   assert.equal(frame.route, lateAttachFixture.subscription_id);
   assert.equal(frame.generation, 1);
+  assert.equal(frame.stream_epoch, 0);
   terminalBody(frame);
 }
 const attachedIndex = kindIndex(historyFrames, "attach_state");
@@ -739,7 +741,15 @@ assert.equal(
   kindIndex(unavailableFrames, "snapshot_ready") < kindIndex(unavailableFrames, "history_unavailable"),
   true,
 );
-assert.equal(kindIndex(unavailableFrames, "snapshot_finish"), -1);
+assert.equal(
+  kindIndex(unavailableFrames, "history_unavailable") < kindIndex(unavailableFrames, "snapshot_finish"),
+  true,
+);
+assert.equal(
+  kindIndex(unavailableFrames, "snapshot_finish") < kindIndex(unavailableFrames, "output"),
+  true,
+);
+assert.equal(kindIndex(unavailableFrames, "snapshot_history"), -1);
 assert.equal(lateAttachFixture.conformance_fixture_revision, 49);
 
 const verification = verifyPackageAssets();
