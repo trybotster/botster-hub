@@ -434,7 +434,10 @@ impl TestOfferPeer {
 
     pub(crate) fn park_or_reject_host_event(&mut self, plaintext: &[u8]) {
         if !self.accept_host_events {
-            panic!("unnegotiated peer helper must not receive daemon_event");
+            panic!(
+                "unnegotiated peer helper must not receive daemon_event: {}",
+                String::from_utf8_lossy(plaintext)
+            );
         }
         self.pending_host_events
             .push_back(serde_json::from_slice(plaintext).expect("parse daemon event"));
