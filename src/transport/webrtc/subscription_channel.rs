@@ -922,6 +922,16 @@ where
 #[allow(unused_imports)]
 mod tests {
     use super::*;
+    use botster_terminal_protocol::{RouteId, RoutedTerminalFrame, encode_output};
+
+    fn test_frame(body: &[u8]) -> RoutedTerminalFrame {
+        RoutedTerminalFrame::new(
+            RouteId::new("route").expect("route"),
+            1,
+            0,
+            encode_output(body).expect("output frame"),
+        )
+    }
     use crate::admission::budgets::ENTITY_SUBSCRIPTION_QUEUE_CAPACITY;
     use crate::admission::unix_hello::WebrtcTerminalAdmission;
     use crate::daemon::control::handle_control_message;
@@ -1056,15 +1066,13 @@ mod tests {
     #[test]
     fn hard_close_abandons_occupied_frame_before_flush() {
         use crate::admission::connection_budget::{ChannelClass, ConnectionBudget};
-        use botster_terminal_protocol::TerminalFrame;
         let mut budget = ConnectionBudget::default();
         let usage = budget
             .reserve("route".to_string(), ChannelClass::Terminal)
             .expect("reserve route");
         let mux = WebRtcConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
-        let frame =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#).expect("opaque frame");
+        let frame = test_frame(b"output");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         assert!(budget.aggregate_buffered() > 0);
         handle.close();
@@ -1077,7 +1085,7 @@ mod tests {
         assert!(
             runtime
                 .block_on(flush_subscription_adapter_frames(
-                    &channel, &key, &handle, &usage
+                    &channel, &key, &handle, &usage, &mut 1u64,
                 ))
                 .is_err()
         );
@@ -1093,15 +1101,13 @@ mod tests {
     #[test]
     fn hard_close_cancels_pending_send_without_replay() {
         use crate::admission::connection_budget::{ChannelClass, ConnectionBudget};
-        use botster_terminal_protocol::TerminalFrame;
         let mut budget = ConnectionBudget::default();
         let usage = budget
             .reserve("route".to_string(), ChannelClass::Terminal)
             .expect("reserve route");
         let mux = WebRtcConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
-        let frame =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#).expect("opaque frame");
+        let frame = test_frame(b"output");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         let channel = Arc::new(FakeDataChannel::default());
         channel.send_hangs.store(true, Ordering::Release);
@@ -1117,7 +1123,14 @@ mod tests {
             let usage = Arc::clone(&usage);
             let key = key.clone();
             async move {
-                flush_subscription_adapter_frames(channel.as_ref(), &key, &handle, &usage).await
+                flush_subscription_adapter_frames(
+                    channel.as_ref(),
+                    &key,
+                    &handle,
+                    &usage,
+                    &mut 1u64,
+                )
+                .await
             }
         });
         runtime.block_on(async {
@@ -1149,7 +1162,8 @@ mod tests {
                     channel.as_ref(),
                     &key,
                     &handle,
-                    &usage
+                    &usage,
+                    &mut 2u64,
                 ))
                 .is_err()
         );
@@ -1162,6 +1176,7 @@ mod tests {
                 &key,
                 &sibling_handle,
                 &usage,
+                &mut 3u64,
             ))
             .expect("sibling sends");
         assert_eq!(channel.sent.lock().expect("sent frames").len(), 1);
@@ -1172,21 +1187,14 @@ mod tests {
         use crate::admission::connection_budget::{
             AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
         };
-        use botster_terminal_protocol::TerminalFrame;
         let mut budget = ConnectionBudget::default();
         let usage = budget
             .reserve("route".to_string(), ChannelClass::Terminal)
             .expect("reserve route");
         let mux = WebRtcConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
-        let bytes = serde_json::to_vec(
-            &serde_json::json!({"type": "terminal_output", "opaque": "x".repeat(40_000)}),
-        )
-        .expect("opaque bytes");
-        assert_eq!(
-            adapter.try_write(&TerminalFrame::from_bytes(&bytes).expect("opaque frame")),
-            Ok(())
-        );
+        // Four sealed chunks: the fake accepts the first and hangs the second.
+        assert_eq!(adapter.try_write(&test_frame(&vec![b'x'; 40_000])), Ok(()));
         let channel = Arc::new(FakeDataChannel::default());
         channel.hang_after_first_send.store(true, Ordering::Release);
         channel.usage_hangs.store(true, Ordering::Release);
@@ -1202,7 +1210,14 @@ mod tests {
             let usage = Arc::clone(&usage);
             let key = key.clone();
             async move {
-                flush_subscription_adapter_frames(channel.as_ref(), &key, &handle, &usage).await
+                flush_subscription_adapter_frames(
+                    channel.as_ref(),
+                    &key,
+                    &handle,
+                    &usage,
+                    &mut 1u64,
+                )
+                .await
             }
         });
         runtime.block_on(async {
