@@ -1053,8 +1053,13 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             .await
             {
                 Ok(Ok(event)) if is_driver_exit_report(&event) => break event,
-                // Unrelated host events and receive timeouts keep the wait going.
-                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+                // Unrelated host events and expiry of the outer timeout keep the wait going.
+                Ok(Ok(_)) | Err(_) => {}
+                // A receive failure (framing, decrypt, unexpected response) is a failure,
+                // not a retry: a later valid report must not paper over it.
+                Ok(Err(error)) => {
+                    panic!("host event receive failed while waiting for the driver exit report: {error}")
+                }
             }
         };
         let botster_hub_client::DaemonEvent::RuntimeObservation { kind } = &driver_exit else {
