@@ -99,13 +99,19 @@ pub(crate) const TEST_RESERVED_CHANNEL_RECEIPT_ENV: &str =
 /// Records entry to `admit_reserved_subscription_channel`, which the peer handler spawns
 /// from its `on_data_channel` callback; it is not the callback instant and says nothing
 /// about wire transmission of the DCEP ACK. Gated on `BOTSTER_ENV=test` and an explicit
-/// path, and written at most once per process: the fixture that enables it opens exactly
-/// one reserved channel. The instant is captured before the write is scheduled, and the
-/// append runs on the blocking pool, so neither the admission task nor the channel driver
-/// waits on file I/O. A present record is positive evidence; an absent one is
-/// inconclusive, because the detached write may not run or may fail.
+/// path, restricted to reservation labels (the `r-` prefix the Hub assigns at Attach), and
+/// written at most once per process: the fixture that enables it opens exactly one
+/// reserved channel, and the reader matches the recorded label against that fixture's
+/// Attach reservation; a mismatch makes the record irrelevant, not evidence about the
+/// target. The instant is captured before the write is scheduled, and the append runs on
+/// the blocking pool, so neither the admission task nor the channel driver waits on file
+/// I/O. A present record is positive evidence; an absent one is inconclusive, because the
+/// detached write may not run or may fail.
 pub(crate) fn observe_reserved_channel_receipt_for_test(label: &str) {
     static SCHEDULED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !label.starts_with("r-") {
+        return;
+    }
     if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
         return;
     }

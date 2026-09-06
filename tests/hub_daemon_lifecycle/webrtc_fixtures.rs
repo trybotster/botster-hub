@@ -1194,11 +1194,12 @@ impl LocalWebrtcOfferPeer {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_millis())
                     .unwrap_or(0);
-                // Diagnostic only; the open deadline is unchanged. Distinguishes a channel
-                // that never opened (Connecting), one that opened without the poll observing
-                // it (Open), and one that closed early (Closed, or an observed OnClose). The
-                // state read is bounded so it cannot hang the failure path, and the state
-                // alone does not establish the network cause.
+                // Diagnostic only; the open deadline is unchanged. This reads the channel's
+                // state after the deadline expired, so it reports the state at that later
+                // instant (Connecting, Open, or Closed) plus whether the poll observed an
+                // OnClose; it does not establish that the channel never opened or that it
+                // closed before the deadline, and it does not establish the network cause.
+                // The read is bounded so it cannot hang the failure path.
                 let ready_state = match timeout(
                     webrtc_runtime().as_ref(),
                     Duration::from_millis(500),
