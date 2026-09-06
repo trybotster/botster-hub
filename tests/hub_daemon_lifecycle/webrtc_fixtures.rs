@@ -1170,14 +1170,44 @@ impl LocalWebrtcOfferPeer {
             closed: closed_rx,
             open_rx,
         };
-        timeout(
+        match timeout(
             webrtc_runtime().as_ref(),
             Duration::from_secs(5),
             extra_channel.open_rx.recv(),
         )
         .await
-        .map_err(|_| std::io::Error::other("timed out waiting for labeled DataChannel open"))?
-        .ok_or_else(|| std::io::Error::other("labeled DataChannel closed before open"))?;
+        {
+            Ok(Some(())) => {}
+            Ok(None) => {
+                return Err(
+                    std::io::Error::other("labeled DataChannel closed before open").into(),
+                );
+            }
+            Err(_) => {
+                // Diagnostic only; the open deadline is unchanged. Distinguishes a channel
+                // that never opened (Connecting), one that opened without the poll observing
+                // it (Open), and one that closed early (Closed, or an observed OnClose). The
+                // state read is bounded so it cannot hang the failure path, and the state
+                // alone does not establish the network cause.
+                let ready_state = match timeout(
+                    webrtc_runtime().as_ref(),
+                    Duration::from_millis(500),
+                    extra_channel.data_channel.ready_state(),
+                )
+                .await
+                {
+                    Ok(Ok(state)) => format!("{state:?}"),
+                    Ok(Err(error)) => format!("unavailable({error})"),
+                    Err(_) => "unavailable(timeout)".to_string(),
+                };
+                let closed_observed = extra_channel.closed.try_recv().is_ok();
+                return Err(std::io::Error::other(format!(
+                    "timed out waiting for labeled DataChannel open: label={} ready_state={ready_state} closed_observed={closed_observed}",
+                    extra_channel.label
+                ))
+                .into());
+            }
+        }
         Ok(extra_channel)
     }
 
