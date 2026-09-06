@@ -487,8 +487,7 @@ fn external_hub_webrtc_shutdown_after_live_exit_is_idempotent_cleanup() {
                 .await
                 .expect("offer peer accepts answer");
 
-            let start_path =
-                unique_short_test_dir(&format!("webrtc-sd-start-{round}")).join("go");
+            let start_path = unique_short_test_dir(&format!("webrtc-sd-start-{round}")).join("go");
             let release_path = unique_short_test_dir(&format!("webrtc-sd-rel-{round}")).join("go");
             let exit_release_path =
                 unique_short_test_dir(&format!("webrtc-sd-exit-rel-{round}")).join("go");
@@ -711,6 +710,12 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             )
             .await
             .expect("webrtc adapter hello before host requests");
+        // The terminal channel driver reports why it stopped as an admission-free
+        // RuntimeObservation host event to this owning peer. Park host events so that report
+        // can be asserted after the session is shut down and removed below; every other
+        // rejection on this receive path (terminal frames on control, invalid envelopes)
+        // stays in force.
+        offer_peer.enable_host_events();
 
         let status = offer_peer
             .encrypted_request(&stream_key, &botster_hub_client::DaemonRequest::Status)
@@ -1005,6 +1010,45 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
         assert_eq!(
             removed.kind,
             botster_hub_client::DaemonResponseKind::SessionRemoved
+        );
+        // Core closed the terminal adapter when the session was shut down, so the channel
+        // driver must have stopped on the closed adapter: `adapter_closed` from its flush
+        // check, or `adapter_closed_in_flight` if a frame was mid-send. This peer never
+        // closed the channel itself, so `remote_close` is not allowed, and any ingress,
+        // send, or usage exit would be a product defect. Exactly one such report, for this
+        // subscription and its reservation's route generation.
+        let observation_prefix = format!(
+            "terminal_channel_closed:{}:{}:",
+            reservation.subscription_id, reservation.generation
+        );
+        let driver_exits: Vec<String> = offer_peer
+            .pending_host_events()
+            .iter()
+            .filter_map(|event| match event {
+                botster_hub_client::DaemonEvent::RuntimeObservation { kind }
+                    if kind.starts_with("terminal_channel_closed:") =>
+                {
+                    Some(kind.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            driver_exits.len(),
+            1,
+            "exactly one terminal driver exit report is expected: {driver_exits:?}"
+        );
+        let reason = driver_exits[0]
+            .strip_prefix(&observation_prefix)
+            .unwrap_or_else(|| {
+                panic!(
+                    "driver exit report must name this subscription and route generation: {} (expected prefix {observation_prefix})",
+                    driver_exits[0]
+                )
+            });
+        assert!(
+            matches!(reason, "adapter_closed" | "adapter_closed_in_flight"),
+            "the driver must stop on the Core-closed adapter, got {reason}"
         );
         loop {
             if matches!(

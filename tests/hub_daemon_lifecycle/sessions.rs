@@ -2542,13 +2542,14 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
         second_resize_sequence, resize_sequence,
         "subscriber resize sequences diverged: first={first_resize:?} second={second_resize:?}"
     );
-    let persisted: serde_json::Value = serde_json::from_slice(
-        &fs::read(data_dir.join("sessions").join("entity-session.json"))
-            .expect("read resized session record"),
-    )
-    .expect("parse resized session record");
-    assert_eq!(persisted.get("rows").and_then(serde_json::Value::as_u64), Some(31));
-    assert_eq!(persisted.get("cols").and_then(serde_json::Value::as_u64), Some(101));
+    // Core owns the registry filename encoding; read the record through its identity-checked
+    // loader rather than a privately constructed path.
+    let persisted = botster_core_daemon::SessionRegistry::new(&data_dir)
+        .load(&botster_core::SessionId("entity-session".to_string()))
+        .expect("read resized session record")
+        .expect("resized session record exists");
+    assert_eq!(persisted.rows, 31);
+    assert_eq!(persisted.cols, 101);
 
     terminal
         .send_terminal_frame(
@@ -4893,17 +4894,22 @@ fn shutdown_from_another_connection_preserves_process_exit_for_attached_subscrip
         "attached subscription did not observe the exit marker"
     );
 
-    let registry: serde_json::Value = serde_json::from_slice(
-        &fs::read(data_dir.join("sessions").join(format!("{session_id}.json")))
-            .expect("read worker session registry"),
-    )
-    .expect("parse worker session registry");
-    let pty_child_pid = registry["process"]["pid"]
-        .as_u64()
-        .expect("registry PTY child pid") as u32;
+    // Core owns the registry filename encoding; read the record through its identity-checked
+    // loader rather than a privately constructed path.
+    let registry = botster_core_daemon::SessionRegistry::new(&data_dir)
+        .load(&botster_core::SessionId(session_id.to_string()))
+        .expect("read worker session registry")
+        .expect("worker session registry record exists");
+    let pty_child_pid = registry
+        .process
+        .as_ref()
+        .and_then(|process| process.pid)
+        .expect("registry PTY child pid");
     let worker_socket = PathBuf::from(
-        registry["recovery_identity"]["worker_control_socket"]
-            .as_str()
+        registry
+            .recovery_identity
+            .as_ref()
+            .and_then(|recovery| recovery["worker_control_socket"].as_str())
             .expect("registry worker control socket"),
     );
     fs::write(&release_path, b"release").expect("release controlled natural exit");
