@@ -761,3 +761,96 @@ named hardware. No performance claim is made before those numbers exist, and no
 
 Workflow plugin redesign, Project Pipelines behavior, cloud federation, and any
 change to `botster-ui-contract` 0.3.3.
+
+## 11. Dispatch addendum (root rulings, 2026-09-06)
+
+Root dispatched the writers on 2026-09-06. These rulings are binding and
+resolve ambiguities in sections 1 through 10. Root resolves shared changes.
+The architect is read-only and does not edit this plan.
+
+Active roster:
+
+| Role | Session |
+| --- | --- |
+| Root coordinator | `sess-1788561261-002e-6e11191cb68e3da8e22b8f8cbf0c82d0` |
+| Architect (read-only) | `sess-1788670869-0053-25424b7eef10cad10790cf600ce396a3` |
+| Core implementer | `sess-1788675489-0054-8400c459a8ec2cdd4af574025ef08dd5` |
+| Hub implementer (this worktree) | `sess-1788675499-0055-90fd63b5ec9fc95d4f4476d0482e20d1` |
+| Web implementer | `sess-1788675506-0056-d4dd46f4fe6c03a5d0d3b09ba5456a00` |
+| TUI implementer | `sess-1788675514-0057-ff32ec4c3e2cc7f93bdd1cdeb7a0096e` |
+
+Rulings:
+
+1. The session worker Ghostty stays active and parses every PTY output byte
+   even when no client is attached. Only the duplicate parent parser is removed.
+   In-process embedder state and client renderers stay correct.
+2. Raw PTY and snapshot data stay binary on every hot-path hop. Host-requested
+   snapshot paging is low-rate control, not the terminal output path. There is
+   no application acknowledgement per output chunk.
+3. Worker input correlation must distinguish all clients and routes. The
+   parent uses a unique worker-operation key that Core maps to
+   `(ClientId, RouteId, route generation, client operation id)`.
+   `route_generation` alone is sufficient only when its global uniqueness is
+   enforced. One client's cancellation never affects another client.
+4. Core owns the exact scheme 2 byte order, the complete mode, keyboard, and
+   mouse enum tables, sequence and boundary metadata, and maximum frame and
+   page lengths. Core freezes these in Phase A and generates both the Rust and
+   TS codecs. No writer implements from pseudocode that omits existing
+   snapshot, color, or geometry information. The current correct snapshot and
+   live ordering from one worker capture boundary is preserved; a pre-capture
+   history stream never interleaves with live output in a way that replays or
+   loses bytes. `ROUTE_RESYNC` fences old queued and transport data with an
+   explicit generation or stream epoch; a reset marker alone is insufficient
+   when stale frames can arrive later.
+5. On overflow, only the affected route recovers. Byte continuity is never
+   silently lost. Total retained payload bytes are bounded, including
+   assembling paste, encoded input, captures, and snapshots; shared-buffer
+   accounting and ownership are documented. Snapshot pages fit egress limits;
+   no whole-snapshot single frame exceeds the route cap.
+6. The section 7 copy and allocation table is a ceiling to improve on, not a
+   command to add copies. `Arc` clones and stack routed descriptors need no
+   heap allocation. Kernel and renderer copy counts remain unmeasured. Writers
+   prefer existing shared buffer primitives and reserved header space where
+   they safely avoid another allocation. No speculative allocator framework.
+7. Lock ownership alone does not establish that an arbitrary existing socket
+   belongs to Botster. Hub validates path type, ownership, and namespace, and
+   fails closed for an unknown or live listener. Hub never unlinks an
+   unrelated path. There is no migration and no forced old-worker termination.
+8. The existing plan is sufficient to start implementation. Private method
+   names can change. Public cross-layer schema changes require the schema
+   owner and root to update all consumers together. No writer invents fallback
+   paths, speculative stubs, or multiple final contracts. Each coherent phase
+   has one source checkpoint; existing commits are not amended.
+9. All current tests and diagnostic campaigns remain cancelled. Writers may
+   prepare replacement tests but do not execute tests, live harnesses,
+   benchmarks, or old matrices until root authorizes the coherent replacement
+   stack. Source-only work starts now. Formatting and type or compiler checks
+   are allowed implementation tools. A writer asks root for the single heavy
+   build window before Cargo build, check, or dependency compilation: at most
+   2 Cargo jobs, one heavy window for the host.
+10. No writer publishes, merges, advances old pipelines, or deletes worktrees
+    or data. Root shares and publishes schema commits when required, without
+    waiting for old tickets. A writer requests schema artifacts by message when
+    permissions block cross-repository reads. No writer bypasses permissions.
+    Generated copies come from the owning schema, not from hand-maintained
+    alternate definitions.
+11. Output stays small: initial ownership confirmation, schema checkpoint with
+    exact exported API and artifact paths, material contract conflict, and the
+    complete implementation checkpoint. Writers do not ask permission for every
+    scoped edit. Blockers are returned consolidated; unaffected parts continue.
+12. Core and Hub schema definition work starts immediately in parallel. Web
+    and TUI implement their independent event-loop and rendering cleanup now
+    and consume the frozen schema when it arrives. No layer waits idle for a
+    merge or an old matrix.
+
+Hub-specific dispatch notes:
+
+- Hub implements the host v9 envelope, correlation DTOs, and generated
+  artifacts first, in parallel with Core Phase A, then combines the exact Core
+  schema when it is available.
+- Hub does not preserve `CoreDaemonHandle::call` and does not implement
+  terminal phase queues.
+- Hub keeps the correct rc.1 drain, barrier, and close mechanisms.
+- Hub removes temporary runtime diagnostic hooks, not genuine security checks.
+- Evidence under `target/.botster-foundation-evidence` and the `/tmp` matrix
+  evidence is preserved.
