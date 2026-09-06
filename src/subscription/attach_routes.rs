@@ -663,8 +663,8 @@ impl AttachedSubscriptionChange {
 mod tests {
     use super::*;
     use botster_core::{
-        CoreSessionMetadata, ResizePayload, SessionSpawnRequest, SpawnEnvironment,
-        SpawnWorkingDirectory,
+        ClientId, CoreSessionMetadata, ResizePayload, SessionId, SessionSpawnRequest,
+        SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
     };
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -678,6 +678,9 @@ mod tests {
 
     #[test]
     fn ingress_loss_hard_stops_exact_bound_route_and_preserves_sibling() {
+        use crate::runtime::AttachBindPlan;
+        use botster_terminal_protocol::{RouteId, RoutedTerminalFrame, encode_output};
+
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -704,10 +707,10 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("config");
-        let mut runtime = HubRuntime::new(config);
+        let runtime = HubRuntime::new(config).expect("runtime");
         let session_id = SessionId("ingress-loss-session".to_string());
         runtime
-            .spawn_session(
+            .spawn_session_for_test(
                 SessionSpawnRequest {
                     request_id: botster_core::RequestId("ingress-loss-spawn".to_string()),
                     session_id: session_id.clone(),
@@ -720,11 +723,12 @@ mod tests {
                     initial_pty_size: Some(ResizePayload { rows: 24, cols: 80 }),
                 },
                 CoreSessionMetadata::new(),
-                1,
             )
             .expect("spawn session");
 
         let mut registry = AttachStreamRegistry::default();
+        let mux = UnixConnectionMux::new();
+        let capabilities = negotiated_unix_capability_set(&[], None).expect("capabilities");
         for (client_id, subscription_id) in [
             ("lost-client", "lost-subscription"),
             ("sibling-client", "sibling-subscription"),
@@ -737,31 +741,32 @@ mod tests {
                 session_id.0.clone(),
                 subscription_id.to_string(),
             );
-            registry
-                .begin_core_attach(&mut runtime, &session_id.0, subscription_id, 2)
-                .expect("attach through Core");
-        }
-
-        let mux = UnixConnectionMux::new();
-        let capabilities = negotiated_unix_capability_set(&[], None).expect("capabilities");
-        for (client_id, subscription_id) in [
-            ("lost-client", "lost-subscription"),
-            ("sibling-client", "sibling-subscription"),
-        ] {
-            bind_unix_adapter_after_attaching(
-                &mut registry,
-                &mut runtime,
-                UnixBindRequest {
-                    client_id,
-                    session_id: &session_id.0,
-                    subscription_id,
+            let (adapter, handle) = mux.create_adapter();
+            // One Core owner turn attaches the route and binds the adapter.
+            let generation = runtime
+                .attach_and_bind_terminal(AttachBindPlan {
+                    client_id: ClientId(client_id.to_string()),
+                    session_id: session_id.clone(),
+                    subscription_id: SubscriptionId(subscription_id.to_string()),
                     capabilities: capabilities.clone(),
-                    now_seconds: 3,
-                    mux: Some(&mux),
-                },
-            )
-            .expect("bind through Hub")
-            .expect("bound handle");
+                    now_seconds: 2,
+                    adapter: Box::new(adapter),
+                })
+                .wait(crate::runtime::STARTUP_CORE_WAIT)
+                .expect("attach turn")
+                .expect("attach and bind through Core");
+            registry.mark_adapter_bound(
+                &session_id.0,
+                subscription_id,
+                generation,
+                BoundAdapterHandle::Unix(handle.clone()),
+            );
+            mux.register(
+                session_id.0.clone(),
+                subscription_id.to_string(),
+                generation.0,
+                handle,
+            );
         }
 
         let lost_generation = registry
@@ -782,7 +787,7 @@ mod tests {
         // only the affected Core route. Inventory reads do not advance progress.
         let deadline = Instant::now() + Duration::from_secs(5);
         let inventory = loop {
-            let inventory = runtime.list_terminal_subscriptions();
+            let inventory = runtime.list_terminal_subscriptions_for_test();
             let lost_route_present = inventory.iter().any(|row| {
                 row.session_id == session_id
                     && row.subscription_id.0 == "lost-subscription"
@@ -816,10 +821,12 @@ mod tests {
             "the sibling route must remain bound"
         );
         assert!(!sibling.is_closed(), "the sibling adapter must stay live");
-        let output = botster_terminal_protocol::TerminalFrame::from_bytes(
-            br#"{"type":"terminal_output","marker":"sibling-live"}"#,
-        )
-        .expect("opaque terminal output");
+        let output = RoutedTerminalFrame::new(
+            RouteId::new("sibling-subscription").expect("route"),
+            sibling_generation.0,
+            0,
+            encode_output(b"sibling-live").expect("output frame"),
+        );
         sibling.write_opaque_frame(&output);
         assert!(
             sibling.snapshot_active().is_some(),
@@ -827,7 +834,7 @@ mod tests {
         );
 
         runtime
-            .shutdown_session(session_id, 5)
+            .shutdown_session_for_test(session_id)
             .expect("shutdown session");
         let _ = std::fs::remove_dir_all(data_directory);
     }

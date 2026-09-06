@@ -936,6 +936,36 @@ pub fn run_maintenance_kind(
     }
 }
 
+/// Test helper: run one slice kind and follow its Core reads to completion.
+///
+/// Tests drive slices from their own thread, not the owner loop, so each
+/// call may wait for the data-plane thread. Reads live in a thread-local so
+/// call sites keep the production signature minus the reads argument.
+#[cfg(test)]
+pub(crate) fn run_maintenance_kind_to_completion(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    kind: MaintenanceSliceKind,
+) {
+    thread_local! {
+        static READS: std::cell::RefCell<MaintenanceCoreReads> =
+            std::cell::RefCell::new(MaintenanceCoreReads::default());
+    }
+    READS.with(|reads| {
+        let mut reads = reads.borrow_mut();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        run_maintenance_kind(runtime, state, &mut reads, kind);
+        while reads.in_flight() {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance slice {kind:?} did not complete its Core read"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            run_maintenance_kind(runtime, state, &mut reads, kind);
+        }
+    });
+}
+
 fn handle_unavailable_observe_pass(state: &mut MaintenanceState) {
     state.observe_resume = None;
     if !state.projection.baseline_complete || state.baseline.is_some() {
@@ -2605,7 +2635,7 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("config");
-        let runtime = HubRuntime::new(config);
+        let runtime = HubRuntime::new(config).expect("runtime");
         for index in 0..32 {
             runtime.insert_test_event_handler(&format!("other.{index:02}"), "other_event");
             runtime.insert_test_event_handler(&format!("session.{index:02}"), "session_family");
@@ -2804,7 +2834,7 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("config");
-        let runtime = HubRuntime::new(config);
+        let runtime = HubRuntime::new(config).expect("runtime");
         runtime.record_acknowledged_spawn("retire-session-00");
         let mut state = sealed_maintenance(12, Some(12));
         sync_acknowledged_spawns(&runtime, &mut state);
@@ -2903,7 +2933,7 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("config");
-        let runtime = HubRuntime::new(config);
+        let runtime = HubRuntime::new(config).expect("runtime");
         runtime.record_acknowledged_spawn("runtime-session");
         let mut state = sealed_maintenance(12, Some(12));
         assert!(
@@ -3020,9 +3050,9 @@ mod tests {
             }
             .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
             .expect("config");
-            let mut runtime = HubRuntime::new(config);
+            let mut runtime = HubRuntime::new(config).expect("runtime");
             runtime
-                .spawn_session(
+                .spawn_session_for_test(
                     botster_core::SessionSpawnRequest {
                         request_id: RequestId("expired-gone-spawn".to_string()),
                         session_id: SessionId("gone-session".to_string()),
@@ -3035,14 +3065,13 @@ mod tests {
                         initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
                     },
                     botster_core::CoreSessionMetadata::new(),
-                    1,
                 )
                 .expect("spawn gone session");
             runtime
-                .shutdown_session(SessionId("gone-session".to_string()), 2)
+                .shutdown_session_for_test(SessionId("gone-session".to_string()))
                 .expect("remove gone session");
             runtime
-                .spawn_session(
+                .spawn_session_for_test(
                     botster_core::SessionSpawnRequest {
                         request_id: RequestId("expired-keep-spawn".to_string()),
                         session_id: SessionId("keep-session".to_string()),
@@ -3055,15 +3084,18 @@ mod tests {
                         initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
                     },
                     botster_core::CoreSessionMetadata::new(),
-                    3,
                 )
                 .expect("spawn keep session");
             let mut observe_state = MaintenanceState::default();
             for _ in 0..16 {
-                run_maintenance_kind(&runtime, &mut observe_state, MaintenanceSliceKind::Observe);
+                run_maintenance_kind_to_completion(
+                    &runtime,
+                    &mut observe_state,
+                    MaintenanceSliceKind::Observe,
+                );
             }
             let current = runtime
-                .lifecycle_baseline_page(None, None, BASELINE_PAGE_BUDGET)
+                .lifecycle_baseline_page_for_test(None, None, BASELINE_PAGE_BUDGET)
                 .expect("current source cursor");
             let mut projection = SessionProjection::default();
             projection.seal_baseline(SessionLifecycleCursor {
@@ -3089,14 +3121,22 @@ mod tests {
                 .acknowledged_spawn_ids
                 .insert("keep-session".to_string());
             assert!(!state.projection_caught_up());
-            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::JournalPull);
+            run_maintenance_kind_to_completion(
+                &runtime,
+                &mut state,
+                MaintenanceSliceKind::JournalPull,
+            );
             assert!(
                 state.projection.gap,
                 "a discarded prefix must remint a fresh baseline, not replay the retained suffix"
             );
             assert!(!state.projection.rows.contains_key("gone-session"));
             for _ in 0..8 {
-                run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::HostBridge);
+                run_maintenance_kind_to_completion(
+                    &runtime,
+                    &mut state,
+                    MaintenanceSliceKind::HostBridge,
+                );
                 if state.baseline.is_some() {
                     break;
                 }
@@ -3106,7 +3146,11 @@ mod tests {
                 "CursorExpired remint must arm baseline recovery"
             );
             for _ in 0..8 {
-                run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::Baseline);
+                run_maintenance_kind_to_completion(
+                    &runtime,
+                    &mut state,
+                    MaintenanceSliceKind::Baseline,
+                );
                 if state.projection.baseline_complete && state.baseline.is_none() {
                     break;
                 }
@@ -3133,8 +3177,16 @@ mod tests {
                 "projecting the live Spawn must release the pending hold"
             );
             for _ in 0..8 {
-                run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::JournalPull);
-                run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::ProjectionApply);
+                run_maintenance_kind_to_completion(
+                    &runtime,
+                    &mut state,
+                    MaintenanceSliceKind::JournalPull,
+                );
+                run_maintenance_kind_to_completion(
+                    &runtime,
+                    &mut state,
+                    MaintenanceSliceKind::ProjectionApply,
+                );
                 if state.projection_caught_up() {
                     break;
                 }
@@ -3143,7 +3195,7 @@ mod tests {
                 state.projection_caught_up(),
                 "fresh baseline plus journal confirm must release first-snapshot hold"
             );
-            let _ = runtime.shutdown_session(SessionId("keep-session".to_string()), 4);
+            let _ = runtime.shutdown_session_for_test(SessionId("keep-session".to_string()));
             let _ = std::fs::remove_dir_all(data_directory);
         });
     }
@@ -3221,13 +3273,13 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("config");
-        let mut runtime = HubRuntime::new(config);
+        let mut runtime = HubRuntime::new(config).expect("runtime");
         let expected = (0..20)
             .map(|index| format!("recover-session-{index:02}"))
             .collect::<BTreeSet<_>>();
         for id in &expected {
             runtime
-                .spawn_session(
+                .spawn_session_for_test(
                     botster_core::SessionSpawnRequest {
                         request_id: RequestId(format!("recover-spawn-{id}")),
                         session_id: SessionId(id.clone()),
@@ -3240,14 +3292,17 @@ mod tests {
                         initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
                     },
                     botster_core::CoreSessionMetadata::new(),
-                    1,
                 )
                 .expect("spawn recovery session");
         }
         let mut state = MaintenanceState::default();
         start_baseline_recovery(&mut state);
         for _ in 0..8 {
-            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::HostBridge);
+            run_maintenance_kind_to_completion(
+                &runtime,
+                &mut state,
+                MaintenanceSliceKind::HostBridge,
+            );
             if state.baseline.is_some() {
                 break;
             }
@@ -3257,7 +3312,11 @@ mod tests {
             "late projection must arm baseline recovery after the gap pass"
         );
         for _ in 0..8 {
-            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::Baseline);
+            run_maintenance_kind_to_completion(
+                &runtime,
+                &mut state,
+                MaintenanceSliceKind::Baseline,
+            );
             if state.projection.baseline_complete && state.baseline.is_none() {
                 break;
             }
@@ -3279,8 +3338,16 @@ mod tests {
             "recovery fixture must exceed one baseline page"
         );
         for _ in 0..16 {
-            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::JournalPull);
-            run_maintenance_kind(&runtime, &mut state, MaintenanceSliceKind::ProjectionApply);
+            run_maintenance_kind_to_completion(
+                &runtime,
+                &mut state,
+                MaintenanceSliceKind::JournalPull,
+            );
+            run_maintenance_kind_to_completion(
+                &runtime,
+                &mut state,
+                MaintenanceSliceKind::ProjectionApply,
+            );
             if state.projection_caught_up() {
                 break;
             }
@@ -3302,7 +3369,7 @@ mod tests {
             recovered.len()
         );
         for id in &expected {
-            let _ = runtime.shutdown_session(SessionId(id.clone()), 2);
+            let _ = runtime.shutdown_session_for_test(SessionId(id.clone()));
         }
         let _ = std::fs::remove_dir_all(data_directory);
     }
@@ -3645,7 +3712,7 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("config");
-        (HubRuntime::new(config), data_directory)
+        (HubRuntime::new(config).expect("runtime"), data_directory)
     }
 
     fn subscribe_worktree_consumer(runtime: &HubRuntime, plugin_key: &str) {
@@ -4050,7 +4117,7 @@ return botster.register({})
     }
 
     fn drain_event_flights(runtime: &HubRuntime, state: &mut MaintenanceState) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline
             && (!state.event_in_flight.is_empty() || !state.pending_retirements.is_empty())
         {
@@ -4078,25 +4145,22 @@ return botster.register({})
 
         let (timeout_registry, timeout_root) = install_lua_event_plugin("t1-hold", hold_lua);
         let (mut timeout_runtime, timeout_dir) = event_delivery_runtime("t1-hold");
-        timeout_runtime.test_set_seams(crate::runtime::HubTestSeams {
-            event_invocation_timeout_ms: crate::runtime::event_invocation_timeout_ms_from(
-                Some("test"),
-                Some("30"),
-            ),
-            event_handler_hold_ms: crate::runtime::event_handler_hold_ms_from(
-                Some("test"),
-                Some("250"),
-            ),
-            ..crate::runtime::HubTestSeams::default()
-        });
         timeout_runtime
             .load_lua_plugin_package(&timeout_registry, "event-probe.plugin")
             .expect("load hold plugin");
         ingress_worktree_created(&timeout_runtime);
+        // Hold the handler past the invocation bound so the classification is
+        // a timeout, not a handler failure.
+        crate::lua_runtime::TEST_EVENT_HANDLER_HOLD_MS.store(
+            EVENT_INVOCATION_TIMEOUT_MS + 500,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut timeout_state = MaintenanceState::default();
         run_package_event_delivery_slice(&timeout_runtime, &mut timeout_state);
         assert_eq!(timeout_state.event_in_flight.len(), 1);
         drain_event_flights(&timeout_runtime, &mut timeout_state);
+        crate::lua_runtime::TEST_EVENT_HANDLER_HOLD_MS
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let timeout_snap = timeout_runtime.event_plane_counters_snapshot();
         assert_eq!(timeout_snap.event_handler_timed_out, 1);
         assert_eq!(timeout_snap.event_handler_failed, 0);

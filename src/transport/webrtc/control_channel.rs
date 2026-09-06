@@ -933,10 +933,9 @@ mod tests {
         TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
     };
     use botster_core::{AesGcmKey, encrypt_aes_gcm};
-    use botster_hub_client::DaemonLocalWebrtcDeliveryKind;
     use botster_hub_client::{
         DaemonDiagnostic, DaemonEntityFrame, DaemonHello, DaemonRequest, DaemonResponse,
-        LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
+        LOCAL_WEBRTC_MAX_DELIVERY_BYTES, OPERATOR_ERROR_TOO_MANY_REQUESTS,
     };
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
@@ -959,9 +958,11 @@ mod tests {
         terminal_cause: Option<LocalWebrtcTerminalCause>,
     ) -> (FakeDataChannel, Option<LocalWebrtcSendFailure>) {
         let key = AesGcmKey::from_slice(&[15; 32]).unwrap();
+        reset_test_request_ids();
         let data_channel = FakeDataChannel::default();
         {
             let mut events = data_channel.events.lock().unwrap();
+            events.push_back(encrypted_hello_event(&key, &webrtc_adapter_hello()));
             events.push_back(DataChannelEvent::OnBufferedAmountHigh);
             events.push_back(encrypted_request_event(&key, &DaemonRequest::Status));
             if terminal_cause.is_none() {
@@ -1031,15 +1032,20 @@ mod tests {
         send_fails: bool,
     ) -> (FakeDataChannel, Option<LocalWebrtcSendFailure>) {
         let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
+        reset_test_request_ids();
         let data_channel = FakeDataChannel::default();
-        data_channel.send_fails.store(send_fails, Ordering::Release);
         {
             let mut events = data_channel.events.lock().unwrap();
+            events.push_back(encrypted_hello_event(&key, &webrtc_adapter_hello()));
             events.push_back(encrypted_request_event(
                 &key,
                 &DaemonRequest::DaemonShutdown,
             ));
         }
+        // The hello ack must reach the peer; only the shutdown response may fail.
+        data_channel
+            .fail_sends_after
+            .store(if send_fails { 1 } else { 0 }, Ordering::Release);
         let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-shutdown-delivery".to_string(),
@@ -1107,9 +1113,11 @@ mod tests {
     #[test]
     fn recoverable_disconnect_after_response_preserves_followup_shutdown() {
         let key = AesGcmKey::from_slice(&[17; 32]).unwrap();
+        reset_test_request_ids();
         let data_channel = Arc::new(FakeDataChannel::default());
         {
             let mut events = data_channel.events.lock().unwrap();
+            events.push_back(encrypted_hello_event(&key, &webrtc_adapter_hello()));
             events.push_back(encrypted_request_event(&key, &DaemonRequest::Status));
             events.push_back(encrypted_request_event(
                 &key,
@@ -1165,7 +1173,8 @@ mod tests {
                 .unwrap();
 
             let deadline = Instant::now() + Duration::from_secs(1);
-            while responder_data_channel.sent.lock().unwrap().len() < 2 {
+            // hello ack plus two responses
+            while responder_data_channel.sent.lock().unwrap().len() < 3 {
                 assert!(
                     Instant::now() < deadline,
                     "both responses must complete before terminal close"
@@ -1197,7 +1206,11 @@ mod tests {
 
         responder.join().unwrap();
         assert!(failure.is_none());
-        assert_eq!(data_channel.sent.lock().unwrap().len(), 2);
+        assert_eq!(
+            data_channel.sent.lock().unwrap().len(),
+            3,
+            "hello ack, status response, and shutdown response"
+        );
         assert!(data_channel.closed.load(Ordering::Acquire));
     }
 
@@ -1209,7 +1222,11 @@ mod tests {
                 .sent_before_low_water
                 .load(Ordering::Acquire)
         );
-        assert_eq!(resumed_channel.sent.lock().unwrap().len(), 1);
+        assert_eq!(
+            resumed_channel.sent.lock().unwrap().len(),
+            2,
+            "hello ack and the status response"
+        );
         assert!(resumed_channel.closed.load(Ordering::Acquire));
     }
 
@@ -1222,7 +1239,11 @@ mod tests {
         ] {
             let (channel, failure) = run_idle_pressure_case(Some(cause));
             assert_eq!(failure.unwrap().cause, cause);
-            assert!(channel.sent.lock().unwrap().is_empty());
+            assert_eq!(
+                channel.sent.lock().unwrap().len(),
+                1,
+                "only the hello ack leaves before the pressured response"
+            );
             assert!(channel.closed.load(Ordering::Acquire));
         }
     }
@@ -1331,9 +1352,10 @@ mod tests {
             .unwrap()
             .push_back(DataChannelEvent::OnBufferedAmountHigh);
         let key = AesGcmKey::from_slice(&[5; 32]).unwrap();
-        let mut pending = VecDeque::from([PendingLocalWebrtcRequest::Request(Box::new(
-            DaemonRequest::Status,
-        ))]);
+        let mut pending = VecDeque::from([PendingLocalWebrtcRequest::Request {
+            request_id: "1".to_string(),
+            request: Box::new(DaemonRequest::Status),
+        }]);
         let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-fixture".to_string(),
@@ -1385,6 +1407,7 @@ mod tests {
 
         runtime.block_on(close_data_channel(
             &data_channel,
+            &key,
             &mut pending,
             peer_state.as_ref(),
             cause,
@@ -1429,12 +1452,8 @@ mod tests {
             .unwrap()
             .push_back(DataChannelEvent::OnBufferedAmountHigh);
         let key = AesGcmKey::from_slice(&[16; 32]).unwrap();
-        let frames = frame_encrypted_daemon_delivery(
-            DaemonLocalWebrtcDeliveryKind::DaemonResponse,
-            "response-progress",
-            &"a".repeat(256 * 1024),
-        )
-        .unwrap();
+        let frames =
+            frame_encrypted_daemon_delivery("response-progress", &"a".repeat(256 * 1024)).unwrap();
         assert!(frames.len() > 1);
         let mut pending = VecDeque::new();
         let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
@@ -1480,6 +1499,7 @@ mod tests {
 
         runtime.block_on(close_data_channel(
             &data_channel,
+            &key,
             &mut pending,
             peer_state.as_ref(),
             failure.cause,
@@ -1547,9 +1567,10 @@ mod tests {
             .push_host_event(DaemonEvent::RuntimeObservation {
                 kind: "second-lifecycle".to_string(),
             });
-        let mut pending = VecDeque::from([PendingLocalWebrtcRequest::Request(Box::new(
-            DaemonRequest::Status,
-        ))]);
+        let mut pending = VecDeque::from([PendingLocalWebrtcRequest::Request {
+            request_id: "1".to_string(),
+            request: Box::new(DaemonRequest::Status),
+        }]);
         let mut flow_control = LocalWebrtcFlowControl::default();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1924,7 +1945,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let mut flow_control = LocalWebrtcFlowControl::default();
+        let mut flow_control = LocalWebrtcFlowControl {
+            hello_accepted: true,
+            ..LocalWebrtcFlowControl::default()
+        };
         let peer_state = test_peer_state("grant-inbound-request");
 
         let completed = runtime.block_on(send_response_frames(
@@ -1940,7 +1964,8 @@ mod tests {
         assert_eq!(data_channel.sent.lock().unwrap().len(), 2);
         assert!(matches!(
             pending.pop_front(),
-            Some(PendingLocalWebrtcRequest::Request(request)) if *request == DaemonRequest::Status
+            Some(PendingLocalWebrtcRequest::Request { request, .. })
+                if *request == DaemonRequest::Status
         ));
         assert!(pending.is_empty());
     }
@@ -1948,8 +1973,12 @@ mod tests {
     #[test]
     fn overflowing_requests_each_preserve_one_fifo_operator_response() {
         let key = AesGcmKey::from_slice(&[8; 32]).unwrap();
+        reset_test_request_ids();
         let mut pending = VecDeque::new();
-        let mut flow_control = LocalWebrtcFlowControl::default();
+        let mut flow_control = LocalWebrtcFlowControl {
+            hello_accepted: true,
+            ..LocalWebrtcFlowControl::default()
+        };
 
         let inbound_requests = LOCAL_WEBRTC_PENDING_REQUESTS + 4;
         for _ in 0..inbound_requests {
@@ -1965,35 +1994,45 @@ mod tests {
             );
         }
 
-        assert_eq!(pending.len(), LOCAL_WEBRTC_PENDING_REQUESTS + 1);
+        assert_eq!(pending.len(), inbound_requests);
+        let rejected = pending
+            .iter()
+            .filter(|queued| matches!(queued, PendingLocalWebrtcRequest::TooManyRequests { .. }))
+            .count();
+        assert_eq!(
+            rejected, 4,
+            "every request past the limit keeps its own rejection"
+        );
         assert!(matches!(
             pending.back(),
-            Some(PendingLocalWebrtcRequest::QueueOverflow(4))
+            Some(PendingLocalWebrtcRequest::TooManyRequests { request_id, operation })
+                if request_id == &inbound_requests.to_string() && *operation == "status"
         ));
         let mut responses_emitted = 0;
         while pop_pending_request(&mut pending).is_some() {
             responses_emitted += 1;
         }
         assert_eq!(responses_emitted, inbound_requests);
-        let response = queued_request_overflow_response();
+        let response = too_many_requests_response("33", "status");
         assert_eq!(
             response.kind,
             botster_hub_client::DaemonResponseKind::OperatorError
         );
-        assert!(
-            response.diagnostics[0]
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("capacity exceeded")
-        );
+        let error = response.error.expect("correlated operator error");
+        assert_eq!(error.code, OPERATOR_ERROR_TOO_MANY_REQUESTS);
+        assert_eq!(error.request_id, "33");
+        assert_eq!(error.operation, "status");
     }
 
     #[test]
     fn interleaved_overflow_runs_preserve_fifo_response_order() {
         let key = AesGcmKey::from_slice(&[11; 32]).unwrap();
+        reset_test_request_ids();
         let mut pending = VecDeque::new();
-        let mut flow_control = LocalWebrtcFlowControl::default();
+        let mut flow_control = LocalWebrtcFlowControl {
+            hello_accepted: true,
+            ..LocalWebrtcFlowControl::default()
+        };
         {
             let mut apply_request = |request: &DaemonRequest| {
                 apply_data_channel_event(
@@ -2012,7 +2051,8 @@ mod tests {
         }
         assert!(matches!(
             pop_pending_request(&mut pending),
-            Some(PendingLocalWebrtcRequest::Request(request)) if *request == DaemonRequest::Status
+            Some(PendingLocalWebrtcRequest::Request { request, .. })
+                if *request == DaemonRequest::Status
         ));
 
         assert!(
@@ -2038,14 +2078,14 @@ mod tests {
 
         let emitted_order = std::iter::from_fn(|| pop_pending_request(&mut pending))
             .map(|pending| match pending {
-                PendingLocalWebrtcRequest::Request(request)
+                PendingLocalWebrtcRequest::Request { request, .. }
                     if *request == DaemonRequest::ListSessions =>
                 {
                     "new-request"
                 }
-                PendingLocalWebrtcRequest::Request(_) => "status",
+                PendingLocalWebrtcRequest::Request { .. } => "status",
                 PendingLocalWebrtcRequest::Hello(_) => "hello",
-                PendingLocalWebrtcRequest::QueueOverflow(_) => "overflow",
+                PendingLocalWebrtcRequest::TooManyRequests { .. } => "overflow",
             })
             .collect::<Vec<_>>();
         let mut expected_order = vec!["status"; LOCAL_WEBRTC_PENDING_REQUESTS - 1];

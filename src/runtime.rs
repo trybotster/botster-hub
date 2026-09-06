@@ -5091,6 +5091,73 @@ impl HubRuntime {
     }
 }
 
+#[cfg(test)]
+impl HubRuntime {
+    /// Test helper: spawn one session and wait for Core's completion.
+    pub(crate) fn spawn_session_for_test(
+        &self,
+        request: SessionSpawnRequest,
+        metadata: CoreSessionMetadata,
+    ) -> Result<CoreSession, CoreDaemonError> {
+        match self
+            .begin_spawn(request, metadata)
+            .wait(self, STARTUP_CORE_WAIT)?
+        {
+            CoreCompletion::Spawn { result, .. } => result,
+            _ => Err(CoreDaemonError::Shutdown),
+        }
+    }
+
+    /// Test helper: shut one session down and wait for Core's completion.
+    pub(crate) fn shutdown_session_for_test(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), CoreDaemonError> {
+        match self
+            .begin_shutdown_session(session_id)
+            .wait(self, STARTUP_CORE_WAIT)?
+        {
+            CoreCompletion::ShutdownSession { result, .. } => result,
+            _ => Err(CoreDaemonError::Shutdown),
+        }
+    }
+
+    /// Test helper: current Core terminal subscription inventory.
+    pub(crate) fn list_terminal_subscriptions_for_test(&self) -> Vec<TerminalSubscriptionRecord> {
+        self.list_terminal_subscriptions()
+            .wait(STARTUP_CORE_WAIT)
+            .expect("Core inventory")
+    }
+
+    /// Test helper: mark one session stale and wait for Core.
+    pub(crate) fn mark_session_stale_for_test(
+        &self,
+        session_id: &SessionId,
+        now_seconds: u64,
+    ) -> Result<(), CoreDaemonError> {
+        self.mark_session_stale_now(session_id, now_seconds)
+    }
+
+    /// Test helper: one lifecycle baseline page read to completion.
+    pub(crate) fn lifecycle_baseline_page_for_test(
+        &self,
+        snapshot: Option<&SessionLifecycleCursor>,
+        after: Option<&SessionId>,
+        budget: LifecycleBaselineBudget,
+    ) -> Result<SessionLifecycleBaselinePage, SessionLifecyclePageError> {
+        self.lifecycle_baseline_page(snapshot, after, budget)
+            .wait(STARTUP_CORE_WAIT)
+            .expect("Core baseline page")
+    }
+
+    /// Test helper: durable session list read to completion.
+    pub(crate) fn list_sessions_for_test(&self) -> Result<Vec<DaemonSession>, CoreDaemonError> {
+        self.list_sessions()
+            .wait(STARTUP_CORE_WAIT)
+            .map_err(core_bridge_error)?
+    }
+}
+
 fn json_null() -> serde_json::Value {
     serde_json::Value::Null
 }
@@ -5895,7 +5962,7 @@ mod tests {
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .expect("runtime config should build");
 
-        let core_config = core_daemon_config(&config, &HubTestSeams::default());
+        let core_config = core_daemon_config(&config);
         assert!(
             core_config.worker_path.is_some(),
             "hub CoreDaemonConfig must use worker-backed sessions so in-process durability adoption is unreachable"
@@ -6129,67 +6196,5 @@ mod tests {
             command.args(args).status().expect("run git").success(),
             "git command failed: {args:?}"
         );
-    }
-
-    #[test]
-    fn hub_test_seams_require_test_mode() {
-        assert_eq!(drop_journal_wakes_from(Some("test"), Some("3")), Some(3));
-        assert_eq!(drop_journal_wakes_from(Some("production"), Some("3")), None);
-        assert_eq!(drop_journal_wakes_from(None, Some("3")), None);
-        assert_eq!(drop_journal_wakes_from(Some("test"), Some("100")), Some(64));
-
-        let hold = std::env::temp_dir().join(format!(
-            "hub-hold-journal-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::write(&hold, b"hold").expect("write hold file");
-        assert_eq!(
-            hold_journal_pull_from(Some("test"), Some(hold.as_os_str())),
-            Some(hold.clone())
-        );
-        assert_eq!(
-            hold_journal_pull_from(Some("production"), Some(hold.as_os_str())),
-            None
-        );
-        assert_eq!(hold_journal_pull_from(None, Some(hold.as_os_str())), None);
-        std::fs::remove_file(&hold).expect("remove hold file");
-        assert_eq!(
-            hold_journal_pull_from(Some("test"), Some(hold.as_os_str())),
-            Some(hold)
-        );
-
-        assert_eq!(
-            lifecycle_journal_capacity_from(Some("test"), Some("8")),
-            Some(8)
-        );
-        assert_eq!(
-            lifecycle_journal_capacity_from(Some("production"), Some("8")),
-            None
-        );
-        assert_eq!(lifecycle_journal_capacity_from(None, Some("8")), None);
-
-        assert_eq!(
-            event_invocation_timeout_ms_from(Some("test"), Some("50")),
-            Some(50)
-        );
-        assert_eq!(
-            event_invocation_timeout_ms_from(Some("production"), Some("50")),
-            None
-        );
-        assert_eq!(event_invocation_timeout_ms_from(None, Some("50")), None);
-
-        assert_eq!(
-            event_handler_hold_ms_from(Some("test"), Some("25")),
-            Some(25)
-        );
-        assert_eq!(
-            event_handler_hold_ms_from(Some("production"), Some("25")),
-            None
-        );
-        assert_eq!(event_handler_hold_ms_from(None, Some("25")), None);
     }
 }

@@ -1617,19 +1617,6 @@ mod tests {
     }
 
     #[test]
-    fn client_event_queue_max_override_requires_test_mode() {
-        assert_eq!(
-            test_client_event_queue_max_from(Some("test"), Some("1")),
-            Some(1)
-        );
-        assert_eq!(
-            test_client_event_queue_max_from(Some("production"), Some("1")),
-            None
-        );
-        assert_eq!(test_client_event_queue_max_from(None, Some("1")), None);
-    }
-
-    #[test]
     fn apply_pending_cleanups_preserves_ids_added_after_snapshot() {
         let router = admitted_router(EventAudience::Clients);
         let plane = ClientEventPlane::default();

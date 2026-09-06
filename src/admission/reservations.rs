@@ -394,7 +394,29 @@ pub(crate) fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-const fn reservation_expires_in_seconds() -> u32 {
+#[cfg(test)]
+thread_local! {
+    static TEST_RESERVATION_EXPIRY: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with a shorter reservation expiry on this thread. Test-only; the
+/// production expiry is the constant above.
+#[cfg(test)]
+pub(crate) fn with_reservation_expiry_for_test<R>(seconds: u32, f: impl FnOnce() -> R) -> R {
+    TEST_RESERVATION_EXPIRY.with(|slot| {
+        let previous = slot.replace(Some(seconds));
+        let result = f();
+        slot.set(previous);
+        result
+    })
+}
+
+fn reservation_expires_in_seconds() -> u32 {
+    #[cfg(test)]
+    if let Some(seconds) = TEST_RESERVATION_EXPIRY.with(std::cell::Cell::get) {
+        return seconds;
+    }
     TERMINAL_RESERVATION_EXPIRES_IN_SECONDS
 }
 

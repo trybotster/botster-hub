@@ -1335,6 +1335,8 @@ mod tests {
             .runtime_mut()
             .expect("runtime")
             .list_terminal_subscriptions()
+            .wait(Duration::from_secs(5))
+            .expect("inventory")
             .iter()
             .find(|row| row.session_id.0 == session_id && row.subscription_id.0 == subscription_id)
             .expect("the bound route must be live before the remote close")
@@ -1359,18 +1361,14 @@ mod tests {
                 );
             }
             let runtime = harness.daemon.runtime_mut().expect("runtime");
-            let _ = runtime.observe_lifecycle_slice(
-                1,
-                None,
-                botster_core_daemon::ObserveLifecycleBudget {
-                    max_sessions: 32,
-                    max_encoded_result_bytes: 64 * 1024,
-                    max_elapsed: Duration::from_millis(25),
-                },
-            );
-            let core_present = runtime.list_terminal_subscriptions().iter().any(|row| {
-                row.session_id.0 == session_id && row.subscription_id.0 == subscription_id
-            });
+            let core_present = runtime
+                .list_terminal_subscriptions()
+                .wait(Duration::from_secs(5))
+                .expect("inventory")
+                .iter()
+                .any(|row| {
+                    row.session_id.0 == session_id && row.subscription_id.0 == subscription_id
+                });
             let reservation = harness
                 .state
                 .pending_runtime
@@ -2410,74 +2408,6 @@ mod tests {
             extra.closed.load(Ordering::Acquire),
             "production reject path must finish local_close"
         );
-    }
-
-    #[test]
-    fn extra_channel_close_marker_requires_lost_claim_and_close_ok() {
-        let _lock = EXTRA_CHANNEL_ORACLE_ENV
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "so-2ch-label-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create label-control dir");
-        let marker = dir.join("extra-closed");
-        let observation = dir.join("extra-observation.json");
-        let previous_env = std::env::var("BOTSTER_ENV").ok();
-        let previous_marker = std::env::var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV).ok();
-        let previous_observation = std::env::var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV).ok();
-        unsafe {
-            std::env::set_var("BOTSTER_ENV", "test");
-            std::env::set_var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV, &marker);
-            std::env::set_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV, &observation);
-        }
-        let close = Ok(Ok(()));
-        observe_rejected_data_channel_for_test(true, &close, "botster-client");
-        assert!(
-            !marker.exists(),
-            "close marker must stay absent when the channel kept the claim"
-        );
-        observe_rejected_data_channel_for_test(false, &close, "botster-client");
-        assert!(
-            marker.exists(),
-            "close marker must write for any rejected label after lost_claim and Ok(Ok(()))"
-        );
-        let observed: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&observation).expect("read complete observation"),
-        )
-        .expect("observation must contain complete JSON");
-        assert_eq!(observed["lost_claim"], true);
-        assert_eq!(observed["close_ok"], true);
-        assert!(
-            !observation.with_extension("tmp").exists(),
-            "atomic observation publication must retire its temporary file"
-        );
-        std::fs::remove_file(&marker).expect("reset close marker");
-        observe_rejected_data_channel_for_test(false, &close, EXTRA_DATA_CHANNEL_LABEL);
-        assert!(
-            marker.exists(),
-            "close marker must write for botster-extra after lost_claim and Ok(Ok(()))"
-        );
-        unsafe {
-            match previous_env {
-                Some(value) => std::env::set_var("BOTSTER_ENV", value),
-                None => std::env::remove_var("BOTSTER_ENV"),
-            }
-            match previous_marker {
-                Some(value) => std::env::set_var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV, value),
-                None => std::env::remove_var(TEST_EXTRA_CHANNEL_CLOSE_MARKER_ENV),
-            }
-            match previous_observation {
-                Some(value) => std::env::set_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV, value),
-                None => std::env::remove_var(TEST_EXTRA_CHANNEL_OBSERVATION_ENV),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

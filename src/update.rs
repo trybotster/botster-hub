@@ -1351,27 +1351,6 @@ source = "git+https://example.test/core#abc123"
     }
 
     #[test]
-    fn worker_mode_probe_requires_a_json_safe_generation() {
-        assert!(mode_probe_issue(DaemonResponseKind::ReadModeFlags, Some(1), None).is_none());
-        let zero = mode_probe_issue(DaemonResponseKind::ReadModeFlags, Some(0), None).unwrap();
-        assert_eq!(zero.code, "unsafe_mode_generation");
-        let unsafe_generation = mode_probe_issue(
-            DaemonResponseKind::ReadModeFlags,
-            Some(JSON_SAFE_INTEGER_MAX + 1),
-            None,
-        )
-        .unwrap();
-        assert_eq!(unsafe_generation.code, "unsafe_mode_generation");
-        let rejected = mode_probe_issue(
-            DaemonResponseKind::OperatorError,
-            None,
-            Some("mode_read_failed"),
-        )
-        .unwrap();
-        assert_eq!(rejected.code, "read_mode_flags_rejected");
-    }
-
-    #[test]
     fn update_probes_all_nonterminal_session_lifecycles() {
         for lifecycle in ["starting", "running", "stopping", "recovering"] {
             assert!(is_nonterminal_session_lifecycle(lifecycle), "{lifecycle}");

@@ -480,6 +480,13 @@ struct LuaHostApi {
     causal_scopes: Arc<CausalScopeTable>,
 }
 
+/// Test-only hold applied before package-event handler invocations, in
+/// milliseconds. Production code never sets it; it compiles out of release
+/// builds. Tests use it to prove timeout classification deterministically.
+#[cfg(test)]
+pub(crate) static TEST_EVENT_HANDLER_HOLD_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Shared hub-owned primitives exposed to one Lua plugin runtime.
 #[derive(Clone)]
 pub struct LuaPluginHostApi {
@@ -615,6 +622,13 @@ impl PluginRuntime for LuaPluginRuntime {
             );
         }
 
+        #[cfg(test)]
+        if request.context.origin.as_deref() == Some("package-event") {
+            let hold_ms = TEST_EVENT_HANDLER_HOLD_MS.load(Ordering::Relaxed);
+            if hold_ms > 0 {
+                thread::sleep(Duration::from_millis(hold_ms));
+            }
+        }
         let lua = self.lua.lock().expect("lua runtime mutex");
         self.instruction_budget
             .store(DEFAULT_INSTRUCTION_BUDGET, Ordering::Relaxed);
