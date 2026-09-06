@@ -1344,10 +1344,10 @@ mod tests {
         let control = include_str!("transport/webrtc/control_channel.rs");
         assert!(!control.contains("HostControlClass::Entity"));
         assert!(!control.contains("entity_ready"));
-        assert!(!control.contains("framed_daemon_entity_frame"));
+        assert!(!control.contains("ServerFrame::Entity"));
         let subscriptions = include_str!("transport/webrtc/subscription_channel.rs");
-        assert!(subscriptions.contains("framed_daemon_entity_frame"));
-        assert!(subscriptions.contains("framed_daemon_event"));
+        assert!(subscriptions.contains("ServerFrame::Entity { entity }"));
+        assert!(subscriptions.contains("ServerFrame::Event {"));
     }
 
     #[test]

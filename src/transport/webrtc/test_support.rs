@@ -11,9 +11,7 @@ use crate::subscription::attach_routes::negotiated_unix_capability_set;
 use crate::subscription::entity::EntityFrameSender;
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::control_channel::LocalWebrtcDataChannel;
-use crate::transport::webrtc::delivery::{
-    encrypt_daemon_response, frame_encrypted_daemon_delivery,
-};
+use crate::transport::webrtc::delivery::{encrypt_server_frame, frame_encrypted_daemon_delivery};
 use crate::transport::webrtc::peer::*;
 use crate::transport::webrtc::{LocalWebrtcError, LocalWebrtcResult};
 use crate::{
@@ -23,9 +21,9 @@ use crate::{
 use async_trait::async_trait;
 use botster_core::{AesGcmEnvelope, AesGcmKey, decrypt_aes_gcm, encrypt_aes_gcm};
 use botster_hub_client::{
-    DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonEvent, DaemonHello, DaemonHelloAck,
-    DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind, DaemonRequest, DaemonResponse,
-    LOCAL_WEBRTC_MAX_DELIVERY_BYTES, PROTOCOL,
+    ClientFrame, DaemonCompatibilityRequirement, DaemonDiagnostic, DaemonEvent, DaemonHello,
+    DaemonHelloAck, DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind, DaemonRequest,
+    DaemonResponse, LOCAL_WEBRTC_MAX_DELIVERY_BYTES, PROTOCOL, ServerFrame,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -59,6 +57,8 @@ pub(crate) struct FakeDataChannel {
     pub(crate) sent: Mutex<Vec<String>>,
     pub(crate) closed: AtomicBool,
     pub(crate) send_fails: AtomicBool,
+    /// When nonzero, sends fail once this many sends have succeeded.
+    pub(crate) fail_sends_after: std::sync::atomic::AtomicUsize,
     pub(crate) send_hangs: AtomicBool,
     pub(crate) send_entered: AtomicBool,
     pub(crate) hang_after_first_send: AtomicBool,
@@ -123,6 +123,10 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
         if self.send_fails.load(Ordering::Acquire) {
             return Err("fixture send failure".to_string());
         }
+        let fail_after = self.fail_sends_after.load(Ordering::Acquire);
+        if fail_after > 0 && self.sent.lock().unwrap().len() >= fail_after {
+            return Err("fixture send failure".to_string());
+        }
         if self
             .events
             .lock()
@@ -140,6 +144,13 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
             self.send_hangs.store(true, Ordering::Release);
         }
         Ok(())
+    }
+
+    async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), String> {
+        // Binary terminal chunks are recorded by length; control tests only
+        // inspect text deliveries.
+        self.local_send_text(&format!("<binary {} bytes>", bytes.len()))
+            .await
     }
 
     async fn local_poll(&self) -> Option<DataChannelEvent> {
@@ -183,11 +194,28 @@ impl FakeDataChannel {
     }
 }
 
-pub(crate) fn encrypted_request_event(
-    key: &AesGcmKey,
-    request: &DaemonRequest,
-) -> DataChannelEvent {
-    let plaintext = serde_json::to_vec(request).unwrap();
+thread_local! {
+    static TEST_REQUEST_IDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Next canonical request id for this test thread. Ids start at 1 and
+/// increase, matching the per-connection rule Hub enforces.
+pub(crate) fn next_test_request_id() -> String {
+    TEST_REQUEST_IDS.with(|slot| {
+        let next = slot.get() + 1;
+        slot.set(next);
+        next.to_string()
+    })
+}
+
+/// Reset the test-thread request id counter; call before each simulated
+/// connection so ids start at 1 again.
+pub(crate) fn reset_test_request_ids() {
+    TEST_REQUEST_IDS.with(|slot| slot.set(0));
+}
+
+fn encrypted_client_frame_event(key: &AesGcmKey, frame: &ClientFrame) -> DataChannelEvent {
+    let plaintext = serde_json::to_vec(frame).unwrap();
     let envelope = encrypt_aes_gcm(key, &plaintext, 1).unwrap();
     let data = serde_json::to_vec(&envelope).unwrap();
     DataChannelEvent::OnMessage(RTCDataChannelMessage {
@@ -196,14 +224,37 @@ pub(crate) fn encrypted_request_event(
     })
 }
 
+/// One encrypted `ClientFrame::Request` with the next test request id.
+pub(crate) fn encrypted_request_event(
+    key: &AesGcmKey,
+    request: &DaemonRequest,
+) -> DataChannelEvent {
+    encrypted_client_frame_event(
+        key,
+        &ClientFrame::Request {
+            request_id: next_test_request_id(),
+            request: request.clone(),
+        },
+    )
+}
+
+/// One encrypted `ClientFrame::Hello`.
 pub(crate) fn encrypted_hello_event(key: &AesGcmKey, hello: &DaemonHello) -> DataChannelEvent {
-    let plaintext = serde_json::to_vec(hello).unwrap();
-    let envelope = encrypt_aes_gcm(key, &plaintext, 1).unwrap();
-    let data = serde_json::to_vec(&envelope).unwrap();
-    DataChannelEvent::OnMessage(RTCDataChannelMessage {
-        is_string: true,
-        data: data.as_slice().into(),
-    })
+    encrypted_client_frame_event(
+        key,
+        &ClientFrame::Hello {
+            hello: hello.clone(),
+        },
+    )
+}
+
+/// The hello a WebRTC adapter client sends first on every channel.
+pub(crate) fn webrtc_adapter_hello() -> DaemonHello {
+    DaemonHello {
+        protocol: PROTOCOL.to_string(),
+        compatibility: DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+        terminal_compatibility: None,
+    }
 }
 
 pub(crate) fn test_peer_state(grant_id: &str) -> LocalWebrtcPeerState {
@@ -375,54 +426,34 @@ impl TestOfferPeer {
         key: &AesGcmKey,
         request: &DaemonRequest,
     ) -> DaemonResponse {
-        let plaintext = serde_json::to_vec(request).expect("serialize request");
-        let envelope = encrypt_aes_gcm(key, &plaintext, 1).expect("encrypt request");
+        let request_id = next_test_request_id();
+        let frame = ClientFrame::Request {
+            request_id: request_id.clone(),
+            request: request.clone(),
+        };
         self.data_channel
-            .send_text(&serde_json::to_string(&envelope).expect("serialize envelope"))
+            .send_text(&encrypt_client_frame_text(key, &frame))
             .await
             .expect("send encrypted request");
         loop {
-            let mut encrypted = String::new();
-            let mut next_chunk_index = 0u32;
-            let mut delivery_kind = None;
-            loop {
-                let response = timeout(
-                    webrtc_runtime().as_ref(),
-                    Duration::from_secs(10),
-                    self.data_channel_message_rx.recv(),
-                )
-                .await
-                .expect("response frame timeout")
-                .expect("data channel remains open for response");
-                let chunk: DaemonLocalWebrtcDeliveryChunk =
-                    serde_json::from_str(&response).expect("parse delivery chunk");
-                if let Some(kind) = delivery_kind {
-                    assert_eq!(kind, chunk.delivery_kind);
-                } else {
-                    delivery_kind = Some(chunk.delivery_kind);
+            match read_server_frame(key, &mut self.data_channel_message_rx, "response").await {
+                ServerFrame::Response {
+                    request_id: answered,
+                    response,
+                } => {
+                    assert_eq!(answered, request_id, "responses correlate by request id");
+                    return response;
                 }
-                assert_eq!(chunk.chunk_index, next_chunk_index);
-                encrypted.push_str(&chunk.payload);
-                next_chunk_index += 1;
-                if chunk.chunk_index + 1 == chunk.chunk_count {
-                    break;
-                }
-            }
-            let envelope: AesGcmEnvelope =
-                serde_json::from_str(&encrypted).expect("parse response envelope");
-            let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt response");
-            match delivery_kind.expect("complete delivery declares a kind") {
-                DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
-                    return serde_json::from_slice(&plaintext).expect("parse daemon response");
-                }
-                DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
+                ServerFrame::Entity { .. } => {
                     // Entity frames can interleave while a subscription is live; keep waiting.
                 }
-                DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
-                    panic!("unbound peer helper must not receive daemon_terminal_frame");
-                }
-                DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
+                ServerFrame::Event { event } => {
+                    let plaintext = serde_json::to_vec(&event).expect("encode event");
                     self.park_or_reject_host_event(&plaintext);
+                }
+                ServerFrame::HelloAck { .. } => {}
+                ServerFrame::Close { reason } => {
+                    panic!("hub closed the control channel during a request: {reason:?}")
                 }
             }
         }
@@ -448,44 +479,12 @@ impl TestOfferPeer {
             return event;
         }
         loop {
-            let mut encrypted = String::new();
-            let mut next_chunk_index = 0u32;
-            let mut delivery_kind = None;
-            loop {
-                let response = timeout(
-                    webrtc_runtime().as_ref(),
-                    Duration::from_secs(10),
-                    self.data_channel_message_rx.recv(),
-                )
-                .await
-                .expect("host event frame timeout")
-                .expect("data channel remains open for host event");
-                let chunk: DaemonLocalWebrtcDeliveryChunk =
-                    serde_json::from_str(&response).expect("parse delivery chunk");
-                if let Some(kind) = delivery_kind {
-                    assert_eq!(kind, chunk.delivery_kind);
-                } else {
-                    delivery_kind = Some(chunk.delivery_kind);
+            match read_server_frame(key, &mut self.data_channel_message_rx, "host event").await {
+                ServerFrame::Event { event } => return event,
+                ServerFrame::Close { reason } => {
+                    panic!("hub closed the control channel while waiting for an event: {reason:?}")
                 }
-                assert_eq!(chunk.chunk_index, next_chunk_index);
-                encrypted.push_str(&chunk.payload);
-                next_chunk_index += 1;
-                if chunk.chunk_index + 1 == chunk.chunk_count {
-                    break;
-                }
-            }
-            let envelope: AesGcmEnvelope =
-                serde_json::from_str(&encrypted).expect("parse event envelope");
-            let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt event");
-            match delivery_kind.expect("complete delivery declares a kind") {
-                DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
-                    return serde_json::from_slice(&plaintext).expect("parse daemon event");
-                }
-                DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame
-                | DaemonLocalWebrtcDeliveryKind::DaemonResponse => {}
-                DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
-                    panic!("unbound peer helper must not receive daemon_terminal_frame");
-                }
+                _ => {}
             }
         }
     }
@@ -495,40 +494,22 @@ impl TestOfferPeer {
         key: &AesGcmKey,
         hello: &DaemonHello,
     ) -> DaemonHelloAck {
-        let plaintext = serde_json::to_vec(hello).expect("serialize hello");
-        let envelope = encrypt_aes_gcm(key, &plaintext, 1).expect("encrypt hello");
+        let frame = ClientFrame::Hello {
+            hello: hello.clone(),
+        };
         self.data_channel
-            .send_text(&serde_json::to_string(&envelope).expect("serialize envelope"))
+            .send_text(&encrypt_client_frame_text(key, &frame))
             .await
             .expect("send encrypted hello");
-        let mut encrypted = String::new();
-        let mut next_chunk_index = 0u32;
         loop {
-            let response = timeout(
-                webrtc_runtime().as_ref(),
-                Duration::from_secs(10),
-                self.data_channel_message_rx.recv(),
-            )
-            .await
-            .expect("hello ack timeout")
-            .expect("data channel remains open for hello ack");
-            let chunk: DaemonLocalWebrtcDeliveryChunk =
-                serde_json::from_str(&response).expect("parse hello ack chunk");
-            assert_eq!(
-                chunk.delivery_kind,
-                DaemonLocalWebrtcDeliveryKind::DaemonResponse
-            );
-            assert_eq!(chunk.chunk_index, next_chunk_index);
-            encrypted.push_str(&chunk.payload);
-            next_chunk_index += 1;
-            if chunk.chunk_index + 1 == chunk.chunk_count {
-                break;
+            match read_server_frame(key, &mut self.data_channel_message_rx, "hello ack").await {
+                ServerFrame::HelloAck { ack } => return ack,
+                ServerFrame::Close { reason } => {
+                    panic!("hub closed the control channel during hello: {reason:?}")
+                }
+                _ => {}
             }
         }
-        let envelope: AesGcmEnvelope =
-            serde_json::from_str(&encrypted).expect("parse hello ack envelope");
-        let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt hello ack");
-        serde_json::from_slice(&plaintext).expect("parse daemon hello ack")
     }
 
     pub(crate) async fn open_reserved_terminal(
@@ -562,6 +543,7 @@ impl TestOfferPeer {
                             let _ = open_tx.try_send(());
                         }
                         DataChannelEvent::OnMessage(message) => {
+                            // Terminal chunks are binary; only JSON deliveries are text.
                             if let Ok(text) = String::from_utf8(message.data.to_vec()) {
                                 let _ = message_tx.try_send(text);
                             }
@@ -576,39 +558,22 @@ impl TestOfferPeer {
             .await
             .expect("timed out waiting for reserved channel open")
             .expect("reserved channel open signal");
-        let plaintext = serde_json::to_vec(hello).expect("serialize reserved hello");
-        let envelope = encrypt_aes_gcm(key, &plaintext, 1).expect("encrypt reserved hello");
+        let frame = ClientFrame::Hello {
+            hello: hello.clone(),
+        };
         channel
-            .send_text(
-                &serde_json::to_string(&envelope).expect("serialize reserved hello envelope"),
-            )
+            .send_text(&encrypt_client_frame_text(key, &frame))
             .await
             .expect("send reserved hello");
-        let mut encrypted = String::new();
-        let mut next_chunk_index = 0u32;
         loop {
-            let response = timeout(runtime.as_ref(), Duration::from_secs(10), message_rx.recv())
-                .await
-                .expect("reserved hello ack timeout")
-                .expect("reserved channel remains open for hello ack");
-            let chunk: DaemonLocalWebrtcDeliveryChunk =
-                serde_json::from_str(&response).expect("parse reserved hello ack chunk");
-            assert_eq!(
-                chunk.delivery_kind,
-                DaemonLocalWebrtcDeliveryKind::DaemonResponse
-            );
-            assert_eq!(chunk.chunk_index, next_chunk_index);
-            encrypted.push_str(&chunk.payload);
-            next_chunk_index += 1;
-            if chunk.chunk_index + 1 == chunk.chunk_count {
-                break;
+            match read_server_frame(key, &mut message_rx, "reserved hello ack").await {
+                ServerFrame::HelloAck { .. } => break,
+                ServerFrame::Close { reason } => {
+                    panic!("hub closed the reserved channel during hello: {reason:?}")
+                }
+                _ => {}
             }
         }
-        let envelope: AesGcmEnvelope =
-            serde_json::from_str(&encrypted).expect("parse reserved hello ack envelope");
-        let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt reserved hello ack");
-        let _: DaemonHelloAck =
-            serde_json::from_slice(&plaintext).expect("parse reserved hello ack");
         self.reserved_channels.insert(
             label.to_string(),
             ReservedTestChannel {
@@ -627,30 +592,15 @@ impl TestOfferPeer {
             .reserved_channels
             .get_mut(label)
             .expect("reserved channel remains open");
-        let mut encrypted = String::new();
-        let mut next_chunk_index = 0u32;
         loop {
-            let response = timeout(
-                webrtc_runtime().as_ref(),
-                Duration::from_secs(10),
-                reserved.message_rx.recv(),
-            )
-            .await
-            .expect("reserved event timeout")
-            .expect("reserved channel remains open for event");
-            let chunk: DaemonLocalWebrtcDeliveryChunk =
-                serde_json::from_str(&response).expect("parse reserved event chunk");
-            assert_eq!(chunk.chunk_index, next_chunk_index);
-            encrypted.push_str(&chunk.payload);
-            next_chunk_index += 1;
-            if chunk.chunk_index + 1 == chunk.chunk_count {
-                break;
+            match read_server_frame(key, &mut reserved.message_rx, "reserved event").await {
+                ServerFrame::Event { event } => return event,
+                ServerFrame::Close { reason } => {
+                    panic!("hub closed the reserved channel while waiting for an event: {reason:?}")
+                }
+                _ => {}
             }
         }
-        let envelope: AesGcmEnvelope =
-            serde_json::from_str(&encrypted).expect("parse reserved event envelope");
-        let plaintext = decrypt_aes_gcm(key, &envelope).expect("decrypt reserved event");
-        serde_json::from_slice(&plaintext).expect("parse reserved daemon event")
     }
 
     pub(crate) async fn wait_reserved_closed(&mut self, label: &str) {
@@ -667,6 +617,58 @@ impl TestOfferPeer {
         .expect("reserved channel close timeout");
         assert!(next.is_none(), "closed channel must end its message stream");
     }
+}
+
+/// Encrypt one client frame into the JSON envelope text the control channel carries.
+pub(crate) fn encrypt_client_frame_text(key: &AesGcmKey, frame: &ClientFrame) -> String {
+    let plaintext = serde_json::to_vec(frame).expect("serialize client frame");
+    let envelope = encrypt_aes_gcm(key, &plaintext, 1).expect("encrypt client frame");
+    serde_json::to_string(&envelope).expect("serialize envelope")
+}
+
+/// Assemble one chunked `server_frame` delivery from text messages and decrypt it.
+pub(crate) async fn read_server_frame(
+    key: &AesGcmKey,
+    receiver: &mut AsyncReceiver<String>,
+    label: &str,
+) -> ServerFrame {
+    let mut encrypted = String::new();
+    let mut next_chunk_index = 0u32;
+    let mut message_id: Option<String> = None;
+    loop {
+        let text = timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(10),
+            receiver.recv(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{label} frame timeout"))
+        .unwrap_or_else(|| panic!("data channel remains open for {label}"));
+        let chunk: DaemonLocalWebrtcDeliveryChunk =
+            serde_json::from_str(&text).expect("parse delivery chunk");
+        assert_eq!(
+            chunk.delivery_kind,
+            DaemonLocalWebrtcDeliveryKind::ServerFrame
+        );
+        if let Some(message_id) = message_id.as_ref() {
+            assert_eq!(
+                message_id, &chunk.message_id,
+                "chunks of one delivery share an id"
+            );
+        } else {
+            message_id = Some(chunk.message_id.clone());
+        }
+        assert_eq!(chunk.chunk_index, next_chunk_index);
+        encrypted.push_str(&chunk.payload);
+        next_chunk_index += 1;
+        if chunk.chunk_index + 1 == chunk.chunk_count {
+            break;
+        }
+    }
+    let envelope: AesGcmEnvelope =
+        serde_json::from_str(&encrypted).unwrap_or_else(|_| panic!("parse {label} envelope"));
+    let plaintext = decrypt_aes_gcm(key, &envelope).unwrap_or_else(|_| panic!("decrypt {label}"));
+    serde_json::from_slice(&plaintext).unwrap_or_else(|_| panic!("parse {label} server frame"))
 }
 
 pub(crate) fn unique_test_data_dir(label: &str) -> PathBuf {
@@ -1954,9 +1956,17 @@ pub(crate) fn receive_test_runtime_message(
         .build()
         .expect("build bounded WebRTC test receive runtime");
     runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
-            .await
-            .expect("timed out waiting for WebRTC runtime message")
-            .expect("WebRTC runtime sender remains live")
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("timed out waiting for WebRTC runtime message")
+                .expect("WebRTC runtime sender remains live");
+            // Every channel starts with Hello; its admission registration is
+            // not the message a request-level test waits for.
+            if matches!(message, ControlMessage::RegisterWebrtcAdmission { .. }) {
+                continue;
+            }
+            return message;
+        }
     })
 }

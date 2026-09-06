@@ -734,6 +734,16 @@ impl ClosedHandle for WebRtcTerminalAdapterHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use botster_terminal_protocol::{RouteId, encode_output};
+
+    fn test_frame(marker: &[u8]) -> RoutedTerminalFrame {
+        RoutedTerminalFrame::new(
+            RouteId::new("route").expect("route"),
+            1,
+            0,
+            encode_output(marker).expect("output frame"),
+        )
+    }
     use std::time::Duration;
 
     use botster_core_test_support::terminal_adapter::{
@@ -774,8 +784,8 @@ mod tests {
         }
 
         fn complete_active_write(&mut self) {
-            if let Some(bytes) = self.handle.complete_active() {
-                self.delivered.push(bytes);
+            if let Some(frame) = self.handle.complete_active() {
+                self.delivered.push(frame.frame.as_bytes().to_vec());
             }
         }
 
@@ -813,9 +823,7 @@ mod tests {
     #[test]
     fn close_does_not_wait_on_occupied_slot() {
         let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
-        let frame =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"in-flight"}"#)
-                .expect("opaque frame");
+        let frame = test_frame(b"in-flight");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Full);
         handle.close();
@@ -848,15 +856,9 @@ mod tests {
             1,
             sibling_handle.clone(),
         );
-        let occupied = TerminalFrame::from_bytes(
-            br#"{"type":"terminal_output","marker":"occupied-late-budget"}"#,
-        )
-        .expect("occupied opaque frame");
-        let occupied_len = occupied.to_bytes().expect("occupied bytes").len();
-        let sibling_frame = TerminalFrame::from_bytes(
-            br#"{"type":"terminal_output","marker":"sibling-late-budget"}"#,
-        )
-        .expect("sibling opaque frame");
+        let occupied = test_frame(b"occupied-late-budget");
+        let occupied_len = occupied.frame.len();
+        let sibling_frame = test_frame(b"sibling-late-budget");
         filled.store(
             AGGREGATE_BUFFERED_HIGH - occupied_len - 32,
             Ordering::Release,
@@ -874,8 +876,7 @@ mod tests {
     #[test]
     fn close_does_not_wait_for_the_aggregate_permit_lock() {
         let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
-        let frame =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#).expect("opaque frame");
+        let frame = test_frame(b"output");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         let guard = handle
             .inner
@@ -901,30 +902,11 @@ mod tests {
     #[test]
     fn completing_twice_does_not_duplicate_the_active_frame() {
         let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
-        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"once"}"#)
-            .expect("opaque frame");
+        let frame = test_frame(b"once");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         assert!(handle.complete_active().is_some());
         assert!(handle.complete_active().is_none());
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
-    }
-
-    #[test]
-    fn data_channel_low_water_does_not_clear_test_forced_route_pressure() {
-        let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
-        handle
-            .inner
-            .test_forced_would_block
-            .store(true, Ordering::Release);
-        handle.set_would_block(false);
-        let frame =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output"}"#).expect("opaque frame");
-
-        assert_eq!(adapter.pressure(), TerminalAdapterPressure::WouldBlock);
-        assert_eq!(
-            adapter.try_write(&frame),
-            Err(TerminalAdapterWriteError::WouldBlock)
-        );
     }
 
     #[test]
@@ -941,9 +923,7 @@ mod tests {
         let mux = WebRtcConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
         mux.register("session".into(), "terminal".into(), 1, handle.clone());
-        let frame =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"aggregate"}"#)
-                .expect("opaque frame");
+        let frame = test_frame(b"aggregate");
 
         assert_eq!(
             adapter.try_write(&frame),
@@ -958,7 +938,7 @@ mod tests {
         assert_eq!(adapter.try_write(&frame), Ok(()));
         assert_eq!(
             handle.complete_active(),
-            Some(frame.to_bytes().expect("bytes"))
+            Some(frame.frame.as_bytes().to_vec())
         );
     }
 
@@ -1054,8 +1034,7 @@ mod tests {
             mux.snapshot_writes().is_empty(),
             "scan is empty before the race write"
         );
-        let frame = TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"race"}"#)
-            .expect("opaque frame");
+        let frame = test_frame(b"race");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()

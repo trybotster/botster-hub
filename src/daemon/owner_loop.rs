@@ -915,7 +915,7 @@ mod tests {
     use crate::daemon::error::daemon_operator_error;
     use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
     use crate::subscription::entity::entity_subscription_error;
-    use crate::transport::unix::connection::{cleanup_detach_failed, handle_connection};
+    use crate::transport::unix::connection::handle_connection;
     use botster_core::RequestId;
     use botster_core::contract::terminal_adapter::TerminalAdapter;
     use botster_hub_client::{
@@ -1099,9 +1099,8 @@ mod tests {
             "async fn handle_connection_async",
             "struct MuxWriteState",
             "struct ConnectionCleanupGuard",
-            "async fn read_async_frame",
+            "async fn read_async_inbound",
             "fn prepare_socket_path",
-            "fn unix_event_flush_stalled",
         ];
         for needle in needles {
             assert!(
@@ -1147,8 +1146,7 @@ mod tests {
         );
         assert!(
             mux.contains("pub(crate) struct MuxWriteState")
-                && mux.contains("pub(crate) async fn read_async_frame")
-                && mux.contains("pub(crate) fn unix_event_flush_stalled"),
+                && mux.contains("pub(crate) async fn read_async_inbound"),
             "mux_write owns framing and mux scheduling"
         );
     }
@@ -1169,27 +1167,6 @@ mod tests {
         assert!(error.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == botster_hub_client::DaemonDiagnosticKind::WorkerCompatibility
         }));
-    }
-
-    #[test]
-    fn connection_cleanup_ignores_only_an_already_removed_session() {
-        let unknown_session = Err(DaemonTransportError::Client(
-            crate::HubClientError::Runtime {
-                request_id: RequestId("cleanup-detach".to_string()),
-                operation: crate::HubClientOperation::Detach,
-                kind: crate::HubClientRuntimeErrorKind::UnknownSession,
-            },
-        ));
-        assert!(!cleanup_detach_failed(&unknown_session));
-
-        let unavailable_runtime: DaemonTransportResult<DaemonResponse> =
-            Err(DaemonTransportError::DaemonNotRunning);
-        assert!(cleanup_detach_failed(&unavailable_runtime));
-        assert!(cleanup_detach_failed(&Ok(entity_subscription_error(
-            "detach_failed",
-            "cleanup-detach",
-            "detach failed",
-        ))));
     }
 
     #[test]
@@ -1526,7 +1503,7 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("config");
-        let runtime = crate::HubRuntime::new(config);
+        let runtime = crate::HubRuntime::new(config).expect("runtime");
         record_egress_write_failure(
             &mut diagnostics,
             &mut counters,
@@ -1596,7 +1573,7 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("config");
-        let runtime = crate::HubRuntime::new(config);
+        let runtime = crate::HubRuntime::new(config).expect("runtime");
         record_egress_write_failure(
             &mut diagnostics,
             &mut counters,
@@ -1820,26 +1797,19 @@ mod tests {
         request: DaemonRequest,
     ) -> DaemonTransportResult<DaemonResponse> {
         let (control_tx, _control_rx) = tokio_mpsc::channel(8);
-        let egress = DaemonEgressDiagnostics::default();
-        let lifecycle = DaemonLifecycleCounters::default();
         let observability = DaemonObservability {
-            egress: &egress,
-            lifecycle: &lifecycle,
+            egress: Vec::new(),
+            lifecycle: DaemonLifecycleCounters::default(),
             client_id: None,
             grant_id: None,
         };
-        let mut clock = 1;
-        let mut drain_cursors = BTreeMap::new();
-        let mut pending = PendingRuntimeState::default();
-        handle_control_request(
-            daemon,
-            &mut clock,
-            &mut drain_cursors,
-            &mut pending,
-            observability,
-            control_tx,
-            request,
-        )
+        let mut state = DaemonControlState::default();
+        match handle_control_request(daemon, &mut state, observability, control_tx, request) {
+            crate::daemon::control::pending::ControlStep::Ready(response) => response,
+            crate::daemon::control::pending::ControlStep::Pending(_) => {
+                panic!("package requests answer without a Core turn")
+            }
+        }
     }
 
     fn live_and_durable_registries(

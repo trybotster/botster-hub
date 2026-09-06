@@ -363,6 +363,7 @@ pub(crate) fn register_entity_subscription(
                 entities: BTreeMap::new(),
                 definition_generation: 0,
                 definition_entities: BTreeMap::new(),
+                awaiting_initial_snapshot: false,
                 resync_reason: None,
                 owner_grant_id,
                 package_last_applied_seq: Some(snapshot_seq),
@@ -397,6 +398,7 @@ pub(crate) fn register_entity_subscription(
         entities: BTreeMap::new(),
         definition_generation: 0,
         definition_entities: BTreeMap::new(),
+        awaiting_initial_snapshot: false,
         resync_reason: None,
         owner_grant_id,
         package_last_applied_seq: None,
@@ -1968,7 +1970,7 @@ mod tests {
         daemon
             .runtime_mut()
             .expect("runtime initialized")
-            .spawn_session(
+            .spawn_session_for_test(
                 botster_core::SessionSpawnRequest {
                     request_id: RequestId("stale-transition-spawn".to_string()),
                     session_id: session_id.clone(),
@@ -1984,7 +1986,6 @@ mod tests {
                     initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
                 },
                 botster_core::CoreSessionMetadata::new(),
-                1,
             )
             .expect("spawn worker-backed session");
 
@@ -1993,7 +1994,7 @@ mod tests {
         for _ in 0..16 {
             let kind = state.maintenance.scheduler.take_slice();
             if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind(
+                crate::daemon_maintenance::run_maintenance_kind_to_completion(
                     runtime,
                     &mut state.maintenance,
                     kind,
@@ -2018,7 +2019,7 @@ mod tests {
             }
             let kind = state.maintenance.scheduler.take_slice();
             if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind(
+                crate::daemon_maintenance::run_maintenance_kind_to_completion(
                     runtime,
                     &mut state.maintenance,
                     kind,
@@ -2045,12 +2046,12 @@ mod tests {
         daemon
             .runtime()
             .expect("runtime initialized")
-            .mark_session_stale(&session_id, 2)
+            .mark_session_stale_for_test(&session_id, 2)
             .expect("mark live session stale through core daemon");
         for _ in 0..16 {
             let kind = state.maintenance.scheduler.take_slice();
             if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind(
+                crate::daemon_maintenance::run_maintenance_kind_to_completion(
                     runtime,
                     &mut state.maintenance,
                     kind,
@@ -2075,7 +2076,7 @@ mod tests {
         daemon
             .runtime_mut()
             .expect("runtime initialized")
-            .shutdown_session(session_id, 3)
+            .shutdown_session_for_test(session_id)
             .expect("stop worker-backed test session");
         daemon.stop();
         let _ = fs::remove_dir_all(data_directory);
@@ -2115,7 +2116,7 @@ mod tests {
         for _ in 0..16 {
             let kind = state.maintenance.scheduler.take_slice();
             if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind(
+                crate::daemon_maintenance::run_maintenance_kind_to_completion(
                     runtime,
                     &mut state.maintenance,
                     kind,
@@ -2142,7 +2143,7 @@ mod tests {
             if kind == crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery {
                 drive_entity_subscriptions(&mut daemon, &mut state);
             } else if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind(
+                crate::daemon_maintenance::run_maintenance_kind_to_completion(
                     runtime,
                     &mut state.maintenance,
                     kind,
@@ -2158,7 +2159,7 @@ mod tests {
         daemon
             .runtime_mut()
             .expect("runtime initialized")
-            .spawn_session(
+            .spawn_session_for_test(
                 botster_core::SessionSpawnRequest {
                     request_id: RequestId("existing-sub-spawn".to_string()),
                     session_id: session_id.clone(),
@@ -2171,7 +2172,6 @@ mod tests {
                     initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
                 },
                 botster_core::CoreSessionMetadata::new(),
-                1,
             )
             .expect("spawn after first snapshot");
         state.maintenance.note_authoritative_mutation();
@@ -2181,7 +2181,7 @@ mod tests {
             if kind == crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery {
                 drive_entity_subscriptions(&mut daemon, &mut state);
             } else if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind(
+                crate::daemon_maintenance::run_maintenance_kind_to_completion(
                     runtime,
                     &mut state.maintenance,
                     kind,
@@ -2219,7 +2219,7 @@ mod tests {
         let _ = daemon
             .runtime_mut()
             .expect("runtime initialized")
-            .shutdown_session(session_id, 2);
+            .shutdown_session_for_test(session_id);
         daemon.stop();
         let _ = fs::remove_dir_all(data_directory);
     }
@@ -2264,6 +2264,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: Some(overflow_reason.clone()),
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -2334,6 +2335,7 @@ mod tests {
                 entities: BTreeMap::new(),
                 definition_generation: 1,
                 definition_entities: BTreeMap::new(),
+                awaiting_initial_snapshot: false,
                 resync_reason: Some("subscriber_overflow".to_string()),
                 owner_grant_id: None,
                 package_last_applied_seq: None,
@@ -2375,6 +2377,7 @@ mod tests {
         definition_generation: u64,
         next_seq: u64,
         definition_entities: BTreeMap<String, Value>,
+        awaiting_initial_snapshot: false,
         resync_reason: Option<String>,
     ) -> EntitySubscriptionState {
         EntitySubscriptionState {
@@ -2594,6 +2597,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: Some(overflow_reason.clone()),
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -2686,6 +2690,7 @@ mod tests {
             )]),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -2759,6 +2764,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -2827,6 +2833,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -2906,6 +2913,7 @@ mod tests {
                 entities: BTreeMap::new(),
                 definition_generation: 0,
                 definition_entities: BTreeMap::new(),
+                awaiting_initial_snapshot: false,
                 resync_reason: None,
                 owner_grant_id: None,
                 package_last_applied_seq: None,
@@ -2970,6 +2978,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -3066,6 +3075,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -3160,6 +3170,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -3236,6 +3247,7 @@ mod tests {
             entities,
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -3294,6 +3306,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -3390,6 +3403,7 @@ mod tests {
                     entities: BTreeMap::new(),
                     definition_generation: 0,
                     definition_entities: BTreeMap::new(),
+                    awaiting_initial_snapshot: false,
                     resync_reason: None,
                     owner_grant_id: None,
                     package_last_applied_seq: None,
@@ -3453,6 +3467,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,
@@ -3534,6 +3549,7 @@ mod tests {
             entities: BTreeMap::new(),
             definition_generation: 0,
             definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
             resync_reason: None,
             owner_grant_id: None,
             package_last_applied_seq: None,

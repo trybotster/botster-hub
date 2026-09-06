@@ -904,18 +904,6 @@ enum CleanupRouteOutcome {
     DetachFailed,
 }
 
-pub(crate) fn cleanup_detach_failed(result: &DaemonTransportResult<DaemonResponse>) -> bool {
-    match result {
-        Err(DaemonTransportError::Client(crate::HubClientError::Runtime {
-            operation: crate::HubClientOperation::Detach,
-            kind: crate::HubClientRuntimeErrorKind::UnknownSession,
-            ..
-        })) => false,
-        Ok(response) => response.kind == DaemonResponseKind::OperatorError,
-        Err(_) => true,
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn handle_connection(
     stream: UnixStream,

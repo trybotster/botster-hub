@@ -925,10 +925,12 @@ mod tests {
     #[test]
     fn hanging_data_channel_local_close_still_runs_cleanup_once_within_bound() {
         let data_channel = FakeDataChannel::default();
+        let key = AesGcmKey::from_slice(&[22; 32]).unwrap();
         let mut pending = VecDeque::new();
-        pending.push_back(PendingLocalWebrtcRequest::Request(Box::new(
-            DaemonRequest::Status,
-        )));
+        pending.push_back(PendingLocalWebrtcRequest::Request {
+            request_id: "1".to_string(),
+            request: Box::new(DaemonRequest::Status),
+        });
         let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
         let peer_state = Arc::new(LocalWebrtcPeerState::new(
             "grant-local-close-hang".to_string(),
@@ -944,6 +946,7 @@ mod tests {
         let started = Instant::now();
         runtime.block_on(close_data_channel(
             &data_channel,
+            &key,
             &mut pending,
             peer_state.as_ref(),
             LocalWebrtcTerminalCause::ChannelClosed,
@@ -1314,12 +1317,6 @@ mod tests {
     #[test]
     fn reservation_rejection_states_and_timeout_release_are_distinct() {
         let _teardown_guard = teardown_test_lock();
-        let previous_expiry = std::env::var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS").ok();
-        let previous_botster_env = std::env::var("BOTSTER_ENV").ok();
-        unsafe {
-            std::env::set_var("BOTSTER_ENV", "test");
-            std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", "30");
-        }
         let mut harness = PeerHarness::new("reservation-matrix");
         let mut peer_a = harness.signal_peer("http://127.0.0.1:41904");
         let mut peer_b = harness.signal_peer("http://127.0.0.1:41905");
@@ -1392,13 +1389,9 @@ mod tests {
                 .contains_key("matrix-over-limit")
         );
 
-        unsafe {
-            std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", "1");
-        }
-        let late = harness.subscribe_entities(&mut peer_a, "matrix-late");
-        unsafe {
-            std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", "30");
-        }
+        let late = crate::admission::reservations::with_reservation_expiry_for_test(1, || {
+            harness.subscribe_entities(&mut peer_a, "matrix-late")
+        });
         let late_reservation = late.subscription_reservation.expect("late reservation");
         std::thread::sleep(Duration::from_millis(1_100));
         assert!(matches!(
@@ -1424,18 +1417,6 @@ mod tests {
             "control and the bound live route remain after timeout cleanup"
         );
 
-        unsafe {
-            match previous_botster_env {
-                Some(value) => std::env::set_var("BOTSTER_ENV", value),
-                None => std::env::remove_var("BOTSTER_ENV"),
-            }
-            match previous_expiry {
-                Some(value) => {
-                    std::env::set_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS", value)
-                }
-                None => std::env::remove_var("BOTSTER_HUB_TEST_RESERVATION_EXPIRES_IN_SECONDS"),
-            }
-        }
         peer_a.close_offer();
         peer_b.close_offer();
         harness.cleanup();
@@ -1948,24 +1929,13 @@ mod tests {
             hub_detaches, 0,
             "bound peer loss must not Hub-Detach: before={before:?} after={after:?}"
         );
-        let _ = harness
-            .daemon
-            .runtime_mut()
-            .expect("runtime")
-            .observe_lifecycle_slice(
-                1,
-                None,
-                botster_core_daemon::ObserveLifecycleBudget {
-                    max_sessions: 32,
-                    max_encoded_result_bytes: 64 * 1024,
-                    max_elapsed: Duration::from_millis(25),
-                },
-            );
         let inventory = harness
             .daemon
             .runtime_mut()
             .expect("runtime")
-            .list_terminal_subscriptions();
+            .list_terminal_subscriptions()
+            .wait(Duration::from_secs(5))
+            .expect("inventory");
         assert!(
             inventory.iter().all(|row| {
                 row.session_id.0 != session_id || row.subscription_id.0 != subscription_id
@@ -2094,24 +2064,13 @@ mod tests {
             "dedicated runtime workers must join after fail-closed teardown",
         );
 
-        let _ = harness
-            .daemon
-            .runtime_mut()
-            .expect("runtime")
-            .observe_lifecycle_slice(
-                1,
-                None,
-                botster_core_daemon::ObserveLifecycleBudget {
-                    max_sessions: 32,
-                    max_encoded_result_bytes: 64 * 1024,
-                    max_elapsed: Duration::from_millis(25),
-                },
-            );
         let inventory = harness
             .daemon
             .runtime_mut()
             .expect("runtime")
-            .list_terminal_subscriptions();
+            .list_terminal_subscriptions()
+            .wait(Duration::from_secs(5))
+            .expect("inventory");
         assert!(
             inventory.is_empty(),
             "fail-closed must leave zero Core inventory rows before session shutdown: {inventory:?}"
@@ -3055,7 +3014,9 @@ mod tests {
             .daemon
             .runtime_mut()
             .expect("runtime")
-            .list_terminal_subscriptions();
+            .list_terminal_subscriptions()
+            .wait(Duration::from_secs(5))
+            .expect("inventory");
         assert!(
             inventory.is_empty(),
             "timeout fail-closed must leave zero Core inventory rows: {inventory:?}"
