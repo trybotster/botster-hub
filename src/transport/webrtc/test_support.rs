@@ -55,6 +55,8 @@ pub(crate) static EXTRA_CHANNEL_ORACLE_ENV: Mutex<()> = Mutex::new(());
 pub(crate) struct FakeDataChannel {
     pub(crate) events: Mutex<VecDeque<DataChannelEvent>>,
     pub(crate) sent: Mutex<Vec<String>>,
+    /// Binary terminal chunks, verbatim, in send order.
+    pub(crate) sent_binary: Mutex<Vec<Vec<u8>>>,
     pub(crate) closed: AtomicBool,
     pub(crate) send_fails: AtomicBool,
     /// When nonzero, sends fail once this many sends have succeeded.
@@ -147,10 +149,12 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
     }
 
     async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), String> {
-        // Binary terminal chunks are recorded by length; control tests only
-        // inspect text deliveries.
+        // The text log records the length so control tests keep one send
+        // list; `sent_binary` keeps the chunk bytes for reassembly checks.
         self.local_send_text(&format!("<binary {} bytes>", bytes.len()))
-            .await
+            .await?;
+        self.sent_binary.lock().unwrap().push(bytes.to_vec());
+        Ok(())
     }
 
     async fn local_poll(&self) -> Option<DataChannelEvent> {
