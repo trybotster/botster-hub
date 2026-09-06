@@ -1142,6 +1142,37 @@ mod tests {
             .await
             .expect("send entered");
         });
+        // Sibling progress while this route stays blocked: a second route on
+        // its own channel completes a send before the first route closes.
+        let sibling_channel = FakeDataChannel::default();
+        let (mut sibling, sibling_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        assert_eq!(sibling.try_write(&frame), Ok(()));
+        runtime
+            .block_on(flush_subscription_adapter_frames(
+                &sibling_channel,
+                &key,
+                &sibling_handle,
+                &usage,
+                &mut 1u64,
+            ))
+            .expect("sibling sends while the first route is blocked");
+        assert_eq!(sibling_channel.sent.lock().expect("sibling sends").len(), 1);
+        assert!(
+            !flush.is_finished(),
+            "the blocked route must still be pending when the sibling completes"
+        );
+        assert!(channel.sent.lock().expect("sent frames").is_empty());
+        // Bounded growth: the blocked route keeps one in-flight frame and
+        // refuses a second one instead of queueing it.
+        let buffered_while_blocked = budget.aggregate_buffered();
+        assert!(
+            matches!(
+                adapter.try_write(&frame),
+                Err(TerminalAdapterWriteError::Full | TerminalAdapterWriteError::WouldBlock)
+            ),
+            "a blocked route must not queue beyond its bounded slot"
+        );
+        assert_eq!(budget.aggregate_buffered(), buffered_while_blocked);
         handle.close_from_host();
         handle.close();
         let result = runtime.block_on(async {
@@ -1168,18 +1199,18 @@ mod tests {
                 .is_err()
         );
         assert!(channel.sent.lock().expect("sent frames").is_empty());
-        let (mut sibling, sibling_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        // The sibling route keeps sending after the first route closed.
         assert_eq!(sibling.try_write(&frame), Ok(()));
         runtime
             .block_on(flush_subscription_adapter_frames(
-                channel.as_ref(),
+                &sibling_channel,
                 &key,
                 &sibling_handle,
                 &usage,
-                &mut 3u64,
+                &mut 2u64,
             ))
-            .expect("sibling sends");
-        assert_eq!(channel.sent.lock().expect("sent frames").len(), 1);
+            .expect("sibling sends after the first route closed");
+        assert_eq!(sibling_channel.sent.lock().expect("sibling sends").len(), 2);
     }
 
     #[test]
@@ -1269,6 +1300,17 @@ mod tests {
                 .is_err()
         );
         assert_eq!(budget.aggregate_buffered(), accepted);
+        // Accounting alone is not completion: the one accepted chunk never
+        // reassembles into a message on the receiving side.
+        let sent = channel.sent_binary.lock().expect("sent chunks").clone();
+        assert_eq!(sent.len(), 1);
+        let mut assembly = InboundTerminalChunkAssembly::new(1);
+        assert_eq!(
+            assembly.push(&key, &sent[0]),
+            Ok(None),
+            "the accepted chunk alone must not complete the message"
+        );
+        assert!(assembly.is_partial());
         channel.outstanding_bytes.store(0, Ordering::Release);
         runtime
             .block_on(publish_channel_usage(channel.as_ref(), &usage))
@@ -1279,6 +1321,91 @@ mod tests {
             1,
             "cancelled chunk must not replay"
         );
+    }
+
+    #[test]
+    fn hard_close_in_flight_ends_the_stream_before_a_truncated_message_completes() {
+        use botster_hub_client::LocalWebrtcTerminalChunkHeader;
+        let (mut adapter, handle) =
+            crate::transport::webrtc::adapter::WebRtcTerminalAdapter::pair();
+        // Four sealed chunks: the fake accepts the first and hangs the second.
+        assert_eq!(adapter.try_write(&test_frame(&vec![b'x'; 40_000])), Ok(()));
+        let channel = Arc::new(FakeDataChannel::default());
+        channel.hang_after_first_send.store(true, Ordering::Release);
+        let usage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = AesGcmKey::from_slice(&[17; 32]).expect("test key");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let driver = runtime.spawn({
+            let channel = Arc::clone(&channel);
+            let handle = handle.clone();
+            let usage = Arc::clone(&usage);
+            let key = key.clone();
+            async move {
+                let peer_state = test_peer_state("grant-truncated");
+                run_bound_subscription_channel(
+                    channel.as_ref(),
+                    &key,
+                    BoundSubscriptionRoute {
+                        peer_state: &peer_state,
+                        grant_id: "grant-truncated",
+                        label: "route-truncated",
+                        subscription_id: "sub-truncated",
+                        generation: 1,
+                    },
+                    BoundSubscription::Terminal { handle, usage },
+                    Vec::new(),
+                )
+                .await;
+            }
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !channel.send_entered.load(Ordering::Acquire)
+                    || channel.sent.lock().expect("sent").len() != 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first chunk accepted and second send pending");
+        });
+        assert!(!driver.is_finished());
+        handle.close_from_host();
+        handle.close();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), driver)
+                .await
+                .expect("the driver exits after the in-flight close")
+                .expect("driver task");
+        });
+        assert!(
+            channel.closed.load(Ordering::Acquire),
+            "the stream must end with an explicit DataChannel close"
+        );
+        assert!(handle.is_closed());
+        let sent = channel.sent_binary.lock().expect("sent chunks").clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "no further chunk of the abandoned message may follow the close"
+        );
+        let (header, _) = LocalWebrtcTerminalChunkHeader::decode(&sent[0]).expect("chunk header");
+        assert_eq!(header.chunk_index, 0);
+        assert!(
+            header.chunk_count > 1,
+            "the abandoned message spans several chunks"
+        );
+        let mut assembly = InboundTerminalChunkAssembly::new(1);
+        assert_eq!(
+            assembly.push(&key, &sent[0]),
+            Ok(None),
+            "a truncated message must never complete on the receiving side"
+        );
+        assert!(assembly.is_partial());
     }
 
     #[test]

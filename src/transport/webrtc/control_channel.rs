@@ -1294,7 +1294,7 @@ mod tests {
         use botster_core::contract::terminal_adapter::{
             TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError,
         };
-        use botster_terminal_protocol::TerminalFrame;
+        use botster_terminal_protocol::{RouteId, RoutedTerminalFrame, encode_output};
 
         let mux = WebRtcConnectionMux::new();
         let (stall, stall_handle) = mux.create_adapter();
@@ -1329,10 +1329,12 @@ mod tests {
         assert_eq!(stall.pressure(), TerminalAdapterPressure::Ready);
         assert_eq!(sibling.pressure(), TerminalAdapterPressure::Ready);
 
-        let frame = TerminalFrame::from_bytes(
-            br#"{"type":"terminal_output","marker":"sibling-under-high-water"}"#,
-        )
-        .expect("opaque sibling frame");
+        let frame = RoutedTerminalFrame::new(
+            RouteId::new("wwb-live").expect("route"),
+            1,
+            0,
+            encode_output(b"sibling-under-high-water").expect("output frame"),
+        );
         assert_eq!(sibling.try_write(&frame), Ok(()));
         assert_eq!(sibling.pressure(), TerminalAdapterPressure::Full);
         assert_ne!(

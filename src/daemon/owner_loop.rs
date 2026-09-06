@@ -930,16 +930,78 @@ mod tests {
     use botster_core::RequestId;
     use botster_core::contract::terminal_adapter::TerminalAdapter;
     use botster_hub_client::{
-        DaemonHello, DaemonHelloAck, DaemonRequest, DaemonResponse, DaemonResponseKind, PROTOCOL,
-        read_frame, write_frame,
+        ClientFrame, DaemonCompatibilityRequirement, DaemonHello, DaemonHelloAck, DaemonRequest,
+        DaemonResponse, DaemonResponseKind, DaemonUnixFrameReader, DaemonUnixMuxFrame,
+        DaemonUnixTerminalFrame, PROTOCOL, ServerFrame, encode_client_frame, write_client_frame,
     };
-    use botster_terminal_protocol::TerminalFrame;
-    use serde_json::Value;
+    use botster_terminal_protocol::{RouteId, RoutedTerminalFrame, encode_output};
     use std::io::Write;
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_hello(client: &mut UnixStream) {
+        write_client_frame(
+            client,
+            &ClientFrame::Hello {
+                hello: DaemonHello {
+                    protocol: PROTOCOL.to_string(),
+                    compatibility: DaemonCompatibilityRequirement::current(),
+                    terminal_compatibility: None,
+                },
+            },
+        )
+        .expect("write daemon hello");
+    }
+
+    fn write_request(client: &mut UnixStream, request_id: u64, request: DaemonRequest) {
+        write_client_frame(
+            client,
+            &ClientFrame::Request {
+                request_id: request_id.to_string(),
+                request,
+            },
+        )
+        .expect("write client request");
+    }
+
+    fn read_hello_ack(
+        client: &mut UnixStream,
+        reader: &mut DaemonUnixFrameReader,
+    ) -> DaemonHelloAck {
+        match reader.read_frame(client).expect("read daemon hello ack") {
+            DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { ack }) => ack,
+            other => panic!("expected hello ack, got {other:?}"),
+        }
+    }
+
+    fn read_response(
+        client: &mut UnixStream,
+        reader: &mut DaemonUnixFrameReader,
+        expected_request_id: u64,
+    ) -> DaemonResponse {
+        match reader.read_frame(client).expect("read daemon response") {
+            DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                request_id,
+                response,
+            }) => {
+                assert_eq!(request_id, expected_request_id.to_string());
+                response
+            }
+            other => panic!("expected correlated response, got {other:?}"),
+        }
+    }
+
+    fn read_terminal(
+        client: &mut UnixStream,
+        reader: &mut DaemonUnixFrameReader,
+    ) -> DaemonUnixTerminalFrame {
+        match reader.read_frame(client).expect("read terminal frame") {
+            DaemonUnixMuxFrame::Terminal(frame) => frame,
+            other => panic!("expected terminal container, got {other:?}"),
+        }
+    }
 
     #[test]
     fn due_reconciliation_precedes_an_already_ready_control_message() {
@@ -1186,25 +1248,18 @@ mod tests {
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
-        write_frame(
-            &mut client,
-            &DaemonHello {
-                protocol: PROTOCOL.to_string(),
-                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
-                terminal_compatibility: None,
-            },
-        )
-        .expect("write daemon hello");
-        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+        write_hello(&mut client);
+        let mut reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut client, &mut reader);
 
-        write_frame(
+        write_request(
             &mut client,
-            &DaemonRequest::Attach {
+            1,
+            DaemonRequest::Attach {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
             },
-        )
-        .expect("write attach request");
+        );
         let ControlMessage::Request {
             request, reply_tx, ..
         } = receive_test_control_request(&mut control_rx)
@@ -1215,7 +1270,7 @@ mod tests {
         reply_tx
             .send(Ok(daemon_events(Vec::new())))
             .expect("reply to attach request");
-        let _: DaemonResponse = read_frame(&mut client).expect("read attach response");
+        let _ = read_response(&mut client, &mut reader, 1);
 
         client
             .shutdown(Shutdown::Both)
@@ -1236,24 +1291,16 @@ mod tests {
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
-        write_frame(
-            &mut client,
-            &DaemonHello {
-                protocol: PROTOCOL.to_string(),
-                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
-                terminal_compatibility: None,
-            },
-        )
-        .expect("write daemon hello");
-        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+        write_hello(&mut client);
+        let mut reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut client, &mut reader);
 
         let ControlMessage::RegisterUnixAdmission { reply_tx, .. } =
             receive_test_control_message(&mut control_rx)
         else {
             panic!("expected RegisterUnixAdmission after Hello");
         };
-        write_frame(&mut client, &DaemonRequest::Status)
-            .expect("write status while admission ack is held");
+        write_request(&mut client, 1, DaemonRequest::Status);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1276,7 +1323,7 @@ mod tests {
         reply_tx
             .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
             .expect("reply to status");
-        let _: DaemonResponse = read_frame(&mut client).expect("read status response");
+        let _ = read_response(&mut client, &mut reader, 1);
         client
             .shutdown(Shutdown::Both)
             .expect("disconnect daemon client");
@@ -1295,16 +1342,9 @@ mod tests {
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
-        write_frame(
-            &mut client,
-            &DaemonHello {
-                protocol: PROTOCOL.to_string(),
-                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
-                terminal_compatibility: None,
-            },
-        )
-        .expect("write daemon hello");
-        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+        write_hello(&mut client);
+        let mut reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut client, &mut reader);
 
         let ControlMessage::RegisterUnixAdmission {
             admission,
@@ -1325,24 +1365,30 @@ mod tests {
             handle,
         );
 
-        let mut request_bytes =
-            serde_json::to_vec(&DaemonRequest::Status).expect("encode status request");
-        request_bytes.push(b'\n');
+        let request_bytes = encode_client_frame(&ClientFrame::Request {
+            request_id: "1".to_string(),
+            request: DaemonRequest::Status,
+        })
+        .expect("encode status request");
         let split = request_bytes.len() / 2;
         client
             .write_all(&request_bytes[..split])
             .expect("write partial status request");
 
-        let frame =
-            TerminalFrame::from_bytes(br#"{"type":"terminal_output","marker":"writer-wake"}"#)
-                .expect("create terminal output frame");
+        let body = encode_output(b"writer-wake").expect("encode terminal output");
+        let body_bytes = body.as_bytes().to_vec();
+        let frame = RoutedTerminalFrame::new(
+            RouteId::new("partial-subscription").expect("route"),
+            1,
+            0,
+            body,
+        );
         adapter.try_write(&frame).expect("store terminal output");
         reply_tx.send(()).expect("ack unix admission");
-        let terminal: Value = read_frame(&mut client).expect("read terminal output");
-        assert_eq!(
-            terminal.get("plane").and_then(Value::as_str),
-            Some(botster_hub_client::UNIX_TERMINAL_PLANE)
-        );
+        let terminal = read_terminal(&mut client, &mut reader);
+        assert_eq!(terminal.route, "partial-subscription");
+        assert_eq!(terminal.generation, 1);
+        assert_eq!(terminal.body, body_bytes);
 
         client
             .write_all(&request_bytes[split..])
@@ -1357,7 +1403,7 @@ mod tests {
         reply_tx
             .send(Ok(daemon_response_base(DaemonResponseKind::Status)))
             .expect("reply to status");
-        let response: DaemonResponse = read_frame(&mut client).expect("read status response");
+        let response = read_response(&mut client, &mut reader, 1);
         assert_eq!(response.kind, DaemonResponseKind::Status);
 
         client
@@ -1375,25 +1421,18 @@ mod tests {
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
-        write_frame(
-            &mut client,
-            &DaemonHello {
-                protocol: PROTOCOL.to_string(),
-                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
-                terminal_compatibility: None,
-            },
-        )
-        .expect("write daemon hello");
-        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+        write_hello(&mut client);
+        let mut reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut client, &mut reader);
 
-        write_frame(
+        write_request(
             &mut client,
-            &DaemonRequest::Attach {
+            1,
+            DaemonRequest::Attach {
                 session_id: "missing-session".to_string(),
                 subscription_id: "missing-sub".to_string(),
             },
-        )
-        .expect("write attach request");
+        );
         let ControlMessage::Request {
             request, reply_tx, ..
         } = receive_test_control_request(&mut control_rx)
@@ -1407,7 +1446,7 @@ mod tests {
                 "attach failed before adapter bind",
             )))
             .expect("reply with attach operator error");
-        let _: DaemonResponse = read_frame(&mut client).expect("read attach operator error");
+        let _ = read_response(&mut client, &mut reader, 1);
 
         client
             .shutdown(Shutdown::Both)
@@ -1428,25 +1467,18 @@ mod tests {
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
-        write_frame(
-            &mut client,
-            &DaemonHello {
-                protocol: PROTOCOL.to_string(),
-                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
-                terminal_compatibility: None,
-            },
-        )
-        .expect("write daemon hello");
-        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
+        write_hello(&mut client);
+        let mut reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut client, &mut reader);
 
-        write_frame(
+        write_request(
             &mut client,
-            &DaemonRequest::Attach {
+            1,
+            DaemonRequest::Attach {
                 session_id: "session".to_string(),
                 subscription_id: "subscription".to_string(),
             },
-        )
-        .expect("write attach request");
+        );
         let ControlMessage::Request {
             request, reply_tx, ..
         } = receive_test_control_request(&mut control_rx)
@@ -1460,9 +1492,9 @@ mod tests {
                 "attach failed before adapter bind",
             )))
             .expect("reply with attach operator error");
-        let _: DaemonResponse = read_frame(&mut client).expect("read attach operator error");
+        let _ = read_response(&mut client, &mut reader, 1);
 
-        write_frame(&mut client, &DaemonRequest::Status).expect("write status");
+        write_request(&mut client, 2, DaemonRequest::Status);
         let ControlMessage::Request {
             request, reply_tx, ..
         } = receive_test_control_request(&mut control_rx)
@@ -1473,7 +1505,7 @@ mod tests {
         reply_tx
             .send(Ok(daemon_events(Vec::new())))
             .expect("reply with status");
-        let _: DaemonResponse = read_frame(&mut client).expect("read status");
+        let _ = read_response(&mut client, &mut reader, 2);
 
         client
             .shutdown(Shutdown::Both)
@@ -1695,18 +1727,10 @@ mod tests {
         let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
         let connection = thread::spawn(move || handle_connection(server, control_tx));
 
-        write_frame(
-            &mut client,
-            &DaemonHello {
-                protocol: PROTOCOL.to_string(),
-                compatibility: botster_hub_client::DaemonCompatibilityRequirement::current(),
-                terminal_compatibility: None,
-            },
-        )
-        .expect("write daemon hello");
-        let _: DaemonHelloAck = read_frame(&mut client).expect("read daemon hello ack");
-        write_frame(&mut client, &DaemonRequest::DaemonShutdown)
-            .expect("write daemon shutdown request");
+        write_hello(&mut client);
+        let mut reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut client, &mut reader);
+        write_request(&mut client, 1, DaemonRequest::DaemonShutdown);
 
         let ControlMessage::Request {
             request,
