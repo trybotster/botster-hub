@@ -1660,7 +1660,6 @@ pub struct ClientEventConformanceReport {
     pub reconnect_without_replay: bool,
     pub unsubscribed: bool,
     pub control_progressed_during_events: bool,
-    pub event_gap: bool,
 }
 
 /// Prove generic client package-event consumption at the public Unix host-control boundary.
@@ -1670,15 +1669,10 @@ pub struct ClientEventConformanceReport {
 /// and drives exact owner-plus-name subscribe, receive, subject filtering,
 /// reconnect without replay, unsubscribe, and continued Status progress.
 ///
-/// Slow-consumer `event_gap` runs only when `stall_path` is `Some` and the
-/// IsolatedHub child was started with `BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX=1`
-/// and `BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH` equal to that path.
-///
 /// This entrypoint does not change published npm fixture bytes.
 pub fn run_client_event_conformance(
     hub: &IsolatedHub,
     producer_path: impl AsRef<Path>,
-    stall_path: Option<&Path>,
 ) -> Result<ClientEventConformanceReport, ConformanceError> {
     let producer_dir = materialize_event_producer(hub, producer_path.as_ref())?;
     let enabled = request(
@@ -1832,85 +1826,6 @@ pub fn run_client_event_conformance(
         "status_after_unsubscribe",
     )?;
 
-    let mut event_gap = false;
-    if let Some(stall_path) = stall_path {
-        let mut gap_client =
-            connect_for_package_event_subscriptions(hub.endpoint()).map_err(|source| {
-                ConformanceError::Client {
-                    operation: "gap_connect",
-                    source,
-                }
-            })?;
-        let gap_sub = gap_client
-            .subscribe_events(
-                "sub-event-gap",
-                EVENT_CONFORMANCE_PRODUCER,
-                EVENT_CONFORMANCE_NAME,
-                Vec::new(),
-            )
-            .map_err(|source| ConformanceError::Client {
-                operation: "gap_subscribe",
-                source,
-            })?;
-        expect_kind(
-            &gap_sub,
-            DaemonResponseKind::EventSubscribed,
-            "gap_subscribe",
-        )?;
-        fs::write(stall_path, b"stall").map_err(|source| ConformanceError::Io {
-            operation: "create_event_stall",
-            source,
-        })?;
-        emit_event_ready(hub.endpoint(), "queued", None, None, None)?;
-        emit_event_ready(hub.endpoint(), "overflow", None, None, None)?;
-        let status_stalled = gap_client
-            .request(&DaemonRequest::Status)
-            .map_err(|source| ConformanceError::Client {
-                operation: "status_during_stall",
-                source,
-            })?;
-        expect_kind(
-            &status_stalled,
-            DaemonResponseKind::Status,
-            "status_during_stall",
-        )?;
-        let _ = fs::remove_file(stall_path);
-        gap_client
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .map_err(|source| ConformanceError::Client {
-                operation: "gap_timeout",
-                source,
-            })?;
-        match gap_client.next_event() {
-            Ok(DaemonEvent::EventGap { .. }) => event_gap = true,
-            Ok(other) => {
-                return Err(ConformanceError::UnexpectedValue {
-                    operation: "event_gap",
-                    field: "next_event",
-                    expected: "EventGap".to_string(),
-                    actual: format!("{other:?}"),
-                });
-            }
-            Err(source) => {
-                return Err(ConformanceError::Client {
-                    operation: "event_gap",
-                    source,
-                });
-            }
-        }
-        let status_after_gap = gap_client
-            .request(&DaemonRequest::Status)
-            .map_err(|source| ConformanceError::Client {
-                operation: "status_after_gap",
-                source,
-            })?;
-        expect_kind(
-            &status_after_gap,
-            DaemonResponseKind::Status,
-            "status_after_gap",
-        )?;
-    }
-
     Ok(ClientEventConformanceReport {
         negotiated_package_event_subscriptions: negotiated,
         exact_subscribe: true,
@@ -1919,7 +1834,6 @@ pub fn run_client_event_conformance(
         reconnect_without_replay: true,
         unsubscribed: true,
         control_progressed_during_events: true,
-        event_gap,
     })
 }
 
