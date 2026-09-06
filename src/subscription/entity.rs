@@ -2377,7 +2377,6 @@ mod tests {
         definition_generation: u64,
         next_seq: u64,
         definition_entities: BTreeMap<String, Value>,
-        awaiting_initial_snapshot: false,
         resync_reason: Option<String>,
     ) -> EntitySubscriptionState {
         EntitySubscriptionState {

@@ -99,18 +99,13 @@ pub(crate) fn handle(
         .expect("host family");
     }
     let request = *request;
-    let step = handle_control_request(
-        daemon,
-        state,
-        DaemonObservability {
-            egress: state.egress_diagnostics.diagnostics(),
-            lifecycle: state.lifecycle_counters.clone(),
-            client_id: client_id.clone(),
-            grant_id: grant_id.clone(),
-        },
-        control_tx,
-        request.clone(),
-    );
+    let observability = DaemonObservability {
+        egress: state.egress_diagnostics.diagnostics(),
+        lifecycle: state.lifecycle_counters.clone(),
+        client_id: client_id.clone(),
+        grant_id: grant_id.clone(),
+    };
+    let step = handle_control_request(daemon, state, observability, control_tx, request.clone());
     let entry = PendingControlRequest {
         request,
         reply_tx,

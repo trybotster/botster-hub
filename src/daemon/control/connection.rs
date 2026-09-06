@@ -19,7 +19,9 @@ use crate::daemon::control::message::{
 };
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_loop::tick;
-use crate::subscription::attach_routes::{WebrtcBindRequest, bind_webrtc_adapter_after_attaching};
+use crate::data_plane::driver::CoreTicketPoll;
+use crate::runtime::BindRoutePlan;
+use crate::subscription::attach_routes::{BoundAdapterHandle, negotiated_unix_capability_set};
 
 pub(crate) fn handle(
     daemon: &mut HubDaemon,
@@ -360,7 +362,7 @@ fn bind_reserved_subscription(
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
     };
-    let Some(runtime) = daemon.runtime_mut() else {
+    let Some(runtime) = daemon.runtime() else {
         retire_reserved_subscription(daemon, state, &grant_id, &label);
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
@@ -373,41 +375,81 @@ fn bind_reserved_subscription(
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
     };
-    let bind_now = tick(&mut state.logical_clock);
-    let aggregate = state
+    let Ok(capabilities) =
+        negotiated_unix_capability_set(&required_features, terminal_requirement.as_ref())
+    else {
+        retire_reserved_subscription(daemon, state, &grant_id, &label);
+        let _ = reply_tx.send(Err(BindReservedError::BindFailed));
+        return false;
+    };
+    let Some(aggregate) = state
         .pending_runtime
         .admission
         .connection_budgets
         .get(&peer_generation)
-        .map(|budget| budget.aggregate());
-    let result = bind_webrtc_adapter_after_attaching(
-        &mut state.pending_runtime,
-        runtime,
-        WebrtcBindRequest {
-            client_id: &client_id,
-            session_id: &reservation.session_id,
-            subscription_id: &reservation.subscription_id,
-            required_features: &required_features,
-            terminal_requirement: terminal_requirement.as_ref(),
-            now_seconds: bind_now,
-            mux: Some(&mux),
-            aggregate,
-        },
-    );
-    match result {
-        Ok(Some(handle)) => {
-            let _ = state
-                .pending_runtime
-                .admission
-                .reservations
-                .mark_bound(&label, peer_generation);
-            let _ = reply_tx.send(Ok(BoundSubscription::Terminal { handle, usage }));
-        }
-        Ok(None) | Err(()) => {
-            retire_reserved_subscription(daemon, state, &grant_id, &label);
-            let _ = reply_tx.send(Err(BindReservedError::BindFailed));
-        }
-    }
+        .map(|budget| budget.aggregate())
+    else {
+        retire_reserved_subscription(daemon, state, &grant_id, &label);
+        let _ = reply_tx.send(Err(BindReservedError::BindFailed));
+        return false;
+    };
+    let bind_now = tick(&mut state.logical_clock);
+    let generation = botster_core::TerminalSubscriptionGeneration(reservation.generation);
+    let (adapter, handle) = mux.create_adapter_with_aggregate(aggregate);
+    // The bind runs on the Core owner thread; the reply follows as owner work.
+    let mut ticket = runtime.bind_route_adapter(BindRoutePlan {
+        client_id: botster_core::ClientId(client_id),
+        session_id: botster_core::SessionId(reservation.session_id.clone()),
+        subscription_id: botster_core::SubscriptionId(reservation.subscription_id.clone()),
+        generation,
+        capabilities,
+        now_seconds: bind_now,
+        adapter: Box::new(adapter),
+    });
+    let session_id = reservation.session_id.clone();
+    let subscription_id = reservation.subscription_id.clone();
+    let mut reply_tx = Some(reply_tx);
+    let mut usage = Some(usage);
+    state
+        .pending_owner_work
+        .push(Box::new(move |daemon, state| {
+            let bound = match ticket.poll() {
+                CoreTicketPoll::Pending => return false,
+                CoreTicketPoll::Lost => false,
+                CoreTicketPoll::Ready(result) => result.is_ok(),
+            };
+            let (Some(reply_tx), Some(usage)) = (reply_tx.take(), usage.take()) else {
+                return true;
+            };
+            if bound {
+                state.pending_runtime.mark_adapter_bound(
+                    &session_id,
+                    &subscription_id,
+                    generation,
+                    BoundAdapterHandle::WebRtc(handle.clone()),
+                );
+                mux.register(
+                    session_id.clone(),
+                    subscription_id.clone(),
+                    generation.0,
+                    handle.clone(),
+                );
+                let _ = state
+                    .pending_runtime
+                    .admission
+                    .reservations
+                    .mark_bound(&label, peer_generation);
+                let _ = reply_tx.send(Ok(BoundSubscription::Terminal {
+                    handle: handle.clone(),
+                    usage,
+                }));
+            } else {
+                handle.close();
+                retire_reserved_subscription(daemon, state, &grant_id, &label);
+                let _ = reply_tx.send(Err(BindReservedError::BindFailed));
+            }
+            true
+        }));
     false
 }
 
