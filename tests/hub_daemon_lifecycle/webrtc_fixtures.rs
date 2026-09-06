@@ -1179,9 +1179,7 @@ impl LocalWebrtcOfferPeer {
         {
             Ok(Some(())) => {}
             Ok(None) => {
-                return Err(
-                    std::io::Error::other("labeled DataChannel closed before open").into(),
-                );
+                return Err(std::io::Error::other("labeled DataChannel closed before open").into());
             }
             Err(_) => {
                 // Diagnostic only; the open deadline is unchanged. Distinguishes a channel
