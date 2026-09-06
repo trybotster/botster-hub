@@ -1752,6 +1752,7 @@ mod tests {
             software.clone(),
             installation.clone(),
             botster_hub_client::DaemonObservabilityCounters::default(),
+            None,
         );
         assert_eq!(projected.lifecycle_state, "running");
         assert_eq!(projected.compatibility, DaemonCompatibility::current());

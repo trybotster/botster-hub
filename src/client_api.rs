@@ -2361,9 +2361,12 @@ pub(crate) fn runtime_error(
         HubRuntimeError::CoreDaemon(_) if operation == HubClientOperation::ReadModeFlags => {
             HubClientRuntimeErrorKind::ModeReadFailed
         }
-        HubRuntimeError::CoreDaemon(_) => HubClientRuntimeErrorKind::Runtime,
-        HubRuntimeError::State(_) => HubClientRuntimeErrorKind::State,
-        HubRuntimeError::Credentials(_) => HubClientRuntimeErrorKind::State,
+        HubRuntimeError::CoreDaemon(_) | HubRuntimeError::Capability(_) => {
+            HubClientRuntimeErrorKind::Runtime
+        }
+        HubRuntimeError::State(_)
+        | HubRuntimeError::Credentials(_)
+        | HubRuntimeError::IncompatibleWorkers { .. } => HubClientRuntimeErrorKind::State,
     };
     HubClientError::Runtime {
         request_id,
