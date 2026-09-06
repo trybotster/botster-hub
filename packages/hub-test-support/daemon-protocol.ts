@@ -5,6 +5,38 @@ import type { PackageNoticeReactionDescriptor, PackageSurfaceDescriptor, UiActio
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
+// Host-control protocol 9 constants. See botster-hub-client/src/lib.rs.
+export const PROTOCOL = "botster-hub-daemon-v1";
+export const PROTOCOL_VERSION = 9;
+export const CONFORMANCE_FIXTURE_REVISION = 49;
+export const MAX_REQUEST_ID_BYTES = 20;
+export const MAX_OUTSTANDING_REQUESTS = 32;
+export const MAX_CONTROL_REQUEST_BYTES = 1048576;
+export const MAX_CONTROL_RESPONSE_BYTES = 1048576;
+export const SNAPSHOT_PAGE_BYTES = 262144;
+export const MAX_OPEN_CAPTURES_PER_CONNECTION = 4;
+export const SNAPSHOT_CAPTURE_TTL_SECONDS = 60;
+export const OPERATOR_ERROR_TOO_MANY_REQUESTS = "too_many_requests";
+
+// Unix socket framing: [u32 LE frame_len][u8 container][payload]; frame_len = 1 + payload length.
+// Terminal container payload: [u16 LE route_len][route UTF-8][u64 LE generation][u32 LE stream_epoch][body].
+export const UNIX_FRAME_LENGTH_PREFIX_BYTES = 4;
+export const UNIX_CONTAINER_CONTROL = 1;
+export const UNIX_CONTAINER_TERMINAL = 2;
+export const MAX_UNIX_TERMINAL_ROUTE_BYTES = 1024;
+export const MAX_UNIX_FRAME_BYTES = 4195343;
+
+// Local WebRTC control deliveries stay JSON text chunks of one encrypted ServerFrame.
+// Local WebRTC terminal chunks are binary DataChannel messages:
+// [u8 version=2][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][u32 LE stream_epoch][12-byte nonce][AES-GCM ciphertext || 16-byte tag].
+// The route is the subscription DataChannel label; total_bytes is the plaintext body length.
+export const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION = 2;
+export const LOCAL_WEBRTC_MAX_FRAME_BYTES = 65536;
+export const LOCAL_WEBRTC_MAX_DELIVERY_BYTES = 16777216;
+export const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES = 33;
+export const LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES = 12;
+export const LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES = 16;
+
 export interface AesGcmEnvelope {
   nonce: string;
   ciphertext: string;
@@ -22,10 +54,42 @@ export interface DaemonLocalWebrtcDeliveryChunk {
 }
 
 export type DaemonLocalWebrtcDeliveryKind =
-  | "daemon_response"
-  | "daemon_entity_frame"
-  | "daemon_terminal_frame"
-  | "daemon_event";
+  | "server_frame";
+
+export interface LocalWebrtcTerminalChunkHeader {
+  message_id: number;
+  chunk_index: number;
+  chunk_count: number;
+  total_bytes: number;
+  generation: number;
+  stream_epoch: number;
+}
+
+export type ClientFrame =
+  | { frame: "hello"; hello: DaemonHello }
+  | { frame: "request"; request_id: string; request: DaemonRequest };
+
+export type ServerFrame =
+  | { frame: "hello_ack"; ack: DaemonHelloAck }
+  | { frame: "response"; request_id: string; response: DaemonResponse }
+  | { frame: "event"; event: DaemonEvent }
+  | { frame: "entity"; entity: DaemonEntityFrame }
+  | { frame: "close"; reason: DaemonCloseReason };
+
+export type DaemonCloseReason =
+  | { reason: "protocol_error"; code: DaemonProtocolErrorCode }
+  | { reason: "daemon_shutdown" };
+
+export type DaemonProtocolErrorCode =
+  | "malformed_frame"
+  | "frame_too_large"
+  | "unknown_container"
+  | "unknown_frame"
+  | "invalid_request_id"
+  | "nonincreasing_request_id"
+  | "handshake_order"
+  | "invalid_route"
+  | "invalid_input_header";
 
 export interface DaemonHello {
   protocol: string;
@@ -53,14 +117,6 @@ export interface TerminalCompatibilityRequirement {
   required_features: string[];
   minimum_conformance_fixture_revision: number;
   client_name: string;
-}
-
-export interface DaemonUnixTerminalEnvelope {
-  plane: string;
-  kind: string;
-  session_id: string;
-  subscription_id: string;
-  payload_base64: string;
 }
 
 export interface DaemonCompatibility {
@@ -101,6 +157,7 @@ export type DaemonRequest =
   | { type: "read_screen"; session_id: string }
   | { type: "read_mode_flags"; session_id: string }
   | { type: "capture_snapshot"; session_id: string }
+  | { type: "read_snapshot_page"; session_id: string; capture_id: string; page: number }
   | { type: "list_session_types" }
   | { type: "list_session_types_for_target"; target_id: string }
   | { type: "show_session_type"; session_type_id: string }
@@ -165,9 +222,11 @@ export interface DaemonResponse {
   session_context?: DaemonSessionContext | null;
   read_screen?: DaemonReadScreen | null;
   mode_flags?: DaemonModeFlags | null;
+  terminal_attach?: DaemonTerminalAttach | null;
   terminal_reservation?: DaemonTerminalReservation | null;
   subscription_reservation?: DaemonSubscriptionReservation | null;
   capture_snapshot?: DaemonCaptureSnapshot | null;
+  snapshot_page?: DaemonSnapshotPage | null;
   spawn_targets?: DaemonSpawnTarget[];
   spawn_target_validation?: DaemonSpawnTargetValidation | null;
   worktrees?: DaemonWorktree[];
@@ -198,9 +257,16 @@ export interface DaemonResponse {
   diagnostics?: DaemonDiagnostic[];
 }
 
+export type HistoryUnavailableReason =
+  | "evicted"
+  | "restart"
+  | "oversize"
+  | "capture_failed";
+
 export interface DaemonReadScreen {
   session_id: string;
   text: string;
+  unavailable?: HistoryUnavailableReason | null;
 }
 
 export interface DaemonModeFlags {
@@ -212,8 +278,15 @@ export interface DaemonModeFlags {
   alt_screen: boolean;
   focus_reporting: boolean;
   application_cursor: boolean;
-  mode_generation: number;
-  mode_revision: number;
+  rows: number;
+  cols: number;
+  unavailable?: HistoryUnavailableReason | null;
+}
+
+export interface DaemonTerminalAttach {
+  session_id: string;
+  subscription_id: string;
+  generation: number;
 }
 
 export interface DaemonTerminalReservation {
@@ -240,10 +313,22 @@ export type DaemonSubscriptionReservationKind =
 
 export interface DaemonCaptureSnapshot {
   session_id: string;
+  capture_id: string;
+  total_bytes: number;
+  page_bytes: number;
+  pages: number;
   rows: number;
   cols: number;
-  payload_format?: string | null;
-  payload_bytes: number;
+  unavailable?: HistoryUnavailableReason | null;
+}
+
+export interface DaemonSnapshotPage {
+  session_id: string;
+  capture_id: string;
+  page: number;
+  payload_base64: string;
+  payload_encoding: "base64";
+  bytes: number;
 }
 
 export interface DaemonPluginSurface {
@@ -288,8 +373,10 @@ export type DaemonResponseKind =
   | "session_context"
   | "read_screen"
   | "read_mode_flags"
+  | "terminal_attached"
   | "terminal_reservation"
   | "capture_snapshot"
+  | "snapshot_page"
   | "spawn_targets"
   | "spawn_target_validation"
   | "worktrees"
@@ -830,7 +917,17 @@ export interface DaemonStatus {
   lifecycle_counters?: DaemonLifecycleCounters;
   live_attach_occupancy?: DaemonAttachOccupancy[];
   observability?: DaemonObservabilityCounters;
+  retention?: DaemonRetentionAccounting | null;
   diagnostics?: DaemonDiagnostic[];
+}
+
+export interface DaemonRetentionAccounting {
+  max_object_bytes: number;
+  max_total_bytes: number;
+  max_sessions: number;
+  total_bytes: number;
+  sessions: number;
+  evictions: number;
 }
 
 export interface DaemonAttachOccupancy {
@@ -1041,11 +1138,6 @@ export type DaemonDiagnosticKind =
 
 export type DaemonEvent =
   | { type: "session_lifecycle"; session_id: string; state: string }
-  | { type: "terminal_output"; session_id: string; subscription_id: string; payload_base64: string; payload_encoding: "base64"; bytes: number }
-  | { type: "snapshot"; session_id: string; subscription_id: string; payload_base64: string; payload_encoding: "base64"; bytes: number }
-  | { type: "scrollback"; session_id: string; subscription_id: string; payload_base64: string; payload_encoding: "base64"; bytes: number }
-  | { type: "process_exit"; session_id: string; subscription_id: string; code: number | null }
-  | { type: "attach_state"; session_id: string; subscription_id: string; state: string }
   | { type: "runtime_observation"; kind: string }
   | { type: "worktree_lifecycle"; event: DaemonWorktreeLifecycleEvent }
   | { type: "terminal_subscription_closed"; session_id: string; subscription_id: string; generation: number; reason: string }

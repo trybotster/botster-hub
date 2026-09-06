@@ -19,21 +19,21 @@ export const SNAPSHOT_CAPTURE_TTL_SECONDS = 60;
 export const OPERATOR_ERROR_TOO_MANY_REQUESTS = "too_many_requests";
 
 // Unix socket framing: [u32 LE frame_len][u8 container][payload]; frame_len = 1 + payload length.
-// Terminal container payload: [u16 LE route_len][route UTF-8][u64 LE generation][body].
+// Terminal container payload: [u16 LE route_len][route UTF-8][u64 LE generation][u32 LE stream_epoch][body].
 export const UNIX_FRAME_LENGTH_PREFIX_BYTES = 4;
 export const UNIX_CONTAINER_CONTROL = 1;
 export const UNIX_CONTAINER_TERMINAL = 2;
 export const MAX_UNIX_TERMINAL_ROUTE_BYTES = 1024;
-export const MAX_UNIX_FRAME_BYTES = 4195339;
+export const MAX_UNIX_FRAME_BYTES = 4195343;
 
 // Local WebRTC control deliveries stay JSON text chunks of one encrypted ServerFrame.
 // Local WebRTC terminal chunks are binary DataChannel messages:
-// [u8 version=2][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][12-byte nonce][AES-GCM ciphertext || 16-byte tag].
+// [u8 version=2][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][u32 LE stream_epoch][12-byte nonce][AES-GCM ciphertext || 16-byte tag].
 // The route is the subscription DataChannel label; total_bytes is the plaintext body length.
 export const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION = 2;
 export const LOCAL_WEBRTC_MAX_FRAME_BYTES = 65536;
 export const LOCAL_WEBRTC_MAX_DELIVERY_BYTES = 16777216;
-export const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES = 29;
+export const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES = 33;
 export const LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES = 12;
 export const LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES = 16;
 
@@ -62,6 +62,7 @@ export interface LocalWebrtcTerminalChunkHeader {
   chunk_count: number;
   total_bytes: number;
   generation: number;
+  stream_epoch: number;
 }
 
 export type ClientFrame =

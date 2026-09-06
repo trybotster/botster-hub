@@ -11,11 +11,19 @@
 //! ```text
 //! UnixFrame = [u32 LE frame_len][u8 container][payload]    frame_len = 1 + payload.len()
 //! container 1 CONTROL   payload = UTF-8 JSON `ClientFrame` (client to Hub) or `ServerFrame` (Hub to client)
-//! container 2 TERMINAL  payload = [u16 LE route_len][route UTF-8][u64 LE generation][body]
+//! container 2 TERMINAL  payload = [u16 LE route_len][route UTF-8][u64 LE generation][u32 LE stream_epoch][body]
 //! ```
 //!
 //! A terminal container body is opaque to this crate. Hub to client it is one
 //! Core terminal-stream body; client to Hub it is one Core terminal input frame.
+//! `generation` is the fixed attachment generation for the life of the route.
+//! `stream_epoch` is Core routing metadata captured when the frame was queued:
+//! Hub copies it verbatim and never advances it; a client adopts a new epoch
+//! only from a `ROUTE_RESYNC` whose `from_epoch` equals its accepted epoch and
+//! whose envelope epoch equals `to_epoch`, and drops any data frame carrying a
+//! different epoch. Client to Hub, the field is always 0 (reserved); Hub
+//! validates only the route and the fixed generation and never rejects input
+//! on that field.
 //! Control requests carry a client-chosen `request_id` (canonical decimal `u64`,
 //! strictly increasing per connection). Hub may complete requests out of order;
 //! the response echoes the id.
@@ -80,8 +88,9 @@ pub const UNIX_CONTAINER_CONTROL: u8 = 1;
 pub const UNIX_CONTAINER_TERMINAL: u8 = 2;
 /// Maximum route id length inside a terminal container (UTF-8 bytes).
 pub const MAX_UNIX_TERMINAL_ROUTE_BYTES: usize = 1024;
-/// Fixed terminal container header bytes before the route: `u16` route length plus `u64` generation.
-pub const UNIX_TERMINAL_CONTAINER_FIXED_BYTES: usize = 2 + 8;
+/// Fixed terminal container bytes around the route: `u16` route length, `u64`
+/// generation, and `u32` stream epoch.
+pub const UNIX_TERMINAL_CONTAINER_FIXED_BYTES: usize = 2 + 8 + 4;
 /// Largest Unix frame (container byte plus payload) this crate reads or writes.
 ///
 /// Control payloads are bounded separately by [`MAX_CONTROL_REQUEST_BYTES`] and
@@ -99,15 +108,23 @@ pub const LOCAL_WEBRTC_MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 /// Fixed header bytes of one binary local WebRTC terminal chunk.
 ///
 /// ```text
-/// WebrtcTerminalChunk = [u8 version = 2][u64 LE message_id][u32 LE chunk_index]
-///                       [u32 LE chunk_count][u32 LE total_bytes][u64 LE generation]
-///                       [sealed slice: 12-byte nonce || AES-GCM ciphertext || 16-byte tag]
+/// offset  0  u8      version = 2
+/// offset  1  u64 LE  message_id      per channel, per direction, strictly increasing from 1
+/// offset  9  u32 LE  chunk_index
+/// offset 13  u32 LE  chunk_count
+/// offset 17  u32 LE  total_bytes     plaintext length of the whole message
+/// offset 21  u64 LE  generation      fixed attachment generation of the route
+/// offset 29  u32 LE  stream_epoch    Core routing metadata, copied verbatim
+/// offset 33  [12-byte nonce][AES-GCM ciphertext || 16-byte tag]
 /// ```
 ///
-/// The route is the subscription DataChannel label. `total_bytes` is the
-/// plaintext body length; each sealed slice decrypts to one contiguous slice of
-/// that body, in `chunk_index` order.
-pub const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES: usize = 1 + 8 + 4 + 4 + 4 + 8;
+/// The route is the subscription DataChannel label. Reassembly identity is
+/// `(label, direction, message_id)`; chunks of one message are contiguous on
+/// the ordered channel in `chunk_index` order, every chunk repeats the same
+/// `generation` and `stream_epoch`, and each sealed slice decrypts to one
+/// contiguous slice of the plaintext body. A mismatch drops the message and
+/// closes that channel only.
+pub const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES: usize = 1 + 8 + 4 + 4 + 4 + 8 + 4;
 /// AES-GCM nonce bytes in a sealed terminal chunk slice.
 pub const LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES: usize = 12;
 /// AES-GCM tag bytes in a sealed terminal chunk slice.
@@ -339,15 +356,26 @@ impl Error for DaemonRequestError {}
 pub struct DaemonUnixTerminalFrame {
     /// Subscription id of the route. 1..=1024 UTF-8 bytes.
     pub route: String,
-    /// Route generation minted by Core at attach.
+    /// Fixed attachment generation minted by Core at attach.
     pub generation: u64,
+    /// Core stream epoch captured when the frame was queued. See the crate docs.
+    pub stream_epoch: u32,
     /// Hub to client: one Core terminal-stream body. Client to Hub: one Core input frame.
     pub body: Vec<u8>,
 }
 
 /// Header of one Unix terminal container, built on the stack for `writev`.
 ///
-/// Layout: `[u32 LE frame_len][u8 container = 2][u16 LE route_len][route][u64 LE generation]`.
+/// Layout after the length prefix and container byte, with offsets relative
+/// to the container payload:
+///
+/// ```text
+/// offset 0             u16 LE  route_len       1..=1024
+/// offset 2             route   UTF-8, route_len bytes
+/// offset 2+route_len   u64 LE  generation      fixed attachment generation
+/// offset 10+route_len  u32 LE  stream_epoch    Core routing metadata
+/// offset 14+route_len  body
+/// ```
 #[derive(Debug, Clone)]
 pub struct UnixTerminalContainerHeader {
     bytes: [u8; UNIX_FRAME_LENGTH_PREFIX_BYTES
@@ -364,7 +392,7 @@ impl UnixTerminalContainerHeader {
     /// [`MAX_UNIX_TERMINAL_ROUTE_BYTES`], or the frame would exceed
     /// [`MAX_UNIX_FRAME_BYTES`].
     #[must_use]
-    pub fn new(route: &str, generation: u64, body_len: usize) -> Option<Self> {
+    pub fn new(route: &str, generation: u64, stream_epoch: u32, body_len: usize) -> Option<Self> {
         let route_bytes = route.as_bytes();
         if route_bytes.is_empty() || route_bytes.len() > MAX_UNIX_TERMINAL_ROUTE_BYTES {
             return None;
@@ -389,6 +417,8 @@ impl UnixTerminalContainerHeader {
         cursor += route_bytes.len();
         bytes[cursor..cursor + 8].copy_from_slice(&generation.to_le_bytes());
         cursor += 8;
+        bytes[cursor..cursor + 4].copy_from_slice(&stream_epoch.to_le_bytes());
+        cursor += 4;
         Some(Self { bytes, len: cursor })
     }
 
@@ -401,8 +431,13 @@ impl UnixTerminalContainerHeader {
 
 /// Encode one complete terminal container (header plus body) into a new buffer.
 #[must_use]
-pub fn encode_unix_terminal_frame(route: &str, generation: u64, body: &[u8]) -> Option<Vec<u8>> {
-    let header = UnixTerminalContainerHeader::new(route, generation, body.len())?;
+pub fn encode_unix_terminal_frame(
+    route: &str,
+    generation: u64,
+    stream_epoch: u32,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    let header = UnixTerminalContainerHeader::new(route, generation, stream_epoch, body.len())?;
     let mut frame = Vec::with_capacity(header.as_bytes().len() + body.len());
     frame.extend_from_slice(header.as_bytes());
     frame.extend_from_slice(body);
@@ -456,7 +491,7 @@ pub fn decode_unix_frame<T: for<'de> Deserialize<'de>>(
             let route_len = usize::from(u16::from_le_bytes([payload[0], payload[1]]));
             if route_len == 0
                 || route_len > MAX_UNIX_TERMINAL_ROUTE_BYTES
-                || payload.len() < 2 + route_len + 8
+                || payload.len() < UNIX_TERMINAL_CONTAINER_FIXED_BYTES + route_len
             {
                 return Err(DaemonProtocolErrorCode::InvalidRoute);
             }
@@ -468,10 +503,14 @@ pub fn decode_unix_frame<T: for<'de> Deserialize<'de>>(
             let generation_start = 2 + route_len;
             let mut generation = [0u8; 8];
             generation.copy_from_slice(&payload[generation_start..generation_start + 8]);
+            let epoch_start = generation_start + 8;
+            let mut stream_epoch = [0u8; 4];
+            stream_epoch.copy_from_slice(&payload[epoch_start..epoch_start + 4]);
             Ok(DaemonUnixFrame::Terminal(DaemonUnixTerminalFrame {
                 route: route.to_string(),
                 generation: u64::from_le_bytes(generation),
-                body: payload[generation_start + 8..].to_vec(),
+                stream_epoch: u32::from_le_bytes(stream_epoch),
+                body: payload[epoch_start + 4..].to_vec(),
             }))
         }
         _ => Err(DaemonProtocolErrorCode::UnknownContainer),
@@ -605,11 +644,13 @@ pub fn write_unix_terminal_frame(
     stream: &mut UnixStream,
     route: &str,
     generation: u64,
+    stream_epoch: u32,
     body: &[u8],
 ) -> DaemonTransportResult<()> {
-    let header = UnixTerminalContainerHeader::new(route, generation, body.len()).ok_or(
-        DaemonTransportError::Protocol("invalid terminal route or frame size"),
-    )?;
+    let header = UnixTerminalContainerHeader::new(route, generation, stream_epoch, body.len())
+        .ok_or(DaemonTransportError::Protocol(
+            "invalid terminal route or frame size",
+        ))?;
     stream
         .write_all(header.as_bytes())
         .map_err(normalize_socket_io_error)?;
@@ -907,14 +948,17 @@ impl DaemonConnection {
     /// Write one opaque terminal input frame for one route on this muxed connection.
     ///
     /// This is not a control request. Hub does not send a paired response;
-    /// results arrive on the terminal stream.
+    /// results arrive on the terminal stream. `stream_epoch` is reserved for
+    /// the input direction and must be 0; Hub validates only the route and the
+    /// fixed generation.
     pub fn send_terminal_frame(
         &mut self,
         route: &str,
         generation: u64,
+        stream_epoch: u32,
         body: &[u8],
     ) -> DaemonTransportResult<()> {
-        write_unix_terminal_frame(&mut self.stream, route, generation, body)
+        write_unix_terminal_frame(&mut self.stream, route, generation, stream_epoch, body)
     }
 
     /// Opaque terminal frames skipped while waiting for a host response.
@@ -3839,18 +3883,20 @@ pub enum DaemonEvent {
 /// client to Hub carries slices of one Core terminal input frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalWebrtcTerminalChunkHeader {
-    /// Per-channel, per-direction message counter. Strictly increasing.
+    /// Per-channel, per-direction message counter. Strictly increasing from 1.
     pub message_id: u64,
     pub chunk_index: u32,
     pub chunk_count: u32,
     /// Plaintext body length of the whole message.
     pub total_bytes: u32,
-    /// Route generation. A chunk whose generation differs from the bound route is discarded.
+    /// Fixed attachment generation. A chunk whose generation differs from the bound route is discarded.
     pub generation: u64,
+    /// Core stream epoch captured when the frame was queued, copied verbatim by Hub.
+    pub stream_epoch: u32,
 }
 
 impl LocalWebrtcTerminalChunkHeader {
-    /// Write the header into the first [`LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES`] of `out`.
+    /// Encode the fixed header.
     #[must_use]
     pub fn encode(&self) -> [u8; LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES] {
         let mut bytes = [0u8; LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES];
@@ -3860,6 +3906,7 @@ impl LocalWebrtcTerminalChunkHeader {
         bytes[13..17].copy_from_slice(&self.chunk_count.to_le_bytes());
         bytes[17..21].copy_from_slice(&self.total_bytes.to_le_bytes());
         bytes[21..29].copy_from_slice(&self.generation.to_le_bytes());
+        bytes[29..33].copy_from_slice(&self.stream_epoch.to_le_bytes());
         bytes
     }
 
@@ -3895,6 +3942,7 @@ impl LocalWebrtcTerminalChunkHeader {
             chunk_count: read_u32(13),
             total_bytes: read_u32(17),
             generation: u64::from_le_bytes(generation),
+            stream_epoch: read_u32(29),
         };
         if header.chunk_count == 0
             || header.chunk_index >= header.chunk_count
@@ -4254,7 +4302,7 @@ mod tests {
             let mut frames = DaemonUnixFrameReader::new();
             let first_id = expect_request(&mut frames, &mut server, &DaemonRequest::Status);
             let second_id = expect_request(&mut frames, &mut server, &DaemonRequest::ListSessions);
-            write_unix_terminal_frame(&mut server, "route", 5, b"opaque").expect("terminal");
+            write_unix_terminal_frame(&mut server, "route", 5, 0, b"opaque").expect("terminal");
             write_server_frame(
                 &mut server,
                 &ServerFrame::Event {
@@ -4730,7 +4778,7 @@ mod tests {
     fn poll_terminal_keeps_a_split_frame_and_returns_none_on_timeout() {
         let (mut server, client) = UnixStream::pair().expect("pair");
         let mut connection = test_connection(client);
-        let frame = encode_unix_terminal_frame("sub", 1, b"a").expect("encode");
+        let frame = encode_unix_terminal_frame("sub", 1, 0, b"a").expect("encode");
         server.write_all(&frame[..9]).expect("write prefix");
         assert!(
             connection
@@ -7787,16 +7835,24 @@ mod tests {
     #[test]
     fn terminal_container_round_trips_route_generation_and_opaque_body() {
         let body = [2u8, 1, 0, 0, 3, 0, 0, 0, b'a', b'b', b'c'];
-        let frame = encode_unix_terminal_frame("sub-1", 9, &body).expect("encode container");
+        let frame = encode_unix_terminal_frame("sub-1", 9, 4, &body).expect("encode container");
         let frame_len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
         assert_eq!(frame_len, frame.len() - UNIX_FRAME_LENGTH_PREFIX_BYTES);
         assert_eq!(frame[4], UNIX_CONTAINER_TERMINAL);
-        let header = UnixTerminalContainerHeader::new("sub-1", 9, body.len()).expect("header");
+        let header = UnixTerminalContainerHeader::new("sub-1", 9, 4, body.len()).expect("header");
         assert_eq!(&frame[..header.as_bytes().len()], header.as_bytes());
         assert_eq!(
             header.as_bytes().len(),
             UNIX_FRAME_LENGTH_PREFIX_BYTES + 1 + UNIX_TERMINAL_CONTAINER_FIXED_BYTES + 5
         );
+        // Container payload offsets: route_len at 0, route at 2, generation at
+        // 2 + route_len, stream_epoch at 10 + route_len, body at 14 + route_len.
+        let payload = &frame[UNIX_FRAME_LENGTH_PREFIX_BYTES + 1..];
+        assert_eq!(&payload[0..2], &5u16.to_le_bytes());
+        assert_eq!(&payload[2..7], b"sub-1");
+        assert_eq!(&payload[7..15], &9u64.to_le_bytes());
+        assert_eq!(&payload[15..19], &4u32.to_le_bytes());
+        assert_eq!(&payload[19..], &body);
 
         match decode_unix_frame::<ServerFrame>(&frame[UNIX_FRAME_LENGTH_PREFIX_BYTES..])
             .expect("decode container")
@@ -7804,17 +7860,18 @@ mod tests {
             DaemonUnixFrame::Terminal(decoded) => {
                 assert_eq!(decoded.route, "sub-1");
                 assert_eq!(decoded.generation, 9);
+                assert_eq!(decoded.stream_epoch, 4);
                 assert_eq!(decoded.body, body);
             }
             DaemonUnixFrame::Control(_) => panic!("terminal container decoded as control"),
         }
 
-        assert!(UnixTerminalContainerHeader::new("", 1, 0).is_none());
+        assert!(UnixTerminalContainerHeader::new("", 1, 0, 0).is_none());
         let long_route = "r".repeat(MAX_UNIX_TERMINAL_ROUTE_BYTES + 1);
-        assert!(UnixTerminalContainerHeader::new(&long_route, 1, 0).is_none());
+        assert!(UnixTerminalContainerHeader::new(&long_route, 1, 0, 0).is_none());
         let max_route = "r".repeat(MAX_UNIX_TERMINAL_ROUTE_BYTES);
-        assert!(UnixTerminalContainerHeader::new(&max_route, 1, 0).is_some());
-        assert!(UnixTerminalContainerHeader::new("route", 1, MAX_UNIX_FRAME_BYTES).is_none());
+        assert!(UnixTerminalContainerHeader::new(&max_route, 1, 0, 0).is_some());
+        assert!(UnixTerminalContainerHeader::new("route", 1, 0, MAX_UNIX_FRAME_BYTES).is_none());
 
         let mut control_route = frame.clone();
         control_route[UNIX_FRAME_LENGTH_PREFIX_BYTES + 1 + 2] = b'\n';
@@ -7831,7 +7888,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_millis(30)))
             .expect("timeout");
-        let frame = encode_unix_terminal_frame("sub", 3, b"a").expect("encode");
+        let frame = encode_unix_terminal_frame("sub", 3, 0, b"a").expect("encode");
         let mut frames = DaemonUnixFrameReader::new();
         server.write_all(&frame[..3]).expect("write partial prefix");
         let first = frames.read_frame(&mut client);
@@ -7871,7 +7928,16 @@ mod tests {
             chunk_count: 3,
             total_bytes: 30_000,
             generation: 11,
+            stream_epoch: 2,
         };
+        let encoded = header.encode();
+        assert_eq!(encoded[0], 2);
+        assert_eq!(&encoded[1..9], &7u64.to_le_bytes());
+        assert_eq!(&encoded[9..13], &1u32.to_le_bytes());
+        assert_eq!(&encoded[13..17], &3u32.to_le_bytes());
+        assert_eq!(&encoded[17..21], &30_000u32.to_le_bytes());
+        assert_eq!(&encoded[21..29], &11u64.to_le_bytes());
+        assert_eq!(&encoded[29..33], &2u32.to_le_bytes());
         let sealed =
             vec![
                 0u8;

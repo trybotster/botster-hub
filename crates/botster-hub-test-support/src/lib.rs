@@ -366,6 +366,7 @@ pub fn run_session_lifecycle_subscription_conformance(
         .send_terminal_frame(
             &route.subscription_id,
             route.generation,
+            0,
             &terminal_resize_frame_bytes(operation_ids.next(), 31, 101),
         )
         .map_err(|error| session_lifecycle_error("lifecycle patch", error.to_string()))?;
@@ -410,6 +411,7 @@ pub fn run_session_lifecycle_subscription_conformance(
         .send_terminal_frame(
             &route.subscription_id,
             route.generation,
+            0,
             &terminal_input_frame_bytes(operation_ids.next(), b"release\n"),
         )
         .map_err(|error| session_lifecycle_error("lifecycle release", error.to_string()))?;
@@ -846,6 +848,7 @@ fn run_many_pty_client_attach_scenario(
         .send_terminal_frame(
             &route.subscription_id,
             route.generation,
+            0,
             &terminal_input_frame_bytes(
                 operation_ids.next(),
                 format!("{MANY_PTY_INPUT}\n").as_bytes(),
@@ -1508,6 +1511,7 @@ pub fn run_client_conformance(
         .send_terminal_frame(
             &route.subscription_id,
             route.generation,
+            0,
             &terminal_resize_frame_bytes(operation_ids.next(), 33, 102),
         )
         .map_err(|source| ConformanceError::Client {
@@ -1518,6 +1522,7 @@ pub fn run_client_conformance(
         .send_terminal_frame(
             &route.subscription_id,
             route.generation,
+            0,
             &terminal_input_frame_bytes(operation_ids.next(), b"from-conformance\r"),
         )
         .map_err(|source| ConformanceError::Client {
@@ -1536,6 +1541,7 @@ pub fn run_client_conformance(
         .send_terminal_frame(
             &route.subscription_id,
             route.generation,
+            0,
             &terminal_input_frame_bytes(operation_ids.next(), b"size-check\r"),
         )
         .map_err(|source| ConformanceError::Client {
@@ -1555,6 +1561,7 @@ pub fn run_client_conformance(
         .send_terminal_frame(
             &route.subscription_id,
             route.generation,
+            0,
             &terminal_input_frame_bytes(operation_ids.next(), b"quit\r"),
         )
         .map_err(|source| ConformanceError::Client {
@@ -6325,11 +6332,15 @@ mod tests {
         let attached = position_of_kind(frames, "attach_state");
         let ready = position_of_kind(frames, "snapshot_ready");
         let unavailable = position_of_kind(frames, "history_unavailable");
+        let finish = position_of_kind(frames, "snapshot_finish");
         let live = position_of_kind(frames, "output");
-        assert!(attached < ready && ready < unavailable && unavailable < live);
         assert!(
-            !frames.iter().any(|frame| frame.kind == "snapshot_finish"),
-            "a failed capture never emits SNAPSHOT_FINISH"
+            attached < ready && ready < unavailable && unavailable < finish && finish < live,
+            "post-READY capture failure replaces history pages, then finishes, then live output"
+        );
+        assert!(
+            !frames.iter().any(|frame| frame.kind == "snapshot_history"),
+            "a failed capture sends no history pages"
         );
         assert_eq!(
             botster_terminal_protocol::decode_history_unavailable(&fixture_terminal_frame(
@@ -6455,7 +6466,7 @@ mod tests {
         assert_eq!(provenance.protocol_git, LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT);
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_CORE_PIN,
-            "e0c07f9100955c9c32261afc42c4297e3cea54a0"
+            "b19cfb380e469bbcb47a5425d624b699c5fac565"
         );
         assert_eq!(provenance.core_pin, LATE_ATTACH_GHOSTSNP_CORE_PIN);
         assert_eq!(
@@ -6597,6 +6608,7 @@ mod tests {
             serde_json::json!({
                 "route": frame.route,
                 "generation": 1,
+                "stream_epoch": 0,
                 "kind": frame.kind,
                 "terminal_body_base64": frame.terminal_body_base64,
                 "terminal_body_bytes": frame.terminal_body_bytes,

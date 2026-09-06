@@ -107,8 +107,9 @@ The support matrix is generated from the Rust compatibility descriptors.
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
 Rust serde scenario and preserves attached, modes, `snapshot_ready`,
-`snapshot_history` pages, `snapshot_finish` or `history_unavailable`, then
-live output as Core scheme 2 `terminal_body_base64` frames. An opaque
+`snapshot_history` pages (or `history_unavailable` in their place),
+`snapshot_finish`, then live output as Core scheme 2 `terminal_body_base64`
+frames. An opaque
 authoritative snapshot may represent a blank terminal; clients must not infer
 visible history from payload byte length. Only `read_screen_text` is
 renderable restored content; snapshot frame bodies must never be appended as
