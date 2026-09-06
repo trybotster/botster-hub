@@ -707,8 +707,6 @@ fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
     }
 }
 
-#[derive(Debug)]
-
 pub(crate) struct DaemonControlState {
     pub(crate) logical_clock: u64,
     pub(crate) drain_cursors: BTreeMap<String, u64>,
@@ -749,6 +747,19 @@ pub(crate) struct DaemonControlState {
             >,
         >,
     >,
+}
+
+impl fmt::Debug for DaemonControlState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DaemonControlState")
+            .field("logical_clock", &self.logical_clock)
+            .field("entity_subscriptions", &self.entity_subscriptions.len())
+            .field("lifecycle_counters", &self.lifecycle_counters)
+            .field("pending_requests", &self.pending_requests.len())
+            .field("pending_owner_work", &self.pending_owner_work.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for DaemonControlState {
