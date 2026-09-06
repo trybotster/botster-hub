@@ -1153,6 +1153,12 @@ impl LocalWebrtcOfferPeer {
                 }),
             )
             .await?;
+        // Creation completion instant (after create_data_channel returned), reported on a
+        // timeout for correlation with the Hub's admission-entry receipt.
+        let creation_completed_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
         spawn_offerer_channel_poll(
             runtime,
             extra.clone(),
@@ -1182,6 +1188,12 @@ impl LocalWebrtcOfferPeer {
                 return Err(std::io::Error::other("labeled DataChannel closed before open").into());
             }
             Err(_) => {
+                // Timeout instant, captured on entering this branch before any diagnostic
+                // read.
+                let timeout_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis())
+                    .unwrap_or(0);
                 // Diagnostic only; the open deadline is unchanged. Distinguishes a channel
                 // that never opened (Connecting), one that opened without the poll observing
                 // it (Open), and one that closed early (Closed, or an observed OnClose). The
@@ -1200,7 +1212,7 @@ impl LocalWebrtcOfferPeer {
                 };
                 let closed_observed = extra_channel.closed.try_recv().is_ok();
                 return Err(std::io::Error::other(format!(
-                    "timed out waiting for labeled DataChannel open: label={} ready_state={ready_state} closed_observed={closed_observed}",
+                    "timed out waiting for labeled DataChannel open: label={} ready_state={ready_state} closed_observed={closed_observed} creation_completed_unix_ms={creation_completed_unix_ms} timeout_unix_ms={timeout_unix_ms}",
                     extra_channel.label
                 ))
                 .into());

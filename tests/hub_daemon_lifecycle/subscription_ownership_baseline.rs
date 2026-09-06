@@ -159,6 +159,13 @@ fn webrtc_peer_rejects_a_second_data_channel() {
     let observation = marker_dir.join("extra-observation.json");
     let marker = close_marker.to_string_lossy().into_owned();
     let observation_path = observation.to_string_lossy().into_owned();
+    // Diagnostic: the Hub appends at most one JSON line when a reserved-label channel
+    // reaches admission-task entry (positive evidence only; absence is inconclusive). Read
+    // post-mortem from the marker dir on a reserved-open timeout.
+    let receipt_path = marker_dir
+        .join("reserved-receipt.jsonl")
+        .to_string_lossy()
+        .into_owned();
     let (hub, endpoint, bootstrap) = start_webrtc_adapter_hub_with_env(
         "so-2ch",
         &[
@@ -169,6 +176,10 @@ fn webrtc_peer_rejects_a_second_data_channel() {
             (
                 "BOTSTER_HUB_TEST_EXTRA_CHANNEL_OBSERVATION",
                 observation_path.as_str(),
+            ),
+            (
+                "BOTSTER_HUB_TEST_RESERVED_CHANNEL_RECEIPT",
+                receipt_path.as_str(),
             ),
         ],
     );

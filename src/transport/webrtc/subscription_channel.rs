@@ -91,6 +91,51 @@ pub(crate) fn observe_rejected_data_channel_for_test(
         }
     }
 }
+pub(crate) const TEST_RESERVED_CHANNEL_RECEIPT_ENV: &str =
+    "BOTSTER_HUB_TEST_RESERVED_CHANNEL_RECEIPT";
+
+/// Test-only receipt that a reserved-label DataChannel reached admission-task entry.
+///
+/// Records entry to `admit_reserved_subscription_channel`, which the peer handler spawns
+/// from its `on_data_channel` callback; it is not the callback instant and says nothing
+/// about wire transmission of the DCEP ACK. Gated on `BOTSTER_ENV=test` and an explicit
+/// path, and written at most once per process: the fixture that enables it opens exactly
+/// one reserved channel. The instant is captured before the write is scheduled, and the
+/// append runs on the blocking pool, so neither the admission task nor the channel driver
+/// waits on file I/O. A present record is positive evidence; an absent one is
+/// inconclusive, because the detached write may not run or may fail.
+pub(crate) fn observe_reserved_channel_receipt_for_test(label: &str) {
+    static SCHEDULED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if std::env::var("BOTSTER_ENV").as_deref() != Ok("test") {
+        return;
+    }
+    let Ok(path) = std::env::var(TEST_RESERVED_CHANNEL_RECEIPT_ENV) else {
+        return;
+    };
+    if path.is_empty() || SCHEDULED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let admission_entry_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let line = serde_json::json!({
+        "label": label,
+        "admission_entry_unix_ms": admission_entry_unix_ms,
+    })
+    .to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    });
+}
+
 pub(crate) async fn reject_extra_data_channel<C>(
     grant_id: &str,
     claimed: bool,
@@ -171,6 +216,7 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
 ) where
     C: LocalWebrtcDataChannel + ?Sized,
 {
+    observe_reserved_channel_receipt_for_test(label);
     let (inspect_tx, inspect_rx) = oneshot::channel();
     if peer_state
         .runtime_tx
