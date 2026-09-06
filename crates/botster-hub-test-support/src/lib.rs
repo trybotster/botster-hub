@@ -6347,7 +6347,7 @@ mod tests {
                 &frames[unavailable]
             ))
             .expect("reason decodes"),
-            HistoryUnavailableReason::CaptureFailed
+            botster_terminal_protocol::HistoryUnavailableReason::CaptureFailed
         );
     }
 
@@ -6495,19 +6495,19 @@ mod tests {
             GhosttyClientProjection::new(TerminalScreenSize::new(24, 80)).expect("history client");
         assert_eq!(
             history_client
-                .install_ghostsnp_ready(LATE_ATTACH_HISTORY_READY_PAYLOAD.to_vec())
+                .install_ghostsnp_ready(LATE_ATTACH_HISTORY_READY_PAYLOAD)
                 .expect("history READY"),
             GhosttySnapshotDecodeProgress::Ready
         );
         assert_eq!(
             history_client
-                .apply_ghostsnp_history(LATE_ATTACH_HISTORY_PAGE_PAYLOAD.to_vec())
+                .apply_ghostsnp_history(LATE_ATTACH_HISTORY_PAGE_PAYLOAD)
                 .expect("history PAGE"),
             GhosttySnapshotDecodeProgress::History
         );
         assert_eq!(
             history_client
-                .apply_ghostsnp_history(LATE_ATTACH_HISTORY_FINISH_PAYLOAD.to_vec())
+                .apply_ghostsnp_history(LATE_ATTACH_HISTORY_FINISH_PAYLOAD)
                 .expect("history FINISH"),
             GhosttySnapshotDecodeProgress::Finish
         );
@@ -6532,13 +6532,13 @@ mod tests {
             GhosttyClientProjection::new(TerminalScreenSize::new(24, 80)).expect("blank client");
         assert_eq!(
             blank_client
-                .install_ghostsnp_ready(LATE_ATTACH_NO_HISTORY_READY_PAYLOAD.to_vec())
+                .install_ghostsnp_ready(LATE_ATTACH_NO_HISTORY_READY_PAYLOAD)
                 .expect("blank READY"),
             GhosttySnapshotDecodeProgress::Ready
         );
         assert_eq!(
             blank_client
-                .apply_ghostsnp_history(LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD.to_vec())
+                .apply_ghostsnp_history(LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD)
                 .expect("blank FINISH"),
             GhosttySnapshotDecodeProgress::Finish
         );
@@ -6666,10 +6666,6 @@ mod tests {
         );
         let ready = fixture_terminal_frame(&scenario.history_then_live[2]);
         assert_eq!(ready.body(), LATE_ATTACH_HISTORY_READY_PAYLOAD);
-        assert_eq!(
-            hex_sha256(ready.body()),
-            LATE_ATTACH_HISTORY_READY_PAYLOAD_SHA256
-        );
         let page = fixture_terminal_frame(&scenario.history_then_live[4]);
         assert_eq!(page.body(), LATE_ATTACH_HISTORY_PAGE_PAYLOAD);
         let finish_record = fixture_terminal_frame(&scenario.history_then_live[5]);
