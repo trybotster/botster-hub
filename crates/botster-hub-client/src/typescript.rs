@@ -22,6 +22,143 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "export type JsonObject = { [key: string]: JsonValue };",
     );
     line(&mut output, "");
+    line(
+        &mut output,
+        "// Host-control protocol 9 constants. See botster-hub-client/src/lib.rs.",
+    );
+    emit_const(&mut output, "PROTOCOL", &format!("\"{}\"", crate::PROTOCOL));
+    emit_const(
+        &mut output,
+        "PROTOCOL_VERSION",
+        &crate::PROTOCOL_VERSION.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "CONFORMANCE_FIXTURE_REVISION",
+        &crate::CONFORMANCE_FIXTURE_REVISION.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "MAX_REQUEST_ID_BYTES",
+        &crate::MAX_REQUEST_ID_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "MAX_OUTSTANDING_REQUESTS",
+        &crate::MAX_OUTSTANDING_REQUESTS.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "MAX_CONTROL_REQUEST_BYTES",
+        &crate::MAX_CONTROL_REQUEST_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "MAX_CONTROL_RESPONSE_BYTES",
+        &crate::MAX_CONTROL_RESPONSE_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "SNAPSHOT_PAGE_BYTES",
+        &crate::SNAPSHOT_PAGE_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "MAX_OPEN_CAPTURES_PER_CONNECTION",
+        &crate::MAX_OPEN_CAPTURES_PER_CONNECTION.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "SNAPSHOT_CAPTURE_TTL_SECONDS",
+        &crate::SNAPSHOT_CAPTURE_TTL_SECONDS.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "OPERATOR_ERROR_TOO_MANY_REQUESTS",
+        &format!("\"{}\"", crate::OPERATOR_ERROR_TOO_MANY_REQUESTS),
+    );
+    line(&mut output, "");
+    line(
+        &mut output,
+        "// Unix socket framing: [u32 LE frame_len][u8 container][payload]; frame_len = 1 + payload length.",
+    );
+    line(
+        &mut output,
+        "// Terminal container payload: [u16 LE route_len][route UTF-8][u64 LE generation][body].",
+    );
+    emit_const(
+        &mut output,
+        "UNIX_FRAME_LENGTH_PREFIX_BYTES",
+        &crate::UNIX_FRAME_LENGTH_PREFIX_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "UNIX_CONTAINER_CONTROL",
+        &crate::UNIX_CONTAINER_CONTROL.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "UNIX_CONTAINER_TERMINAL",
+        &crate::UNIX_CONTAINER_TERMINAL.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "MAX_UNIX_TERMINAL_ROUTE_BYTES",
+        &crate::MAX_UNIX_TERMINAL_ROUTE_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "MAX_UNIX_FRAME_BYTES",
+        &crate::MAX_UNIX_FRAME_BYTES.to_string(),
+    );
+    line(&mut output, "");
+    line(
+        &mut output,
+        "// Local WebRTC control deliveries stay JSON text chunks of one encrypted ServerFrame.",
+    );
+    line(
+        &mut output,
+        "// Local WebRTC terminal chunks are binary DataChannel messages:",
+    );
+    line(
+        &mut output,
+        "// [u8 version=2][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][12-byte nonce][AES-GCM ciphertext || 16-byte tag].",
+    );
+    line(
+        &mut output,
+        "// The route is the subscription DataChannel label; total_bytes is the plaintext body length.",
+    );
+    emit_const(
+        &mut output,
+        "LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION",
+        &crate::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "LOCAL_WEBRTC_MAX_FRAME_BYTES",
+        &crate::LOCAL_WEBRTC_MAX_FRAME_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "LOCAL_WEBRTC_MAX_DELIVERY_BYTES",
+        &crate::LOCAL_WEBRTC_MAX_DELIVERY_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES",
+        &crate::LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES",
+        &crate::LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
+        "LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES",
+        &crate::LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES.to_string(),
+    );
+    line(&mut output, "");
     emit_interface(
         &mut output,
         "AesGcmEnvelope",
@@ -47,11 +184,69 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     emit_string_union(
         &mut output,
         "DaemonLocalWebrtcDeliveryKind",
+        &["server_frame"],
+    );
+    emit_interface(
+        &mut output,
+        "LocalWebrtcTerminalChunkHeader",
         &[
-            "daemon_response",
-            "daemon_entity_frame",
-            "daemon_terminal_frame",
-            "daemon_event",
+            ("message_id", "number"),
+            ("chunk_index", "number"),
+            ("chunk_count", "number"),
+            ("total_bytes", "number"),
+            ("generation", "number"),
+        ],
+    );
+
+    emit_union(
+        &mut output,
+        "ClientFrame",
+        "frame",
+        &[
+            ("hello", &[("hello", "DaemonHello")]),
+            (
+                "request",
+                &[("request_id", "string"), ("request", "DaemonRequest")],
+            ),
+        ],
+    );
+    emit_union(
+        &mut output,
+        "ServerFrame",
+        "frame",
+        &[
+            ("hello_ack", &[("ack", "DaemonHelloAck")]),
+            (
+                "response",
+                &[("request_id", "string"), ("response", "DaemonResponse")],
+            ),
+            ("event", &[("event", "DaemonEvent")]),
+            ("entity", &[("entity", "DaemonEntityFrame")]),
+            ("close", &[("reason", "DaemonCloseReason")]),
+        ],
+    );
+    emit_union(
+        &mut output,
+        "DaemonCloseReason",
+        "reason",
+        &[
+            ("protocol_error", &[("code", "DaemonProtocolErrorCode")]),
+            ("daemon_shutdown", &[]),
+        ],
+    );
+    emit_string_union(
+        &mut output,
+        "DaemonProtocolErrorCode",
+        &[
+            "malformed_frame",
+            "frame_too_large",
+            "unknown_container",
+            "unknown_frame",
+            "invalid_request_id",
+            "nonincreasing_request_id",
+            "handshake_order",
+            "invalid_route",
+            "invalid_input_header",
         ],
     );
 
@@ -96,17 +291,6 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("required_features", "string[]"),
             ("minimum_conformance_fixture_revision", "number"),
             ("client_name", "string"),
-        ],
-    );
-    emit_interface(
-        &mut output,
-        "DaemonUnixTerminalEnvelope",
-        &[
-            ("plane", "string"),
-            ("kind", "string"),
-            ("session_id", "string"),
-            ("subscription_id", "string"),
-            ("payload_base64", "string"),
         ],
     );
     emit_interface(
@@ -196,6 +380,14 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("read_screen", &[("session_id", "string")]),
             ("read_mode_flags", &[("session_id", "string")]),
             ("capture_snapshot", &[("session_id", "string")]),
+            (
+                "read_snapshot_page",
+                &[
+                    ("session_id", "string"),
+                    ("capture_id", "string"),
+                    ("page", "number"),
+                ],
+            ),
             ("list_session_types", &[]),
             ("list_session_types_for_target", &[("target_id", "string")]),
             ("show_session_type", &[("session_type_id", "string")]),
@@ -411,12 +603,14 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("session_context?", "DaemonSessionContext | null"),
             ("read_screen?", "DaemonReadScreen | null"),
             ("mode_flags?", "DaemonModeFlags | null"),
+            ("terminal_attach?", "DaemonTerminalAttach | null"),
             ("terminal_reservation?", "DaemonTerminalReservation | null"),
             (
                 "subscription_reservation?",
                 "DaemonSubscriptionReservation | null",
             ),
             ("capture_snapshot?", "DaemonCaptureSnapshot | null"),
+            ("snapshot_page?", "DaemonSnapshotPage | null"),
             ("spawn_targets?", "DaemonSpawnTarget[]"),
             (
                 "spawn_target_validation?",
@@ -462,10 +656,19 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("diagnostics?", "DaemonDiagnostic[]"),
         ],
     );
+    emit_string_union(
+        &mut output,
+        "HistoryUnavailableReason",
+        &["evicted", "restart", "oversize", "capture_failed"],
+    );
     emit_interface(
         &mut output,
         "DaemonReadScreen",
-        &[("session_id", "string"), ("text", "string")],
+        &[
+            ("session_id", "string"),
+            ("text", "string"),
+            ("unavailable?", "HistoryUnavailableReason | null"),
+        ],
     );
     emit_interface(
         &mut output,
@@ -479,8 +682,18 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("alt_screen", "boolean"),
             ("focus_reporting", "boolean"),
             ("application_cursor", "boolean"),
-            ("mode_generation", "number"),
-            ("mode_revision", "number"),
+            ("rows", "number"),
+            ("cols", "number"),
+            ("unavailable?", "HistoryUnavailableReason | null"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonTerminalAttach",
+        &[
+            ("session_id", "string"),
+            ("subscription_id", "string"),
+            ("generation", "number"),
         ],
     );
     emit_interface(
@@ -517,10 +730,25 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "DaemonCaptureSnapshot",
         &[
             ("session_id", "string"),
+            ("capture_id", "string"),
+            ("total_bytes", "number"),
+            ("page_bytes", "number"),
+            ("pages", "number"),
             ("rows", "number"),
             ("cols", "number"),
-            ("payload_format?", "string | null"),
-            ("payload_bytes", "number"),
+            ("unavailable?", "HistoryUnavailableReason | null"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonSnapshotPage",
+        &[
+            ("session_id", "string"),
+            ("capture_id", "string"),
+            ("page", "number"),
+            ("payload_base64", "string"),
+            ("payload_encoding", "\"base64\""),
+            ("bytes", "number"),
         ],
     );
     emit_interface(
@@ -577,8 +805,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             "session_context",
             "read_screen",
             "read_mode_flags",
+            "terminal_attached",
             "terminal_reservation",
             "capture_snapshot",
+            "snapshot_page",
             "spawn_targets",
             "spawn_target_validation",
             "worktrees",
@@ -1277,7 +1507,20 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("lifecycle_counters?", "DaemonLifecycleCounters"),
             ("live_attach_occupancy?", "DaemonAttachOccupancy[]"),
             ("observability?", "DaemonObservabilityCounters"),
+            ("retention?", "DaemonRetentionAccounting | null"),
             ("diagnostics?", "DaemonDiagnostic[]"),
+        ],
+    );
+    emit_interface(
+        &mut output,
+        "DaemonRetentionAccounting",
+        &[
+            ("max_object_bytes", "number"),
+            ("max_total_bytes", "number"),
+            ("max_sessions", "number"),
+            ("total_bytes", "number"),
+            ("sessions", "number"),
+            ("evictions", "number"),
         ],
     );
     emit_interface(
@@ -1576,52 +1819,6 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                 "session_lifecycle",
                 &[("session_id", "string"), ("state", "string")],
             ),
-            (
-                "terminal_output",
-                &[
-                    ("session_id", "string"),
-                    ("subscription_id", "string"),
-                    ("payload_base64", "string"),
-                    ("payload_encoding", "\"base64\""),
-                    ("bytes", "number"),
-                ],
-            ),
-            (
-                "snapshot",
-                &[
-                    ("session_id", "string"),
-                    ("subscription_id", "string"),
-                    ("payload_base64", "string"),
-                    ("payload_encoding", "\"base64\""),
-                    ("bytes", "number"),
-                ],
-            ),
-            (
-                "scrollback",
-                &[
-                    ("session_id", "string"),
-                    ("subscription_id", "string"),
-                    ("payload_base64", "string"),
-                    ("payload_encoding", "\"base64\""),
-                    ("bytes", "number"),
-                ],
-            ),
-            (
-                "process_exit",
-                &[
-                    ("session_id", "string"),
-                    ("subscription_id", "string"),
-                    ("code", "number | null"),
-                ],
-            ),
-            (
-                "attach_state",
-                &[
-                    ("session_id", "string"),
-                    ("subscription_id", "string"),
-                    ("state", "string"),
-                ],
-            ),
             ("runtime_observation", &[("kind", "string")]),
             (
                 "worktree_lifecycle",
@@ -1665,6 +1862,10 @@ pub(crate) fn daemon_protocol_typescript() -> String {
 fn line(output: &mut String, text: &str) {
     output.push_str(text);
     output.push('\n');
+}
+
+fn emit_const(output: &mut String, name: &str, value: &str) {
+    line(output, &format!("export const {name} = {value};"));
 }
 
 fn emit_interface(output: &mut String, name: &str, fields: &[(&str, &str)]) {

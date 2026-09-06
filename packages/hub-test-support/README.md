@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.43:
+Use this command for version 0.1.44:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.43
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.44
 ```
 
 ```js
@@ -81,53 +81,57 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.43"
+    "@trybotster/hub-test-support": "0.1.44"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.43` carries byte-faithful live
-`terminal_output` payloads (`payload_base64`, `payload_encoding`, `bytes`)
-and authentic dual GHOSTSNP late-attach fixtures (conformance revision 48).
-History attach uses incremental READY, PAGE, and FINISH Snapshot frames.
-No-history attach uses READY then FINISH. Import-visible state matches the
-ReadScreen oracles; do not dual-use a history-bearing golden as no-history.
-Protocol version is 8. The package includes the live-output envelope, full
-`ModeFlags` freshness fields, explicit
-session-type execution modes, spawn-point session-type listing
-(`list_session_types_for_target`), and the session-type authoring view
-(`show_session_type_definition`). First-party clients should pin this
-coordinate when they use these contracts.
+`@trybotster/hub-test-support@0.1.44` carries host-control protocol 9
+(`ClientFrame` / `ServerFrame` with `request_id` correlation, length-prefixed
+Unix containers, binary AES-GCM WebRTC terminal chunks) and authentic dual
+GHOSTSNP late-attach fixtures as Core scheme 2 terminal frames (conformance
+revision 49). History attach delivers `attach_state`, `modes`,
+`snapshot_ready`, `snapshot_history` pages, `snapshot_finish`, `output`, and
+`process_exit`. No-history attach delivers `snapshot_ready` then the GHOSTSNP
+finish record as one `snapshot_history` page. Import-visible state matches
+the ReadScreen oracles; do not dual-use a history-bearing golden as
+no-history. Protocol version is 9. The package includes paged snapshot
+readback (`capture_snapshot`, `read_snapshot_page`), typed
+`HistoryUnavailableReason` values, explicit session-type execution modes,
+spawn-point session-type listing (`list_session_types_for_target`), and the
+session-type authoring view (`show_session_type_definition`). First-party
+clients should pin this coordinate when they use these contracts.
 
 The support matrix is generated from the Rust compatibility descriptors.
 `terminal_readback` appears in both `supported_features` and
 `required_features`; downstream compatibility checks must implement it rather
 than treating it as optional. The late-attach fixture is generated from the
-Rust serde scenario and preserves attaching, READY, optional PAGE frames,
-FINISH or `snapshot_history_incomplete`, attached, then live output. An opaque authoritative
-snapshot may represent a blank terminal; clients must not infer visible
-history from payload byte length. Only `read_screen_text` is renderable
-restored content; `snapshot` and `scrollback` base64 payloads must never be
-appended as terminal text. Version 0.1.6 / conformance revision 13 uses
-superseded JSON number arrays, while version 0.1.5 / revision 12 exposes
-lossy string history. Neither is current binary-history contract authority.
+Rust serde scenario and preserves attached, modes, `snapshot_ready`,
+`snapshot_history` pages, `snapshot_finish` or `history_unavailable`, then
+live output as Core scheme 2 `terminal_body_base64` frames. An opaque
+authoritative snapshot may represent a blank terminal; clients must not infer
+visible history from payload byte length. Only `read_screen_text` is
+renderable restored content; snapshot frame bodies must never be appended as
+terminal text. Version 0.1.6 / conformance revision 13 uses superseded JSON
+number arrays, while version 0.1.5 / revision 12 exposes lossy string
+history. Neither is current binary-history contract authority.
 
-Version 0.1.43 carries protocol version 8 / conformance revision 48 with
+Version 0.1.44 carries protocol version 9 / conformance revision 49 with
 advertised optional `unix_terminal_adapter`,
 `terminal_subscription_closed`, `webrtc_terminal_adapter`,
 `attach_occupancy`,
 `package_event_subscriptions`,
-negotiated WebRTC `daemon_event` close delivery, and
-`snapshot_delivery=ready_then_history` support,
-byte-faithful live `terminal_output` payloads, incremental GHOSTSNP
-READY/PAGE/FINISH goldens, ModeFlags freshness, Snapshot-only GHOSTSNP rules,
-and the
-`DaemonSessionTypeExecution` contract. Version 0.1.35 is the prior published
-coordinate at protocol 7 / revision 40. A compatible Hello must require
+negotiated WebRTC close-event delivery, and
+`snapshot_delivery=ready_then_history` support, Core scheme 2 terminal
+frames, incremental GHOSTSNP READY/PAGE/FINISH goldens, paged snapshot
+readback, and the
+`DaemonSessionTypeExecution` contract. Version 0.1.43 is the prior published
+coordinate at protocol 8 / revision 48. A compatible Hello must require
 `terminal_subscription_closed`
 (`FEATURE_TERMINAL_SUBSCRIPTION_CLOSED` /
 `DaemonCompatibilityRequirement::for_webrtc_terminal_subscription_closed()`)
-before Hub sends `DaemonLocalWebrtcDeliveryKind` `daemon_event`. The feature
+before Hub sends the `terminal_subscription_closed` event inside a
+`server_frame` delivery. The feature
 stays optional in default `required_features`. The contract
 defines the explicit `relative_executable` and `shell_command` modes.
 It also carries spawn-point session-type listing

@@ -17,28 +17,64 @@ use std::time::{Duration, Instant};
 use botster_core::{RunnableEntrypointHubConnection, RunnableEntrypointHubConnectionTransport};
 use botster_hub_client::{
     DaemonCompatibilityRequirement, DaemonConnection, DaemonDiagnosticKind, DaemonEndpoint,
-    DaemonEntityFrame, DaemonEvent, DaemonLiveOutputPayload, DaemonOperatorError, DaemonRequest,
-    DaemonResponse, DaemonResponseKind, DaemonTransportError, FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
-    connect_for_package_event_subscriptions, ensure_compatible,
+    DaemonEntityFrame, DaemonEvent, DaemonOperatorError, DaemonRequest, DaemonResponse,
+    DaemonResponseKind, DaemonTerminalAttach, DaemonTransportError, DaemonUnixTerminalFrame,
+    FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS, connect_for_package_event_subscriptions,
+    ensure_compatible,
 };
+use botster_terminal_protocol::{AttachStateCode, TerminalFrame, decode_attach_state};
+use botster_terminal_protocol_client::{TerminalInputCommand, encode_terminal_input};
 use botster_ui_contract::{
     UiActionId, UiActionKind, UiActionRequest, UiActionRequestId, UiActionResult,
     UiActionResultState, UiFormValues, UiPresentationOperation, UiSurfaceId,
 };
 use serde::{Deserialize, Serialize};
 
-fn terminal_input_frame_bytes(data: &[u8]) -> Vec<u8> {
-    let mut bytes = vec![1, 1];
-    bytes.extend_from_slice(&(u16::try_from(data.len()).unwrap_or(0)).to_be_bytes());
-    bytes.extend_from_slice(data);
-    bytes
+/// Client-side input operation ids for one attached route: strictly increasing from 1.
+#[derive(Debug, Default)]
+struct InputOperationIds {
+    last: u64,
 }
 
-fn terminal_resize_frame_bytes(rows: u16, cols: u16) -> Vec<u8> {
-    let mut bytes = vec![1, 3, 0, 4];
-    bytes.extend_from_slice(&rows.to_be_bytes());
-    bytes.extend_from_slice(&cols.to_be_bytes());
-    bytes
+impl InputOperationIds {
+    fn next(&mut self) -> u64 {
+        self.last += 1;
+        self.last
+    }
+}
+
+/// Encode one scheme 2 `RAW_BYTES` input frame with the Core client encoder.
+fn terminal_input_frame_bytes(operation_id: u64, data: &[u8]) -> Vec<u8> {
+    encode_terminal_input(&TerminalInputCommand::RawBytes {
+        operation_id,
+        data: data.to_vec(),
+    })
+    .expect("raw input within the scheme 2 body ceiling")
+    .into_bytes()
+}
+
+/// Encode one scheme 2 `RESIZE` input frame with cell geometry only.
+fn terminal_resize_frame_bytes(operation_id: u64, rows: u16, cols: u16) -> Vec<u8> {
+    encode_terminal_input(&TerminalInputCommand::Resize {
+        operation_id,
+        rows,
+        cols,
+        width_px: 0,
+        height_px: 0,
+    })
+    .expect("resize input encodes")
+    .into_bytes()
+}
+
+/// Read the admitted route from an `Attach` response on a muxed Unix connection.
+fn terminal_attach_body(response: &DaemonResponse) -> Result<DaemonTerminalAttach, &'static str> {
+    if response.kind != DaemonResponseKind::TerminalAttached {
+        return Err("attach response kind was not terminal_attached");
+    }
+    response
+        .terminal_attach
+        .clone()
+        .ok_or("attach response was missing its terminal_attach body")
 }
 
 mod isolated_hub;
@@ -77,15 +113,15 @@ pub(crate) use conformance_data::{
     LATE_ATTACH_HISTORY_PAGE_PAYLOAD_SHA256, LATE_ATTACH_HISTORY_PAYLOAD,
     LATE_ATTACH_HISTORY_PAYLOAD_LEN, LATE_ATTACH_HISTORY_PAYLOAD_SHA256,
     LATE_ATTACH_HISTORY_READY_PAYLOAD, LATE_ATTACH_HISTORY_SCREEN_TEXT,
-    LATE_ATTACH_HISTORY_SESSION_ID, LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-    LATE_ATTACH_INCOMPLETE_SESSION_ID, LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
-    LATE_ATTACH_LIVE_DATA, LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD,
-    LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD_LEN, LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD_SHA256,
-    LATE_ATTACH_NO_HISTORY_LIVE_DATA, LATE_ATTACH_NO_HISTORY_PAYLOAD,
-    LATE_ATTACH_NO_HISTORY_PAYLOAD_LEN, LATE_ATTACH_NO_HISTORY_PAYLOAD_SHA256,
-    LATE_ATTACH_NO_HISTORY_READY_PAYLOAD, LATE_ATTACH_NO_HISTORY_SESSION_ID,
-    LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID, PLUGIN_CONTRACT_ACCEPTED_REPLACEMENT_SCOPE,
-    PLUGIN_CONTRACT_ACTION, PLUGIN_CONTRACT_APP_SURFACE, PLUGIN_CONTRACT_BLOCKED_SURFACE,
+    LATE_ATTACH_HISTORY_SESSION_ID, LATE_ATTACH_HISTORY_SUBSCRIPTION_ID, LATE_ATTACH_LIVE_DATA,
+    LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD, LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD_LEN,
+    LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD_SHA256, LATE_ATTACH_NO_HISTORY_LIVE_DATA,
+    LATE_ATTACH_NO_HISTORY_PAYLOAD, LATE_ATTACH_NO_HISTORY_PAYLOAD_LEN,
+    LATE_ATTACH_NO_HISTORY_PAYLOAD_SHA256, LATE_ATTACH_NO_HISTORY_READY_PAYLOAD,
+    LATE_ATTACH_NO_HISTORY_SESSION_ID, LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+    LATE_ATTACH_UNAVAILABLE_SESSION_ID, LATE_ATTACH_UNAVAILABLE_SUBSCRIPTION_ID,
+    PLUGIN_CONTRACT_ACCEPTED_REPLACEMENT_SCOPE, PLUGIN_CONTRACT_ACTION,
+    PLUGIN_CONTRACT_APP_SURFACE, PLUGIN_CONTRACT_BLOCKED_SURFACE,
     PLUGIN_CONTRACT_DIALOG_FORM_NODE_ID, PLUGIN_CONTRACT_DIALOG_INPUT_NODE_ID,
     PLUGIN_CONTRACT_DIALOG_NODE_ID, PLUGIN_CONTRACT_EMPTY_SURFACE, PLUGIN_CONTRACT_ENTITY_FAMILY,
     PLUGIN_CONTRACT_ENTITY_SURFACE, PLUGIN_CONTRACT_INVALID_BODY_SURFACE,
@@ -106,18 +142,19 @@ pub use conformance_data::{
     SessionEntitySubscriptionSupport, SessionLifecycleSubscriptionConformanceScenario,
     SessionPluginBindingConformanceScenario, SessionPluginBindingExpectedStages,
     SessionPluginMaterializedControl, SessionPluginMaterializedRow, SessionPluginRowExpectedStages,
-    SessionTypeAuthoringSupport, TerminalModeFlagsSupport, TerminalStreamingSupport, TestAssetFile,
-    application_primitives_fixture_descriptor, copy_plugin_contract_matrix_fixture,
-    daemon_protocol_typescript_artifact, first_party_client_support_matrix,
-    late_attach_ghostsnp_provenance, late_attach_history_conformance_fixture_json,
-    late_attach_history_conformance_scenario, late_attach_history_events,
-    late_attach_history_incomplete_events, late_attach_history_payload_bytes,
-    late_attach_history_payload_sha256, late_attach_incremental_frame_identity,
-    late_attach_no_history_events, late_attach_no_history_payload_bytes,
-    late_attach_no_history_payload_sha256, local_webrtc_delivery_chunk_conformance_fixture_json,
-    materialize_session_plugin_bindings, materialize_session_plugin_rows,
-    mode_flags_conformance_fixture_json, mode_flags_conformance_scenario,
-    plugin_contract_matrix_fixture_asset, session_lifecycle_subscription_conformance_fixture_json,
+    SessionTypeAuthoringSupport, TerminalModeFlagsSupport, TerminalStreamFixtureFrame,
+    TerminalStreamingSupport, TestAssetFile, application_primitives_fixture_descriptor,
+    copy_plugin_contract_matrix_fixture, daemon_protocol_typescript_artifact,
+    first_party_client_support_matrix, late_attach_ghostsnp_provenance,
+    late_attach_history_conformance_fixture_json, late_attach_history_conformance_scenario,
+    late_attach_history_frames, late_attach_history_payload_bytes,
+    late_attach_history_payload_sha256, late_attach_history_unavailable_frames,
+    late_attach_incremental_frame_identity, late_attach_no_history_frames,
+    late_attach_no_history_payload_bytes, late_attach_no_history_payload_sha256,
+    local_webrtc_delivery_chunk_conformance_fixture_json, materialize_session_plugin_bindings,
+    materialize_session_plugin_rows, mode_flags_conformance_fixture_json,
+    mode_flags_conformance_scenario, plugin_contract_matrix_fixture_asset,
+    session_lifecycle_subscription_conformance_fixture_json,
     session_lifecycle_subscription_conformance_scenario,
     session_plugin_binding_conformance_fixture_json, session_plugin_binding_conformance_scenario,
 };
@@ -316,17 +353,20 @@ pub fn run_session_lifecycle_subscription_conformance(
 
     let mut terminal = DaemonConnection::connect(endpoint)
         .map_err(|error| session_lifecycle_error("lifecycle attach", error.to_string()))?;
-    terminal
+    let attach = terminal
         .request(&DaemonRequest::Attach {
             session_id: SESSION_LIFECYCLE_SESSION_ID.to_string(),
             subscription_id: "session-lifecycle-terminal".to_string(),
         })
         .map_err(|error| session_lifecycle_error("lifecycle attach", error.to_string()))?;
+    let route = terminal_attach_body(&attach)
+        .map_err(|message| session_lifecycle_error("lifecycle attach", message))?;
+    let mut operation_ids = InputOperationIds::default();
     terminal
         .send_terminal_frame(
-            SESSION_LIFECYCLE_SESSION_ID,
-            "session-lifecycle-terminal",
-            &terminal_resize_frame_bytes(31, 101),
+            &route.subscription_id,
+            route.generation,
+            &terminal_resize_frame_bytes(operation_ids.next(), 31, 101),
         )
         .map_err(|error| session_lifecycle_error("lifecycle patch", error.to_string()))?;
     let resize_deadline = Instant::now() + Duration::from_secs(5);
@@ -368,9 +408,9 @@ pub fn run_session_lifecycle_subscription_conformance(
     }
     terminal
         .send_terminal_frame(
-            SESSION_LIFECYCLE_SESSION_ID,
-            "session-lifecycle-terminal",
-            &terminal_input_frame_bytes(b"release\n"),
+            &route.subscription_id,
+            route.generation,
+            &terminal_input_frame_bytes(operation_ids.next(), b"release\n"),
         )
         .map_err(|error| session_lifecycle_error("lifecycle release", error.to_string()))?;
 
@@ -589,7 +629,8 @@ pub struct ManyPtyConformanceReport {
     pub quiet_sessions_exited: usize,
     pub history_observed: bool,
     pub screen_marker_observed: bool,
-    pub snapshot_payload_bytes: usize,
+    /// Total GHOSTSNP bytes reported by the paged capture.
+    pub snapshot_total_bytes: u64,
     pub live_output_observed: bool,
     pub cleaned_sessions: usize,
 }
@@ -721,12 +762,13 @@ fn run_many_pty_client_attach_scenario(
         ManyPtyConformanceStage::Attach,
         MANY_PTY_NOISY_SESSION_ID,
     )?;
-    many_pty_expect_kind(
-        &attach,
-        DaemonResponseKind::Events,
-        ManyPtyConformanceStage::Attach,
-        MANY_PTY_NOISY_SESSION_ID,
-    )?;
+    let route = terminal_attach_body(&attach).map_err(|message| {
+        many_pty_error(
+            ManyPtyConformanceStage::Attach,
+            MANY_PTY_NOISY_SESSION_ID,
+            message,
+        )
+    })?;
     if !attach.events.is_empty() {
         return Err(many_pty_error(
             ManyPtyConformanceStage::Attach,
@@ -787,19 +829,27 @@ fn run_many_pty_client_attach_scenario(
             "capture_snapshot response was missing its body",
         )
     })?;
-    if snapshot.payload_bytes == 0 || snapshot.payload_format.is_none() {
+    if snapshot.unavailable.is_some()
+        || snapshot.total_bytes == 0
+        || snapshot.pages == 0
+        || snapshot.capture_id.is_empty()
+    {
         return Err(many_pty_error(
             ManyPtyConformanceStage::History,
             MANY_PTY_NOISY_SESSION_ID,
-            "capture_snapshot did not return a non-empty opaque payload with a declared format",
+            "capture_snapshot did not open a non-empty paged capture",
         ));
     }
 
+    let mut operation_ids = InputOperationIds::default();
     connection
         .send_terminal_frame(
-            MANY_PTY_NOISY_SESSION_ID,
-            MANY_PTY_SUBSCRIPTION_ID,
-            &terminal_input_frame_bytes(format!("{MANY_PTY_INPUT}\n").as_bytes()),
+            &route.subscription_id,
+            route.generation,
+            &terminal_input_frame_bytes(
+                operation_ids.next(),
+                format!("{MANY_PTY_INPUT}\n").as_bytes(),
+            ),
         )
         .map_err(|error| {
             many_pty_error(
@@ -843,7 +893,7 @@ fn run_many_pty_client_attach_scenario(
         quiet_sessions_exited: quiet_session_ids.len(),
         history_observed: true,
         screen_marker_observed: true,
-        snapshot_payload_bytes: snapshot.payload_bytes,
+        snapshot_total_bytes: snapshot.total_bytes,
         live_output_observed: true,
         cleaned_sessions: 0,
     })
@@ -946,65 +996,6 @@ fn wait_for_many_pty_screen_marker(
             "pre-attach screen marker did not appear before the deadline; screen tail: {screen_tail:?}"
         ),
     ))
-}
-
-#[allow(dead_code)]
-fn many_pty_saw_live_output(events: &[DaemonEvent]) -> bool {
-    many_pty_live_output_index(events).is_some()
-}
-
-#[allow(dead_code)]
-fn many_pty_live_output_index(events: &[DaemonEvent]) -> Option<usize> {
-    let mut output = String::new();
-    for (index, event) in events.iter().enumerate() {
-        if let DaemonEvent::TerminalOutput {
-            subscription_id,
-            payload,
-            ..
-        } = event
-            && subscription_id == MANY_PTY_SUBSCRIPTION_ID
-        {
-            output.push_str(&live_output_utf8(payload));
-            if output.contains(MANY_PTY_LIVE_MARKER) {
-                return Some(index);
-            }
-        }
-    }
-    None
-}
-
-#[allow(dead_code)]
-fn many_pty_terminal_output(events: &[DaemonEvent]) -> String {
-    let mut output = String::new();
-    for event in events {
-        if let DaemonEvent::TerminalOutput {
-            subscription_id,
-            payload,
-            ..
-        } = event
-            && subscription_id == MANY_PTY_SUBSCRIPTION_ID
-        {
-            output.push_str(&live_output_utf8(payload));
-        }
-    }
-    output
-}
-
-#[allow(dead_code)]
-fn live_output_utf8(payload: &DaemonLiveOutputPayload) -> String {
-    String::from_utf8_lossy(&payload.decoded_bytes().unwrap_or_default()).into_owned()
-}
-
-#[cfg(test)]
-fn live_output_contains(payload: &DaemonLiveOutputPayload, needle: &str) -> bool {
-    payload
-        .decoded_bytes()
-        .map(|bytes| {
-            bytes
-                .windows(needle.len())
-                .any(|window| window == needle.as_bytes())
-        })
-        .unwrap_or(false)
 }
 
 fn many_pty_tail(text: &str) -> String {
@@ -1479,13 +1470,21 @@ pub fn run_client_conformance(
             operation: "attach",
             source,
         })?;
-    expect_kind(&attach, DaemonResponseKind::Events, "attach")?;
+    expect_kind(&attach, DaemonResponseKind::TerminalAttached, "attach")?;
+    let route = attach
+        .terminal_attach
+        .clone()
+        .ok_or(ConformanceError::MissingBody {
+            operation: "attach",
+            field: "terminal_attach",
+        })?;
     if !attach.events.is_empty() {
         return Err(ConformanceError::MissingOutput {
             needle: "empty attach bodies",
             output: format!("{:?}", attach.events),
         });
     }
+    let mut operation_ids = InputOperationIds::default();
     let mut drain_output = String::new();
     let mut terminal_attached = false;
     let attached_deadline = Instant::now() + Duration::from_secs(5);
@@ -1507,9 +1506,9 @@ pub fn run_client_conformance(
 
     terminal
         .send_terminal_frame(
-            CONFORMANCE_SESSION_ID,
-            CONFORMANCE_SUBSCRIPTION_ID,
-            &terminal_resize_frame_bytes(33, 102),
+            &route.subscription_id,
+            route.generation,
+            &terminal_resize_frame_bytes(operation_ids.next(), 33, 102),
         )
         .map_err(|source| ConformanceError::Client {
             operation: "terminal_resize_frame",
@@ -1517,9 +1516,9 @@ pub fn run_client_conformance(
         })?;
     terminal
         .send_terminal_frame(
-            CONFORMANCE_SESSION_ID,
-            CONFORMANCE_SUBSCRIPTION_ID,
-            &terminal_input_frame_bytes(b"from-conformance\r"),
+            &route.subscription_id,
+            route.generation,
+            &terminal_input_frame_bytes(operation_ids.next(), b"from-conformance\r"),
         )
         .map_err(|source| ConformanceError::Client {
             operation: "terminal_input_frame",
@@ -1535,9 +1534,9 @@ pub fn run_client_conformance(
     }
     terminal
         .send_terminal_frame(
-            CONFORMANCE_SESSION_ID,
-            CONFORMANCE_SUBSCRIPTION_ID,
-            &terminal_input_frame_bytes(b"size-check\r"),
+            &route.subscription_id,
+            route.generation,
+            &terminal_input_frame_bytes(operation_ids.next(), b"size-check\r"),
         )
         .map_err(|source| ConformanceError::Client {
             operation: "terminal_size_check_frame",
@@ -1554,9 +1553,9 @@ pub fn run_client_conformance(
     }
     terminal
         .send_terminal_frame(
-            CONFORMANCE_SESSION_ID,
-            CONFORMANCE_SUBSCRIPTION_ID,
-            &terminal_input_frame_bytes(b"quit\r"),
+            &route.subscription_id,
+            route.generation,
+            &terminal_input_frame_bytes(operation_ids.next(), b"quit\r"),
         )
         .map_err(|source| ConformanceError::Client {
             operation: "send_quit",
@@ -4196,25 +4195,56 @@ if (!fs.existsSync(dataDir) || !fs.statSync(dataDir).isDirectory()) {
   process.exit(45);
 }
 
-function readLine(connection) {
-  const newline = connection.buffer.indexOf('\n');
-  if (newline >= 0) {
-    const line = connection.buffer.slice(0, newline);
-    connection.buffer = connection.buffer.slice(newline + 1);
-    return Promise.resolve(line);
+// Host-control protocol 9 Unix framing: [u32 LE frame_len][u8 container][payload].
+const UNIX_CONTAINER_CONTROL = 1;
+
+function encodeControlFrame(frame) {
+  const payload = Buffer.from(JSON.stringify(frame), 'utf8');
+  const header = Buffer.alloc(5);
+  header.writeUInt32LE(1 + payload.length, 0);
+  header.writeUInt8(UNIX_CONTAINER_CONTROL, 4);
+  return Buffer.concat([header, payload]);
+}
+
+function takeFrame(connection) {
+  if (connection.buffer.length < 4) {
+    return undefined;
+  }
+  const frameLength = connection.buffer.readUInt32LE(0);
+  if (connection.buffer.length < 4 + frameLength) {
+    return undefined;
+  }
+  const container = connection.buffer.readUInt8(4);
+  const payload = connection.buffer.subarray(5, 4 + frameLength);
+  connection.buffer = connection.buffer.subarray(4 + frameLength);
+  if (container !== UNIX_CONTAINER_CONTROL) {
+    throw new Error(`unexpected container ${container}`);
+  }
+  return JSON.parse(payload.toString('utf8'));
+}
+
+function readControlFrame(connection) {
+  const ready = takeFrame(connection);
+  if (ready !== undefined) {
+    return Promise.resolve(ready);
   }
 
   return new Promise((resolve, reject) => {
     const onData = (chunk) => {
-      connection.buffer += chunk.toString('utf8');
-      const newline = connection.buffer.indexOf('\n');
-      if (newline < 0) {
+      connection.buffer = Buffer.concat([connection.buffer, chunk]);
+      let frame;
+      try {
+        frame = takeFrame(connection);
+      } catch (error) {
+        cleanup();
+        reject(error);
+        return;
+      }
+      if (frame === undefined) {
         return;
       }
       cleanup();
-      const line = connection.buffer.slice(0, newline);
-      connection.buffer = connection.buffer.slice(newline + 1);
-      resolve(line);
+      resolve(frame);
     };
     const onError = (error) => {
       cleanup();
@@ -4230,27 +4260,39 @@ function readLine(connection) {
 }
 
 const stream = net.createConnection(socket);
-const connection = { stream, buffer: '' };
+const connection = { stream, buffer: Buffer.alloc(0) };
 
 await new Promise((resolve, reject) => {
   stream.once('connect', resolve);
   stream.once('error', reject);
 });
-stream.write(JSON.stringify({
-  protocol: 'botster-hub-daemon-v1',
-  compatibility: {
+stream.write(encodeControlFrame({
+  frame: 'hello',
+  hello: {
     protocol: 'botster-hub-daemon-v1',
-    protocol_version: 1,
-    required_features: [],
-    minimum_conformance_fixture_revision: 1,
-    client_name: 'foreground-terminal-app-open-fixture',
+    compatibility: {
+      protocol: 'botster-hub-daemon-v1',
+      protocol_version: 9,
+      required_features: [],
+      minimum_conformance_fixture_revision: 49,
+      client_name: 'foreground-terminal-app-open-fixture',
+    },
   },
-}) + '\n');
-await readLine(connection);
-stream.write(JSON.stringify({ type: 'status' }) + '\n');
-const response = JSON.parse(await readLine(connection));
+}));
+const ack = await readControlFrame(connection);
+if (ack.frame !== 'hello_ack') {
+  console.error(`unexpected hello ack ${JSON.stringify(ack)}`);
+  process.exit(46);
+}
+stream.write(encodeControlFrame({ frame: 'request', request_id: '1', request: { type: 'status' } }));
+const reply = await readControlFrame(connection);
 stream.end();
 
+if (reply.frame !== 'response' || reply.request_id !== '1') {
+  console.error(`unexpected daemon frame ${JSON.stringify(reply)}`);
+  process.exit(46);
+}
+const response = reply.response;
 if (response.kind !== 'status' || !response.status) {
   console.error(`unexpected daemon response ${JSON.stringify(response)}`);
   process.exit(46);
@@ -4443,41 +4485,33 @@ fn append_read_screen(
     Ok(())
 }
 
-fn envelope_is_attached_frame(envelope: &botster_hub_client::DaemonUnixTerminalEnvelope) -> bool {
-    if envelope.session_id != CONFORMANCE_SESSION_ID
-        || envelope.subscription_id != CONFORMANCE_SUBSCRIPTION_ID
-    {
+/// True for the scheme 2 `ATTACH_STATE attached` frame on the conformance route.
+fn frame_is_attached(frame: &DaemonUnixTerminalFrame) -> bool {
+    if frame.route != CONFORMANCE_SUBSCRIPTION_ID {
         return false;
     }
-    envelope
-        .payload_bytes()
+    TerminalFrame::from_bytes(&frame.body)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<DaemonEvent>(&bytes).ok())
-        .is_some_and(|event| {
-            matches!(
-                event,
-                DaemonEvent::AttachState { state, .. } if state == "attached"
-            )
-        })
+        .and_then(|frame| decode_attach_state(&frame).ok())
+        .is_some_and(|state| state == AttachStateCode::Attached)
 }
 
 fn take_attached_terminal_frame(terminal: &mut DaemonConnection) -> Result<bool, ConformanceError> {
-    while let Some(envelope) =
-        terminal
-            .poll_terminal(Duration::from_millis(25))
-            .map_err(|source| ConformanceError::Client {
-                operation: "attach_wait",
-                source,
-            })?
+    while let Some(frame) = terminal
+        .poll_terminal(Duration::from_millis(25))
+        .map_err(|source| ConformanceError::Client {
+            operation: "attach_wait",
+            source,
+        })?
     {
-        if envelope_is_attached_frame(&envelope) {
+        if frame_is_attached(&frame) {
             return Ok(true);
         }
     }
     Ok(terminal
         .take_skipped_terminal()
-        .into_iter()
-        .any(|envelope| envelope_is_attached_frame(&envelope)))
+        .iter()
+        .any(frame_is_attached))
 }
 
 fn request(
@@ -6068,7 +6102,7 @@ mod tests {
                     "supported": true,
                     "fixture_path": "botster_hub_test_support::late_attach_history_conformance_scenario",
                     "json_helper": "botster_hub_test_support::late_attach_history_conformance_fixture_json",
-                    "event_type": "botster_hub_client::DaemonEvent",
+                    "event_type": "botster_hub_test_support::TerminalStreamFixtureFrame",
                     "runtime_regression": "external_daemon_same_session_reattach_replays_opaque_history_before_live_output",
                 },
                 "terminal_mode_flags": {
@@ -6124,7 +6158,7 @@ mod tests {
         );
         assert_eq!(
             matrix.late_attach_history.event_type,
-            "botster_hub_client::DaemonEvent"
+            "botster_hub_test_support::TerminalStreamFixtureFrame"
         );
     }
 
@@ -6162,54 +6196,67 @@ mod tests {
         assert!(scenario.backend_failure.mode_flags.is_none());
     }
 
+    /// Decode one fixture frame with the Core header validator.
+    fn fixture_terminal_frame(frame: &TerminalStreamFixtureFrame) -> TerminalFrame {
+        let bytes = frame.terminal_body();
+        assert_eq!(bytes.len(), frame.terminal_body_bytes);
+        let decoded = TerminalFrame::from_bytes(&bytes).expect("fixture body has a valid header");
+        assert_eq!(decoded.kind().name(), frame.kind);
+        decoded
+    }
+
+    fn position_of_kind(frames: &[TerminalStreamFixtureFrame], kind: &str) -> usize {
+        frames
+            .iter()
+            .position(|frame| frame.kind == kind)
+            .unwrap_or_else(|| panic!("fixture includes a {kind} frame"))
+    }
+
+    fn last_position_of_kind(frames: &[TerminalStreamFixtureFrame], kind: &str) -> usize {
+        frames
+            .iter()
+            .rposition(|frame| frame.kind == kind)
+            .unwrap_or_else(|| panic!("fixture includes a {kind} frame"))
+    }
+
     #[test]
     fn late_attach_history_fixture_orders_history_before_live_output() {
         let scenario = late_attach_history_conformance_scenario();
+        let frames = &scenario.history_then_live;
 
-        let attaching_index = scenario
-            .history_then_live
-            .iter()
-            .position(|event| {
-                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attaching")
-            })
-            .expect("fixture includes attaching state");
-        let history_index = scenario
-            .history_then_live
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    DaemonEvent::Snapshot { history, .. }
-                        | DaemonEvent::Scrollback { history, .. }
-                        if history.bytes > 0
-                )
-            })
-            .expect("fixture includes opaque initial state");
-        let live_index = scenario
-            .history_then_live
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    DaemonEvent::TerminalOutput { payload, .. }
-                        if live_output_contains(payload, "live-after-attach")
-                )
-            })
-            .expect("fixture includes later live output");
-        let attached_index = scenario
-            .history_then_live
-            .iter()
-            .position(|event| {
-                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attached")
-            })
-            .expect("fixture includes attached state");
-
+        for frame in frames {
+            assert_eq!(frame.route, LATE_ATTACH_HISTORY_SUBSCRIPTION_ID);
+            assert_eq!(frame.generation, 1);
+            let decoded = fixture_terminal_frame(frame);
+            if frame.kind == "attach_state" {
+                assert_eq!(
+                    decode_attach_state(&decoded).expect("attach state decodes"),
+                    AttachStateCode::Attached
+                );
+            }
+        }
+        let attached = position_of_kind(frames, "attach_state");
+        let modes = position_of_kind(frames, "modes");
+        let ready = position_of_kind(frames, "snapshot_ready");
+        let first_history = position_of_kind(frames, "snapshot_history");
+        let finish = position_of_kind(frames, "snapshot_finish");
+        let last_output = last_position_of_kind(frames, "output");
+        let exit = position_of_kind(frames, "process_exit");
         assert!(
-            attaching_index < history_index
-                && history_index < attached_index
-                && attached_index < live_index,
-            "fixture must preserve attaching < history < attached < live"
+            attached < modes && modes < ready && ready < first_history && first_history < finish,
+            "fixture must preserve attached < modes < ready < history < finish"
         );
+        assert!(finish < last_output && last_output < exit);
+        assert_eq!(exit, frames.len() - 1, "process_exit is the last frame");
+        assert!(
+            position_of_kind(frames, "output") > ready,
+            "live output never precedes SNAPSHOT_READY"
+        );
+        let modes_body =
+            botster_terminal_protocol::decode_modes(&fixture_terminal_frame(&frames[modes]))
+                .expect("modes decode");
+        assert_eq!(modes_body.rows, 24);
+        assert_eq!(modes_body.cols, 80);
         assert_eq!(
             scenario
                 .read_screen_text
@@ -6218,71 +6265,78 @@ mod tests {
             1,
             "ReadScreen fixture text is the semantic restored-history oracle"
         );
+        assert_eq!(
+            scenario.terminal_protocol,
+            botster_terminal_protocol::PROTOCOL
+        );
+        assert_eq!(
+            scenario.terminal_protocol_version,
+            botster_terminal_protocol::PROTOCOL_VERSION
+        );
     }
 
     #[test]
-    fn late_attach_history_fixture_idle_case_does_not_fabricate_scrollback() {
+    fn late_attach_history_fixture_idle_case_does_not_fabricate_history_pages() {
         let scenario = late_attach_history_conformance_scenario();
+        let frames = &scenario.no_history_then_live;
 
-        assert!(
-            !scenario
-                .no_history_then_live
-                .iter()
-                .any(|event| { matches!(event, DaemonEvent::Scrollback { .. }) }),
-            "idle fixture must not fabricate scrollback"
-        );
         assert!(scenario.no_history_read_screen_text.is_empty());
-        let no_history_snapshot =
-            scenario
-                .no_history_then_live
-                .iter()
-                .find_map(|event| match event {
-                    DaemonEvent::Snapshot { history, .. } => Some(history),
-                    _ => None,
-                });
-        let no_history_snapshot =
-            no_history_snapshot.expect("no_history emits explicit blank GHOSTSNP Snapshot");
-        let blank = no_history_snapshot
-            .decoded_bytes()
-            .expect("no_history snapshot decodes");
+        let ready = position_of_kind(frames, "snapshot_ready");
+        let blank = fixture_terminal_frame(&frames[ready]);
         assert!(
-            blank.starts_with(GHOSTSNP_MAGIC),
-            "no_history Snapshot must be GHOSTSNP"
+            blank.body().starts_with(GHOSTSNP_MAGIC),
+            "no_history SNAPSHOT_READY must be GHOSTSNP"
         );
-        assert_eq!(blank, LATE_ATTACH_NO_HISTORY_PAYLOAD);
-        let attaching = scenario
-            .no_history_then_live
+        assert_eq!(blank.body(), LATE_ATTACH_NO_HISTORY_PAYLOAD);
+        let history_pages = frames
             .iter()
-            .position(|event| {
-                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attaching")
-            })
-            .expect("attaching");
-        let snapshot = scenario
-            .no_history_then_live
-            .iter()
-            .position(|event| matches!(event, DaemonEvent::Snapshot { .. }))
-            .expect("snapshot");
-        let attached = scenario
-            .no_history_then_live
-            .iter()
-            .position(|event| {
-                matches!(event, DaemonEvent::AttachState { state, .. } if state == "attached")
-            })
-            .expect("attached");
-        let live = scenario
-            .no_history_then_live
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    DaemonEvent::TerminalOutput { payload, .. }
-                        if live_output_contains(payload, "live-without-history")
-                )
-            })
-            .expect("live");
+            .filter(|frame| frame.kind == "snapshot_history")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            history_pages.len(),
+            1,
+            "idle fixture carries only the GHOSTSNP finish record as history"
+        );
+        assert_eq!(
+            fixture_terminal_frame(history_pages[0]).body(),
+            LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD
+        );
+        let attached = position_of_kind(frames, "attach_state");
+        let finish = position_of_kind(frames, "snapshot_finish");
+        let live = position_of_kind(frames, "output");
         assert!(
-            attaching < snapshot && snapshot < attached && attached < live,
-            "no_history must preserve attaching < Snapshot < attached < live"
+            attached < ready && ready < finish && finish < live,
+            "no_history must preserve attached < ready < finish < live"
+        );
+        assert_eq!(
+            fixture_terminal_frame(&frames[live]).body(),
+            LATE_ATTACH_NO_HISTORY_LIVE_DATA.as_bytes()
+        );
+    }
+
+    #[test]
+    fn late_attach_history_unavailable_fixture_keeps_the_route_attached() {
+        let scenario = late_attach_history_conformance_scenario();
+        let frames = &scenario.history_unavailable_then_live;
+
+        for frame in frames {
+            assert_eq!(frame.route, LATE_ATTACH_UNAVAILABLE_SUBSCRIPTION_ID);
+        }
+        let attached = position_of_kind(frames, "attach_state");
+        let ready = position_of_kind(frames, "snapshot_ready");
+        let unavailable = position_of_kind(frames, "history_unavailable");
+        let live = position_of_kind(frames, "output");
+        assert!(attached < ready && ready < unavailable && unavailable < live);
+        assert!(
+            !frames.iter().any(|frame| frame.kind == "snapshot_finish"),
+            "a failed capture never emits SNAPSHOT_FINISH"
+        );
+        assert_eq!(
+            botster_terminal_protocol::decode_history_unavailable(&fixture_terminal_frame(
+                &frames[unavailable]
+            ))
+            .expect("reason decodes"),
+            HistoryUnavailableReason::CaptureFailed
         );
     }
 
@@ -6290,22 +6344,18 @@ mod tests {
     fn late_attach_history_fixture_preserves_opaque_payload_bytes() {
         let scenario = late_attach_history_conformance_scenario();
 
-        for event in scenario
+        for frame in scenario
             .history_then_live
             .iter()
             .chain(scenario.no_history_then_live.iter())
         {
-            match event {
-                DaemonEvent::Snapshot { history, .. } | DaemonEvent::Scrollback { history, .. } => {
-                    let payload = history.decoded_bytes().expect("fixture payload decodes");
-                    assert_eq!(history.bytes, payload.len());
-                    assert_eq!(
-                        history.payload_encoding,
-                        botster_hub_client::DaemonHistoryEncoding::Base64
-                    );
-                    assert!(!payload.is_empty());
-                }
-                _ => {}
+            let decoded = fixture_terminal_frame(frame);
+            if frame.kind == "snapshot_ready" || frame.kind == "snapshot_history" {
+                assert!(!decoded.body().is_empty());
+                assert_eq!(
+                    decoded.len(),
+                    botster_terminal_protocol::TERMINAL_BODY_HEADER_BYTES + decoded.body().len()
+                );
             }
         }
     }
@@ -6405,7 +6455,7 @@ mod tests {
         assert_eq!(provenance.protocol_git, LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT);
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_CORE_PIN,
-            "bf6e7d996bca2786ad4142c870a13c57a490e241"
+            "e0c07f9100955c9c32261afc42c4297e3cea54a0"
         );
         assert_eq!(provenance.core_pin, LATE_ATTACH_GHOSTSNP_CORE_PIN);
         assert_eq!(
@@ -6506,209 +6556,116 @@ mod tests {
     }
 
     #[test]
-    fn late_attach_history_fixture_keeps_control_events_distinct_from_terminal_bytes() {
+    fn late_attach_history_fixture_keeps_control_frames_distinct_from_terminal_bytes() {
         let scenario = late_attach_history_conformance_scenario();
-        let all_events = scenario
+        let all_frames = scenario
             .history_then_live
             .iter()
             .chain(scenario.no_history_then_live.iter())
+            .chain(scenario.history_unavailable_then_live.iter())
             .collect::<Vec<_>>();
 
-        assert!(all_events.iter().any(|event| {
-            matches!(
-                event,
-                DaemonEvent::AttachState {
-                    state,
-                    ..
-                } if state == "attached"
-            )
+        assert!(all_frames.iter().any(|frame| frame.kind == "attach_state"));
+        assert!(all_frames.iter().any(|frame| {
+            frame.kind == "process_exit"
+                && botster_terminal_protocol::decode_process_exit(&fixture_terminal_frame(frame))
+                    .expect("exit decodes")
+                    .code
+                    == Some(0)
         }));
-        assert!(
-            all_events
-                .iter()
-                .any(|event| matches!(event, DaemonEvent::ProcessExit { code: Some(0), .. }))
-        );
-        assert!(
-            all_events.iter().all(|event| {
-                !matches!(
-                    event,
-                    DaemonEvent::AttachState { .. } | DaemonEvent::ProcessExit { .. }
-                ) || !matches!(
-                    event,
-                    DaemonEvent::TerminalOutput { .. }
-                        | DaemonEvent::Snapshot { .. }
-                        | DaemonEvent::Scrollback { .. }
-                )
-            }),
-            "control events must stay separate from terminal byte events"
-        );
+        for frame in &all_frames {
+            let decoded = fixture_terminal_frame(frame);
+            let shared = decoded.kind().is_shared();
+            match frame.kind.as_str() {
+                "attach_state" | "history_unavailable" => {
+                    assert!(!shared, "{} is a personalized route frame", frame.kind);
+                }
+                "output" | "snapshot_ready" | "snapshot_history" | "snapshot_finish"
+                | "process_exit" | "modes" => {
+                    assert!(shared, "{} is a shared session frame", frame.kind);
+                }
+                other => panic!("unexpected fixture kind {other}"),
+            }
+        }
     }
 
     #[test]
     fn late_attach_history_fixture_serializes_to_stable_client_json() {
         let value = late_attach_history_conformance_fixture_json();
-        let history_ready = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
-            LATE_ATTACH_HISTORY_READY_PAYLOAD,
-        );
-        let history_page = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
-            LATE_ATTACH_HISTORY_PAGE_PAYLOAD,
-        );
-        let history_finish = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
-            LATE_ATTACH_HISTORY_FINISH_PAYLOAD,
-        );
-        let blank_ready = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
-            LATE_ATTACH_NO_HISTORY_READY_PAYLOAD,
-        );
-        let blank_finish = botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(
-            LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD,
-        );
-        let history_live = DaemonLiveOutputPayload::from_bytes(LATE_ATTACH_LIVE_DATA.as_bytes());
-        let no_history_live =
-            DaemonLiveOutputPayload::from_bytes(LATE_ATTACH_NO_HISTORY_LIVE_DATA.as_bytes());
+        let scenario = late_attach_history_conformance_scenario();
+        let frame_json = |frame: &TerminalStreamFixtureFrame| {
+            serde_json::json!({
+                "route": frame.route,
+                "generation": 1,
+                "kind": frame.kind,
+                "terminal_body_base64": frame.terminal_body_base64,
+                "terminal_body_bytes": frame.terminal_body_bytes,
+            })
+        };
 
         assert_eq!(
             value,
             serde_json::json!({
                 "conformance_fixture_revision": botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
+                "terminal_protocol": botster_terminal_protocol::PROTOCOL,
+                "terminal_protocol_version": botster_terminal_protocol::PROTOCOL_VERSION,
                 "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
                 "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
                 "no_history_session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
                 "no_history_subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
+                "history_unavailable_session_id": LATE_ATTACH_UNAVAILABLE_SESSION_ID,
+                "history_unavailable_subscription_id": LATE_ATTACH_UNAVAILABLE_SUBSCRIPTION_ID,
                 "read_screen_text": LATE_ATTACH_HISTORY_SCREEN_TEXT,
                 "no_history_read_screen_text": "",
-                "history_then_live": [
-                    {
-                        "type": "attach_state",
-                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "state": "attaching",
-                    },
-                    {
-                        "type": "snapshot",
-                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": history_ready.payload_base64,
-                        "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_HISTORY_READY_PAYLOAD.len(),
-                    },
-                    {
-                        "type": "snapshot",
-                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": history_page.payload_base64,
-                        "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_HISTORY_PAGE_PAYLOAD.len(),
-                    },
-                    {
-                        "type": "snapshot",
-                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": history_finish.payload_base64,
-                        "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_HISTORY_FINISH_PAYLOAD.len(),
-                    },
-                    {
-                        "type": "attach_state",
-                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "state": "attached",
-                    },
-                    {
-                        "type": "terminal_output",
-                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": history_live.payload_base64,
-                        "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_LIVE_DATA.len(),
-                    },
-                    {
-                        "type": "process_exit",
-                        "session_id": LATE_ATTACH_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-                        "code": 0,
-                    },
-                ],
-                "no_history_then_live": [
-                    {
-                        "type": "attach_state",
-                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-                        "state": "attaching",
-                    },
-                    {
-                        "type": "snapshot",
-                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": blank_ready.payload_base64,
-                        "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_NO_HISTORY_READY_PAYLOAD.len(),
-                    },
-                    {
-                        "type": "snapshot",
-                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": blank_finish.payload_base64,
-                        "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD.len(),
-                    },
-                    {
-                        "type": "attach_state",
-                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-                        "state": "attached",
-                    },
-                    {
-                        "type": "terminal_output",
-                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-                        "payload_base64": no_history_live.payload_base64,
-                        "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_NO_HISTORY_LIVE_DATA.len(),
-                    },
-                    {
-                        "type": "process_exit",
-                        "session_id": LATE_ATTACH_NO_HISTORY_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-                        "code": 0,
-                    },
-                ],
-                "history_incomplete_then_live": [
-                    {
-                        "type": "attach_state",
-                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
-                        "state": "attaching",
-                    },
-                    {
-                        "type": "snapshot",
-                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
-                        "payload_base64": history_ready.payload_base64,
-                        "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_HISTORY_READY_PAYLOAD.len(),
-                    },
-                    {
-                        "type": "attach_state",
-                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
-                        "state": "snapshot_history_incomplete",
-                    },
-                    {
-                        "type": "attach_state",
-                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
-                        "state": "attached",
-                    },
-                    {
-                        "type": "terminal_output",
-                        "session_id": LATE_ATTACH_INCOMPLETE_SESSION_ID,
-                        "subscription_id": LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
-                        "payload_base64": history_live.payload_base64,
-                        "payload_encoding": "base64",
-                        "bytes": LATE_ATTACH_LIVE_DATA.len(),
-                    },
-                ],
+                "history_then_live": scenario
+                    .history_then_live
+                    .iter()
+                    .map(frame_json)
+                    .collect::<Vec<_>>(),
+                "no_history_then_live": scenario
+                    .no_history_then_live
+                    .iter()
+                    .map(frame_json)
+                    .collect::<Vec<_>>(),
+                "history_unavailable_then_live": scenario
+                    .history_unavailable_then_live
+                    .iter()
+                    .map(frame_json)
+                    .collect::<Vec<_>>(),
             })
+        );
+        assert_eq!(
+            scenario
+                .history_then_live
+                .iter()
+                .map(|frame| frame.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "attach_state",
+                "modes",
+                "snapshot_ready",
+                "output",
+                "snapshot_history",
+                "snapshot_history",
+                "snapshot_finish",
+                "output",
+                "process_exit",
+            ]
+        );
+        let ready = fixture_terminal_frame(&scenario.history_then_live[2]);
+        assert_eq!(ready.body(), LATE_ATTACH_HISTORY_READY_PAYLOAD);
+        assert_eq!(
+            hex_sha256(ready.body()),
+            LATE_ATTACH_HISTORY_READY_PAYLOAD_SHA256
+        );
+        let page = fixture_terminal_frame(&scenario.history_then_live[4]);
+        assert_eq!(page.body(), LATE_ATTACH_HISTORY_PAGE_PAYLOAD);
+        let finish_record = fixture_terminal_frame(&scenario.history_then_live[5]);
+        assert_eq!(finish_record.body(), LATE_ATTACH_HISTORY_FINISH_PAYLOAD);
+        assert!(
+            fixture_terminal_frame(&scenario.history_then_live[6])
+                .body()
+                .is_empty()
         );
     }
 

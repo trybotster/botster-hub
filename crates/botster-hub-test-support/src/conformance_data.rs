@@ -7,12 +7,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use botster_hub_client::{
     DaemonCompatibility, DaemonCompatibilityRequirement, DaemonDiagnosticKind, DaemonEntityFrame,
-    DaemonEvent, DaemonLiveOutputPayload, DaemonModeFlags, DaemonRequest, DaemonResponseKind,
-    DaemonSessionEntity, DaemonSessionType, DaemonSessionTypeDefinition,
-    DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeSource,
-    DaemonSessionTypeWorkingDirectory,
+    DaemonModeFlags, DaemonRequest, DaemonResponseKind, DaemonSessionEntity, DaemonSessionType,
+    DaemonSessionTypeDefinition, DaemonSessionTypeExecution, DaemonSessionTypeMutationSource,
+    DaemonSessionTypeSource, DaemonSessionTypeWorkingDirectory, LocalWebrtcTerminalChunkHeader,
+};
+use botster_terminal_protocol::{
+    AttachStateCode, HistoryUnavailableReason, ModesBody, TerminalFrame, encode_attach_state,
+    encode_history_unavailable, encode_modes, encode_output, encode_process_exit,
+    encode_snapshot_finish, encode_snapshot_history, encode_snapshot_ready, mode_bits,
 };
 use botster_ui_contract::{UiNode, realize_bind_list_descendant_id};
 use serde::{Deserialize, Serialize};
@@ -28,9 +33,12 @@ pub(crate) const LATE_ATTACH_HISTORY_SUBSCRIPTION_ID: &str =
 pub(crate) const LATE_ATTACH_NO_HISTORY_SESSION_ID: &str = "late-attach-no-history-fixture-session";
 pub(crate) const LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID: &str =
     "late-attach-no-history-fixture-subscription";
-pub(crate) const LATE_ATTACH_INCOMPLETE_SESSION_ID: &str = "late-attach-incomplete-fixture-session";
-pub(crate) const LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID: &str =
-    "late-attach-incomplete-fixture-subscription";
+pub(crate) const LATE_ATTACH_UNAVAILABLE_SESSION_ID: &str =
+    "late-attach-unavailable-fixture-session";
+pub(crate) const LATE_ATTACH_UNAVAILABLE_SUBSCRIPTION_ID: &str =
+    "late-attach-unavailable-fixture-subscription";
+/// Route generation used by every late-attach fixture frame.
+pub(crate) const LATE_ATTACH_FIXTURE_GENERATION: u64 = 1;
 /// Frozen GHOSTSNP magic shared by both late-attach Core files.
 pub(crate) const GHOSTSNP_MAGIC: &[u8] = b"GHOSTSNP";
 /// Locked `botster-terminal-protocol` crate that owns the late-attach files.
@@ -39,7 +47,7 @@ pub(crate) const LATE_ATTACH_GHOSTSNP_PROTOCOL_CRATE: &str = "botster-terminal-p
 pub(crate) const LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT: &str =
     "https://github.com/trybotster/botster-core.git";
 /// Core revision that owns the consumed `botster-terminal-protocol` files.
-pub(crate) const LATE_ATTACH_GHOSTSNP_CORE_PIN: &str = "bf6e7d996bca2786ad4142c870a13c57a490e241";
+pub(crate) const LATE_ATTACH_GHOSTSNP_CORE_PIN: &str = "e0c07f9100955c9c32261afc42c4297e3cea54a0";
 /// Ghostty submodule pin resolved by the locked Core revision.
 pub(crate) const LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN: &str =
     "eb72ec61304ea256be1d86ed8fa961c84e43ecbd";
@@ -353,23 +361,53 @@ pub struct TerminalModeFlagsSupport {
     pub response_kind: String,
 }
 
+/// One scheme 2 terminal frame as a client observes it on a Hub terminal container.
+///
+/// `terminal_body_base64` is the complete Core `TerminalBody` (8-byte header
+/// plus body) produced by the Core encoders. Clients decode it with the Core
+/// terminal-protocol codec; Hub never inspects it. `route` and `generation`
+/// come from the container envelope, never from the body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalStreamFixtureFrame {
+    pub route: String,
+    pub generation: u64,
+    /// Core `TerminalKind` name, for readable ordering assertions.
+    pub kind: String,
+    pub terminal_body_base64: String,
+    pub terminal_body_bytes: usize,
+}
+
+impl TerminalStreamFixtureFrame {
+    /// Decode the complete `TerminalBody` bytes.
+    #[must_use]
+    pub fn terminal_body(&self) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(&self.terminal_body_base64)
+            .expect("fixture terminal body is valid base64")
+    }
+}
+
 /// Public client-shaped scenario for late terminal attach state and screen restoration.
 ///
-/// The events use [`botster_hub_client::DaemonEvent`] values only, so
+/// The frames are Core scheme 2 bodies inside Hub terminal containers, so
 /// downstream web/TUI tests can either consume this struct in Rust test code or
 /// mirror the serde JSON emitted by [`late_attach_history_conformance_fixture_json`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LateAttachHistoryConformanceScenario {
     pub conformance_fixture_revision: u16,
+    pub terminal_protocol: String,
+    pub terminal_protocol_version: u16,
     pub session_id: String,
     pub subscription_id: String,
     pub no_history_session_id: String,
     pub no_history_subscription_id: String,
+    pub history_unavailable_session_id: String,
+    pub history_unavailable_subscription_id: String,
     pub read_screen_text: String,
     pub no_history_read_screen_text: String,
-    pub history_then_live: Vec<DaemonEvent>,
-    pub no_history_then_live: Vec<DaemonEvent>,
-    pub history_incomplete_then_live: Vec<DaemonEvent>,
+    pub history_then_live: Vec<TerminalStreamFixtureFrame>,
+    pub no_history_then_live: Vec<TerminalStreamFixtureFrame>,
+    pub history_unavailable_then_live: Vec<TerminalStreamFixtureFrame>,
 }
 
 /// Public request/response conformance scenarios for authoritative terminal mode readback.
@@ -650,7 +688,7 @@ pub fn first_party_client_support_matrix() -> FirstPartyClientSupportMatrix {
                 .to_string(),
             json_helper: "botster_hub_test_support::late_attach_history_conformance_fixture_json"
                 .to_string(),
-            event_type: "botster_hub_client::DaemonEvent".to_string(),
+            event_type: "botster_hub_test_support::TerminalStreamFixtureFrame".to_string(),
             runtime_regression:
                 "external_daemon_same_session_reattach_replays_opaque_history_before_live_output"
                     .to_string(),
@@ -1530,15 +1568,19 @@ pub fn session_plugin_binding_conformance_fixture_json() -> serde_json::Value {
 pub fn late_attach_history_conformance_scenario() -> LateAttachHistoryConformanceScenario {
     LateAttachHistoryConformanceScenario {
         conformance_fixture_revision: botster_hub_client::CONFORMANCE_FIXTURE_REVISION,
+        terminal_protocol: botster_terminal_protocol::PROTOCOL.to_string(),
+        terminal_protocol_version: botster_terminal_protocol::PROTOCOL_VERSION,
         session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
         subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
         no_history_session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
         no_history_subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
+        history_unavailable_session_id: LATE_ATTACH_UNAVAILABLE_SESSION_ID.to_string(),
+        history_unavailable_subscription_id: LATE_ATTACH_UNAVAILABLE_SUBSCRIPTION_ID.to_string(),
         read_screen_text: LATE_ATTACH_HISTORY_SCREEN_TEXT.to_string(),
         no_history_read_screen_text: String::new(),
-        history_then_live: late_attach_history_events(),
-        no_history_then_live: late_attach_no_history_events(),
-        history_incomplete_then_live: late_attach_history_incomplete_events(),
+        history_then_live: late_attach_history_frames(),
+        no_history_then_live: late_attach_no_history_frames(),
+        history_unavailable_then_live: late_attach_history_unavailable_frames(),
     }
 }
 
@@ -1555,13 +1597,13 @@ pub fn mode_flags_conformance_scenario() -> ModeFlagsConformanceScenario {
         mouse_off: ModeFlagsConformanceSuccess {
             response_kind: DaemonResponseKind::ReadModeFlags,
             mode_flags: DaemonModeFlags::new(
-                SESSION_ID, false, true, false, 0, false, false, false, 1, 1,
+                SESSION_ID, false, true, false, 0, false, false, false, 24, 80, None,
             ),
         },
         mouse_on: ModeFlagsConformanceSuccess {
             response_kind: DaemonResponseKind::ReadModeFlags,
             mode_flags: DaemonModeFlags::new(
-                SESSION_ID, false, true, false, 9, false, false, false, 1, 2,
+                SESSION_ID, false, true, false, 9, false, false, false, 24, 80, None,
             ),
         },
         unknown_session: ModeFlagsConformanceFailure {
@@ -1579,124 +1621,118 @@ pub fn mode_flags_conformance_scenario() -> ModeFlagsConformanceScenario {
     }
 }
 
-fn snapshot_event(session_id: &str, subscription_id: &str, bytes: &[u8]) -> DaemonEvent {
-    DaemonEvent::Snapshot {
-        session_id: session_id.to_string(),
-        subscription_id: subscription_id.to_string(),
-        history: botster_hub_client::DaemonOpaqueHistoryPayload::from_bytes(bytes),
+/// Wrap one Core-encoded frame as a fixture frame on `route`.
+fn fixture_frame(route: &str, frame: TerminalFrame) -> TerminalStreamFixtureFrame {
+    TerminalStreamFixtureFrame {
+        route: route.to_string(),
+        generation: LATE_ATTACH_FIXTURE_GENERATION,
+        kind: frame.kind().name().to_string(),
+        terminal_body_base64: base64::engine::general_purpose::STANDARD.encode(frame.as_bytes()),
+        terminal_body_bytes: frame.len(),
     }
 }
 
-/// Incremental late-attach sequence: READY, PAGE, FINISH, attached, live, exit.
+/// Fixture terminal geometry and modes: cursor visible, 24 rows by 80 columns.
+fn fixture_modes() -> ModesBody {
+    ModesBody {
+        mode_bits: mode_bits::CURSOR_VISIBLE,
+        rows: 24,
+        cols: 80,
+    }
+}
+
+/// Late-attach sequence with history: attached, MODES, SNAPSHOT_READY, live
+/// OUTPUT interleaved before SNAPSHOT_HISTORY, the GHOSTSNP finish record as
+/// the last SNAPSHOT_HISTORY page, SNAPSHOT_FINISH, later OUTPUT, PROCESS_EXIT.
 #[must_use]
-pub fn late_attach_history_events() -> Vec<DaemonEvent> {
+pub fn late_attach_history_frames() -> Vec<TerminalStreamFixtureFrame> {
+    let route = LATE_ATTACH_HISTORY_SUBSCRIPTION_ID;
     vec![
-        DaemonEvent::AttachState {
-            session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
-            state: "attaching".to_string(),
-        },
-        snapshot_event(
-            LATE_ATTACH_HISTORY_SESSION_ID,
-            LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-            LATE_ATTACH_HISTORY_READY_PAYLOAD,
+        fixture_frame(
+            route,
+            encode_attach_state(AttachStateCode::Attached).expect("attach state encodes"),
         ),
-        snapshot_event(
-            LATE_ATTACH_HISTORY_SESSION_ID,
-            LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-            LATE_ATTACH_HISTORY_PAGE_PAYLOAD,
+        fixture_frame(route, encode_modes(fixture_modes()).expect("modes encode")),
+        fixture_frame(
+            route,
+            encode_snapshot_ready(LATE_ATTACH_HISTORY_READY_PAYLOAD).expect("ready encodes"),
         ),
-        snapshot_event(
-            LATE_ATTACH_HISTORY_SESSION_ID,
-            LATE_ATTACH_HISTORY_SUBSCRIPTION_ID,
-            LATE_ATTACH_HISTORY_FINISH_PAYLOAD,
+        fixture_frame(
+            route,
+            encode_output(LATE_ATTACH_LIVE_DATA.as_bytes()).expect("output encodes"),
         ),
-        DaemonEvent::AttachState {
-            session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
-            state: "attached".to_string(),
-        },
-        DaemonEvent::TerminalOutput {
-            session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(LATE_ATTACH_LIVE_DATA.as_bytes()),
-        },
-        DaemonEvent::ProcessExit {
-            session_id: LATE_ATTACH_HISTORY_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_HISTORY_SUBSCRIPTION_ID.to_string(),
-            code: Some(0),
-        },
+        fixture_frame(
+            route,
+            encode_snapshot_history(LATE_ATTACH_HISTORY_PAGE_PAYLOAD).expect("page encodes"),
+        ),
+        fixture_frame(
+            route,
+            encode_snapshot_history(LATE_ATTACH_HISTORY_FINISH_PAYLOAD)
+                .expect("finish record encodes"),
+        ),
+        fixture_frame(route, encode_snapshot_finish().expect("finish encodes")),
+        fixture_frame(
+            route,
+            encode_output(LATE_ATTACH_LIVE_DATA.as_bytes()).expect("output encodes"),
+        ),
+        fixture_frame(route, encode_process_exit(Some(0)).expect("exit encodes")),
     ]
 }
 
-/// Empty-history late-attach sequence: READY, FINISH, attached, live, exit.
+/// Empty-history late-attach sequence: attached, MODES, blank SNAPSHOT_READY,
+/// the blank GHOSTSNP finish record as SNAPSHOT_HISTORY, SNAPSHOT_FINISH,
+/// OUTPUT, PROCESS_EXIT.
 #[must_use]
-pub fn late_attach_no_history_events() -> Vec<DaemonEvent> {
+pub fn late_attach_no_history_frames() -> Vec<TerminalStreamFixtureFrame> {
+    let route = LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID;
     vec![
-        DaemonEvent::AttachState {
-            session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
-            state: "attaching".to_string(),
-        },
-        snapshot_event(
-            LATE_ATTACH_NO_HISTORY_SESSION_ID,
-            LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-            LATE_ATTACH_NO_HISTORY_READY_PAYLOAD,
+        fixture_frame(
+            route,
+            encode_attach_state(AttachStateCode::Attached).expect("attach state encodes"),
         ),
-        snapshot_event(
-            LATE_ATTACH_NO_HISTORY_SESSION_ID,
-            LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID,
-            LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD,
+        fixture_frame(route, encode_modes(fixture_modes()).expect("modes encode")),
+        fixture_frame(
+            route,
+            encode_snapshot_ready(LATE_ATTACH_NO_HISTORY_READY_PAYLOAD).expect("ready encodes"),
         ),
-        DaemonEvent::AttachState {
-            session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
-            state: "attached".to_string(),
-        },
-        DaemonEvent::TerminalOutput {
-            session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(
-                LATE_ATTACH_NO_HISTORY_LIVE_DATA.as_bytes(),
-            ),
-        },
-        DaemonEvent::ProcessExit {
-            session_id: LATE_ATTACH_NO_HISTORY_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_NO_HISTORY_SUBSCRIPTION_ID.to_string(),
-            code: Some(0),
-        },
+        fixture_frame(
+            route,
+            encode_snapshot_history(LATE_ATTACH_NO_HISTORY_FINISH_PAYLOAD)
+                .expect("finish record encodes"),
+        ),
+        fixture_frame(route, encode_snapshot_finish().expect("finish encodes")),
+        fixture_frame(
+            route,
+            encode_output(LATE_ATTACH_NO_HISTORY_LIVE_DATA.as_bytes()).expect("output encodes"),
+        ),
+        fixture_frame(route, encode_process_exit(Some(0)).expect("exit encodes")),
     ]
 }
 
-/// Post-READY history failure: READY, snapshot_history_incomplete, attached, live.
+/// Post-READY capture failure: attached, MODES, SNAPSHOT_READY,
+/// HISTORY_UNAVAILABLE(capture_failed), OUTPUT. The route stays attached.
 #[must_use]
-pub fn late_attach_history_incomplete_events() -> Vec<DaemonEvent> {
+pub fn late_attach_history_unavailable_frames() -> Vec<TerminalStreamFixtureFrame> {
+    let route = LATE_ATTACH_UNAVAILABLE_SUBSCRIPTION_ID;
     vec![
-        DaemonEvent::AttachState {
-            session_id: LATE_ATTACH_INCOMPLETE_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID.to_string(),
-            state: "attaching".to_string(),
-        },
-        snapshot_event(
-            LATE_ATTACH_INCOMPLETE_SESSION_ID,
-            LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID,
-            LATE_ATTACH_HISTORY_READY_PAYLOAD,
+        fixture_frame(
+            route,
+            encode_attach_state(AttachStateCode::Attached).expect("attach state encodes"),
         ),
-        DaemonEvent::AttachState {
-            session_id: LATE_ATTACH_INCOMPLETE_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID.to_string(),
-            state: botster_hub_client::ATTACH_STATE_SNAPSHOT_HISTORY_INCOMPLETE.to_string(),
-        },
-        DaemonEvent::AttachState {
-            session_id: LATE_ATTACH_INCOMPLETE_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID.to_string(),
-            state: "attached".to_string(),
-        },
-        DaemonEvent::TerminalOutput {
-            session_id: LATE_ATTACH_INCOMPLETE_SESSION_ID.to_string(),
-            subscription_id: LATE_ATTACH_INCOMPLETE_SUBSCRIPTION_ID.to_string(),
-            payload: DaemonLiveOutputPayload::from_bytes(LATE_ATTACH_LIVE_DATA.as_bytes()),
-        },
+        fixture_frame(route, encode_modes(fixture_modes()).expect("modes encode")),
+        fixture_frame(
+            route,
+            encode_snapshot_ready(LATE_ATTACH_HISTORY_READY_PAYLOAD).expect("ready encodes"),
+        ),
+        fixture_frame(
+            route,
+            encode_history_unavailable(HistoryUnavailableReason::CaptureFailed)
+                .expect("history unavailable encodes"),
+        ),
+        fixture_frame(
+            route,
+            encode_output(LATE_ATTACH_LIVE_DATA.as_bytes()).expect("output encodes"),
+        ),
     ]
 }
 
@@ -1817,24 +1853,52 @@ pub fn mode_flags_conformance_fixture_json() -> serde_json::Value {
 /// Return deterministic local WebRTC delivery-chunk scenarios for downstream clients.
 #[must_use]
 pub fn local_webrtc_delivery_chunk_conformance_fixture_json() -> serde_json::Value {
+    let terminal_header = LocalWebrtcTerminalChunkHeader {
+        message_id: 7,
+        chunk_index: 1,
+        chunk_count: 3,
+        total_bytes: 30_000,
+        generation: 11,
+    };
+    let terminal_header_hex = terminal_header
+        .encode()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     serde_json::json!({
         "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
         "maximum_frame_bytes_exclusive": botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES,
         "maximum_delivery_bytes": botster_hub_client::LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
+        "control_delivery_kinds": ["server_frame"],
+        "terminal_chunk": {
+            "layout": "[u8 version][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][12-byte nonce][ciphertext || 16-byte tag]",
+            "header_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES,
+            "nonce_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES,
+            "tag_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES,
+            "route_identity": "subscription DataChannel label",
+            "example": {
+                "message_id": terminal_header.message_id,
+                "chunk_index": terminal_header.chunk_index,
+                "chunk_count": terminal_header.chunk_count,
+                "total_bytes": terminal_header.total_bytes,
+                "generation": terminal_header.generation,
+                "header_hex": terminal_header_hex
+            }
+        },
         "scenarios": {
-            "daemon_response": [{
+            "server_frame": [{
                 "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
-                "delivery_kind": "daemon_response",
+                "delivery_kind": "server_frame",
                 "message_id": "response-single",
                 "chunk_index": 0,
                 "chunk_count": 1,
                 "total_bytes": 18,
                 "payload": "encrypted-envelope"
             }],
-            "daemon_entity_frame": [
+            "server_frame_multiple": [
                 {
                     "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
-                    "delivery_kind": "daemon_entity_frame",
+                    "delivery_kind": "server_frame",
                     "message_id": "entity-multiple",
                     "chunk_index": 0,
                     "chunk_count": 2,
@@ -1843,7 +1907,7 @@ pub fn local_webrtc_delivery_chunk_conformance_fixture_json() -> serde_json::Val
                 },
                 {
                     "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
-                    "delivery_kind": "daemon_entity_frame",
+                    "delivery_kind": "server_frame",
                     "message_id": "entity-multiple",
                     "chunk_index": 1,
                     "chunk_count": 2,
@@ -1862,7 +1926,7 @@ pub fn local_webrtc_delivery_chunk_conformance_fixture_json() -> serde_json::Val
             },
             "over_budget_operator_error": [{
                 "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
-                "delivery_kind": "daemon_response",
+                "delivery_kind": "server_frame",
                 "message_id": "response-over-budget",
                 "chunk_index": 0,
                 "chunk_count": 1,

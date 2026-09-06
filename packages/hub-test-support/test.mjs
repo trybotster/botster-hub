@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.43");
+assert.equal(metadata.package_version, "0.1.44");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 8);
-assert.equal(metadata.conformance_fixture_revision, 48);
+assert.equal(metadata.protocol_version, 9);
+assert.equal(metadata.conformance_fixture_revision, 49);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
 {
@@ -174,8 +174,8 @@ assert.equal(metadata.conformance_fixture_revision, 48);
     ...readme.matchAll(/"@trybotster\/hub-test-support":\s*"([^"]+)"/g),
   ].map((match) => match[1]);
   assert.deepEqual(packageSpecPins, [version]);
-  assert.match(readme, /protocol version 8/);
-  assert.match(readme, /conformance revision 48/);
+  assert.match(readme, /protocol version 9/);
+  assert.match(readme, /conformance revision 49/);
   assert.doesNotMatch(readme, /mode_gated_input|ModeGatedInput|SendInput/);
 }
 assert.deepEqual(metadata.ui_contract, {
@@ -241,6 +241,16 @@ assert.match(protocol, /capture_snapshot/);
 assert.match(protocol, /export interface DaemonReadScreen/);
 assert.match(protocol, /export interface DaemonModeFlags/);
 assert.match(protocol, /export interface DaemonCaptureSnapshot/);
+assert.match(protocol, /export interface DaemonSnapshotPage/);
+assert.match(protocol, /read_snapshot_page/);
+assert.match(protocol, /export type HistoryUnavailableReason/);
+assert.match(protocol, /export type ClientFrame/);
+assert.match(protocol, /export type ServerFrame/);
+assert.match(protocol, /export const PROTOCOL_VERSION = 9;/);
+assert.match(protocol, /export const MAX_OUTSTANDING_REQUESTS = 32;/);
+assert.match(protocol, /export const UNIX_CONTAINER_TERMINAL = 2;/);
+assert.match(protocol, /export const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES = 29;/);
+assert.doesNotMatch(protocol, /terminal_output|DaemonUnixTerminalEnvelope|mode_generation/);
 assert.match(protocol, /export interface DaemonLocalWebrtcDeliveryChunk/);
 assert.match(protocol, /export interface DaemonPluginWorkerCounters/);
 assert.match(protocol, /plugin_worker_counters\?: DaemonPluginWorkerCounters \| null/);
@@ -596,12 +606,26 @@ assert.equal(modeFlagsFixture.backend_failure.mode_flags, null);
 assert.equal(chunkFixture.version, 2);
 assert.equal(chunkFixture.maximum_frame_bytes_exclusive, 65536);
 assert.equal(chunkFixture.maximum_delivery_bytes, 16777216);
-assert.equal(chunkFixture.scenarios.daemon_response.length, 1);
-assert.equal(chunkFixture.scenarios.daemon_response[0].delivery_kind, "daemon_response");
-assert.equal(chunkFixture.scenarios.daemon_entity_frame.length, 2);
-assert.equal(chunkFixture.scenarios.daemon_entity_frame[0].delivery_kind, "daemon_entity_frame");
+assert.deepEqual(chunkFixture.control_delivery_kinds, ["server_frame"]);
+assert.equal(chunkFixture.terminal_chunk.header_bytes, 29);
+assert.equal(chunkFixture.terminal_chunk.nonce_bytes, 12);
+assert.equal(chunkFixture.terminal_chunk.tag_bytes, 16);
+{
+  const header = Buffer.from(chunkFixture.terminal_chunk.example.header_hex, "hex");
+  assert.equal(header.length, 29);
+  assert.equal(header.readUInt8(0), 2);
+  assert.equal(Number(header.readBigUInt64LE(1)), chunkFixture.terminal_chunk.example.message_id);
+  assert.equal(header.readUInt32LE(9), chunkFixture.terminal_chunk.example.chunk_index);
+  assert.equal(header.readUInt32LE(13), chunkFixture.terminal_chunk.example.chunk_count);
+  assert.equal(header.readUInt32LE(17), chunkFixture.terminal_chunk.example.total_bytes);
+  assert.equal(Number(header.readBigUInt64LE(21)), chunkFixture.terminal_chunk.example.generation);
+}
+assert.equal(chunkFixture.scenarios.server_frame.length, 1);
+assert.equal(chunkFixture.scenarios.server_frame[0].delivery_kind, "server_frame");
+assert.equal(chunkFixture.scenarios.server_frame_multiple.length, 2);
+assert.equal(chunkFixture.scenarios.server_frame_multiple[0].delivery_kind, "server_frame");
 assert.equal(
-  chunkFixture.scenarios.daemon_entity_frame.map((chunk) => chunk.payload).join(""),
+  chunkFixture.scenarios.server_frame_multiple.map((chunk) => chunk.payload).join(""),
   "encrypted-envelope",
 );
 const largeScenario = chunkFixture.scenarios.large_generated;
@@ -626,64 +650,64 @@ const GOLDEN_A_SHA256 =
   "fbcdda31d682a61420251eed68f72e413485f057e3f374c57582955b0316bb6d";
 const GOLDEN_B_SHA256 =
   "06962b11d4a3acfb9b7c52b673a7b476904ddee2dd754b89b190ff82fdcfd0cc";
-const historyIndex = lateAttachFixture.history_then_live.findIndex(
-  (event) =>
-    (event.type === "snapshot" || event.type === "scrollback") &&
-    event.payload_base64.length > 0,
-);
-const liveIndex = lateAttachFixture.history_then_live.findIndex(
-  (event) => event.type === "terminal_output",
-);
-const attachingIndex = lateAttachFixture.history_then_live.findIndex(
-  (event) => event.type === "attach_state" && event.state === "attaching",
-);
-const attachedIndex = lateAttachFixture.history_then_live.findIndex(
-  (event) => event.type === "attach_state" && event.state === "attached",
-);
-assert.notEqual(attachingIndex, -1);
-assert.notEqual(historyIndex, -1);
+// Core scheme 2 TerminalBody: [u8 scheme=2][u8 kind][u16 LE flags][u32 LE body_len][body].
+// Clients decode bodies with the Core terminal-protocol codec; this check reads
+// only the fixed header and the payload after it.
+const TERMINAL_BODY_HEADER_BYTES = 8;
+function terminalBody(frame) {
+  const bytes = Buffer.from(frame.terminal_body_base64, "base64");
+  assert.equal(frame.terminal_body_bytes, bytes.length);
+  assert.equal(bytes.readUInt8(0), 2, "scheme byte");
+  assert.equal(bytes.readUInt32LE(4), bytes.length - TERMINAL_BODY_HEADER_BYTES, "body_len");
+  return bytes.subarray(TERMINAL_BODY_HEADER_BYTES);
+}
+function kindIndex(frames, kind) {
+  return frames.findIndex((frame) => frame.kind === kind);
+}
+function lastKindIndex(frames, kind) {
+  return frames.findLastIndex((frame) => frame.kind === kind);
+}
+assert.equal(lateAttachFixture.terminal_protocol, "botster-terminal-v2");
+assert.equal(lateAttachFixture.terminal_protocol_version, 2);
+const historyFrames = lateAttachFixture.history_then_live;
+for (const frame of historyFrames) {
+  assert.equal(frame.route, lateAttachFixture.subscription_id);
+  assert.equal(frame.generation, 1);
+  terminalBody(frame);
+}
+const attachedIndex = kindIndex(historyFrames, "attach_state");
+const modesIndex = kindIndex(historyFrames, "modes");
+const readyIndex = kindIndex(historyFrames, "snapshot_ready");
+const firstHistoryIndex = kindIndex(historyFrames, "snapshot_history");
+const finishIndex = kindIndex(historyFrames, "snapshot_finish");
+const lastOutputIndex = lastKindIndex(historyFrames, "output");
+const exitIndex = kindIndex(historyFrames, "process_exit");
 assert.notEqual(attachedIndex, -1);
-assert.equal(attachingIndex < historyIndex, true);
-assert.equal(historyIndex < attachedIndex, true);
-assert.equal(attachedIndex < liveIndex, true);
-const historySnapshot = lateAttachFixture.history_then_live[historyIndex];
-assert.equal(historySnapshot.type, "snapshot");
-const historyPayload = Buffer.from(historySnapshot.payload_base64, "base64");
-assert.equal(historySnapshot.bytes, historyPayload.length);
-assert.equal(historySnapshot.payload_encoding, "base64");
-assert.equal(historyPayload.subarray(0, 8).equals(GHOSTSNP_MAGIC), true);
-assert.equal(createHash("sha256").update(historyPayload).digest("hex"), GOLDEN_A_SHA256);
+assert.notEqual(readyIndex, -1);
+assert.equal(attachedIndex < modesIndex, true);
+assert.equal(modesIndex < readyIndex, true);
+assert.equal(readyIndex < firstHistoryIndex, true);
+assert.equal(firstHistoryIndex < finishIndex, true);
+assert.equal(finishIndex < lastOutputIndex, true);
+assert.equal(exitIndex, historyFrames.length - 1);
+assert.equal(kindIndex(historyFrames, "output") > readyIndex, true, "live output follows READY");
+const readyPayload = terminalBody(historyFrames[readyIndex]);
+assert.equal(readyPayload.subarray(0, 8).equals(GHOSTSNP_MAGIC), true);
+assert.equal(createHash("sha256").update(readyPayload).digest("hex"), GOLDEN_A_SHA256);
 // Authentic GHOSTSNP may embed screen glyphs in binary form; clients must restore
 // via Ghostty import / ReadScreen, never by appending snapshot bytes as text.
-// Only the first Snapshot is a READY frame with GHOSTSNP magic. Later PAGE and
-// FINISH frames are continuation bytes.
-const historySnapshots = lateAttachFixture.history_then_live.filter(
-  (event) => event.type === "snapshot",
-);
-assert.ok(historySnapshots.length >= 2);
-for (const [index, event] of historySnapshots.entries()) {
-  const payload = Buffer.from(event.payload_base64, "base64");
-  assert.equal(event.bytes, payload.length);
-  assert.equal(event.payload_encoding, "base64");
-  if (index === 0) {
-    assert.equal(payload.subarray(0, 8).equals(GHOSTSNP_MAGIC), true);
-  } else {
-    assert.equal(payload.subarray(0, 8).equals(GHOSTSNP_MAGIC), false);
-  }
+// Only SNAPSHOT_READY carries GHOSTSNP magic. SNAPSHOT_HISTORY pages are
+// continuation records; SNAPSHOT_FINISH is empty.
+for (const frame of historyFrames.filter((frame) => frame.kind === "snapshot_history")) {
+  assert.equal(terminalBody(frame).subarray(0, 8).equals(GHOSTSNP_MAGIC), false);
 }
+assert.equal(terminalBody(historyFrames[finishIndex]).length, 0);
 assert.equal(lateAttachFixture.read_screen_text.match(/history-before-live/g)?.length, 1);
 assert.equal(lateAttachFixture.no_history_read_screen_text, "");
-function liveOutputText(event) {
-  assert.equal(event.payload_encoding, "base64");
-  assert.equal(event.data, undefined);
-  const payload = Buffer.from(event.payload_base64, "base64");
-  assert.equal(event.bytes, payload.length);
-  return payload.toString("utf8");
-}
 let restoredPresentation = lateAttachFixture.read_screen_text;
-const bufferedLive = lateAttachFixture.history_then_live
-  .filter((event) => event.type === "terminal_output")
-  .map(liveOutputText)
+const bufferedLive = historyFrames
+  .filter((frame) => frame.kind === "output")
+  .map((frame) => terminalBody(frame).toString("utf8"))
   .join("");
 restoredPresentation += bufferedLive;
 assert.equal(
@@ -691,51 +715,32 @@ assert.equal(
     restoredPresentation.indexOf("live-after-attach"),
   true,
 );
-const noHistoryAttachingIndex = lateAttachFixture.no_history_then_live.findIndex(
-  (event) => event.type === "attach_state" && event.state === "attaching",
+const noHistoryFrames = lateAttachFixture.no_history_then_live;
+const noHistoryAttachedIndex = kindIndex(noHistoryFrames, "attach_state");
+const noHistoryReadyIndex = kindIndex(noHistoryFrames, "snapshot_ready");
+const noHistoryFinishIndex = kindIndex(noHistoryFrames, "snapshot_finish");
+const noHistoryLiveIndex = noHistoryFrames.findIndex(
+  (frame) =>
+    frame.kind === "output" && terminalBody(frame).toString("utf8").includes("live-without-history"),
 );
-const noHistorySnapshotIndex = lateAttachFixture.no_history_then_live.findIndex(
-  (event) => event.type === "snapshot",
-);
-const noHistoryAttachedIndex = lateAttachFixture.no_history_then_live.findIndex(
-  (event) => event.type === "attach_state" && event.state === "attached",
-);
-const noHistoryLiveIndex = lateAttachFixture.no_history_then_live.findIndex(
-  (event) =>
-    event.type === "terminal_output" && liveOutputText(event).includes("live-without-history"),
-);
-const noHistoryLastInitialStateIndex = lateAttachFixture.no_history_then_live.findLastIndex(
-  (event) => event.type === "snapshot" || event.type === "scrollback",
-);
-const noHistoryFirstTerminalOutputIndex = lateAttachFixture.no_history_then_live.findIndex(
-  (event) => event.type === "terminal_output",
-);
-assert.equal(
-  lateAttachFixture.no_history_then_live.some((event) => event.type === "scrollback"),
-  false,
-);
-assert.notEqual(noHistorySnapshotIndex, -1);
-assert.equal(noHistoryAttachingIndex < noHistorySnapshotIndex, true);
-assert.equal(noHistorySnapshotIndex < noHistoryAttachedIndex, true);
-assert.equal(
-  noHistoryLastInitialStateIndex === -1 || noHistoryLastInitialStateIndex < noHistoryAttachedIndex,
-  true,
-);
-assert.equal(noHistoryAttachedIndex < noHistoryFirstTerminalOutputIndex, true);
-assert.equal(noHistoryAttachedIndex < noHistoryLiveIndex, true);
-const noHistorySnapshot = lateAttachFixture.no_history_then_live[noHistorySnapshotIndex];
-const noHistoryPayload = Buffer.from(noHistorySnapshot.payload_base64, "base64");
-assert.equal(noHistorySnapshot.bytes, noHistoryPayload.length);
+assert.notEqual(noHistoryReadyIndex, -1);
+assert.equal(noHistoryAttachedIndex < noHistoryReadyIndex, true);
+assert.equal(noHistoryReadyIndex < noHistoryFinishIndex, true);
+assert.equal(noHistoryFinishIndex < noHistoryLiveIndex, true);
+const noHistoryPayload = terminalBody(noHistoryFrames[noHistoryReadyIndex]);
 assert.equal(noHistoryPayload.subarray(0, 8).equals(GHOSTSNP_MAGIC), true);
 assert.equal(createHash("sha256").update(noHistoryPayload).digest("hex"), GOLDEN_B_SHA256);
 assert.notEqual(GOLDEN_A_SHA256, GOLDEN_B_SHA256);
-assert.equal(historyPayload.equals(noHistoryPayload), false);
-// Exactly one Snapshot on no_history and empty ReadScreen oracle.
+assert.equal(readyPayload.equals(noHistoryPayload), false);
+// The idle case carries exactly one history page: the GHOSTSNP finish record.
+assert.equal(noHistoryFrames.filter((frame) => frame.kind === "snapshot_history").length, 1);
+const unavailableFrames = lateAttachFixture.history_unavailable_then_live;
 assert.equal(
-  lateAttachFixture.no_history_then_live.filter((event) => event.type === "snapshot").length,
-  2,
+  kindIndex(unavailableFrames, "snapshot_ready") < kindIndex(unavailableFrames, "history_unavailable"),
+  true,
 );
-assert.equal(lateAttachFixture.conformance_fixture_revision, 48);
+assert.equal(kindIndex(unavailableFrames, "snapshot_finish"), -1);
+assert.equal(lateAttachFixture.conformance_fixture_revision, 49);
 
 const verification = verifyPackageAssets();
 assert.deepEqual(verification, { ok: true, failures: [] });
