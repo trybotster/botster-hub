@@ -56,7 +56,7 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 use crate::support::{
-    ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,
+    candidate_session_worker_binary_path, recovering_mutex_guard, validate_cli_daemon_shutdown,
     wait_for_cli_daemon_shutdown,
 };
 

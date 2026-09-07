@@ -81,6 +81,7 @@ mod isolated_hub;
 pub use isolated_hub::{
     IsolatedHub, IsolatedHubBuilder, IsolatedHubError, IsolatedHubStartGuard, TeardownPhase,
     clear_isolated_hub_taint, isolated_hub_start_guard, isolated_hub_taint,
+    verify_candidate_manifest,
 };
 
 /// Shared OS monotonic clock for campaign emission-to-receipt samples.
@@ -6380,7 +6381,7 @@ mod tests {
         assert_eq!(provenance.protocol_git, LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT);
         assert_eq!(
             LATE_ATTACH_GHOSTSNP_CORE_PIN,
-            "347bd99bf7fa59a62975111eedabe2db16479335"
+            "98a50ef43f62bd9da6e062bd4d44d961fa3c78c9"
         );
         assert_eq!(provenance.core_pin, LATE_ATTACH_GHOSTSNP_CORE_PIN);
         assert_eq!(

@@ -14,15 +14,15 @@ use botster_core_daemon::{
     RegistrySessionState, SessionAdoptionState,
 };
 use botster_hub::{
-    CredentialKeyPurpose, CredentialKeyReference, CredentialProviderKind, DataDirectoryOption,
-    FileHubStateStore, HostIdentityOptions, HubRuntime, HubRuntimeError, HubStartupOptions,
-    HubStateStore, RuntimeEnvironment, SessionDefaults, TestFileCredentialStore, TransportBindings,
-    TrustedBrowserIdentity, credential_key_id,
+    CoreEngineOptions, CredentialKeyPurpose, CredentialKeyReference, CredentialProviderKind,
+    DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime, HubRuntimeError,
+    HubStartupOptions, HubStateStore, RuntimeEnvironment, SessionDefaults, TestFileCredentialStore,
+    TransportBindings, TrustedBrowserIdentity, credential_key_id,
 };
 
 mod support;
 use support::{
-    bind_shared_terminal_adapter, ensure_session_worker_binary, send_terminal_input,
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, send_terminal_input,
     send_terminal_resize,
 };
 
@@ -81,7 +81,7 @@ fn explicit_config() -> botster_hub::HubConfig {
 fn explicit_config_with_data_dir(
     data_directory: impl Into<std::path::PathBuf>,
 ) -> botster_hub::HubConfig {
-    ensure_session_worker_binary();
+    let session_worker_path = candidate_session_worker_binary_path().to_path_buf();
     let data_directory = data_directory.into();
     let data_directory = data_directory.with_file_name(format!(
         "{}-{}",
@@ -108,6 +108,10 @@ fn explicit_config_with_data_dir(
         transports: TransportBindings {
             local_socket: None,
             tcp: Vec::new(),
+        },
+        core_engine: CoreEngineOptions {
+            session_worker_path: Some(session_worker_path),
+            ..CoreEngineOptions::default()
         },
         ..HubStartupOptions::default()
     }

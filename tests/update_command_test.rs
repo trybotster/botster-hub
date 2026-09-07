@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod support;
 use botster_terminal_protocol::TerminalKind;
-use support::ensure_session_worker_binary;
+use support::{candidate_hub_binary_path, candidate_session_worker_binary_path};
 
 #[test]
 fn update_requires_an_explicit_scope() {
@@ -62,7 +62,6 @@ fn update_rejects_a_dirty_source_repository_through_the_production_cli() {
 
 #[test]
 fn daemon_api_starts_and_reports_a_failed_source_update() {
-    ensure_session_worker_binary();
     let root = unique_test_dir("daemon-api-update");
     let data_dir = root.join("data");
     let source = root.join("source");
@@ -78,11 +77,8 @@ fn daemon_api_starts_and_reports_a_failed_source_update() {
     git(&source, &["commit", "-m", "fixture"]);
     fs::write(source.join("operator-change"), "preserve\n").unwrap();
 
-    let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
-        .canonicalize()
-        .unwrap();
-    let worker_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug/botster-session-worker")
+    let hub_bin = candidate_hub_binary_path().canonicalize().unwrap();
+    let worker_bin = candidate_session_worker_binary_path()
         .canonicalize()
         .unwrap();
     let daemon_pid =
@@ -150,16 +146,12 @@ fn daemon_api_starts_and_reports_a_failed_source_update() {
 
 #[test]
 fn update_build_failure_leaves_the_running_daemon_unchanged() {
-    ensure_session_worker_binary();
     let root = unique_test_dir("build-failure");
     let data_dir = root.join("data");
     fs::create_dir_all(&data_dir).unwrap();
     let source = create_clean_update_source(&root, false);
-    let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
-        .canonicalize()
-        .unwrap();
-    let worker_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug/botster-session-worker")
+    let hub_bin = candidate_hub_binary_path().canonicalize().unwrap();
+    let worker_bin = candidate_session_worker_binary_path()
         .canonicalize()
         .unwrap();
     let mut daemon = Command::new(&hub_bin)
@@ -234,18 +226,14 @@ fn update_build_failure_leaves_the_running_daemon_unchanged() {
 
 #[test]
 fn update_replaces_the_daemon_before_a_verification_failure() {
-    ensure_session_worker_binary();
     let root = unique_test_dir("replace-verification");
     let data_dir = root.join("data");
     fs::create_dir_all(&data_dir).unwrap();
     let source = create_clean_update_source(&root, true);
     let source_target = source.join("target/debug");
     fs::create_dir_all(&source_target).unwrap();
-    let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
-        .canonicalize()
-        .unwrap();
-    let worker_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug/botster-session-worker")
+    let hub_bin = candidate_hub_binary_path().canonicalize().unwrap();
+    let worker_bin = candidate_session_worker_binary_path()
         .canonicalize()
         .unwrap();
     fs::copy(&hub_bin, source_target.join("botster-hub")).unwrap();
@@ -302,7 +290,6 @@ fn update_replaces_the_daemon_before_a_verification_failure() {
 
 #[test]
 fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
-    ensure_session_worker_binary();
     let root = unique_test_dir("all-missing-contract");
     let data_dir = root.join("data");
     fs::create_dir_all(&data_dir).unwrap();
@@ -310,11 +297,8 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
     let package = create_direct_local_package(&root);
     let head_before = git_output(&source, &["rev-parse", "HEAD"]);
     let lock_before = fs::read(source.join("Cargo.lock")).unwrap();
-    let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
-        .canonicalize()
-        .unwrap();
-    let worker_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug/botster-session-worker")
+    let hub_bin = candidate_hub_binary_path().canonicalize().unwrap();
+    let worker_bin = candidate_session_worker_binary_path()
         .canonicalize()
         .unwrap();
     let mut daemon = Command::new(&hub_bin)
@@ -419,9 +403,7 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
     fs::create_dir_all(&data_dir).unwrap();
     let source = create_real_build_update_source(&root);
     let source_target = source.join("target/debug");
-    let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
-        .canonicalize()
-        .unwrap();
+    let hub_bin = candidate_hub_binary_path().canonicalize().unwrap();
     let old_pid = start_detached_daemon_with_update_source(
         &hub_bin,
         &preupdate_worker,

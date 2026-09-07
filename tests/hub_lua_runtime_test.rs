@@ -18,7 +18,7 @@ use botster_hub::package_event_router::{
     LeaseIdentity, release_or_retract,
 };
 use botster_hub::{
-    DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
+    CoreEngineOptions, DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
     HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginHostApi, LuaPluginRuntime,
     PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, Worktree,
     default_package_policy,
@@ -26,7 +26,7 @@ use botster_hub::{
 use botster_ui_contract::{UiActionRequest, UiActionResultState, UiAuthoredNodeId, UiNodeKind};
 
 mod support;
-use support::ensure_session_worker_binary;
+use support::candidate_session_worker_binary_path;
 
 fn explicit_runtime(name: &str) -> HubRuntime {
     let data_directory = PathBuf::from("target")
@@ -49,7 +49,7 @@ fn explicit_runtime_in_with_cleanup(
     data_directory: PathBuf,
     clear_data_directory: bool,
 ) -> HubRuntime {
-    ensure_session_worker_binary();
+    let session_worker_path = candidate_session_worker_binary_path().to_path_buf();
     if clear_data_directory {
         let _ = std::fs::remove_dir_all(&data_directory);
     }
@@ -69,6 +69,10 @@ fn explicit_runtime_in_with_cleanup(
         transports: TransportBindings {
             local_socket: None,
             tcp: Vec::new(),
+        },
+        core_engine: CoreEngineOptions {
+            session_worker_path: Some(session_worker_path),
+            ..CoreEngineOptions::default()
         },
         ..HubStartupOptions::default()
     }

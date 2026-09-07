@@ -72,7 +72,7 @@ mod support;
 
 use hub_daemon_lifecycle::*;
 use support::{
-    bind_shared_terminal_adapter, ensure_session_worker_binary, recovering_mutex_guard,
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, recovering_mutex_guard,
     send_terminal_input, validate_cli_daemon_shutdown, wait_for_cli_daemon_shutdown,
 };
 

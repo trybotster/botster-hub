@@ -1,26 +1,38 @@
-use std::path::Path;
-use std::process::{Child, Command, Output};
-use std::sync::{Mutex, MutexGuard, Once};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Output};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+struct CandidateBinaries {
+    hub: PathBuf,
+    worker: PathBuf,
+}
+
+fn candidate_binaries() -> &'static CandidateBinaries {
+    static CANDIDATE: OnceLock<CandidateBinaries> = OnceLock::new();
+    CANDIDATE.get_or_init(|| {
+        let hub = required_candidate_path("BOTSTER_HUB_BIN");
+        let worker = required_candidate_path("BOTSTER_SESSION_WORKER_BIN");
+        let manifest = required_candidate_path("BOTSTER_CANDIDATE_MANIFEST");
+        botster_hub_test_support::verify_candidate_manifest(&manifest, &hub, &worker)
+            .unwrap_or_else(|error| panic!("candidate manifest verification failed: {error}"));
+        CandidateBinaries { hub, worker }
+    })
+}
+
+fn required_candidate_path(variable: &'static str) -> PathBuf {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("missing required candidate path in {variable}"))
+}
 
 #[allow(dead_code)]
-pub fn ensure_session_worker_binary() {
-    static BUILD_WORKER: Once = Once::new();
-    BUILD_WORKER.call_once(|| {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let status = Command::new("cargo")
-            .args([
-                "build",
-                "--locked",
-                "-p",
-                "botster-core-daemon",
-                "--bin",
-                "botster-session-worker",
-            ])
-            .current_dir(manifest_dir)
-            .status()
-            .expect("worker binary build command should run");
-        assert!(status.success(), "botster-session-worker should build");
-    });
+pub fn candidate_hub_binary_path() -> &'static Path {
+    &candidate_binaries().hub
+}
+
+#[allow(dead_code)]
+pub fn candidate_session_worker_binary_path() -> &'static Path {
+    &candidate_binaries().worker
 }
 
 #[allow(dead_code)]

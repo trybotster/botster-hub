@@ -42,7 +42,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{Receiver as AsyncReceiver, Sender as AsyncSender, channel, default_runtime};
 
 use crate::support::{
-    ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,
+    candidate_session_worker_binary_path, recovering_mutex_guard, validate_cli_daemon_shutdown,
     wait_for_cli_daemon_shutdown,
 };
 

@@ -15,7 +15,9 @@ use botster_hub::{
 };
 
 mod support;
-use support::{bind_shared_terminal_adapter, ensure_session_worker_binary, send_terminal_input};
+use support::{
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, send_terminal_input,
+};
 
 const RUNTIME_PACKAGE: &str = "runtime.synthetic-plugin";
 const RUNTIME_SESSION: &str = "runtime-local-session";
@@ -28,7 +30,6 @@ fn local_runtime_runs_daemon_package_lifecycle_session_and_clean_shutdown() {
 }
 
 fn run_local_runtime() {
-    ensure_session_worker_binary();
     let data_dir = unique_test_dir("runtime");
     let config = explicit_config(&data_dir);
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
@@ -410,6 +411,7 @@ fn drain_until(
 }
 
 fn explicit_config(data_directory: &Path) -> botster_hub::HubConfig {
+    let session_worker_path = candidate_session_worker_binary_path().to_path_buf();
     HubStartupOptions {
         host: HostIdentityOptions {
             id: "local-runtime-test".to_string(),
@@ -426,6 +428,10 @@ fn explicit_config(data_directory: &Path) -> botster_hub::HubConfig {
         transports: TransportBindings {
             local_socket: None,
             tcp: Vec::new(),
+        },
+        core_engine: CoreEngineOptions {
+            session_worker_path: Some(session_worker_path),
+            ..CoreEngineOptions::default()
         },
         ..HubStartupOptions::default()
     }

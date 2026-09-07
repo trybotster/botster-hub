@@ -17,13 +17,13 @@ use botster_core_daemon::{
     ObserveLifecycleBudget, ObserveLifecycleCursor, ReadinessEvidence,
 };
 use botster_hub::{
-    DataDirectoryOption, DeviceSessionTypeSource, FileHubStateStore, HostIdentityOptions,
-    HubClientAdmission, HubClientApi, HubClientError, HubClientIdentity, HubClientOperation,
-    HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
-    HubClientRole, HubPackageManifest, HubRuntime, HubStartupOptions, HubStateStore,
-    PackageProvenance, PackageRegistry, PackageSessionType, PackageSessionTypeExecution,
-    PackageSessionTypeWorkingDirectory, RuntimeEnvironment, SessionDefaults,
-    SessionTypeMutationSource, SpawnTarget, TransportBindings,
+    CoreEngineOptions, DataDirectoryOption, DeviceSessionTypeSource, FileHubStateStore,
+    HostIdentityOptions, HubClientAdmission, HubClientApi, HubClientError, HubClientIdentity,
+    HubClientOperation, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
+    HubClientResponseBody, HubClientRole, HubPackageManifest, HubRuntime, HubStartupOptions,
+    HubStateStore, PackageProvenance, PackageRegistry, PackageSessionType,
+    PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory, RuntimeEnvironment,
+    SessionDefaults, SessionTypeMutationSource, SpawnTarget, TransportBindings,
 };
 use botster_ui_contract::{
     PackageNavigationEntry, PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind,
@@ -32,12 +32,12 @@ use botster_ui_contract::{
 
 mod support;
 use support::{
-    bind_shared_terminal_adapter, ensure_session_worker_binary, send_terminal_input,
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, send_terminal_input,
     send_terminal_resize,
 };
 
 fn explicit_runtime(name: &str) -> HubRuntime {
-    ensure_session_worker_binary();
+    let session_worker_path = candidate_session_worker_binary_path().to_path_buf();
     let data_directory = format!(
         "target/botster-hub-test-data/client-api-{}-{name}",
         std::process::id()
@@ -59,6 +59,10 @@ fn explicit_runtime(name: &str) -> HubRuntime {
         transports: TransportBindings {
             local_socket: None,
             tcp: Vec::new(),
+        },
+        core_engine: CoreEngineOptions {
+            session_worker_path: Some(session_worker_path),
+            ..CoreEngineOptions::default()
         },
         ..HubStartupOptions::default()
     }

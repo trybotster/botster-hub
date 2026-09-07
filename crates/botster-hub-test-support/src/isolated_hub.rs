@@ -185,7 +185,7 @@ impl IsolatedHubBuilder {
             .manifest
             .or_else(|| env::var_os(CANDIDATE_MANIFEST_ENV).map(PathBuf::from))
         {
-            validate_candidate_manifest(&manifest, &hub_bin, &session_worker_bin)?;
+            verify_candidate_manifest(&manifest, &hub_bin, &session_worker_bin)?;
         }
 
         fs::create_dir_all(&data_dir).map_err(|source| IsolatedHubError::CreateDataDir {
@@ -1123,7 +1123,8 @@ struct CandidateArtifact {
     sha256: String,
 }
 
-fn validate_candidate_manifest(
+/// Verify the two candidate executable files against one cross-layer manifest.
+pub fn verify_candidate_manifest(
     manifest_path: &Path,
     hub_bin: &Path,
     session_worker_bin: &Path,
@@ -1299,7 +1300,7 @@ mod candidate_manifest_tests {
         fs::write(&worker, worker_bytes).expect("write worker fixture");
         write_manifest(&manifest, hub_bytes, worker_bytes);
 
-        validate_candidate_manifest(&manifest, &hub, &worker).expect("matching candidate manifest");
+        verify_candidate_manifest(&manifest, &hub, &worker).expect("matching candidate manifest");
 
         fs::remove_dir_all(root).expect("remove fixture directory");
     }

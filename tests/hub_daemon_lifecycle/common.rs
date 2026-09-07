@@ -43,7 +43,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{Receiver as AsyncReceiver, Sender as AsyncSender, channel, default_runtime};
 
 use crate::support::{
-    ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,
+    candidate_session_worker_binary_path, recovering_mutex_guard, validate_cli_daemon_shutdown,
     wait_for_cli_daemon_shutdown,
 };
 
@@ -206,7 +206,7 @@ pub(crate) fn unique_short_test_dir(name: &str) -> PathBuf {
 }
 
 pub(crate) fn explicit_config(data_directory: impl Into<PathBuf>) -> botster_hub::HubConfig {
-    ensure_session_worker_binary();
+    let session_worker_path = candidate_session_worker_binary_path().to_path_buf();
     HubStartupOptions {
         host: HostIdentityOptions {
             id: "hub-daemon-test".to_string(),
@@ -222,6 +222,10 @@ pub(crate) fn explicit_config(data_directory: impl Into<PathBuf>) -> botster_hub
         },
         transports: TransportBindings {
             ..TransportBindings::default()
+        },
+        core_engine: CoreEngineOptions {
+            session_worker_path: Some(session_worker_path),
+            ..CoreEngineOptions::default()
         },
         ..HubStartupOptions::default()
     }
@@ -932,7 +936,7 @@ pub(crate) fn assert_no_state_file_under(root: &Path) {
 pub(crate) fn build_real_release() -> &'static RealRelease {
     static RELEASE: OnceLock<RealRelease> = OnceLock::new();
     RELEASE.get_or_init(|| {
-        ensure_session_worker_binary();
+        let candidate_worker = candidate_session_worker_binary_path().to_path_buf();
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let hub_revision = String::from_utf8(
             Command::new("git")
@@ -996,10 +1000,7 @@ pub(crate) fn build_real_release() -> &'static RealRelease {
 
         RealRelease {
             hub_binary: target.join("debug").join("botster-hub"),
-            worker_binary: Path::new(env!("CARGO_BIN_EXE_botster-hub"))
-                .parent()
-                .expect("hub binary directory")
-                .join("botster-session-worker"),
+            worker_binary: candidate_worker,
             hub_revision,
             core_revision,
         }
