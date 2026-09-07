@@ -1,0 +1,119 @@
+#!/bin/sh
+# Build one revision-coupled development candidate without release signing.
+set -eu
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: script/build-dev-artifacts --out-dir <dir>
+
+This command writes the canonical two-binary manifest for cross-layer runs.
+Core's worker-only manifest is valid only for Core-local runs.
+USAGE
+}
+
+OUT_DIR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out-dir) OUT_DIR="${2:?--out-dir requires a value}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unexpected argument: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+if [ -z "$OUT_DIR" ]; then
+  echo "missing required --out-dir" >&2
+  usage
+  exit 2
+fi
+
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_root"
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "development candidates require a git checkout" >&2
+  exit 1
+fi
+dirty=$(git status --porcelain)
+if [ -n "$dirty" ]; then
+  echo "refusing to build a development candidate from a dirty checkout:" >&2
+  echo "$dirty" >&2
+  exit 1
+fi
+
+jobs=${CARGO_BUILD_JOBS:-2}
+case "$jobs" in
+  ''|*[!0-9]*) echo "CARGO_BUILD_JOBS must be 1 or 2" >&2; exit 2 ;;
+esac
+if [ "$jobs" -lt 1 ] || [ "$jobs" -gt 2 ]; then
+  echo "CARGO_BUILD_JOBS must be 1 or 2" >&2
+  exit 2
+fi
+export CARGO_BUILD_JOBS="$jobs"
+export CARGO_INCREMENTAL=0
+
+hub_revision=$(git rev-parse HEAD)
+core_revision=$(
+  awk '
+    /^name = "botster-core"$/ { in_core = 1; next }
+    in_core && /^source = / {
+      match($0, /#[0-9a-f]+/)
+      print substr($0, RSTART + 1, RLENGTH - 1)
+      exit
+    }
+  ' Cargo.lock
+)
+if [ -z "$core_revision" ]; then
+  echo "could not read the Cargo.lock-pinned botster-core revision" >&2
+  exit 1
+fi
+
+BOTSTER_BUILD_REVISION="$hub_revision" cargo build --locked -p botster-hub --bin botster-hub
+cargo build --locked -p botster-core-daemon --bin botster-session-worker
+
+target_dir=${CARGO_TARGET_DIR:-target}
+mkdir -p "$OUT_DIR"
+cp "$target_dir/debug/botster-hub" "$OUT_DIR/botster-hub"
+cp "$target_dir/debug/botster-session-worker" "$OUT_DIR/botster-session-worker"
+
+checksum() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+size_of() {
+  wc -c < "$1" | tr -d ' '
+}
+
+hub_sha=$(checksum "$OUT_DIR/botster-hub")
+hub_size=$(size_of "$OUT_DIR/botster-hub")
+worker_sha=$(checksum "$OUT_DIR/botster-session-worker")
+worker_size=$(size_of "$OUT_DIR/botster-session-worker")
+
+manifest="$OUT_DIR/install-manifest.json"
+cat > "$manifest" <<MANIFEST
+{
+  "source_revisions": {
+    "botster_hub": "$hub_revision",
+    "botster_core": "$core_revision"
+  },
+  "artifacts": [
+    {
+      "name": "botster-hub",
+      "size": $hub_size,
+      "sha256": "$hub_sha"
+    },
+    {
+      "name": "botster-session-worker",
+      "size": $worker_size,
+      "sha256": "$worker_sha"
+    }
+  ]
+}
+MANIFEST
+
+echo "BOTSTER_HUB_BIN=$OUT_DIR/botster-hub"
+echo "BOTSTER_SESSION_WORKER_BIN=$OUT_DIR/botster-session-worker"
+echo "BOTSTER_CANDIDATE_MANIFEST=$manifest"
