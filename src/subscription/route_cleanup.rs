@@ -568,20 +568,52 @@ mod tests {
         let mut registry = crate::subscription::attach_routes::AttachStreamRegistry::default();
         let unix = owner("a");
         for index in 0..MAX_ATTACH_ROUTES_PER_OWNER {
-            assert!(reserve_attach_route(&mut registry, &unix, &format!("s{index}"), "sub"));
+            assert!(reserve_attach_route(
+                &mut registry,
+                &unix,
+                &format!("s{index}"),
+                "sub"
+            ));
         }
-        assert_eq!(registry.stream_count_for_owner(&unix), 0, "pending keys alone fill the cap");
-        assert!(!reserve_attach_route(&mut registry, &unix, "overflow", "sub"));
-        assert!(reserve_attach_route(&mut registry, &owner("b"), "overflow", "sub"));
+        assert_eq!(
+            registry.stream_count_for_owner(&unix),
+            0,
+            "pending keys alone fill the cap"
+        );
+        assert!(!reserve_attach_route(
+            &mut registry,
+            &unix,
+            "overflow",
+            "sub"
+        ));
+        assert!(reserve_attach_route(
+            &mut registry,
+            &owner("b"),
+            "overflow",
+            "sub"
+        ));
         // Re-attaching a held key is not a new reservation.
         assert!(reserve_attach_route(&mut registry, &unix, "s0", "sub"));
         // A failed attach releases the key unless a live stream holds it.
         registry.start_attach(unix.clone(), "s0".into(), "sub".into());
         release_failed_attach_route(&mut registry, &unix, "s0", "sub");
-        assert!(!reserve_attach_route(&mut registry, &unix, "overflow", "sub"));
+        assert!(!reserve_attach_route(
+            &mut registry,
+            &unix,
+            "overflow",
+            "sub"
+        ));
         registry.cancel_stream("s0", "sub");
         release_failed_attach_route(&mut registry, &unix, "s0", "sub");
-        assert!(reserve_attach_route(&mut registry, &unix, "overflow", "sub"));
-        assert_eq!(registry.take_owner_routes("a").len(), MAX_ATTACH_ROUTES_PER_OWNER);
+        assert!(reserve_attach_route(
+            &mut registry,
+            &unix,
+            "overflow",
+            "sub"
+        ));
+        assert_eq!(
+            registry.take_owner_routes("a").len(),
+            MAX_ATTACH_ROUTES_PER_OWNER
+        );
     }
 }
