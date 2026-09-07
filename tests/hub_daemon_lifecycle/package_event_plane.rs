@@ -14,28 +14,18 @@ fn isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_workt
 
     let hub = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(PathBuf::from("/tmp/bh-event-plane"))
             .name("package-event-plane"),
     );
 
-    let hub_bin = PathBuf::from(env!("CARGO_BIN_EXE_botster-hub"))
+    let hub_bin = candidate_hub_binary_path()
         .canonicalize()
         .expect("hub realpath");
     let worker_bin = session_worker_binary_path()
         .canonicalize()
         .expect("worker realpath");
-    assert!(
-        hub_bin.starts_with(Path::new(env!("CARGO_MANIFEST_DIR")).join("target")),
-        "hub binary must live under this checkout: {}",
-        hub_bin.display()
-    );
-    assert!(
-        worker_bin.starts_with(Path::new(env!("CARGO_MANIFEST_DIR")).join("target")),
-        "session worker must live under this checkout: {}",
-        worker_bin.display()
-    );
     let hub_sha = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -44,9 +34,19 @@ fn isolated_hub_two_packages_emit_and_consume_exact_event_without_blocking_workt
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .unwrap_or_default();
     let lock_core_sha = lockfile_core_revision();
+    let manifest_path = std::env::var_os("BOTSTER_CANDIDATE_MANIFEST")
+        .map(PathBuf::from)
+        .expect("BOTSTER_CANDIDATE_MANIFEST must identify the candidate");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(&manifest_path).expect("read candidate manifest provenance"),
+    )
+    .expect("candidate manifest JSON");
+    let manifest_core_sha = manifest["source_revisions"]["botster_core"]
+        .as_str()
+        .expect("candidate manifest has botster_core source revision");
     assert_eq!(
-        lock_core_sha, "bf6e7d996bca2786ad4142c870a13c57a490e241",
-        "live proof must use the pinned Core revision"
+        manifest_core_sha, lock_core_sha,
+        "candidate Core revision must match Cargo.lock"
     );
     eprintln!(
         "event-plane live proof hub_sha={} core_sha={} hub_bin={} worker_bin={}",
@@ -208,7 +208,7 @@ fn isolated_hub_event_to_entity_provider_emit_stays_rejected_causal_scope() {
 
     let hub = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(PathBuf::from("/tmp/bh-event-plane-cycle"))
             .name("package-event-cycle"),
@@ -287,7 +287,7 @@ pub(crate) fn enable_event_plane_producer_with_env(
     copy_dir_all(&producer_src, &producer_dir);
     rewrite_package_source_path(&producer_dir);
     let mut builder = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .hub_bin(candidate_hub_binary_path())
         .session_worker_bin(session_worker_binary_path())
         .root(PathBuf::from(format!("/tmp/bh-event-plane-{label}")))
         .name(format!("package-event-{label}"));

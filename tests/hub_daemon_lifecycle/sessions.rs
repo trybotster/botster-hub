@@ -1722,7 +1722,7 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
     let _guard = daemon_test_guard();
     let conformance_hub = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(unique_short_test_dir("slc"))
             .name("published-runner"),
@@ -4339,7 +4339,7 @@ fn process_ownership_external_hub_test_support_cleans_up_isolated_daemon() {
     let _guard = daemon_test_guard();
     let first = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(PathBuf::from("/tmp/bh-test-support"))
             .name("downstream-shape"),
@@ -4490,7 +4490,7 @@ fn process_ownership_external_hub_test_support_cleans_up_isolated_daemon() {
 
     let second = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(PathBuf::from("/tmp/bh-test-support"))
             .name("downstream-shape-determinism"),
@@ -4506,7 +4506,7 @@ fn external_hub_client_many_pty_adversarial_conformance_ci() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(PathBuf::from("/tmp/bh-test-support"))
             .name("many-pty-client-attach-ci"),
@@ -4529,7 +4529,7 @@ fn external_hub_client_many_pty_adversarial_conformance_local() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(PathBuf::from("/tmp/bh-test-support"))
             .name("many-pty-client-attach-local"),

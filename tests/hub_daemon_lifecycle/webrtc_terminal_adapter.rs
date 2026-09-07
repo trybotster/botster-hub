@@ -350,7 +350,7 @@ fn webrtc_terminal_adapter_bind_returns_only_attaching_then_terminal_frames() {
     });
     eprintln!(
         "webrtc adapter bind provenance hub_bin={} session_worker={}",
-        env!("CARGO_BIN_EXE_botster-hub"),
+        candidate_hub_binary_path().display(),
         session_worker_binary_path().display()
     );
     shutdown_short_lived_session(&endpoint, session_id);
@@ -1432,7 +1432,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
     );
     eprintln!(
         "unix+webrtc occupancy provenance hub_bin={} session_worker={}",
-        env!("CARGO_BIN_EXE_botster-hub"),
+        candidate_hub_binary_path().display(),
         session_worker_binary_path().display()
     );
 
