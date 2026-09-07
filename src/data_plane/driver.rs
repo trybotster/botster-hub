@@ -29,8 +29,9 @@ pub(crate) const DATA_PLANE_STOP_BOUND: Duration = Duration::from_millis(
     DATA_PLANE_WATCHDOG.as_millis() as u64 * 2 + DATA_PLANE_STOP_SLACK.as_millis() as u64,
 );
 pub(crate) const DATA_PLANE_MAX_CLOSE_KEYS: usize = 8;
-/// Host operations the owner may leave queued before `submit` applies
-/// backpressure to the submitting thread.
+/// Host operations the owner may leave queued. A submission that finds the
+/// queue full is refused at once with a [`CoreTicketPoll::Refused`] ticket;
+/// admission never waits for the data-plane thread.
 pub(crate) const CORE_REQUEST_CAPACITY: usize = 64;
 const CORE_REQUESTS_PER_TURN: usize = CORE_REQUEST_CAPACITY;
 const STOP_ACTION_SHUTDOWN: u8 = 0;
@@ -57,6 +58,9 @@ pub enum CoreTicketPoll<T> {
     Ready(T),
     /// The data-plane thread stopped before it ran the operation.
     Lost,
+    /// Admission refused the operation because the bounded request queue was
+    /// full. Nothing was queued; the caller decides whether to retry later.
+    Refused,
 }
 
 /// Why a blocking [`CoreTicket::wait`] returned without a result.
@@ -66,6 +70,8 @@ pub enum CoreTicketError {
     Timeout,
     /// The data-plane thread stopped before it ran the operation.
     DriverStopped,
+    /// The bounded request queue was full; the operation was never queued.
+    Overloaded,
 }
 
 impl std::fmt::Display for CoreTicketError {
@@ -73,6 +79,7 @@ impl std::fmt::Display for CoreTicketError {
         formatter.write_str(match self {
             Self::Timeout => "core operation wait timed out",
             Self::DriverStopped => "core data-plane driver stopped",
+            Self::Overloaded => "core request queue is full",
         })
     }
 }
@@ -86,31 +93,85 @@ impl std::error::Error for CoreTicketError {}
 /// block on [`Self::wait`].
 #[derive(Debug)]
 pub struct CoreTicket<T> {
-    receiver: Receiver<T>,
+    slot: CoreTicketSlot<T>,
+}
+
+#[derive(Debug)]
+enum CoreTicketSlot<T> {
+    /// The operation was queued; its result arrives on this channel.
+    Queued(Receiver<T>),
+    /// Admission refused the operation; there is nothing to wait for.
+    Refused,
 }
 
 impl<T> CoreTicket<T> {
+    fn queued(receiver: Receiver<T>) -> Self {
+        Self {
+            slot: CoreTicketSlot::Queued(receiver),
+        }
+    }
+
     fn lost() -> Self {
         let (_sender, receiver) = mpsc::sync_channel(1);
-        Self { receiver }
+        Self::queued(receiver)
+    }
+
+    fn refused() -> Self {
+        Self {
+            slot: CoreTicketSlot::Refused,
+        }
     }
 
     /// Non-blocking read; owner-thread use.
     pub(crate) fn poll(&mut self) -> CoreTicketPoll<T> {
-        match self.receiver.try_recv() {
-            Ok(value) => CoreTicketPoll::Ready(value),
-            Err(TryRecvError::Empty) => CoreTicketPoll::Pending,
-            Err(TryRecvError::Disconnected) => CoreTicketPoll::Lost,
+        match &self.slot {
+            CoreTicketSlot::Refused => CoreTicketPoll::Refused,
+            CoreTicketSlot::Queued(receiver) => match receiver.try_recv() {
+                Ok(value) => CoreTicketPoll::Ready(value),
+                Err(TryRecvError::Empty) => CoreTicketPoll::Pending,
+                Err(TryRecvError::Disconnected) => CoreTicketPoll::Lost,
+            },
         }
     }
 
     /// Bounded blocking read for threads that do not serve the owner loop.
     pub fn wait(self, timeout: Duration) -> Result<T, CoreTicketError> {
-        match self.receiver.recv_timeout(timeout) {
-            Ok(value) => Ok(value),
-            Err(RecvTimeoutError::Timeout) => Err(CoreTicketError::Timeout),
-            Err(RecvTimeoutError::Disconnected) => Err(CoreTicketError::DriverStopped),
+        match self.slot {
+            CoreTicketSlot::Refused => Err(CoreTicketError::Overloaded),
+            CoreTicketSlot::Queued(receiver) => match receiver.recv_timeout(timeout) {
+                Ok(value) => Ok(value),
+                Err(RecvTimeoutError::Timeout) => Err(CoreTicketError::Timeout),
+                Err(RecvTimeoutError::Disconnected) => Err(CoreTicketError::DriverStopped),
+            },
         }
+    }
+}
+
+/// Outcome of one nonblocking request admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoreAdmission {
+    /// The request is queued for the next data-plane turn.
+    Queued,
+    /// The bounded queue was full; the request was dropped unqueued.
+    Refused,
+    /// The driver stopped accepting requests.
+    Stopped,
+}
+
+/// Admit one request without waiting. The queue bound is the only
+/// backpressure: a full queue refuses, it never blocks the submitter.
+fn admit_request(
+    requests: &SyncSender<CoreRequest>,
+    accepting: &AtomicBool,
+    request: CoreRequest,
+) -> CoreAdmission {
+    if !accepting.load(Ordering::Acquire) {
+        return CoreAdmission::Stopped;
+    }
+    match requests.try_send(request) {
+        Ok(()) => CoreAdmission::Queued,
+        Err(TrySendError::Full(_)) => CoreAdmission::Refused,
+        Err(TrySendError::Disconnected(_)) => CoreAdmission::Stopped,
     }
 }
 
@@ -145,7 +206,10 @@ pub(crate) struct CoreDaemonHandle {
 impl CoreDaemonHandle {
     /// Queue one host operation for the Core owner thread and return its
     /// result slot. Returns at once; the operation runs on the next
-    /// data-plane turn.
+    /// data-plane turn. A full queue yields a ticket that polls
+    /// [`CoreTicketPoll::Refused`] and nothing is queued: the admission mutex
+    /// is held only across the accepting check and one `try_send`, so the
+    /// owner thread and `stop_and_join` never wait on a saturated queue.
     pub(crate) fn submit<T, F>(&self, operation: F) -> CoreTicket<T>
     where
         T: Send + 'static,
@@ -156,26 +220,17 @@ impl CoreDaemonHandle {
             let _ = completed_tx.send(operation(daemon));
         });
         let _admission = self.admission.lock().expect("Core request admission mutex");
-        if !self.accepting.load(Ordering::Acquire) {
-            return CoreTicket::lost();
-        }
-        match self.requests.try_send(request) {
-            Ok(()) => {}
-            Err(TrySendError::Full(request)) => {
-                if self.requests.send(request).is_err() {
-                    return CoreTicket::lost();
-                }
-            }
-            Err(TrySendError::Disconnected(_)) => return CoreTicket::lost(),
+        match admit_request(&self.requests, &self.accepting, request) {
+            CoreAdmission::Queued => {}
+            CoreAdmission::Refused => return CoreTicket::refused(),
+            CoreAdmission::Stopped => return CoreTicket::lost(),
         }
         self.request_pending.store(true, Ordering::Release);
         if self.owner_waiting.swap(false, Ordering::AcqRel) {
             self.control.interrupt();
         }
         drop(_admission);
-        CoreTicket {
-            receiver: completed_rx,
-        }
+        CoreTicket::queued(completed_rx)
     }
 
     /// Start one Core operation. The ticket carries the pending id; the
@@ -400,4 +455,95 @@ fn current_unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn noop_request() -> CoreRequest {
+        Box::new(|_| {})
+    }
+
+    #[test]
+    fn full_queue_refuses_without_waiting_and_keeps_queued_work() {
+        let (requests, receiver) = mpsc::sync_channel::<CoreRequest>(CORE_REQUEST_CAPACITY);
+        let accepting = AtomicBool::new(true);
+        for _ in 0..CORE_REQUEST_CAPACITY {
+            assert_eq!(
+                admit_request(&requests, &accepting, noop_request()),
+                CoreAdmission::Queued
+            );
+        }
+        // The receiver is never drained: the next admission must refuse at
+        // once instead of parking the submitter behind the data plane.
+        let started = Instant::now();
+        assert_eq!(
+            admit_request(&requests, &accepting, noop_request()),
+            CoreAdmission::Refused
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "refusal must not wait for queue space"
+        );
+        // Refusal drops nothing already queued.
+        assert_eq!(receiver.try_iter().count(), CORE_REQUEST_CAPACITY);
+        // Space freed by the consumer admits again.
+        assert_eq!(
+            admit_request(&requests, &accepting, noop_request()),
+            CoreAdmission::Queued
+        );
+    }
+
+    #[test]
+    fn stop_admission_wins_over_a_saturated_queue() {
+        let (requests, _receiver) = mpsc::sync_channel::<CoreRequest>(CORE_REQUEST_CAPACITY);
+        let accepting = Arc::new(AtomicBool::new(true));
+        let admission = Arc::new(Mutex::new(()));
+        for _ in 0..CORE_REQUEST_CAPACITY {
+            assert_eq!(
+                admit_request(&requests, &accepting, noop_request()),
+                CoreAdmission::Queued
+            );
+        }
+        // A submitter racing a saturated queue holds the admission mutex only
+        // for one try_send, so the stop path acquires it promptly.
+        let submitter = {
+            let requests = requests.clone();
+            let accepting = Arc::clone(&accepting);
+            let admission = Arc::clone(&admission);
+            std::thread::spawn(move || {
+                let _guard = admission.lock().expect("admission");
+                admit_request(&requests, &accepting, noop_request())
+            })
+        };
+        let refused = submitter.join().expect("submitter thread");
+        assert_eq!(refused, CoreAdmission::Refused);
+        let started = Instant::now();
+        {
+            let _guard = admission.lock().expect("admission");
+            accepting.store(false, Ordering::Release);
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "stop admission must not wait behind a full queue"
+        );
+        assert_eq!(
+            admit_request(&requests, &accepting, noop_request()),
+            CoreAdmission::Stopped
+        );
+    }
+
+    #[test]
+    fn refused_ticket_resolves_without_a_result() {
+        let mut ticket: CoreTicket<u8> = CoreTicket::refused();
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Refused));
+        assert_eq!(
+            ticket.wait(Duration::from_millis(1)),
+            Err(CoreTicketError::Overloaded)
+        );
+        let mut lost: CoreTicket<u8> = CoreTicket::lost();
+        assert!(matches!(lost.poll(), CoreTicketPoll::Lost));
+    }
 }

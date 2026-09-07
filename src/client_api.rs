@@ -126,10 +126,14 @@ impl HubClientPending {
     }
 
     fn lost(&self) -> HubClientError {
+        self.bridge_error(CoreTicketError::DriverStopped)
+    }
+
+    fn bridge_error(&self, error: CoreTicketError) -> HubClientError {
         runtime_error(
             self.request_id.clone(),
             self.operation,
-            core_bridge_error(CoreTicketError::DriverStopped),
+            core_bridge_error(error),
         )
     }
 
@@ -142,6 +146,10 @@ impl HubClientPending {
                     self.stage = HubClientPendingStage::Done;
                     Some(Err(self.lost()))
                 }
+                CoreTicketPoll::Refused => {
+                    self.stage = HubClientPendingStage::Done;
+                    Some(Err(self.bridge_error(CoreTicketError::Overloaded)))
+                }
                 CoreTicketPoll::Ready(result) => {
                     self.stage = HubClientPendingStage::Done;
                     Some(result)
@@ -152,6 +160,10 @@ impl HubClientPending {
                 CoreTicketPoll::Lost => {
                     self.stage = HubClientPendingStage::Done;
                     Some(Err(self.lost()))
+                }
+                CoreTicketPoll::Refused => {
+                    self.stage = HubClientPendingStage::Done;
+                    Some(Err(self.bridge_error(CoreTicketError::Overloaded)))
                 }
                 CoreTicketPoll::Ready(Err(error)) => {
                     self.stage = HubClientPendingStage::Done;

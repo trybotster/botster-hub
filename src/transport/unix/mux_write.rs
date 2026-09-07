@@ -802,12 +802,12 @@ pub(crate) mod mux_write_resume_tests {
         marker: &str,
     ) -> UnixTerminalAdapter {
         let (mut adapter, handle) = mux.create_adapter();
-        mux.register(
+        assert!(mux.register(
             session_id.to_string(),
             subscription_id.to_string(),
             1,
             handle,
-        );
+        ));
         assert_eq!(
             adapter.try_write(&output_frame(subscription_id, marker)),
             Ok(())
@@ -1120,12 +1120,12 @@ pub(crate) mod mux_write_resume_tests {
                 .expect("admit event");
         }
         let (mut adapter, handle) = mux.create_adapter();
-        mux.register(
+        assert!(mux.register(
             "late".to_string(),
             "sub-late".to_string(),
             1,
             handle.clone(),
-        );
+        ));
         let exit = RoutedTerminalFrame::new(
             RouteId::new("sub-late").expect("route"),
             1,
@@ -1168,7 +1168,7 @@ pub(crate) mod mux_write_resume_tests {
     pub(crate) async fn hard_close_after_serialization_abandons_zero_offset_terminal() {
         let mux = UnixConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
-        mux.register("closed".to_string(), "sub".to_string(), 1, handle.clone());
+        assert!(mux.register("closed".to_string(), "sub".to_string(), 1, handle.clone()));
         let frame = output_frame("sub", "closed");
         assert_eq!(adapter.try_write(&frame), Ok(()));
         let active = handle.snapshot_active().expect("active frame");
@@ -1213,7 +1213,7 @@ pub(crate) mod mux_write_resume_tests {
     {
         let mux = UnixConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
-        mux.register("closing".to_string(), "sub".to_string(), 1, handle.clone());
+        assert!(mux.register("closing".to_string(), "sub".to_string(), 1, handle.clone()));
         assert_eq!(adapter.try_write(&output_frame("sub", "closing")), Ok(()));
         let mut writer = PrefixStallWriter {
             written: Vec::new(),
@@ -1275,7 +1275,7 @@ pub(crate) mod mux_write_resume_tests {
     pub(crate) async fn finishing_a_partial_live_write_does_not_defer_the_next_frame() {
         let mux = UnixConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
-        mux.register("s".to_string(), "sub".to_string(), 1, handle.clone());
+        assert!(mux.register("s".to_string(), "sub".to_string(), 1, handle.clone()));
         let output = output_frame("sub", "out");
         assert_eq!(adapter.try_write(&output), Ok(()));
         let mut writer = PrefixStallWriter {
@@ -1321,12 +1321,12 @@ pub(crate) mod mux_write_resume_tests {
         let mux = UnixConnectionMux::new();
         let _stall = occupy_route(&mux, "stall", "sub", "flood");
         let (mut closer, close_handle) = mux.create_adapter();
-        mux.register(
+        assert!(mux.register(
             "closing".to_string(),
             "sub-close".to_string(),
             1,
             close_handle.clone(),
-        );
+        ));
         assert_eq!(
             closer.try_write(&output_frame("sub-close", "close")),
             Ok(())

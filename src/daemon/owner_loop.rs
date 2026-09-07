@@ -1357,12 +1357,12 @@ mod tests {
             panic!("expected terminal admission");
         };
         let (mut adapter, handle) = mux.create_adapter();
-        mux.register(
+        assert!(mux.register(
             "partial-session".to_string(),
             "partial-subscription".to_string(),
             1,
             handle,
-        );
+        ));
 
         let request_bytes = encode_client_frame(&ClientFrame::Request {
             request_id: "1".to_string(),

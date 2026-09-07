@@ -271,7 +271,9 @@ impl CloseEventDecisions {
         };
         match ticket.poll() {
             CoreTicketPoll::Pending => true,
-            CoreTicketPoll::Lost => {
+            // A refused read keeps this single slot free; the next owner turn
+            // submits again, so retries stay bounded to one in flight.
+            CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
                 self.read = None;
                 false
             }

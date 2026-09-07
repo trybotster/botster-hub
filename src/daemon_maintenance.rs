@@ -1014,7 +1014,8 @@ fn run_observe_slice(
     };
     let result = match ticket.poll() {
         CoreTicketPoll::Pending => return,
-        CoreTicketPoll::Lost => {
+        // Refused: the single slot is freed and the next slice resubmits.
+        CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
             reads.observe = None;
             return;
         }
@@ -1062,7 +1063,7 @@ fn run_journal_pull_slice(
     let (result, woke) = match reads.journal.as_mut() {
         Some((ticket, woke)) => match ticket.poll() {
             CoreTicketPoll::Pending => return,
-            CoreTicketPoll::Lost => {
+            CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
                 reads.journal = None;
                 return;
             }
@@ -1162,7 +1163,7 @@ fn run_baseline_slice(
     let result = match reads.baseline.as_mut() {
         Some(ticket) => match ticket.poll() {
             CoreTicketPoll::Pending => return,
-            CoreTicketPoll::Lost => {
+            CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
                 reads.baseline = None;
                 return;
             }

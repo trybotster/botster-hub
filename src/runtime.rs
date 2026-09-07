@@ -1868,6 +1868,11 @@ impl HubRuntime {
                             let _ = response.send(Err(CoreTicketError::DriverStopped.to_string()));
                         }
                     }
+                    CoreTicketPoll::Refused => {
+                        if let InflightPluginCore::Coordination { response, .. } = entry {
+                            let _ = response.send(Err(CoreTicketError::Overloaded.to_string()));
+                        }
+                    }
                 },
                 InflightPluginCore::SessionTypeSpawn { start, .. } => {
                     let completion = match start.tracker.poll(self) {
@@ -1876,6 +1881,9 @@ impl HubRuntime {
                             continue;
                         }
                         CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
+                        CoreTicketPoll::Refused => {
+                            Err(core_bridge_error(CoreTicketError::Overloaded))
+                        }
                         CoreTicketPoll::Ready(Err(error)) => Err(error),
                         CoreTicketPoll::Ready(Ok(CoreCompletion::Spawn { result, .. })) => result,
                         CoreTicketPoll::Ready(Ok(_)) => Err(CoreDaemonError::Shutdown),
@@ -2076,6 +2084,7 @@ impl HubRuntime {
         let completion = match start.tracker.poll(self) {
             CoreTicketPoll::Pending => return false,
             CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
+            CoreTicketPoll::Refused => Err(core_bridge_error(CoreTicketError::Overloaded)),
             CoreTicketPoll::Ready(Err(error)) => Err(error),
             CoreTicketPoll::Ready(Ok(CoreCompletion::Spawn { result, .. })) => result,
             CoreTicketPoll::Ready(Ok(_)) => Err(CoreDaemonError::Shutdown),
@@ -3713,41 +3722,6 @@ impl HubRuntime {
         })
     }
 
-    /// Detach the live generation one client owns for a route, when any.
-    ///
-    /// Returns the detached generation. `None` means the client owned no live
-    /// generation for the route.
-    pub(crate) fn detach_owned_generation(
-        &self,
-        client_id: ClientId,
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        now_seconds: u64,
-    ) -> CoreTicket<Result<Option<TerminalSubscriptionGeneration>, CoreDaemonError>> {
-        self.core_daemon.submit(move |daemon| {
-            let generation = daemon
-                .list_terminal_subscriptions()
-                .into_iter()
-                .find(|row| {
-                    row.client_id == client_id
-                        && row.session_id == session_id
-                        && row.subscription_id == subscription_id
-                })
-                .map(|row| row.generation);
-            let Some(generation) = generation else {
-                return Ok(None);
-            };
-            daemon.detach_terminal_subscription(
-                client_id,
-                session_id,
-                subscription_id,
-                generation,
-                now_seconds,
-            )?;
-            Ok(Some(generation))
-        })
-    }
-
     pub(crate) fn close_work_source(&self) -> crate::data_plane::CloseWorkSource {
         self.close_work.clone()
     }
@@ -4699,9 +4673,17 @@ fn settle_entity_publish_op(
 pub(crate) const STARTUP_CORE_WAIT: Duration = Duration::from_secs(30);
 
 /// Map a lost or timed-out bridge wait onto the Core error surface.
+/// Core-typed view of a bridge outcome that never reached Core.
+///
+/// A refused admission is a pending-operation limit on the Hub side of the
+/// bridge; a stopped or timed-out bridge reads as shutdown.
 pub(crate) fn core_bridge_error(error: CoreTicketError) -> CoreDaemonError {
-    let _ = error;
-    CoreDaemonError::Shutdown
+    match error {
+        CoreTicketError::Timeout | CoreTicketError::DriverStopped => CoreDaemonError::Shutdown,
+        CoreTicketError::Overloaded => {
+            CoreDaemonError::PendingLimit(botster_core_daemon::PendingLimitKind::Spawns)
+        }
+    }
 }
 
 /// One Core operation from `begin` to its completion.
@@ -4751,6 +4733,10 @@ impl CoreOperationTracker {
                     self.stage = CoreOperationStage::Done;
                     return CoreTicketPoll::Lost;
                 }
+                CoreTicketPoll::Refused => {
+                    self.stage = CoreOperationStage::Done;
+                    return CoreTicketPoll::Refused;
+                }
                 CoreTicketPoll::Ready(Err(error)) => {
                     self.stage = CoreOperationStage::Done;
                     return CoreTicketPoll::Ready(Err(error));
@@ -4785,6 +4771,9 @@ impl CoreOperationTracker {
                 CoreTicketPoll::Ready(result) => return result,
                 CoreTicketPoll::Lost => {
                     return Err(core_bridge_error(CoreTicketError::DriverStopped));
+                }
+                CoreTicketPoll::Refused => {
+                    return Err(core_bridge_error(CoreTicketError::Overloaded));
                 }
                 CoreTicketPoll::Pending => {
                     if Instant::now() >= deadline {
@@ -5008,7 +4997,9 @@ impl HubRuntime {
                     CoreTicketPoll::Ready(Ok(id)) => {
                         tracker.stage = CoreOperationStage::Pending(id)
                     }
-                    CoreTicketPoll::Ready(Err(_)) | CoreTicketPoll::Lost => {
+                    CoreTicketPoll::Ready(Err(_))
+                    | CoreTicketPoll::Lost
+                    | CoreTicketPoll::Refused => {
                         tracker.stage = CoreOperationStage::Done;
                     }
                     CoreTicketPoll::Pending => {}

@@ -5,8 +5,10 @@
 //! Core ticket or completion arrives. Reads that the owner projection can
 //! answer (`Status` session count, `ListSessions`) never touch Core.
 
-use botster_core::{ClientId, SessionId, SubscriptionId};
-use botster_core_daemon::{CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError};
+use botster_core::{ClientId, SessionId, SubscriptionId, TerminalSubscriptionGeneration};
+use botster_core_daemon::{
+    CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError, DetachTerminalSubscriptionResult,
+};
 use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonDiagnostic, DaemonModeFlags, DaemonOperatorError,
     DaemonReadScreen, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonRetentionAccounting,
@@ -34,7 +36,7 @@ use crate::daemon::shutdown::{
 use crate::data_plane::driver::CoreTicketPoll;
 use crate::runtime::{AttachBindFailure, AttachBindPlan, CoreOperationTracker};
 use crate::subscription::attach_routes::{
-    AttachStreamOwner, BoundAdapterHandle, overlay_live_attach_occupancy,
+    AttachStreamOwner, AttachmentIdentity, BoundAdapterHandle, overlay_live_attach_occupancy,
 };
 use crate::subscription::closed_events::{
     suppress_unix_session_close_events, suppress_webrtc_session_close_events,
@@ -90,6 +92,15 @@ pub(crate) fn core_operator_error(
 
 fn lost_core(operation: &'static str, request_id: &str) -> DaemonResponse {
     core_operator_error(operation, request_id, &CoreDaemonError::Shutdown)
+}
+
+/// Typed refusal: the bounded Core request queue was full, nothing ran.
+fn overloaded_core(operation: &'static str, request_id: &str) -> DaemonResponse {
+    core_operator_error(
+        operation,
+        request_id,
+        &core_bridge_error(CoreTicketError::Overloaded),
+    )
 }
 
 fn history_unavailable(
@@ -164,6 +175,9 @@ fn poll_tracker(
     match tracker.poll(runtime) {
         CoreTicketPoll::Pending => Err(ControlPoll::Pending),
         CoreTicketPoll::Lost => Err(ControlPoll::Ready(Ok(lost_core(operation, request_id)))),
+        CoreTicketPoll::Refused => {
+            Err(ControlPoll::Ready(Ok(overloaded_core(operation, request_id))))
+        }
         CoreTicketPoll::Ready(Err(error)) => Err(ControlPoll::Ready(Ok(core_operator_error(
             operation, request_id, &error,
         )))),
@@ -237,6 +251,9 @@ pub(crate) fn handle_runtime(
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
                     CoreTicketPoll::Lost => {
                         return ControlPoll::Ready(Ok(lost_core("status", "daemon-status")));
+                    }
+                    CoreTicketPoll::Refused => {
+                        return ControlPoll::Ready(Ok(overloaded_core("status", "daemon-status")));
                     }
                     CoreTicketPoll::Ready(value) => value,
                 };
@@ -372,6 +389,7 @@ pub(crate) fn handle_runtime(
                 let result = match ticket.poll() {
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
                     CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
+                    CoreTicketPoll::Refused => Err(core_bridge_error(CoreTicketError::Overloaded)),
                     CoreTicketPoll::Ready(result) => result,
                 };
                 match result {
@@ -548,6 +566,7 @@ pub(crate) fn handle_runtime(
                 let result = match ticket.poll() {
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
                     CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
+                    CoreTicketPoll::Refused => Err(core_bridge_error(CoreTicketError::Overloaded)),
                     CoreTicketPoll::Ready(result) => result,
                 };
                 ControlPoll::Ready(Ok(match result {
@@ -614,6 +633,60 @@ fn capture_owner_id(observability: &DaemonObservability, client_id: &str) -> Str
         .unwrap_or_else(|| format!("client:{client_id}"))
 }
 
+/// Detach one exact Core generation as bounded owner work.
+///
+/// Used when a deferred attach or bind completed in Core after its owner
+/// stopped being the current attachment (connection closed, route replaced).
+/// The generation is exact, so a replacement stream's generation is never
+/// touched. At most one Core ticket is in flight; a refused admission is
+/// retried on the next owner turn, and a lost driver ends the work.
+pub(crate) fn schedule_exact_generation_detach(
+    state: &mut DaemonControlState,
+    client_id: String,
+    session_id: String,
+    subscription_id: String,
+    generation: TerminalSubscriptionGeneration,
+) {
+    let mut ticket: Option<
+        crate::data_plane::driver::CoreTicket<
+            Result<DetachTerminalSubscriptionResult, CoreDaemonError>,
+        >,
+    > = None;
+    state
+        .pending_owner_work
+        .push(Box::new(move |daemon, state| {
+            if ticket.is_none() {
+                let Some(runtime) = daemon.runtime() else {
+                    return true;
+                };
+                let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
+                ticket = Some(runtime.detach_terminal_subscription(
+                    ClientId(client_id.clone()),
+                    SessionId(session_id.clone()),
+                    SubscriptionId(subscription_id.clone()),
+                    generation,
+                    now,
+                ));
+            }
+            match ticket.as_mut().expect("ticket submitted above").poll() {
+                CoreTicketPoll::Pending => false,
+                // One in-flight ticket; resubmit on the next turn.
+                CoreTicketPoll::Refused => {
+                    ticket = None;
+                    false
+                }
+                CoreTicketPoll::Lost | CoreTicketPoll::Ready(_) => true,
+            }
+        }));
+}
+
+fn stale_attach_error() -> DaemonResponse {
+    super::attach_bind_operator_error(
+        "invalid_request",
+        "the attaching connection closed or the route was replaced before the attach completed",
+    )
+}
+
 fn handle_attach(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
@@ -675,7 +748,8 @@ fn handle_attach(
             client_id: client_id.clone(),
             grant_id: observability.grant_id.clone(),
         };
-        pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
+        let identity =
+            pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
         let runtime = daemon.runtime().expect("runtime checked by caller");
         let mut ticket = runtime.attach_route(
             ClientId(client_id.clone()),
@@ -683,24 +757,45 @@ fn handle_attach(
             SubscriptionId(subscription_id.clone()),
             now,
         );
-        return ControlStep::pending(move |daemon, state| {
+        return ControlStep::pending(move |_, state| {
             let result = match ticket.poll() {
                 CoreTicketPoll::Pending => return ControlPoll::Pending,
                 CoreTicketPoll::Lost => Err(AttachBindFailure::Attach(CoreDaemonError::Shutdown)),
+                CoreTicketPoll::Refused => Err(AttachBindFailure::Attach(core_bridge_error(
+                    CoreTicketError::Overloaded,
+                ))),
                 CoreTicketPoll::Ready(result) => result,
             };
-            let pending_runtime = &mut state.pending_runtime;
             let generation = match result {
                 Ok(generation) => generation,
                 Err(failure) => {
-                    pending_runtime.cancel_stream(&session_id, &subscription_id);
+                    let _ = state
+                        .pending_runtime
+                        .cancel_stream_if(&session_id, &subscription_id, &identity);
                     return ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                         "invalid_request",
                         &attach_bind_failure_message(&failure),
                     )));
                 }
             };
-            pending_runtime.record_generation(&session_id, &subscription_id, generation);
+            // Fence: the route is attached in Core, but only the attachment
+            // that started it may record it. Otherwise release exactly it.
+            if !state.pending_runtime.record_generation_if(
+                &session_id,
+                &subscription_id,
+                &identity,
+                generation,
+            ) {
+                schedule_exact_generation_detach(
+                    state,
+                    client_id.clone(),
+                    session_id.clone(),
+                    subscription_id.clone(),
+                    generation,
+                );
+                return ControlPoll::Ready(Ok(stale_attach_error()));
+            }
+            let pending_runtime = &mut state.pending_runtime;
             let reserved = pending_runtime.admission.reservations.reserve(
                 session_id.clone(),
                 subscription_id.clone(),
@@ -746,16 +841,18 @@ fn handle_attach(
             match response {
                 Ok(response) => ControlPoll::Ready(Ok(response)),
                 Err(error) => {
-                    // The route exists in Core without an adapter; release it.
-                    if let Some(runtime) = daemon.runtime() {
-                        let _ = runtime.detach_owned_generation(
-                            ClientId(client_id.clone()),
-                            SessionId(session_id.clone()),
-                            SubscriptionId(subscription_id.clone()),
-                            now,
-                        );
-                    }
-                    pending_runtime.cancel_stream(&session_id, &subscription_id);
+                    // The route exists in Core without an adapter; release
+                    // exactly the generation this attach created.
+                    let _ = state
+                        .pending_runtime
+                        .cancel_stream_if(&session_id, &subscription_id, &identity);
+                    schedule_exact_generation_detach(
+                        state,
+                        client_id.clone(),
+                        session_id.clone(),
+                        subscription_id.clone(),
+                        generation,
+                    );
                     ControlPoll::Ready(Ok(error))
                 }
             }
@@ -778,11 +875,12 @@ fn handle_attach(
         client_id: client_id.clone(),
         grant_id: None,
     };
-    pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
+    let identity =
+        pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
     let (adapter, handle) = mux.create_adapter();
     let runtime = daemon.runtime().expect("runtime checked by caller");
     let mut ticket = runtime.attach_and_bind_terminal(AttachBindPlan {
-        client_id: ClientId(client_id),
+        client_id: ClientId(client_id.clone()),
         session_id: SessionId(session_id.clone()),
         subscription_id: SubscriptionId(subscription_id.clone()),
         capabilities,
@@ -793,23 +891,47 @@ fn handle_attach(
         let result = match ticket.poll() {
             CoreTicketPoll::Pending => return ControlPoll::Pending,
             CoreTicketPoll::Lost => Err(AttachBindFailure::Attach(CoreDaemonError::Shutdown)),
+            CoreTicketPoll::Refused => Err(AttachBindFailure::Attach(core_bridge_error(
+                CoreTicketError::Overloaded,
+            ))),
             CoreTicketPoll::Ready(result) => result,
         };
-        let pending_runtime = &mut state.pending_runtime;
         match result {
             Ok(generation) => {
-                pending_runtime.mark_adapter_bound(
-                    &session_id,
-                    &subscription_id,
-                    generation,
-                    BoundAdapterHandle::Unix(handle.clone()),
-                );
-                mux.register(
-                    session_id.clone(),
-                    subscription_id.clone(),
-                    generation.0,
-                    handle.clone(),
-                );
+                // Fence before any mutation: the stream must still be this
+                // attachment and the connection mux must accept the route.
+                // `register` fails closed once `close_all` ran, so a bind
+                // that lands after connection teardown never outlives it.
+                let live = state
+                    .pending_runtime
+                    .stream_matches(&session_id, &subscription_id, &identity)
+                    && mux.register(
+                        session_id.clone(),
+                        subscription_id.clone(),
+                        generation.0,
+                        handle.clone(),
+                    );
+                let bound = live
+                    && state.pending_runtime.mark_adapter_bound_if(
+                        &session_id,
+                        &subscription_id,
+                        &identity,
+                        generation,
+                        BoundAdapterHandle::Unix(handle.clone()),
+                    );
+                if !bound {
+                    // Late success for a dead attachment: release exactly
+                    // this generation and leave any replacement alone.
+                    handle.close();
+                    schedule_exact_generation_detach(
+                        state,
+                        client_id.clone(),
+                        session_id.clone(),
+                        subscription_id.clone(),
+                        generation,
+                    );
+                    return ControlPoll::Ready(Ok(stale_attach_error()));
+                }
                 let mut response = daemon_response_base(DaemonResponseKind::TerminalAttached);
                 response.terminal_attach = Some(DaemonTerminalAttach::new(
                     session_id.clone(),
@@ -820,7 +942,9 @@ fn handle_attach(
             }
             Err(failure) => {
                 handle.close();
-                pending_runtime.cancel_stream(&session_id, &subscription_id);
+                let _ = state
+                    .pending_runtime
+                    .cancel_stream_if(&session_id, &subscription_id, &identity);
                 ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                     "invalid_request",
                     &attach_bind_failure_message(&failure),
@@ -862,6 +986,9 @@ fn handle_shutdown_session(
                     let classification = match ticket.poll() {
                         CoreTicketPoll::Pending => return ControlPoll::Pending,
                         CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
+                        CoreTicketPoll::Refused => {
+                            Err(core_bridge_error(CoreTicketError::Overloaded))
+                        }
                         CoreTicketPoll::Ready(result) => result,
                     };
                     match classification {
@@ -923,6 +1050,9 @@ fn handle_shutdown_session(
                     let classification = match ticket.poll() {
                         CoreTicketPoll::Pending => return ControlPoll::Pending,
                         CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
+                        CoreTicketPoll::Refused => {
+                            Err(core_bridge_error(CoreTicketError::Overloaded))
+                        }
                         CoreTicketPoll::Ready(result) => result,
                     };
                     return ControlPoll::Ready(Ok(match classification {

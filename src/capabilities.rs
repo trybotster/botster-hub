@@ -1001,8 +1001,14 @@ impl KeyedPluginStore {
         }
     }
 
+    /// Exact plugin database namespace for one plugin identity.
+    ///
+    /// Package admission bounds the name only by uniqueness and the reserved
+    /// `hub` owner, so two admitted identities must never share a namespace.
+    /// The encoding is injective; an identity too long for the namespace
+    /// limit is a typed error, not a collision.
     fn namespace(plugin_key: &PluginKey) -> Result<Namespace, CapabilityRuntimeError> {
-        Namespace::new(&sanitize_plugin_key(plugin_key)).map_err(|error| {
+        Namespace::new(&plugin_namespace_text(plugin_key)).map_err(|error| {
             CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::InvalidRequest,
                 format!("plugin key is not a valid plugin database namespace: {error}"),
@@ -1775,24 +1781,23 @@ fn sanitized_io_error(error: io::Error) -> String {
     }
 }
 
-fn sanitize_plugin_key(plugin_key: &PluginKey) -> String {
-    let sanitized = plugin_key
-        .0
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-
-    if sanitized == "." || sanitized == ".." || sanitized.starts_with('.') {
-        format!("_{sanitized}")
-    } else {
-        sanitized
+/// Injective namespace text for one plugin identity.
+///
+/// Lowercase ASCII letters, digits, and `-` pass through. Every other byte of
+/// the UTF-8 identity is written as `_` followed by two lowercase hex digits,
+/// including `_` itself, so no two identities produce the same text and the
+/// output uses only characters the Core namespace accepts. The text never
+/// starts with `.` because `.` is always escaped.
+fn plugin_namespace_text(plugin_key: &PluginKey) -> String {
+    let mut text = String::with_capacity(plugin_key.0.len());
+    for byte in plugin_key.0.bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' {
+            text.push(char::from(byte));
+        } else {
+            text.push_str(&format!("_{byte:02x}"));
+        }
     }
+    text
 }
 
 fn scoped_capability(surface: CapabilitySurface, scope: impl Into<String>) -> Capability {
@@ -1832,6 +1837,38 @@ fn event_plugin_key(event: &CapabilityRuntimeEvent) -> Option<PluginKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Admitted package names are bounded only by uniqueness and the reserved
+    /// `hub` owner, so the namespace text must be injective.
+    #[test]
+    fn plugin_namespace_text_is_injective_for_admitted_identities() {
+        let identities = [
+            "a/b", "a_b", "a b", "a:b", "a.b", "A_b", "a_5fb", "a-b", ".hidden", "..",
+            "über", "u_c3_bcber",
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for identity in identities {
+            let text = plugin_namespace_text(&PluginKey(identity.to_string()));
+            assert!(
+                seen.insert(text.clone()),
+                "{identity:?} collided on namespace text {text:?}"
+            );
+            Namespace::new(&text)
+                .unwrap_or_else(|error| panic!("{identity:?} -> {text:?}: {error}"));
+        }
+        assert_eq!(
+            plugin_namespace_text(&PluginKey("project-pipelines".into())),
+            "project-pipelines"
+        );
+        assert_eq!(
+            plugin_namespace_text(&PluginKey("a/b".into())),
+            "a_2fb"
+        );
+        assert_eq!(
+            plugin_namespace_text(&PluginKey("a_b".into())),
+            "a_5fb"
+        );
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_backend(name: &str) -> Arc<KeyedPluginStore> {
