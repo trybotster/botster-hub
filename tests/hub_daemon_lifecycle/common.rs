@@ -121,10 +121,22 @@ pub(crate) fn terminal_resize_frame_bytes(rows: u16, cols: u16) -> InputSpec {
 
 /// One paste transaction: BEGIN, the data in protocol-sized chunks, COMMIT.
 pub(crate) fn terminal_paste_frame_bytes(data: &[u8]) -> Vec<InputSpec> {
+    terminal_paste_frame_bytes_with_unsafe_opt_in(data, false)
+}
+
+/// One paste transaction that explicitly permits unsafe control bytes.
+pub(crate) fn terminal_paste_frame_bytes_allowing_unsafe(data: &[u8]) -> Vec<InputSpec> {
+    terminal_paste_frame_bytes_with_unsafe_opt_in(data, true)
+}
+
+fn terminal_paste_frame_bytes_with_unsafe_opt_in(
+    data: &[u8],
+    allow_unsafe: bool,
+) -> Vec<InputSpec> {
     use botster_terminal_protocol::MAX_PASTE_CHUNK_DATA_BYTES;
     let mut frames = vec![InputSpec::PasteBegin {
         total_len: u32::try_from(data.len()).expect("paste fits u32"),
-        allow_unsafe: false,
+        allow_unsafe,
     }];
     for (index, chunk) in data.chunks(MAX_PASTE_CHUNK_DATA_BYTES).enumerate() {
         frames.push(InputSpec::PasteChunk {
