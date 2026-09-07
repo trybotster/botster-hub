@@ -43,8 +43,8 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{Receiver as AsyncReceiver, Sender as AsyncSender, channel, default_runtime};
 
 use crate::support::{
-    candidate_session_worker_binary_path, recovering_mutex_guard, validate_cli_daemon_shutdown,
-    wait_for_cli_daemon_shutdown,
+    candidate_hub_binary_path, candidate_session_worker_binary_path, recovering_mutex_guard,
+    validate_cli_daemon_shutdown, wait_for_cli_daemon_shutdown,
 };
 
 use super::*;
@@ -54,7 +54,7 @@ pub(crate) fn start_cli_daemon(data_dir: &Path) -> PanicSafeCliDaemon {
     check_harness_taint();
     // Verify the candidate manifest once before this process starts.
     candidate_session_worker_binary_path();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    let mut command = Command::new(candidate_hub_binary_path());
     command
         .arg("start")
         .arg("--data-dir")
@@ -78,7 +78,7 @@ pub(crate) fn start_cli_daemon_with_env(
     check_harness_taint();
     // Verify the candidate manifest once before this process starts.
     candidate_session_worker_binary_path();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    let mut command = Command::new(candidate_hub_binary_path());
     command
         .arg("start")
         .arg("--data-dir")
@@ -106,7 +106,7 @@ pub(crate) fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> PanicS
     check_harness_taint();
     // Verify the candidate manifest once before this process starts.
     candidate_session_worker_binary_path();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    let mut command = Command::new(candidate_hub_binary_path());
     command
         .arg("start")
         .arg("--data-dir")

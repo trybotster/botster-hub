@@ -3155,7 +3155,7 @@ fn isolated_hub_shutdown_reaps_live_session_workers() {
     botster_hub_test_support::clear_isolated_hub_taint();
     let hub = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(unique_short_test_dir("ih-reap"))
             .name("owned-worker-reap"),

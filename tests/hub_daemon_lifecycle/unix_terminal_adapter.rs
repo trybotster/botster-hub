@@ -170,7 +170,7 @@ fn unix_adapter_bind_returns_only_attaching_then_opaque_envelopes() {
 
     eprintln!(
         "unix adapter bind provenance hub_bin={} session_worker={}",
-        env!("CARGO_BIN_EXE_botster-hub"),
+        candidate_hub_binary_path().display(),
         session_worker_binary_path().display()
     );
 
@@ -1835,7 +1835,7 @@ fn unix_eof_releases_exact_attach_occupancy_on_sibling_status() {
     );
     eprintln!(
         "unix eof occupancy provenance hub_bin={} session_worker={}",
-        env!("CARGO_BIN_EXE_botster-hub"),
+        candidate_hub_binary_path().display(),
         session_worker_binary_path().display()
     );
 

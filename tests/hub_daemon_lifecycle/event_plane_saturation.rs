@@ -3161,7 +3161,7 @@ fn start_campaign_hub(
     extra_env: &[(&str, &str)],
 ) -> botster_hub_test_support::IsolatedHub {
     let mut builder = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+        .hub_bin(candidate_hub_binary_path())
         .session_worker_bin(session_worker_binary_path())
         .root(PathBuf::from(format!("/tmp/bh-event-sat-{name}")))
         .name(format!("event-sat-{name}"));

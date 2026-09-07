@@ -431,7 +431,7 @@ fn daemon_plugin_contract_matrix_fixture_exercises_public_package_contracts() {
     .expect("copy published plugin contract matrix fixture");
     let hub = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(PathBuf::from("/tmp/bh-plugin-contract-matrix"))
             .name("plugin-contract-matrix"),
@@ -761,7 +761,7 @@ fn daemon_project_pipelines_example_exercises_published_surface_conformance() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(PathBuf::from("/tmp/bh-project-pipelines-conformance"))
             .name("project-pipelines"),
@@ -829,7 +829,7 @@ fn foreground_terminal_app_open_absolutizes_relative_runtime_paths() {
     let daemon_working_directory = PathBuf::from("/tmp");
     let hub = start_isolated_hub(
         botster_hub_test_support::IsolatedHubBuilder::new()
-            .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
+            .hub_bin(candidate_hub_binary_path())
             .session_worker_bin(session_worker_binary_path())
             .root(PathBuf::from("bh-relative-runtime"))
             .working_directory(&daemon_working_directory)
@@ -6604,4 +6604,3 @@ fn daemon_package_entity_subscriber_overflow_resyncs_from_provider() {
     held.unsubscribe().expect("unsubscribe");
     shutdown_cli_daemon(&data_dir, child);
 }
-
