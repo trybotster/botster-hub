@@ -7,7 +7,10 @@
 //! completes or transfers to a cleanup obligation, so a connection that
 //! disconnects with cleanup outstanding does not free capacity for new
 //! admissions. Nothing is discarded at the limit: new admissions are refused
-//! with a typed error instead.
+//! with a typed error instead, and no path creates a permit past capacity.
+//! Every accepted resource physically carries its permit: a Unix connection
+//! in its cleanup guard, a WebRTC peer in the budget's peer table, a pending
+//! request in its entry.
 //!
 //! An obligation keeps at most one Core ticket in flight. A refused admission
 //! resubmits on the next owner turn; a lost driver ends the obligation.
@@ -80,15 +83,15 @@ pub(crate) struct OwnerBudgetCounters {
     pub requests_past_deadline: u64,
     /// Obligations still pending past the deadline (counted once).
     pub obligations_past_deadline: u64,
-    /// Cleanup that arrived without a matching reserved permit.
-    pub forced: u64,
+    /// Cleanup work that arrived for a resource holding no permit. This is
+    /// an invariant break; the work is refused (fail closed), never retained
+    /// past capacity.
+    pub invariant_violations: u64,
 }
 
 pub(crate) struct OwnerBudget {
     capacity: usize,
     outstanding: usize,
-    /// Permits reserved by accepted Unix connections, consumed by cleanup.
-    connection_permits: Vec<OwnerPermit>,
     /// Permits reserved by admitted WebRTC peers, keyed by grant id.
     peer_permits: std::collections::BTreeMap<String, OwnerPermit>,
     obligations: Vec<CleanupObligation>,
@@ -107,7 +110,6 @@ impl std::fmt::Debug for OwnerBudget {
             .debug_struct("OwnerBudget")
             .field("capacity", &self.capacity)
             .field("outstanding", &self.outstanding)
-            .field("connection_permits", &self.connection_permits.len())
             .field("peer_permits", &self.peer_permits.len())
             .field("obligations", &self.obligations.len())
             .field("counters", &self.counters)
@@ -120,7 +122,6 @@ impl OwnerBudget {
         Self {
             capacity,
             outstanding: 0,
-            connection_permits: Vec::new(),
             peer_permits: std::collections::BTreeMap::new(),
             obligations: Vec::new(),
             counters: OwnerBudgetCounters::default(),
@@ -153,15 +154,12 @@ impl OwnerBudget {
         })
     }
 
-    /// Reserve a permit for cleanup that arrived without one. This is the
-    /// only way past the capacity, counted so the invariant break is visible;
-    /// cleanup is never discarded.
-    fn force_reserve(&mut self, owner: impl Into<String>) -> OwnerPermit {
-        self.counters.forced = self.counters.forced.saturating_add(1);
-        self.outstanding += 1;
-        OwnerPermit {
-            owner: owner.into(),
-        }
+    /// Record cleanup work that arrived for a resource holding no permit.
+    /// The caller refuses the work; nothing is retained past capacity.
+    pub(crate) fn record_invariant_violation(&mut self, what: &str) {
+        self.counters.invariant_violations =
+            self.counters.invariant_violations.saturating_add(1);
+        eprintln!("botster-hub owner budget invariant violated: {what}");
     }
 
     pub(crate) fn release(&mut self, permit: OwnerPermit) {
@@ -169,28 +167,12 @@ impl OwnerBudget {
         self.outstanding = self.outstanding.saturating_sub(1);
     }
 
-    /// Reserve the permit an accepted connection holds until its cleanup
-    /// completes. `false` means the connection must be refused.
+    /// Reserve the permit an accepted connection carries in its cleanup
+    /// guard until its cleanup completes. `None` means the connection must
+    /// be refused.
     #[must_use]
-    pub(crate) fn reserve_connection(&mut self) -> bool {
-        match self.reserve("connection") {
-            Some(permit) => {
-                self.connection_permits.push(permit);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Take the permit for one connection's cleanup.
-    pub(crate) fn take_connection_permit(&mut self, client_id: &str) -> OwnerPermit {
-        match self.connection_permits.pop() {
-            Some(mut permit) => {
-                permit.owner = format!("cleanup:{client_id}");
-                permit
-            }
-            None => self.force_reserve(format!("cleanup:{client_id}")),
-        }
+    pub(crate) fn reserve_connection(&mut self) -> Option<OwnerPermit> {
+        self.reserve("connection")
     }
 
     /// Reserve the permit an admitted WebRTC peer holds until peer cleanup.
@@ -208,13 +190,6 @@ impl OwnerBudget {
     /// Take the permit for one peer's cleanup, when the peer was admitted.
     pub(crate) fn take_peer_permit(&mut self, grant_id: &str) -> Option<OwnerPermit> {
         self.peer_permits.remove(grant_id)
-    }
-
-    /// Take the peer's permit, or force one when cleanup work exists for a
-    /// peer that never reserved (counted; cleanup is never discarded).
-    pub(crate) fn take_peer_permit_or_force(&mut self, grant_id: &str) -> OwnerPermit {
-        self.take_peer_permit(grant_id)
-            .unwrap_or_else(|| self.force_reserve(format!("peer-cleanup:{grant_id}")))
     }
 
     /// Retain owner work that must complete, holding `permit` until it does.
@@ -360,14 +335,12 @@ mod tests {
     #[test]
     fn connection_permit_survives_disconnect_until_cleanup_completes() {
         let mut budget = OwnerBudget::with_capacity(1);
-        assert!(budget.reserve_connection());
+        let permit = budget.reserve_connection().expect("connection permit");
         // The transport permit is gone; the budget permit is not.
-        assert!(!budget.reserve_connection());
-        let permit = budget.take_connection_permit("client-1");
-        assert_eq!(permit.owner(), "cleanup:client-1");
+        assert!(budget.reserve_connection().is_none());
         budget.retain(permit, "test", |_, _| ObligationPoll::Pending);
         assert!(
-            !budget.reserve_connection(),
+            budget.reserve_connection().is_none(),
             "a new connection cannot replenish the budget while cleanup remains"
         );
         assert_eq!(budget.queued_obligations(), 1);
@@ -375,12 +348,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_without_a_reserved_permit_is_forced_not_discarded() {
+    fn nothing_creates_a_permit_past_capacity() {
         let mut budget = OwnerBudget::with_capacity(0);
-        let permit = budget.take_connection_permit("orphan");
-        assert_eq!(budget.counters.forced, 1);
-        assert_eq!(budget.outstanding(), 1);
-        budget.release(permit);
+        assert!(budget.reserve("x").is_none());
+        assert!(budget.reserve_connection().is_none());
+        assert!(!budget.reserve_peer("grant"));
+        assert!(budget.take_peer_permit("grant").is_none());
+        budget.record_invariant_violation("test");
+        assert_eq!(budget.counters.invariant_violations, 1);
         assert_eq!(budget.outstanding(), 0);
     }
 

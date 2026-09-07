@@ -30,10 +30,23 @@ pub(crate) enum ControlPoll {
 pub(crate) type ControlContinuation =
     Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>;
 
+/// Retirement for a request that owns Core work: it receives the entry's
+/// permit and must retain an obligation that cancels or releases that work.
+pub(crate) type RetireHook =
+    Box<dyn FnOnce(&mut HubDaemon, &mut DaemonControlState, OwnerPermit) + Send>;
+
+/// A deferred request: its continuation, and how to retire it when its
+/// client leaves or its deadline passes. Without a hook, retirement drops
+/// the continuation (a pure read) and releases the permit.
+pub(crate) struct PendingStep {
+    pub(crate) continuation: ControlContinuation,
+    pub(crate) retire: Option<RetireHook>,
+}
+
 /// Result of starting one control request.
 pub(crate) enum ControlStep {
     Ready(DaemonTransportResult<DaemonResponse>),
-    Pending(ControlContinuation),
+    Pending(PendingStep),
 }
 
 impl ControlStep {
@@ -46,7 +59,24 @@ impl ControlStep {
         + Send
         + 'static,
     ) -> Self {
-        Self::Pending(Box::new(continuation))
+        Self::Pending(PendingStep {
+            continuation: Box::new(continuation),
+            retire: None,
+        })
+    }
+
+    /// A deferred request whose Core work must be cancelled or released
+    /// when the request is retired.
+    pub(crate) fn pending_retirable(
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
+        + Send
+        + 'static,
+        retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, OwnerPermit) + Send + 'static,
+    ) -> Self {
+        Self::Pending(PendingStep {
+            continuation: Box::new(continuation),
+            retire: Some(Box::new(retire)),
+        })
     }
 }
 
@@ -73,23 +103,23 @@ pub(crate) struct PendingControlRequest {
     pub(crate) must_finish: bool,
     pub(crate) past_deadline: bool,
     pub(crate) continuation: ControlContinuation,
+    pub(crate) retire: Option<RetireHook>,
 }
 
 /// Requests whose Core work has side effects the owner must observe, or
-/// that own cleanup for what they created. Everything else is a read that
-/// can be retired when its client left or the deadline passed; the Core
-/// answer is then dropped, and captures are released by connection cleanup.
+/// that consume state (ReceiveMessages drains routed envelopes). Everything
+/// else is a read that can be retired when its client left or the deadline
+/// passed: the Core answer is dropped, or the request's retire hook cancels
+/// and releases what it owns (CaptureSnapshot).
 pub(crate) fn request_must_finish(request: &DaemonRequest) -> bool {
     !matches!(
         request,
         DaemonRequest::Status { .. }
             | DaemonRequest::ListSessions { .. }
             | DaemonRequest::Whoami { .. }
-            | DaemonRequest::ReceiveMessages { .. }
             | DaemonRequest::ReadScreen { .. }
             | DaemonRequest::ReadModeFlags { .. }
             | DaemonRequest::CaptureSnapshot { .. }
-            | DaemonRequest::Drain { .. }
             | DaemonRequest::ListSessionTypes { .. }
             | DaemonRequest::ListSessionTypesForTarget { .. }
             | DaemonRequest::ShowSessionType { .. }
@@ -109,9 +139,18 @@ pub(crate) fn next_request_deadline(pending: &[PendingControlRequest]) -> Option
         .min()
 }
 
-fn retire(state: &mut DaemonControlState, mut entry: PendingControlRequest, reason: &str) {
-    if let Some(permit) = entry.permit.take() {
-        state.budget.release(permit);
+fn retire(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    mut entry: PendingControlRequest,
+    reason: &str,
+) {
+    match (entry.permit.take(), entry.retire.take()) {
+        // The request owns Core work: the hook keeps the permit in an
+        // obligation that cancels or releases it.
+        (Some(permit), Some(hook)) => hook(daemon, state, permit),
+        (Some(permit), None) => state.budget.release(permit),
+        (None, _) => {}
     }
     state.budget.counters.retired_abandoned = state.budget.counters.retired_abandoned.saturating_add(1);
     *state
@@ -125,12 +164,16 @@ fn retire(state: &mut DaemonControlState, mut entry: PendingControlRequest, reas
 }
 
 /// Retire every retirable pending request `client` left behind.
-pub(crate) fn retire_abandoned_requests(state: &mut DaemonControlState, client: &str) {
+pub(crate) fn retire_abandoned_requests(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    client: &str,
+) {
     let pending = std::mem::take(&mut state.pending_requests);
     let mut retained = Vec::with_capacity(pending.len());
     for entry in pending {
         if !entry.must_finish && entry.client.as_deref() == Some(client) {
-            retire(state, entry, "client_left");
+            retire(daemon, state, entry, "client_left");
         } else {
             retained.push(entry);
         }
@@ -169,13 +212,15 @@ pub(crate) fn poll_pending_requests(
         }
         let expired = now.saturating_duration_since(entry.accepted_at) >= RETAINED_OPERATION_DEADLINE;
         if !entry.must_finish && entry.reply_tx.is_closed() {
-            retire(state, entry, "reply_closed");
+            retire(daemon, state, entry, "reply_closed");
             continue;
         }
         if !entry.must_finish && expired {
-            retire(state, entry, "deadline");
+            retire(daemon, state, entry, "deadline");
             continue;
         }
+        // A must-finish entry past its deadline is flagged once and then
+        // excluded from the wake calculation, so it cannot busy-wake.
         if expired && !entry.past_deadline {
             entry.past_deadline = true;
             state.budget.counters.requests_past_deadline =

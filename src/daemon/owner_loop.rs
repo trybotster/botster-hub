@@ -288,8 +288,9 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     admission_permit,
                 }) => {
                     // The owner budget permit outlives the transport permit:
-                    // it is held until this connection's cleanup completes.
-                    if !control_state.budget.reserve_connection() {
+                    // it travels in the connection's cleanup guard and comes
+                    // back with the cleanup message.
+                    let Some(connection_permit) = control_state.budget.reserve_connection() else {
                         control_state.lifecycle_counters.rejected_connections = control_state
                             .lifecycle_counters
                             .rejected_connections
@@ -302,7 +303,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         drop(stream);
                         drop(admission_permit);
                         continue;
-                    }
+                    };
                     control_state.lifecycle_counters.accepted_connections = control_state
                         .lifecycle_counters
                         .accepted_connections
@@ -321,9 +322,15 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         .max(control_state.lifecycle_counters.live_connections);
                     connection_tasks.push(transport_runtime.spawn(async move {
                         let _admission_permit = admission_permit;
-                        if let Err(error) =
-                            handle_connection_async(stream, tx, cleanup, shutdown, event_plane)
-                                .await
+                        if let Err(error) = handle_connection_async(
+                            stream,
+                            tx,
+                            cleanup,
+                            shutdown,
+                            event_plane,
+                            connection_permit,
+                        )
+                        .await
                         {
                             eprintln!("botster-hub daemon connection error: {error}");
                         }

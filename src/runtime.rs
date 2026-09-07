@@ -3851,6 +3851,17 @@ impl HubRuntime {
         }))
     }
 
+    /// Cancel one pending Core operation. `true` when it was still pending.
+    pub(crate) fn cancel_core_operation(&self, id: PendingOperationId) -> CoreTicket<bool> {
+        self.core_daemon.submit(move |daemon| daemon.cancel(id))
+    }
+
+    /// Release one open capture. `true` when it was open.
+    pub(crate) fn release_capture(&self, capture: CaptureId) -> CoreTicket<bool> {
+        self.core_daemon
+            .submit(move |daemon| daemon.release_capture(&capture))
+    }
+
     /// Read one page of an open capture. The page shares the capture buffer.
     pub fn read_snapshot_page(
         &self,
