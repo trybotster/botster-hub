@@ -1129,6 +1129,24 @@ main() {
       ;;
   esac
 
+  candidate_path_count=0
+  [[ -n "${BOTSTER_HUB_BIN:-}" ]] && ((candidate_path_count += 1))
+  [[ -n "${BOTSTER_SESSION_WORKER_BIN:-}" ]] && ((candidate_path_count += 1))
+  [[ -n "${BOTSTER_CANDIDATE_MANIFEST:-}" ]] && ((candidate_path_count += 1))
+  if ((candidate_path_count == 0)); then
+    candidate_dir="$ARTIFACT_DIR/candidate"
+    candidate_exports=$(CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 "$SUBJECT_DIR/script/build-dev-artifacts" --out-dir "$candidate_dir")
+    export BOTSTER_HUB_BIN
+    export BOTSTER_SESSION_WORKER_BIN
+    export BOTSTER_CANDIDATE_MANIFEST
+    BOTSTER_HUB_BIN=$(sed -n 's/^BOTSTER_HUB_BIN=//p' <<<"$candidate_exports")
+    BOTSTER_SESSION_WORKER_BIN=$(sed -n 's/^BOTSTER_SESSION_WORKER_BIN=//p' <<<"$candidate_exports")
+    BOTSTER_CANDIDATE_MANIFEST=$(sed -n 's/^BOTSTER_CANDIDATE_MANIFEST=//p' <<<"$candidate_exports")
+  elif ((candidate_path_count != 3)); then
+    log "BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, and BOTSTER_CANDIDATE_MANIFEST must be set together"
+    return 2
+  fi
+
   touch "$ARTIFACT_DIR/campaign-status.tsv" "$ARTIFACT_DIR/commands.txt"
   printf 'started_at=%s\nrun_timeout_seconds=%s\ncampaign_timeout_seconds=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_TIMEOUT_SECONDS" "$CAMPAIGN_TIMEOUT_SECONDS" \
