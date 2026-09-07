@@ -9,14 +9,13 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::PackageSource;
 use botster_hub::{
-    DaemonPackage, DaemonRequest, DaemonResponse, DaemonResponseKind, FileHubStateStore, HubState,
-    PackageRecord, daemon_transport_request,
+    DaemonPackage, DaemonRequest, FileHubStateStore, HubState, PackageRecord,
+    daemon_transport_request,
 };
 use serde::Deserialize;
 

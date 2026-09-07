@@ -4,4 +4,6 @@ pub(crate) mod host_write_order;
 pub(crate) mod listener;
 pub(crate) mod mux_write;
 
-pub(crate) use adapter::{UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle};
+#[cfg(test)]
+pub(crate) use adapter::UnixTerminalAdapter;
+pub(crate) use adapter::{UnixConnectionMux, UnixTerminalAdapterHandle};

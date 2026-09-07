@@ -26,6 +26,54 @@ use support::{
     send_terminal_resize,
 };
 
+/// Bound wait for one Core ticket answered by the Hub data-plane driver.
+const CORE_WAIT: Duration = Duration::from_secs(30);
+
+fn wait_ticket<T>(ticket: botster_hub::CoreTicket<T>) -> T {
+    ticket
+        .wait(CORE_WAIT)
+        .expect("core bridge answers the ticket")
+}
+
+fn spawn_through_core(
+    runtime: &HubRuntime,
+    request: SessionSpawnRequest,
+) -> botster_core::CoreSession {
+    match runtime
+        .begin_spawn(request, CoreSessionMetadata::new())
+        .wait(runtime, CORE_WAIT)
+    {
+        Ok(botster_core_daemon::CoreCompletion::Spawn { result, .. }) => {
+            result.expect("spawn through core daemon")
+        }
+        other => panic!("unexpected spawn completion: {other:?}"),
+    }
+}
+
+fn adopt_through_core(runtime: &HubRuntime, session_id: &SessionId) -> botster_core::CoreSession {
+    match runtime
+        .begin_adopt_session(session_id)
+        .wait(runtime, CORE_WAIT)
+    {
+        Ok(botster_core_daemon::CoreCompletion::Adopt { result, .. }) => {
+            result.expect("adopt through core daemon")
+        }
+        other => panic!("unexpected adopt completion: {other:?}"),
+    }
+}
+
+fn shutdown_through_core(runtime: &HubRuntime, session_id: SessionId) {
+    match runtime
+        .begin_shutdown_session(session_id)
+        .wait(runtime, CORE_WAIT)
+    {
+        Ok(botster_core_daemon::CoreCompletion::ShutdownSession { result, .. }) => {
+            result.expect("shutdown through core daemon")
+        }
+        other => panic!("unexpected shutdown completion: {other:?}"),
+    }
+}
+
 fn explicit_config() -> botster_hub::HubConfig {
     explicit_config_with_data_dir("target/botster-hub-test-data/runtime")
 }
@@ -139,16 +187,21 @@ fn drain_until(
             },
         );
         *logical_clock += 1;
-        if let Ok(screen) = runtime.read_screen(
-            RequestId("drain-until-screen".to_string()),
-            session_id.clone(),
-            *logical_clock,
-        ) && screen
-            .screen
-            .text
-            .as_bytes()
-            .windows(needle.len())
-            .any(|window| window == needle)
+        let screen = runtime
+            .begin_read_screen(
+                RequestId("drain-until-screen".to_string()),
+                session_id.clone(),
+                *logical_clock,
+            )
+            .wait(runtime, Duration::from_secs(5));
+        if let Ok(botster_core_daemon::CoreCompletion::ReadScreen {
+            result: Ok(screen), ..
+        }) = screen
+            && screen
+                .text
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window == needle)
         {
             observed.extend(needle.iter().copied());
             return observed;
@@ -167,40 +220,25 @@ fn drain_until(
 #[test]
 fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
     let config = explicit_config();
-    let mut runtime = HubRuntime::new(config);
+    let mut runtime = HubRuntime::new(config).expect("hub runtime starts");
     let request = spawn_request(runtime.config());
     let session_id = request.session_id.clone();
     let client_id = ClientId("fake-client".to_string());
     let subscription_id = SubscriptionId("fake-subscription".to_string());
     let mut logical_clock = 20;
 
-    let spawn = runtime
-        .spawn_session(request, CoreSessionMetadata::new(), logical_clock)
-        .expect("spawn local command through core daemon");
+    let spawn = spawn_through_core(&runtime, request);
     logical_clock += 1;
     assert_eq!(spawn.session_id, session_id);
     assert_eq!(spawn.lifecycle, SessionLifecycleState::Running);
-    assert!(
-        runtime
-            .session(&session_id)
-            .expect("daemon session lookup")
-            .is_some()
-    );
+    let listed = wait_ticket(runtime.list_sessions()).expect("daemon list");
     assert_eq!(
-        runtime.list_sessions().expect("daemon list").len(),
+        listed.len(),
         1,
         "hub visibility should come from core daemon registry"
     );
+    assert_eq!(listed[0].session_id, session_id);
 
-    runtime
-        .attach_client(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            logical_clock,
-        )
-        .expect("attach fake client through core daemon");
-    logical_clock += 1;
     let adapter = bind_shared_terminal_adapter(
         &mut runtime,
         client_id.clone(),
@@ -221,7 +259,7 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
     logical_clock += 1;
     let deadline = Instant::now() + Duration::from_secs(5);
     let listed = loop {
-        let listed = runtime.list_sessions().expect("daemon list after resize");
+        let listed = wait_ticket(runtime.list_sessions()).expect("daemon list after resize");
         if listed[0].size.rows == 30 && listed[0].size.cols == 100 {
             break listed;
         }
@@ -242,10 +280,9 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
         &mut logical_clock,
     );
 
-    runtime
-        .shutdown_session(session_id.clone(), logical_clock)
-        .expect("shutdown through core daemon");
-    let listed = runtime.list_sessions().expect("daemon list after shutdown");
+    shutdown_through_core(&runtime, session_id.clone());
+    let _ = logical_clock;
+    let listed = wait_ticket(runtime.list_sessions()).expect("daemon list after shutdown");
     assert_eq!(listed[0].registry_state, RegistrySessionState::Exited);
 }
 
@@ -372,15 +409,13 @@ fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
     let mut logical_clock = 200;
 
     {
-        let mut runtime = HubRuntime::new(config.clone());
+        let mut runtime = HubRuntime::new(config.clone()).expect("hub runtime starts");
         let mut request = spawn_request(runtime.config());
         request.session_id = session_id.clone();
-        runtime
-            .spawn_session(request, CoreSessionMetadata::new(), logical_clock)
-            .expect("hub runtime should spawn through worker-backed core daemon");
+        spawn_through_core(&runtime, request);
         logical_clock += 1;
 
-        let listed = runtime.list_sessions().expect("daemon list");
+        let listed = wait_ticket(runtime.list_sessions()).expect("daemon list");
         assert_eq!(listed[0].session_id, session_id);
         assert!(
             listed[0]
@@ -391,8 +426,7 @@ fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
             "worker-backed spawn should persist a child process identity"
         );
 
-        let reports = runtime
-            .adoption_scan()
+        let reports = wait_ticket(runtime.adoption_scan())
             .expect("worker-backed hub runtime should scan adoption evidence");
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].state, SessionAdoptionState::Adoptable);
@@ -408,26 +442,14 @@ fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
         runtime.release_sessions_for_restart();
     }
 
-    let mut restarted = HubRuntime::new(config);
-    let reports = restarted
-        .adoption_scan()
+    let mut restarted = HubRuntime::new(config).expect("hub runtime restarts");
+    let reports = wait_ticket(restarted.adoption_scan())
         .expect("fresh hub runtime should classify released worker");
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].state, SessionAdoptionState::Adoptable);
-    restarted
-        .adopt_session(&session_id, logical_clock)
-        .expect("fresh hub runtime should adopt live worker");
+    adopt_through_core(&restarted, &session_id);
     logical_clock += 1;
 
-    restarted
-        .attach_client(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            logical_clock,
-        )
-        .expect("attach through adopted worker");
-    logical_clock += 1;
     let adapter = bind_shared_terminal_adapter(
         &mut restarted,
         client_id.clone(),
@@ -444,52 +466,46 @@ fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
         b"echo:after-adopt",
         &mut logical_clock,
     );
-    restarted
-        .shutdown_session(session_id.clone(), logical_clock)
-        .expect("shutdown adopted worker through hub runtime");
-    let listed = restarted
-        .list_sessions()
-        .expect("registry should list adopted shutdown");
+    shutdown_through_core(&restarted, session_id.clone());
+    let _ = logical_clock;
+    let listed =
+        wait_ticket(restarted.list_sessions()).expect("registry should list adopted shutdown");
     assert_eq!(listed[0].registry_state, RegistrySessionState::Exited);
 }
 
 #[test]
 fn hub_runtime_guarded_write_delegates_readiness_and_delivery_state_to_core_daemon() {
     let config = explicit_config_with_data_dir("target/botster-hub-test-data/runtime-guarded");
-    let mut runtime = HubRuntime::new(config);
+    let mut runtime = HubRuntime::new(config).expect("hub runtime starts");
     let request = spawn_request(runtime.config());
     let session_id = request.session_id.clone();
     let client_id = ClientId("guarded-client".to_string());
     let subscription_id = SubscriptionId("guarded-subscription".to_string());
     let mut logical_clock = 100;
 
-    runtime
-        .spawn_session(request, CoreSessionMetadata::new(), logical_clock)
-        .expect("spawn for guarded write");
+    spawn_through_core(&runtime, request);
     logical_clock += 1;
-    runtime
-        .attach_client(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            logical_clock,
-        )
-        .expect("attach for guarded write");
+    wait_ticket(runtime.attach_route(
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+        logical_clock,
+    ))
+    .expect("attach for guarded write");
     logical_clock += 1;
 
     let mode_flags = ModeFlags {
         cursor_visible: true,
         ..ModeFlags::default()
     };
-    let written = runtime
-        .guarded_write(GuardedWriteRequest {
-            session_id: session_id.clone(),
-            client_id: client_id.clone(),
-            data: b"guarded\n".to_vec(),
-            readiness: ReadinessEvidence::ready(mode_flags),
-            now_seconds: logical_clock,
-        })
-        .expect("ready guarded write should cross core daemon");
+    let written = wait_ticket(runtime.guarded_write(GuardedWriteRequest {
+        session_id: session_id.clone(),
+        client_id: client_id.clone(),
+        data: b"guarded\n".to_vec(),
+        readiness: ReadinessEvidence::ready(mode_flags),
+        now_seconds: logical_clock,
+    }))
+    .expect("ready guarded write should cross core daemon");
     logical_clock += 1;
     assert!(matches!(written.decision, GuardedWriteDecision::Write));
     assert_eq!(
@@ -509,15 +525,14 @@ fn hub_runtime_guarded_write_delegates_readiness_and_delivery_state_to_core_daem
         &mut logical_clock,
     );
 
-    let deferred = runtime
-        .guarded_write(GuardedWriteRequest {
-            session_id: session_id.clone(),
-            client_id: client_id.clone(),
-            data: b"deferred\n".to_vec(),
-            readiness: ReadinessEvidence::default(),
-            now_seconds: logical_clock,
-        })
-        .expect("absent readiness evidence should be core-deferred");
+    let deferred = wait_ticket(runtime.guarded_write(GuardedWriteRequest {
+        session_id: session_id.clone(),
+        client_id: client_id.clone(),
+        data: b"deferred\n".to_vec(),
+        readiness: ReadinessEvidence::default(),
+        now_seconds: logical_clock,
+    }))
+    .expect("absent readiness evidence should be core-deferred");
     assert!(matches!(
         deferred.decision,
         GuardedWriteDecision::Defer { .. }
@@ -549,56 +564,51 @@ fn runtime_boot_loads_hub_state_from_configured_data_directory() {
 #[test]
 fn bind_terminal_adapter_inventory_echoes_capability_set() {
     let config = explicit_config_with_data_dir("target/botster-hub-test-data/runtime-unix-bind");
-    let mut runtime = HubRuntime::new(config);
+    let runtime = HubRuntime::new(config).expect("hub runtime starts");
     let request = spawn_request(runtime.config());
     let session_id = request.session_id.clone();
     let client_id = ClientId("unix-bind-client".to_string());
     let subscription_id = SubscriptionId("unix-bind-sub".to_string());
     let mut logical_clock = 20;
 
-    runtime
-        .spawn_session(request, CoreSessionMetadata::new(), logical_clock)
-        .expect("spawn");
+    spawn_through_core(&runtime, request);
     logical_clock += 1;
-    runtime
-        .attach_client(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            logical_clock,
-        )
-        .expect("attach");
+    let generation = wait_ticket(runtime.attach_route(
+        client_id.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+        logical_clock,
+    ))
+    .expect("attach");
     logical_clock += 1;
 
-    let before = runtime.list_terminal_subscriptions();
-    let generation = before
-        .iter()
-        .find(|row| {
-            row.client_id == client_id
-                && row.session_id == session_id
-                && row.subscription_id == subscription_id
-        })
-        .map(|row| row.generation)
-        .expect("live generation after attach");
+    let before = wait_ticket(runtime.list_terminal_subscriptions());
     assert!(before.iter().any(|row| {
-        row.generation == generation && !row.adapter_bound && row.capabilities.is_none()
+        row.client_id == client_id
+            && row.session_id == session_id
+            && row.subscription_id == subscription_id
+            && row.generation == generation
+            && !row.adapter_bound
+            && row.capabilities.is_none()
     }));
 
     let capabilities =
         botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
             .expect("advertised tokens");
-    runtime
-        .bind_terminal_adapter(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            generation,
-            capabilities.clone(),
-            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
-        )
-        .expect("bind");
+    wait_ticket(runtime.bind_route_adapter(botster_hub::BindRoutePlan {
+        client_id: client_id.clone(),
+        session_id: session_id.clone(),
+        subscription_id: subscription_id.clone(),
+        generation,
+        capabilities: capabilities.clone(),
+        now_seconds: logical_clock,
+        adapter: Box::new(
+            botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default(),
+        ),
+    }))
+    .expect("bind");
 
-    let after = runtime.list_terminal_subscriptions();
+    let after = wait_ticket(runtime.list_terminal_subscriptions());
     let bound = after
         .iter()
         .find(|row| row.generation == generation)

@@ -24,7 +24,6 @@ use serde_json::Value;
 use crate::HubDaemon;
 use crate::admission::budgets::DAEMON_MAX_FRAME_BYTES;
 use crate::client_api_dto::response::daemon_response_base;
-use crate::client_api_dto::session::daemon_session_type_from_client;
 use crate::daemon::control::session_types::session_type_catalog_entities;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
@@ -250,11 +249,11 @@ pub(crate) fn register_entity_subscription(
             .session_type_catalog
             .refresh(daemon, generation)
             .map(|(generation, entities)| (generation, entities.clone()));
-        if let Some((generation, entities)) = catalog {
+        if let Some((generation, entities)) = &catalog {
             let snapshot = DaemonEntityFrame::Snapshot {
                 subscription_id: subscription_id.clone(),
                 entity_type: entity_type.clone(),
-                snapshot_seq: generation,
+                snapshot_seq: *generation,
                 items: entities.values().cloned().collect(),
                 resync_reason: None,
             };
@@ -605,8 +604,7 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
     if state.entity_subscriptions.is_empty() {
         return;
     }
-    let packages = daemon.package_registry().clone();
-    let Some(runtime) = daemon.runtime_mut() else {
+    let Some(runtime) = daemon.runtime() else {
         state.entity_subscriptions.clear();
         state.lifecycle_counters.live_entity_subscriptions = 0;
         return;
@@ -623,6 +621,8 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
         .values()
         .any(|subscription| subscription.entity_type == "session_type")
     {
+        // The catalog refresh reads the daemon immutably; the mutable runtime
+        // borrow below starts only after it.
         let generation = runtime.state().session_type_generation;
         match state.session_type_catalog.refresh(daemon, generation) {
             Some((generation, entities)) => {
@@ -635,6 +635,9 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
             None => state.maintenance.try_wake(),
         }
     }
+    let Some(runtime) = daemon.runtime_mut() else {
+        return;
+    };
 
     let started = Instant::now();
     let mut delivered = 0usize;
@@ -2385,6 +2388,7 @@ mod tests {
             cursor: None,
             entities: BTreeMap::new(),
             definition_generation,
+            awaiting_initial_snapshot: false,
             definition_entities,
             resync_reason,
             owner_grant_id: None,

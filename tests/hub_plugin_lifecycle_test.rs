@@ -105,7 +105,7 @@ fn explicit_runtime() -> HubRuntime {
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit runtime config should build");
 
-    HubRuntime::new(config)
+    HubRuntime::new(config).expect("hub runtime starts")
 }
 
 fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
@@ -364,7 +364,7 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
         None,
     ))
     .expect("configured runtime");
-    let mut hub = HubRuntime::new(config);
+    let mut hub = HubRuntime::new(config).expect("hub runtime starts");
     let baseline = hub.plugin_worker_debug_snapshot();
     assert_eq!(baseline.live_plugin_executors, 0);
     assert_eq!(baseline.live_executor_workers, 0);

@@ -2542,7 +2542,6 @@ mod tests {
             .expect("build extra-channel close runtime");
         runtime.block_on(reject_extra_data_channel(
             "grant-extra",
-            false,
             EXTRA_DATA_CHANNEL_LABEL,
             &extra,
         ));

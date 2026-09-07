@@ -69,25 +69,26 @@ pub fn bind_shared_terminal_adapter(
     session_id: botster_core::SessionId,
     subscription_id: botster_core::SubscriptionId,
 ) -> botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter {
-    let generation = runtime
-        .list_terminal_subscriptions()
-        .into_iter()
-        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
-        .map(|row| row.generation)
-        .expect("live terminal generation");
     let adapter =
         botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter::auto_complete();
+    // Attach and bind run as one Core operation; the ticket is waited off the
+    // owner loop because this test thread is not the Hub owner.
     runtime
-        .bind_terminal_adapter(
+        .attach_and_bind_terminal(botster_hub::AttachBindPlan {
             client_id,
             session_id,
             subscription_id,
-            generation,
-            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
-                .expect("terminal capabilities"),
-            Box::new(adapter.clone()),
-        )
-        .expect("bind shared terminal adapter");
+            capabilities: botster_core::TerminalCapabilitySet::from_tokens([
+                "terminal_streaming",
+                "resize",
+            ])
+            .expect("terminal capabilities"),
+            now_seconds: 1,
+            adapter: Box::new(adapter.clone()),
+        })
+        .wait(std::time::Duration::from_secs(30))
+        .expect("core bridge answers the attach")
+        .expect("attach and bind shared terminal adapter");
     adapter
 }
 

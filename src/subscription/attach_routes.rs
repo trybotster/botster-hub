@@ -18,13 +18,9 @@ use botster_terminal_protocol::{
     FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY, TerminalCompatibility,
 };
 
-use crate::HubDaemon;
-use crate::HubRuntime;
 use crate::daemon::owner_loop::PendingRuntimeState;
-use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter, UnixTerminalAdapterHandle};
-use crate::transport::webrtc::{
-    WebRtcConnectionMux, WebRtcTerminalAdapter, WebRtcTerminalAdapterHandle,
-};
+use crate::transport::unix::UnixTerminalAdapterHandle;
+use crate::transport::webrtc::WebRtcTerminalAdapterHandle;
 
 #[derive(Clone)]
 pub(crate) enum BoundAdapterHandle {
@@ -33,13 +29,6 @@ pub(crate) enum BoundAdapterHandle {
 }
 
 impl BoundAdapterHandle {
-    pub(crate) fn close(&self) {
-        match self {
-            Self::Unix(handle) => handle.close(),
-            Self::WebRtc(handle) => handle.close(),
-        }
-    }
-
     pub(crate) fn close_from_host(&self) {
         match self {
             Self::Unix(handle) => handle.close_from_host(),
@@ -139,15 +128,6 @@ impl AttachStreamRegistry {
     pub(crate) fn cancel_stream(&mut self, session_id: &str, subscription_id: &str) {
         self.forget_connection_bound_route(session_id, subscription_id);
         self.close_adapter(session_id, subscription_id);
-        self.remove_stream_metadata(session_id, subscription_id);
-    }
-
-    pub(crate) fn forget_stream_without_adapter_close(
-        &mut self,
-        session_id: &str,
-        subscription_id: &str,
-    ) {
-        self.forget_connection_bound_route(session_id, subscription_id);
         self.remove_stream_metadata(session_id, subscription_id);
     }
 
@@ -662,6 +642,8 @@ impl AttachedSubscriptionChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HubRuntime;
+    use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter};
     use botster_core::{
         ClientId, CoreSessionMetadata, ResizePayload, SessionId, SessionSpawnRequest,
         SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,

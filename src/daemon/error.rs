@@ -509,6 +509,10 @@ impl From<ClientDaemonTransportError> for DaemonTransportError {
             ClientDaemonTransportError::Protocol(message) => Self::Protocol(message),
             ClientDaemonTransportError::Compatibility(error) => Self::Compatibility(error),
             ClientDaemonTransportError::ControlThreadStopped => Self::ControlThreadStopped,
+            ClientDaemonTransportError::ProtocolViolation(code) => Self::Protocol(code.as_str()),
+            // Client-only outcomes: Hub never receives its own close or request errors.
+            ClientDaemonTransportError::ClosedByHub(_) => Self::Protocol("closed by hub"),
+            ClientDaemonTransportError::Request(_) => Self::Protocol("request did not complete"),
         }
     }
 }

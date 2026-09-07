@@ -25,19 +25,17 @@ use botster_core_daemon::{
     ObserveLifecycleSlice, PendingOperationId, PublishRoutedEnvelopeRequest, ReadModeFlagsRequest,
     ReadScreenRequest, RegistrySessionState, RetentionAccounting, RetentionPolicy,
     RoutedEnvelopeDeliveryStateResult, SessionAdoptionReport, SessionAdoptionState,
-    SessionLifecycleBaselinePage, SessionLifecycleCursor, SessionLifecycleLookup,
-    SessionLifecyclePage, SessionLifecyclePageError, SessionRegistryStateLookup, SnapshotPage,
-    SpawnSessionRequest,
+    SessionLifecycleBaselinePage, SessionLifecycleCursor, SessionLifecyclePage,
+    SessionLifecyclePageError, SessionRegistryStateLookup, SnapshotPage, SpawnSessionRequest,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
-use std::ffi::OsStr;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::capabilities::HubCapabilityRuntime;
 use crate::config::HubConfig;
@@ -3651,6 +3649,11 @@ impl HubRuntime {
 
     /// Read hub-owned context by context id or session id.
     #[must_use]
+    /// Shared handle to the session context map for deferred completions.
+    pub(crate) fn session_contexts_handle(&self) -> SharedSessionContexts {
+        Arc::clone(&self.session_contexts)
+    }
+
     pub fn session_context(&self, id: &str) -> Option<HubSessionContext> {
         self.session_contexts
             .lock()
@@ -3665,7 +3668,7 @@ impl HubRuntime {
     /// exists, declare the adapter, attach, look up the new generation, bind
     /// the adapter. Any failure after attach detaches again so Core holds no
     /// route without an adapter. Nothing here waits on the owner thread.
-    pub(crate) fn attach_and_bind_terminal(
+    pub fn attach_and_bind_terminal(
         &self,
         plan: AttachBindPlan,
     ) -> CoreTicket<Result<TerminalSubscriptionGeneration, AttachBindFailure>> {
@@ -3675,7 +3678,7 @@ impl HubRuntime {
 
     /// Attach one route without an adapter. Core holds the route's frames
     /// until [`Self::bind_route_adapter`] binds one (WebRTC reserved channel).
-    pub(crate) fn attach_route(
+    pub fn attach_route(
         &self,
         client_id: ClientId,
         session_id: SessionId,
@@ -3689,7 +3692,7 @@ impl HubRuntime {
 
     /// Bind an adapter to an attached generation. On failure Core detaches
     /// that generation so no route stays without an adapter.
-    pub(crate) fn bind_route_adapter(
+    pub fn bind_route_adapter(
         &self,
         plan: BindRoutePlan,
     ) -> CoreTicket<Result<(), AttachBindFailure>> {
@@ -3787,20 +3790,6 @@ impl HubRuntime {
 }
 
 impl HubRuntime {
-    /// Return one exact-session control-plane lifecycle lookup.
-    ///
-    /// Shutdown classify uses this typed result. It does not walk baseline
-    /// pages or consume terminal Drain.
-    pub(crate) fn observe_session_lifecycle(
-        &self,
-        session_id: &SessionId,
-        now_seconds: u64,
-    ) -> CoreTicket<Result<SessionLifecycleLookup, CoreDaemonError>> {
-        let session_id = session_id.clone();
-        self.core_daemon
-            .submit(move |daemon| daemon.observe_session_lifecycle(&session_id, now_seconds))
-    }
-
     /// Exact non-mutating registry state for one session.
     #[allow(dead_code)]
     pub(crate) fn session_registry_state(
@@ -4326,6 +4315,12 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::MissingModeFlagsResponse(_) => "missing_mode_flags_response",
         CoreDaemonError::ControlPlaneFailed(_) => "control_plane_failed",
         CoreDaemonError::ExplicitResizeBusy(_) => "explicit_resize_busy",
+        CoreDaemonError::PendingLimit(_) => "pending_limit",
+        CoreDaemonError::DeadlineExpired => "deadline_expired",
+        CoreDaemonError::Cancelled => "cancelled",
+        CoreDaemonError::WorkerLinkFailed(_) => "worker_link_failed",
+        CoreDaemonError::UnknownCapture(_) => "unknown_capture",
+        CoreDaemonError::SnapshotPageOutOfRange { .. } => "snapshot_page_out_of_range",
         CoreDaemonError::BindTerminalAdapter(error) => match error {
             BindTerminalAdapterError::BindBeforeAttach { .. } => {
                 "bind_terminal_adapter.bind_before_attach"
@@ -4453,13 +4448,6 @@ fn session_lifecycle_label(lifecycle: SessionLifecycleState) -> &'static str {
         SessionLifecycleState::Exited { .. } => "exited",
         SessionLifecycleState::Failed { .. } => "failed",
     }
-}
-
-fn current_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 fn package_entity_mutation_exceeds_limit(
@@ -4831,7 +4819,7 @@ struct SessionTypeSpawnStart {
 }
 
 /// Inputs for one attach-and-bind turn on the Core owner thread.
-pub(crate) struct AttachBindPlan {
+pub struct AttachBindPlan {
     pub client_id: ClientId,
     pub session_id: SessionId,
     pub subscription_id: SubscriptionId,
@@ -4842,7 +4830,7 @@ pub(crate) struct AttachBindPlan {
 
 /// Where an attach-and-bind turn failed. Core holds no route afterwards.
 #[derive(Debug)]
-pub(crate) enum AttachBindFailure {
+pub enum AttachBindFailure {
     /// `attach` itself failed; the adapter declaration was cancelled.
     Attach(CoreDaemonError),
     /// Attach succeeded but no live generation was visible; the route was detached.
@@ -4852,7 +4840,7 @@ pub(crate) enum AttachBindFailure {
 }
 
 /// Adapter bind inputs for one attached generation.
-pub(crate) struct BindRoutePlan {
+pub struct BindRoutePlan {
     pub client_id: ClientId,
     pub session_id: SessionId,
     pub subscription_id: SubscriptionId,
@@ -5054,11 +5042,6 @@ impl HubRuntime {
             .and_then(|mut map| map.remove(&id))
     }
 
-    /// Start one Core operation of any kind.
-    pub(crate) fn begin_operation(&self, operation: CoreOperation) -> CoreOperationTracker {
-        CoreOperationTracker::new(self.core_daemon.begin(operation))
-    }
-
     /// Run one closure on the Core owner thread and read its result later.
     pub(crate) fn submit_core<T, F>(&self, operation: F) -> CoreTicket<T>
     where
@@ -5148,13 +5131,6 @@ impl HubRuntime {
         self.lifecycle_baseline_page(snapshot, after, budget)
             .wait(STARTUP_CORE_WAIT)
             .expect("Core baseline page")
-    }
-
-    /// Test helper: durable session list read to completion.
-    pub(crate) fn list_sessions_for_test(&self) -> Result<Vec<DaemonSession>, CoreDaemonError> {
-        self.list_sessions()
-            .wait(STARTUP_CORE_WAIT)
-            .map_err(core_bridge_error)?
     }
 }
 
@@ -6177,8 +6153,8 @@ mod tests {
     }
 
     fn current_unix_nanos() -> u128 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default()
     }

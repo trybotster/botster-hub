@@ -1,6 +1,6 @@
 //! Local WebRTC bootstrap, signal, and peer-closed control family.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 

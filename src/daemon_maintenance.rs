@@ -22,9 +22,9 @@ use botster_core::{
     PluginInvocationRequest, PluginInvocationResult, RequestId,
 };
 use botster_core_daemon::{
-    LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor,
-    SessionLifecycleChange, SessionLifecycleCursor, SessionLifecyclePageError,
-    SessionLifecycleResyncReason,
+    LifecycleBaselineBudget, ObserveLifecycleBudget, ObserveLifecycleCursor, ObserveLifecycleSlice,
+    SessionLifecycleBaselinePage, SessionLifecycleChange, SessionLifecycleCursor,
+    SessionLifecyclePage, SessionLifecyclePageError, SessionLifecycleResyncReason,
 };
 
 use crate::HubRuntime;
@@ -3050,7 +3050,7 @@ mod tests {
             }
             .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
             .expect("config");
-            let mut runtime = HubRuntime::new(config).expect("runtime");
+            let runtime = HubRuntime::new(config).expect("runtime");
             runtime
                 .spawn_session_for_test(
                     botster_core::SessionSpawnRequest {
@@ -3273,7 +3273,7 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("config");
-        let mut runtime = HubRuntime::new(config).expect("runtime");
+        let runtime = HubRuntime::new(config).expect("runtime");
         let expected = (0..20)
             .map(|index| format!("recover-session-{index:02}"))
             .collect::<BTreeSet<_>>();

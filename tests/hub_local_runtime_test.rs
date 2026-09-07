@@ -97,6 +97,7 @@ fn run_local_runtime() {
                 request_id: request_id("runtime-plugin-lifecycle"),
             },
         )
+        .wait(reloaded.runtime().expect("runtime initialized"))
         .expect("pull plugin lifecycle through client api");
     let HubClientResponseBody::PluginLifecycle(records) = lifecycle.body else {
         panic!("plugin lifecycle response expected");
@@ -154,17 +155,19 @@ fn run_local_runtime() {
 
     if flow.is_err() && session_started {
         let cleanup_registry = reloaded.package_registry().clone();
-        let _ = api.handle_request(
-            reloaded
-                .runtime_mut()
-                .expect("runtime initialized for cleanup"),
-            &cleanup_registry,
-            HubClientRequest::Shutdown {
-                request_id: request_id("runtime-cleanup-shutdown"),
-                session_id: session_id.clone(),
-                now_seconds: logical_clock,
-            },
-        );
+        let _ = api
+            .handle_request(
+                reloaded
+                    .runtime_mut()
+                    .expect("runtime initialized for cleanup"),
+                &cleanup_registry,
+                HubClientRequest::Shutdown {
+                    request_id: request_id("runtime-cleanup-shutdown"),
+                    session_id: session_id.clone(),
+                    now_seconds: logical_clock,
+                },
+            )
+            .wait(reloaded.runtime().expect("runtime initialized for cleanup"));
     }
     if let Err(payload) = flow {
         panic::resume_unwind(payload);
@@ -181,6 +184,7 @@ fn run_local_runtime() {
                 now_seconds: logical_clock,
             },
         )
+        .wait(reloaded.runtime().expect("runtime initialized"))
         .expect("shutdown through client api");
     let HubClientResponseBody::Events(events) = shutdown.body else {
         panic!("shutdown should return events");
@@ -204,6 +208,7 @@ fn assert_status_and_packages(
                 request_id: request_id("runtime-status"),
             },
         )
+        .wait(runtime)
         .expect("status through client api");
     let HubClientResponseBody::Status(status) = status.body else {
         panic!("status response expected");
@@ -218,6 +223,7 @@ fn assert_status_and_packages(
                 request_id: request_id("runtime-list-packages"),
             },
         )
+        .wait(runtime)
         .expect("packages through client api");
     let HubClientResponseBody::Packages(records) = response.body else {
         panic!("package response expected");
@@ -253,7 +259,7 @@ fn spawn_attach_input_and_drain(
                 command: "printf 'runtime:ready\\n'; while IFS= read -r line; do printf 'runtime:%s\\n' \"$line\"; done".to_string(),
                 now_seconds: *logical_clock,
             },
-        )
+        ).wait(runtime)
         .expect("spawn through client api");
     *logical_clock += 1;
     let HubClientResponseBody::Spawned(spawned) = spawn.body else {
@@ -261,15 +267,7 @@ fn spawn_attach_input_and_drain(
     };
     assert_eq!(spawned.session.lifecycle, SessionLifecycleState::Running);
 
-    runtime
-        .attach_client(
-            api.identity().client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            *logical_clock,
-        )
-        .expect("runtime attach");
-    *logical_clock += 1;
+    // Attach and bind run as one Core operation inside the shared helper.
     let terminal_adapter = bind_shared_terminal_adapter(
         runtime,
         api.identity().client_id.clone(),
@@ -315,15 +313,18 @@ fn read_screen_until(
 ) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        let _ = runtime.observe_lifecycle_slice(
-            *logical_clock,
-            None,
-            botster_core_daemon::ObserveLifecycleBudget {
-                max_sessions: 32,
-                max_encoded_result_bytes: 64 * 1024,
-                max_elapsed: Duration::from_millis(20),
-            },
-        );
+        let _ = runtime
+            .observe_lifecycle_slice(
+                *logical_clock,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(20),
+                },
+            )
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge");
         let response = api
             .handle_request(
                 runtime,
@@ -334,6 +335,7 @@ fn read_screen_until(
                     now_seconds: *logical_clock,
                 },
             )
+            .wait(runtime)
             .expect("read screen through client api");
         *logical_clock += 1;
         let HubClientResponseBody::ReadScreen(screen) = response.body else {
@@ -360,15 +362,18 @@ fn drain_until(
 
     let needle_text = String::from_utf8_lossy(needle);
     while Instant::now() < deadline {
-        let _ = runtime.observe_lifecycle_slice(
-            *logical_clock,
-            None,
-            botster_core_daemon::ObserveLifecycleBudget {
-                max_sessions: 32,
-                max_encoded_result_bytes: 64 * 1024,
-                max_elapsed: Duration::from_millis(20),
-            },
-        );
+        let _ = runtime
+            .observe_lifecycle_slice(
+                *logical_clock,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(20),
+                },
+            )
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge");
         let response = api
             .handle_request(
                 runtime,
@@ -379,6 +384,7 @@ fn drain_until(
                     now_seconds: *logical_clock,
                 },
             )
+            .wait(runtime)
             .expect("read screen");
         *logical_clock += 1;
         let HubClientResponseBody::ReadScreen(screen) = response.body else {

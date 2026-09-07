@@ -38,6 +38,7 @@ fn external_crate_constructs_hub_startup_options_with_prior_exhaustive_literal()
         plugin_directories: DirectoryList::default(),
         provider_directories: DirectoryList::default(),
         transports: TransportBindings::default(),
+        retention: botster_hub::RetentionOptions::default(),
         core_engine: CoreEngineOptions::default(),
         package_event_plane: botster_hub::PackageEventPlaneOptions::default(),
     };
@@ -64,6 +65,7 @@ fn external_crate_constructs_hub_config_with_prior_exhaustive_literal() {
         plugin_directories: DirectoryList::default(),
         provider_directories: DirectoryList::default(),
         transports: TransportBindings::default(),
+        retention: botster_hub::RetentionOptions::default(),
         core_engine: CoreEngineOptions::default(),
         package_event_plane: botster_hub::PackageEventPlaneOptions::default(),
     }
@@ -72,6 +74,7 @@ fn external_crate_constructs_hub_config_with_prior_exhaustive_literal() {
     let config = HubConfig {
         host: built.host,
         data_directory: built.data_directory,
+        retention: built.retention,
         session_defaults: built.session_defaults,
         plugin_directories: built.plugin_directories,
         provider_directories: built.provider_directories,
@@ -103,6 +106,7 @@ fn executor_concurrency_one_is_rejected_at_hub_construction() {
         plugin_directories: DirectoryList::default(),
         provider_directories: DirectoryList::default(),
         transports: TransportBindings::default(),
+        retention: botster_hub::RetentionOptions::default(),
         core_engine: CoreEngineOptions {
             plugin_worker_executor_concurrency: 1,
             ..CoreEngineOptions::default()

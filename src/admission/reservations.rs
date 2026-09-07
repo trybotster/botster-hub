@@ -4,7 +4,6 @@
 //! contents. Core-minted generations stay recorded values.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{

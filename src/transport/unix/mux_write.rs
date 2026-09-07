@@ -14,10 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 use botster_hub_client::{
-    ClientFrame, DaemonEntityFrame, DaemonEvent, DaemonHello, DaemonProtocolErrorCode,
-    DaemonRequest, DaemonResponse, DaemonUnixFrame, DaemonUnixTerminalFrame,
-    MAX_CONTROL_REQUEST_BYTES, MAX_UNIX_FRAME_BYTES, ServerFrame, UNIX_FRAME_LENGTH_PREFIX_BYTES,
-    UnixTerminalContainerHeader, decode_unix_frame, encode_server_frame,
+    ClientFrame, DaemonEntityFrame, DaemonHello, DaemonProtocolErrorCode, DaemonRequest,
+    DaemonResponse, DaemonUnixFrame, DaemonUnixTerminalFrame, MAX_CONTROL_REQUEST_BYTES,
+    MAX_UNIX_FRAME_BYTES, ServerFrame, UNIX_FRAME_LENGTH_PREFIX_BYTES, UnixTerminalContainerHeader,
+    decode_unix_frame, encode_server_frame,
 };
 use botster_terminal_protocol::MAX_TERMINAL_INPUT_FRAME_BYTES;
 
@@ -50,6 +50,7 @@ impl MuxWriteState {
             || !self.queued_control.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_response_count(&self) -> usize {
         let pending =
             self.pending
@@ -74,20 +75,6 @@ impl MuxWriteState {
             PendingMuxClass::Response,
             delivery_ack,
             close_after,
-        )?);
-        Ok(())
-    }
-
-    /// Queue one non-response control frame such as a typed close.
-    pub(crate) fn enqueue_server_frame(
-        &mut self,
-        frame: &ServerFrame,
-    ) -> DaemonTransportResult<()> {
-        self.queued_control.push_back(control_mux_frame(
-            frame,
-            PendingMuxClass::Response,
-            None,
-            false,
         )?);
         Ok(())
     }
@@ -567,7 +554,9 @@ pub(crate) async fn write_async_server_frame(
 
 /// Build a host event frame for tests and diagnostics.
 #[cfg(test)]
-pub(crate) fn event_mux_frame(event: DaemonEvent) -> DaemonTransportResult<PendingMuxFrame> {
+pub(crate) fn event_mux_frame(
+    event: botster_hub_client::DaemonEvent,
+) -> DaemonTransportResult<PendingMuxFrame> {
     control_mux_frame(
         &ServerFrame::Event { event },
         PendingMuxClass::Event,

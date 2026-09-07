@@ -4,7 +4,6 @@
 //! recovery. Package refresh, web launch, and operator-console composition stay
 //! in `main`. WebRTC smoke lives in `local_webrtc_smoke`.
 
-use std::env;
 use std::io::{self, BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};

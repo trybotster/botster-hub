@@ -147,8 +147,9 @@ pub use client_api::{
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
     HostIdentityOptions, HubConfig, HubConfigError, HubStartupOptions, LocalSocketBinding,
-    PackageEventPlaneOptions, PackageEventPlanePolicy, RuntimeEnvironment, SessionDefaults,
-    SessionIoCoalescingOptions, TcpBinding, TransportBindings, build_default_config_for_runtime,
+    PackageEventPlaneOptions, PackageEventPlanePolicy, RetentionOptions, RuntimeEnvironment,
+    SessionDefaults, SessionIoCoalescingOptions, TcpBinding, TransportBindings,
+    build_default_config_for_runtime,
 };
 pub use credentials::{
     CredentialKeyPurpose, CredentialPolicyError, CredentialProviderKind, OsKeychainCredentialStore,
@@ -158,6 +159,7 @@ pub use daemon::{
     HubDaemon, HubDaemonError, HubDaemonResult, HubDaemonState, HubDaemonStatus, HubStateLoadSource,
 };
 pub use daemon_maintenance::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
+pub use data_plane::driver::{CoreTicket, CoreTicketError, CoreTicketPoll};
 pub use entrypoint_supervisor::{
     EntrypointDiagnostic, EntrypointProcessSnapshot, EntrypointSupervisor,
     EntrypointSupervisorError, EntrypointSupervisorResult,
@@ -201,6 +203,7 @@ pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,
     host_profile,
 };
+pub use runtime::{AttachBindFailure, AttachBindPlan, BindRoutePlan, CoreOperationTracker};
 pub use runtime::{
     HubLuaPluginLoadError, HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
     daemon_session_to_core_session,
