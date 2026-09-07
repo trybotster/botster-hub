@@ -42,6 +42,21 @@ use crate::subscription::closed_events::{
 use crate::subscription::entity::entity_subscription_error;
 
 /// Typed operator error for one Core failure on a session request.
+/// Operator-facing text for one attach-and-bind failure, with the Core cause.
+fn attach_bind_failure_message(failure: &AttachBindFailure) -> String {
+    match failure {
+        AttachBindFailure::Attach(error) => {
+            format!("attach failed before adapter bind: {error}")
+        }
+        AttachBindFailure::MissingGeneration => {
+            "attach failed before adapter bind: no live generation".to_string()
+        }
+        AttachBindFailure::Bind(error) => {
+            format!("Attach failed to bind a Unix adapter: {error}")
+        }
+    }
+}
+
 pub(crate) fn core_operator_error(
     operation: &'static str,
     request_id: &str,
@@ -677,11 +692,11 @@ fn handle_attach(
             let pending_runtime = &mut state.pending_runtime;
             let generation = match result {
                 Ok(generation) => generation,
-                Err(_) => {
+                Err(failure) => {
                     pending_runtime.cancel_stream(&session_id, &subscription_id);
                     return ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                         "invalid_request",
-                        "attach failed before adapter bind",
+                        &attach_bind_failure_message(&failure),
                     )));
                 }
             };
@@ -808,12 +823,7 @@ fn handle_attach(
                 pending_runtime.cancel_stream(&session_id, &subscription_id);
                 ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                     "invalid_request",
-                    match failure {
-                        AttachBindFailure::Attach(_) | AttachBindFailure::MissingGeneration => {
-                            "attach failed before adapter bind"
-                        }
-                        AttachBindFailure::Bind(_) => "Attach failed to bind a Unix adapter",
-                    },
+                    &attach_bind_failure_message(&failure),
                 )))
             }
         }

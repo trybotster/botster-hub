@@ -436,6 +436,7 @@ dependencies = [
  "botster-core",
  "botster-core-daemon",
  "botster-core-test-support",
+ "botster-hub",
  "botster-hub-client",
  "botster-hub-installation",
  "botster-hub-test-support",

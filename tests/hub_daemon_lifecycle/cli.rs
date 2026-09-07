@@ -405,7 +405,6 @@ impl PanicSafeCliDaemon {
         output
     }
 
-
     fn retain_identity_capture(
         &mut self,
         trigger: CleanupTrigger,

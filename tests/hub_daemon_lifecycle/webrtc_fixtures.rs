@@ -734,7 +734,7 @@ fn spawn_offerer_channel_poll(
                     if let Some(messages_tx) = &messages_tx {
                         let _ = messages_tx.try_send(inbound.clone());
                     }
-                    let _ = admit_inbound_frame(&occupancy, &inbound_tx, InboundMessage::Text(inbound));
+                    let _ = admit_inbound_frame(&occupancy, &inbound_tx, inbound);
                 }
                 DataChannelEvent::OnClose => {
                     if let Some(closed_tx) = &closed_tx {
@@ -1087,7 +1087,8 @@ impl LocalWebrtcOfferPeer {
                 }
                 FixtureDelivery::Terminal { body, .. } => {
                     self.control_terminal_frame_count += 1;
-                    self.pending_terminal_frames.push_back((String::new(), body));
+                    self.pending_terminal_frames
+                        .push_back((String::new(), body));
                 }
             }
         }
@@ -1536,7 +1537,9 @@ impl LocalWebrtcOfferPeer {
                     std::io::Error::other("terminal chunk exceeds WebRTC frame bound").into(),
                 );
             }
-            channel.send(bytes::BytesMut::from(chunk.as_slice())).await?;
+            channel
+                .send(bytes::BytesMut::from(chunk.as_slice()))
+                .await?;
         }
         Ok(())
     }
@@ -2515,7 +2518,8 @@ fn inbound_chunk_reassembly_survives_cancelled_read() {
     let second_chunk = test_chunk(1, 2, &encrypted[mid..], encrypted.len());
 
     let (tx, mut inbound) = WebrtcInboundMailbox::bounded(8, 64 * 1024);
-    admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text(first_chunk)).expect("admit first chunk");
+    admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text(first_chunk))
+        .expect("admit first chunk");
 
     let cancelled = block_on(async {
         timeout(
@@ -2534,9 +2538,9 @@ fn inbound_chunk_reassembly_survives_cancelled_read() {
         "cancelled receive_delivery must keep reassembly state"
     );
 
-    admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text(second_chunk)).expect("admit second chunk");
-    let (delivery, metrics) =
-        block_on(inbound.receive_delivery(&key)).expect("resume delivery");
+    admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text(second_chunk))
+        .expect("admit second chunk");
+    let (delivery, metrics) = block_on(inbound.receive_delivery(&key)).expect("resume delivery");
     assert!(matches!(
         delivery,
         FixtureDelivery::Server(botster_hub_client::ServerFrame::Event {
@@ -2555,9 +2559,18 @@ fn inbound_chunk_reassembly_survives_cancelled_read() {
 fn inbound_occupancy_overflows_at_explicit_count_and_byte_limits() {
     let _runtime = default_runtime().expect("async runtime");
     let (tx, inbound) = WebrtcInboundMailbox::bounded(1, 8);
-    admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text("abcd".to_string())).expect("first frame");
-    let count_err = admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text("efgh".to_string()))
-        .expect_err("count overflow");
+    admit_inbound_frame(
+        &inbound.occupancy,
+        &tx,
+        InboundMessage::Text("abcd".to_string()),
+    )
+    .expect("first frame");
+    let count_err = admit_inbound_frame(
+        &inbound.occupancy,
+        &tx,
+        InboundMessage::Text("efgh".to_string()),
+    )
+    .expect_err("count overflow");
     assert_eq!(count_err, InboundAdmitError::CountLimit);
     let count_snap = inbound.occupancy.snapshot();
     assert_eq!(count_snap.count, 1);
@@ -2567,8 +2580,12 @@ fn inbound_occupancy_overflows_at_explicit_count_and_byte_limits() {
     assert_eq!(count_snap.max_bytes, 8);
 
     let (tx, inbound) = WebrtcInboundMailbox::bounded(8, 8);
-    let byte_err = admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text("ninebytes".to_string()))
-        .expect_err("byte overflow");
+    let byte_err = admit_inbound_frame(
+        &inbound.occupancy,
+        &tx,
+        InboundMessage::Text("ninebytes".to_string()),
+    )
+    .expect_err("byte overflow");
     assert_eq!(byte_err, InboundAdmitError::ByteLimit);
     let byte_snap = inbound.occupancy.snapshot();
     assert_eq!(byte_snap.count, 0);
@@ -2595,10 +2612,19 @@ fn inbound_occupancy_reserves_before_send_so_consumer_cannot_underflow() {
     assert_eq!(snap.overflow, 0);
 
     let occupancy = FixtureQueueOccupancy::new(8, 1024);
-    let (narrow_tx, _narrow_rx) = channel::<String>(1);
-    admit_inbound_frame(&occupancy, &narrow_tx, InboundMessage::Text("full".to_string())).expect("fill channel");
-    let full_err =
-        admit_inbound_frame(&occupancy, &narrow_tx, InboundMessage::Text("drop".to_string())).expect_err("channel full");
+    let (narrow_tx, _narrow_rx) = channel::<InboundMessage>(1);
+    admit_inbound_frame(
+        &occupancy,
+        &narrow_tx,
+        InboundMessage::Text("full".to_string()),
+    )
+    .expect("fill channel");
+    let full_err = admit_inbound_frame(
+        &occupancy,
+        &narrow_tx,
+        InboundMessage::Text("drop".to_string()),
+    )
+    .expect_err("channel full");
     assert_eq!(full_err, InboundAdmitError::ChannelFull);
     let snap = occupancy.snapshot();
     assert_eq!(snap.count, 1);
