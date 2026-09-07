@@ -423,7 +423,9 @@ mod tests {
         let old = state
             .pending_runtime
             .start_attach(owner("a"), "s".into(), "sub".into());
-        let (_, old_handle) = UnixTerminalAdapter::pair();
+        // Keep the adapter halves alive: dropping an adapter closes its slot,
+        // which would make `is_closed` true without any host close.
+        let (_old_adapter, old_handle) = UnixTerminalAdapter::pair();
         assert!(state.pending_runtime.mark_adapter_bound_if(
             "s",
             "sub",
@@ -441,7 +443,7 @@ mod tests {
         let replacement = state
             .pending_runtime
             .start_attach(owner("a"), "s".into(), "sub".into());
-        let (_, new_handle) = UnixTerminalAdapter::pair();
+        let (_new_adapter, new_handle) = UnixTerminalAdapter::pair();
         assert!(state.pending_runtime.mark_adapter_bound_if(
             "s",
             "sub",
@@ -459,7 +461,10 @@ mod tests {
             &mut applied,
         );
         assert!(state.pending_runtime.is_adapter_bound("s", "sub"));
-        assert!(!new_handle.is_closed());
+        assert!(
+            !new_handle.host_closed(),
+            "cleanup never host-closed the replacement adapter"
+        );
         assert_eq!(applied.bound_closes, 0);
     }
 
@@ -471,7 +476,7 @@ mod tests {
         let identity = state
             .pending_runtime
             .start_attach(owner("a"), "s".into(), "sub".into());
-        let (_, handle) = UnixTerminalAdapter::pair();
+        let (_adapter, handle) = UnixTerminalAdapter::pair();
         assert!(state.pending_runtime.mark_adapter_bound_if(
             "s",
             "sub",
@@ -479,6 +484,7 @@ mod tests {
             TerminalSubscriptionGeneration(1),
             BoundAdapterHandle::Unix(handle.clone()),
         ));
+        assert!(!handle.host_closed(), "bound, not yet closed");
         for key in ["sub", "gone"] {
             record_attached_subscription_change(
                 &mut state.pending_runtime,
@@ -513,7 +519,7 @@ mod tests {
             ],
             &mut applied,
         );
-        assert!(handle.is_closed());
+        assert!(handle.host_closed(), "cleanup host-closed the owned adapter");
         assert!(state.pending_runtime.stream_identity("s", "sub").is_none());
         assert!(state.pending_runtime.live_attach_routes.is_empty());
         assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 0);
