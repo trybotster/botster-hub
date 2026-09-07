@@ -46,7 +46,9 @@ use crate::subscription::closed_events::{
     suppress_unix_session_close_events, suppress_webrtc_session_close_events,
 };
 use crate::subscription::entity::entity_subscription_error;
-use crate::subscription::route_cleanup::{ATTACH_ROUTE_LIMIT, owner_has_attach_capacity};
+use crate::subscription::route_cleanup::{
+    ATTACH_ROUTE_LIMIT, release_failed_attach_route, reserve_attach_route,
+};
 
 /// Typed operator error for one Core failure on a session request.
 /// Operator-facing text for one attach-and-bind failure, with the Core cause.
@@ -881,18 +883,26 @@ fn handle_attach(
         if !holds_permit {
             return ControlStep::ready(owner_budget_error());
         }
-        if !owner_has_attach_capacity(pending_runtime, &owner) {
+        // Reserve the route key and the cleanup permit before any Core work
+        // exists for this attach; both are released on every failure path.
+        if !reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id) {
             return ControlStep::ready(attach_route_limit_error());
         }
-        // Reserve the cleanup permit before Core work exists for this attach.
         let Some(cleanup_permit) = state.budget.reserve() else {
+            release_failed_attach_route(
+                &mut state.pending_runtime,
+                &owner,
+                &session_id,
+                &subscription_id,
+            );
             return ControlStep::ready(owner_budget_error());
         };
         let mut cleanup_permit = Some(cleanup_permit);
-        let identity =
-            state
-                .pending_runtime
-                .start_attach(owner, session_id.clone(), subscription_id.clone());
+        let identity = state.pending_runtime.start_attach(
+            owner.clone(),
+            session_id.clone(),
+            subscription_id.clone(),
+        );
         let runtime = daemon.runtime().expect("runtime checked by caller");
         let mut ticket = runtime.attach_route(
             ClientId(client_id.clone()),
@@ -921,6 +931,12 @@ fn handle_attach(
                         &subscription_id,
                         &identity,
                     );
+                    release_failed_attach_route(
+                        &mut state.pending_runtime,
+                        &owner,
+                        &session_id,
+                        &subscription_id,
+                    );
                     return ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                         "invalid_request",
                         &attach_bind_failure_message(&failure),
@@ -942,6 +958,12 @@ fn handle_attach(
                     session_id.clone(),
                     subscription_id.clone(),
                     generation,
+                );
+                release_failed_attach_route(
+                    &mut state.pending_runtime,
+                    &owner,
+                    &session_id,
+                    &subscription_id,
                 );
                 return ControlPoll::Ready(Ok(stale_attach_error()));
             }
@@ -1009,6 +1031,12 @@ fn handle_attach(
                         subscription_id.clone(),
                         generation,
                     );
+                    release_failed_attach_route(
+                        &mut state.pending_runtime,
+                        &owner,
+                        &session_id,
+                        &subscription_id,
+                    );
                     ControlPoll::Ready(Ok(error))
                 }
             }
@@ -1031,18 +1059,26 @@ fn handle_attach(
         client_id: client_id.clone(),
         grant_id: None,
     };
-    if !owner_has_attach_capacity(pending_runtime, &owner) {
+    // Reserve the route key and the cleanup permit before any Core work
+    // exists for this attach; both are released on every failure path.
+    if !reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id) {
         return ControlStep::ready(attach_route_limit_error());
     }
-    // Reserve the cleanup permit before Core work exists for this attach.
     let Some(cleanup_permit) = state.budget.reserve() else {
+        release_failed_attach_route(
+            &mut state.pending_runtime,
+            &owner,
+            &session_id,
+            &subscription_id,
+        );
         return ControlStep::ready(owner_budget_error());
     };
     let mut cleanup_permit = Some(cleanup_permit);
-    let identity =
-        state
-            .pending_runtime
-            .start_attach(owner, session_id.clone(), subscription_id.clone());
+    let identity = state.pending_runtime.start_attach(
+        owner.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    );
     let (adapter, handle) = mux.create_adapter();
     let runtime = daemon.runtime().expect("runtime checked by caller");
     let mut ticket = runtime.attach_and_bind_terminal(AttachBindPlan {
@@ -1101,6 +1137,12 @@ fn handle_attach(
                         subscription_id.clone(),
                         generation,
                     );
+                    release_failed_attach_route(
+                        &mut state.pending_runtime,
+                        &owner,
+                        &session_id,
+                        &subscription_id,
+                    );
                     return ControlPoll::Ready(Ok(stale_attach_error()));
                 }
                 state.budget.release(permit);
@@ -1119,6 +1161,12 @@ fn handle_attach(
                     &session_id,
                     &subscription_id,
                     &identity,
+                );
+                release_failed_attach_route(
+                    &mut state.pending_runtime,
+                    &owner,
+                    &session_id,
+                    &subscription_id,
                 );
                 ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                     "invalid_request",

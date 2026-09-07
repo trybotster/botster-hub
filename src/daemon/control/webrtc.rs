@@ -28,7 +28,7 @@ use crate::subscription::route_cleanup::{
     CleanupCandidate, candidate_for_departing_owner, retain_route_cleanup,
 };
 use crate::transport::webrtc::{
-    LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES, LocalWebrtcAttachedSubscription,
+    LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
     LocalWebrtcSenderTerminalRecord, LocalWebrtcSignalRequest,
 };
 
@@ -257,60 +257,18 @@ pub(crate) fn handle_peer_closed(
         }
     }
 
-    // Merge attach candidates from the PeerClosed snapshot and any fail-closed siblings.
-    // Owner-check every row: a delayed snapshot must not detach an attach that a
-    // different live grant now owns after (session_id, subscription_id) reuse.
-    let mut detach_candidates = attached_subscriptions;
-    for subscription in remove_result.attached_subscriptions {
-        if !detach_candidates.iter().any(|existing| {
-            existing.session_id == subscription.session_id
-                && existing.subscription_id == subscription.subscription_id
-        }) {
-            detach_candidates.push(subscription);
-        }
-    }
-    // Independent of the peer-side snapshot: include every attach currently owned by a
-    // removed grant so residual Attach rows that raced after cleanup_once still get cleaned.
-    for ((session_id, subscription_id), owner) in &state.pending_runtime.attach_owner_grant_ids {
-        if removed_grants.contains(owner.as_str())
-            && !detach_candidates.iter().any(|existing| {
-                existing.session_id == *session_id && existing.subscription_id == *subscription_id
-            })
-        {
-            detach_candidates.push(LocalWebrtcAttachedSubscription {
-                session_id: session_id.clone(),
-                subscription_id: subscription_id.clone(),
-            });
-        }
-    }
-    let detach_list: Vec<LocalWebrtcAttachedSubscription> = detach_candidates
-        .into_iter()
-        .filter(|subscription| {
-            match state
-                .pending_runtime
-                .attach_owner_grant_ids
-                .get(&(
-                    subscription.session_id.clone(),
-                    subscription.subscription_id.clone(),
-                ))
-                .map(String::as_str)
-            {
-                // Unowned residual (socket path or missing index): allow cleanup.
-                None => true,
-                // Only detach when the current owner is one of the grants this forget removes.
-                Some(owner) => removed_grants.contains(owner),
-            }
-        })
-        .collect();
-    // Occupancy set is the counter source of truth. PeerClosed must release
-    // live_attach_routes here so a replacement Attach can become live.
-    // Capture Core ownership, stream identity, and generation for every route
-    // before the synchronous bookkeeping below mutates the registry, grouped
-    // by the departing grant that owns it. A route whose current stream
-    // belongs to a grant that is not removed is a replacement and is skipped.
-    // Every removed grant's acknowledged history is covered as well.
-    let mut route_keys: BTreeSet<(String, String)> = detach_list
+    // Duplicate or unknown close snapshots: a grant whose permit was already
+    // taken by an earlier close owns nothing now. Only grants still holding
+    // their permit take part in route cleanup, and no candidate is built
+    // for any other grant.
+    let cleaning_grants: BTreeSet<String> = removed_grants
         .iter()
+        .filter(|grant| state.budget.peer_holds_permit(grant))
+        .cloned()
+        .collect();
+    let snapshot: BTreeSet<(String, String)> = attached_subscriptions
+        .iter()
+        .chain(remove_result.attached_subscriptions.iter())
         .map(|subscription| {
             (
                 subscription.session_id.clone(),
@@ -318,91 +276,76 @@ pub(crate) fn handle_peer_closed(
             )
         })
         .collect();
-    for removed in &removed_grants {
-        route_keys.extend(state.pending_runtime.take_acknowledged_routes(removed));
-        for (session_id, subscription_id, _) in
-            state.pending_runtime.unbound_routes_for_grant(removed)
-        {
-            route_keys.insert((session_id, subscription_id));
-        }
+    // One validated set drives every cleanup mutation and every Core
+    // candidate: a key whose current stream belongs to anyone else (a Unix
+    // client or a live grant) is a replacement and is never touched.
+    let departing =
+        state
+            .pending_runtime
+            .departing_routes_for_grants(&cleaning_grants, &grant_id, &snapshot);
+    for grant in &cleaning_grants {
+        let _ = state.pending_runtime.take_owner_routes(grant);
     }
     let mut candidates_by_grant: BTreeMap<String, Vec<CleanupCandidate>> = BTreeMap::new();
-    for (session_id, subscription_id) in &route_keys {
-        let owner_grant = state
-            .pending_runtime
-            .attach_owner_grant_ids
-            .get(&(session_id.clone(), subscription_id.clone()))
-            .filter(|owner| removed_grants.contains(owner.as_str()))
-            .cloned()
-            .unwrap_or_else(|| grant_id.clone());
-        let departing = AttachStreamOwner {
+    let mut bound_closes = 0u64;
+    for (grant, keys) in &departing {
+        let departing_owner = AttachStreamOwner {
             client_id: String::new(),
-            grant_id: Some(owner_grant.clone()),
+            grant_id: Some(grant.clone()),
         };
-        let core_client_id = runtime_client_id(&DaemonRequest::Detach {
-            session_id: session_id.clone(),
-            subscription_id: subscription_id.clone(),
-        });
-        if let Some(candidate) = candidate_for_departing_owner(
-            &state.pending_runtime,
-            &departing,
-            &core_client_id,
-            session_id,
-            subscription_id,
-        ) {
+        for (session_id, subscription_id) in keys {
+            let core_client_id = runtime_client_id(&DaemonRequest::Detach {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            });
+            let Some(candidate) = candidate_for_departing_owner(
+                &state.pending_runtime,
+                &departing_owner,
+                &core_client_id,
+                session_id,
+                subscription_id,
+            ) else {
+                continue;
+            };
+            // Synchronous owner bookkeeping, fenced on the captured identity:
+            // close and cancel only the departing grant's own stream, and
+            // release the live-attach occupancy so a replacement can attach.
+            if let Some(identity) = candidate.identity.as_ref() {
+                if state
+                    .pending_runtime
+                    .is_adapter_bound(session_id, subscription_id)
+                {
+                    bound_closes += 1;
+                }
+                let _ = state
+                    .pending_runtime
+                    .close_adapter_if(session_id, subscription_id, identity);
+                let _ = state
+                    .pending_runtime
+                    .cancel_stream_if(session_id, subscription_id, identity);
+            }
+            record_attached_subscription_change(
+                &mut state.pending_runtime,
+                &mut state.attach_close,
+                &mut state.lifecycle_counters,
+                Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                })),
+                None,
+            );
             candidates_by_grant
-                .entry(owner_grant)
+                .entry(grant.clone())
                 .or_default()
                 .push(candidate);
         }
     }
-    // Unbound streams of removed grants are cancelled now so a late attach
-    // continuation finds an identity mismatch and releases its own generation.
-    for removed in &removed_grants {
-        for (session_id, subscription_id, identity) in
-            state.pending_runtime.unbound_routes_for_grant(removed)
-        {
-            let _ =
-                state
-                    .pending_runtime
-                    .cancel_stream_if(&session_id, &subscription_id, &identity);
-        }
-    }
-    for subscription in &detach_list {
-        record_attached_subscription_change(
-            &mut state.pending_runtime,
-            &mut state.attach_close,
-            &mut state.lifecycle_counters,
-            Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
-                session_id: subscription.session_id.clone(),
-                subscription_id: subscription.subscription_id.clone(),
-            })),
-            None,
-        );
-    }
-    let mut bound_detach = Vec::new();
-    for subscription in detach_list {
-        if state
-            .pending_runtime
-            .is_adapter_bound(&subscription.session_id, &subscription.subscription_id)
-        {
-            bound_detach.push(subscription);
-        }
-    }
-    if !bound_detach.is_empty() {
+    if bound_closes > 0 {
         *state
             .lifecycle_counters
             .cleanup_by_reason
             .entry("bound_adapter_close".to_string())
-            .or_insert(0) += bound_detach.len() as u64;
-    }
-    for grant_id in &removed_grants {
-        state.pending_runtime.close_adapters_for_grant(grant_id);
-    }
-    for subscription in &bound_detach {
-        state
-            .pending_runtime
-            .cancel_stream(&subscription.session_id, &subscription.subscription_id);
+            .or_insert(0) += bound_closes;
     }
     for grant_id in &removed_grants {
         let peer_generation = state
@@ -461,19 +404,16 @@ pub(crate) fn handle_peer_closed(
         .retain(|_, owner| !removed_grants.contains(owner.as_str()));
     let _ = control_tx;
     // Every removed grant (primary and fail-closed siblings) retires its
-    // abandoned reads and hands its permit to its own cleanup obligation.
-    // Attach admission requires the grant to hold its permit, so a grant
-    // without one owns no route and has no candidates to carry.
+    // abandoned reads. Every grant still holding its permit hands it to its
+    // own cleanup obligation, or releases it when it owns no route.
     for removed in &removed_grants {
         retire_abandoned_requests(daemon, state, removed);
-        let candidates = candidates_by_grant.remove(removed).unwrap_or_default();
-        let Some(permit) = state.budget.take_peer_permit(removed) else {
-            debug_assert!(
-                candidates.is_empty(),
-                "attach admission requires the peer permit"
-            );
+    }
+    for grant in &cleaning_grants {
+        let Some(permit) = state.budget.take_peer_permit(grant) else {
             continue;
         };
+        let candidates = candidates_by_grant.remove(grant).unwrap_or_default();
         if candidates.is_empty() || daemon.runtime().is_none() {
             state.budget.release(permit);
             continue;
