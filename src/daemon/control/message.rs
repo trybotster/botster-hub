@@ -66,12 +66,9 @@ pub(crate) fn egress_write_class(error: &DaemonTransportError) -> EgressWriteCla
 
 #[derive(Debug)]
 pub(crate) enum ControlMessage {
-    /// The data-plane thread moved data, published a ticket result, or
-    /// finished a Core operation. `journal_advanced` carries Core's coalesced
-    /// lifecycle-journal wake for this turn.
-    DataPlaneProgress {
-        journal_advanced: bool,
-    },
+    /// The data-plane thread recorded one or more coalesced progress facts.
+    /// The shared latch owns the facts. This message is only a doorbell.
+    DataPlaneProgress,
     AcceptedConnection {
         stream: TokioUnixStream,
         admission_permit: OwnedSemaphorePermit,

@@ -79,6 +79,14 @@ impl DaemonControlState {
             .expect("the reconcile read must be submitted before its result is controlled");
         read.ticket = crate::data_plane::driver::CoreTicket::resolved(inventory);
     }
+
+    pub(crate) fn note_terminal_inventory_changed(&mut self) {
+        let reconcile_active =
+            self.reconcile_inventory.is_some() || self.pump.reconcile_after.is_some();
+        self.pump
+            .note_inventory_change_during_reconcile(reconcile_active);
+        self.background.mark_pump();
+    }
 }
 
 /// Earliest deadline among retained obligations and pending requests, so the
@@ -332,6 +340,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
+        crate::daemon::control::record_data_plane_progress(&daemon, &mut control_state);
         let completion_published = control_state
             .plugin_result_budget
             .take_completion_notification();
@@ -749,6 +758,7 @@ pub(crate) fn run_inventory_reconcile_phase(
 
     let Some(runtime) = daemon.runtime() else {
         state.pump.reconcile_after = None;
+        state.pump.take_inventory_reconcile_again();
         state.reconcile_inventory = None;
         return false;
     };
@@ -814,7 +824,7 @@ pub(crate) fn run_inventory_reconcile_phase(
         true
     } else {
         state.pump.reconcile_after = None;
-        false
+        state.pump.take_inventory_reconcile_again()
     }
 }
 
@@ -3802,6 +3812,62 @@ return botster.register({
             None,
         );
         generation
+    }
+
+    #[test]
+    fn terminal_inventory_wake_survives_maintenance_first_journal_consumption() {
+        let mut state = DaemonControlState::default();
+        state.maintenance.note_journal_advanced();
+        state.note_terminal_inventory_changed();
+
+        assert!(
+            state.maintenance.take_journal_wake(),
+            "the Maintenance Observe path consumes the independent journal bit"
+        );
+        assert!(
+            state.background.pump_pending(),
+            "journal consumption must not clear the terminal inventory Pump latch"
+        );
+        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
+        assert!(!state.background.pump_pending());
+    }
+
+    #[test]
+    fn terminal_inventory_change_during_reconcile_schedules_one_fresh_pass_without_spin() {
+        let (mut daemon, mut state, _mux, _session_id) =
+            reconcile_wiring_fixture("inventory-wake-during-reconcile");
+
+        state.background.mark_pump();
+        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
+        state.pump.force_next(PumpPhase::InventoryReconcile);
+        run_one_pump_phase(&mut daemon, &mut state);
+        assert!(state.reconcile_inventory.is_some());
+        assert!(state.background.pump_pending());
+
+        state.note_terminal_inventory_changed();
+        state.resolve_submitted_reconcile_inventory_for_test(Vec::new());
+        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
+        state.pump.force_next(PumpPhase::InventoryReconcile);
+        run_one_pump_phase(&mut daemon, &mut state);
+        assert!(
+            state.background.pump_pending(),
+            "an inventory change during the read must schedule a fresh pass"
+        );
+
+        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
+        state.pump.force_next(PumpPhase::InventoryReconcile);
+        run_one_pump_phase(&mut daemon, &mut state);
+        assert!(state.reconcile_inventory.is_some());
+        state.resolve_submitted_reconcile_inventory_for_test(Vec::new());
+        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
+        state.pump.force_next(PumpPhase::InventoryReconcile);
+        run_one_pump_phase(&mut daemon, &mut state);
+        assert!(state.reconcile_inventory.is_none());
+        assert!(
+            !state.background.pump_pending(),
+            "a clean fresh pass must not create idle Pump work"
+        );
+        let _ = daemon.stop();
     }
 
     #[test]

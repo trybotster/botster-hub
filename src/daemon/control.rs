@@ -99,17 +99,8 @@ pub(crate) fn handle_control_message(
     message: ControlMessage,
 ) -> bool {
     match message {
-        ControlMessage::DataPlaneProgress { journal_advanced } => {
-            if let Some(runtime) = daemon.runtime() {
-                runtime.absorb_core_completions();
-            }
-            if journal_advanced {
-                state.maintenance.note_journal_advanced();
-                state.maintenance.note_authoritative_mutation();
-            }
-            if state.maintenance_reads.in_flight() {
-                state.maintenance.try_wake();
-            }
+        ControlMessage::DataPlaneProgress => {
+            record_data_plane_progress(daemon, state);
             request::poll_deferred(daemon, state)
         }
         message @ ControlMessage::AcceptedConnection { .. }
@@ -164,6 +155,31 @@ pub(crate) fn handle_control_message(
             false
         }
     }
+}
+
+pub(crate) fn record_data_plane_progress(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+) -> bool {
+    let Some(runtime) = daemon.runtime() else {
+        return false;
+    };
+    let progress = runtime.take_data_plane_progress();
+    if !progress.progressed && !progress.journal_advanced && !progress.terminal_inventory_changed {
+        return false;
+    }
+    runtime.absorb_core_completions();
+    if progress.journal_advanced {
+        state.maintenance.note_journal_advanced();
+        state.maintenance.note_authoritative_mutation();
+    }
+    if progress.terminal_inventory_changed {
+        state.note_terminal_inventory_changed();
+    }
+    if state.maintenance_reads.in_flight() {
+        state.maintenance.try_wake();
+    }
+    true
 }
 
 pub(crate) fn handle_control_request(
