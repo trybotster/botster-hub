@@ -1308,7 +1308,9 @@ mod tests {
         for replacement_client in ["client-a", "client-b"] {
             let mut registry = AttachStreamRegistry::default();
             let old = registry.start_attach(owner(), "s".into(), "sub".into());
-            let (_, old_handle) = UnixTerminalAdapter::pair();
+            // Keep the adapter halves alive: dropping an adapter closes its
+            // slot, which would make `is_closed` true without any host close.
+            let (_old_adapter, old_handle) = UnixTerminalAdapter::pair();
             assert!(registry.mark_adapter_bound_if(
                 "s",
                 "sub",
@@ -1332,7 +1334,7 @@ mod tests {
                 "s".into(),
                 "sub".into(),
             );
-            let (_, new_handle) = UnixTerminalAdapter::pair();
+            let (_new_adapter, new_handle) = UnixTerminalAdapter::pair();
             assert!(registry.mark_adapter_bound_if(
                 "s",
                 "sub",
@@ -1349,7 +1351,10 @@ mod tests {
                 registry.is_adapter_bound("s", "sub"),
                 "replacement by {replacement_client} stays bound"
             );
-            assert!(!new_handle.is_closed());
+            assert!(
+                !new_handle.host_closed(),
+                "cleanup never host-closed the replacement adapter"
+            );
             assert_eq!(
                 registry.recorded_generation("s", "sub"),
                 Some(TerminalSubscriptionGeneration(2))
@@ -1386,7 +1391,7 @@ mod tests {
         // K2: the peer attached it once; a Unix client replaced it.
         registry.start_attach(peer.clone(), "s".into(), "k2".into());
         let unix = registry.start_attach(owner(), "s".into(), "k2".into());
-        let (_, unix_handle) = UnixTerminalAdapter::pair();
+        let (_unix_adapter, unix_handle) = UnixTerminalAdapter::pair();
         assert!(registry.mark_adapter_bound_if(
             "s",
             "k2",
@@ -1412,7 +1417,7 @@ mod tests {
         );
         assert_eq!(departing.len(), 1);
         assert!(registry.is_adapter_bound("s", "k2"));
-        assert!(!unix_handle.is_closed());
+        assert!(!unix_handle.host_closed());
     }
 
     /// A duplicate close arrives with a streamless snapshot after the first
