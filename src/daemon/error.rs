@@ -399,6 +399,11 @@ pub enum DaemonTransportError {
     UnexpectedResponse,
     DaemonNotRunning,
     ControlThreadStopped,
+    ResponseBackpressured {
+        pending_bytes: usize,
+        frame_bytes: usize,
+        capacity: usize,
+    },
     Io(std::io::Error),
     Json(serde_json::Error),
     Daemon(crate::HubDaemonError),
@@ -442,6 +447,14 @@ impl fmt::Display for DaemonTransportError {
             Self::UnexpectedResponse => write!(formatter, "unexpected daemon response"),
             Self::DaemonNotRunning => write!(formatter, "daemon runtime is not running"),
             Self::ControlThreadStopped => write!(formatter, "daemon control thread stopped"),
+            Self::ResponseBackpressured {
+                pending_bytes,
+                frame_bytes,
+                capacity,
+            } => write!(
+                formatter,
+                "daemon response backpressure: {pending_bytes} pending bytes plus {frame_bytes} frame bytes exceeds {capacity} bytes"
+            ),
             Self::Io(error) => write!(formatter, "{error}"),
             Self::Json(error) => write!(formatter, "{error}"),
             Self::Daemon(error) => write!(formatter, "{error}"),
