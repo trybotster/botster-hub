@@ -1700,6 +1700,11 @@ pub(crate) fn write_botster_web_package(root: &Path) {
     fs::create_dir_all(root.join("scripts")).expect("create botster-web package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write botster-web core entrypoint");
+    let mut daemon_requirement =
+        botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
+    daemon_requirement.client_name = "botster-web-production-runtime-fixture".to_string();
+    let daemon_requirement =
+        serde_json::to_string(&daemon_requirement).expect("serialize botster-web requirement");
     fs::write(
         root.join("scripts").join("local-package-server.mjs"),
         r#"
@@ -1720,53 +1725,100 @@ const startupDelayMs = Number(process.env.BOTSTER_WEB_TEST_STARTUP_DELAY_MS || '
 const connections = new Map();
 let boundPort = null;
 
-function currentRequirement() {
-  return {
-    protocol: 'botster-hub-daemon-v1',
-    protocol_version: 1,
-    required_features: [
-      'sessions',
-      'terminal_streaming',
-      'resize',
-      'plugin_surface_render',
-      'plugin_surface_action',
-    ],
-    minimum_conformance_fixture_revision: 1,
-    client_name: 'botster-web-production-runtime-fixture',
-  };
+// Framing values come from botster_hub_client constants. daemon-protocol.ts is derived from them.
+const PROTOCOL_VERSION = __PROTOCOL_VERSION__;
+const UNIX_FRAME_LENGTH_PREFIX_BYTES = __UNIX_FRAME_LENGTH_PREFIX_BYTES__;
+const UNIX_CONTAINER_CONTROL = __UNIX_CONTAINER_CONTROL__;
+const MAX_CONTROL_REQUEST_BYTES = __MAX_CONTROL_REQUEST_BYTES__;
+const MAX_CONTROL_RESPONSE_BYTES = __MAX_CONTROL_RESPONSE_BYTES__;
+const DAEMON_REQUIREMENT = __DAEMON_REQUIREMENT__;
+
+function encodeControlFrame(frame) {
+  const payload = Buffer.from(JSON.stringify(frame), 'utf8');
+  if (payload.length > MAX_CONTROL_REQUEST_BYTES) {
+    throw new Error(`control payload exceeds ${MAX_CONTROL_REQUEST_BYTES} bytes`);
+  }
+  const header = Buffer.alloc(UNIX_FRAME_LENGTH_PREFIX_BYTES + 1);
+  header.writeUInt32LE(1 + payload.length, 0);
+  header.writeUInt8(UNIX_CONTAINER_CONTROL, UNIX_FRAME_LENGTH_PREFIX_BYTES);
+  return Buffer.concat([header, payload]);
 }
 
-function readLine(connection) {
-  const newline = connection.buffer.indexOf('\n');
-  if (newline >= 0) {
-    const line = connection.buffer.slice(0, newline);
-    connection.buffer = connection.buffer.slice(newline + 1);
-    return Promise.resolve(line);
+function takeControlFrame(connection) {
+  if (connection.buffer.length < UNIX_FRAME_LENGTH_PREFIX_BYTES) {
+    return undefined;
+  }
+  const frameLength = connection.buffer.readUInt32LE(0);
+  if (frameLength === 0 || frameLength > 1 + MAX_CONTROL_RESPONSE_BYTES) {
+    throw new Error(`invalid control frame length ${frameLength}`);
+  }
+  if (connection.buffer.length < UNIX_FRAME_LENGTH_PREFIX_BYTES + frameLength) {
+    return undefined;
+  }
+  const container = connection.buffer.readUInt8(UNIX_FRAME_LENGTH_PREFIX_BYTES);
+  const payload = connection.buffer.subarray(
+    UNIX_FRAME_LENGTH_PREFIX_BYTES + 1,
+    UNIX_FRAME_LENGTH_PREFIX_BYTES + frameLength,
+  );
+  connection.buffer = connection.buffer.subarray(
+    UNIX_FRAME_LENGTH_PREFIX_BYTES + frameLength,
+  );
+  if (container !== UNIX_CONTAINER_CONTROL) {
+    throw new Error(`unexpected daemon container ${container}`);
+  }
+  return JSON.parse(payload.toString('utf8'));
+}
+
+function readControlFrame(connection) {
+  const ready = takeControlFrame(connection);
+  if (ready !== undefined) {
+    return Promise.resolve(ready);
   }
 
   return new Promise((resolve, reject) => {
     const onData = (chunk) => {
-      connection.buffer += chunk.toString('utf8');
-      const newline = connection.buffer.indexOf('\n');
-      if (newline < 0) {
+      connection.buffer = Buffer.concat([connection.buffer, chunk]);
+      let frame;
+      try {
+        frame = takeControlFrame(connection);
+      } catch (error) {
+        cleanup();
+        reject(error);
+        return;
+      }
+      if (frame === undefined) {
         return;
       }
       cleanup();
-      const line = connection.buffer.slice(0, newline);
-      connection.buffer = connection.buffer.slice(newline + 1);
-      resolve(line);
+      resolve(frame);
     };
     const onError = (error) => {
       cleanup();
       reject(error);
     };
+    const onEnd = () => {
+      cleanup();
+      reject(new Error('daemon connection ended before a complete control frame'));
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error('daemon connection closed before a complete control frame'));
+    };
     const cleanup = () => {
       connection.stream.off('data', onData);
       connection.stream.off('error', onError);
+      connection.stream.off('end', onEnd);
+      connection.stream.off('close', onClose);
     };
     connection.stream.on('data', onData);
     connection.stream.once('error', onError);
+    connection.stream.once('end', onEnd);
+    connection.stream.once('close', onClose);
   });
+}
+
+function currentRequirement() {
+  return DAEMON_REQUIREMENT;
 }
 
 async function connectDaemon() {
@@ -1774,18 +1826,24 @@ async function connectDaemon() {
     throw new Error('BOTSTER_HUB_CONNECTION does not contain a Unix socket');
   }
   const stream = net.createConnection(socket);
-  const connection = { stream, buffer: '' };
+  const connection = { stream, buffer: Buffer.alloc(0), nextRequestId: 1 };
   try {
     await new Promise((resolve, reject) => {
       stream.once('connect', resolve);
       stream.once('error', reject);
     });
-    stream.write(JSON.stringify({
-      protocol: 'botster-hub-daemon-v1',
-      compatibility: currentRequirement(),
-    }) + '\n');
-    const helloAck = JSON.parse(await readLine(connection));
-    if (helloAck.protocol !== 'botster-hub-daemon-v1' || !helloAck.compatibility) {
+    stream.write(encodeControlFrame({
+      frame: 'hello',
+      hello: {
+        protocol: 'botster-hub-daemon-v1',
+        compatibility: currentRequirement(),
+      },
+    }));
+    const helloFrame = await readControlFrame(connection);
+    const helloAck = helloFrame.ack;
+    if (helloFrame.frame !== 'hello_ack'
+        || helloAck?.protocol !== 'botster-hub-daemon-v1'
+        || helloAck?.compatibility?.protocol_version !== PROTOCOL_VERSION) {
       throw new Error(`unexpected daemon hello ack: ${JSON.stringify(helloAck)}`);
     }
     return connection;
@@ -1799,13 +1857,30 @@ async function probeDaemon() {
   let connection = null;
   try {
     connection = await connectDaemon();
-    connection.stream.write(JSON.stringify({ type: 'status' }) + '\n');
-    const response = JSON.parse(await readLine(connection));
+    const response = await sendDaemonRequest(connection, { type: 'status' });
     if (response.kind !== 'status' || !response.status) {
       throw new Error(`unexpected daemon status response: ${JSON.stringify(response)}`);
     }
   } finally {
     connection?.stream.destroy();
+  }
+}
+
+async function sendDaemonRequest(connection, request) {
+  const requestId = String(connection.nextRequestId++);
+  connection.stream.write(encodeControlFrame({
+    frame: 'request',
+    request_id: requestId,
+    request,
+  }));
+  while (true) {
+    const frame = await readControlFrame(connection);
+    if (frame.frame === 'close') {
+      throw new Error(`daemon closed connection: ${JSON.stringify(frame.reason)}`);
+    }
+    if (frame.frame === 'response' && frame.request_id === requestId) {
+      return frame.response;
+    }
   }
 }
 
@@ -1823,17 +1898,16 @@ async function daemonRequest(payload) {
     }
   }
 
-  connection.stream.write(JSON.stringify(payload.request) + '\n');
-  const response = JSON.parse(await readLine(connection));
-
-  if (!connectionId || payload.close === true) {
-    connection.stream.end();
-    if (connectionId) {
-      connections.delete(connectionId);
+  try {
+    return await sendDaemonRequest(connection, payload.request);
+  } finally {
+    if (!connectionId || payload.close === true) {
+      connection.stream.end();
+      if (connectionId) {
+        connections.delete(connectionId);
+      }
     }
   }
-
-  return response;
 }
 
 const server = http.createServer(async (request, response) => {
@@ -1912,7 +1986,28 @@ if (startupDelayMs > 0) {
 } else {
   listen();
 }
-"#,
+"#
+        .replace("__DAEMON_REQUIREMENT__", &daemon_requirement)
+        .replace(
+            "__PROTOCOL_VERSION__",
+            &botster_hub_client::PROTOCOL_VERSION.to_string(),
+        )
+        .replace(
+            "__UNIX_FRAME_LENGTH_PREFIX_BYTES__",
+            &botster_hub_client::UNIX_FRAME_LENGTH_PREFIX_BYTES.to_string(),
+        )
+        .replace(
+            "__UNIX_CONTAINER_CONTROL__",
+            &botster_hub_client::UNIX_CONTAINER_CONTROL.to_string(),
+        )
+        .replace(
+            "__MAX_CONTROL_REQUEST_BYTES__",
+            &botster_hub_client::MAX_CONTROL_REQUEST_BYTES.to_string(),
+        )
+        .replace(
+            "__MAX_CONTROL_RESPONSE_BYTES__",
+            &botster_hub_client::MAX_CONTROL_RESPONSE_BYTES.to_string(),
+        ),
     )
     .expect("write botster-web package server script");
     let manifest = serde_json::json!({
