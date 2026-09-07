@@ -196,14 +196,19 @@ pub(crate) fn handle_peer_closed(
     else {
         unreachable!("webrtc peer-closed owner received a non-peer-closed control message");
     };
-    let cleanup_reason = format!("webrtc_{}", terminal_record.cause);
-    *state
-        .lifecycle_counters
-        .cleanup_by_reason
-        .entry(cleanup_reason)
-        .or_default() += 1;
-    state.lifecycle_counters.cleanup_completed =
-        state.lifecycle_counters.cleanup_completed.saturating_add(1);
+    // A duplicate close (the grant's permit was already taken by an earlier
+    // close) has no effect: no counters, no route cleanup.
+    let first_close = state.budget.peer_holds_permit(&grant_id);
+    if first_close {
+        let cleanup_reason = format!("webrtc_{}", terminal_record.cause);
+        *state
+            .lifecycle_counters
+            .cleanup_by_reason
+            .entry(cleanup_reason)
+            .or_default() += 1;
+        state.lifecycle_counters.cleanup_completed =
+            state.lifecycle_counters.cleanup_completed.saturating_add(1);
+    }
     if let Err(error) =
         persist_local_webrtc_terminal_record(local_webrtc_terminal_record_path, &terminal_record)
     {

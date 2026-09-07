@@ -283,6 +283,11 @@ impl AttachStreamRegistry {
         primary: &str,
         snapshot: &BTreeSet<(String, String)>,
     ) -> BTreeMap<String, BTreeSet<(String, String)>> {
+        // A close for grants that hold nothing (a duplicate close) has no
+        // departing routes and therefore no effect on any bookkeeping.
+        if removed.is_empty() {
+            return BTreeMap::new();
+        }
         let mut keys = snapshot.clone();
         for grant in removed {
             if let Some(routes) = self.owner_routes.get(grant) {
@@ -306,12 +311,18 @@ impl AttachStreamRegistry {
                     Some(grant) if removed.contains(grant) => grant.to_string(),
                     _ => continue,
                 },
-                None => self
+                None => match self
                     .attach_owner_grant_ids
                     .get(&key)
                     .filter(|grant| removed.contains(grant.as_str()))
                     .cloned()
-                    .unwrap_or_else(|| primary.to_string()),
+                {
+                    Some(grant) => grant,
+                    // A streamless snapshot key falls back to the primary
+                    // only when the primary itself is being cleaned.
+                    None if removed.contains(primary) => primary.to_string(),
+                    None => continue,
+                },
             };
             departing.entry(grant).or_default().insert(key);
         }
@@ -1395,6 +1406,34 @@ mod tests {
         assert_eq!(departing.len(), 1);
         assert!(registry.is_adapter_bound("s", "k2"));
         assert!(!unix_handle.is_closed());
+    }
+
+    /// A duplicate close arrives with a streamless snapshot after the first
+    /// close consumed the grant's permit: no cleaning grants, so no
+    /// departing routes and no bookkeeping mutation.
+    #[test]
+    fn duplicate_streamless_close_has_no_departing_routes() {
+        let mut registry = AttachStreamRegistry::default();
+        registry
+            .attach_owner_grant_ids
+            .insert(("s".to_string(), "k".to_string()), "grant-old".to_string());
+        let snapshot: BTreeSet<(String, String)> =
+            [("s".to_string(), "k".to_string())].into_iter().collect();
+        let none: BTreeSet<String> = BTreeSet::new();
+        assert!(
+            registry
+                .departing_routes_for_grants(&none, "grant-old", &snapshot)
+                .is_empty()
+        );
+        // A sibling-only close does not attribute streamless keys to a
+        // primary that is not being cleaned.
+        let sibling: BTreeSet<String> = ["grant-sibling".to_string()].into_iter().collect();
+        registry.attach_owner_grant_ids.clear();
+        assert!(
+            registry
+                .departing_routes_for_grants(&sibling, "grant-old", &snapshot)
+                .is_empty()
+        );
     }
 
     #[test]
