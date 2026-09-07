@@ -571,9 +571,6 @@ impl DaemonUnixFrameReader {
             }
             self.prefix_filled += read;
             if self.prefix_filled == UNIX_FRAME_LENGTH_PREFIX_BYTES {
-                if self.prefix[0] == b'{' {
-                    return Err(precompatibility_hub_error());
-                }
                 let declared = u32::from_le_bytes(self.prefix) as usize;
                 if declared == 0 || declared > max_frame_bytes {
                     return Err(DaemonTransportError::Protocol(
@@ -1388,15 +1385,6 @@ fn normalize_socket_io_error(error: std::io::Error) -> DaemonTransportError {
     } else {
         DaemonTransportError::Io(error)
     }
-}
-
-fn precompatibility_hub_error() -> DaemonTransportError {
-    DaemonTransportError::Compatibility(DaemonCompatibilityError {
-        diagnostic: "hub predates host-control protocol 9 framing".to_string(),
-        diagnostics: vec![DaemonDiagnostic::compatibility_mismatch(
-            "hub predates host-control protocol 9 framing",
-        )],
-    })
 }
 
 fn write_read_screen(
@@ -7665,7 +7653,7 @@ mod tests {
     }
 
     #[test]
-    fn newline_json_hello_ack_reports_a_protocol_nine_predating_hub() {
+    fn newline_json_hello_ack_reports_an_invalid_frame_length() {
         let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
         server
             .write_all(br#"{"protocol":"botster-hub-daemon-v1","compatibility":{}}"#)
@@ -7674,10 +7662,72 @@ mod tests {
 
         let error = read_hello_ack(&mut client).expect_err("old hello ack should fail");
 
-        assert!(matches!(error, DaemonTransportError::Compatibility(_)));
+        assert!(matches!(error, DaemonTransportError::Protocol(_)));
         assert_eq!(
             error.to_string(),
-            "hub predates host-control protocol 9 framing"
+            "daemon protocol error: unix frame length is zero or exceeds the bound"
+        );
+    }
+
+    #[test]
+    fn valid_frame_lengths_with_json_low_byte_are_accepted() {
+        for body_len in [123, 379] {
+            let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+            let body = vec![0_u8; body_len];
+            server
+                .write_all(&(body.len() as u32).to_le_bytes())
+                .expect("write length prefix");
+            server.write_all(&body).expect("write frame body");
+
+            let mut reader = DaemonUnixFrameReader::new();
+            let frame = reader
+                .read_raw_frame(&mut client, MAX_UNIX_FRAME_BYTES)
+                .expect("valid bounded frame");
+
+            assert_eq!(frame, body);
+        }
+    }
+
+    #[test]
+    fn frame_reader_distinguishes_empty_and_truncated_prefix_eof() {
+        let (server, mut client) = UnixStream::pair().expect("pair unix streams");
+        drop(server);
+        let mut reader = DaemonUnixFrameReader::new();
+        assert!(matches!(
+            reader.read_raw_frame(&mut client, MAX_UNIX_FRAME_BYTES),
+            Err(DaemonTransportError::ClientDisconnected)
+        ));
+
+        for prefix_len in 1..UNIX_FRAME_LENGTH_PREFIX_BYTES {
+            let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+            server
+                .write_all(&123_u32.to_le_bytes()[..prefix_len])
+                .expect("write partial prefix");
+            drop(server);
+            let mut reader = DaemonUnixFrameReader::new();
+            let error = reader
+                .read_raw_frame(&mut client, MAX_UNIX_FRAME_BYTES)
+                .expect_err("partial prefix must fail at EOF");
+            assert_eq!(
+                error.to_string(),
+                "daemon protocol error: truncated unix frame length prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_declared_frame_length_is_a_bound_error() {
+        let (mut server, mut client) = UnixStream::pair().expect("pair unix streams");
+        server
+            .write_all(&0_u32.to_le_bytes())
+            .expect("write zero length prefix");
+        let mut reader = DaemonUnixFrameReader::new();
+        let error = reader
+            .read_raw_frame(&mut client, MAX_UNIX_FRAME_BYTES)
+            .expect_err("zero declared length must fail");
+        assert_eq!(
+            error.to_string(),
+            "daemon protocol error: unix frame length is zero or exceeds the bound"
         );
     }
 
