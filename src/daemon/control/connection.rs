@@ -17,10 +17,12 @@ use crate::admission::unix_hello::{
 use crate::daemon::control::message::{
     BindReservedError, BoundSubscription, ControlMessage, ReservationInspectReply,
 };
-use crate::daemon::owner_budget::{CoreWorkPoll, OWNER_BUDGET_EXHAUSTED, ObligationPoll, drive_core_slot};
-use crate::data_plane::driver::CoreTicket;
+use crate::daemon::owner_budget::{
+    CoreWorkPoll, OWNER_BUDGET_EXHAUSTED, ObligationPoll, drive_core_slot,
+};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_loop::tick;
+use crate::data_plane::driver::CoreTicket;
 use crate::data_plane::driver::CoreTicketPoll;
 use crate::runtime::BindRoutePlan;
 use crate::subscription::attach_routes::{BoundAdapterHandle, negotiated_unix_capability_set};
@@ -422,7 +424,7 @@ fn bind_reserved_subscription(
     };
     // The bind holds one budget permit from here until the adapter is bound
     // and delivered, or until the exact generation it created is released.
-    let Some(permit) = state.budget.reserve(format!("bind:{label}")) else {
+    let Some(permit) = state.budget.reserve() else {
         retire_reserved_subscription(daemon, state, &grant_id, &label);
         let _ = reply_tx.send(Err(BindReservedError::OverLimit));
         return false;

@@ -10,12 +10,11 @@ use botster_hub_client::{
 
 use crate::HubDaemon;
 use crate::client_api_dto::response::daemon_hub_update;
-use crate::daemon::control::message::{ControlMessage, ControlReplySender, ControlSender};
 use crate::daemon::control::attach_bind_operator_error;
+use crate::daemon::control::message::{ControlMessage, ControlReplySender, ControlSender};
 use crate::daemon::control::pending::{
     ControlStep, PendingControlRequest, poll_pending_requests, request_must_finish,
 };
-use crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED;
 use crate::daemon::control::{
     DaemonObservability, control_request_operation_label, events, handle_control_request, host,
     webrtc,
@@ -26,6 +25,7 @@ use crate::daemon::error::{
     daemon_package_error, daemon_snapshot_stream_forbidden_error, daemon_spawn_target_error,
     daemon_state_error, daemon_worktree_error,
 };
+use crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED;
 use crate::daemon::owner_loop::{
     DaemonControlState, request_succeeded, send_control_response, should_mark_pump_after_control,
 };
@@ -109,10 +109,7 @@ pub(crate) fn handle(
     // entry is retired; the transport's per-connection limit ends with the
     // connection, this one does not.
     let client = grant_id.clone().or_else(|| client_id.clone());
-    let Some(permit) = state
-        .budget
-        .reserve(format!("request:{}", client.as_deref().unwrap_or("-")))
-    else {
+    let Some(permit) = state.budget.reserve() else {
         return send_control_response(
             reply_tx,
             Ok(attach_bind_operator_error(

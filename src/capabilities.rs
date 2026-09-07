@@ -1028,7 +1028,7 @@ impl KeyedPluginStore {
             return Ok(());
         }
         Err(CapabilityRuntimeError::new(
-            CapabilityRuntimeErrorKind::Denied,
+            CapabilityRuntimeErrorKind::CapabilityDenied,
             format!(
                 "plugin database namespace holds a record owned by plugin {:?}, not {:?}",
                 record.plugin_key.0, plugin_key.0
@@ -1207,12 +1207,14 @@ impl PluginStoreBackend for KeyedPluginStore {
     ) -> Result<PluginStoreRecord, CapabilityRuntimeError> {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
         let namespace = Self::namespace(plugin_key)?;
-        let record = self.read_record(plugin_key, &namespace, key)?.ok_or_else(|| {
-            CapabilityRuntimeError::new(
-                CapabilityRuntimeErrorKind::StoreNotFound,
-                "plugin-store record was not found",
-            )
-        })?;
+        let record = self
+            .read_record(plugin_key, &namespace, key)?
+            .ok_or_else(|| {
+                CapabilityRuntimeError::new(
+                    CapabilityRuntimeErrorKind::StoreNotFound,
+                    "plugin-store record was not found",
+                )
+            })?;
         self.store
             .batch(
                 &namespace,
@@ -1232,7 +1234,7 @@ impl PluginStoreBackend for KeyedPluginStore {
         let _guard = self.lock.lock().expect("plugin store lock poisoned");
         let namespace = Self::namespace(plugin_key)?;
         Ok(self
-            .read_records(&namespace)?
+            .read_records(plugin_key, &namespace)?
             .values()
             .filter(|record| {
                 prefix
@@ -1987,7 +1989,10 @@ mod tests {
             ]
         ));
         let records = backend
-            .read_records(&plugin_key, &KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
+            .read_records(
+                &plugin_key,
+                &KeyedPluginStore::namespace(&plugin_key).expect("namespace"),
+            )
             .expect("read committed batch");
         assert_eq!(records.len(), 2);
         assert_eq!(records[&PluginStoreKey("ticket".to_string())].revision, 2);
@@ -2017,7 +2022,10 @@ mod tests {
             assert!(failed.key.is_some());
             assert_eq!(
                 backend
-                    .read_records(&plugin_key, &KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
+                    .read_records(
+                        &plugin_key,
+                        &KeyedPluginStore::namespace(&plugin_key).expect("namespace")
+                    )
                     .expect("read unchanged batch"),
                 records
             );
@@ -2044,7 +2052,10 @@ mod tests {
         assert_eq!(oversized.key, Some(PluginStoreKey("oversized".to_string())));
         assert_eq!(
             backend
-                .read_records(&plugin_key, &KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
+                .read_records(
+                    &plugin_key,
+                    &KeyedPluginStore::namespace(&plugin_key).expect("namespace")
+                )
                 .expect("read after per-record quota failure"),
             records
         );
@@ -2057,7 +2068,10 @@ mod tests {
         );
         assert_eq!(
             backend
-                .read_records(&plugin_key, &KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
+                .read_records(
+                    &plugin_key,
+                    &KeyedPluginStore::namespace(&plugin_key).expect("namespace")
+                )
                 .expect("read after empty batch"),
             records
         );
@@ -2088,7 +2102,10 @@ mod tests {
         assert_eq!(aggregate.key, None);
         assert!(
             aggregate_backend
-                .read_records(&plugin_key, &KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
+                .read_records(
+                    &plugin_key,
+                    &KeyedPluginStore::namespace(&plugin_key).expect("namespace")
+                )
                 .expect("read after aggregate quota failure")
                 .is_empty()
         );
@@ -2121,7 +2138,10 @@ mod tests {
         );
         assert!(replacement.ok);
         let records = replacement_backend
-            .read_records(&plugin_key, &KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
+            .read_records(
+                &plugin_key,
+                &KeyedPluginStore::namespace(&plugin_key).expect("namespace"),
+            )
             .expect("read legal replacement at key quota");
         assert_eq!(records.len(), 1);
         assert!(records.contains_key(&PluginStoreKey("new".to_string())));
