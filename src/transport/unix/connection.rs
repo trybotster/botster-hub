@@ -782,122 +782,125 @@ pub(crate) fn handle_connection_cleanup(
         })
         .collect();
     let now = tick(&mut state.logical_clock);
-    let mut ticket = Some(runtime.submit_core(cleanup_core_turn(
-        owners.clone(),
-        client_id.clone(),
-        now,
-    )));
-    state.pending_owner_work.push(Box::new(move |daemon, state| {
-        use crate::data_plane::driver::CoreTicketPoll;
-        let Some(live_ticket) = ticket.as_mut() else {
-            // The previous admission was refused; one ticket in flight.
-            let Some(runtime) = daemon.runtime() else {
-                return true;
-            };
-            ticket = Some(runtime.submit_core(cleanup_core_turn(
-                owners.clone(),
-                client_id.clone(),
-                now,
-            )));
-            return false;
-        };
-        let outcomes = match live_ticket.poll() {
-            CoreTicketPoll::Pending => return false,
-            CoreTicketPoll::Refused => {
-                ticket = None;
+    let mut ticket =
+        Some(runtime.submit_core(cleanup_core_turn(owners.clone(), client_id.clone(), now)));
+    state
+        .pending_owner_work
+        .push(Box::new(move |daemon, state| {
+            use crate::data_plane::driver::CoreTicketPoll;
+            let Some(live_ticket) = ticket.as_mut() else {
+                // The previous admission was refused; one ticket in flight.
+                let Some(runtime) = daemon.runtime() else {
+                    return true;
+                };
+                ticket = Some(runtime.submit_core(cleanup_core_turn(
+                    owners.clone(),
+                    client_id.clone(),
+                    now,
+                )));
                 return false;
-            }
-            CoreTicketPoll::Lost => Vec::new(),
-            CoreTicketPoll::Ready(outcomes) => outcomes,
-        };
-        let mut failed = false;
-        let mut bound_closes = 0u64;
-        for (session_id, subscription_id, identity, outcome) in outcomes {
-            match outcome {
-                CleanupRouteOutcome::Foreign => continue,
-                CleanupRouteOutcome::NoGeneration => {
-                    record_attached_subscription_change(
-                        &mut state.pending_runtime,
-                        &mut state.attach_close,
-                        &mut state.lifecycle_counters,
-                        Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
-                            session_id,
-                            subscription_id,
-                        })),
-                        None,
+            };
+            let outcomes = match live_ticket.poll() {
+                CoreTicketPoll::Pending => return false,
+                CoreTicketPoll::Refused => {
+                    ticket = None;
+                    return false;
+                }
+                CoreTicketPoll::Lost => Vec::new(),
+                CoreTicketPoll::Ready(outcomes) => outcomes,
+            };
+            let mut failed = false;
+            let mut bound_closes = 0u64;
+            for (session_id, subscription_id, identity, outcome) in outcomes {
+                match outcome {
+                    CleanupRouteOutcome::Foreign => continue,
+                    CleanupRouteOutcome::NoGeneration => {
+                        record_attached_subscription_change(
+                            &mut state.pending_runtime,
+                            &mut state.attach_close,
+                            &mut state.lifecycle_counters,
+                            Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                                session_id,
+                                subscription_id,
+                            })),
+                            None,
+                        );
+                        continue;
+                    }
+                    CleanupRouteOutcome::DetachFailed => {
+                        failed = true;
+                        continue;
+                    }
+                    CleanupRouteOutcome::Detached => {}
+                }
+                *state
+                    .lifecycle_counters
+                    .cleanup_by_reason
+                    .entry("cleanup_generation_detach".to_string())
+                    .or_insert(0) += 1;
+                // Mutate only the stream captured at cleanup start. A replacement
+                // that attached during the Core turn keeps its adapter.
+                let owned_stream = identity.as_ref().is_some_and(|identity| {
+                    state
+                        .pending_runtime
+                        .stream_matches(&session_id, &subscription_id, identity)
+                });
+                if owned_stream {
+                    let identity = identity.as_ref().expect("checked above");
+                    let was_bound = state
+                        .pending_runtime
+                        .is_adapter_bound(&session_id, &subscription_id);
+                    let _ = state.pending_runtime.close_adapter_if(
+                        &session_id,
+                        &subscription_id,
+                        identity,
                     );
+                    let _ = state.pending_runtime.cancel_stream_if(
+                        &session_id,
+                        &subscription_id,
+                        identity,
+                    );
+                    if was_bound {
+                        bound_closes += 1;
+                    }
+                } else if state
+                    .pending_runtime
+                    .stream_identity(&session_id, &subscription_id)
+                    .is_some()
+                {
+                    // A replacement owns the route key now; its live attach
+                    // record stays untouched.
                     continue;
                 }
-                CleanupRouteOutcome::DetachFailed => {
-                    failed = true;
-                    continue;
-                }
-                CleanupRouteOutcome::Detached => {}
+                record_attached_subscription_change(
+                    &mut state.pending_runtime,
+                    &mut state.attach_close,
+                    &mut state.lifecycle_counters,
+                    Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                        session_id,
+                        subscription_id,
+                    })),
+                    None,
+                );
             }
-            *state
-                .lifecycle_counters
-                .cleanup_by_reason
-                .entry("cleanup_generation_detach".to_string())
-                .or_insert(0) += 1;
-            // Mutate only the stream captured at cleanup start. A replacement
-            // that attached during the Core turn keeps its adapter.
-            let owned_stream = identity.as_ref().is_some_and(|identity| {
-                state
-                    .pending_runtime
-                    .stream_matches(&session_id, &subscription_id, identity)
-            });
-            if owned_stream {
-                let identity = identity.as_ref().expect("checked above");
-                let was_bound = state
-                    .pending_runtime
-                    .is_adapter_bound(&session_id, &subscription_id);
-                let _ = state
-                    .pending_runtime
-                    .close_adapter_if(&session_id, &subscription_id, identity);
-                let _ = state
-                    .pending_runtime
-                    .cancel_stream_if(&session_id, &subscription_id, identity);
-                if was_bound {
-                    bound_closes += 1;
-                }
-            } else if state
-                .pending_runtime
-                .stream_identity(&session_id, &subscription_id)
-                .is_some()
-            {
-                // A replacement owns the route key now; its live attach
-                // record stays untouched.
-                continue;
+            if bound_closes > 0 {
+                *state
+                    .lifecycle_counters
+                    .cleanup_by_reason
+                    .entry("bound_adapter_close".to_string())
+                    .or_insert(0) += bound_closes;
             }
-            record_attached_subscription_change(
-                &mut state.pending_runtime,
-                &mut state.attach_close,
-                &mut state.lifecycle_counters,
-                Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
-                    session_id,
-                    subscription_id,
-                })),
-                None,
-            );
-        }
-        if bound_closes > 0 {
-            *state
-                .lifecycle_counters
-                .cleanup_by_reason
-                .entry("bound_adapter_close".to_string())
-                .or_insert(0) += bound_closes;
-        }
-        if failed {
-            // `connection_cleanup_ignores_only_an_already_removed_session` is the
-            // designated positive control for predicate-true cleanup failures.
-            state.lifecycle_counters.cleanup_failed =
-                state.lifecycle_counters.cleanup_failed.saturating_add(1);
-        } else {
-            state.lifecycle_counters.cleanup_completed =
-                state.lifecycle_counters.cleanup_completed.saturating_add(1);
-        }
-        true
-    }));
+            if failed {
+                // `connection_cleanup_ignores_only_an_already_removed_session` is the
+                // designated positive control for predicate-true cleanup failures.
+                state.lifecycle_counters.cleanup_failed =
+                    state.lifecycle_counters.cleanup_failed.saturating_add(1);
+            } else {
+                state.lifecycle_counters.cleanup_completed =
+                    state.lifecycle_counters.cleanup_completed.saturating_add(1);
+            }
+            true
+        }));
 }
 
 /// One Core owner turn that detaches every candidate route the closed
@@ -906,8 +909,7 @@ fn cleanup_core_turn(
     owners: Vec<CleanupCandidate>,
     client_id: String,
     now: u64,
-) -> impl FnOnce(&mut botster_core_daemon::CoreDaemon) -> Vec<CleanupRouteReport> + Send + 'static
-{
+) -> impl FnOnce(&mut botster_core_daemon::CoreDaemon) -> Vec<CleanupRouteReport> + Send + 'static {
     move |daemon| {
         let inventory = daemon.list_terminal_subscriptions();
         let mut outcomes = Vec::with_capacity(owners.len());

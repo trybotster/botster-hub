@@ -1843,8 +1843,18 @@ mod tests {
     #[test]
     fn plugin_namespace_text_is_injective_for_admitted_identities() {
         let identities = [
-            "a/b", "a_b", "a b", "a:b", "a.b", "A_b", "a_5fb", "a-b", ".hidden", "..",
-            "über", "u_c3_bcber",
+            "a/b",
+            "a_b",
+            "a b",
+            "a:b",
+            "a.b",
+            "A_b",
+            "a_5fb",
+            "a-b",
+            ".hidden",
+            "..",
+            "über",
+            "u_c3_bcber",
         ];
         let mut seen = std::collections::BTreeSet::new();
         for identity in identities {
@@ -1860,14 +1870,8 @@ mod tests {
             plugin_namespace_text(&PluginKey("project-pipelines".into())),
             "project-pipelines"
         );
-        assert_eq!(
-            plugin_namespace_text(&PluginKey("a/b".into())),
-            "a_2fb"
-        );
-        assert_eq!(
-            plugin_namespace_text(&PluginKey("a_b".into())),
-            "a_5fb"
-        );
+        assert_eq!(plugin_namespace_text(&PluginKey("a/b".into())), "a_2fb");
+        assert_eq!(plugin_namespace_text(&PluginKey("a_b".into())), "a_5fb");
     }
     use std::time::{SystemTime, UNIX_EPOCH};
 

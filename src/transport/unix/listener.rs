@@ -44,7 +44,6 @@ pub(crate) const SOCKET_OWNER_LOCK_SUFFIX: &str = ".owner";
 /// lock file stays on disk so the next contender locks the same inode.
 pub(crate) struct SocketOwnerLock {
     file: fs::File,
-    path: PathBuf,
 }
 
 impl SocketOwnerLock {
@@ -57,11 +56,6 @@ impl SocketOwnerLock {
             .unwrap_or_default();
         name.push(SOCKET_OWNER_LOCK_SUFFIX);
         socket_path.with_file_name(name)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
     }
 }
 
@@ -99,7 +93,7 @@ pub(crate) fn acquire_socket_owner_lock(
             DaemonTransportError::Io(error)
         });
     }
-    Ok(SocketOwnerLock { file, path })
+    Ok(SocketOwnerLock { file })
 }
 
 pub(crate) async fn accept_connections(
@@ -311,14 +305,14 @@ mod tests {
     fn owner_lock_is_exclusive_and_released_on_drop() {
         let socket = temp_socket_path("lock");
         let first = acquire_socket_owner_lock(&socket).expect("first lock");
-        assert!(first.path().exists());
+        assert!(SocketOwnerLock::lock_path(&socket).exists());
         assert!(matches!(
             acquire_socket_owner_lock(&socket),
             Err(DaemonTransportError::AlreadyRunning)
         ));
         drop(first);
         let second = acquire_socket_owner_lock(&socket).expect("lock after release");
-        let lock_path = second.path().to_path_buf();
+        let lock_path = SocketOwnerLock::lock_path(&socket);
         drop(second);
         assert!(
             lock_path.exists(),
@@ -360,7 +354,7 @@ mod tests {
         );
         drop(early);
         let later = acquire_socket_owner_lock(&socket).expect("lock after the early contender");
-        let lock_path = later.path().to_path_buf();
+        let lock_path = SocketOwnerLock::lock_path(&socket);
         drop(later);
         let _ = fs::remove_file(lock_path);
     }
