@@ -1659,6 +1659,285 @@ mod tests {
         }
     }
 
+    fn inventory_row(
+        client_id: &str,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) -> TerminalSubscriptionRecord {
+        TerminalSubscriptionRecord {
+            client_id: ClientId(client_id.to_string()),
+            session_id: SessionId(session_id.to_string()),
+            subscription_id: SubscriptionId(subscription_id.to_string()),
+            generation: TerminalSubscriptionGeneration(generation),
+            adapter_bound: true,
+            capabilities: None,
+        }
+    }
+
+    fn bind_unix(
+        registry: &mut AttachStreamRegistry,
+        identity: &AttachmentIdentity,
+        session_id: &str,
+        subscription_id: &str,
+        generation: u64,
+    ) -> (
+        UnixTerminalAdapter,
+        crate::transport::unix::UnixTerminalAdapterHandle,
+    ) {
+        // The adapter half stays alive: dropping it closes the slot and
+        // would make `is_closed` true without any host close.
+        let (adapter, handle) = UnixTerminalAdapter::pair();
+        assert!(registry.mark_adapter_bound_if(
+            session_id,
+            subscription_id,
+            identity,
+            TerminalSubscriptionGeneration(generation),
+            BoundAdapterHandle::Unix(handle.clone()),
+        ));
+        (adapter, handle)
+    }
+
+    // Inventory-reconcile timing table (architect0060 rows 1-6). Each test
+    // models one Core inventory read as the row vector that read returned:
+    // the vector is fixed at the moment the read is submitted, and applied
+    // later through the real `reconcile_inventory_slice`. Rows that attach
+    // after the read was submitted cannot be in that vector; the current
+    // implementation closes them as stale. The production correction must
+    // carry the registry attach epoch captured at read submission and skip
+    // streams whose epoch is newer.
+
+    /// Row 1 (positive control): a stream bound before the read and absent
+    /// from it was ended by Core; reconcile closes and cancels it.
+    #[test]
+    fn reconcile_closes_a_bound_stream_older_than_the_read_and_absent_from_it() {
+        let mut registry = AttachStreamRegistry::default();
+        let old = registry.start_attach(owner(), "s".into(), "gone".into());
+        let (_adapter, handle) = bind_unix(&mut registry, &old, "s", "gone", 5);
+        // Read submitted after the bind; Core ended the route before the read
+        // ran, so the vector lacks it.
+        let read: Vec<TerminalSubscriptionRecord> = Vec::new();
+        registry.reconcile_inventory(&read);
+        assert!(handle.host_closed(), "Core-ended route is host-closed");
+        assert!(registry.stream_identity("s", "gone").is_none());
+    }
+
+    /// Row 2 (red on the current implementation): a stream attached and
+    /// bound after the read was submitted is absent from that read's rows
+    /// and must survive the late application.
+    #[test]
+    fn reconcile_must_not_close_a_stream_attached_after_the_read_was_taken() {
+        let mut registry = AttachStreamRegistry::default();
+        let before = registry.start_attach(owner(), "s".into(), "before".into());
+        let (_a1, before_handle) = bind_unix(&mut registry, &before, "s", "before", 1);
+        // Read submitted now: it can only ever contain "before".
+        let read = vec![inventory_row("client-a", "s", "before", 1)];
+        // The newer attach lands (Core turn, then owner bind) before apply.
+        let later = registry.start_attach(owner(), "s".into(), "later".into());
+        let (_a2, later_handle) = bind_unix(&mut registry, &later, "s", "later", 2);
+        registry.reconcile_inventory(&read);
+        assert!(!before_handle.host_closed(), "present row survives");
+        assert!(
+            !later_handle.host_closed(),
+            "a route attached after the read must not be closed by that read"
+        );
+        assert!(registry.stream_matches("s", "later", &later));
+        assert!(registry.is_adapter_bound("s", "later"));
+        assert_eq!(
+            registry.recorded_generation("s", "later"),
+            Some(TerminalSubscriptionGeneration(2))
+        );
+    }
+
+    /// Row 3: an attach submitted before the read but still unbound at apply
+    /// is not visited; it is judged by a later read once bound.
+    #[test]
+    fn reconcile_does_not_visit_an_attach_still_unbound_at_apply() {
+        let mut registry = AttachStreamRegistry::default();
+        let pending = registry.start_attach(owner(), "s".into(), "pending".into());
+        let read: Vec<TerminalSubscriptionRecord> = Vec::new();
+        let progress = registry.reconcile_inventory_slice(|_, _| None, None, usize::MAX);
+        let _ = read;
+        assert_eq!(progress.validated, 0, "unbound rows are not validated");
+        assert!(
+            registry.stream_matches("s", "pending", &pending),
+            "untouched"
+        );
+        assert!(!registry.is_adapter_bound("s", "pending"));
+        assert_eq!(registry.recorded_generation("s", "pending"), None);
+    }
+
+    /// Row 4: a replacement owner (new client, new generation) on the same
+    /// key. start_attach already cancelled and host-closed the old owner's
+    /// stream; the read holds only the current owner's row, and the current
+    /// stream survives under its own identity.
+    #[test]
+    fn reconcile_keeps_the_replacement_owner_when_inventory_holds_only_its_row() {
+        let mut registry = AttachStreamRegistry::default();
+        let old = registry.start_attach(owner(), "s".into(), "k".into());
+        let (_a1, old_handle) = bind_unix(&mut registry, &old, "s", "k", 1);
+        let replacement = registry.start_attach(
+            AttachStreamOwner {
+                client_id: "client-b".to_string(),
+                grant_id: None,
+            },
+            "s".into(),
+            "k".into(),
+        );
+        assert!(
+            old_handle.host_closed(),
+            "start_attach closed the old owner"
+        );
+        let (_a2, new_handle) = bind_unix(&mut registry, &replacement, "s", "k", 2);
+        let read = vec![inventory_row("client-b", "s", "k", 2)];
+        registry.reconcile_inventory(&read);
+        assert!(!new_handle.host_closed());
+        assert!(registry.stream_matches("s", "k", &replacement));
+        assert_eq!(
+            registry
+                .stream_identity("s", "k")
+                .map(|identity| identity.client_id),
+            Some("client-b".to_string())
+        );
+    }
+
+    /// Row 5 (red on the current implementation): with one route per slice,
+    /// a stream attached between slices is absent from a second read that
+    /// was submitted before its attach and must survive that slice.
+    #[test]
+    fn reconcile_slice_must_not_close_a_stream_attached_between_slices_when_the_read_predates_it() {
+        let mut registry = AttachStreamRegistry::default();
+        let first = registry.start_attach(owner(), "s".into(), "a-first".into());
+        let (_a1, first_handle) = bind_unix(&mut registry, &first, "s", "a-first", 1);
+        let read_one = vec![inventory_row("client-a", "s", "a-first", 1)];
+        let progress = registry.reconcile_inventory_slice(
+            |session_id, subscription_id| {
+                read_one
+                    .iter()
+                    .find(|row| {
+                        row.session_id.0 == session_id && row.subscription_id.0 == subscription_id
+                    })
+                    .map(|row| row.generation)
+            },
+            None,
+            1,
+        );
+        assert_eq!(progress.validated, 1);
+        assert!(!first_handle.host_closed());
+        // Second read submitted before the next attach lands.
+        let read_two = read_one.clone();
+        let second = registry.start_attach(owner(), "s".into(), "b-second".into());
+        let (_a2, second_handle) = bind_unix(&mut registry, &second, "s", "b-second", 2);
+        let _ = registry.reconcile_inventory_slice(
+            |session_id, subscription_id| {
+                read_two
+                    .iter()
+                    .find(|row| {
+                        row.session_id.0 == session_id && row.subscription_id.0 == subscription_id
+                    })
+                    .map(|row| row.generation)
+            },
+            progress.after,
+            1,
+        );
+        assert!(
+            !second_handle.host_closed(),
+            "a route attached after the slice's read must survive that slice"
+        );
+        assert!(registry.stream_matches("s", "b-second", &second));
+    }
+
+    /// Row 5 control: the same paging, but the second read was submitted
+    /// after the attach and includes it; it survives today.
+    #[test]
+    fn reconcile_slice_keeps_a_stream_attached_between_slices_when_the_next_read_includes_it() {
+        let mut registry = AttachStreamRegistry::default();
+        let first = registry.start_attach(owner(), "s".into(), "a-first".into());
+        let (_a1, _first_handle) = bind_unix(&mut registry, &first, "s", "a-first", 1);
+        let progress = registry.reconcile_inventory_slice(
+            |_, _| Some(TerminalSubscriptionGeneration(1)),
+            None,
+            1,
+        );
+        let second = registry.start_attach(owner(), "s".into(), "b-second".into());
+        let (_a2, second_handle) = bind_unix(&mut registry, &second, "s", "b-second", 2);
+        let read_two = vec![
+            inventory_row("client-a", "s", "a-first", 1),
+            inventory_row("client-a", "s", "b-second", 2),
+        ];
+        let _ = registry.reconcile_inventory_slice(
+            |session_id, subscription_id| {
+                read_two
+                    .iter()
+                    .find(|row| {
+                        row.session_id.0 == session_id && row.subscription_id.0 == subscription_id
+                    })
+                    .map(|row| row.generation)
+            },
+            progress.after,
+            1,
+        );
+        assert!(!second_handle.host_closed());
+    }
+
+    /// Row 6: WebRTC split timing. attach_route lands at Core turn N (the
+    /// generation is recorded, no adapter yet); the read is submitted after
+    /// that turn, so its rows include the route; the reserved bind lands at
+    /// turn N+k before apply. The stream is visited after the bind, the row
+    /// is present, and it survives.
+    #[test]
+    fn reconcile_visits_a_split_attach_bind_stream_after_bind_with_its_row_present() {
+        let mut registry = AttachStreamRegistry::default();
+        let peer = AttachStreamOwner {
+            client_id: "botster-hub-daemon-subscription-w".to_string(),
+            grant_id: Some("grant-w".to_string()),
+        };
+        let identity = registry.start_attach(peer, "s".into(), "w".into());
+        assert!(registry.record_generation_if(
+            "s",
+            "w",
+            &identity,
+            TerminalSubscriptionGeneration(7)
+        ));
+        let read = vec![inventory_row(
+            "botster-hub-daemon-subscription-w",
+            "s",
+            "w",
+            7,
+        )];
+        let (_adapter, handle) = bind_unix(&mut registry, &identity, "s", "w", 7);
+        registry.reconcile_inventory(&read);
+        assert!(!handle.host_closed());
+        assert!(registry.stream_matches("s", "w", &identity));
+    }
+
+    /// Row 6 (red on the current implementation): the read is submitted
+    /// before the attach_route turn; the bind lands before apply. The route
+    /// cannot be in that read and must survive.
+    #[test]
+    fn reconcile_must_not_close_a_split_attach_bind_stream_whose_attach_followed_the_read() {
+        let mut registry = AttachStreamRegistry::default();
+        let read: Vec<TerminalSubscriptionRecord> = Vec::new();
+        let peer = AttachStreamOwner {
+            client_id: "botster-hub-daemon-subscription-w".to_string(),
+            grant_id: Some("grant-w".to_string()),
+        };
+        let identity = registry.start_attach(peer, "s".into(), "w".into());
+        assert!(registry.record_generation_if(
+            "s",
+            "w",
+            &identity,
+            TerminalSubscriptionGeneration(7)
+        ));
+        let (_adapter, handle) = bind_unix(&mut registry, &identity, "s", "w", 7);
+        registry.reconcile_inventory(&read);
+        assert!(
+            !handle.host_closed(),
+            "a split attach/bind that followed the read must survive it"
+        );
+        assert!(registry.stream_matches("s", "w", &identity));
+    }
+
     #[test]
     fn reconcile_releases_routes_missing_from_core_inventory() {
         let mut registry = AttachStreamRegistry::default();
