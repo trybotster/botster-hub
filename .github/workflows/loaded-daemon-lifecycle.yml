@@ -174,16 +174,22 @@ jobs:
           printf 'precompile_args=' | tee -a "$ARTIFACT_DIR/metadata.txt"
           printf '%q ' "${test_args[@]}" | tee -a "$ARTIFACT_DIR/metadata.txt"
           printf '\n' | tee -a "$ARTIFACT_DIR/metadata.txt"
+          candidate_dir="$GITHUB_WORKSPACE/subject/target/candidate"
+          candidate_exports="$(CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 script/build-dev-artifacts --out-dir "$candidate_dir")"
+          printf '%s\n' "$candidate_exports" | tee -a "$ARTIFACT_DIR/metadata.txt"
+          BOTSTER_HUB_BIN="$(sed -n 's/^BOTSTER_HUB_BIN=//p' <<<"$candidate_exports")"
+          BOTSTER_SESSION_WORKER_BIN="$(sed -n 's/^BOTSTER_SESSION_WORKER_BIN=//p' <<<"$candidate_exports")"
+          BOTSTER_CANDIDATE_MANIFEST="$(sed -n 's/^BOTSTER_CANDIDATE_MANIFEST=//p' <<<"$candidate_exports")"
+          export BOTSTER_HUB_BIN BOTSTER_SESSION_WORKER_BIN BOTSTER_CANDIDATE_MANIFEST
+          {
+            printf 'BOTSTER_HUB_BIN=%s\n' "$BOTSTER_HUB_BIN"
+            printf 'BOTSTER_SESSION_WORKER_BIN=%s\n' "$BOTSTER_SESSION_WORKER_BIN"
+            printf 'BOTSTER_CANDIDATE_MANIFEST=%s\n' "$BOTSTER_CANDIDATE_MANIFEST"
+          } >> "$GITHUB_ENV"
           ./test.sh "${test_args[@]}" 2>&1 \
             | tee "$ARTIFACT_DIR/precompile.log"
-          worker_args=(build --locked -p botster-core-daemon --bin botster-session-worker)
-          printf 'worker_precompile_args=cargo ' | tee -a "$ARTIFACT_DIR/metadata.txt"
-          printf '%q ' "${worker_args[@]}" | tee -a "$ARTIFACT_DIR/metadata.txt"
-          printf '\n' | tee -a "$ARTIFACT_DIR/metadata.txt"
-          cargo "${worker_args[@]}" 2>&1 \
-            | tee -a "$ARTIFACT_DIR/precompile.log"
-          hub_bin="$GITHUB_WORKSPACE/subject/target/debug/botster-hub"
-          worker_bin="$GITHUB_WORKSPACE/subject/target/debug/botster-session-worker"
+          hub_bin="$BOTSTER_HUB_BIN"
+          worker_bin="$BOTSTER_SESSION_WORKER_BIN"
           if [[ ! -x "$hub_bin" || ! -x "$worker_bin" ]]; then
             printf 'missing precompiled runtime binary: hub=%s worker=%s\n' "$hub_bin" "$worker_bin" \
               | tee -a "$ARTIFACT_DIR/metadata.txt"

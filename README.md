@@ -424,6 +424,14 @@ script/test-production-package-runtime \
   --evidence-dir /path/to/new-evidence-directory
 ```
 
+`./test.sh` builds one clean, revision-coupled development candidate before it starts Cargo tests.
+The wrapper can reuse a candidate when `BOTSTER_HUB_BIN`,
+`BOTSTER_SESSION_WORKER_BIN`, and `BOTSTER_CANDIDATE_MANIFEST` are all set.
+The wrapper verifies both candidate hashes before each use. The loaded runner
+builds one candidate for all repetitions in a gate run. A bare `cargo test`
+command for daemon-spawning tests must receive the same three values from
+`script/build-dev-artifacts`.
+
 The cross-repository acceptance script requires Ruby 2.7 or newer and uses only
 Ruby's standard library. It checks the interpreter before building artifacts and
 prints an installation/version remediation when the prerequisite is missing.

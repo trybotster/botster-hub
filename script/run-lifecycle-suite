@@ -246,7 +246,6 @@ else
   dirty_forced=0
 fi
 
-cargo build --locked -p botster-core-daemon --bin botster-session-worker
 set +e
 "$test_sh" --locked --test hub_daemon_lifecycle_test "$@" >"$suite_log" 2>&1
 suite_status=$?

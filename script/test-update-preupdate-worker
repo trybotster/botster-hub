@@ -13,6 +13,6 @@ cargo install \
   botster-core-daemon
 
 BOTSTER_PREUPDATE_WORKER_BIN="$fixture_root/install/bin/botster-session-worker" \
-  cargo test -p botster-hub --test update_command_test \
+  ./test.sh -p botster-hub --test update_command_test \
   update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order \
   -- --ignored --exact --test-threads=1
