@@ -62,20 +62,19 @@ pub(crate) struct InventoryRead {
 }
 
 impl DaemonControlState {
-    /// Install a read result as if the read had been submitted at
-    /// `read_epoch` and already answered. The next reconcile phase applies
-    /// exactly this inventory. Test-only: no production path resolves a read
-    /// without submitting it.
+    /// Replace the result of the submitted reconcile read without changing
+    /// its submission epoch. The next reconcile phase applies this inventory.
+    /// Test-only: the production submission branch must create the read first.
     #[cfg(test)]
-    pub(crate) fn install_reconcile_inventory_for_test(
+    pub(crate) fn resolve_submitted_reconcile_inventory_for_test(
         &mut self,
         inventory: Vec<botster_core::TerminalSubscriptionRecord>,
-        read_epoch: u64,
     ) {
-        self.reconcile_inventory = Some(InventoryRead {
-            read_epoch,
-            ticket: crate::data_plane::driver::CoreTicket::resolved(inventory),
-        });
+        let read = self
+            .reconcile_inventory
+            .as_mut()
+            .expect("the reconcile read must be submitted before its result is controlled");
+        read.ticket = crate::data_plane::driver::CoreTicket::resolved(inventory);
     }
 }
 
@@ -2649,12 +2648,15 @@ mod tests {
     #[test]
     fn reconcile_read_submitted_before_an_attach_leaves_that_attach_bound() {
         let (mut daemon, mut state, mux, session_id) = reconcile_wiring_fixture("before");
-        // The read is submitted now: epoch captured before the attach exists.
-        let read_epoch = state.pending_runtime.attach_epoch();
+        assert!(
+            run_inventory_reconcile_phase(&daemon, &mut state),
+            "the first phase turn submits the inventory read"
+        );
         let generation = attach_through_control(&mut daemon, &mut state, &session_id, "newer");
         assert!(state.pending_runtime.is_adapter_bound(&session_id, "newer"));
-        // The read's result cannot contain the newer route.
-        state.install_reconcile_inventory_for_test(Vec::new(), read_epoch);
+        // Control only the result application. The read keeps the epoch that
+        // the production submission branch captured before this attach.
+        state.resolve_submitted_reconcile_inventory_for_test(Vec::new());
         let more = run_inventory_reconcile_phase(&daemon, &mut state);
         assert!(!more);
         assert!(
@@ -2675,10 +2677,13 @@ mod tests {
         let handle = mux
             .route_handle(&session_id, "older", generation)
             .expect("registered route");
-        // The read is submitted after the attach; an empty result means
-        // Core ended the route, and reconcile must close it.
-        let read_epoch = state.pending_runtime.attach_epoch();
-        state.install_reconcile_inventory_for_test(Vec::new(), read_epoch);
+        // The read is submitted after the attach; an empty result means Core
+        // ended the route, and reconcile must close it.
+        assert!(
+            run_inventory_reconcile_phase(&daemon, &mut state),
+            "the first phase turn submits the inventory read"
+        );
+        state.resolve_submitted_reconcile_inventory_for_test(Vec::new());
         let _ = run_inventory_reconcile_phase(&daemon, &mut state);
         assert!(!state.pending_runtime.is_adapter_bound(&session_id, "older"));
         assert!(
