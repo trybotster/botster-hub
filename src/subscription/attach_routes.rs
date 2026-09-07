@@ -291,10 +291,8 @@ impl AttachStreamRegistry {
         // Each key keeps the grant it is already known to belong to: a
         // route-set entry belongs to that grant, a stream to its owner. A
         // snapshot key carries no attribution of its own.
-        let mut keys: BTreeMap<(String, String), Option<String>> = snapshot
-            .iter()
-            .map(|key| (key.clone(), None))
-            .collect();
+        let mut keys: BTreeMap<(String, String), Option<String>> =
+            snapshot.iter().map(|key| (key.clone(), None)).collect();
         for grant in removed {
             if let Some(routes) = self.owner_routes.get(grant) {
                 for key in routes {
