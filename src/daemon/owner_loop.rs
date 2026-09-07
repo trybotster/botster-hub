@@ -2478,6 +2478,276 @@ return botster.register({
     }
 
     #[test]
+    fn blocked_plugin_connection_returns_correlated_too_many_requests_before_release() {
+        let root = unique_package_control_dir("controlled-plugin-admission-limit");
+        let data_directory = root.join("data");
+        let package_dir = root.join("owner.controlled-gate");
+        write_package_control_manifest(
+            &package_dir,
+            "owner.controlled-gate",
+            serde_json::json!({
+                "capabilities": [{ "surface": "mcp" }],
+                "entrypoints": [
+                    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+                ]
+            }),
+        );
+        write_controlled_gate_lua_plugin(&package_dir);
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config).expect("start admission-limit daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install admission-limit plugin");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner.controlled-gate".to_string(),
+            },
+        )
+        .expect("enable admission-limit plugin");
+
+        let (server, mut client) = UnixStream::pair().expect("create plugin pressure socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound plugin pressure response reads");
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let connection_tx = control_tx.clone();
+        let connection = thread::spawn(move || handle_connection(server, connection_tx));
+        write_hello(&mut client);
+        let mut reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut client, &mut reader);
+
+        let mut state = DaemonControlState::default();
+        let transport_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build plugin pressure transport runtime");
+        let local_webrtc_terminal_record_path = root.join("local-webrtc-terminal.json");
+        let registration = receive_test_control_message(&mut control_rx);
+        let terminal_mux = match &registration {
+            ControlMessage::RegisterUnixAdmission {
+                admission: UnixTerminalAdmission::Admitted { mux, .. },
+                ..
+            } => mux.clone(),
+            _ => panic!("expected admitted Unix registration"),
+        };
+        let (mut terminal_adapter, terminal_handle) = terminal_mux.create_adapter();
+        assert!(terminal_mux.register(
+            "pressure-session".to_string(),
+            "pressure-subscription".to_string(),
+            1,
+            terminal_handle,
+        ));
+        assert!(!handle_control_message(
+            &mut daemon,
+            &mut state,
+            &local_webrtc_terminal_record_path,
+            transport_runtime.handle(),
+            control_tx.clone(),
+            registration,
+        ));
+
+        crate::lua_runtime::arm_test_plugin_invocation_gate();
+        for serial in 1..=botster_hub_client::MAX_OUTSTANDING_REQUESTS + 1 {
+            write_request(
+                &mut client,
+                u64::try_from(serial).expect("request serial"),
+                DaemonRequest::PluginMcpCallTool {
+                    name: "owner.controlled_gate".to_string(),
+                    arguments: serde_json::json!({ "token": serial }),
+                },
+            );
+        }
+
+        for serial in 1..=botster_hub_client::MAX_OUTSTANDING_REQUESTS {
+            let message = receive_test_control_message(&mut control_rx);
+            assert!(
+                matches!(
+                    &message,
+                    ControlMessage::Request {
+                        request,
+                        transport_request_id: Some(request_id),
+                        ..
+                    } if matches!(request.as_ref(), DaemonRequest::PluginMcpCallTool { .. })
+                        && request_id == &serial.to_string()
+                ),
+                "request {serial} must reach production connection and owner admission"
+            );
+            assert!(!handle_control_message(
+                &mut daemon,
+                &mut state,
+                &local_webrtc_terminal_record_path,
+                transport_runtime.handle(),
+                control_tx.clone(),
+                message,
+            ));
+        }
+        assert!(
+            crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::from_secs(2)),
+            "the controlled plugin worker must enter the gate"
+        );
+
+        let refused_id = u64::try_from(botster_hub_client::MAX_OUTSTANDING_REQUESTS + 1)
+            .expect("refused request id");
+        let refusal = read_response(&mut client, &mut reader, refused_id);
+        assert_eq!(refusal.kind, DaemonResponseKind::OperatorError);
+        assert_eq!(
+            refusal.error.as_ref().map(|error| error.code.as_str()),
+            Some(botster_hub_client::OPERATOR_ERROR_TOO_MANY_REQUESTS)
+        );
+        assert_eq!(
+            state.pending_requests.len(),
+            botster_hub_client::MAX_OUTSTANDING_REQUESTS
+        );
+
+        let terminal_body =
+            encode_output(b"terminal-after-refusal").expect("encode terminal output after refusal");
+        let expected_terminal_body = terminal_body.as_bytes().to_vec();
+        terminal_adapter
+            .try_write(&RoutedTerminalFrame::new(
+                RouteId::new("pressure-subscription").expect("pressure route"),
+                1,
+                0,
+                terminal_body,
+            ))
+            .expect("write terminal output after refusal");
+        let terminal = read_terminal(&mut client, &mut reader);
+        assert_eq!(terminal.route, "pressure-subscription");
+        assert_eq!(terminal.generation, 1);
+        assert_eq!(terminal.body, expected_terminal_body);
+
+        let (sibling_server, mut sibling_client) =
+            UnixStream::pair().expect("create sibling status socket pair");
+        sibling_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound sibling status reads");
+        let sibling_tx = control_tx.clone();
+        let sibling_connection =
+            thread::spawn(move || handle_connection(sibling_server, sibling_tx));
+        write_hello(&mut sibling_client);
+        let mut sibling_reader = DaemonUnixFrameReader::new();
+        let _ = read_hello_ack(&mut sibling_client, &mut sibling_reader);
+        let sibling_registration = receive_test_control_message(&mut control_rx);
+        assert!(matches!(
+            sibling_registration,
+            ControlMessage::RegisterUnixAdmission { .. }
+        ));
+        assert!(!handle_control_message(
+            &mut daemon,
+            &mut state,
+            &local_webrtc_terminal_record_path,
+            transport_runtime.handle(),
+            control_tx.clone(),
+            sibling_registration,
+        ));
+        write_request(&mut sibling_client, 1, DaemonRequest::Status);
+        let sibling_status = receive_test_control_message(&mut control_rx);
+        assert!(matches!(
+            &sibling_status,
+            ControlMessage::Request { request, .. }
+                if matches!(request.as_ref(), DaemonRequest::Status)
+        ));
+        assert!(!handle_control_message(
+            &mut daemon,
+            &mut state,
+            &local_webrtc_terminal_record_path,
+            transport_runtime.handle(),
+            control_tx.clone(),
+            sibling_status,
+        ));
+        let sibling_deadline = Instant::now() + Duration::from_secs(2);
+        while state.pending_requests.len() > botster_hub_client::MAX_OUTSTANDING_REQUESTS {
+            assert!(!crate::daemon::control::request::poll_deferred(
+                &mut daemon,
+                &mut state,
+            ));
+            assert!(
+                Instant::now() < sibling_deadline,
+                "the sibling Status request must complete while the plugin handler is held"
+            );
+            if state.pending_requests.len() > botster_hub_client::MAX_OUTSTANDING_REQUESTS {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(
+            read_response(&mut sibling_client, &mut sibling_reader, 1).kind,
+            DaemonResponseKind::Status
+        );
+        sibling_client
+            .shutdown(Shutdown::Both)
+            .expect("disconnect sibling status client");
+        sibling_connection
+            .join()
+            .expect("join sibling status connection")
+            .expect("sibling status disconnect is clean");
+
+        crate::lua_runtime::release_test_plugin_invocation_gate();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.pending_requests.is_empty() {
+            if let Some(runtime) = daemon.runtime() {
+                let DaemonControlState {
+                    maintenance,
+                    plugin_controls,
+                    plugin_entities,
+                    plugin_result_budget,
+                    ..
+                } = &mut state;
+                let _ = run_completion_drain_slice_for_owner(
+                    runtime,
+                    maintenance,
+                    plugin_controls,
+                    plugin_entities,
+                    plugin_result_budget,
+                );
+            }
+            assert!(!crate::daemon::control::request::poll_deferred(
+                &mut daemon,
+                &mut state,
+            ));
+            assert!(
+                Instant::now() < deadline,
+                "admitted plugin requests did not complete after gate release"
+            );
+            if !state.pending_requests.is_empty() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let mut completed = vec![false; botster_hub_client::MAX_OUTSTANDING_REQUESTS + 1];
+        for _ in 0..botster_hub_client::MAX_OUTSTANDING_REQUESTS {
+            let DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                request_id,
+                response,
+            }) = reader
+                .read_frame(&mut client)
+                .expect("read admitted plugin response")
+            else {
+                panic!("admitted plugin request must return a response frame");
+            };
+            let request_id = request_id.parse::<usize>().expect("numeric request id");
+            assert!((1..=botster_hub_client::MAX_OUTSTANDING_REQUESTS).contains(&request_id));
+            assert!(
+                !completed[request_id],
+                "request {request_id} answered twice"
+            );
+            assert_eq!(response.kind, DaemonResponseKind::PluginMcpToolResult);
+            completed[request_id] = true;
+        }
+        assert!(completed[1..].iter().all(|completed| *completed));
+        assert!(!state.plugin_controls.has_pending());
+        client
+            .shutdown(Shutdown::Both)
+            .expect("disconnect plugin pressure client");
+        connection
+            .join()
+            .expect("join plugin pressure connection")
+            .expect("plugin pressure disconnect is clean");
+        daemon.stop();
+    }
+
+    #[test]
     fn asynchronous_plugin_paths_preserve_success_and_failure_response_shapes() {
         let root = unique_package_control_dir("async-plugin-response-shapes");
         let data_directory = root.join("data");
