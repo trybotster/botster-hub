@@ -2,6 +2,7 @@
 //! and post-processing.
 
 use std::sync::mpsc;
+use std::time::Instant;
 
 use botster_hub_client::{
     DaemonHubUpdate, DaemonHubUpdateState, DaemonRequest, DaemonResponse, DaemonResponseKind,
@@ -10,7 +11,11 @@ use botster_hub_client::{
 use crate::HubDaemon;
 use crate::client_api_dto::response::daemon_hub_update;
 use crate::daemon::control::message::{ControlMessage, ControlReplySender, ControlSender};
-use crate::daemon::control::pending::{ControlStep, PendingControlRequest, poll_pending_requests};
+use crate::daemon::control::attach_bind_operator_error;
+use crate::daemon::control::pending::{
+    ControlStep, PendingControlRequest, poll_pending_requests, request_must_finish,
+};
+use crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED;
 use crate::daemon::control::{
     DaemonObservability, control_request_operation_label, events, handle_control_request, host,
     webrtc,
@@ -26,7 +31,8 @@ use crate::daemon::owner_loop::{
 };
 use crate::maintenance::software_identity;
 use crate::subscription::attach_routes::{
-    attached_subscription_change_for_response, record_attached_subscription_change,
+    AttachedSubscriptionChange, attached_subscription_change_for_response,
+    record_attached_subscription_change,
 };
 
 pub(crate) fn handle(
@@ -98,6 +104,24 @@ pub(crate) fn handle(
         .expect("host family");
     }
     let request = *request;
+    // Reserve the budget permit before any Core work is admitted. The permit
+    // stays with the pending entry until the response is finished or the
+    // entry is retired; the transport's per-connection limit ends with the
+    // connection, this one does not.
+    let client = grant_id.clone().or_else(|| client_id.clone());
+    let Some(permit) = state
+        .budget
+        .reserve(format!("request:{}", client.as_deref().unwrap_or("-")))
+    else {
+        return send_control_response(
+            reply_tx,
+            Ok(attach_bind_operator_error(
+                OWNER_BUDGET_EXHAUSTED,
+                "the daemon holds its maximum retained requests and cleanup; retry later",
+            )),
+            response_delivery_rx,
+        );
+    };
     let observability = DaemonObservability {
         egress: state.egress_diagnostics.diagnostics(),
         lifecycle: state.lifecycle_counters.clone(),
@@ -106,10 +130,15 @@ pub(crate) fn handle(
     };
     let step = handle_control_request(daemon, state, observability, control_tx, request.clone());
     let entry = PendingControlRequest {
+        must_finish: request_must_finish(&request),
         request,
         reply_tx,
         response_delivery_rx,
         grant_id,
+        client,
+        permit: Some(permit),
+        accepted_at: Instant::now(),
+        past_deadline: false,
         continuation: Box::new(|_, _| crate::daemon::control::pending::ControlPoll::Pending),
     };
     match step {
@@ -126,7 +155,7 @@ pub(crate) fn handle(
 
 /// Poll deferred requests and answer the finished ones.
 pub(crate) fn poll_deferred(daemon: &mut HubDaemon, state: &mut DaemonControlState) -> bool {
-    poll_pending_requests(daemon, state, finish)
+    poll_pending_requests(daemon, state, Instant::now(), finish)
 }
 
 /// Post-process one complete response and send it. Returns `true` after a
@@ -142,8 +171,12 @@ fn finish(
         reply_tx,
         response_delivery_rx,
         grant_id,
+        permit,
         ..
     } = entry;
+    if let Some(permit) = permit {
+        state.budget.release(permit);
+    }
     let reconcile_after_request = matches!(
         request,
         DaemonRequest::Spawn { .. }
@@ -204,6 +237,24 @@ fn finish(
     }
     if let Ok(response) = response.as_ref() {
         let change = attached_subscription_change_for_response(&request, response);
+        // A Detach whose route key is now owned by a replacement stream must
+        // not remove the replacement's live-attach bookkeeping.
+        let change = match (&request, change) {
+            (
+                DaemonRequest::Detach {
+                    session_id,
+                    subscription_id,
+                },
+                Some(AttachedSubscriptionChange::Detach(_)),
+            ) if state
+                .pending_runtime
+                .stream_identity(session_id, subscription_id)
+                .is_some() =>
+            {
+                None
+            }
+            (_, change) => change,
+        };
         record_attached_subscription_change(
             &mut state.pending_runtime,
             &mut state.attach_close,

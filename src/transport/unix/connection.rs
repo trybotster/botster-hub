@@ -12,8 +12,8 @@ use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use botster_core::{ClientId, SessionId, SubscriptionId};
-use botster_core_daemon::DetachTerminalSubscriptionResult;
+use botster_core::{SessionId, SubscriptionId};
+use botster_core_daemon::CaptureOwner;
 use botster_hub_client::DaemonConnection as ClientDaemonConnection;
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 use botster_hub_client::{
@@ -40,10 +40,13 @@ use crate::daemon::control::message::{
 };
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::{DaemonControlState, tick};
+use crate::daemon::control::pending::retire_abandoned_requests;
 use crate::subscription::attach_routes::{
-    AttachedSubscription, AttachedSubscriptionChange, AttachmentIdentity,
-    apply_attached_subscription_change, attached_subscription_change_for_response,
-    live_generation_for_route, record_attached_subscription_change,
+    AttachedSubscription, AttachedSubscriptionChange, apply_attached_subscription_change,
+    attached_subscription_change_for_response,
+};
+use crate::subscription::route_cleanup::{
+    CleanupCandidate, candidate_from_registry, retain_route_cleanup,
 };
 use crate::subscription::entity::EntityFrameSender;
 use crate::transport::unix::UnixConnectionMux;
@@ -710,25 +713,46 @@ pub(crate) fn handle_connection_cleanup(
         .admission
         .unix_admissions
         .remove(&cleanup.client_id);
-    let mut candidates = BTreeSet::new();
+    // Every route this connection may own in Core, captured with the stream
+    // identity and generation before any owner-side mutation. Attach admission
+    // bounds the count per owner, so this vector is bounded.
+    let mut keys = BTreeSet::new();
     for claim in state
         .pending_runtime
         .take_connection_bound_routes(&cleanup.client_id)
     {
-        candidates.insert((claim.session_id, claim.subscription_id));
+        keys.insert((claim.session_id, claim.subscription_id));
     }
-    // Attach streams this client started but never bound are cancelled now,
-    // so a late attach or bind continuation finds an identity mismatch and
-    // releases its own generation. Core-side membership for those routes is
-    // still detached by the Core turn below.
-    for (session_id, subscription_id, identity) in state
+    for subscription in &cleanup.attached_subscriptions {
+        keys.insert((
+            subscription.session_id.clone(),
+            subscription.subscription_id.clone(),
+        ));
+    }
+    let unbound = state
         .pending_runtime
-        .unbound_routes_for_client(&cleanup.client_id)
-    {
+        .unbound_routes_for_client(&cleanup.client_id);
+    for (session_id, subscription_id, _) in &unbound {
+        keys.insert((session_id.clone(), subscription_id.clone()));
+    }
+    let candidates: Vec<CleanupCandidate> = keys
+        .iter()
+        .map(|(session_id, subscription_id)| {
+            candidate_from_registry(
+                &state.pending_runtime,
+                &cleanup.client_id,
+                session_id,
+                subscription_id,
+            )
+        })
+        .collect();
+    // Attach streams this client started but never bound are cancelled now,
+    // so a late attach continuation finds an identity mismatch and releases
+    // its own generation. Core-side membership is detached by the obligation.
+    for (session_id, subscription_id, identity) in unbound {
         let _ = state
             .pending_runtime
             .cancel_stream_if(&session_id, &subscription_id, &identity);
-        candidates.insert((session_id, subscription_id));
     }
     state
         .pending_runtime
@@ -739,235 +763,52 @@ pub(crate) fn handle_connection_cleanup(
         state
             .event_plane
             .cleanup_connection(&cleanup.client_id, runtime.package_event_router());
-        runtime.release_owner_captures(botster_core_daemon::CaptureOwner(format!(
-            "client:{}",
-            cleanup.client_id
-        )));
-    }
-    for subscription in &cleanup.attached_subscriptions {
-        candidates.insert((
-            subscription.session_id.clone(),
-            subscription.subscription_id.clone(),
-        ));
     }
     if let Some(UnixTerminalAdmission::Admitted { mux, .. }) = unix_admission {
         mux.close_all();
     }
-    if candidates.is_empty() {
+    // Reads this client left pending are retired; requests that must finish
+    // keep their permits and run to completion.
+    retire_abandoned_requests(state, &cleanup.client_id);
+    // The permit reserved when the connection was accepted now carries the
+    // cleanup obligation: captures released and every route detached in
+    // Core, then identity-fenced owner bookkeeping.
+    let permit = state.budget.take_connection_permit(&cleanup.client_id);
+    if daemon.runtime().is_none() {
+        state.budget.release(permit);
         state.lifecycle_counters.cleanup_completed =
             state.lifecycle_counters.cleanup_completed.saturating_add(1);
         return;
     }
-    let Some(runtime) = daemon.runtime() else {
-        state.lifecycle_counters.cleanup_completed =
-            state.lifecycle_counters.cleanup_completed.saturating_add(1);
-        return;
-    };
-    // Detach every route this connection owned in one Core owner turn, then
-    // finish the owner bookkeeping when the turn reports back.
-    // Capture the attachment identity of every candidate now. The owner-side
-    // bookkeeping after the Core turn only mutates a stream that still has
-    // this identity; a replacement attached meanwhile is left alone.
-    let client_id = cleanup.client_id.clone();
-    let owners: Vec<CleanupCandidate> = candidates
-        .iter()
-        .map(|(session_id, subscription_id)| {
-            (
-                session_id.clone(),
-                subscription_id.clone(),
-                state
-                    .pending_runtime
-                    .stream_identity(session_id, subscription_id),
-            )
-        })
-        .collect();
     let now = tick(&mut state.logical_clock);
-    let mut ticket =
-        Some(runtime.submit_core(cleanup_core_turn(owners.clone(), client_id.clone(), now)));
-    state
-        .pending_owner_work
-        .push(Box::new(move |daemon, state| {
-            use crate::data_plane::driver::CoreTicketPoll;
-            let Some(live_ticket) = ticket.as_mut() else {
-                // The previous admission was refused; one ticket in flight.
-                let Some(runtime) = daemon.runtime() else {
-                    return true;
-                };
-                ticket = Some(runtime.submit_core(cleanup_core_turn(
-                    owners.clone(),
-                    client_id.clone(),
-                    now,
-                )));
-                return false;
-            };
-            let outcomes = match live_ticket.poll() {
-                CoreTicketPoll::Pending => return false,
-                CoreTicketPoll::Refused => {
-                    ticket = None;
-                    return false;
-                }
-                CoreTicketPoll::Lost => Vec::new(),
-                CoreTicketPoll::Ready(outcomes) => outcomes,
-            };
-            let mut failed = false;
-            let mut bound_closes = 0u64;
-            for (session_id, subscription_id, identity, outcome) in outcomes {
-                match outcome {
-                    CleanupRouteOutcome::Foreign => continue,
-                    CleanupRouteOutcome::NoGeneration => {
-                        record_attached_subscription_change(
-                            &mut state.pending_runtime,
-                            &mut state.attach_close,
-                            &mut state.lifecycle_counters,
-                            Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
-                                session_id,
-                                subscription_id,
-                            })),
-                            None,
-                        );
-                        continue;
-                    }
-                    CleanupRouteOutcome::DetachFailed => {
-                        failed = true;
-                        continue;
-                    }
-                    CleanupRouteOutcome::Detached => {}
-                }
-                *state
-                    .lifecycle_counters
-                    .cleanup_by_reason
-                    .entry("cleanup_generation_detach".to_string())
-                    .or_insert(0) += 1;
-                // Mutate only the stream captured at cleanup start. A replacement
-                // that attached during the Core turn keeps its adapter.
-                let owned_stream = identity.as_ref().is_some_and(|identity| {
-                    state
-                        .pending_runtime
-                        .stream_matches(&session_id, &subscription_id, identity)
-                });
-                if owned_stream {
-                    let identity = identity.as_ref().expect("checked above");
-                    let was_bound = state
-                        .pending_runtime
-                        .is_adapter_bound(&session_id, &subscription_id);
-                    let _ = state.pending_runtime.close_adapter_if(
-                        &session_id,
-                        &subscription_id,
-                        identity,
-                    );
-                    let _ = state.pending_runtime.cancel_stream_if(
-                        &session_id,
-                        &subscription_id,
-                        identity,
-                    );
-                    if was_bound {
-                        bound_closes += 1;
-                    }
-                } else if state
-                    .pending_runtime
-                    .stream_identity(&session_id, &subscription_id)
-                    .is_some()
-                {
-                    // A replacement owns the route key now; its live attach
-                    // record stays untouched.
-                    continue;
-                }
-                record_attached_subscription_change(
-                    &mut state.pending_runtime,
-                    &mut state.attach_close,
-                    &mut state.lifecycle_counters,
-                    Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
-                        session_id,
-                        subscription_id,
-                    })),
-                    None,
-                );
-            }
-            if bound_closes > 0 {
+    let capture_owner = CaptureOwner(format!("client:{}", cleanup.client_id));
+    retain_route_cleanup(
+        state,
+        permit,
+        "unix_connection_cleanup",
+        Some(capture_owner),
+        candidates,
+        now,
+        |state, applied| {
+            if applied.bound_closes > 0 {
                 *state
                     .lifecycle_counters
                     .cleanup_by_reason
                     .entry("bound_adapter_close".to_string())
-                    .or_insert(0) += bound_closes;
+                    .or_insert(0) += applied.bound_closes;
             }
-            if failed {
-                // `connection_cleanup_ignores_only_an_already_removed_session` is the
-                // designated positive control for predicate-true cleanup failures.
+            if applied.failed {
+                // `connection_cleanup_ignores_only_an_already_removed_session`
+                // is the designated positive control for predicate-true
+                // cleanup failures.
                 state.lifecycle_counters.cleanup_failed =
                     state.lifecycle_counters.cleanup_failed.saturating_add(1);
             } else {
                 state.lifecycle_counters.cleanup_completed =
                     state.lifecycle_counters.cleanup_completed.saturating_add(1);
             }
-            true
-        }));
-}
-
-/// One Core owner turn that detaches every candidate route the closed
-/// connection owned. Built as a value so a refused admission can resubmit.
-fn cleanup_core_turn(
-    owners: Vec<CleanupCandidate>,
-    client_id: String,
-    now: u64,
-) -> impl FnOnce(&mut botster_core_daemon::CoreDaemon) -> Vec<CleanupRouteReport> + Send + 'static {
-    move |daemon| {
-        let inventory = daemon.list_terminal_subscriptions();
-        let mut outcomes = Vec::with_capacity(owners.len());
-        for (session_id, subscription_id, identity) in owners {
-            let generation =
-                live_generation_for_route(&inventory, &client_id, &session_id, &subscription_id);
-            let foreign_core_owner = inventory.iter().any(|row| {
-                row.session_id.0 == session_id
-                    && row.subscription_id.0 == subscription_id
-                    && row.client_id.0 != client_id
-            });
-            let foreign_stream_owner = identity
-                .as_ref()
-                .is_some_and(|identity| identity.client_id != client_id);
-            let outcome = match generation {
-                None if foreign_core_owner || foreign_stream_owner => CleanupRouteOutcome::Foreign,
-                None => CleanupRouteOutcome::NoGeneration,
-                Some(generation) => match daemon.detach_terminal_subscription(
-                    ClientId(client_id.clone()),
-                    SessionId(session_id.clone()),
-                    SubscriptionId(subscription_id.clone()),
-                    generation,
-                    now,
-                ) {
-                    Ok(
-                        DetachTerminalSubscriptionResult::Detached { .. }
-                        | DetachTerminalSubscriptionResult::AlreadyGone
-                        | DetachTerminalSubscriptionResult::GenerationMismatch { .. },
-                    ) => CleanupRouteOutcome::Detached,
-                    Err(_) => CleanupRouteOutcome::DetachFailed,
-                },
-            };
-            outcomes.push((session_id, subscription_id, identity, outcome));
-        }
-        outcomes
-    }
-}
-
-/// One route the closed connection may own, with the attachment identity
-/// captured when cleanup started.
-type CleanupCandidate = (String, String, Option<AttachmentIdentity>);
-
-/// One candidate with its Core-turn outcome.
-type CleanupRouteReport = (
-    String,
-    String,
-    Option<AttachmentIdentity>,
-    CleanupRouteOutcome,
-);
-
-/// Per-route result of one connection cleanup turn on the Core owner thread.
-enum CleanupRouteOutcome {
-    /// Another client or stream owns the route; leave it alone.
-    Foreign,
-    /// No live generation existed; record the detach without Core work.
-    NoGeneration,
-    Detached,
-    DetachFailed,
+        },
+    );
 }
 
 #[cfg(test)]

@@ -13,14 +13,18 @@ use crate::HubDaemon;
 use crate::client_api_dto::response::{
     daemon_local_webrtc_answer, daemon_local_webrtc_bootstrap, daemon_response_base,
 };
-use crate::daemon::control::DaemonObservability;
 use crate::daemon::control::message::{ControlMessage, ControlSender};
-use crate::daemon::control::pending::{ControlPoll, ControlStep};
+use crate::daemon::control::pending::retire_abandoned_requests;
+use crate::daemon::control::runtime_client_id;
+use crate::daemon::owner_loop::tick;
 use crate::daemon::error::{DaemonTransportResult, local_webrtc_bootstrap_issue_error};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon_projection::app_local_url;
 use crate::subscription::attach_routes::{
     AttachedSubscription, AttachedSubscriptionChange, record_attached_subscription_change,
+};
+use crate::subscription::route_cleanup::{
+    CleanupCandidate, candidate_from_registry, retain_route_cleanup,
 };
 use crate::transport::webrtc::{
     LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES, LocalWebrtcAttachedSubscription,
@@ -67,40 +71,6 @@ fn persist_local_webrtc_terminal_record(
         return Err(error);
     }
     Ok(())
-}
-
-/// Detach every subscription a closed peer still owned. Each detach runs
-/// through the session family; Core-bound steps continue as owner work and
-/// their responses are dropped because no peer waits for them.
-fn detach_local_webrtc_subscriptions(
-    daemon: &mut HubDaemon,
-    state: &mut DaemonControlState,
-    attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
-) {
-    for subscription in attached_subscriptions {
-        let observability = DaemonObservability {
-            egress: Vec::new(),
-            lifecycle: state.lifecycle_counters.clone(),
-            client_id: None,
-            grant_id: None,
-        };
-        let step = crate::daemon::control::sessions::handle_runtime(
-            daemon,
-            state,
-            observability,
-            DaemonRequest::Detach {
-                session_id: subscription.session_id,
-                subscription_id: subscription.subscription_id,
-            },
-        );
-        if let ControlStep::Pending(mut continuation) = step {
-            state
-                .pending_owner_work
-                .push(Box::new(move |daemon, state| {
-                    !matches!(continuation(daemon, state), ControlPoll::Pending)
-                }));
-        }
-    }
 }
 
 fn issue_local_webrtc_bootstrap_response(
@@ -333,6 +303,24 @@ pub(crate) fn handle_peer_closed(
         .collect();
     // Occupancy set is the counter source of truth. PeerClosed must release
     // live_attach_routes here so a replacement Attach can become live.
+    // Capture Core ownership, stream identity, and generation for every route
+    // before the synchronous bookkeeping below mutates the registry. The
+    // obligation detaches these in Core after the peer is gone.
+    let candidates: Vec<CleanupCandidate> = detach_list
+        .iter()
+        .map(|subscription| {
+            let fallback = runtime_client_id(&DaemonRequest::Detach {
+                session_id: subscription.session_id.clone(),
+                subscription_id: subscription.subscription_id.clone(),
+            });
+            candidate_from_registry(
+                &state.pending_runtime,
+                &fallback,
+                &subscription.session_id,
+                &subscription.subscription_id,
+            )
+        })
+        .collect();
     for subscription in &detach_list {
         record_attached_subscription_change(
             &mut state.pending_runtime,
@@ -346,15 +334,12 @@ pub(crate) fn handle_peer_closed(
         );
     }
     let mut bound_detach = Vec::new();
-    let mut unbound_detach = Vec::new();
     for subscription in detach_list {
         if state
             .pending_runtime
             .is_adapter_bound(&subscription.session_id, &subscription.subscription_id)
         {
             bound_detach.push(subscription);
-        } else {
-            unbound_detach.push(subscription);
         }
     }
     if !bound_detach.is_empty() {
@@ -428,6 +413,32 @@ pub(crate) fn handle_peer_closed(
         .attach_owner_grant_ids
         .retain(|_, owner| !removed_grants.contains(owner.as_str()));
     let _ = control_tx;
-    detach_local_webrtc_subscriptions(daemon, state, unbound_detach);
+    retire_abandoned_requests(state, &grant_id);
+    // The permit reserved at peer admission carries the Core cleanup. A peer
+    // rejected for budget reasons reserved nothing and owns nothing in Core.
+    let permit = state.budget.take_peer_permit(&grant_id);
+    match (permit, candidates.is_empty(), daemon.runtime().is_some()) {
+        (Some(permit), true, _) | (Some(permit), _, false) => state.budget.release(permit),
+        (None, true, _) | (None, _, false) => {}
+        (permit, false, true) => {
+            let permit =
+                permit.unwrap_or_else(|| state.budget.take_peer_permit_or_force(&grant_id));
+            let now = tick(&mut state.logical_clock);
+            retain_route_cleanup(
+                state,
+                permit,
+                "webrtc_peer_cleanup",
+                None,
+                candidates,
+                now,
+                |state, applied| {
+                    if applied.failed {
+                        state.lifecycle_counters.cleanup_failed =
+                            state.lifecycle_counters.cleanup_failed.saturating_add(1);
+                    }
+                },
+            );
+        }
+    }
     false
 }

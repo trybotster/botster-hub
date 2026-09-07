@@ -165,6 +165,17 @@ impl AttachStreamRegistry {
         self.stream_identity(session_id, subscription_id).as_ref() == Some(identity)
     }
 
+    /// Streams one owner holds: by grant for WebRTC, by client otherwise.
+    pub(crate) fn stream_count_for_owner(&self, owner: &AttachStreamOwner) -> usize {
+        self.streams
+            .values()
+            .filter(|stream| match owner.grant_id.as_deref() {
+                Some(grant_id) => stream.owner.grant_id.as_deref() == Some(grant_id),
+                None => stream.owner.client_id == owner.client_id,
+            })
+            .count()
+    }
+
     /// Streams one client owns that never bound an adapter. Cleanup cancels
     /// them before the Core turn so a late completion sees the mismatch.
     pub(crate) fn unbound_routes_for_client(

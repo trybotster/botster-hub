@@ -17,7 +17,8 @@ use crate::admission::unix_hello::{
 use crate::daemon::control::message::{
     BindReservedError, BoundSubscription, ControlMessage, ReservationInspectReply,
 };
-use crate::daemon::control::sessions::schedule_exact_generation_detach;
+use crate::daemon::owner_budget::{CoreWorkPoll, OWNER_BUDGET_EXHAUSTED, ObligationPoll, drive_core_slot};
+use crate::data_plane::driver::CoreTicket;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_loop::tick;
 use crate::data_plane::driver::CoreTicketPoll;
@@ -137,6 +138,29 @@ fn register_webrtc_admission(
             | WebrtcTerminalAdmission::Rejected {
                 peer_generation, ..
             } => *peer_generation = generation,
+        }
+        if !state.budget.reserve_peer(&grant_id) {
+            let (mux, peer_generation) = match &admission {
+                WebrtcTerminalAdmission::Admitted {
+                    mux,
+                    peer_generation,
+                    ..
+                }
+                | WebrtcTerminalAdmission::Rejected {
+                    mux,
+                    peer_generation,
+                    ..
+                } => (mux.clone(), *peer_generation),
+            };
+            admission = WebrtcTerminalAdmission::Rejected {
+                code: OWNER_BUDGET_EXHAUSTED,
+                diagnostic: botster_hub_client::DaemonDiagnostic::action_failure(
+                    "webrtc_admission",
+                    "the daemon holds its maximum retained connections and cleanup",
+                ),
+                mux,
+                peer_generation,
+            };
         }
         let mut budget = crate::admission::connection_budget::ConnectionBudget::default();
         let _ = budget.reserve("control".to_string(), ChannelClass::Control);
@@ -396,6 +420,13 @@ fn bind_reserved_subscription(
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
     };
+    // The bind holds one budget permit from here until the adapter is bound
+    // and delivered, or until the exact generation it created is released.
+    let Some(permit) = state.budget.reserve(format!("bind:{label}")) else {
+        retire_reserved_subscription(daemon, state, &grant_id, &label);
+        let _ = reply_tx.send(Err(BindReservedError::OverLimit));
+        return false;
+    };
     let bind_now = tick(&mut state.logical_clock);
     let generation = botster_core::TerminalSubscriptionGeneration(reservation.generation);
     let (adapter, handle) = mux.create_adapter_with_aggregate(aggregate);
@@ -414,22 +445,50 @@ fn bind_reserved_subscription(
     let subscription_id = reservation.subscription_id.clone();
     let mut reply_tx = Some(reply_tx);
     let mut usage = Some(usage);
+    // Phase two of the obligation: release exactly the generation this bind
+    // created when the bind turned out stale or undeliverable.
+    let mut stale_generation: Option<botster_core::TerminalSubscriptionGeneration> = None;
+    let mut detach_slot: Option<
+        CoreTicket<
+            Result<
+                botster_core_daemon::DetachTerminalSubscriptionResult,
+                botster_core_daemon::CoreDaemonError,
+            >,
+        >,
+    > = None;
     state
-        .pending_owner_work
-        .push(Box::new(move |daemon, state| {
+        .budget
+        .retain(permit, "reserved_bind", move |daemon, state| {
+            if let Some(stale) = stale_generation {
+                return match drive_core_slot(&mut detach_slot, daemon, state, |runtime, state| {
+                    let now = tick(&mut state.logical_clock);
+                    runtime.detach_terminal_subscription(
+                        botster_core::ClientId(client_id.clone()),
+                        botster_core::SessionId(session_id.clone()),
+                        botster_core::SubscriptionId(subscription_id.clone()),
+                        stale,
+                        now,
+                    )
+                }) {
+                    CoreWorkPoll::Pending => ObligationPoll::Pending,
+                    CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
+                };
+            }
             let bound = match ticket.poll() {
-                CoreTicketPoll::Pending => return false,
+                CoreTicketPoll::Pending => return ObligationPoll::Pending,
+                // The adapter moved into the bind plan; a refused or lost
+                // admission created nothing in Core and cannot be resubmitted.
                 CoreTicketPoll::Lost | CoreTicketPoll::Refused => false,
                 CoreTicketPoll::Ready(result) => result.is_ok(),
             };
             let (Some(reply_tx), Some(usage)) = (reply_tx.take(), usage.take()) else {
-                return true;
+                return ObligationPoll::Done;
             };
             if !bound {
                 handle.close();
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
                 let _ = reply_tx.send(Err(BindReservedError::BindFailed));
-                return true;
+                return ObligationPoll::Done;
             }
             // The adapter is bound in Core. Fence every owner-side mutation
             // on the attachment identity and on the reservation still being
@@ -447,16 +506,10 @@ fn bind_reserved_subscription(
                     .is_some();
             if !reservation_bound {
                 handle.close();
-                schedule_exact_generation_detach(
-                    state,
-                    client_id.clone(),
-                    session_id.clone(),
-                    subscription_id.clone(),
-                    generation,
-                );
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
                 let _ = reply_tx.send(Err(BindReservedError::BindFailed));
-                return true;
+                stale_generation = Some(generation);
+                return ObligationPoll::Pending;
             }
             let registered = state.pending_runtime.mark_adapter_bound_if(
                 &session_id,
@@ -486,17 +539,12 @@ fn bind_reserved_subscription(
                     &subscription_id,
                     &identity,
                 );
-                schedule_exact_generation_detach(
-                    state,
-                    client_id.clone(),
-                    session_id.clone(),
-                    subscription_id.clone(),
-                    generation,
-                );
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
+                stale_generation = Some(generation);
+                return ObligationPoll::Pending;
             }
-            true
-        }));
+            ObligationPoll::Done
+        });
     false
 }
 
