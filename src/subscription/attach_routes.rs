@@ -288,24 +288,32 @@ impl AttachStreamRegistry {
         if removed.is_empty() {
             return BTreeMap::new();
         }
-        let mut keys = snapshot.clone();
+        // Each key keeps the grant it is already known to belong to: a
+        // route-set entry belongs to that grant, a stream to its owner. A
+        // snapshot key carries no attribution of its own.
+        let mut keys: BTreeMap<(String, String), Option<String>> = snapshot
+            .iter()
+            .map(|key| (key.clone(), None))
+            .collect();
         for grant in removed {
             if let Some(routes) = self.owner_routes.get(grant) {
-                keys.extend(routes.iter().cloned());
+                for key in routes {
+                    keys.insert(key.clone(), Some(grant.clone()));
+                }
             }
         }
         for (key, stream) in &self.streams {
-            if stream
+            if let Some(grant) = stream
                 .owner
                 .grant_id
                 .as_ref()
-                .is_some_and(|grant| removed.contains(grant))
+                .filter(|grant| removed.contains(*grant))
             {
-                keys.insert(key.clone());
+                keys.insert(key.clone(), Some(grant.clone()));
             }
         }
         let mut departing: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
-        for key in keys {
+        for (key, known_owner) in keys {
             let grant = match self.streams.get(&key) {
                 Some(stream) => match stream.owner.grant_id.as_deref() {
                     Some(grant) if removed.contains(grant) => grant.to_string(),
@@ -316,10 +324,11 @@ impl AttachStreamRegistry {
                     .get(&key)
                     .filter(|grant| removed.contains(grant.as_str()))
                     .cloned()
+                    .or(known_owner)
                 {
                     Some(grant) => grant,
-                    // A streamless snapshot key falls back to the primary
-                    // only when the primary itself is being cleaned.
+                    // An unattributed streamless snapshot key falls back to
+                    // the primary only when the primary is being cleaned.
                     None if removed.contains(primary) => primary.to_string(),
                     None => continue,
                 },
@@ -1433,6 +1442,27 @@ mod tests {
             registry
                 .departing_routes_for_grants(&sibling, "grant-old", &snapshot)
                 .is_empty()
+        );
+    }
+
+    /// A sibling grant's reserved key with no stream and no index entry
+    /// stays attributed to the sibling when only the sibling is cleaned.
+    #[test]
+    fn sibling_route_set_entry_keeps_its_owner() {
+        let mut registry = AttachStreamRegistry::default();
+        assert_eq!(
+            registry.reserve_route("grant-sibling", "s", "k", 4),
+            RouteReservation::Inserted
+        );
+        let cleaning: BTreeSet<String> = ["grant-sibling".to_string()].into_iter().collect();
+        let empty: BTreeSet<(String, String)> = BTreeSet::new();
+        let departing = registry.departing_routes_for_grants(&cleaning, "grant-old", &empty);
+        assert_eq!(departing.len(), 1);
+        assert!(
+            departing
+                .get("grant-sibling")
+                .is_some_and(|keys| keys.contains(&("s".to_string(), "k".to_string()))),
+            "the sibling's own route-set key keeps its attribution"
         );
     }
 
