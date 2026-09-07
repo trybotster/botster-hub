@@ -226,6 +226,7 @@ pub struct PumpScheduler {
     next: PumpPhase,
     pub close_cursor: PumpAdmissionCursor,
     pub reconcile_after: Option<(String, String)>,
+    inventory_reconcile_again: bool,
 }
 
 impl Default for PumpScheduler {
@@ -234,6 +235,7 @@ impl Default for PumpScheduler {
             next: PumpPhase::Observe,
             close_cursor: PumpAdmissionCursor::default(),
             reconcile_after: None,
+            inventory_reconcile_again: false,
         }
     }
 }
@@ -246,8 +248,16 @@ impl PumpScheduler {
         phase
     }
 
+    pub(crate) fn note_inventory_change_during_reconcile(&mut self, active: bool) {
+        self.inventory_reconcile_again |= active;
+    }
+
+    pub(crate) fn take_inventory_reconcile_again(&mut self) -> bool {
+        std::mem::take(&mut self.inventory_reconcile_again)
+    }
+
     #[cfg(test)]
-    fn force_next(&mut self, phase: PumpPhase) {
+    pub(crate) fn force_next(&mut self, phase: PumpPhase) {
         self.next = phase;
     }
 }

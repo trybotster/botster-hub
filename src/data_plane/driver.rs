@@ -36,6 +36,9 @@ pub(crate) const CORE_REQUEST_CAPACITY: usize = 64;
 const CORE_REQUESTS_PER_TURN: usize = CORE_REQUEST_CAPACITY;
 const STOP_ACTION_SHUTDOWN: u8 = 0;
 const STOP_ACTION_RELEASE_FOR_RESTART: u8 = 1;
+const DATA_PLANE_PROGRESS: u8 = 1 << 0;
+const DATA_PLANE_JOURNAL_ADVANCED: u8 = 1 << 1;
+const DATA_PLANE_TERMINAL_INVENTORY_CHANGED: u8 = 1 << 2;
 
 pub(crate) const DATA_PLANE_DRIVER_STOP_TIMEOUT: &str = "data_plane_driver_stop_timeout";
 
@@ -45,6 +48,54 @@ pub(crate) struct DataPlaneDriver {
     done: Receiver<()>,
     thread: Option<JoinHandle<()>>,
     owner_wake: Arc<Mutex<Option<ControlSender>>>,
+    progress_latch: Arc<DataPlaneProgressLatch>,
+}
+
+/// Coalesced data-plane facts. The producer sets each bit before its
+/// best-effort doorbell, and the owner clears the bits only after reading them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DataPlaneProgress {
+    pub(crate) progressed: bool,
+    pub(crate) journal_advanced: bool,
+    pub(crate) terminal_inventory_changed: bool,
+}
+
+#[derive(Debug, Default)]
+struct DataPlaneProgressLatch {
+    bits: AtomicU8,
+}
+
+impl DataPlaneProgressLatch {
+    fn publish(&self, progress: DataPlaneProgress, owner_wake: &Mutex<Option<ControlSender>>) {
+        let mut bits = 0;
+        if progress.progressed {
+            bits |= DATA_PLANE_PROGRESS;
+        }
+        if progress.journal_advanced {
+            bits |= DATA_PLANE_JOURNAL_ADVANCED;
+        }
+        if progress.terminal_inventory_changed {
+            bits |= DATA_PLANE_TERMINAL_INVENTORY_CHANGED;
+        }
+        if bits == 0 {
+            return;
+        }
+        self.bits.fetch_or(bits, Ordering::Release);
+        if let Ok(slot) = owner_wake.lock()
+            && let Some(sender) = slot.as_ref()
+        {
+            let _ = sender.try_send(ControlMessage::DataPlaneProgress);
+        }
+    }
+
+    fn take(&self) -> DataPlaneProgress {
+        let bits = self.bits.swap(0, Ordering::AcqRel);
+        DataPlaneProgress {
+            progressed: bits & DATA_PLANE_PROGRESS != 0,
+            journal_advanced: bits & DATA_PLANE_JOURNAL_ADVANCED != 0,
+            terminal_inventory_changed: bits & DATA_PLANE_TERMINAL_INVENTORY_CHANGED != 0,
+        }
+    }
 }
 
 type CoreRequest = Box<dyn FnOnce(&mut CoreDaemon) + Send + 'static>;
@@ -273,6 +324,8 @@ impl DataPlaneDriver {
         let thread_stop_action = Arc::clone(&stop_action);
         let owner_wake = Arc::new(Mutex::new(None));
         let thread_owner_wake = Arc::clone(&owner_wake);
+        let progress_latch = Arc::new(DataPlaneProgressLatch::default());
+        let thread_progress_latch = Arc::clone(&progress_latch);
         let thread = std::thread::Builder::new()
             .name("botster-hub-data-plane".to_string())
             .spawn(move || {
@@ -285,6 +338,7 @@ impl DataPlaneDriver {
                     completion_tx,
                     close_work,
                     thread_owner_wake,
+                    thread_progress_latch,
                     thread_request_pending,
                     thread_owner_waiting,
                 );
@@ -310,6 +364,7 @@ impl DataPlaneDriver {
             done: done_rx,
             thread: Some(thread),
             owner_wake,
+            progress_latch,
         };
         (
             driver,
@@ -324,6 +379,10 @@ impl DataPlaneDriver {
         if let Ok(mut slot) = self.owner_wake.lock() {
             *slot = Some(sender);
         }
+    }
+
+    pub(crate) fn take_progress(&self) -> DataPlaneProgress {
+        self.progress_latch.take()
     }
 
     pub(crate) fn stop_and_join(&mut self, release_for_restart: bool) -> Result<(), &'static str> {
@@ -375,6 +434,7 @@ fn run_loop(
     completions: mpsc::Sender<CoreCompletion>,
     close_work: CloseWorkSource,
     owner_wake: Arc<Mutex<Option<ControlSender>>>,
+    progress_latch: Arc<DataPlaneProgressLatch>,
     request_pending: Arc<AtomicBool>,
     owner_waiting: Arc<AtomicBool>,
 ) {
@@ -401,10 +461,12 @@ fn run_loop(
         };
         let now_seconds = current_unix_seconds();
         let mut progress = false;
+        let mut terminal_inventory_changed = false;
         if let Some(batch) = batch
-            && core_daemon.pump_woken(&batch, now_seconds).is_ok()
+            && let Ok(outcome) = core_daemon.pump_woken(&batch, now_seconds)
         {
-            progress |= !batch.adapter_routes.is_empty() || !batch.ingress_sessions.is_empty();
+            progress |= outcome.pumped_routes > 0 || !batch.ingress_sessions.is_empty();
+            terminal_inventory_changed |= outcome.terminal_inventory_changed;
         }
         progress |= run_core_requests(core_daemon, &requests) > 0;
         progress |= publish_completions(core_daemon, &completions);
@@ -424,12 +486,14 @@ fn run_loop(
             }
         }
         let journal_advanced = core_daemon.take_journal_advanced_wake();
-        if (progress || journal_advanced)
-            && let Ok(slot) = owner_wake.lock()
-            && let Some(sender) = slot.as_ref()
-        {
-            let _ = sender.try_send(ControlMessage::DataPlaneProgress { journal_advanced });
-        }
+        progress_latch.publish(
+            DataPlaneProgress {
+                progressed: progress,
+                journal_advanced,
+                terminal_inventory_changed,
+            },
+            &owner_wake,
+        );
     }
     for request in requests.try_iter().take(CORE_REQUEST_CAPACITY) {
         request(core_daemon);
@@ -475,6 +539,76 @@ mod tests {
 
     fn noop_request() -> CoreRequest {
         Box::new(|_| {})
+    }
+
+    #[test]
+    fn progress_latch_preserves_coalesced_inventory_when_the_doorbell_queue_is_full() {
+        let latch = DataPlaneProgressLatch::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(ControlMessage::RejectedConnection)
+            .expect("fill owner doorbell queue");
+        let owner_wake = Mutex::new(Some(sender));
+
+        latch.publish(
+            DataPlaneProgress {
+                progressed: true,
+                journal_advanced: false,
+                terminal_inventory_changed: true,
+            },
+            &owner_wake,
+        );
+        latch.publish(
+            DataPlaneProgress {
+                progressed: false,
+                journal_advanced: true,
+                terminal_inventory_changed: true,
+            },
+            &owner_wake,
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::RejectedConnection)
+        ));
+        assert_eq!(
+            latch.take(),
+            DataPlaneProgress {
+                progressed: true,
+                journal_advanced: true,
+                terminal_inventory_changed: true,
+            }
+        );
+        assert_eq!(latch.take(), DataPlaneProgress::default());
+
+        latch.publish(
+            DataPlaneProgress {
+                progressed: false,
+                journal_advanced: false,
+                terminal_inventory_changed: true,
+            },
+            &owner_wake,
+        );
+        latch.publish(
+            DataPlaneProgress {
+                progressed: true,
+                journal_advanced: true,
+                terminal_inventory_changed: false,
+            },
+            &owner_wake,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::DataPlaneProgress)
+        ));
+        assert_eq!(
+            latch.take(),
+            DataPlaneProgress {
+                progressed: true,
+                journal_advanced: true,
+                terminal_inventory_changed: true,
+            }
+        );
     }
 
     #[test]

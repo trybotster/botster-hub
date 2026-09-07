@@ -3872,6 +3872,13 @@ impl HubRuntime {
         }
     }
 
+    pub(crate) fn take_data_plane_progress(&self) -> crate::data_plane::driver::DataPlaneProgress {
+        self.data_plane
+            .as_ref()
+            .map(crate::data_plane::driver::DataPlaneDriver::take_progress)
+            .unwrap_or_default()
+    }
+
     /// Control-plane terminal subscription inventory. No terminal bodies.
     #[must_use]
     pub fn list_terminal_subscriptions(&self) -> CoreTicket<Vec<TerminalSubscriptionRecord>> {
