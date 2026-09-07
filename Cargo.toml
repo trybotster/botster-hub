@@ -45,7 +45,14 @@ getrandom = "0.3.4"
 keyring = "4.1.2"
 notify = "8.2.0"
 
+[features]
+# Test-only entry points over crate-private terminal binding mechanisms.
+# Enabled for this crate's own integration tests through the self
+# dev-dependency below; production builds never carry it.
+test-internals = []
+
 [dev-dependencies]
+botster-hub = { path = ".", features = ["test-internals"] }
 botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "a931125b027f5832845ae0365a8011d499f61ab6" }
 botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "a931125b027f5832845ae0365a8011d499f61ab6", features = ["libghostty-vt"] }
 botster-hub-test-support = { path = "crates/botster-hub-test-support" }

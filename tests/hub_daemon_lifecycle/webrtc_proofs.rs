@@ -864,7 +864,7 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             .terminal_reservation
             .as_ref()
             .expect("WebRTC Attach returns a reservation");
-        let reserved = offer_peer
+        let _reserved = offer_peer
             .open_reserved_terminal(
                 &stream_key,
                 &reservation.label,
@@ -878,20 +878,22 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
             )
             .await
             .expect("open reserved subscription channel");
-        LocalWebrtcOfferPeer::send_reserved_terminal_frame(
-            &reserved,
-            &stream_key,
-            &terminal_resize_frame_bytes(33, 111),
-        )
-        .await
-        .expect("resize through reserved channel");
-        LocalWebrtcOfferPeer::send_reserved_terminal_frame(
-            &reserved,
-            &stream_key,
-            &terminal_input_frame_bytes(b"from-local-webrtc\n"),
-        )
-        .await
-        .expect("input through reserved channel");
+        offer_peer
+            .send_terminal_input(
+                &stream_key,
+                &reservation.label,
+                &terminal_resize_frame_bytes(33, 111),
+            )
+            .await
+            .expect("resize through reserved channel");
+        offer_peer
+            .send_terminal_input(
+                &stream_key,
+                &reservation.label,
+                &terminal_input_frame_bytes(b"from-local-webrtc\n"),
+            )
+            .await
+            .expect("input through reserved channel");
 
         let mut observed = String::new();
         for _ in 0..120 {
@@ -908,10 +910,8 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
                 observed = body.text;
             }
             while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
-                if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
-                    && let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event
-                {
-                    observed.push_str(&live_output_utf8(payload));
+                if let Some(output) = terminal_body_output(&bytes) {
+                    observed.push_str(&live_output_utf8(&output));
                 }
             }
             if observed.contains("local-webrtc-ready") {
@@ -1639,20 +1639,16 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
     let closed_peer_drain = connection
         .request(&botster_hub_client::DaemonRequest::Status)
         .expect("drain closed WebRTC subscription");
-    let events_after_close = closed_peer_drain.events;
+    let occupancy_after_close = closed_peer_drain
+        .status
+        .as_ref()
+        .map(|status| status.live_attach_occupancy.clone())
+        .unwrap_or_default();
     assert!(
-        events_after_close.iter().all(|event| {
-            !matches!(
-                event,
-                botster_hub_client::DaemonEvent::TerminalOutput {
-                    subscription_id,
-                    payload,
-                    ..
-                } if subscription_id == "local-webrtc-drop-subscription"
-                    && live_output_contains(payload, "drop:after-webrtc-close")
-            )
-        }),
-        "closed WebRTC peer subscription must not receive later output: {events_after_close:?}"
+        occupancy_after_close
+            .iter()
+            .all(|row| row.subscription_id != "local-webrtc-drop-subscription"),
+        "closed WebRTC peer subscription must not stay attached: {occupancy_after_close:?}"
     );
 
     let shutdown_session = connection

@@ -94,6 +94,37 @@ impl PeerConnectionEventHandler for LocalWebrtcOffererHandler {
     }
 }
 
+/// One DataChannel message as the fixture received it.
+#[derive(Debug, Clone)]
+pub(crate) enum InboundMessage {
+    /// A control delivery chunk (JSON text).
+    Text(String),
+    /// A sealed terminal chunk on a reserved terminal channel.
+    Binary(Vec<u8>),
+}
+
+impl InboundMessage {
+    fn len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Binary(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// One complete delivery decoded by the fixture.
+#[derive(Debug)]
+pub(crate) enum FixtureDelivery {
+    /// A control-plane server frame.
+    Server(botster_hub_client::ServerFrame),
+    /// One plaintext terminal frame body from a reserved terminal channel.
+    Terminal {
+        generation: u64,
+        stream_epoch: u32,
+        body: Vec<u8>,
+    },
+}
+
 struct InboundReassembly {
     encrypted: String,
     delivery_kind: Option<botster_hub_client::DaemonLocalWebrtcDeliveryKind>,
@@ -101,6 +132,52 @@ struct InboundReassembly {
     expected_chunk_count: Option<u32>,
     maximum_frame_bytes: usize,
     next_chunk_index: u32,
+}
+
+/// Client-side reassembly of the binary terminal chunk stream on one channel.
+struct TerminalReassembly {
+    message_id: u64,
+    chunk_count: u32,
+    total_bytes: usize,
+    next_chunk_index: u32,
+    plaintext: Vec<u8>,
+    generation: u64,
+    stream_epoch: u32,
+    maximum_frame_bytes: usize,
+}
+
+/// Seal one input frame body into binary terminal chunks for a reserved channel.
+fn seal_terminal_chunks(
+    key: &AesGcmKey,
+    generation: u64,
+    body: &[u8],
+    message_id: u64,
+) -> Vec<Vec<u8>> {
+    const CHUNK_BYTES: usize = 12 * 1024;
+    assert!(!body.is_empty(), "terminal body must not be empty");
+    let total_bytes = u32::try_from(body.len()).expect("terminal body fits u32");
+    let chunk_count = u32::try_from(body.len().div_ceil(CHUNK_BYTES)).expect("chunk count");
+    body.chunks(CHUNK_BYTES)
+        .enumerate()
+        .map(|(chunk_index, slice)| {
+            let header = botster_hub_client::LocalWebrtcTerminalChunkHeader {
+                message_id,
+                chunk_index: chunk_index as u32,
+                chunk_count,
+                total_bytes,
+                generation,
+                stream_epoch: 0,
+            };
+            let mut message = Vec::with_capacity(
+                botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES
+                    + slice.len()
+                    + botster_core::AES_GCM_SEALED_OVERHEAD_BYTES,
+            );
+            message.extend_from_slice(&header.encode());
+            botster_core::seal_aes_gcm(key, slice, &mut message).expect("seal terminal chunk");
+            message
+        })
+        .collect()
 }
 
 pub(crate) struct FixtureQueueSnapshot {
@@ -270,40 +347,99 @@ where
 
 fn admit_inbound_frame(
     occupancy: &FixtureQueueOccupancy,
-    tx: &AsyncSender<String>,
-    text: String,
+    tx: &AsyncSender<InboundMessage>,
+    message: InboundMessage,
 ) -> Result<(), InboundAdmitError> {
-    let add_bytes = text.len() as u64;
+    let add_bytes = message.len() as u64;
     admit_inbound_frame_with_send(occupancy, add_bytes, || {
-        tx.try_send(text)
+        tx.try_send(message)
             .map_err(|_| InboundAdmitError::ChannelFull)
     })
 }
 
 struct WebrtcInboundMailbox {
-    rx: AsyncReceiver<String>,
+    rx: AsyncReceiver<InboundMessage>,
     occupancy: Arc<FixtureQueueOccupancy>,
     reassembly: Option<InboundReassembly>,
+    terminal: Option<TerminalReassembly>,
+    last_terminal_message_id: Option<u64>,
 }
 
 impl WebrtcInboundMailbox {
-    fn bounded(max_count: usize, max_bytes: usize) -> (AsyncSender<String>, Self) {
-        let (tx, rx) = channel::<String>(max_count);
+    fn bounded(max_count: usize, max_bytes: usize) -> (AsyncSender<InboundMessage>, Self) {
+        let (tx, rx) = channel::<InboundMessage>(max_count);
         (
             tx,
             Self {
                 rx,
                 occupancy: Arc::new(FixtureQueueOccupancy::new(max_count, max_bytes)),
                 reassembly: None,
+                terminal: None,
+                last_terminal_message_id: None,
             },
         )
     }
 
-    async fn recv_raw(&mut self, bound: Duration) -> Option<String> {
+    /// Apply one sealed terminal chunk; a complete message returns its plaintext.
+    fn apply_terminal_chunk(
+        &mut self,
+        key: &AesGcmKey,
+        message: &[u8],
+    ) -> Result<Option<TerminalReassembly>, Box<dyn std::error::Error>> {
+        let (header, sealed) = botster_hub_client::LocalWebrtcTerminalChunkHeader::decode(message)
+            .ok_or_else(|| std::io::Error::other("terminal chunk header failed to decode"))?;
+        if let Some(last) = self.last_terminal_message_id
+            && header.message_id <= last
+        {
+            return Err(std::io::Error::other("terminal message id did not advance").into());
+        }
+        let slice = botster_core::open_aes_gcm(key, sealed)?;
+        let row = match self.terminal.as_mut() {
+            None => {
+                if header.chunk_index != 0 {
+                    return Err(std::io::Error::other("terminal message began mid-stream").into());
+                }
+                self.terminal.insert(TerminalReassembly {
+                    message_id: header.message_id,
+                    chunk_count: header.chunk_count,
+                    total_bytes: header.total_bytes as usize,
+                    next_chunk_index: 0,
+                    plaintext: Vec::with_capacity(header.total_bytes as usize),
+                    generation: header.generation,
+                    stream_epoch: header.stream_epoch,
+                    maximum_frame_bytes: 0,
+                })
+            }
+            Some(row) => {
+                if row.message_id != header.message_id
+                    || row.chunk_count != header.chunk_count
+                    || row.total_bytes != header.total_bytes as usize
+                    || row.next_chunk_index != header.chunk_index
+                {
+                    return Err(std::io::Error::other("terminal chunk out of order").into());
+                }
+                row
+            }
+        };
+        row.maximum_frame_bytes = row.maximum_frame_bytes.max(message.len());
+        row.plaintext.extend_from_slice(&slice);
+        row.next_chunk_index += 1;
+        if row.next_chunk_index == row.chunk_count {
+            let finished = self.terminal.take().expect("assembling row");
+            if finished.plaintext.len() != finished.total_bytes {
+                return Err(std::io::Error::other("terminal message length mismatch").into());
+            }
+            self.last_terminal_message_id = Some(finished.message_id);
+            return Ok(Some(finished));
+        }
+        Ok(None)
+    }
+
+    async fn recv_raw(&mut self, bound: Duration) -> Option<InboundMessage> {
         match timeout(webrtc_runtime().as_ref(), bound, self.rx.recv()).await {
-            Ok(Some(text)) => {
-                self.occupancy.record_pop(text.len() as u64);
-                Some(text)
+            Ok(Some(message)) => {
+                self.occupancy.record_pop(message.len() as u64);
+                Some(message)
             }
             _ => None,
         }
@@ -312,25 +448,18 @@ impl WebrtcInboundMailbox {
     async fn receive_delivery(
         &mut self,
         key: &AesGcmKey,
-    ) -> Result<
-        (
-            botster_hub_client::DaemonLocalWebrtcDeliveryKind,
-            Vec<u8>,
-            LocalWebrtcResponseMetrics,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Result<(FixtureDelivery, LocalWebrtcResponseMetrics), Box<dyn std::error::Error>> {
         loop {
-            let response = match timeout(
+            let message = match timeout(
                 webrtc_runtime().as_ref(),
                 Duration::from_secs(10),
                 self.rx.recv(),
             )
             .await
             {
-                Ok(Some(response)) => {
-                    self.occupancy.record_pop(response.len() as u64);
-                    response
+                Ok(Some(message)) => {
+                    self.occupancy.record_pop(message.len() as u64);
+                    message
                 }
                 Ok(None) => {
                     let progress = self.reassembly.take();
@@ -348,7 +477,7 @@ impl WebrtcInboundMailbox {
                 Err(_) => {
                     let progress = self.reassembly.take();
                     return Err(local_webrtc_response_progress_error(
-                        "response_timeout",
+                        "timeout",
                         progress.as_ref().and_then(|row| row.message_id.as_deref()),
                         progress
                             .as_ref()
@@ -359,22 +488,41 @@ impl WebrtcInboundMailbox {
                     .into());
                 }
             };
-            if let Some(finished) = apply_inbound_chunk(&mut self.reassembly, &response)? {
-                let envelope_bytes = finished.encrypted.len();
-                let chunk_count = finished.expected_chunk_count.unwrap_or(0) as usize;
-                let envelope = serde_json::from_str::<AesGcmEnvelope>(&finished.encrypted)?;
-                let plaintext = decrypt_aes_gcm(key, &envelope)?;
-                return Ok((
-                    finished
-                        .delivery_kind
-                        .expect("complete delivery declares a kind"),
-                    plaintext,
-                    LocalWebrtcResponseMetrics {
-                        envelope_bytes,
-                        chunk_count,
-                        maximum_frame_bytes: finished.maximum_frame_bytes,
-                    },
-                ));
+            match message {
+                InboundMessage::Text(response) => {
+                    if let Some(finished) = apply_inbound_chunk(&mut self.reassembly, &response)? {
+                        let envelope_bytes = finished.encrypted.len();
+                        let chunk_count = finished.expected_chunk_count.unwrap_or(0) as usize;
+                        let envelope = serde_json::from_str::<AesGcmEnvelope>(&finished.encrypted)?;
+                        let plaintext = decrypt_aes_gcm(key, &envelope)?;
+                        let frame: botster_hub_client::ServerFrame =
+                            serde_json::from_slice(&plaintext)?;
+                        return Ok((
+                            FixtureDelivery::Server(frame),
+                            LocalWebrtcResponseMetrics {
+                                envelope_bytes,
+                                chunk_count,
+                                maximum_frame_bytes: finished.maximum_frame_bytes,
+                            },
+                        ));
+                    }
+                }
+                InboundMessage::Binary(bytes) => {
+                    if let Some(finished) = self.apply_terminal_chunk(key, &bytes)? {
+                        return Ok((
+                            FixtureDelivery::Terminal {
+                                generation: finished.generation,
+                                stream_epoch: finished.stream_epoch,
+                                body: finished.plaintext,
+                            },
+                            LocalWebrtcResponseMetrics {
+                                envelope_bytes: finished.total_bytes,
+                                chunk_count: finished.chunk_count as usize,
+                                maximum_frame_bytes: finished.maximum_frame_bytes,
+                            },
+                        ));
+                    }
+                }
             }
         }
     }
@@ -517,13 +665,20 @@ pub(crate) struct LocalWebrtcOfferPeer {
     subscription_labels: Vec<String>,
     pub(crate) subscription_receive_errors: Vec<(String, String)>,
     pub(crate) control_terminal_frame_count: u64,
+    request_ids: botster_hub_client::RequestIdSequence,
+    /// Attachment generation observed per reserved channel label.
+    route_generations: BTreeMap<String, u64>,
+    route_operation_ids: RouteOperationIds,
+    next_terminal_message_id: u64,
+    /// Label of the reserved channel that produced the last terminal delivery.
+    last_terminal_label: String,
 }
 
 pub(crate) struct ExtraWebrtcDataChannel {
     pub(crate) label: String,
     pub(crate) data_channel: Arc<dyn DataChannel>,
     inbound: WebrtcInboundMailbox,
-    pub(crate) messages: AsyncReceiver<String>,
+    pub(crate) messages: AsyncReceiver<InboundMessage>,
     pub(crate) closed: AsyncReceiver<()>,
     open_rx: AsyncReceiver<()>,
 }
@@ -543,14 +698,8 @@ impl ExtraWebrtcDataChannel {
                 Ok(Some(message)) => Some(message),
                 _ => self.inbound.recv_raw(Duration::from_millis(50)).await,
             };
-            let Some(message) = message else {
-                continue;
-            };
-            if let Ok(chunk) =
-                serde_json::from_str::<botster_hub_client::DaemonLocalWebrtcDeliveryChunk>(&message)
-                && chunk.delivery_kind
-                    == botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame
-            {
+            // Terminal data only ever travels as binary chunks.
+            if let Some(InboundMessage::Binary(_)) = message {
                 extra_terminal_frames += 1;
             }
         }
@@ -562,9 +711,9 @@ fn spawn_offerer_channel_poll(
     runtime: std::sync::Arc<dyn webrtc::runtime::Runtime>,
     data_channel: Arc<dyn DataChannel>,
     open_tx: AsyncSender<()>,
-    inbound_tx: AsyncSender<String>,
+    inbound_tx: AsyncSender<InboundMessage>,
     occupancy: Arc<FixtureQueueOccupancy>,
-    messages_tx: Option<AsyncSender<String>>,
+    messages_tx: Option<AsyncSender<InboundMessage>>,
     closed_tx: Option<AsyncSender<()>>,
 ) {
     runtime.spawn(Box::pin(async move {
@@ -574,12 +723,18 @@ fn spawn_offerer_channel_poll(
                     let _ = open_tx.try_send(());
                 }
                 DataChannelEvent::OnMessage(message) => {
-                    if let Ok(text) = String::from_utf8(message.data.to_vec()) {
-                        if let Some(messages_tx) = &messages_tx {
-                            let _ = messages_tx.try_send(text.clone());
+                    let inbound = if message.is_string {
+                        match String::from_utf8(message.data.to_vec()) {
+                            Ok(text) => InboundMessage::Text(text),
+                            Err(_) => continue,
                         }
-                        let _ = admit_inbound_frame(&occupancy, &inbound_tx, text);
+                    } else {
+                        InboundMessage::Binary(message.data.to_vec())
+                    };
+                    if let Some(messages_tx) = &messages_tx {
+                        let _ = messages_tx.try_send(inbound.clone());
                     }
+                    let _ = admit_inbound_frame(&occupancy, &inbound_tx, InboundMessage::Text(inbound));
                 }
                 DataChannelEvent::OnClose => {
                     if let Some(closed_tx) = &closed_tx {
@@ -660,7 +815,7 @@ impl LocalWebrtcOfferPeer {
 
         let extra_channel = if with_extra {
             let (open_tx, open_rx) = channel::<()>(1);
-            let (message_tx, message_rx) = channel::<String>(256);
+            let (message_tx, message_rx) = channel::<InboundMessage>(256);
             let (closed_tx, closed_rx) = channel::<()>(1);
             let (inbound_tx, inbound) =
                 WebrtcInboundMailbox::bounded(WEBRTC_INBOUND_MAX_FRAMES, WEBRTC_INBOUND_MAX_BYTES);
@@ -727,6 +882,11 @@ impl LocalWebrtcOfferPeer {
                 subscription_labels: Vec::new(),
                 subscription_receive_errors: Vec::new(),
                 control_terminal_frame_count: 0,
+                request_ids: botster_hub_client::RequestIdSequence::new(),
+                route_generations: BTreeMap::new(),
+                route_operation_ids: RouteOperationIds::default(),
+                next_terminal_message_id: 1,
+                last_terminal_label: String::new(),
             },
             extra_channel,
             offer,
@@ -804,7 +964,7 @@ impl LocalWebrtcOfferPeer {
         &mut self,
         incoming: ExtraWebrtcDataChannel,
     ) -> ExtraWebrtcDataChannel {
-        let (_unused_messages_tx, unused_messages) = channel::<String>(1);
+        let (_unused_messages_tx, unused_messages) = channel::<InboundMessage>(1);
         let (_unused_closed_tx, unused_closed) = channel::<()>(1);
         let (_unused_open_tx, unused_open) = channel::<()>(1);
         let rejected = ExtraWebrtcDataChannel {
@@ -864,17 +1024,33 @@ impl LocalWebrtcOfferPeer {
         ),
         Box<dyn std::error::Error>,
     > {
-        let plaintext = serde_json::to_vec(request)?;
+        let request_id = self.request_ids.next().to_string();
+        let frame = botster_hub_client::ClientFrame::Request {
+            request_id: request_id.clone(),
+            request: request.clone(),
+        };
+        let plaintext = serde_json::to_vec(&frame)?;
         let envelope = encrypt_aes_gcm(key, &plaintext, 1)?;
         self.data_channel
             .send_text(&serde_json::to_string(&envelope)?)
             .await?;
         loop {
-            let (delivery_kind, plaintext, metrics) = self.receive_delivery(key).await?;
-            match delivery_kind {
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
-                    let response: botster_hub_client::DaemonResponse =
-                        serde_json::from_slice(&plaintext)?;
+            let (delivery, metrics) = self.receive_delivery(key).await?;
+            match delivery {
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Response {
+                    request_id: answered,
+                    response,
+                }) => {
+                    if answered != request_id {
+                        return Err(std::io::Error::other(format!(
+                            "response {answered} does not correlate with request {request_id}"
+                        ))
+                        .into());
+                    }
+                    if let Some(reservation) = response.terminal_reservation.as_ref() {
+                        self.route_generations
+                            .insert(reservation.label.clone(), reservation.generation);
+                    }
                     if let Some(reservation) = response.subscription_reservation.as_ref() {
                         let compatibility = match reservation.kind {
                             botster_hub_client::DaemonSubscriptionReservationKind::Entity => {
@@ -894,17 +1070,24 @@ impl LocalWebrtcOfferPeer {
                     }
                     return Ok((response, metrics));
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
-                    self.pending_entity_frames
-                        .push_back(serde_json::from_slice(&plaintext)?);
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Entity { entity }) => {
+                    self.pending_entity_frames.push_back(entity);
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Event { event }) => {
+                    self.park_or_reject_host_event(&event)?;
+                }
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Close { reason }) => {
+                    return Err(std::io::Error::other(format!(
+                        "hub closed the control channel: {reason:?}"
+                    ))
+                    .into());
+                }
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::HelloAck { .. }) => {
+                    return Err(std::io::Error::other("unexpected hello ack").into());
+                }
+                FixtureDelivery::Terminal { body, .. } => {
                     self.control_terminal_frame_count += 1;
-                    self.pending_terminal_frames
-                        .push_back((String::new(), plaintext));
-                }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
-                    self.park_or_reject_host_event(&plaintext)?;
+                    self.pending_terminal_frames.push_back((String::new(), body));
                 }
             }
         }
@@ -918,28 +1101,33 @@ impl LocalWebrtcOfferPeer {
             return Ok(frame);
         }
         loop {
-            let (delivery_kind, plaintext, _) = if self.subscription_inbounds.is_empty() {
+            let (delivery, _) = if self.subscription_inbounds.is_empty() {
                 self.receive_delivery(key).await?
             } else {
                 self.receive_subscription_delivery(key).await?
             };
-            match delivery_kind {
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
-                    return Ok(serde_json::from_slice(&plaintext)?);
+            match delivery {
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Entity { entity }) => {
+                    return Ok(entity);
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Response { .. }) => {
                     return Err(std::io::Error::other(
                         "received uncorrelated daemon response while waiting for entity frame",
                     )
                     .into());
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
-                    self.control_terminal_frame_count += 1;
-                    self.pending_terminal_frames
-                        .push_back((String::new(), plaintext));
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Event { event }) => {
+                    self.park_or_reject_host_event(&event)?;
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
-                    self.park_or_reject_host_event(&plaintext)?;
+                FixtureDelivery::Server(other) => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected server frame while waiting for entity frame: {other:?}"
+                    ))
+                    .into());
+                }
+                FixtureDelivery::Terminal { body, .. } => {
+                    let label = self.last_terminal_label.clone();
+                    self.pending_terminal_frames.push_back((label, body));
                 }
             }
         }
@@ -950,23 +1138,26 @@ impl LocalWebrtcOfferPeer {
         key: &AesGcmKey,
         hello: &botster_hub_client::DaemonHello,
     ) -> Result<botster_hub_client::DaemonHelloAck, Box<dyn std::error::Error>> {
-        let plaintext = serde_json::to_vec(hello)?;
+        let frame = botster_hub_client::ClientFrame::Hello {
+            hello: hello.clone(),
+        };
+        let plaintext = serde_json::to_vec(&frame)?;
         let envelope = encrypt_aes_gcm(key, &plaintext, 1)?;
         self.data_channel
             .send_text(&serde_json::to_string(&envelope)?)
             .await?;
         loop {
-            let (delivery_kind, plaintext, _) = self.receive_delivery(key).await?;
-            match delivery_kind {
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
-                    return Ok(serde_json::from_slice(&plaintext)?);
+            let (delivery, _) = self.receive_delivery(key).await?;
+            match delivery {
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::HelloAck { ack }) => {
+                    return Ok(ack);
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
-                    self.park_or_reject_host_event(&plaintext)?;
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Event { event }) => {
+                    self.park_or_reject_host_event(&event)?;
                 }
-                _ => {
+                other => {
                     return Err(std::io::Error::other(format!(
-                        "hello ack used unexpected delivery kind {delivery_kind:?}"
+                        "hello ack expected, got {other:?}"
                     ))
                     .into());
                 }
@@ -974,42 +1165,97 @@ impl LocalWebrtcOfferPeer {
         }
     }
 
+    /// The next plaintext terminal frame body from a reserved terminal channel.
     pub(crate) async fn next_terminal_frame(
         &mut self,
         key: &AesGcmKey,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        if let Some((_message_id, bytes)) = self.pending_terminal_frames.pop_front() {
-            return Ok(bytes);
+        self.next_terminal_frame_with_label(key)
+            .await
+            .map(|(_, bytes)| bytes)
+    }
+
+    /// The next plaintext terminal frame body with the label of its channel.
+    pub(crate) async fn next_terminal_frame_with_label(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
+        if let Some(pending) = self.pending_terminal_frames.pop_front() {
+            return Ok(pending);
         }
         loop {
             let from_control = self.subscription_inbounds.is_empty();
-            let (delivery_kind, plaintext, _) = if from_control {
+            let (delivery, _) = if from_control {
                 self.receive_delivery(key).await?
             } else {
                 self.receive_subscription_delivery(key).await?
             };
-            match delivery_kind {
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
+            match delivery {
+                FixtureDelivery::Terminal { body, .. } => {
                     if from_control {
                         self.control_terminal_frame_count += 1;
+                        return Ok((String::new(), body));
                     }
-                    return Ok(plaintext);
+                    return Ok((self.last_terminal_label.clone(), body));
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
-                    self.pending_entity_frames
-                        .push_back(serde_json::from_slice(&plaintext)?);
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Entity { entity }) => {
+                    self.pending_entity_frames.push_back(entity);
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Response { .. }) => {
                     return Err(std::io::Error::other(
                         "received daemon response while waiting for terminal frame",
                     )
                     .into());
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
-                    self.park_or_reject_host_event(&plaintext)?;
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Event { event }) => {
+                    self.park_or_reject_host_event(&event)?;
+                }
+                FixtureDelivery::Server(other) => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected server frame while waiting for terminal frame: {other:?}"
+                    ))
+                    .into());
                 }
             }
         }
+    }
+
+    /// Attachment generation observed on the reserved channel `label`.
+    pub(crate) fn route_generation(&self, label: &str) -> Option<u64> {
+        self.route_generations.get(label).copied()
+    }
+
+    /// Send one input command on the reserved terminal channel `label`.
+    ///
+    /// The route must have shown its generation, from the attach response or
+    /// from a frame already read on the channel.
+    pub(crate) async fn send_terminal_input(
+        &mut self,
+        key: &AesGcmKey,
+        label: &str,
+        input: &InputSpec,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let index = self
+            .subscription_labels
+            .iter()
+            .position(|candidate| candidate == label)
+            .ok_or_else(|| std::io::Error::other(format!("no open reserved channel {label}")))?;
+        let generation = self.route_generation(label).ok_or_else(|| {
+            std::io::Error::other(format!("generation for {label} is not known yet"))
+        })?;
+        let operation_id = self.route_operation_ids.assign(label, input);
+        let message_id = self.next_terminal_message_id;
+        self.next_terminal_message_id += 1;
+        let channel = Arc::clone(&self.subscription_channels[index]);
+        Self::send_reserved_terminal_frame(
+            &channel,
+            key,
+            generation,
+            message_id,
+            &input.encode(operation_id),
+        )
+        .await?;
+        Ok(operation_id)
     }
 
     pub(crate) fn enable_host_events(&mut self) {
@@ -1062,16 +1308,17 @@ impl LocalWebrtcOfferPeer {
 
     fn park_or_reject_host_event(
         &mut self,
-        plaintext: &[u8],
+        event: &botster_hub_client::DaemonEvent,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let plaintext = serde_json::to_vec(event)?;
         if !self.accept_host_events {
             return Err(std::io::Error::other(format!(
                 "unnegotiated IsolatedHub receive path must not decode daemon_event: {}",
-                String::from_utf8_lossy(plaintext)
+                String::from_utf8_lossy(&plaintext)
             ))
             .into());
         }
-        self.pending_host.try_park(plaintext)
+        self.pending_host.try_park(&plaintext)
     }
 
     pub(crate) async fn next_host_event(
@@ -1082,28 +1329,32 @@ impl LocalWebrtcOfferPeer {
             return Ok(event);
         }
         loop {
-            let (delivery_kind, plaintext, _) = if self.subscription_inbounds.is_empty() {
+            let (delivery, _) = if self.subscription_inbounds.is_empty() {
                 self.receive_delivery(key).await?
             } else {
                 self.receive_subscription_delivery(key).await?
             };
-            match delivery_kind {
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEvent => {
-                    return Ok(serde_json::from_slice(&plaintext)?);
+            match delivery {
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Event { event }) => {
+                    return Ok(event);
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame => {
-                    self.control_terminal_frame_count += 1;
-                    self.pending_terminal_frames
-                        .push_back((String::new(), plaintext));
+                FixtureDelivery::Terminal { body, .. } => {
+                    let label = self.last_terminal_label.clone();
+                    self.pending_terminal_frames.push_back((label, body));
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonEntityFrame => {
-                    self.pending_entity_frames
-                        .push_back(serde_json::from_slice(&plaintext)?);
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Entity { entity }) => {
+                    self.pending_entity_frames.push_back(entity);
                 }
-                botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse => {
+                FixtureDelivery::Server(botster_hub_client::ServerFrame::Response { .. }) => {
                     return Err(std::io::Error::other(
                         "received daemon response while waiting for host event",
                     )
+                    .into());
+                }
+                FixtureDelivery::Server(other) => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected server frame while waiting for host event: {other:?}"
+                    ))
                     .into());
                 }
             }
@@ -1113,14 +1364,7 @@ impl LocalWebrtcOfferPeer {
     pub(crate) async fn receive_delivery(
         &mut self,
         key: &AesGcmKey,
-    ) -> Result<
-        (
-            botster_hub_client::DaemonLocalWebrtcDeliveryKind,
-            Vec<u8>,
-            LocalWebrtcResponseMetrics,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Result<(FixtureDelivery, LocalWebrtcResponseMetrics), Box<dyn std::error::Error>> {
         self.inbound.receive_delivery(key).await
     }
 
@@ -1137,7 +1381,7 @@ impl LocalWebrtcOfferPeer {
         let runtime =
             default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
         let (open_tx, open_rx) = channel::<()>(1);
-        let (message_tx, message_rx) = channel::<String>(256);
+        let (message_tx, message_rx) = channel::<InboundMessage>(256);
         let (closed_tx, closed_rx) = channel::<()>(1);
         let (inbound_tx, inbound) =
             WebrtcInboundMailbox::bounded(WEBRTC_INBOUND_MAX_FRAMES, WEBRTC_INBOUND_MAX_BYTES);
@@ -1239,20 +1483,25 @@ impl LocalWebrtcOfferPeer {
     ) -> Result<Arc<dyn DataChannel>, Box<dyn std::error::Error>> {
         let extra = self.create_labeled_data_channel(label).await?;
         let channel = extra.data_channel.clone();
-        let plaintext = serde_json::to_vec(hello)?;
+        let frame = botster_hub_client::ClientFrame::Hello {
+            hello: hello.clone(),
+        };
+        let plaintext = serde_json::to_vec(&frame)?;
         let envelope = encrypt_aes_gcm(key, &plaintext, 1)?;
         channel
             .send_text(&serde_json::to_string(&envelope)?)
             .await?;
         let mut extra = extra;
-        let (delivery_kind, plaintext, _) = extra.inbound.receive_delivery(key).await?;
-        if delivery_kind != botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse {
-            return Err(std::io::Error::other(format!(
-                "reserved hello ack used unexpected delivery kind {delivery_kind:?}"
-            ))
-            .into());
+        let (delivery, _) = extra.inbound.receive_delivery(key).await?;
+        match delivery {
+            FixtureDelivery::Server(botster_hub_client::ServerFrame::HelloAck { .. }) => {}
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "reserved hello ack expected, got {other:?}"
+                ))
+                .into());
+            }
         }
-        let _ack: botster_hub_client::DaemonHelloAck = serde_json::from_slice(&plaintext)?;
         self.subscription_channels.push(Arc::clone(&channel));
         self.subscription_inbounds.push(extra.inbound);
         self.subscription_labels.push(label.to_string());
@@ -1273,44 +1522,21 @@ impl LocalWebrtcOfferPeer {
         self.open_reserved_subscription(key, label, hello).await
     }
 
+    /// Send raw input body bytes on a reserved terminal channel at `generation`.
     pub(crate) async fn send_reserved_terminal_frame(
         channel: &Arc<dyn DataChannel>,
         key: &AesGcmKey,
+        generation: u64,
+        message_id: u64,
         frame: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        const CHUNK_BYTES: usize = 12 * 1024;
-        static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
-
-        let envelope = encrypt_aes_gcm(key, frame, 1)?;
-        let encrypted = serde_json::to_string(&envelope)?;
-        if encrypted.len() > botster_hub_client::LOCAL_WEBRTC_MAX_DELIVERY_BYTES {
-            return Err(
-                std::io::Error::other("terminal frame exceeds WebRTC delivery bound").into(),
-            );
-        }
-        let message_id = format!(
-            "test-terminal-{}",
-            NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let chunk_count = encrypted.len().max(1).div_ceil(CHUNK_BYTES);
-        for (chunk_index, payload) in encrypted.as_bytes().chunks(CHUNK_BYTES).enumerate() {
-            let chunk = botster_hub_client::DaemonLocalWebrtcDeliveryChunk {
-                version: botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
-                delivery_kind:
-                    botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame,
-                message_id: message_id.clone(),
-                chunk_index: chunk_index as u32,
-                chunk_count: chunk_count as u32,
-                total_bytes: encrypted.len() as u32,
-                payload: std::str::from_utf8(payload)?.to_string(),
-            };
-            let serialized = serde_json::to_string(&chunk)?;
-            if serialized.len() >= botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES {
+        for chunk in seal_terminal_chunks(key, generation, frame, message_id) {
+            if chunk.len() >= botster_hub_client::LOCAL_WEBRTC_MAX_FRAME_BYTES {
                 return Err(
                     std::io::Error::other("terminal chunk exceeds WebRTC frame bound").into(),
                 );
             }
-            channel.send_text(&serialized).await?;
+            channel.send(bytes::BytesMut::from(chunk.as_slice())).await?;
         }
         Ok(())
     }
@@ -1318,14 +1544,7 @@ impl LocalWebrtcOfferPeer {
     async fn receive_subscription_delivery(
         &mut self,
         key: &AesGcmKey,
-    ) -> Result<
-        (
-            botster_hub_client::DaemonLocalWebrtcDeliveryKind,
-            Vec<u8>,
-            LocalWebrtcResponseMetrics,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Result<(FixtureDelivery, LocalWebrtcResponseMetrics), Box<dyn std::error::Error>> {
         if self.subscription_inbounds.is_empty() {
             return Err(std::io::Error::other("no reserved subscription channel").into());
         }
@@ -1339,7 +1558,14 @@ impl LocalWebrtcOfferPeer {
                 )
                 .await
                 {
-                    Ok(Ok(delivery)) => return Ok(delivery),
+                    Ok(Ok(delivery)) => {
+                        if let FixtureDelivery::Terminal { generation, .. } = &delivery.0 {
+                            let label = self.subscription_labels[index].clone();
+                            self.route_generations.insert(label.clone(), *generation);
+                            self.last_terminal_label = label;
+                        }
+                        return Ok(delivery);
+                    }
                     Ok(Err(error)) => {
                         let label = self.subscription_labels.remove(index);
                         assert!(
@@ -2276,14 +2502,20 @@ fn session_lifecycle_event(session_id: &str) -> Vec<u8> {
 fn inbound_chunk_reassembly_survives_cancelled_read() {
     let _runtime = default_runtime().expect("async runtime");
     let key = AesGcmKey::from_slice(&[9; 32]).expect("test AES key");
-    let envelope = encrypt_aes_gcm(&key, b"delivery-ok", 1).expect("encrypt delivery");
+    let frame = botster_hub_client::ServerFrame::Event {
+        event: botster_hub_client::DaemonEvent::RuntimeObservation {
+            kind: "delivery-ok".to_string(),
+        },
+    };
+    let plaintext = serde_json::to_vec(&frame).expect("server frame json");
+    let envelope = encrypt_aes_gcm(&key, &plaintext, 1).expect("encrypt delivery");
     let encrypted = serde_json::to_string(&envelope).expect("envelope json");
     let mid = encrypted.len() / 2;
     let first_chunk = test_chunk(0, 2, &encrypted[..mid], encrypted.len());
     let second_chunk = test_chunk(1, 2, &encrypted[mid..], encrypted.len());
 
     let (tx, mut inbound) = WebrtcInboundMailbox::bounded(8, 64 * 1024);
-    admit_inbound_frame(&inbound.occupancy, &tx, first_chunk).expect("admit first chunk");
+    admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text(first_chunk)).expect("admit first chunk");
 
     let cancelled = block_on(async {
         timeout(
@@ -2302,14 +2534,15 @@ fn inbound_chunk_reassembly_survives_cancelled_read() {
         "cancelled receive_delivery must keep reassembly state"
     );
 
-    admit_inbound_frame(&inbound.occupancy, &tx, second_chunk).expect("admit second chunk");
-    let (kind, plaintext, metrics) =
+    admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text(second_chunk)).expect("admit second chunk");
+    let (delivery, metrics) =
         block_on(inbound.receive_delivery(&key)).expect("resume delivery");
-    assert_eq!(
-        kind,
-        botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonResponse
-    );
-    assert_eq!(plaintext, b"delivery-ok");
+    assert!(matches!(
+        delivery,
+        FixtureDelivery::Server(botster_hub_client::ServerFrame::Event {
+            event: botster_hub_client::DaemonEvent::RuntimeObservation { ref kind }
+        }) if kind == "delivery-ok"
+    ));
     assert_eq!(metrics.chunk_count, 2);
     assert!(inbound.reassembly.is_none());
     let snap = inbound.occupancy.snapshot();
@@ -2322,8 +2555,8 @@ fn inbound_chunk_reassembly_survives_cancelled_read() {
 fn inbound_occupancy_overflows_at_explicit_count_and_byte_limits() {
     let _runtime = default_runtime().expect("async runtime");
     let (tx, inbound) = WebrtcInboundMailbox::bounded(1, 8);
-    admit_inbound_frame(&inbound.occupancy, &tx, "abcd".to_string()).expect("first frame");
-    let count_err = admit_inbound_frame(&inbound.occupancy, &tx, "efgh".to_string())
+    admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text("abcd".to_string())).expect("first frame");
+    let count_err = admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text("efgh".to_string()))
         .expect_err("count overflow");
     assert_eq!(count_err, InboundAdmitError::CountLimit);
     let count_snap = inbound.occupancy.snapshot();
@@ -2334,7 +2567,7 @@ fn inbound_occupancy_overflows_at_explicit_count_and_byte_limits() {
     assert_eq!(count_snap.max_bytes, 8);
 
     let (tx, inbound) = WebrtcInboundMailbox::bounded(8, 8);
-    let byte_err = admit_inbound_frame(&inbound.occupancy, &tx, "ninebytes".to_string())
+    let byte_err = admit_inbound_frame(&inbound.occupancy, &tx, InboundMessage::Text("ninebytes".to_string()))
         .expect_err("byte overflow");
     assert_eq!(byte_err, InboundAdmitError::ByteLimit);
     let byte_snap = inbound.occupancy.snapshot();
@@ -2363,9 +2596,9 @@ fn inbound_occupancy_reserves_before_send_so_consumer_cannot_underflow() {
 
     let occupancy = FixtureQueueOccupancy::new(8, 1024);
     let (narrow_tx, _narrow_rx) = channel::<String>(1);
-    admit_inbound_frame(&occupancy, &narrow_tx, "full".to_string()).expect("fill channel");
+    admit_inbound_frame(&occupancy, &narrow_tx, InboundMessage::Text("full".to_string())).expect("fill channel");
     let full_err =
-        admit_inbound_frame(&occupancy, &narrow_tx, "drop".to_string()).expect_err("channel full");
+        admit_inbound_frame(&occupancy, &narrow_tx, InboundMessage::Text("drop".to_string())).expect_err("channel full");
     assert_eq!(full_err, InboundAdmitError::ChannelFull);
     let snap = occupancy.snapshot();
     assert_eq!(snap.count, 1);

@@ -482,7 +482,7 @@ fn isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text() {
 }
 
 fn wait_for_package_event_token(
-    connection: &mut LifecycleConnection,
+    connection: &mut botster_hub_client::DaemonConnection,
     token: &str,
 ) -> serde_json::Value {
     wait_for_package_event_tokens(connection, &[token])
@@ -492,7 +492,7 @@ fn wait_for_package_event_token(
 }
 
 fn wait_for_package_event_tokens(
-    connection: &mut LifecycleConnection,
+    connection: &mut botster_hub_client::DaemonConnection,
     tokens: &[&str],
 ) -> Vec<serde_json::Value> {
     let mut found = BTreeMap::new();
@@ -537,7 +537,7 @@ fn wait_for_package_event_tokens(
 }
 
 fn collect_skipped_package_event_tokens(
-    connection: &mut LifecycleConnection,
+    connection: &mut botster_hub_client::DaemonConnection,
     tokens: &[&str],
     found: &mut BTreeMap<String, serde_json::Value>,
 ) {

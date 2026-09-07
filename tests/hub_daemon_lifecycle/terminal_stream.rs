@@ -172,6 +172,12 @@ pub(crate) fn frame_output_bytes(frame: &DaemonUnixTerminalFrame) -> Option<Vec<
     decode_route_event(frame).and_then(|event| event.output().map(<[u8]>::to_vec))
 }
 
+/// OUTPUT bytes of one plaintext terminal frame body (any transport).
+pub(crate) fn terminal_body_output(bytes: &[u8]) -> Option<Vec<u8>> {
+    let frame = TerminalFrame::from_bytes(bytes).ok()?;
+    (frame.kind() == TerminalKind::Output).then(|| frame.body().to_vec())
+}
+
 /// Per-route input operation ids.
 ///
 /// Ids are strictly increasing per route from 1. A paste transaction reuses

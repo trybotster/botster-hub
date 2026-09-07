@@ -50,7 +50,23 @@ use crate::support::{
 use super::*;
 
 pub(crate) fn start_cli_daemon(data_dir: &Path) -> PanicSafeCliDaemon {
-    start_cli_daemon_with_worker_egress_capacity(data_dir, None)
+    let _guard = daemon_test_guard();
+    check_harness_taint();
+    ensure_session_worker_binary();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--session-worker-bin")
+        .arg(session_worker_binary_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_test_process_group(&mut command);
+    let child = command.spawn().expect("spawn botster-hub start");
+    let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "lifecycle daemon");
+    wait_for_status(data_dir, daemon.child_mut());
+    daemon
 }
 
 pub(crate) fn start_cli_daemon_with_env(
@@ -389,17 +405,6 @@ impl PanicSafeCliDaemon {
         output
     }
 
-    pub(crate) fn start_with_runtime_drain_failure(
-        data_dir: &Path,
-        session_id: &str,
-        egress_capacity: Option<usize>,
-        panic_context: &'static str,
-    ) -> Self {
-        let mut daemon =
-            start_cli_daemon_with_runtime_drain_failure(data_dir, session_id, egress_capacity);
-        daemon.panic_context = panic_context;
-        daemon
-    }
 
     fn retain_identity_capture(
         &mut self,

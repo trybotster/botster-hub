@@ -1845,16 +1845,17 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     assert_eq!(status.provider_count, 0);
     assert!(store.path().exists());
 
-    let runtime = daemon.runtime_mut().expect("runtime initialized");
+    let runtime = daemon.runtime().expect("runtime initialized");
     let request = spawn_request(runtime.config());
     let session_id = request.session_id.clone();
-    runtime
-        .spawn_session(request, CoreSessionMetadata::new(), 1)
-        .expect("spawn through core daemon runtime");
-    assert_eq!(runtime.list_sessions().expect("daemon list").len(), 1);
-    runtime
-        .shutdown_session(session_id, 2)
-        .expect("shutdown through core daemon runtime");
+    spawn_through_core(runtime, request);
+    assert_eq!(
+        wait_ticket(runtime.list_sessions())
+            .expect("daemon list")
+            .len(),
+        1
+    );
+    shutdown_through_core(runtime, session_id);
 
     let stopped = daemon.stop();
     assert_eq!(stopped.lifecycle_state, HubDaemonState::Stopped);
@@ -1888,37 +1889,29 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
             command: "printf 'restart-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
             now_seconds: logical_clock,
         },
-    )
+    ).wait(daemon.runtime().expect("runtime initialized"))
     .expect("spawn through hub client api");
     logical_clock += 1;
-    let runtime = daemon.runtime_mut().expect("runtime initialized");
-    runtime
-        .attach_client(
-            api.identity().client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            logical_clock,
-        )
-        .expect("attach before restart");
-    logical_clock += 1;
-    let generation = runtime
-        .list_terminal_subscriptions()
-        .into_iter()
-        .find(|row| row.session_id == session_id && row.subscription_id == subscription_id)
-        .map(|row| row.generation)
-        .expect("live generation");
-    runtime
-        .bind_terminal_adapter(
-            api.identity().client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            generation,
-            botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
-                .expect("tokens"),
-            Box::new(botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default()),
-        )
-        .expect("bind before restart");
-    logical_clock += 1;
+    let runtime = daemon.runtime().expect("runtime initialized");
+    wait_ticket(botster_hub::test_internals::attach_and_bind_terminal(
+        runtime,
+        botster_hub::test_internals::TestAttachBindPlan {
+            client_id: api.identity().client_id.clone(),
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+            capabilities: botster_core::TerminalCapabilitySet::from_tokens([
+                "terminal_streaming",
+                "resize",
+            ])
+            .expect("tokens"),
+            now_seconds: logical_clock,
+            adapter: Box::new(
+                botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default(),
+            ),
+        },
+    ))
+    .expect("attach and bind before restart");
+    logical_clock += 2;
     daemon.stop();
 
     let mut restarted = HubDaemon::start(config).expect("restart hub daemon");
@@ -1938,21 +1931,13 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
             HubClientRequest::ListSessions {
                 request_id: RequestId("hub-daemon-restart-list".to_string()),
             },
-        )
+        ).wait(restarted.runtime().expect("runtime initialized"))
         .expect("list after restart through client api");
     assert!(
         matches!(listed.body, HubClientResponseBody::Sessions(sessions) if sessions.iter().any(|session| session.session_id == session_id))
     );
 
     let runtime = restarted.runtime_mut().expect("runtime initialized");
-    runtime
-        .attach_client(
-            api.identity().client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            logical_clock,
-        )
-        .expect("reattach after restart through runtime attach");
     logical_clock += 1;
     let terminal_adapter = bind_shared_terminal_adapter(
         runtime,
@@ -1987,7 +1972,7 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
                     session_id: session_id.clone(),
                     now_seconds: logical_clock,
                 },
-            )
+            ).wait(restarted.runtime().expect("runtime initialized"))
             .expect("read screen after restart");
         if let HubClientResponseBody::ReadScreen(body) = response.body {
             screen = body.text;
@@ -2009,7 +1994,7 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
             session_id,
             now_seconds: logical_clock,
         },
-    )
+    ).wait(restarted.runtime().expect("runtime initialized"))
     .expect("shutdown after restart through client api");
 }
 
@@ -2058,7 +2043,7 @@ fn daemon_startup_reconciliation_marks_stale_and_recovers_missing_live_sessions(
             command: "printf 'recovered-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
             now_seconds: 1,
         },
-    )
+    ).wait(first.runtime().expect("runtime initialized"))
     .expect("spawn recovered session through client api");
     first.stop();
 
@@ -2131,14 +2116,16 @@ fn daemon_startup_reconciliation_marks_stale_adoption_socket_and_continues() {
                     command: "printf 'fresh-after-stale-ready\\n'; sleep 1".to_string(),
                     now_seconds: 3,
                 },
-            )
+            ).wait(daemon.runtime().expect("runtime initialized"))
             .expect("fresh session should spawn after stale adoption reconciliation");
             assert!(
-                daemon
-                    .runtime()
-                    .expect("runtime initialized")
-                    .list_sessions()
-                    .expect("list sessions after fresh spawn")
+                wait_ticket(
+                    daemon
+                        .runtime()
+                        .expect("runtime initialized")
+                        .list_sessions()
+                )
+                .expect("list sessions after fresh spawn")
                     .iter()
                     .any(|session| session.session_id == fresh_session_id),
                 "fresh session should be visible after stale adoption reconciliation"
@@ -2376,14 +2363,11 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
         let drain = connection
             .request(&botster_hub_client::DaemonRequest::Status)
             .ok();
-        attached |= drain.is_some_and(|response| {
-            response.events.iter().any(|event| {
-                matches!(
-                    event,
-                    botster_hub_client::DaemonEvent::AttachState { state, .. } if state == "attached"
-                )
-            })
-        });
+        let _ = drain;
+        attached |= connection
+            .poll_route_events(Duration::from_millis(25))
+            .iter()
+            .any(|event| event.on_route("cli-restart-subscription-after") && event.is_attached());
         let screen = connection
             .request(&botster_hub_client::DaemonRequest::ReadScreen {
                 session_id: session_id.to_string(),

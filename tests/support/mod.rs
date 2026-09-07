@@ -73,8 +73,9 @@ pub fn bind_shared_terminal_adapter(
         botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter::auto_complete();
     // Attach and bind run as one Core operation; the ticket is waited off the
     // owner loop because this test thread is not the Hub owner.
-    runtime
-        .attach_and_bind_terminal(botster_hub::AttachBindPlan {
+    botster_hub::test_internals::attach_and_bind_terminal(
+        runtime,
+        botster_hub::test_internals::TestAttachBindPlan {
             client_id,
             session_id,
             subscription_id,
@@ -85,10 +86,11 @@ pub fn bind_shared_terminal_adapter(
             .expect("terminal capabilities"),
             now_seconds: 1,
             adapter: Box::new(adapter.clone()),
-        })
-        .wait(std::time::Duration::from_secs(30))
-        .expect("core bridge answers the attach")
-        .expect("attach and bind shared terminal adapter");
+        },
+    )
+    .wait(std::time::Duration::from_secs(30))
+    .expect("core bridge answers the attach")
+    .expect("attach and bind shared terminal adapter");
     adapter
 }
 

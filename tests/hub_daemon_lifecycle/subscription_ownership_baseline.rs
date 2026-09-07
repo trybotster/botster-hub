@@ -373,7 +373,7 @@ fn terminal_adapter_contract_is_duplex_at_the_locked_core_pin() {
     impl botster_core::contract::terminal_adapter::TerminalAdapter for Duplex {
         fn try_write(
             &mut self,
-            _frame: &botster_terminal_protocol::TerminalFrame,
+            _frame: &botster_terminal_protocol::RoutedTerminalFrame,
         ) -> Result<(), botster_core::contract::terminal_adapter::TerminalAdapterWriteError>
         {
             Ok(())
@@ -563,19 +563,11 @@ fn transport_and_data_plane_reject_terminal_retry_and_scheduling_tokens() {
     );
 }
 
+/// READY or HISTORY payload of one route frame.
 fn unix_envelope_snapshot_bytes(
-    envelope: &botster_hub_client::DaemonUnixTerminalFrame,
+    frame: &botster_hub_client::DaemonUnixTerminalFrame,
 ) -> Option<Vec<u8>> {
-    let bytes = envelope.payload_bytes().ok()?;
-    if bytes.starts_with(GHOSTSNP_MAGIC) {
-        return Some(bytes);
-    }
-    match serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) {
-        Ok(botster_hub_client::DaemonEvent::Snapshot { history, .. }) => {
-            history.decoded_bytes().ok().map(|decoded| decoded.to_vec())
-        }
-        _ => None,
-    }
+    decode_route_event(frame).and_then(|event| event.snapshot_bytes().map(<[u8]>::to_vec))
 }
 
 fn apply_ready_then_history_progress(
@@ -585,11 +577,11 @@ fn apply_ready_then_history_progress(
 ) -> botster_terminal_ghostty::GhosttySnapshotDecodeProgress {
     if !saw_ready {
         projection
-            .install_ghostsnp_ready(bytes)
+            .install_ghostsnp_ready(&bytes)
             .expect("READY snapshot")
     } else {
         projection
-            .apply_ghostsnp_history(bytes)
+            .apply_ghostsnp_history(&bytes)
             .expect("PAGE or FINISH snapshot")
     }
 }
@@ -614,14 +606,11 @@ fn attach_ready_precedes_history_finish() {
         attach_source.contains("for_ready_then_history_attach()"),
         "Hub must advertise the ready_then_history split"
     );
-    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
-    let mut incomplete = String::new();
+    let mut stream = RawUnixClient::from_stream(stream);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
-        &mut reader,
-        &mut incomplete,
         "so-rth-session",
         "so-rth-sub",
         "printf 'so-rth-ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
@@ -647,9 +636,7 @@ fn attach_ready_precedes_history_finish() {
             if progress == botster_terminal_ghostty::GhosttySnapshotDecodeProgress::Ready {
                 assert!(!saw_finish, "READY must precede FINISH");
                 saw_ready = true;
-                write_unix_terminal_frame(
-                    &mut stream,
-                    "so-rth-session",
+                stream.send_terminal_input(
                     "so-rth-sub",
                     &terminal_input_frame_bytes(b"so-rth-input\r"),
                 );
@@ -663,20 +650,14 @@ fn attach_ready_precedes_history_finish() {
         if saw_finish {
             break;
         }
-        let drain = request_collecting_mux(
-            &mut stream,
-            &mut reader,
-            &mut incomplete,
+        let drain = stream.request_collecting(
             &botster_hub_client::DaemonRequest::Status,
             &mut envelopes,
             &mut events,
         );
         assert!(
-            drain
-                .events
-                .iter()
-                .all(|event| !matches!(event, botster_hub_client::DaemonEvent::Snapshot { .. })),
-            "bound drain must not return snapshot bodies on the host plane: {:?}",
+            drain.events.is_empty(),
+            "bound drain must not carry terminal bodies on the host plane: {:?}",
             drain.events
         );
     }
@@ -707,26 +688,19 @@ fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
         .push(botster_hub_client::FEATURE_ATTACH_OCCUPANCY.to_string());
     let stream = botster_hub_client::connect_and_hello_with_requirement(&endpoint, &requirement)
         .expect("unix+occupancy hello");
-    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
-    let mut stream = stream;
-    let mut incomplete = String::new();
+    let mut stream = RawUnixClient::from_stream(stream);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
-        &mut reader,
-        &mut incomplete,
         "so-sup-session",
         "so-sup-sub",
         "sleep 30",
         &mut envelopes,
         &mut events,
     );
-    let before = request_collecting_mux(
-        &mut stream,
-        &mut reader,
-        &mut incomplete,
-        &botster_hub_client::DaemonRequest::Status,
+    let before = stream.request_collecting(
+                &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
     );
@@ -740,11 +714,8 @@ fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
         "so-sup-sub",
     )
     .expect("attached route must publish a Core generation");
-    let shutdown = request_collecting_mux(
-        &mut stream,
-        &mut reader,
-        &mut incomplete,
-        &botster_hub_client::DaemonRequest::ShutdownSession {
+    let shutdown = stream.request_collecting(
+                &botster_hub_client::DaemonRequest::ShutdownSession {
             session_id: "so-sup-session".to_string(),
         },
         &mut envelopes,
@@ -756,11 +727,8 @@ fn shutdown_suppresses_exact_route_generations_before_core_teardown() {
         "ShutdownSession must complete: {:?}",
         shutdown.error
     );
-    let _after = request_collecting_mux(
-        &mut stream,
-        &mut reader,
-        &mut incomplete,
-        &botster_hub_client::DaemonRequest::Status,
+    let _after = stream.request_collecting(
+                &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
     );
@@ -801,22 +769,17 @@ fn extend_concatenated_from_pending_webrtc_frames(
     peer: &mut LocalWebrtcOfferPeer,
     concatenated: &mut Vec<u8>,
 ) {
+    // The fixture yields plaintext terminal frame bodies; only OUTPUT carries PTY bytes.
     while let Some((_, bytes)) = peer.pending_terminal_frames.pop_front() {
-        if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) {
-            if let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event {
-                let decoded = live_output_decoded_bytes(payload);
-                assert!(
-                    !payload_has_utf8_replacement(&decoded),
-                    "live payload must not contain U+FFFD: {decoded:?}"
-                );
-                concatenated.extend(decoded);
-            }
-        } else {
+        let frame = botster_terminal_protocol::TerminalFrame::from_bytes(&bytes)
+            .expect("reserved channel carries protocol terminal frames");
+        if frame.kind() == botster_terminal_protocol::TerminalKind::Output {
             assert!(
-                !payload_has_utf8_replacement(&bytes),
-                "live payload must not contain U+FFFD: {bytes:?}"
+                !payload_has_utf8_replacement(frame.body()),
+                "live payload must not contain U+FFFD: {:?}",
+                frame.body()
             );
-            concatenated.extend(bytes);
+            concatenated.extend_from_slice(frame.body());
         }
     }
 }
@@ -1022,9 +985,6 @@ fn peer_close_leaves_sibling_peers_working() {
         wait_for_webrtc_marker(&mut peer_a, &key_a, session_a, sub_a, "so-sib-a-ready").await;
         wait_for_webrtc_marker(&mut peer_b, &key_b, session_b, sub_b, "so-sib-b-ready").await;
         peer_a.peer.close().await.expect("close peer a");
-        // Reserved-label duplex input is not available on this WebRTC peer yet.
-        let _reserved_duplex_input = terminal_input_frame_bytes(b"so-sib-live\r");
-        let _ = _reserved_duplex_input.len();
         wait_for_webrtc_marker(&mut peer_b, &key_b, session_b, sub_b, "so-sib-b-ready").await;
         peer_b.peer.close().await.expect("close peer b");
     });

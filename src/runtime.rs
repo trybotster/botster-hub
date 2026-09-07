@@ -3668,7 +3668,7 @@ impl HubRuntime {
     /// exists, declare the adapter, attach, look up the new generation, bind
     /// the adapter. Any failure after attach detaches again so Core holds no
     /// route without an adapter. Nothing here waits on the owner thread.
-    pub fn attach_and_bind_terminal(
+    pub(crate) fn attach_and_bind_terminal(
         &self,
         plan: AttachBindPlan,
     ) -> CoreTicket<Result<TerminalSubscriptionGeneration, AttachBindFailure>> {
@@ -3678,7 +3678,7 @@ impl HubRuntime {
 
     /// Attach one route without an adapter. Core holds the route's frames
     /// until [`Self::bind_route_adapter`] binds one (WebRTC reserved channel).
-    pub fn attach_route(
+    pub(crate) fn attach_route(
         &self,
         client_id: ClientId,
         session_id: SessionId,
@@ -3692,7 +3692,7 @@ impl HubRuntime {
 
     /// Bind an adapter to an attached generation. On failure Core detaches
     /// that generation so no route stays without an adapter.
-    pub fn bind_route_adapter(
+    pub(crate) fn bind_route_adapter(
         &self,
         plan: BindRoutePlan,
     ) -> CoreTicket<Result<(), AttachBindFailure>> {
@@ -4819,7 +4819,7 @@ struct SessionTypeSpawnStart {
 }
 
 /// Inputs for one attach-and-bind turn on the Core owner thread.
-pub struct AttachBindPlan {
+pub(crate) struct AttachBindPlan {
     pub client_id: ClientId,
     pub session_id: SessionId,
     pub subscription_id: SubscriptionId,
@@ -4830,7 +4830,7 @@ pub struct AttachBindPlan {
 
 /// Where an attach-and-bind turn failed. Core holds no route afterwards.
 #[derive(Debug)]
-pub enum AttachBindFailure {
+pub(crate) enum AttachBindFailure {
     /// `attach` itself failed; the adapter declaration was cancelled.
     Attach(CoreDaemonError),
     /// Attach succeeded but no live generation was visible; the route was detached.
@@ -4840,7 +4840,7 @@ pub enum AttachBindFailure {
 }
 
 /// Adapter bind inputs for one attached generation.
-pub struct BindRoutePlan {
+pub(crate) struct BindRoutePlan {
     pub client_id: ClientId,
     pub session_id: SessionId,
     pub subscription_id: SubscriptionId,
@@ -4850,7 +4850,7 @@ pub struct BindRoutePlan {
     pub adapter: Box<dyn botster_core::contract::terminal_wake::WakingTerminalAdapter + Send>,
 }
 
-fn attach_and_bind_on_core(
+pub(crate) fn attach_and_bind_on_core(
     daemon: &mut botster_core_daemon::CoreDaemon,
     plan: AttachBindPlan,
 ) -> Result<TerminalSubscriptionGeneration, AttachBindFailure> {
@@ -4890,7 +4890,7 @@ fn attach_and_bind_on_core(
     Ok(generation)
 }
 
-fn attach_route_on_core(
+pub(crate) fn attach_route_on_core(
     daemon: &mut botster_core_daemon::CoreDaemon,
     client_id: ClientId,
     session_id: SessionId,
@@ -4948,7 +4948,7 @@ fn attach_route_on_core(
     Ok(generation)
 }
 
-fn bind_route_on_core(
+pub(crate) fn bind_route_on_core(
     daemon: &mut botster_core_daemon::CoreDaemon,
     plan: BindRoutePlan,
 ) -> Result<(), AttachBindFailure> {

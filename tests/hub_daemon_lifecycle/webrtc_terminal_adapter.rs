@@ -174,21 +174,7 @@ fn webrtc_terminal_contains(
     needle: &str,
 ) -> bool {
     frames.iter().any(|(_, bytes)| {
-        if bytes
-            .windows(needle.len())
-            .any(|window| window == needle.as_bytes())
-        {
-            return true;
-        }
-        let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(bytes) else {
-            return false;
-        };
-        match event {
-            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => {
-                live_output_contains(&payload, needle)
-            }
-            _ => false,
-        }
+        terminal_body_output(bytes).is_some_and(|output| bytes_contain(&output, needle.as_bytes()))
     })
 }
 
@@ -275,17 +261,6 @@ fn start_webrtc_adapter_hub_with_env(
     let endpoint = hub.endpoint().clone();
     let (_origin, bootstrap) = start_botster_web_and_issue_bootstrap(&endpoint);
     (hub, endpoint, bootstrap)
-}
-
-fn webrtc_event_is_terminal_body(event: &botster_hub_client::DaemonEvent) -> bool {
-    matches!(
-        event,
-        botster_hub_client::DaemonEvent::AttachState { .. }
-            | botster_hub_client::DaemonEvent::Snapshot { .. }
-            | botster_hub_client::DaemonEvent::Scrollback { .. }
-            | botster_hub_client::DaemonEvent::TerminalOutput { .. }
-            | botster_hub_client::DaemonEvent::ProcessExit { .. }
-    )
 }
 
 fn cleanup_delta(
@@ -497,12 +472,8 @@ fn webrtc_terminal_adapter_second_data_channel_does_not_receive_terminal_frames(
         while Instant::now() < extra_deadline {
             match timeout(Duration::from_millis(50), extra.messages.recv()).await {
                 Ok(Some(message)) => {
-                    if let Ok(chunk) = serde_json::from_str::<
-                        botster_hub_client::DaemonLocalWebrtcDeliveryChunk,
-                    >(&message)
-                        && chunk.delivery_kind
-                            == botster_hub_client::DaemonLocalWebrtcDeliveryKind::DaemonTerminalFrame
-                    {
+                    // Terminal data only ever travels as binary chunks.
+                    if matches!(message, InboundMessage::Binary(_)) {
                         extra_terminal_frames += 1;
                     }
                 }
@@ -1022,44 +993,69 @@ async fn wait_for_webrtc_exit_fixture_event(
     exited: bool,
     exit_label: &str,
 ) {
+    use botster_terminal_protocol::{AttachStateCode, TerminalFrame, TerminalKind};
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut retained = VecDeque::new();
     let mut bytes_seen = 0;
     let mut outcome = "deadline expired".to_string();
     let mut found = false;
     while Instant::now() < deadline {
-        let bytes = match timeout(
+        let (label, bytes) = match timeout(
             deadline.saturating_duration_since(Instant::now()),
-            peer.next_terminal_frame(key),
-        ).await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(error)) => { outcome = format!("receive error: {error}"); break; }
-            Err(_) => { outcome = "receive timeout".to_string(); break; }
+            peer.next_terminal_frame_with_label(key),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => {
+                outcome = format!("receive error: {error}");
+                break;
+            }
+            Err(_) => {
+                outcome = "receive timeout".to_string();
+                break;
+            }
         };
         bytes_seen += bytes.len();
-        assert!(retained.len() < 256 && bytes_seen <= 4 * 1024 * 1024,
-            "exit fixture evidence exceeded its storage bound");
-        let event = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes);
-        match &event {
-            Ok(botster_hub_client::DaemonEvent::AttachState { session_id, subscription_id, state })
-                if !exited && session_id == "wnx-exit" && subscription_id == "sub-exit" && state == "attached" => {
-                    found = true;
+        assert!(
+            retained.len() < 256 && bytes_seen <= 4 * 1024 * 1024,
+            "exit fixture evidence exceeded its storage bound"
+        );
+        if label == exit_label
+            && let Ok(frame) = TerminalFrame::from_bytes(&bytes)
+        {
+            match frame.kind() {
+                TerminalKind::AttachState if !exited => {
+                    if botster_terminal_protocol::decode_attach_state(&frame)
+                        == Ok(AttachStateCode::Attached)
+                    {
+                        found = true;
+                    }
                 }
-            Ok(botster_hub_client::DaemonEvent::ProcessExit { session_id, subscription_id, code })
-                if session_id == "wnx-exit" && subscription_id == "sub-exit" => {
+                TerminalKind::ProcessExit => {
                     assert!(exited, "exit fixture ended before Attached");
-                    assert_eq!(*code, Some(0), "exit fixture must exit successfully");
+                    let exit = botster_terminal_protocol::decode_process_exit(&frame)
+                        .expect("process exit body decodes");
+                    assert_eq!(exit.code, Some(0), "exit fixture must exit successfully");
                     found = true;
                 }
-            _ => {}
+                _ => {}
+            }
         }
-        if found { break; }
-        retained.push_back((String::new(), bytes));
+        if found {
+            break;
+        }
+        retained.push_back((label, bytes));
     }
-    let evidence: Vec<_> = retained.iter().map(|(_, bytes)| {
-        serde_json::from_slice::<serde_json::Value>(bytes)
-            .unwrap_or_else(|_| serde_json::json!({"malformed_frame_bytes": bytes}))
-    }).collect();
+    let evidence: Vec<String> = retained
+        .iter()
+        .map(|(label, bytes)| {
+            let kind = TerminalFrame::from_bytes(bytes)
+                .map(|frame| frame.kind().name())
+                .unwrap_or("malformed");
+            format!("{label}:{kind}:{}", bytes.len())
+        })
+        .collect();
     // These frames still belong to their original consumers.
     peer.pending_terminal_frames.extend(retained);
     let exit_channel_errors: Vec<&str> = peer
@@ -1080,7 +1076,11 @@ async fn wait_for_webrtc_exit_fixture_event(
             _ => None,
         })
         .collect();
-    assert!(found, "wnx-exit/sub-exit missing event exited={exited}; {outcome}; exit_label={exit_label}; exit_channel_errors={exit_channel_errors:?}; terminal_channel_closed={terminal_channel_closed:?}; retained={evidence:?}; subscription_receive_errors={:?}", peer.subscription_receive_errors);
+    assert!(
+        found,
+        "wnx-exit/sub-exit missing frame exited={exited}; {outcome}; exit_label={exit_label}; exit_channel_errors={exit_channel_errors:?}; terminal_channel_closed={terminal_channel_closed:?}; retained={evidence:?}; subscription_receive_errors={:?}",
+        peer.subscription_receive_errors
+    );
 }
 
 #[test]
@@ -1104,9 +1104,9 @@ fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_em
         let live = peer.encrypted_request(&key, &botster_hub_client::DaemonRequest::ListSessions)
             .await.expect("live state before exit release");
         assert!(live.sessions.iter().any(|row| row.session_id == "wnx-exit" && row.lifecycle == "running"));
-        LocalWebrtcOfferPeer::send_reserved_terminal_frame(
-            &exit_channel, &key, &terminal_input_frame_bytes(b"wnx-release\r"),
-        ).await.expect("release exit through the bound terminal route");
+        peer.send_terminal_input(&key, &exit_label, &terminal_input_frame_bytes(b"wnx-release\r"))
+            .await
+            .expect("release exit through the bound terminal route");
         wait_for_webrtc_exit_fixture_event(&mut peer, &key, true, &exit_label).await;
         wait_for_authoritative_session_exit(&endpoint, "wnx-exit");
         spawn_and_bind_webrtc(&mut peer, &key, "wnx-shutdown", "sub-shutdown", "sleep 30").await;
@@ -1247,13 +1247,9 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
         bind_reserved_from_attach(&mut owner_b, &key_b, &attach_b, "wsg-session", "wsg-sub")
             .await;
         assert!(
-            !attach_b.events.iter().any(|event| matches!(
-                event,
-                botster_hub_client::DaemonEvent::AttachState { state, .. }
-                    if state == botster_hub_client::ATTACH_STATE_ATTACH_FAILED
-            )),
+            attach_b.terminal_reservation.is_some(),
             "replacement owner B must bind: {:?}",
-            attach_b.events
+            attach_b.error
         );
         let closed =
             wait_for_webrtc_subscription_closed(&mut owner_a, &key_a, "wsg-session", "wsg-sub")
@@ -1289,17 +1285,6 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
             "B's bound adapter must stay owned after A's stale close: {:?}",
             drain.error
         );
-        assert!(
-            drain
-                .events
-                .iter()
-                .all(|event| !webrtc_event_is_terminal_body(event)),
-            "content-blind B adapter must stay bound: {:?}",
-            drain.events
-        );
-        // Reserved-label duplex input is not available on this WebRTC peer yet.
-        let _reserved_duplex_input = terminal_input_frame_bytes(b"after-replace\r");
-        let _ = _reserved_duplex_input.len();
         let drain = owner_b
             .encrypted_request(
                 &key_b,
@@ -1353,33 +1338,21 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
     let session_id = "nsd-session";
     let unix_sub = "nsd-unix";
     let webrtc_sub = "nsd-webrtc";
-    let (mut unix, mut unix_reader, mut unix_incomplete) = unix_adapter_connection(&endpoint);
+    let mut unix = RawUnixClient::connect_unix_terminal_adapter(&endpoint);
     let mut unix_envelopes = Vec::new();
 
-    let spawned = request_skipping_envelopes(
-        &mut unix,
-        &mut unix_reader,
-        &mut unix_incomplete,
-        &botster_hub_client::DaemonRequest::Spawn {
+    let spawned = unix.request_skipping(&botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
             command: "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
-        },
-        &mut unix_envelopes,
-    );
+        }, &mut unix_envelopes);
     assert_eq!(
         spawned.kind,
         botster_hub_client::DaemonResponseKind::Spawned
     );
-    let unix_attach = request_skipping_envelopes(
-        &mut unix,
-        &mut unix_reader,
-        &mut unix_incomplete,
-        &botster_hub_client::DaemonRequest::Attach {
+    let unix_attach = unix.request_skipping(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
             subscription_id: unix_sub.to_string(),
-        },
-        &mut unix_envelopes,
-    );
+        }, &mut unix_envelopes);
     assert_eq!(
         unix_attach.kind,
         botster_hub_client::DaemonResponseKind::TerminalAttached
@@ -1448,19 +1421,8 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
         after.live_attach_occupancy
     );
 
-    write_unix_terminal_frame(
-        &mut unix,
-        session_id,
-        unix_sub,
-        &terminal_input_frame_bytes(b"after-webrtc-loss\r"),
-    );
-    let listed = request_skipping_envelopes(
-        &mut unix,
-        &mut unix_reader,
-        &mut unix_incomplete,
-        &botster_hub_client::DaemonRequest::ListSessions,
-        &mut unix_envelopes,
-    );
+    unix.send_terminal_input(unix_sub, &terminal_input_frame_bytes(b"after-webrtc-loss\r"));
+    let listed = unix.request_skipping(&botster_hub_client::DaemonRequest::ListSessions, &mut unix_envelopes);
     assert!(
         listed
             .sessions
