@@ -60,6 +60,7 @@ fn expected_paste_frames(payload: &[u8]) -> usize {
     payload.len().div_ceil(botster_terminal_protocol::MAX_PASTE_CHUNK_DATA_BYTES) + 2
 }
 
+/// The raw sink has no line editor that can enable bracketed paste wrappers.
 fn paste_sink_command(sink: &Path, ready: &str, done: &str) -> String {
     format!(
         "stty raw -echo; printf '{ready}'; head -c {LIVE_PASTE_BYTES} > {}; printf '{done}'; sleep 30",
@@ -263,7 +264,7 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     envelopes.clear();
     events.clear();
 
-    let frames = terminal_paste_frame_bytes(&payload);
+    let frames = terminal_paste_frame_bytes_allowing_unsafe(&payload);
     assert_eq!(frames.len(), expected_paste_frames(&payload));
     let operation_id = stream.send_terminal_input(subscription_id, &frames[0]);
     for frame in &frames[1..] {
@@ -373,7 +374,7 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
             assert!(Instant::now() < ready_deadline, "modes did not become readable");
         };
 
-        let frames = terminal_paste_frame_bytes(&payload);
+        let frames = terminal_paste_frame_bytes_allowing_unsafe(&payload);
         assert_eq!(frames.len(), expected_paste_frames(&payload));
         let operation_id = peer
             .send_terminal_input(&key, &label, &frames[0])
