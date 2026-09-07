@@ -2654,10 +2654,23 @@ mod tests {
             DaemonResponseKind::TerminalAttached,
             "attach must bind: {response:?}"
         );
-        response
+        let generation = response
             .terminal_attach
             .expect("terminal attach body")
-            .generation
+            .generation;
+        // This fixture drives the continuation directly, so it must apply
+        // the response bookkeeping that `finish` applies in production.
+        record_attached_subscription_change(
+            &mut state.pending_runtime,
+            &mut state.attach_close,
+            &mut state.lifecycle_counters,
+            Some(AttachedSubscriptionChange::Attach(AttachedSubscription {
+                session_id: session_id.to_string(),
+                subscription_id: subscription_id.to_string(),
+            })),
+            None,
+        );
+        generation
     }
 
     #[test]
