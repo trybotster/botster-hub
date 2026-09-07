@@ -69,6 +69,7 @@
     },
     "header_bytes": 33,
     "layout": "[u8 version][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][u32 LE stream_epoch][12-byte nonce][ciphertext || 16-byte tag]",
+    "maximum_plaintext_bytes": 12288,
     "nonce_bytes": 12,
     "route_identity": "subscription DataChannel label",
     "tag_bytes": 16

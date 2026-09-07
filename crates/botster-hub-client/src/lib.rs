@@ -105,6 +105,11 @@ pub const LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION: u16 = 2;
 pub const LOCAL_WEBRTC_MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum serialized encrypted delivery envelope accepted for reassembly.
 pub const LOCAL_WEBRTC_MAX_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum plaintext bytes in one local WebRTC terminal chunk.
+///
+/// The Rust WebRTC peer receives messages through a 16 KiB path. This 12 KiB
+/// limit leaves room for the terminal header, nonce, tag, and transport framing.
+pub const LOCAL_WEBRTC_TERMINAL_CHUNK_MAX_PLAINTEXT_BYTES: usize = 12 * 1024;
 /// Fixed header bytes of one binary local WebRTC terminal chunk.
 ///
 /// ```text
