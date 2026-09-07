@@ -16,7 +16,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use tokio::net::UnixListener as TokioUnixListener;
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{Semaphore, watch};
 
 use crate::HubConfig;
 use crate::HubDaemon;
@@ -33,7 +33,7 @@ use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon_maintenance::{
     BackgroundClass, BackgroundClassScheduler, BackgroundTurnDecision, MaintenanceSliceKind,
     MaintenanceState, OBSERVE_SLICE_BUDGET, PUMP_MAX_ROUTES_VALIDATED, PumpPhase, PumpScheduler,
-    decide_background_slice, run_maintenance_kind,
+    decide_background_slice, run_completion_drain_slice_for_owner, run_maintenance_kind,
 };
 use crate::subscription::attach_routes::{
     AttachStreamRegistry, AttachedSubscription, AttachedSubscriptionChange,
@@ -86,10 +86,14 @@ impl DaemonControlState {
 fn next_owner_deadline(state: &DaemonControlState) -> Option<Instant> {
     let obligation = state.budget.next_obligation_deadline();
     let request = crate::daemon::control::pending::next_request_deadline(&state.pending_requests);
-    match (obligation, request) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (left, right) => left.or(right),
-    }
+    [
+        obligation,
+        request,
+        state.plugin_entities.next_reply_deadline(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 enum OwnerEvent {
@@ -205,6 +209,28 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
                 );
             }
         }
+        MaintenanceSliceKind::CompletionDrain => {
+            if let Some(runtime) = daemon.runtime() {
+                let progress = run_completion_drain_slice_for_owner(
+                    runtime,
+                    &mut state.maintenance,
+                    &mut state.plugin_controls,
+                    &mut state.plugin_entities,
+                    &state.plugin_result_budget,
+                );
+                // A productive partial drain can continue. A zero-item drain
+                // waits for either a later Core publication or a retained-byte
+                // release. Core publishes each notifier after its mailbox push,
+                // and Hub clears that bit before this drain. A concurrent
+                // publication therefore leaves a new bit for the next turn.
+                // If retained bytes blocked the head, an existing charge must
+                // later drop because startup rejects any single completion
+                // larger than the full retained-result capacity.
+                if completion_drain_needs_followup(progress) {
+                    state.maintenance.scheduler.prefer_completion_drain();
+                }
+            }
+        }
         other => {
             if let Some(runtime) = daemon.runtime() {
                 let _ = runtime.apply_event_plane_owner_ops();
@@ -236,6 +262,12 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
     }
 }
 
+fn completion_drain_needs_followup(
+    progress: crate::daemon_maintenance::CompletionDrainProgress,
+) -> bool {
+    progress.item_count > 0 && progress.has_remaining
+}
+
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
     let socket_path = socket_path(&config)?;
     let local_webrtc_terminal_record_path = config
@@ -265,8 +297,17 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 .unwrap_or_default(),
             ..PendingRuntimeState::default()
         },
+        plugin_result_budget: crate::daemon::control::reply::RetainedPluginResultBudget::new(),
         ..DaemonControlState::default()
     };
+    control_state
+        .plugin_result_budget
+        .bind_owner_wake(control_tx.clone());
+    if let Some(runtime) = daemon.runtime() {
+        runtime.install_plugin_completion_notifier(
+            control_state.plugin_result_budget.completion_notifier(),
+        );
+    }
     seed_lifecycle_reconciliation(&mut daemon, &mut control_state);
     let transport_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -291,6 +332,28 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
+        let completion_published = control_state
+            .plugin_result_budget
+            .take_completion_notification();
+        let result_capacity_released = control_state
+            .plugin_result_budget
+            .take_release_notification();
+        if completion_published || result_capacity_released {
+            control_state
+                .maintenance
+                .scheduler
+                .prefer_completion_drain();
+        }
+        crate::daemon::control::entities::retire_plugin_entity_replies(
+            &daemon,
+            &mut control_state,
+            Instant::now(),
+        );
+        crate::daemon::control::entities::expire_plugin_entity_resyncs(
+            &daemon,
+            &mut control_state,
+            Instant::now(),
+        );
         mark_due_reconciliation(&mut control_state, Instant::now());
         let slice_due = control_state
             .background
@@ -404,6 +467,10 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         {
             run_one_owner_background_slice(&mut daemon, &mut control_state);
         }
+        crate::daemon::control::entities::drive_plugin_entity_completions(
+            &mut daemon,
+            &mut control_state,
+        );
         crate::daemon::owner_budget::poll_owner_obligations(
             &mut daemon,
             &mut control_state,
@@ -452,14 +519,26 @@ pub(crate) fn send_control_response(
     response: DaemonTransportResult<DaemonResponse>,
     response_delivery_rx: Option<mpsc::Receiver<()>>,
 ) -> bool {
+    send_control_reply(
+        reply_tx,
+        crate::daemon::control::reply::ControlReply::plain(response),
+        response_delivery_rx,
+    )
+}
+
+pub(crate) fn send_control_reply(
+    reply_tx: ControlReplySender,
+    response: crate::daemon::control::reply::ControlReply,
+    response_delivery_rx: Option<mpsc::Receiver<()>>,
+) -> bool {
     let should_stop = matches!(
-        response,
+        response.response(),
         Ok(DaemonResponse {
             kind: DaemonResponseKind::Shutdown,
             ..
         })
     );
-    let response_received = reply_tx.send(response).is_ok();
+    let response_received = reply_tx.send_reply(response).is_ok();
     wait_for_response_delivery(should_stop, response_received, response_delivery_rx);
     should_stop
 }
@@ -489,9 +568,10 @@ fn install_signal_forwarder(control_tx: ControlSender) -> DaemonTransportResult<
     let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(DaemonTransportError::Io)?;
     thread::spawn(move || {
         if signals.forever().next().is_some() {
-            let (reply_tx, _reply_rx) = oneshot::channel();
+            let (reply_tx, _reply_rx) = crate::daemon::control::message::control_reply_channel();
             let _ = control_tx.blocking_send(ControlMessage::Request {
                 request: Box::new(DaemonRequest::DaemonShutdown),
+                transport_request_id: None,
                 reply_tx,
                 response_delivery_rx: None,
                 grant_id: None,
@@ -813,6 +893,12 @@ pub(crate) struct DaemonControlState {
     pub(crate) pending_hub_update_reply: Option<ControlReplySender>,
     /// Requests whose response waits on a Core owner-thread result.
     pub(crate) pending_requests: Vec<crate::daemon::control::pending::PendingControlRequest>,
+    /// Correlation for non-blocking plugin request-response work.
+    pub(crate) plugin_controls: crate::daemon::control::plugins::PluginControlState,
+    /// Correlation and retained replies for asynchronous entity providers.
+    pub(crate) plugin_entities: crate::daemon::control::entities::PluginEntityState,
+    /// Global logical-byte ownership for drained plugin results and replies.
+    pub(crate) plugin_result_budget: crate::daemon::control::reply::RetainedPluginResultBudget,
     /// Bounded ownership of connections, pending requests, and cleanup
     /// obligations (reserved-channel binds, connection and peer cleanup,
     /// exact-generation releases).
@@ -871,6 +957,10 @@ impl Default for DaemonControlState {
             attach_close: crate::subscription::closed_events::AttachCloseBookkeeping::default(),
             pending_hub_update_reply: None,
             pending_requests: Vec::new(),
+            plugin_controls: crate::daemon::control::plugins::PluginControlState::default(),
+            plugin_entities: crate::daemon::control::entities::PluginEntityState::default(),
+            plugin_result_budget:
+                crate::daemon::control::reply::RetainedPluginResultBudget::default(),
             budget: crate::daemon::owner_budget::OwnerBudget::default(),
             maintenance_reads: crate::daemon_maintenance::MaintenanceCoreReads::default(),
             close_event_decisions: crate::subscription::closed_events::CloseEventDecisions::default(
@@ -984,7 +1074,7 @@ fn receive_test_control_request(
 
 #[cfg(test)]
 fn receive_test_control_reply(
-    receiver: oneshot::Receiver<DaemonTransportResult<DaemonResponse>>,
+    receiver: crate::daemon::control::message::ControlReplyReceiver,
 ) -> DaemonTransportResult<DaemonResponse> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -995,6 +1085,8 @@ fn receive_test_control_reply(
             .await
             .expect("timed out waiting for daemon control reply")
             .expect("daemon control reply sender remains live")
+            .into_parts()
+            .0
     })
 }
 
@@ -1130,6 +1222,28 @@ mod tests {
         assert!(matches!(
             decide_background_slice(&mut scheduler, true),
             BackgroundTurnDecision::OneSlice(_)
+        ));
+    }
+
+    #[test]
+    fn only_a_productive_partial_completion_drain_self_rearms() {
+        assert!(!completion_drain_needs_followup(
+            crate::daemon_maintenance::CompletionDrainProgress {
+                item_count: 0,
+                has_remaining: true,
+            }
+        ));
+        assert!(completion_drain_needs_followup(
+            crate::daemon_maintenance::CompletionDrainProgress {
+                item_count: 1,
+                has_remaining: true,
+            }
+        ));
+        assert!(!completion_drain_needs_followup(
+            crate::daemon_maintenance::CompletionDrainProgress {
+                item_count: 1,
+                has_remaining: false,
+            }
         ));
     }
 
@@ -1740,7 +1854,7 @@ mod tests {
             "shutdown response delivery must pass through the wait enforcement seam"
         );
 
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
         let (response_delivery_tx, response_delivery_rx) = mpsc::channel();
         let (stopped_tx, stopped_rx) = mpsc::channel();
 
@@ -1772,7 +1886,7 @@ mod tests {
 
     #[test]
     fn daemon_shutdown_releases_when_delivery_owner_drops() {
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
         let (response_delivery_tx, response_delivery_rx) = mpsc::channel();
         let (stopped_tx, stopped_rx) = mpsc::channel();
 
@@ -1797,7 +1911,7 @@ mod tests {
 
     #[test]
     fn daemon_shutdown_releases_when_response_receiver_drops() {
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
         let (_response_delivery_tx, response_delivery_rx) = mpsc::channel();
         drop(reply_rx);
 
@@ -1925,6 +2039,7 @@ mod tests {
             lifecycle: DaemonLifecycleCounters::default(),
             client_id: None,
             grant_id: None,
+            transport_request_id: None,
         };
         let mut state = DaemonControlState::default();
         match handle_control_request(daemon, &mut state, observability, control_tx, request) {
@@ -2021,6 +2136,748 @@ mod tests {
             "return botster.register({})\n",
         )
         .expect("write lua plugin");
+    }
+
+    fn write_controlled_gate_lua_plugin(package_dir: &Path) {
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            r#"
+return botster.register({
+  tools = {{
+    name = "owner.controlled_gate",
+    description = "Controlled owner progress test.",
+    input_schema = { type = "object", additionalProperties = false },
+    handler = "controlled_gate",
+    call = function(args)
+      return { value = "released", token = args.token }
+    end,
+  }},
+})
+"#,
+        )
+        .expect("write controlled gate lua plugin");
+    }
+
+    fn write_controlled_entity_gate_lua_plugin(package_dir: &Path) {
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            r#"
+return botster.register({
+  handlers = {
+    {
+      id = "controlled_gate",
+      kind = "entity_provider",
+      descriptor_id = "owner-entity-gate.entity",
+      descriptor = { entity_type = "owner-entity-gate.entity", id_field = "id" },
+      call = function(_request)
+        return {
+          type = "entity_snapshot",
+          entity_type = "owner-entity-gate.entity",
+          snapshot_seq = 1,
+          items = {{ id = "entity-1" }},
+        }
+      end,
+    },
+  },
+})
+"#,
+        )
+        .expect("write controlled entity gate lua plugin");
+    }
+
+    fn write_async_plugin_response_fixture(package_dir: &Path) {
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            r#"
+local function fail_if_requested(request)
+  if request.fail == true or (request.payload and request.payload.fail == true) then
+    error("controlled plugin failure")
+  end
+end
+
+return botster.register({
+  tools = {
+    {
+      name = "owner-responses.responses",
+      description = "Return one controlled result.",
+      input_schema = { type = "object", additionalProperties = true },
+      handler = "responses",
+      call = function(args)
+        fail_if_requested(args)
+        return { path = "mcp", ok = true }
+      end,
+    },
+  },
+  handlers = {
+    {
+      id = "surface",
+      kind = "surface_route",
+      descriptor_id = "response.surface",
+      descriptor = { title = "Response", surface_id = "response.surface" },
+      call = function(request)
+        fail_if_requested(request)
+        return {
+          type = "panel",
+          id = "response-panel",
+          children = {{ type = "text", id = "response-label", props = { text = "ok" } }},
+        }
+      end,
+    },
+    {
+      id = "action",
+      kind = "ui_action",
+      descriptor_id = "response.action",
+      descriptor = { action_id = "response.action", surface_id = "response.surface" },
+      call = function(request)
+        fail_if_requested(request)
+        return {
+          request_id = request.request_id,
+          surface_id = request.surface_id,
+          action_id = request.action_id,
+          node_id = request.node_id,
+          state = "accepted",
+          payload = { path = "action", ok = true },
+        }
+      end,
+    },
+    {
+      id = "entities",
+      kind = "entity_provider",
+      descriptor_id = "owner-responses.entity",
+      descriptor = { entity_type = "owner-responses.entity", id_field = "id" },
+      call = function(request)
+        if request.subscription_id == "entity-failure" then
+          error("controlled entity failure")
+        end
+        return {
+          type = "entity_snapshot",
+          entity_type = "owner-responses.entity",
+          snapshot_seq = 1,
+          items = {{ id = "entity-1", ok = true }},
+        }
+      end,
+    },
+  },
+})
+"#,
+        )
+        .expect("write asynchronous response fixture");
+    }
+
+    fn drive_async_plugin_control(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        request: DaemonRequest,
+        transport_request_id: &str,
+    ) -> DaemonTransportResult<DaemonResponse> {
+        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+        let step = handle_control_request(
+            daemon,
+            state,
+            DaemonObservability {
+                egress: Vec::new(),
+                lifecycle: DaemonLifecycleCounters::default(),
+                client_id: Some("response-fixture-connection".to_string()),
+                grant_id: None,
+                transport_request_id: Some(transport_request_id.to_string()),
+            },
+            control_tx,
+            request,
+        );
+        let crate::daemon::control::pending::ControlStep::Pending(mut pending) = step else {
+            panic!("the plugin response fixture request must be asynchronous");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(runtime) = daemon.runtime() {
+                let DaemonControlState {
+                    maintenance,
+                    plugin_controls,
+                    plugin_entities,
+                    plugin_result_budget,
+                    ..
+                } = state;
+                let _ = run_completion_drain_slice_for_owner(
+                    runtime,
+                    maintenance,
+                    plugin_controls,
+                    plugin_entities,
+                    plugin_result_budget,
+                );
+            }
+            match (pending.continuation)(daemon, state) {
+                crate::daemon::control::pending::ControlPoll::Ready(response) => return response,
+                crate::daemon::control::pending::ControlPoll::ReadyRetained(response) => {
+                    assert!(
+                        state.plugin_result_budget.retained_bytes() > 0,
+                        "the reply must retain its Core logical-byte charge"
+                    );
+                    return response.into_parts().0;
+                }
+                crate::daemon::control::pending::ControlPoll::Pending => {
+                    assert!(Instant::now() < deadline, "plugin response timed out");
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_plugin_request_does_not_block_unrelated_owner_control() {
+        let root = unique_package_control_dir("controlled-plugin-gate");
+        let data_directory = root.join("data");
+        let package_dir = root.join("owner.controlled-gate");
+        write_package_control_manifest(
+            &package_dir,
+            "owner.controlled-gate",
+            serde_json::json!({
+                "capabilities": [{ "surface": "mcp" }],
+                "entrypoints": [
+                    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+                ]
+            }),
+        );
+        write_controlled_gate_lua_plugin(&package_dir);
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config).expect("start controlled gate daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install controlled gate plugin");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner.controlled-gate".to_string(),
+            },
+        )
+        .expect("enable controlled gate plugin");
+
+        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+        let mut state = DaemonControlState::default();
+        crate::lua_runtime::arm_test_plugin_invocation_gate();
+        let held = handle_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonObservability {
+                egress: Vec::new(),
+                lifecycle: DaemonLifecycleCounters::default(),
+                client_id: Some("connection-held".to_string()),
+                grant_id: None,
+                transport_request_id: Some("41".to_string()),
+            },
+            control_tx.clone(),
+            DaemonRequest::PluginMcpCallTool {
+                name: "owner.controlled_gate".to_string(),
+                arguments: serde_json::json!({ "token": "held-request-41" }),
+            },
+        );
+        let crate::daemon::control::pending::ControlStep::Pending(mut held) = held else {
+            panic!("the controlled plugin request must wait for its worker");
+        };
+        // Two seconds is a test safety bound for gate entry.
+        assert!(
+            crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::from_secs(2)),
+            "the controlled plugin worker must enter the gate"
+        );
+        assert!(
+            state
+                .plugin_controls
+                .has_transport_correlation("connection-held", "41"),
+            "the held Core request must retain its exact transport correlation"
+        );
+
+        // Two seconds is a test safety bound. It is not a Status latency requirement.
+        let status_started = Instant::now();
+        let status = handle_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonObservability {
+                egress: Vec::new(),
+                lifecycle: DaemonLifecycleCounters::default(),
+                client_id: Some("connection-status".to_string()),
+                grant_id: None,
+                transport_request_id: Some("7".to_string()),
+            },
+            control_tx,
+            DaemonRequest::Status,
+        );
+        let crate::daemon::control::pending::ControlStep::Pending(mut status) = status else {
+            panic!("status must wait only for its independent Core read");
+        };
+        let status_deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            match (status.continuation)(&mut daemon, &mut state) {
+                crate::daemon::control::pending::ControlPoll::Ready(response) => break response,
+                crate::daemon::control::pending::ControlPoll::ReadyRetained(_) => {
+                    panic!("status must not carry a plugin-result charge")
+                }
+                crate::daemon::control::pending::ControlPoll::Pending => {
+                    assert!(
+                        Instant::now() < status_deadline,
+                        "unrelated status exceeded the safety deadline"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+        assert_eq!(
+            status.expect("status response").kind,
+            DaemonResponseKind::Status
+        );
+        assert!(
+            status_started.elapsed() < Duration::from_secs(2),
+            "unrelated owner control exceeded the safety deadline"
+        );
+
+        crate::lua_runtime::release_test_plugin_invocation_gate();
+        // Five seconds is a test safety bound. It is not a plugin latency requirement.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let response = loop {
+            if let Some(runtime) = daemon.runtime() {
+                let DaemonControlState {
+                    maintenance,
+                    plugin_controls,
+                    plugin_entities,
+                    plugin_result_budget,
+                    ..
+                } = &mut state;
+                run_completion_drain_slice_for_owner(
+                    runtime,
+                    maintenance,
+                    plugin_controls,
+                    plugin_entities,
+                    plugin_result_budget,
+                );
+            }
+            match (held.continuation)(&mut daemon, &mut state) {
+                crate::daemon::control::pending::ControlPoll::Ready(response) => break response,
+                crate::daemon::control::pending::ControlPoll::ReadyRetained(response) => {
+                    break response.into_parts().0;
+                }
+                crate::daemon::control::pending::ControlPoll::Pending => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "held plugin reply exceeded the safety deadline"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        .expect("held plugin response");
+        assert_eq!(response.kind, DaemonResponseKind::PluginMcpToolResult);
+        assert_eq!(response.plugin_tool_result["value"], "released");
+        assert_eq!(response.plugin_tool_result["token"], "held-request-41");
+        assert!(
+            !state
+                .plugin_controls
+                .has_transport_correlation("connection-held", "41"),
+            "the correlated row must retire after the exact held reply"
+        );
+        daemon.stop();
+    }
+
+    #[test]
+    fn asynchronous_plugin_paths_preserve_success_and_failure_response_shapes() {
+        let root = unique_package_control_dir("async-plugin-response-shapes");
+        let data_directory = root.join("data");
+        let package_dir = root.join("owner-responses");
+        write_package_control_manifest(
+            &package_dir,
+            "owner-responses",
+            serde_json::json!({
+                "capabilities": [
+                    { "surface": "mcp" },
+                    { "surface": "surfaces" }
+                ],
+                "surfaces": [{
+                    "id": "response.surface",
+                    "kind": "app",
+                    "title": "Response",
+                    "supports": ["render", "action"]
+                }],
+                "entrypoints": [
+                    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+                ]
+            }),
+        );
+        write_async_plugin_response_fixture(&package_dir);
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config).expect("start response-shape daemon");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install response-shape plugin");
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner-responses".to_string(),
+            },
+        )
+        .expect("enable response-shape plugin");
+        let mut state = DaemonControlState::default();
+
+        let mcp_success = drive_async_plugin_control(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::PluginMcpCallTool {
+                name: "owner-responses.responses".to_string(),
+                arguments: serde_json::json!({ "fail": false }),
+            },
+            "mcp-success",
+        )
+        .expect("MCP success response");
+        assert_eq!(mcp_success.kind, DaemonResponseKind::PluginMcpToolResult);
+        assert_eq!(mcp_success.plugin_tool_result["path"], "mcp");
+
+        let mcp_failure = drive_async_plugin_control(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::PluginMcpCallTool {
+                name: "owner-responses.responses".to_string(),
+                arguments: serde_json::json!({ "fail": true }),
+            },
+            "mcp-failure",
+        )
+        .expect("MCP handler failures are typed operator responses");
+        assert_eq!(mcp_failure.kind, DaemonResponseKind::OperatorError);
+        assert!(mcp_failure.error.is_some());
+
+        let render_success = drive_async_plugin_control(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::PluginSurfaceRender {
+                package_name: "owner-responses".to_string(),
+                surface_id: "response.surface".to_string(),
+                payload: serde_json::json!({ "fail": false }),
+            },
+            "render-success",
+        )
+        .expect("render success response");
+        assert_eq!(render_success.kind, DaemonResponseKind::PluginSurface);
+        assert_eq!(
+            render_success
+                .plugin_surface
+                .as_ref()
+                .map(|surface| surface.surface_id.as_str()),
+            Some("response.surface")
+        );
+        assert!(matches!(
+            drive_async_plugin_control(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::PluginSurfaceRender {
+                    package_name: "owner-responses".to_string(),
+                    surface_id: "response.surface".to_string(),
+                    payload: serde_json::json!({ "fail": true }),
+                },
+                "render-failure",
+            ),
+            Err(DaemonTransportError::Client(_))
+        ));
+
+        let action_request = |request_id: &str, fail: bool| {
+            serde_json::from_value(serde_json::json!({
+                "request_id": request_id,
+                "surface_id": "response.surface",
+                "action_id": "response.action",
+                "node_id": "response-form",
+                "kind": "submit",
+                "values": {},
+                "payload": { "fail": fail }
+            }))
+            .expect("canonical UI action request")
+        };
+        let action_success = drive_async_plugin_control(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::PluginSurfaceAction {
+                package_name: "owner-responses".to_string(),
+                request: action_request("action-success", false),
+            },
+            "action-success",
+        )
+        .expect("action success response");
+        assert_eq!(action_success.kind, DaemonResponseKind::PluginActionResult);
+        assert_eq!(
+            action_success
+                .plugin_action_result
+                .as_ref()
+                .and_then(|result| result.payload.as_ref())
+                .map(|payload| &payload["path"]),
+            Some(&serde_json::json!("action"))
+        );
+        assert!(matches!(
+            drive_async_plugin_control(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::PluginSurfaceAction {
+                    package_name: "owner-responses".to_string(),
+                    request: action_request("action-failure", true),
+                },
+                "action-failure",
+            ),
+            Err(DaemonTransportError::Client(_))
+        ));
+
+        for (subscription_id, expected_kind) in [
+            ("entity-success", DaemonResponseKind::EntitySubscribed),
+            ("entity-failure", DaemonResponseKind::OperatorError),
+        ] {
+            let (frame_tx, _frame_rx) = tokio_mpsc::channel(8);
+            let (reply_tx, mut reply_rx) = crate::daemon::control::message::control_reply_channel();
+            crate::daemon::control::entities::handle(
+                &mut daemon,
+                &mut state,
+                ControlMessage::SubscribeEntities {
+                    entity_type: "owner-responses.entity".to_string(),
+                    subscription_id: subscription_id.to_string(),
+                    transport_request_id: Some(format!("transport-{subscription_id}")),
+                    client_id: Some("response-fixture-connection".to_string()),
+                    frame_tx: crate::subscription::entity::EntityFrameSender::Async(frame_tx),
+                    frame_rx: None,
+                    reply_tx,
+                    grant_id: None,
+                },
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let response = loop {
+                if let Some(runtime) = daemon.runtime() {
+                    let DaemonControlState {
+                        maintenance,
+                        plugin_controls,
+                        plugin_entities,
+                        plugin_result_budget,
+                        ..
+                    } = &mut state;
+                    let _ = run_completion_drain_slice_for_owner(
+                        runtime,
+                        maintenance,
+                        plugin_controls,
+                        plugin_entities,
+                        plugin_result_budget,
+                    );
+                }
+                crate::daemon::control::entities::drive_plugin_entity_completions(
+                    &mut daemon,
+                    &mut state,
+                );
+                match reply_rx.try_recv() {
+                    Ok(reply) => break reply.into_parts().0.expect("entity response"),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        assert!(Instant::now() < deadline, "entity response timed out");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("entity reply channel failed: {error}"),
+                }
+            };
+            assert_eq!(response.kind, expected_kind);
+            if expected_kind == DaemonResponseKind::OperatorError {
+                assert!(response.error.is_some());
+            }
+        }
+        daemon.stop();
+    }
+
+    #[test]
+    fn abandoned_plugin_replies_release_owner_capacity_while_execution_remains_live() {
+        for retire_reason in ["reply_closed", "deadline"] {
+            let root = unique_package_control_dir(&format!("controlled-plugin-{retire_reason}"));
+            let data_directory = root.join("data");
+            let package_dir = root.join("owner.controlled-gate");
+            write_package_control_manifest(
+                &package_dir,
+                "owner.controlled-gate",
+                serde_json::json!({
+                    "capabilities": [{ "surface": "mcp" }],
+                    "entrypoints": [
+                        { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+                    ]
+                }),
+            );
+            write_controlled_gate_lua_plugin(&package_dir);
+            let config = package_control_config(data_directory);
+            let mut daemon = HubDaemon::start(config).expect("start controlled gate daemon");
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::InstallPackageLocalPath { path: package_dir },
+            )
+            .expect("install controlled gate plugin");
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::EnablePackage {
+                    package_name: "owner.controlled-gate".to_string(),
+                },
+            )
+            .expect("enable controlled gate plugin");
+
+            let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+            let mut state = DaemonControlState::default();
+            crate::lua_runtime::arm_test_plugin_invocation_gate();
+            let request = DaemonRequest::PluginMcpCallTool {
+                name: "owner.controlled_gate".to_string(),
+                arguments: serde_json::json!({ "token": retire_reason }),
+            };
+            let step = handle_control_request(
+                &mut daemon,
+                &mut state,
+                DaemonObservability {
+                    egress: Vec::new(),
+                    lifecycle: DaemonLifecycleCounters::default(),
+                    client_id: Some(format!("connection-{retire_reason}")),
+                    grant_id: None,
+                    transport_request_id: Some("91".to_string()),
+                },
+                control_tx,
+                request.clone(),
+            );
+            let crate::daemon::control::pending::ControlStep::Pending(step) = step else {
+                panic!("the controlled plugin request must wait for its worker");
+            };
+            assert!(
+                crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::from_secs(2)),
+                "the controlled plugin worker must enter the gate"
+            );
+            let permit = state.budget.reserve().expect("pending request permit");
+            let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+            let mut reply_rx = Some(reply_rx);
+            let accepted_at = if retire_reason == "deadline" {
+                Instant::now()
+                    .checked_sub(crate::daemon::owner_budget::RETAINED_OPERATION_DEADLINE)
+                    .expect("deadline timestamp")
+            } else {
+                Instant::now()
+            };
+            if retire_reason == "reply_closed" {
+                drop(reply_rx.take());
+            }
+            state
+                .pending_requests
+                .push(crate::daemon::control::pending::PendingControlRequest {
+                    request,
+                    reply_tx,
+                    response_delivery_rx: None,
+                    grant_id: None,
+                    client: Some(format!("connection-{retire_reason}")),
+                    permit: Some(permit),
+                    accepted_at,
+                    must_finish: false,
+                    past_deadline: false,
+                    continuation: step.continuation,
+                    retire: step.retire,
+                });
+            assert_eq!(state.budget.outstanding(), 1);
+
+            crate::daemon::control::pending::poll_pending_requests(
+                &mut daemon,
+                &mut state,
+                Instant::now(),
+                |_, _, _, _| panic!("an abandoned held request must retire before completion"),
+            );
+
+            assert!(state.pending_requests.is_empty());
+            assert_eq!(state.budget.outstanding(), 0);
+            assert!(
+                !state
+                    .plugin_controls
+                    .has_transport_correlation(&format!("connection-{retire_reason}"), "91"),
+                "retirement must remove the reply correlation"
+            );
+            assert!(
+                crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::ZERO),
+                "Core execution must remain live after Hub releases reply capacity"
+            );
+
+            crate::lua_runtime::release_test_plugin_invocation_gate();
+            drop(reply_rx);
+            daemon.stop();
+        }
+    }
+
+    #[test]
+    fn abandoned_plugin_entity_subscriptions_release_owner_capacity() {
+        for retire_reason in ["connection_close", "deadline"] {
+            let root =
+                unique_package_control_dir(&format!("controlled-plugin-entity-{retire_reason}"));
+            let data_directory = root.join("data");
+            let package_dir = root.join("owner-entity-gate");
+            write_package_control_manifest(
+                &package_dir,
+                "owner-entity-gate",
+                serde_json::json!({
+                    "entrypoints": [
+                        { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+                    ]
+                }),
+            );
+            write_controlled_entity_gate_lua_plugin(&package_dir);
+            let config = package_control_config(data_directory);
+            let mut daemon = HubDaemon::start(config).expect("start controlled entity daemon");
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::InstallPackageLocalPath { path: package_dir },
+            )
+            .expect("install controlled entity plugin");
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::EnablePackage {
+                    package_name: "owner-entity-gate".to_string(),
+                },
+            )
+            .expect("enable controlled entity plugin");
+
+            let mut state = DaemonControlState::default();
+            let baseline = state.budget.outstanding();
+            let connection_id = format!("entity-connection-{retire_reason}");
+            let (frame_tx, _frame_rx) = tokio_mpsc::channel(8);
+            let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+            crate::lua_runtime::arm_test_plugin_invocation_gate();
+            crate::daemon::control::entities::handle(
+                &mut daemon,
+                &mut state,
+                ControlMessage::SubscribeEntities {
+                    entity_type: "owner-entity-gate.entity".to_string(),
+                    subscription_id: format!("entity-subscription-{retire_reason}"),
+                    transport_request_id: Some("92".to_string()),
+                    client_id: Some(connection_id.clone()),
+                    frame_tx: crate::subscription::entity::EntityFrameSender::Async(frame_tx),
+                    frame_rx: None,
+                    reply_tx,
+                    grant_id: None,
+                },
+            );
+            assert_eq!(state.budget.outstanding(), baseline + 1);
+            assert!(
+                crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::from_secs(2)),
+                "the controlled entity worker must enter the gate"
+            );
+
+            if retire_reason == "connection_close" {
+                crate::daemon::control::entities::retire_plugin_entity_connection(
+                    &daemon,
+                    &mut state,
+                    &connection_id,
+                );
+            } else {
+                crate::daemon::control::entities::retire_plugin_entity_replies(
+                    &daemon,
+                    &mut state,
+                    Instant::now() + crate::daemon::owner_budget::RETAINED_OPERATION_DEADLINE,
+                );
+            }
+
+            assert_eq!(state.budget.outstanding(), baseline);
+            assert!(state.plugin_entities.next_reply_deadline().is_none());
+            assert!(
+                crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::ZERO),
+                "Core execution must remain live after Hub releases entity reply capacity"
+            );
+
+            crate::lua_runtime::release_test_plugin_invocation_gate();
+            drop(reply_rx);
+            daemon.stop();
+        }
     }
 
     fn write_broken_entrypoint(package_dir: &Path) {
@@ -2620,6 +3477,7 @@ mod tests {
             lifecycle: DaemonLifecycleCounters::default(),
             client_id: Some("reconcile-client".to_string()),
             grant_id: None,
+            transport_request_id: None,
         };
         let step = handle_control_request(
             daemon,
@@ -2642,6 +3500,9 @@ mod tests {
             match (pending.continuation)(daemon, state) {
                 crate::daemon::control::pending::ControlPoll::Ready(response) => {
                     break response.expect("attach response");
+                }
+                crate::daemon::control::pending::ControlPoll::ReadyRetained(_) => {
+                    panic!("attach must not carry a plugin-result charge")
                 }
                 crate::daemon::control::pending::ControlPoll::Pending => {
                     assert!(Instant::now() < deadline, "attach continuation timed out");

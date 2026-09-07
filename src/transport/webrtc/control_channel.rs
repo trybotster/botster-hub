@@ -21,7 +21,7 @@ use botster_hub_client::{
     OPERATOR_ERROR_TOO_MANY_REQUESTS, PROTOCOL, PROTOCOL_VERSION, ServerFrame, parse_request_id,
 };
 use bytes::BytesMut;
-use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch};
+use tokio::sync::{mpsc as tokio_mpsc, watch};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::runtime::timeout;
 
@@ -32,8 +32,11 @@ use botster_terminal_protocol::{
 use crate::admission::unix_hello::WebrtcTerminalAdmission;
 use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::control_request_operation_label;
-use crate::daemon::control::message::{ControlMessage, ControlSender};
-use crate::subscription::attach_routes::hello_requires_terminal_subscription_closed;
+use crate::daemon::control::message::{ControlMessage, ControlSender, control_reply_channel};
+use crate::subscription::attach_routes::{
+    EntitySubscriptionChange, RequestCompletionProjection,
+    hello_requires_terminal_subscription_closed,
+};
 use crate::subscription::entity::EntityFrameSender;
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::delivery::{
@@ -42,7 +45,6 @@ use crate::transport::webrtc::delivery::{
 use crate::transport::webrtc::peer::{
     LOCAL_WEBRTC_PEER_CLOSE_BOUND, LocalWebrtcPeerState, LocalWebrtcTerminalCause, webrtc_runtime,
 };
-use crate::transport::webrtc::subscription_channel::local_webrtc_attach_change_for_response;
 
 /// Requests held in the inbound queue while one request is in service.
 pub(crate) const LOCAL_WEBRTC_PENDING_REQUESTS: usize = MAX_OUTSTANDING_REQUESTS;
@@ -429,18 +431,9 @@ where
         };
 
         peer_state.begin_request(&request);
-        let ownership_request = request.as_ref().clone();
-        let entity_subscription_change = match request.as_ref() {
-            DaemonRequest::SubscribeEntities {
-                subscription_id, ..
-            } => Some((true, subscription_id.clone())),
-            DaemonRequest::UnsubscribeEntities { subscription_id } => {
-                Some((false, subscription_id.clone()))
-            }
-            _ => None,
-        };
+        let completion_projection = RequestCompletionProjection::from_request(request.as_ref());
         let daemon_shutdown = matches!(*request, DaemonRequest::DaemonShutdown);
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         let (response_delivery_tx, response_delivery_rx) = if daemon_shutdown {
             let (tx, rx) = mpsc::channel();
             (Some(tx), Some(rx))
@@ -459,6 +452,8 @@ where
                     .send(ControlMessage::SubscribeEntities {
                         entity_type,
                         subscription_id,
+                        transport_request_id: Some(request_id.clone()),
+                        client_id: Some(format!("botster-hub-webrtc-{}", peer_state.grant_id)),
                         frame_tx: EntityFrameSender::Async(frame_tx),
                         frame_rx: Some(frame_rx),
                         reply_tx,
@@ -479,6 +474,7 @@ where
                 runtime_tx
                     .send(ControlMessage::Request {
                         request: Box::new(request),
+                        transport_request_id: Some(request_id.clone()),
                         reply_tx,
                         response_delivery_rx,
                         grant_id: Some(peer_state.grant_id.clone()),
@@ -492,33 +488,48 @@ where
             terminal_cause = LocalWebrtcTerminalCause::RuntimeQueueClosed;
             break;
         }
-        let response = match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
-            Ok(Ok(Ok(response))) => response,
-            Ok(Ok(Err(error))) => response_with_diagnostic(DaemonDiagnostic::action_failure(
-                "local_webrtc_data_channel",
-                error.to_string(),
-            )),
-            Ok(Err(_)) => response_with_diagnostic(DaemonDiagnostic::action_failure(
-                "local_webrtc_data_channel",
-                "runtime reply channel closed",
-            )),
-            Err(_) => response_with_diagnostic(DaemonDiagnostic::action_failure(
-                "local_webrtc_data_channel",
-                "runtime request timed out",
-            )),
-        };
+        let (response, plugin_result_charge) =
+            match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+                Ok(Ok(reply)) => {
+                    let (response, charge) = reply.into_parts();
+                    let response = response.unwrap_or_else(|error| {
+                        response_with_diagnostic(DaemonDiagnostic::action_failure(
+                            "local_webrtc_data_channel",
+                            error.to_string(),
+                        ))
+                    });
+                    (response, charge)
+                }
+                Ok(Err(_)) => (
+                    response_with_diagnostic(DaemonDiagnostic::action_failure(
+                        "local_webrtc_data_channel",
+                        "runtime reply channel closed",
+                    )),
+                    None,
+                ),
+                Err(_) => (
+                    response_with_diagnostic(DaemonDiagnostic::action_failure(
+                        "local_webrtc_data_channel",
+                        "runtime request timed out",
+                    )),
+                    None,
+                ),
+            };
         // OperatorError and Attach attach_failed create no ownership. PeerClosed
         // must not send Detach for a failed attach.
-        peer_state.apply_subscription_change(local_webrtc_attach_change_for_response(
-            &ownership_request,
-            &response,
-        ));
-        if let Some((subscribed, subscription_id)) = entity_subscription_change {
-            if subscribed && response.kind == DaemonResponseKind::EntitySubscribed {
+        peer_state.apply_subscription_change(
+            completion_projection
+                .attached_subscription_change(&response)
+                .map(Into::into),
+        );
+        match completion_projection.entity_subscription_change(&response) {
+            Some(EntitySubscriptionChange::Subscribe(subscription_id)) => {
                 peer_state.add_entity_subscription(subscription_id);
-            } else if !subscribed && response.kind == DaemonResponseKind::EntityUnsubscribed {
+            }
+            Some(EntitySubscriptionChange::Unsubscribe(subscription_id)) => {
                 peer_state.remove_entity_subscription(&subscription_id);
             }
+            None => {}
         }
         let Ok(frames) = framed_daemon_response(stream_key, &request_id, &response) else {
             if let Some(response_delivery_tx) = response_delivery_tx {
@@ -527,6 +538,8 @@ where
             terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
             break;
         };
+        // The framed delivery now owns its independent transport storage.
+        drop(plugin_result_charge);
         let delivery = send_response_frames(
             data_channel,
             stream_key,

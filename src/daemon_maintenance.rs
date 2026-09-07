@@ -58,7 +58,6 @@ const EVENT_INVOCATION_TIMEOUT_MS: u64 = 1_000;
 const SESSION_CHUNK_MAX_ITEMS: usize = 8;
 const SESSION_CHUNK_MAX_BYTES: usize = 32 * 1024;
 const COMPLETION_DRAIN_MAX_ITEMS: usize = 8;
-const COMPLETION_DRAIN_MAX_BYTES: usize = 32 * 1024;
 const FAMILY_QUEUE_MAX_ITEMS: usize = 32;
 const FAMILY_QUEUE_MAX_BYTES: usize = 64 * 1024;
 const FANOUT_QUEUE_MAX_ITEMS: usize = 32;
@@ -152,6 +151,12 @@ impl MaintenanceScheduler {
     pub fn prefer_subscriber_delivery(&mut self) {
         self.wake = true;
         self.next = MaintenanceSliceKind::SubscriberDelivery;
+    }
+
+    /// Drain plugin completions on the next maintenance slice.
+    pub fn prefer_completion_drain(&mut self) {
+        self.wake = true;
+        self.next = MaintenanceSliceKind::CompletionDrain;
     }
 
     /// True when an idle owner turn should run one slice.
@@ -1483,12 +1488,79 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
 }
 
 fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
+    let budget = crate::daemon::control::reply::RetainedPluginResultBudget::new();
+    let _ = run_completion_drain_slice_with_controls(runtime, state, &budget);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompletionDrainProgress {
+    pub(crate) item_count: usize,
+    pub(crate) has_remaining: bool,
+}
+
+pub(crate) fn run_completion_drain_slice_for_owner(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    controls: &mut crate::daemon::control::plugins::PluginControlState,
+    entities: &mut crate::daemon::control::entities::PluginEntityState,
+    result_budget: &crate::daemon::control::reply::RetainedPluginResultBudget,
+) -> CompletionDrainProgress {
+    run_completion_drain_slice_with_owner_routes(
+        runtime,
+        state,
+        Some(controls),
+        Some(entities),
+        result_budget,
+    )
+}
+
+fn run_completion_drain_slice_with_controls(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    result_budget: &crate::daemon::control::reply::RetainedPluginResultBudget,
+) -> CompletionDrainProgress {
+    run_completion_drain_slice_with_owner_routes(runtime, state, None, None, result_budget)
+}
+
+fn run_completion_drain_slice_with_owner_routes(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    mut controls: Option<&mut crate::daemon::control::plugins::PluginControlState>,
+    mut entities: Option<&mut crate::daemon::control::entities::PluginEntityState>,
+    result_budget: &crate::daemon::control::reply::RetainedPluginResultBudget,
+) -> CompletionDrainProgress {
     flush_pending_event_retirements(runtime, state);
-    let drain =
-        runtime.drain_plugin_completions(COMPLETION_DRAIN_MAX_ITEMS, COMPLETION_DRAIN_MAX_BYTES);
-    for completion in drain.completions {
-        apply_plugin_completion(runtime, state, &completion);
+    let drain = runtime
+        .drain_plugin_completions(COMPLETION_DRAIN_MAX_ITEMS, result_budget.available_bytes());
+    let progress = CompletionDrainProgress {
+        item_count: drain.item_count,
+        has_remaining: drain.has_remaining,
+    };
+    for item in drain.completions {
+        let charge = result_budget
+            .try_reserve(item.encoded_len)
+            .expect("Core completion drain exceeded the supplied retained-result byte limit");
+        let completion =
+            crate::daemon::control::reply::RetainedPluginResult::new(item.completion, charge);
+        let completion = if let Some(controls) = controls.as_deref_mut() {
+            match controls.route_completion(completion) {
+                None => continue,
+                Some(completion) => completion,
+            }
+        } else {
+            completion
+        };
+        let completion = if let Some(entities) = entities.as_deref_mut() {
+            match entities.route_completion(completion) {
+                None => continue,
+                Some(completion) => completion,
+            }
+        } else {
+            completion
+        };
+        apply_plugin_completion(runtime, state, completion.value());
     }
+    progress
 }
 
 fn apply_plugin_completion(
@@ -4039,6 +4111,70 @@ return botster.register({})
         assert_eq!(snapshot.queued_holders, 0);
         assert_eq!(snapshot.admitted_holders, 0);
         assert_eq!(snapshot.global_in_flight_bytes, 0);
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn insufficient_nonzero_result_capacity_waits_for_release_before_drain_progress() {
+        let (registry, package_root) = install_lua_event_plugin(
+            "capacity-block",
+            r#"
+events.on("hub", "worktree_created", function(event)
+  return { received = event.event, body = string.rep("x", 4096) }
+end)
+return botster.register({})
+"#,
+        );
+        let (mut runtime, data_directory) = event_delivery_runtime("capacity-block");
+        runtime
+            .load_lua_plugin_package(&registry, "event-probe.plugin")
+            .expect("load capacity-block plugin");
+        ingress_worktree_created(&runtime);
+        let mut state = MaintenanceState::default();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert_eq!(state.event_in_flight.len(), 1);
+
+        let publish_deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime
+            .drain_plugin_completions(0, usize::MAX)
+            .has_remaining
+        {
+            assert!(
+                Instant::now() < publish_deadline,
+                "Core did not publish the capacity-block completion"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let budget = crate::daemon::control::reply::RetainedPluginResultBudget::new();
+        let blocker = budget
+            .try_reserve(crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY - 128)
+            .expect("reserve all but a nonzero tail");
+        let blocked = run_completion_drain_slice_with_controls(&runtime, &mut state, &budget);
+        assert_eq!(blocked.item_count, 0);
+        assert!(blocked.has_remaining);
+        assert_eq!(budget.available_bytes(), 128);
+        assert!(
+            !budget.take_release_notification(),
+            "unchanged capacity must not create a retry wake"
+        );
+        assert_eq!(
+            state.event_in_flight.len(),
+            1,
+            "a zero-progress drain must leave the completion pending"
+        );
+
+        drop(blocker);
+        assert!(
+            budget.take_release_notification(),
+            "dropping retained storage must publish the resume wake"
+        );
+        let resumed = run_completion_drain_slice_with_controls(&runtime, &mut state, &budget);
+        assert_eq!(resumed.item_count, 1);
+        assert!(!resumed.has_remaining);
+        assert!(state.event_in_flight.is_empty());
+
         let _ = std::fs::remove_dir_all(package_root);
         let _ = std::fs::remove_dir_all(data_directory);
     }

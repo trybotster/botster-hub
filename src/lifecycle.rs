@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 
 use botster_core::{
     BoundaryJson, PluginAdmissionResult, PluginCleanupResult, PluginCleanupScope,
-    PluginCompletionDrain, PluginDescriptorKind, PluginHandlerRegistration, PluginInvocationClass,
-    PluginInvocationOutcome, PluginInvocationRequest, PluginKey, PluginLoadSpec,
-    PluginOwnedDescriptor, PluginReloadSpec, PluginResourceRef, PluginRuntime, PluginUnloadSpec,
-    PluginWorkerDebugSnapshot, PluginWorkerEngine, PluginWorkerEngineConfig,
-    PluginWorkerRegistration, RequestId,
+    PluginCompletionDrain, PluginCompletionNotifier, PluginDescriptorKind,
+    PluginHandlerRegistration, PluginInvocationClass, PluginInvocationOutcome,
+    PluginInvocationRequest, PluginKey, PluginLoadSpec, PluginOwnedDescriptor, PluginReloadSpec,
+    PluginResourceRef, PluginRuntime, PluginUnloadSpec, PluginWorkerDebugSnapshot,
+    PluginWorkerEngine, PluginWorkerEngineConfig, PluginWorkerRegistration, RequestId,
 };
 
 use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
@@ -157,6 +157,11 @@ impl HubPluginLifecycle {
     #[must_use]
     pub fn drain_completions(&self, max_items: usize, max_bytes: usize) -> PluginCompletionDrain {
         self.engine.drain_completions(max_items, max_bytes)
+    }
+
+    /// Install Hub's owner-loop notification for published completions.
+    pub fn install_completion_notifier(&self, notifier: PluginCompletionNotifier) {
+        self.engine.install_completion_notifier(notifier);
     }
 
     /// Reload an enabled package through core worker reload cleanup and replacement.

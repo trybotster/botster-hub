@@ -2283,7 +2283,7 @@ pub enum HubClientError {
 /// Result alias for client API requests.
 pub type HubClientResult<T> = Result<T, HubClientError>;
 
-fn admit_plugin_surface_operation(
+pub(crate) fn admit_plugin_surface_operation(
     packages: &PackageRegistry,
     package_name: &str,
     surface_id: &str,
@@ -2454,7 +2454,7 @@ mod runtime_error_tests {
     }
 }
 
-fn plugin_error(
+pub(crate) fn plugin_error(
     request_id: RequestId,
     operation: HubClientOperation,
     error: crate::McpToolError,

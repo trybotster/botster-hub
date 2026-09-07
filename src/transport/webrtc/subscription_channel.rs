@@ -8,7 +8,7 @@
 use botster_core::AesGcmKey;
 use botster_hub_client::{
     ClientFrame, DaemonCompatibility, DaemonDiagnostic, DaemonEntityFrame, DaemonHello,
-    DaemonHelloAck, DaemonRequest, DaemonResponse, PROTOCOL, PROTOCOL_VERSION, ServerFrame,
+    DaemonHelloAck, PROTOCOL, PROTOCOL_VERSION, ServerFrame,
 };
 use botster_terminal_protocol::{
     TerminalCompatibility, ensure_compatible as ensure_terminal_compatible,
@@ -27,7 +27,6 @@ use crate::transport::webrtc::delivery::{
 };
 use crate::transport::webrtc::peer::LocalWebrtcPeerState;
 
-use crate::subscription::attach_routes::response_records_attach_ownership;
 use crate::transport::webrtc::control_channel::LocalWebrtcDataChannel;
 use crate::transport::webrtc::peer::LOCAL_WEBRTC_PEER_CLOSE_BOUND;
 #[cfg(test)]
@@ -93,37 +92,27 @@ pub(crate) enum LocalWebrtcAttachedSubscriptionChange {
     Detach(LocalWebrtcAttachedSubscription),
 }
 
-pub(crate) fn local_webrtc_attach_change_for_response(
-    request: &DaemonRequest,
-    response: &DaemonResponse,
-) -> Option<LocalWebrtcAttachedSubscriptionChange> {
-    if !response_records_attach_ownership(response) {
-        return None;
-    }
-    LocalWebrtcAttachedSubscriptionChange::from_request(request)
-}
-
-impl LocalWebrtcAttachedSubscriptionChange {
-    pub(crate) fn from_request(request: &DaemonRequest) -> Option<Self> {
-        match request {
-            DaemonRequest::Attach {
-                session_id,
-                subscription_id,
-            } => Some(Self::Attach(LocalWebrtcAttachedSubscription {
-                session_id: session_id.clone(),
-                subscription_id: subscription_id.clone(),
-            })),
-            DaemonRequest::Detach {
-                session_id,
-                subscription_id,
-            } => Some(Self::Detach(LocalWebrtcAttachedSubscription {
-                session_id: session_id.clone(),
-                subscription_id: subscription_id.clone(),
-            })),
-            _ => None,
+impl From<crate::subscription::attach_routes::AttachedSubscriptionChange>
+    for LocalWebrtcAttachedSubscriptionChange
+{
+    fn from(change: crate::subscription::attach_routes::AttachedSubscriptionChange) -> Self {
+        match change {
+            crate::subscription::attach_routes::AttachedSubscriptionChange::Attach(
+                subscription,
+            ) => Self::Attach(LocalWebrtcAttachedSubscription {
+                session_id: subscription.session_id,
+                subscription_id: subscription.subscription_id,
+            }),
+            crate::subscription::attach_routes::AttachedSubscriptionChange::Detach(
+                subscription,
+            ) => Self::Detach(LocalWebrtcAttachedSubscription {
+                session_id: subscription.session_id,
+                subscription_id: subscription.subscription_id,
+            }),
         }
     }
 }
+
 pub(crate) async fn admit_reserved_subscription_channel<C>(
     grant_id: &str,
     label: &str,

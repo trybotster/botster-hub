@@ -414,6 +414,7 @@ pub(crate) fn handle_peer_closed(
     // abandoned reads. Every grant still holding its permit hands it to its
     // own cleanup obligation, or releases it when it owns no route.
     for removed in &removed_grants {
+        crate::daemon::control::entities::retire_plugin_entity_connection(daemon, state, removed);
         retire_abandoned_requests(daemon, state, removed);
     }
     for grant in &cleaning_grants {

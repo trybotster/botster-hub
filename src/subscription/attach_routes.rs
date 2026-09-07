@@ -805,7 +805,7 @@ pub(crate) struct AttachedSubscription {
     pub subscription_id: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AttachedSubscriptionChange {
     Attach(AttachedSubscription),
     Detach(AttachedSubscription),
@@ -934,6 +934,68 @@ pub(crate) fn attached_subscription_change_for_response(
     AttachedSubscriptionChange::from_request(request)
 }
 
+/// Small request projection retained until a transport receives the response.
+///
+/// The projection keeps only identifiers used by post-response ownership
+/// bookkeeping. It does not retain plugin arguments or other request payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestCompletionProjection {
+    attached_subscription: Option<AttachedSubscriptionChange>,
+    entity_subscription: Option<EntitySubscriptionChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EntitySubscriptionChange {
+    Subscribe(String),
+    Unsubscribe(String),
+}
+
+impl RequestCompletionProjection {
+    pub(crate) fn from_request(request: &DaemonRequest) -> Self {
+        let entity_subscription = match request {
+            DaemonRequest::SubscribeEntities {
+                subscription_id, ..
+            } => Some(EntitySubscriptionChange::Subscribe(subscription_id.clone())),
+            DaemonRequest::UnsubscribeEntities { subscription_id } => Some(
+                EntitySubscriptionChange::Unsubscribe(subscription_id.clone()),
+            ),
+            _ => None,
+        };
+        Self {
+            attached_subscription: AttachedSubscriptionChange::from_request(request),
+            entity_subscription,
+        }
+    }
+
+    pub(crate) fn attached_subscription_change(
+        &self,
+        response: &DaemonResponse,
+    ) -> Option<AttachedSubscriptionChange> {
+        response_records_attach_ownership(response)
+            .then(|| self.attached_subscription.clone())
+            .flatten()
+    }
+
+    pub(crate) fn entity_subscription_change(
+        &self,
+        response: &DaemonResponse,
+    ) -> Option<EntitySubscriptionChange> {
+        match (&self.entity_subscription, response.kind) {
+            (
+                Some(EntitySubscriptionChange::Subscribe(subscription_id)),
+                DaemonResponseKind::EntitySubscribed,
+            ) => Some(EntitySubscriptionChange::Subscribe(subscription_id.clone())),
+            (
+                Some(EntitySubscriptionChange::Unsubscribe(subscription_id)),
+                DaemonResponseKind::EntityUnsubscribed,
+            ) => Some(EntitySubscriptionChange::Unsubscribe(
+                subscription_id.clone(),
+            )),
+            _ => None,
+        }
+    }
+}
+
 impl AttachedSubscriptionChange {
     fn from_request(request: &DaemonRequest) -> Option<Self> {
         match request {
@@ -960,6 +1022,7 @@ impl AttachedSubscriptionChange {
 mod tests {
     use super::*;
     use crate::HubRuntime;
+    use crate::client_api_dto::response::daemon_response_base;
     use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter};
     use botster_core::{
         ClientId, CoreSessionMetadata, ResizePayload, SessionId, SessionSpawnRequest,
@@ -973,6 +1036,77 @@ mod tests {
             client_id: "client-a".to_string(),
             grant_id: None,
         }
+    }
+
+    #[test]
+    fn request_completion_projection_preserves_exact_response_rules() {
+        let attach = RequestCompletionProjection::from_request(&DaemonRequest::Attach {
+            session_id: "session-a".to_string(),
+            subscription_id: "terminal-a".to_string(),
+        });
+        let detach = RequestCompletionProjection::from_request(&DaemonRequest::Detach {
+            session_id: "session-a".to_string(),
+            subscription_id: "terminal-a".to_string(),
+        });
+        let subscribe =
+            RequestCompletionProjection::from_request(&DaemonRequest::SubscribeEntities {
+                entity_type: "session".to_string(),
+                subscription_id: "entities-a".to_string(),
+            });
+        let unsubscribe =
+            RequestCompletionProjection::from_request(&DaemonRequest::UnsubscribeEntities {
+                subscription_id: "entities-a".to_string(),
+            });
+        let success = daemon_response_base(DaemonResponseKind::Status);
+        let operator_error = daemon_response_base(DaemonResponseKind::OperatorError);
+
+        assert_eq!(
+            attach.attached_subscription_change(&success),
+            Some(AttachedSubscriptionChange::Attach(AttachedSubscription {
+                session_id: "session-a".to_string(),
+                subscription_id: "terminal-a".to_string(),
+            }))
+        );
+        assert_eq!(
+            detach.attached_subscription_change(&success),
+            Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                session_id: "session-a".to_string(),
+                subscription_id: "terminal-a".to_string(),
+            }))
+        );
+        assert!(
+            attach
+                .attached_subscription_change(&operator_error)
+                .is_none()
+        );
+        assert_eq!(
+            subscribe.entity_subscription_change(&daemon_response_base(
+                DaemonResponseKind::EntitySubscribed
+            )),
+            Some(EntitySubscriptionChange::Subscribe(
+                "entities-a".to_string()
+            ))
+        );
+        assert!(
+            subscribe
+                .entity_subscription_change(&daemon_response_base(
+                    DaemonResponseKind::EntityUnsubscribed
+                ))
+                .is_none()
+        );
+        assert_eq!(
+            unsubscribe.entity_subscription_change(&daemon_response_base(
+                DaemonResponseKind::EntityUnsubscribed
+            )),
+            Some(EntitySubscriptionChange::Unsubscribe(
+                "entities-a".to_string()
+            ))
+        );
+        assert!(
+            subscribe
+                .entity_subscription_change(&operator_error)
+                .is_none()
+        );
     }
 
     #[test]

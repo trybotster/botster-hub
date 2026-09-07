@@ -9,6 +9,7 @@ pub(crate) mod messaging;
 pub(crate) mod packages;
 pub(crate) mod pending;
 pub(crate) mod plugins;
+pub(crate) mod reply;
 pub(crate) mod request;
 pub(crate) mod session_types;
 pub(crate) mod sessions;
@@ -38,6 +39,7 @@ pub(crate) struct DaemonObservability {
     pub(crate) lifecycle: DaemonLifecycleCounters,
     pub(crate) client_id: Option<String>,
     pub(crate) grant_id: Option<String>,
+    pub(crate) transport_request_id: Option<String>,
 }
 
 pub(crate) fn request_id(value: &str) -> RequestId {
@@ -151,6 +153,16 @@ pub(crate) fn handle_control_message(
             );
             false
         }
+        ControlMessage::PluginResultCapacityReleased => {
+            state.plugin_result_budget.take_release_notification();
+            state.maintenance.scheduler.prefer_completion_drain();
+            false
+        }
+        ControlMessage::PluginCompletionPublished => {
+            state.plugin_result_budget.take_completion_notification();
+            state.maintenance.scheduler.prefer_completion_drain();
+            false
+        }
     }
 }
 
@@ -259,7 +271,7 @@ pub(crate) fn handle_runtime_control_request(
         | DaemonRequest::PluginMcpCallTool { .. }
         | DaemonRequest::PluginSurfaceRender { .. }
         | DaemonRequest::PluginSurfaceAction { .. } => {
-            plugins::handle_runtime(daemon, observability, request).into()
+            plugins::handle_runtime(daemon, state, observability, request)
         }
         DaemonRequest::DaemonShutdown => {
             host::handle_runtime(daemon, state, observability, request)

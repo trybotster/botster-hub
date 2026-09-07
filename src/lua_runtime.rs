@@ -487,6 +487,81 @@ struct LuaHostApi {
 pub(crate) static TEST_EVENT_HANDLER_HOLD_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(test)]
+#[derive(Default)]
+struct TestPluginInvocationGateState {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+fn test_plugin_invocation_gate() -> &'static (
+    std::sync::Mutex<TestPluginInvocationGateState>,
+    std::sync::Condvar,
+) {
+    static GATE: std::sync::OnceLock<(
+        std::sync::Mutex<TestPluginInvocationGateState>,
+        std::sync::Condvar,
+    )> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        (
+            std::sync::Mutex::new(TestPluginInvocationGateState::default()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn arm_test_plugin_invocation_gate() {
+    let (lock, _) = test_plugin_invocation_gate();
+    let mut state = lock.lock().expect("plugin invocation gate mutex");
+    *state = TestPluginInvocationGateState {
+        armed: true,
+        entered: false,
+        released: false,
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_test_plugin_invocation_gate(deadline: Duration) -> bool {
+    let (lock, condition) = test_plugin_invocation_gate();
+    let state = lock.lock().expect("plugin invocation gate mutex");
+    let (state, _) = condition
+        .wait_timeout_while(state, deadline, |state| !state.entered)
+        .expect("plugin invocation gate wait");
+    state.entered
+}
+
+#[cfg(test)]
+pub(crate) fn release_test_plugin_invocation_gate() {
+    let (lock, condition) = test_plugin_invocation_gate();
+    let mut state = lock.lock().expect("plugin invocation gate mutex");
+    state.released = true;
+    condition.notify_all();
+}
+
+#[cfg(test)]
+fn hold_controlled_test_plugin_invocation(request: &PluginInvocationRequest) -> bool {
+    if request.handler.handler_id != "controlled_gate" {
+        return true;
+    }
+    let (lock, condition) = test_plugin_invocation_gate();
+    let mut state = lock.lock().expect("plugin invocation gate mutex");
+    if !state.armed {
+        return true;
+    }
+    state.entered = true;
+    condition.notify_all();
+    // Ten seconds is a test safety bound. It is not a runtime latency requirement.
+    let (mut state, timeout) = condition
+        .wait_timeout_while(state, Duration::from_secs(10), |state| !state.released)
+        .expect("plugin invocation gate wait");
+    let released = state.released && !timeout.timed_out();
+    state.armed = false;
+    released
+}
+
 /// Shared hub-owned primitives exposed to one Lua plugin runtime.
 #[derive(Clone)]
 pub struct LuaPluginHostApi {
@@ -619,6 +694,15 @@ impl PluginRuntime for LuaPluginRuntime {
                 request,
                 PluginInvocationFailureKind::HandlerFailed,
                 "handler belongs to a different plugin",
+            );
+        }
+
+        #[cfg(test)]
+        if !hold_controlled_test_plugin_invocation(&request) {
+            return failed(
+                request,
+                PluginInvocationFailureKind::TimedOut,
+                "controlled test plugin invocation gate timed out",
             );
         }
 
