@@ -63,19 +63,20 @@ impl MuxWriteState {
     pub(crate) fn enqueue_response(
         &mut self,
         request_id: &str,
-        response: &DaemonResponse,
+        response: DaemonResponse,
         delivery_ack: Option<mpsc::Sender<()>>,
         close_after: bool,
     ) -> DaemonTransportResult<()> {
-        self.queued_control.push_back(control_mux_frame(
+        let frame = control_mux_frame(
             &ServerFrame::Response {
                 request_id: request_id.to_string(),
-                response: response.clone(),
+                response,
             },
             PendingMuxClass::Response,
             delivery_ack,
             close_after,
-        )?);
+        )?;
+        self.queued_control.push_back(frame);
         Ok(())
     }
 
@@ -893,7 +894,7 @@ pub(crate) mod mux_write_resume_tests {
 
         let response = daemon_response_base(DaemonResponseKind::Status);
         write_state
-            .enqueue_response("1", &response, None, false)
+            .enqueue_response("1", response, None, false)
             .expect("enqueue status");
         writer.allow_remainder = true;
         writer.stall_after = usize::MAX;
@@ -951,7 +952,7 @@ pub(crate) mod mux_write_resume_tests {
         write_state
             .enqueue_response(
                 "1",
-                &daemon_response_base(DaemonResponseKind::Status),
+                daemon_response_base(DaemonResponseKind::Status),
                 None,
                 false,
             )
@@ -999,7 +1000,7 @@ pub(crate) mod mux_write_resume_tests {
         write_state
             .enqueue_response(
                 "1",
-                &daemon_response_base(DaemonResponseKind::Status),
+                daemon_response_base(DaemonResponseKind::Status),
                 None,
                 false,
             )
@@ -1049,7 +1050,7 @@ pub(crate) mod mux_write_resume_tests {
         write_state
             .enqueue_response(
                 "7",
-                &daemon_response_base(DaemonResponseKind::Status),
+                daemon_response_base(DaemonResponseKind::Status),
                 None,
                 false,
             )
@@ -1232,7 +1233,7 @@ pub(crate) mod mux_write_resume_tests {
         state
             .enqueue_response(
                 "1",
-                &daemon_response_base(DaemonResponseKind::Status),
+                daemon_response_base(DaemonResponseKind::Status),
                 None,
                 false,
             )
@@ -1368,7 +1369,7 @@ pub(crate) mod mux_write_resume_tests {
         write_state
             .enqueue_response(
                 "9",
-                &daemon_response_base(DaemonResponseKind::Shutdown),
+                daemon_response_base(DaemonResponseKind::Shutdown),
                 Some(ack_tx),
                 true,
             )
@@ -1415,7 +1416,7 @@ pub(crate) mod mux_write_resume_tests {
         write_state
             .enqueue_response(
                 "2",
-                &daemon_response_base(DaemonResponseKind::HubUpdate),
+                daemon_response_base(DaemonResponseKind::HubUpdate),
                 Some(ack_tx),
                 false,
             )
@@ -1455,7 +1456,7 @@ pub(crate) mod mux_write_resume_tests {
         write_state
             .enqueue_response(
                 "3",
-                &daemon_response_base(DaemonResponseKind::Status),
+                daemon_response_base(DaemonResponseKind::Status),
                 None,
                 false,
             )

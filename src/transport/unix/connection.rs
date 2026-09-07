@@ -36,15 +36,17 @@ use crate::admission::unix_hello::{UnixTerminalAdmission, unix_hello_admission};
 use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::control_request_operation_label;
 use crate::daemon::control::message::{
-    ControlMessage, ControlSender, daemon_delivery_kind, egress_write_class,
+    ControlMessage, ControlReplyReceiver, ControlSender, control_reply_channel,
+    daemon_delivery_kind, egress_write_class,
 };
 use crate::daemon::control::pending::retire_abandoned_requests;
+use crate::daemon::control::reply::ControlReply;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_budget::OwnerPermit;
 use crate::daemon::owner_loop::{DaemonControlState, tick};
 use crate::subscription::attach_routes::{
-    AttachStreamOwner, AttachedSubscription, AttachedSubscriptionChange,
-    apply_attached_subscription_change, attached_subscription_change_for_response,
+    AttachStreamOwner, AttachedSubscription, AttachedSubscriptionChange, EntitySubscriptionChange,
+    RequestCompletionProjection, apply_attached_subscription_change,
 };
 use crate::subscription::entity::EntityFrameSender;
 use crate::subscription::route_cleanup::{
@@ -115,8 +117,8 @@ pub fn stream_attach(
 /// One request whose owner reply arrived, ready to be written as a correlated response.
 struct CompletedRequest {
     request_id: String,
-    request: DaemonRequest,
-    response: DaemonTransportResult<DaemonResponse>,
+    projection: RequestCompletionProjection,
+    response: ControlReply,
     response_delivery_tx: Option<mpsc::Sender<()>>,
     close_after: bool,
 }
@@ -382,7 +384,7 @@ pub(crate) async fn handle_connection_async(
         last_request_id = parsed_id;
         if in_flight.len() >= MAX_OUTSTANDING_REQUESTS {
             let response = too_many_requests_response(&request_id, &request);
-            mux_write.enqueue_response(&request_id, &response, None, false)?;
+            mux_write.enqueue_response(&request_id, response, None, false)?;
             if let Err(error) = flush_pending_responses(
                 &mut write_half,
                 &mux,
@@ -398,8 +400,9 @@ pub(crate) async fn handle_connection_async(
             }
             continue;
         }
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         let close_after = matches!(request, DaemonRequest::DaemonShutdown);
+        let projection = RequestCompletionProjection::from_request(&request);
         let requires_delivery_ack =
             close_after || matches!(request, DaemonRequest::StartHubUpdate { .. });
         let (response_delivery_tx, response_delivery_rx) = if requires_delivery_ack {
@@ -408,7 +411,7 @@ pub(crate) async fn handle_connection_async(
         } else {
             (None, None)
         };
-        let sent = match request.clone() {
+        let sent = match request {
             DaemonRequest::SubscribeEntities {
                 entity_type,
                 subscription_id,
@@ -417,6 +420,8 @@ pub(crate) async fn handle_connection_async(
                     .send(ControlMessage::SubscribeEntities {
                         entity_type,
                         subscription_id,
+                        transport_request_id: Some(request_id.clone()),
+                        client_id: Some(client_id.clone()),
                         frame_tx: EntityFrameSender::Async(entity_tx.clone()),
                         frame_rx: None,
                         reply_tx,
@@ -437,6 +442,7 @@ pub(crate) async fn handle_connection_async(
                 control_tx
                     .send(ControlMessage::Request {
                         request: Box::new(request),
+                        transport_request_id: Some(request_id.clone()),
                         reply_tx,
                         response_delivery_rx,
                         grant_id: None,
@@ -451,7 +457,7 @@ pub(crate) async fn handle_connection_async(
             let response = receive_control_response(reply_rx).await;
             CompletedRequest {
                 request_id,
-                request,
+                projection,
                 response,
                 response_delivery_tx,
                 close_after,
@@ -472,36 +478,33 @@ async fn deliver_completed_request(
     event_mailbox: Option<&crate::subscription::package_events::ClientEventMailbox>,
     completed: CompletedRequest,
 ) -> DaemonTransportResult<Option<ConnectionTerminalReason>> {
-    let response = completed.response?;
-    cleanup.apply_subscription_change(attached_subscription_change_for_response(
-        &completed.request,
-        &response,
-    ));
-    match (&completed.request, response.kind) {
-        (
-            DaemonRequest::SubscribeEntities {
-                subscription_id, ..
-            },
-            DaemonResponseKind::EntitySubscribed,
-        ) => cleanup.add_entity_subscription(subscription_id.clone()),
-        (
-            DaemonRequest::UnsubscribeEntities { subscription_id },
-            DaemonResponseKind::EntityUnsubscribed,
-        ) => cleanup.remove_entity_subscription(subscription_id),
-        _ => {}
+    let (response, plugin_result_charge) = completed.response.into_parts();
+    let response = response?;
+    cleanup.apply_subscription_change(completed.projection.attached_subscription_change(&response));
+    match completed.projection.entity_subscription_change(&response) {
+        Some(EntitySubscriptionChange::Subscribe(subscription_id)) => {
+            cleanup.add_entity_subscription(subscription_id)
+        }
+        Some(EntitySubscriptionChange::Unsubscribe(subscription_id)) => {
+            cleanup.remove_entity_subscription(&subscription_id)
+        }
+        None => {}
     }
+    let delivery_kind = daemon_delivery_kind(&response);
     mux_write.enqueue_response(
         &completed.request_id,
-        &response,
+        response,
         completed.response_delivery_tx,
         completed.close_after,
     )?;
+    // The framed response now owns its independent per-connection byte charge.
+    drop(plugin_result_charge);
     if let Err(error) =
         flush_pending_responses(write_half, mux, mux_write, Instant::now(), event_mailbox).await
     {
         cleanup.set_reason(ConnectionTerminalReason::WriteFailure);
         let _ = control_tx.try_send(ControlMessage::EgressWriteFailed {
-            delivery_kind: daemon_delivery_kind(&response),
+            delivery_kind,
             write_class: egress_write_class(&error),
         });
         mux.close_all();
@@ -555,12 +558,10 @@ async fn close_with_protocol_error(
     Err(DaemonTransportError::Protocol(code.as_str()))
 }
 
-pub(crate) async fn receive_control_response(
-    reply_rx: oneshot::Receiver<DaemonTransportResult<DaemonResponse>>,
-) -> DaemonTransportResult<DaemonResponse> {
+pub(crate) async fn receive_control_response(reply_rx: ControlReplyReceiver) -> ControlReply {
     reply_rx
         .await
-        .map_err(|_| DaemonTransportError::ControlThreadStopped)?
+        .unwrap_or_else(|_| ControlReply::plain(Err(DaemonTransportError::ControlThreadStopped)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -786,6 +787,11 @@ pub(crate) fn handle_connection_cleanup(
     }
     // Reads this client left pending are retired; requests that must finish
     // keep their permits and run to completion.
+    crate::daemon::control::entities::retire_plugin_entity_connection(
+        daemon,
+        state,
+        &cleanup.client_id,
+    );
     retire_abandoned_requests(daemon, state, &cleanup.client_id);
     // The permit reserved when the connection was accepted now carries the
     // cleanup obligation: captures released and every route detached in

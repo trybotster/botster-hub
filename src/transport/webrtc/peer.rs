@@ -20,6 +20,8 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::{Runtime, Sender as AsyncSender, default_runtime};
 
+#[cfg(test)]
+use crate::daemon::control::message::control_reply_channel;
 use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::control_channel::{
@@ -1798,7 +1800,7 @@ mod tests {
         assert!(!harness.daemon.local_webrtc().has_live_peer(&grant_id));
 
         let (frame_tx, _frame_rx) = tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
@@ -1808,6 +1810,8 @@ mod tests {
             ControlMessage::SubscribeEntities {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
+                transport_request_id: None,
+                client_id: Some(format!("botster-hub-webrtc-{grant_id}")),
                 frame_tx: EntityFrameSender::Async(frame_tx),
                 frame_rx: None,
                 reply_tx,
@@ -2202,7 +2206,7 @@ mod tests {
                 .saturating_sub(1);
         }
         let (frame_tx, _frame_rx) = tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
@@ -2212,6 +2216,8 @@ mod tests {
             ControlMessage::SubscribeEntities {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
+                transport_request_id: None,
+                client_id: Some(format!("botster-hub-webrtc-{grant_b}")),
                 frame_tx: EntityFrameSender::Async(frame_tx),
                 frame_rx: None,
                 reply_tx,
@@ -2299,7 +2305,7 @@ mod tests {
         assert!(harness.daemon.local_webrtc().has_live_peer(&grant_id));
 
         let (frame_tx, _frame_rx) = tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
@@ -2309,6 +2315,8 @@ mod tests {
             ControlMessage::SubscribeEntities {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
+                transport_request_id: None,
+                client_id: Some(format!("botster-hub-webrtc-{grant_id}")),
                 frame_tx: EntityFrameSender::Async(frame_tx),
                 frame_rx: None,
                 reply_tx,
@@ -2402,7 +2410,7 @@ mod tests {
         assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 0);
         assert!(!harness.daemon.local_webrtc().has_live_peer(&grant_id));
 
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
@@ -2414,6 +2422,7 @@ mod tests {
                     session_id: session_id.clone(),
                     subscription_id: subscription_id.clone(),
                 }),
+                transport_request_id: None,
                 reply_tx,
                 response_delivery_rx: None,
                 grant_id: Some(grant_id.clone()),
@@ -2475,7 +2484,7 @@ mod tests {
         harness.process_until_peer_closed(&grant_id, Instant::now() + Duration::from_secs(10));
         assert!(!harness.daemon.local_webrtc().has_live_peer(&grant_id));
 
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
@@ -2487,6 +2496,7 @@ mod tests {
                     session_id: session_id.clone(),
                     command: "true".to_string(),
                 }),
+                transport_request_id: None,
                 reply_tx,
                 response_delivery_rx: None,
                 grant_id: Some(grant_id.clone()),
@@ -2529,7 +2539,7 @@ mod tests {
         let subscription_id = "reused-unsub-entity".to_string();
 
         let (frame_tx_a, _frame_rx_a) = tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
@@ -2539,6 +2549,8 @@ mod tests {
             ControlMessage::SubscribeEntities {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
+                transport_request_id: None,
+                client_id: Some(format!("botster-hub-webrtc-{grant_a}")),
                 frame_tx: EntityFrameSender::Async(frame_tx_a),
                 frame_rx: None,
                 reply_tx,
@@ -2566,7 +2578,7 @@ mod tests {
         );
 
         let (frame_tx_b, _frame_rx_b) = tokio_mpsc::channel(ENTITY_SUBSCRIPTION_QUEUE_CAPACITY);
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
@@ -2576,6 +2588,8 @@ mod tests {
             ControlMessage::SubscribeEntities {
                 entity_type: "session".to_string(),
                 subscription_id: subscription_id.clone(),
+                transport_request_id: None,
+                client_id: Some(format!("botster-hub-webrtc-{grant_b}")),
                 frame_tx: EntityFrameSender::Async(frame_tx_b),
                 frame_rx: None,
                 reply_tx,
@@ -2596,7 +2610,7 @@ mod tests {
         );
         let live_entity_before = harness.state.lifecycle_counters.live_entity_subscriptions;
 
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = control_reply_channel();
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,

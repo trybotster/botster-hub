@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use botster_hub_client::{
-    DaemonHubUpdate, DaemonHubUpdateState, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonHubUpdate, DaemonHubUpdateState, DaemonRequest, DaemonResponseKind,
 };
 
 use crate::HubDaemon;
@@ -15,19 +15,21 @@ use crate::daemon::control::message::{ControlMessage, ControlReplySender, Contro
 use crate::daemon::control::pending::{
     ControlStep, PendingControlRequest, poll_pending_requests, request_must_finish,
 };
+use crate::daemon::control::reply::ControlReply;
 use crate::daemon::control::{
     DaemonObservability, control_request_operation_label, events, handle_control_request, host,
     webrtc,
 };
 use crate::daemon::error::{
-    DaemonTransportError, DaemonTransportResult, daemon_entrypoint_error,
-    daemon_local_webrtc_error, daemon_operator_error, daemon_package_compensation_error,
-    daemon_package_error, daemon_snapshot_stream_forbidden_error, daemon_spawn_target_error,
-    daemon_state_error, daemon_worktree_error,
+    DaemonTransportError, daemon_entrypoint_error, daemon_local_webrtc_error,
+    daemon_operator_error, daemon_package_compensation_error, daemon_package_error,
+    daemon_snapshot_stream_forbidden_error, daemon_spawn_target_error, daemon_state_error,
+    daemon_worktree_error,
 };
 use crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED;
 use crate::daemon::owner_loop::{
-    DaemonControlState, request_succeeded, send_control_response, should_mark_pump_after_control,
+    DaemonControlState, request_succeeded, send_control_reply, send_control_response,
+    should_mark_pump_after_control,
 };
 use crate::maintenance::software_identity;
 use crate::subscription::attach_routes::{
@@ -44,6 +46,7 @@ pub(crate) fn handle(
 ) -> bool {
     let ControlMessage::Request {
         request,
+        transport_request_id,
         reply_tx,
         response_delivery_rx,
         grant_id,
@@ -124,6 +127,7 @@ pub(crate) fn handle(
         lifecycle: state.lifecycle_counters.clone(),
         client_id: client_id.clone(),
         grant_id: grant_id.clone(),
+        transport_request_id,
     };
     let step = handle_control_request(daemon, state, observability, control_tx, request.clone());
     let entry = PendingControlRequest {
@@ -140,7 +144,7 @@ pub(crate) fn handle(
         retire: None,
     };
     match step {
-        ControlStep::Ready(response) => finish(daemon, state, entry, response),
+        ControlStep::Ready(response) => finish(daemon, state, entry, ControlReply::plain(response)),
         ControlStep::Pending(pending) => {
             state.pending_requests.push(PendingControlRequest {
                 continuation: pending.continuation,
@@ -163,7 +167,7 @@ fn finish(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     entry: PendingControlRequest,
-    response: DaemonTransportResult<DaemonResponse>,
+    response: ControlReply,
 ) -> bool {
     let PendingControlRequest {
         request,
@@ -184,6 +188,7 @@ fn finish(
             | DaemonRequest::ShutdownSession { .. }
             | DaemonRequest::RemoveSession { .. }
     );
+    let (response, plugin_result_charge) = response.into_parts();
     let response = response.or_else(|error| match error {
         DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
         DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
@@ -329,7 +334,11 @@ fn finish(
     // carry terminal frames without a later host control pulse.
     // Authoritative mutations already set one coalesced wake. Status and
     // other reads must not force an extra owner-loop slice.
-    send_control_response(reply_tx, response, response_delivery_rx)
+    send_control_reply(
+        reply_tx,
+        ControlReply::from_parts(response, plugin_result_charge),
+        response_delivery_rx,
+    )
 }
 
 #[allow(dead_code)]

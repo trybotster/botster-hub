@@ -9,12 +9,45 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc as tokio_mpsc, oneshot};
 
 use crate::admission::connection_budget::ChannelClass;
 use crate::admission::unix_hello::{UnixTerminalAdmission, WebrtcTerminalAdmission};
+use crate::daemon::control::reply::{ControlReply, RetainedPluginResult};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::subscription::entity::EntityFrameSender;
 use crate::transport::webrtc::{LocalWebrtcAttachedSubscription, LocalWebrtcSenderTerminalRecord};
 
 pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
-pub(crate) type ControlReplySender = oneshot::Sender<DaemonTransportResult<DaemonResponse>>;
+pub(crate) type ControlReplyReceiver = oneshot::Receiver<ControlReply>;
+
+#[derive(Debug)]
+pub(crate) struct ControlReplySender(oneshot::Sender<ControlReply>);
+
+impl ControlReplySender {
+    pub(crate) fn send(
+        self,
+        response: DaemonTransportResult<DaemonResponse>,
+    ) -> Result<(), ControlReply> {
+        self.0.send(ControlReply::plain(response))
+    }
+
+    pub(crate) fn send_retained(
+        self,
+        response: RetainedPluginResult<DaemonTransportResult<DaemonResponse>>,
+    ) -> Result<(), ControlReply> {
+        self.0.send(ControlReply::retained(response))
+    }
+
+    pub(crate) fn send_reply(self, response: ControlReply) -> Result<(), ControlReply> {
+        self.0.send(response)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
+pub(crate) fn control_reply_channel() -> (ControlReplySender, ControlReplyReceiver) {
+    let (sender, receiver) = oneshot::channel();
+    (ControlReplySender(sender), receiver)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressWriteClass {
@@ -47,6 +80,10 @@ pub(crate) enum ControlMessage {
     SubscribeEntities {
         entity_type: String,
         subscription_id: String,
+        /// Correlation id from the transport frame. Internal requests leave this unset.
+        transport_request_id: Option<String>,
+        /// Stable identity for one transport connection generation.
+        client_id: Option<String>,
         frame_tx: EntityFrameSender,
         frame_rx: Option<tokio_mpsc::Receiver<botster_hub_client::DaemonEntityFrame>>,
         reply_tx: ControlReplySender,
@@ -62,6 +99,8 @@ pub(crate) enum ControlMessage {
     },
     Request {
         request: Box<DaemonRequest>,
+        /// Correlation id from the transport frame. Internal requests leave this unset.
+        transport_request_id: Option<String>,
         reply_tx: ControlReplySender,
         response_delivery_rx: Option<mpsc::Receiver<()>>,
         /// When set, admission requires a still-live local WebRTC peer for this grant.
@@ -78,6 +117,10 @@ pub(crate) enum ControlMessage {
         delivery_kind: DaemonDeliveryKind,
         write_class: EgressWriteClass,
     },
+    /// A transport dropped retained plugin-result storage and released byte capacity.
+    PluginResultCapacityReleased,
+    /// Core published one or more plugin completions for the owner to drain.
+    PluginCompletionPublished,
     LocalWebrtcPeerClosed {
         grant_id: String,
         attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,

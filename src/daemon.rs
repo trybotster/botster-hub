@@ -92,6 +92,8 @@ pub struct HubDaemon {
 impl HubDaemon {
     /// Start the local daemon from explicit, already-validated hub config.
     pub fn start(config: HubConfig) -> HubDaemonResult<Self> {
+        let maximum_completion_bytes = config.plugin_worker_config().completion_queue_byte_capacity;
+        validate_plugin_result_capacity(maximum_completion_bytes)?;
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let state_source = if store.path().exists() {
             HubStateLoadSource::Loaded
@@ -227,6 +229,18 @@ impl HubDaemon {
     }
 }
 
+fn validate_plugin_result_capacity(maximum_completion_bytes: usize) -> HubDaemonResult<()> {
+    let retained_result_capacity =
+        crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY;
+    if maximum_completion_bytes > retained_result_capacity {
+        return Err(HubDaemonError::PluginResultCapacity {
+            maximum_completion_bytes,
+            retained_result_capacity,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn load_enabled_local_plugins(
     runtime: &mut HubRuntime,
     package_registry: &PackageRegistry,
@@ -244,6 +258,11 @@ pub(crate) fn load_enabled_local_plugins(
 /// Typed daemon startup errors.
 #[derive(Debug)]
 pub enum HubDaemonError {
+    /// Core can create one completion that does not fit Hub's retained-result budget.
+    PluginResultCapacity {
+        maximum_completion_bytes: usize,
+        retained_result_capacity: usize,
+    },
     /// Durable state failed to load or initialize.
     State(HubStateStoreError),
     /// Runtime failed to initialize or reconcile daemon-backed sessions.
@@ -261,6 +280,13 @@ pub enum HubDaemonError {
 impl fmt::Display for HubDaemonError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PluginResultCapacity {
+                maximum_completion_bytes,
+                retained_result_capacity,
+            } => write!(
+                formatter,
+                "plugin completion maximum {maximum_completion_bytes} exceeds retained-result capacity {retained_result_capacity}"
+            ),
             Self::State(error) => write!(formatter, "{error}"),
             Self::Runtime(error) => write!(formatter, "{error}"),
             Self::PackageRegistry(error) => {
@@ -276,6 +302,7 @@ impl fmt::Display for HubDaemonError {
 impl Error for HubDaemonError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::PluginResultCapacity { .. } => None,
             Self::State(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::PackageRegistry(_) => None,
@@ -323,3 +350,22 @@ impl From<HubLuaPluginLoadError> for HubDaemonError {
 
 /// Daemon lifecycle result alias.
 pub type HubDaemonResult<T> = Result<T, HubDaemonError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_result_capacity_accepts_exact_limit_and_rejects_larger_completion() {
+        let capacity = crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY;
+        validate_plugin_result_capacity(capacity).expect("exact capacity fits");
+        assert!(matches!(
+            validate_plugin_result_capacity(capacity + 1),
+            Err(HubDaemonError::PluginResultCapacity {
+                maximum_completion_bytes,
+                retained_result_capacity,
+            }) if maximum_completion_bytes == capacity + 1
+                && retained_result_capacity == capacity
+        ));
+    }
+}

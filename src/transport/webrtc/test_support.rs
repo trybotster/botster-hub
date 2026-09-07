@@ -811,7 +811,7 @@ impl PeerHarness {
     }
 
     pub(crate) fn control_request(&mut self, request: DaemonRequest) -> Option<DaemonResponse> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
         handle_control_message(
             &mut self.daemon,
             &mut self.state,
@@ -820,6 +820,7 @@ impl PeerHarness {
             self.control_tx.clone(),
             ControlMessage::Request {
                 request: Box::new(request),
+                transport_request_id: None,
                 reply_tx,
                 response_delivery_rx: None,
                 grant_id: None,

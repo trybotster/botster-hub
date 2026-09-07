@@ -214,6 +214,7 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
             "ReadScreen",
             "ReadModeFlags",
             "CaptureSnapshot",
+            "ReadSnapshotPage",
             "ReadSessionContext",
         ],
     ),
@@ -471,7 +472,12 @@ const CONTROL_MESSAGE_OWNERS: &[(&str, &[&str])] = &[
     ("src/daemon/control/webrtc.rs", &["LocalWebrtcPeerClosed"]),
 ];
 
-const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &["DataPlaneProgress", "EgressWriteFailed"];
+const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &[
+    "DataPlaneProgress",
+    "EgressWriteFailed",
+    "PluginCompletionPublished",
+    "PluginResultCapacityReleased",
+];
 
 fn control_handler_modules() -> Vec<String> {
     let mut paths = Vec::new();
@@ -479,7 +485,10 @@ fn control_handler_modules() -> Vec<String> {
         if !path.starts_with("src/daemon/control/") {
             continue;
         }
-        if path == "src/daemon/control.rs" || path == "src/daemon/control/message.rs" {
+        if path == "src/daemon/control.rs"
+            || path == "src/daemon/control/message.rs"
+            || path == "src/daemon/control/reply.rs"
+        {
             continue;
         }
         paths.push(path);
@@ -534,8 +543,9 @@ fn control_message_variants_have_one_family_or_dispatcher_owner() {
     assert!(dispatcher.contains("connection::handle"));
     assert!(dispatcher.contains("entities::handle"));
     let request = hub_source("src/daemon/control/request.rs");
-    assert!(request.contains("overlay_live_attach_occupancy"));
     assert!(request.contains("has_live_peer(grant_id)"));
+    let sessions = hub_source("src/daemon/control/sessions.rs");
+    assert!(sessions.contains("overlay_live_attach_occupancy"));
 
     let owner_paths: Vec<&str> = CONTROL_MESSAGE_OWNERS
         .iter()
@@ -621,4 +631,28 @@ fn control_rs_request_arm_rejects_inlined_post_processing() {
             "inserting {needle} into control.rs must fail this single-delegation boundary"
         );
     }
+}
+
+#[test]
+fn owner_plugin_paths_use_async_admission_and_completion_routing() {
+    let plugins = hub_source("src/daemon/control/plugins.rs");
+    let entities = hub_source("src/daemon/control/entities.rs");
+    let subscriptions = hub_source("src/subscription/entity.rs");
+    for (path, source) in [
+        ("src/daemon/control/plugins.rs", plugins.as_str()),
+        ("src/daemon/control/entities.rs", entities.as_str()),
+    ] {
+        assert!(
+            source.contains("try_admit_plugin("),
+            "{path} must use bounded plugin worker admission"
+        );
+        assert!(
+            !source.contains("invoke_plugin("),
+            "{path} must not wait for plugin execution on the daemon owner"
+        );
+    }
+    assert!(
+        !subscriptions.contains("plugin_entity_snapshot("),
+        "entity subscription registration must not keep a blocking package-provider branch"
+    );
 }

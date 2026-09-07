@@ -163,6 +163,13 @@ pub type SharedSpawnTargets = Arc<Mutex<Vec<SpawnTarget>>>;
 /// Shared hub-owned worktree projection exposed to Lua plugin workers.
 pub type SharedWorktrees = Arc<Mutex<Vec<Worktree>>>;
 
+/// Prepared package entity-provider work and its causal lease.
+pub(crate) struct PluginEntitySnapshotInvocation {
+    pub(crate) request: PluginInvocationRequest,
+    entity_kind: EntityKind,
+    scope_id: Option<u64>,
+}
+
 /// Hub-owned policy bridge for plugin-safe session-type spawns.
 pub struct HubSessionTypeSpawner {
     pending: Mutex<VecDeque<PendingSessionTypeSpawn>>,
@@ -1782,6 +1789,18 @@ impl HubRuntime {
         &self,
         call: crate::McpCallRequest,
     ) -> Result<serde_json::Value, crate::McpToolError> {
+        let request_id = RequestId(format!("mcp-tool-{}", call.name));
+        let request = self.prepare_plugin_mcp_tool(call, request_id, None)?;
+        Self::complete_plugin_mcp_tool(self.invoke_plugin(request).result)
+    }
+
+    /// Prepare one plugin MCP call for non-blocking worker admission.
+    pub(crate) fn prepare_plugin_mcp_tool(
+        &self,
+        call: crate::McpCallRequest,
+        request_id: RequestId,
+        client_id: Option<ClientId>,
+    ) -> Result<PluginInvocationRequest, crate::McpToolError> {
         let descriptor = self
             .plugin_lifecycle
             .mcp_tool_descriptors()
@@ -1803,12 +1822,12 @@ impl HubRuntime {
         let handler = descriptor.handler.ok_or_else(|| {
             crate::McpToolError::new("plugin_tool_unavailable", "plugin MCP tool has no handler")
         })?;
-        let request = PluginInvocationRequest {
-            request_id: RequestId(format!("mcp-tool-{}", call.name)),
+        Ok(PluginInvocationRequest {
+            request_id,
             handler,
             timeout_ms: SESSION_TYPE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
-                client_id: None,
+                client_id,
                 session_id: None,
                 subscription_id: None,
                 surface_id: None,
@@ -1816,9 +1835,14 @@ impl HubRuntime {
                 metadata: None,
             },
             payload: botster_core::BoundaryJson(call.arguments),
-        };
-        let outcome = self.invoke_plugin(request);
-        match outcome.result {
+        })
+    }
+
+    /// Convert one plugin MCP completion to the existing client result.
+    pub(crate) fn complete_plugin_mcp_tool(
+        result: PluginInvocationResult,
+    ) -> Result<serde_json::Value, crate::McpToolError> {
+        match result {
             botster_core::PluginInvocationResult::Completed(success) => {
                 Ok(success.payload.map_or_else(json_null, |payload| payload.0))
             }
@@ -3004,6 +3028,25 @@ impl HubRuntime {
         surface_id: &str,
         payload: serde_json::Value,
     ) -> Result<UiNode, crate::McpToolError> {
+        let request = self.prepare_plugin_surface_render(
+            package_name,
+            surface_id,
+            payload,
+            RequestId(format!("plugin-surface-render-{package_name}-{surface_id}")),
+            None,
+        )?;
+        self.complete_plugin_surface_render(package_name, self.invoke_plugin(request).result)
+    }
+
+    /// Prepare one plugin surface render for non-blocking worker admission.
+    pub(crate) fn prepare_plugin_surface_render(
+        &self,
+        package_name: &str,
+        surface_id: &str,
+        payload: serde_json::Value,
+        request_id: RequestId,
+        client_id: Option<ClientId>,
+    ) -> Result<PluginInvocationRequest, crate::McpToolError> {
         let descriptor = self
             .plugin_lifecycle
             .surface_route_descriptors()
@@ -3021,13 +3064,12 @@ impl HubRuntime {
         let handler = descriptor.handler.ok_or_else(|| {
             crate::McpToolError::new("surface_unavailable", "plugin surface has no handler")
         })?;
-        let request_id = RequestId(format!("plugin-surface-render-{package_name}-{surface_id}"));
-        let outcome = self.invoke_plugin(PluginInvocationRequest {
+        Ok(PluginInvocationRequest {
             request_id,
             handler,
             timeout_ms: SESSION_TYPE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
-                client_id: None,
+                client_id,
                 session_id: None,
                 subscription_id: None,
                 surface_id: Some(surface_id.to_string()),
@@ -3035,8 +3077,16 @@ impl HubRuntime {
                 metadata: None,
             },
             payload: BoundaryJson(payload),
-        });
-        let value = completed_plugin_payload(outcome.result, "plugin surface render")?;
+        })
+    }
+
+    /// Convert one plugin surface render completion to the existing client result.
+    pub(crate) fn complete_plugin_surface_render(
+        &self,
+        package_name: &str,
+        result: PluginInvocationResult,
+    ) -> Result<UiNode, crate::McpToolError> {
+        let value = completed_plugin_payload(result, "plugin surface render")?;
         let node: UiNode = serde_json::from_value(value).map_err(|error| {
             crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
         })?;
@@ -3050,6 +3100,30 @@ impl HubRuntime {
         package_name: &str,
         request: &UiActionRequest,
     ) -> Result<UiActionResult, crate::McpToolError> {
+        let invocation = self.prepare_plugin_surface_action(
+            package_name,
+            request,
+            RequestId(format!(
+                "plugin-surface-action-{package_name}-{}-{}",
+                request.surface_id.0, request.action_id.0
+            )),
+            None,
+        )?;
+        self.complete_plugin_surface_action(
+            package_name,
+            request,
+            self.invoke_plugin(invocation).result,
+        )
+    }
+
+    /// Prepare one plugin surface action for non-blocking worker admission.
+    pub(crate) fn prepare_plugin_surface_action(
+        &self,
+        package_name: &str,
+        request: &UiActionRequest,
+        request_id: RequestId,
+        client_id: Option<ClientId>,
+    ) -> Result<PluginInvocationRequest, crate::McpToolError> {
         let surface_id = &request.surface_id.0;
         let action_id = &request.action_id.0;
         let descriptor = self
@@ -3069,17 +3143,15 @@ impl HubRuntime {
         let handler = descriptor.handler.ok_or_else(|| {
             crate::McpToolError::new("action_unavailable", "plugin UI action has no handler")
         })?;
-        let outcome = self.invoke_plugin(PluginInvocationRequest {
-            request_id: RequestId(format!(
-                "plugin-surface-action-{package_name}-{surface_id}-{action_id}"
-            )),
+        Ok(PluginInvocationRequest {
+            request_id,
             handler: botster_core::PluginHandlerRef {
                 kind: PluginHandlerKind::UiAction,
                 ..handler
             },
             timeout_ms: SESSION_TYPE_SPAWN_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
-                client_id: None,
+                client_id,
                 session_id: None,
                 subscription_id: None,
                 surface_id: Some(surface_id.to_string()),
@@ -3092,8 +3164,17 @@ impl HubRuntime {
                     format!("invalid plugin UiActionRequest: {error}"),
                 )
             })?),
-        });
-        let value = completed_plugin_payload(outcome.result, "plugin surface action")?;
+        })
+    }
+
+    /// Convert one plugin surface action completion to the existing client result.
+    pub(crate) fn complete_plugin_surface_action(
+        &self,
+        package_name: &str,
+        request: &UiActionRequest,
+        result: PluginInvocationResult,
+    ) -> Result<UiActionResult, crate::McpToolError> {
+        let value = completed_plugin_payload(result, "plugin surface action")?;
         let result: UiActionResult = serde_json::from_value(value).map_err(|error| {
             crate::McpToolError::new(
                 "invalid_action_result",
@@ -3128,6 +3209,24 @@ impl HubRuntime {
         entity_type: &str,
         subscription_id: &str,
     ) -> Result<(u64, Vec<serde_json::Value>), crate::McpToolError> {
+        let invocation = self.prepare_plugin_entity_snapshot(
+            entity_type,
+            subscription_id,
+            RequestId(format!("plugin-entity-provider-{subscription_id}")),
+            None,
+        )?;
+        let result = self.invoke_plugin(invocation.request.clone()).result;
+        self.complete_plugin_entity_snapshot(invocation, result)
+    }
+
+    /// Prepare one entity-provider snapshot for non-blocking worker admission.
+    pub(crate) fn prepare_plugin_entity_snapshot(
+        &self,
+        entity_type: &str,
+        subscription_id: &str,
+        request_id: RequestId,
+        client_id: Option<ClientId>,
+    ) -> Result<PluginEntitySnapshotInvocation, crate::McpToolError> {
         let entity_kind = EntityKind(entity_type.to_string());
         EntityContract::validate_entity_type(&entity_kind, None).map_err(|error| {
             crate::McpToolError::new("invalid_entity_provider", error.to_string())
@@ -3155,7 +3254,6 @@ impl HubRuntime {
         let scope_id = self
             .package_entity_family_state(entity_type)
             .and_then(|family| family.provider_scope_id());
-        let request_id = RequestId(format!("plugin-entity-provider-{subscription_id}"));
         if scope_id.is_some() && !self.leftover_slot_available() {
             return Err(crate::McpToolError::new(
                 "causal_scope_busy",
@@ -3177,12 +3275,12 @@ impl HubRuntime {
         }
         let metadata = scope_id
             .map(|scope_id| BoundaryJson(serde_json::json!({ "causal_scope_id": scope_id })));
-        let outcome = self.invoke_plugin(PluginInvocationRequest {
+        let request = PluginInvocationRequest {
             request_id: request_id.clone(),
             handler,
             timeout_ms: PLUGIN_EVENT_TIMEOUT_MS,
             context: botster_core::PluginInvocationContext {
-                client_id: None,
+                client_id,
                 session_id: None,
                 subscription_id: Some(SubscriptionId(subscription_id.to_string())),
                 surface_id: None,
@@ -3193,16 +3291,36 @@ impl HubRuntime {
                 "entity_type": entity_type,
                 "subscription_id": subscription_id,
             })),
-        });
-        if let Some(scope_id) = scope_id {
-            let _ = self.park_production(self.admit_causal_op(CausalOp::Release {
-                scope_id,
-                identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
-                    request_id: request_id.0.clone(),
-                },
-            }));
-        }
-        let value = completed_plugin_payload(outcome.result, "plugin entity provider")?;
+        };
+        Ok(PluginEntitySnapshotInvocation {
+            request,
+            entity_kind,
+            scope_id,
+        })
+    }
+
+    /// Release a prepared entity-provider lease after refused admission.
+    pub(crate) fn retire_plugin_entity_snapshot(
+        &self,
+        invocation: &PluginEntitySnapshotInvocation,
+    ) {
+        self.release_plugin_entity_snapshot_lease(
+            invocation.scope_id,
+            &invocation.request.request_id,
+        );
+    }
+
+    /// Convert one entity-provider completion and release its causal lease.
+    pub(crate) fn complete_plugin_entity_snapshot(
+        &self,
+        invocation: PluginEntitySnapshotInvocation,
+        result: PluginInvocationResult,
+    ) -> Result<(u64, Vec<serde_json::Value>), crate::McpToolError> {
+        self.release_plugin_entity_snapshot_lease(
+            invocation.scope_id,
+            &invocation.request.request_id,
+        );
+        let value = completed_plugin_payload(result, "plugin entity provider")?;
         let value = coerce_entity_frame_empty_items(value);
         let frame: EntityFrame = serde_json::from_value(value).map_err(|error| {
             crate::McpToolError::new(
@@ -3210,7 +3328,7 @@ impl HubRuntime {
                 format!("invalid entity provider frame: {error}"),
             )
         })?;
-        if frame.entity_type() != &entity_kind {
+        if frame.entity_type() != &invocation.entity_kind {
             return Err(crate::McpToolError::new(
                 "invalid_entity_provider",
                 format!(
@@ -3232,8 +3350,8 @@ impl HubRuntime {
         };
         let mut record_ids = BTreeSet::new();
         for item in &items {
-            let record_id =
-                EntityContract::extract_record_id(&entity_kind, item).map_err(|error| {
+            let record_id = EntityContract::extract_record_id(&invocation.entity_kind, item)
+                .map_err(|error| {
                     crate::McpToolError::new("invalid_entity_provider", error.to_string())
                 })?;
             if !record_ids.insert(record_id.0.clone()) {
@@ -3247,6 +3365,17 @@ impl HubRuntime {
             }
         }
         Ok((snapshot_seq, items))
+    }
+
+    fn release_plugin_entity_snapshot_lease(&self, scope_id: Option<u64>, request_id: &RequestId) {
+        if let Some(scope_id) = scope_id {
+            let _ = self.park_production(self.admit_causal_op(CausalOp::Release {
+                scope_id,
+                identity: crate::package_event_router::LeaseIdentity::ProviderInFlight {
+                    request_id: request_id.0.clone(),
+                },
+            }));
+        }
     }
 
     /// Last capability cleanup produced by reload, unload, or explicit cleanup.
@@ -3559,6 +3688,14 @@ impl HubRuntime {
     ) -> PluginCompletionDrain {
         self.plugin_lifecycle
             .drain_completions(max_items, max_bytes)
+    }
+
+    /// Install the owner-loop callback for newly published plugin completions.
+    pub fn install_plugin_completion_notifier(
+        &self,
+        notifier: botster_core::PluginCompletionNotifier,
+    ) {
+        self.plugin_lifecycle.install_completion_notifier(notifier);
     }
 
     /// Event handlers subscribed to the Hub-owned `/session` family.

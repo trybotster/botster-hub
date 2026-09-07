@@ -14,6 +14,7 @@ use botster_hub_client::{DaemonRequest, DaemonResponse};
 
 use crate::HubDaemon;
 use crate::daemon::control::message::ControlReplySender;
+use crate::daemon::control::reply::{ControlReply, RetainedPluginResult};
 use crate::daemon::error::DaemonTransportResult;
 use crate::daemon::owner_budget::{OwnerPermit, RETAINED_OPERATION_DEADLINE};
 use crate::daemon::owner_loop::DaemonControlState;
@@ -24,14 +25,17 @@ pub(crate) enum ControlPoll {
     Pending,
     /// The response is complete.
     Ready(DaemonTransportResult<DaemonResponse>),
+    /// The response still owns the logical-byte charge for a plugin result.
+    ReadyRetained(RetainedPluginResult<DaemonTransportResult<DaemonResponse>>),
 }
 
 /// One owner-thread continuation for a request that waits on Core.
 pub(crate) type ControlContinuation =
     Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>;
 
-/// Retirement for a request that owns Core work: it receives the entry's
-/// permit and must retain an obligation that cancels or releases that work.
+/// Retirement for a request that owns deferred work. The hook receives the
+/// entry permit. It must cancel, release, or transfer the work to another
+/// bounded owner such as the plugin worker's executor and completion pools.
 pub(crate) type RetireHook =
     Box<dyn FnOnce(&mut HubDaemon, &mut DaemonControlState, OwnerPermit) + Send>;
 
@@ -106,11 +110,10 @@ pub(crate) struct PendingControlRequest {
     pub(crate) retire: Option<RetireHook>,
 }
 
-/// Requests whose Core work has side effects the owner must observe, or
-/// that consume state (ReceiveMessages drains routed envelopes). Everything
-/// else is a read that can be retired when its client left or the deadline
-/// passed: the Core answer is dropped, or the request's retire hook cancels
-/// and releases what it owns (CaptureSnapshot).
+/// Requests whose Core work has effects that require an owner continuation,
+/// or that consume state, must finish. Plugin actions are the exception.
+/// Their execution remains charged in the plugin worker after reply
+/// retirement, and a late completion is drained without replay or delivery.
 pub(crate) fn request_must_finish(request: &DaemonRequest) -> bool {
     !matches!(
         request,
@@ -127,6 +130,9 @@ pub(crate) fn request_must_finish(request: &DaemonRequest) -> bool {
             | DaemonRequest::ResolveSessionType { .. }
             | DaemonRequest::CheckHubUpdate { .. }
             | DaemonRequest::GetHubUpdateExecution { .. }
+            | DaemonRequest::PluginMcpCallTool { .. }
+            | DaemonRequest::PluginSurfaceRender { .. }
+            | DaemonRequest::PluginSurfaceAction { .. }
     )
 }
 
@@ -194,7 +200,7 @@ pub(crate) fn poll_pending_requests(
         &mut HubDaemon,
         &mut DaemonControlState,
         PendingControlRequest,
-        DaemonTransportResult<DaemonResponse>,
+        ControlReply,
     ) -> bool,
 ) -> bool {
     if state.pending_requests.is_empty() {
@@ -239,7 +245,10 @@ pub(crate) fn poll_pending_requests(
         match (entry.continuation)(daemon, state) {
             ControlPoll::Pending => retained.push(entry),
             ControlPoll::Ready(response) => {
-                shutdown = finish(daemon, state, entry, response);
+                shutdown = finish(daemon, state, entry, ControlReply::plain(response));
+            }
+            ControlPoll::ReadyRetained(response) => {
+                shutdown = finish(daemon, state, entry, ControlReply::retained(response));
             }
         }
     }
