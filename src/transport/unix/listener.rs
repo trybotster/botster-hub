@@ -5,7 +5,7 @@
 //! the path is a socket owned by this user inside a directory this user owns,
 //! and nothing accepts connections on it. Any other existing path fails closed.
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -55,7 +55,7 @@ impl SocketOwnerLock {
         socket_path.with_file_name(name)
     }
 
-    #[must_use]
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }

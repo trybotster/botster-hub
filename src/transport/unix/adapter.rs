@@ -109,13 +109,13 @@ impl UnixTerminalAdapter {
     }
 
     /// Create the production adapter and the connection-owned write handle.
-    #[must_use]
+    #[cfg(test)]
     pub(crate) fn pair() -> (Self, UnixTerminalAdapterHandle) {
         Self::pair_with_wake(AdapterWake::new())
     }
 
     /// Create an adapter that stores one wake permit on write or close.
-    #[must_use]
+    #[cfg(test)]
     pub(crate) fn pair_with_wake(wake: AdapterWake) -> (Self, UnixTerminalAdapterHandle) {
         Self::pair_with_wake_and_close_work(wake, Arc::new(AtomicBool::new(false)))
     }
@@ -435,6 +435,7 @@ impl UnixConnectionMux {
             .any(|route| route.handle.snapshot_active().is_some())
     }
 
+    #[cfg(test)]
     pub(crate) fn has_bound_routes(&self) -> bool {
         self.inner
             .routes
@@ -525,6 +526,7 @@ impl UnixTerminalAdapterHandle {
         self.inner.complete_active()
     }
 
+    #[cfg(test)]
     pub(crate) fn write_opaque_frame(&self, frame: &RoutedTerminalFrame) {
         let _ = self.inner.try_write(frame);
     }

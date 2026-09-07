@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use botster_hub_client::{
     DaemonApp, DaemonCoordination, DaemonDiagnostic, DaemonEvent, DaemonHubUpdate,
     DaemonHubUpdateExecution, DaemonLifecycleCounters, DaemonLocalWebrtcAnswer,
-    DaemonLocalWebrtcBootstrap, DaemonModeFlags, DaemonOperatorError, DaemonPackageDiagnostic,
+    DaemonLocalWebrtcBootstrap, DaemonOperatorError, DaemonPackageDiagnostic,
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageRouteDescriptor,
     DaemonPackageUpdateStatus, DaemonPluginResourceCounters, DaemonPluginSurface,
     DaemonResolvedAppLaunch, DaemonResolvedSessionType, DaemonResponse, DaemonResponseKind,
@@ -20,17 +20,16 @@ use crate::client_api_dto::plugin::{
     daemon_plugin_lifecycle_from_client, daemon_plugin_worker_counters_from_client,
 };
 use crate::client_api_dto::session::{
-    daemon_session_from_client, daemon_session_type_definition_from_client,
-    daemon_session_type_from_client, daemon_session_type_mutation_source,
+    daemon_session_type_definition_from_client, daemon_session_type_from_client,
+    daemon_session_type_mutation_source,
 };
 use crate::client_api_dto::workspace::{daemon_spawn_target, daemon_worktree};
 use crate::daemon_projection::{daemon_status_from_status, package_navigation_entries};
 use crate::maintenance::{installation_identity, software_identity};
 use crate::{
     AvailablePackage, HubClientPackage, HubClientPackageNavigationEntry,
-    HubClientPluginLifecycleReport, HubClientPluginSurface, HubClientSession, HubDaemonStatus,
-    McpToolDescriptor, PackageInstallPlan, ResolvedSessionType, SpawnTarget, SpawnTargetValidation,
-    Worktree,
+    HubClientPluginLifecycleReport, HubClientPluginSurface, HubDaemonStatus, McpToolDescriptor,
+    PackageInstallPlan, ResolvedSessionType, SpawnTarget, SpawnTargetValidation, Worktree,
 };
 
 pub(crate) fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
@@ -113,15 +112,6 @@ pub(crate) fn daemon_hub_update(update: DaemonHubUpdate) -> DaemonResponse {
 pub(crate) fn daemon_hub_update_execution(execution: DaemonHubUpdateExecution) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::HubUpdateExecution);
     response.hub_update_execution = Some(execution);
-    response
-}
-
-pub(crate) fn daemon_sessions(sessions: Vec<HubClientSession>) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::Sessions);
-    response.sessions = sessions
-        .into_iter()
-        .map(daemon_session_from_client)
-        .collect();
     response
 }
 

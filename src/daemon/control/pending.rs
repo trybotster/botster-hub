@@ -8,7 +8,6 @@
 //! may mutate owner state exactly as the synchronous handlers did.
 
 use std::sync::mpsc;
-use std::time::Instant;
 
 use botster_hub_client::{DaemonRequest, DaemonResponse};
 
@@ -61,8 +60,6 @@ pub(crate) struct PendingControlRequest {
     pub(crate) reply_tx: ControlReplySender,
     pub(crate) response_delivery_rx: Option<mpsc::Receiver<()>>,
     pub(crate) grant_id: Option<String>,
-    pub(crate) client_id: Option<String>,
-    pub(crate) accepted_at: Instant,
     pub(crate) continuation: ControlContinuation,
 }
 

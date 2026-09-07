@@ -869,6 +869,13 @@ fn execute_filesystem(
     Ok(CapabilityOperationResult::Filesystem(result))
 }
 
+fn backend_error(error: std::io::Error) -> CapabilityRuntimeError {
+    CapabilityRuntimeError::new(
+        CapabilityRuntimeErrorKind::BackendFailed,
+        format!("local capability backend failed: {error}"),
+    )
+}
+
 fn filesystem_entry(entry: fs::DirEntry) -> Result<FilesystemEntry, CapabilityRuntimeError> {
     let metadata = entry.metadata().map_err(backend_error)?;
     let file_name = entry.file_name().to_string_lossy().to_string();
@@ -1825,8 +1832,7 @@ fn event_plugin_key(event: &CapabilityRuntimeEvent) -> Option<PluginKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Condvar, mpsc};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_backend(name: &str) -> Arc<KeyedPluginStore> {
         let nonce = SystemTime::now()
@@ -1900,7 +1906,7 @@ mod tests {
             ]
         ));
         let records = backend
-            .read_records(&plugin_key)
+            .read_records(&KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
             .expect("read committed batch");
         assert_eq!(records.len(), 2);
         assert_eq!(records[&PluginStoreKey("ticket".to_string())].revision, 2);
@@ -1930,7 +1936,7 @@ mod tests {
             assert!(failed.key.is_some());
             assert_eq!(
                 backend
-                    .read_records(&plugin_key)
+                    .read_records(&KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
                     .expect("read unchanged batch"),
                 records
             );
@@ -1957,7 +1963,7 @@ mod tests {
         assert_eq!(oversized.key, Some(PluginStoreKey("oversized".to_string())));
         assert_eq!(
             backend
-                .read_records(&plugin_key)
+                .read_records(&KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
                 .expect("read after per-record quota failure"),
             records
         );
@@ -1970,7 +1976,7 @@ mod tests {
         );
         assert_eq!(
             backend
-                .read_records(&plugin_key)
+                .read_records(&KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
                 .expect("read after empty batch"),
             records
         );
@@ -2001,7 +2007,7 @@ mod tests {
         assert_eq!(aggregate.key, None);
         assert!(
             aggregate_backend
-                .read_records(&plugin_key)
+                .read_records(&KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
                 .expect("read after aggregate quota failure")
                 .is_empty()
         );
@@ -2034,7 +2040,7 @@ mod tests {
         );
         assert!(replacement.ok);
         let records = replacement_backend
-            .read_records(&plugin_key)
+            .read_records(&KeyedPluginStore::namespace(&plugin_key).expect("namespace"))
             .expect("read legal replacement at key quota");
         assert_eq!(records.len(), 1);
         assert!(records.contains_key(&PluginStoreKey("new".to_string())));

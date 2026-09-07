@@ -65,7 +65,7 @@ fn explicit_runtime(name: &str) -> HubRuntime {
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit runtime config should build");
 
-    HubRuntime::new(config)
+    HubRuntime::new(config).expect("hub runtime starts")
 }
 
 fn attach_bound_subscription(
@@ -75,14 +75,8 @@ fn attach_bound_subscription(
     subscription_id: &SubscriptionId,
     now_seconds: u64,
 ) -> botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter {
-    runtime
-        .attach_client(
-            api.identity().client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            now_seconds,
-        )
-        .expect("production adapter path attach");
+    // Attach and bind run as one Core operation inside the shared helper.
+    let _ = now_seconds;
     bind_shared_terminal_adapter(
         runtime,
         api.identity().client_id.clone(),
@@ -107,6 +101,7 @@ fn hub_client_api_attach_fail_closes_without_unbound_inventory() {
             now_seconds: 1,
         },
     )
+    .wait(&runtime)
     .expect("spawn");
     let error = api
         .handle_request(
@@ -119,6 +114,7 @@ fn hub_client_api_attach_fail_closes_without_unbound_inventory() {
                 now_seconds: 2,
             },
         )
+        .wait(&runtime)
         .expect_err("local Attach must fail closed");
     assert!(matches!(
         error,
@@ -126,7 +122,11 @@ fn hub_client_api_attach_fail_closes_without_unbound_inventory() {
             if operation == HubClientOperation::Attach
     ));
     assert!(
-        runtime.list_terminal_subscriptions().is_empty(),
+        runtime
+            .list_terminal_subscriptions()
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core inventory")
+            .is_empty(),
         "fail-closed Attach must not leave an unbound inventory row"
     );
 }
@@ -169,6 +169,7 @@ fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only()
                 definition: definition.clone(),
             },
         )
+        .wait(&runtime)
         .expect("create device session type");
     let HubClientResponseBody::SessionTypes(created) = created.body else {
         panic!("session type response expected");
@@ -193,6 +194,7 @@ fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only()
             definition,
         },
     )
+    .wait(&runtime)
     .expect("update device session type");
     assert_eq!(runtime.state().session_type_generation, 2);
 
@@ -208,6 +210,7 @@ fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only()
                 session_type_id: "terminal-accessory".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("package source is read-only");
     assert!(matches!(
         rejected,
@@ -227,6 +230,7 @@ fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only()
                 session_type_id: "terminal-accessory".to_string(),
             },
         )
+        .wait(&runtime)
         .expect("delete device session type");
     let HubClientResponseBody::SessionTypes(deleted) = deleted.body else {
         panic!("session type response expected");
@@ -282,6 +286,7 @@ fn read_definition(
                 session_type_id: session_type_id.to_string(),
             },
         )
+        .wait(runtime)
         .expect("read authored session type definition");
     let HubClientResponseBody::SessionTypeDefinition(definition) = response.body else {
         panic!("session type definition response expected");
@@ -305,6 +310,7 @@ fn shown_row(
                 session_type_id: session_type_id.to_string(),
             },
         )
+        .wait(runtime)
         .expect("show sanitized session type row");
     let HubClientResponseBody::SessionTypes(mut rows) = response.body else {
         panic!("session types response expected");
@@ -339,6 +345,7 @@ fn session_type_definition_round_trips_authored_path_and_environment() {
                 definition,
             },
         )
+        .wait(&runtime)
         .expect("create authored device session type");
     }
 
@@ -370,6 +377,7 @@ fn session_type_definition_round_trips_authored_path_and_environment() {
                 definition: read.definition.clone(),
             },
         )
+        .wait(&runtime)
         .expect("submit the authoring read back through Update");
 
         let stored = runtime
@@ -409,6 +417,7 @@ fn sanitized_session_type_row_still_cannot_reconstruct_the_authored_definition()
             definition: authored.clone(),
         },
     )
+    .wait(&runtime)
     .expect("create authored device session type");
 
     // What a client could reconstruct before this seam existed: the row derives a
@@ -453,6 +462,7 @@ fn sanitized_session_type_row_still_cannot_reconstruct_the_authored_definition()
                 request_id: request_id("list-lossy"),
             },
         )
+        .wait(&runtime)
         .expect("list session types");
     let HubClientResponseBody::SessionTypes(listed) = listed.body else {
         panic!("session types response expected");
@@ -528,6 +538,7 @@ fn session_type_definition_refuses_package_sources_and_denied_admission() {
                 session_type_id: "init".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("package-owned definitions stay read-only");
     assert!(matches!(
         refused,
@@ -546,6 +557,7 @@ fn session_type_definition_refuses_package_sources_and_denied_admission() {
                 session_type_id: "missing".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("unknown ids stay typed");
     assert!(matches!(
         unknown,
@@ -572,6 +584,7 @@ fn session_type_definition_refuses_package_sources_and_denied_admission() {
                 session_type_id: "init".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("unadmitted callers are refused before policy runs");
     assert!(matches!(
         denied,
@@ -628,6 +641,7 @@ fn session_type_role_interaction_traits_and_lifecycle_are_orthogonal() {
                 definition,
             },
         )
+        .wait(&runtime)
         .expect("orthogonal session type should be accepted");
     }
 
@@ -639,6 +653,7 @@ fn session_type_role_interaction_traits_and_lifecycle_are_orthogonal() {
                 request_id: request_id("list-orthogonal-session-types"),
             },
         )
+        .wait(&runtime)
         .expect("list orthogonal session types");
     let HubClientResponseBody::SessionTypes(session_types) = response.body else {
         panic!("session type response expected");
@@ -719,6 +734,7 @@ fn session_entity_subscription_uses_core_baseline_and_rejects_other_families() {
                 subscription_id: "session-entities".to_string(),
             },
         )
+        .wait(&runtime)
         .expect("session entity family is admitted");
     let HubClientResponseBody::SessionLifecycleBaselinePage(page) = response.body else {
         panic!("expected CoreDaemon lifecycle baseline page");
@@ -736,6 +752,7 @@ fn session_entity_subscription_uses_core_baseline_and_rejects_other_families() {
                 subscription_id: "unrelated".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("unrelated families must not be hydrated");
     assert!(matches!(
         error,
@@ -763,12 +780,15 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
                 now_seconds: index as u64 + 1,
             },
         )
+        .wait(&runtime)
         .expect("spawn session for paged baseline");
     }
 
     assert_eq!(
         runtime
             .list_sessions()
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
             .expect("list spawned sessions")
             .len(),
         33
@@ -785,6 +805,8 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
                     max_elapsed: Duration::from_millis(25),
                 },
             )
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
             .expect("observe spawned sessions");
         if slice.complete || slice.resync_required.is_some() {
             break;
@@ -805,6 +827,7 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
                 subscription_id: "paged-session-entities".to_string(),
             },
         )
+        .wait(&runtime)
         .expect("session entity family is admitted");
     let HubClientResponseBody::SessionLifecycleBaselinePage(first_page) = response.body else {
         panic!("expected a bounded lifecycle baseline page, got {response:?}");
@@ -830,6 +853,8 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
         }
         let page = runtime
             .lifecycle_baseline_page(snapshot.as_ref(), after.as_ref(), budget)
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
             .expect("continue baseline pages");
         rows.extend(page.sessions);
         complete = page.complete;
@@ -840,15 +865,17 @@ fn session_entity_subscription_returns_a_bounded_page_not_a_complete_baseline() 
     assert_eq!(rows.len(), 33);
 
     for index in 0..33 {
-        let _ = api.handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::Shutdown {
-                request_id: request_id(&format!("shutdown-{index}")),
-                session_id: SessionId(format!("paged-session-{index:02}")),
-                now_seconds: 100 + index as u64,
-            },
-        );
+        let _ = api
+            .handle_request(
+                &mut runtime,
+                &packages,
+                HubClientRequest::Shutdown {
+                    request_id: request_id(&format!("shutdown-{index}")),
+                    session_id: SessionId(format!("paged-session-{index:02}")),
+                    now_seconds: 100 + index as u64,
+                },
+            )
+            .wait(&runtime);
     }
 }
 
@@ -1117,6 +1144,7 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
                 request_id: request_id("list-session-types"),
             },
         )
+        .wait(&runtime)
         .expect("list templates");
     let HubClientResponseBody::SessionTypes(templates) = list.body else {
         panic!("session types response expected");
@@ -1140,6 +1168,7 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
                 },
             },
         )
+        .wait(&runtime)
         .expect_err("undeclared env override rejected");
     assert!(matches!(
         rejected_env,
@@ -1162,6 +1191,7 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
                 },
             },
         )
+        .wait(&runtime)
         .expect_err("unadmitted target override rejected");
     assert!(matches!(
         rejected_target,
@@ -1184,6 +1214,7 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
                 },
             },
         )
+        .wait(&runtime)
         .expect_err("unadmitted cwd override rejected");
     assert!(matches!(
         rejected_cwd,
@@ -1213,6 +1244,7 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
                 },
             },
         )
+        .wait(&runtime)
         .expect("resolve bare generic template id");
     let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
         panic!("resolved template response expected");
@@ -1242,6 +1274,7 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
                 now_seconds: 1,
             },
         )
+        .wait(&runtime)
         .expect("spawn session type");
     let HubClientResponseBody::Spawned(spawned) = spawn.body else {
         panic!("spawned response expected");
@@ -1259,6 +1292,7 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
                 key: Some("prompt".to_string()),
             },
         )
+        .wait(&runtime)
         .expect("read session context");
     let HubClientResponseBody::SessionContext(context) = context.body else {
         panic!("context response expected");
@@ -1286,6 +1320,7 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
                 key: None,
             },
         )
+        .wait(&runtime)
         .expect_err("unadmitted context reads are denied");
     assert!(matches!(denied, HubClientError::AdmissionDenied { .. }));
 }
@@ -1332,6 +1367,7 @@ fn session_type_show_rejects_ambiguous_bare_ids() {
                 session_type_id: "init".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("ambiguous bare template id should be rejected");
     assert!(matches!(
         rejected,
@@ -1350,6 +1386,7 @@ fn session_type_show_rejects_ambiguous_bare_ids() {
                 session_type_id: "first-template.plugin/init".to_string(),
             },
         )
+        .wait(&runtime)
         .expect("full template id remains unambiguous");
     let HubClientResponseBody::SessionTypes(templates) = shown.body else {
         panic!("session types response expected");
@@ -1443,6 +1480,7 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
                 request_id: request_id("list-merged-session-types"),
             },
         )
+        .wait(&runtime)
         .expect("list merged templates");
     let HubClientResponseBody::SessionTypes(templates) = list.body else {
         panic!("session types response expected");
@@ -1471,6 +1509,7 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
                     session_type_id: session_type_id.clone(),
                 },
             )
+            .wait(&runtime)
             .expect("show repo override");
         let HubClientResponseBody::SessionTypes(shown) = shown.body else {
             panic!("shown session type expected");
@@ -1493,6 +1532,7 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
                     },
                 },
             )
+            .wait(&runtime)
             .expect("resolve repo override");
         let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
             panic!("resolved session type expected");
@@ -1521,6 +1561,7 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
                 },
             },
         )
+        .wait(&runtime)
         .expect_err("repo cwd outside target rejected");
     assert!(matches!(
         rejected,
@@ -1543,6 +1584,7 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
             definition: updated_repo,
         },
     )
+    .wait(&runtime)
     .expect("update repo definition through admitted target policy");
     assert!(
         fs::read_to_string(repo_root.join(".botster/session-types.json"))
@@ -1561,6 +1603,7 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
                 session_type_id: "init".to_string(),
             },
         )
+        .wait(&runtime)
         .expect("delete repo definition through admitted target policy");
     let HubClientResponseBody::SessionTypes(after_delete) = deleted.body else {
         panic!("session type response expected");
@@ -1672,6 +1715,7 @@ fn session_type_definition_round_trips_repo_sources_and_preserves_selection() {
             definition: effective.definition.clone(),
         },
     )
+    .wait(&runtime)
     .expect("submit the repo authoring read back through Update");
     let written = fs::read_to_string(repo_root.join(".botster/session-types.json"))
         .expect("read Hub-written repo session types");
@@ -1754,6 +1798,7 @@ fn session_type_definition_rejects_ambiguous_bare_ids() {
                 session_type_id: "authored-ambiguous".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("ambiguous bare ids stay ambiguous for the authoring read");
     assert!(matches!(
         ambiguous,
@@ -1849,6 +1894,7 @@ fn session_type_sources_apply_device_over_package_when_repo_disabled() {
                 session_type_request: botster_hub::SessionTypeRequest::default(),
             },
         )
+        .wait(&runtime)
         .expect("resolve device template");
     let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
         panic!("resolved session type expected");
@@ -1894,6 +1940,7 @@ fn session_type_sources_reject_duplicate_ids_within_device_source() {
                 request_id: request_id("list-duplicate-device"),
             },
         )
+        .wait(&runtime)
         .expect_err("duplicate device ids are rejected");
 
     assert!(matches!(
@@ -1946,6 +1993,7 @@ fn session_type_sources_reject_duplicate_ids_within_repo_source() {
                 request_id: request_id("list-duplicate-repo"),
             },
         )
+        .wait(&runtime)
         .expect_err("duplicate repo ids are rejected");
 
     assert!(matches!(
@@ -2030,6 +2078,7 @@ fn session_type_sources_reject_ambiguous_same_rank_repo_ids() {
                 session_type_id: "init".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("same-rank repo ids are ambiguous");
 
     assert!(matches!(
@@ -2171,6 +2220,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
                 request_id: request_id("catalog-device-global"),
             },
         )
+        .wait(&runtime)
         .expect("management catalog");
     let HubClientResponseBody::SessionTypes(catalog) = catalog.body else {
         panic!("session types response expected");
@@ -2199,6 +2249,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
                 target_id: "tgt_hub".to_string(),
             },
         )
+        .wait(&runtime)
         .expect("list for admitted hub target");
     let HubClientResponseBody::SessionTypes(listed) = listed.body else {
         panic!("session types response expected");
@@ -2239,6 +2290,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
                 target_id: "tgt_other".to_string(),
             },
         )
+        .wait(&runtime)
         .expect("list for other target");
     let HubClientResponseBody::SessionTypes(other_list) = other_list.body else {
         panic!("session types response expected");
@@ -2279,6 +2331,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
                     },
                 },
             )
+            .wait(&runtime)
             .unwrap_or_else(|error| panic!("resolve {} at hub: {error:?}", row.session_type_id));
         let HubClientResponseBody::ResolvedSessionType(resolved) = resolved.body else {
             panic!("resolved session type expected");
@@ -2307,6 +2360,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
                 },
             },
         )
+        .wait(&runtime)
         .expect_err("qualified precedence loser must not spawn at T");
     assert!(
         matches!(
@@ -2333,6 +2387,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
                 },
             },
         )
+        .wait(&runtime)
         .expect("resolve relative device at hub");
     let HubClientResponseBody::ResolvedSessionType(relative) = relative.body else {
         panic!("resolved session type expected");
@@ -2362,6 +2417,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
                 },
             },
         )
+        .wait(&runtime)
         .expect_err("cwd outside admitted T rejected");
     assert!(matches!(
         cwd_rejected,
@@ -2381,6 +2437,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
                 target_id: "tgt_disabled".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("disabled target rejected");
     assert!(matches!(
         disabled,
@@ -2398,6 +2455,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
                 target_id: "tgt_missing".to_string(),
             },
         )
+        .wait(&runtime)
         .expect_err("missing target rejected");
     assert!(matches!(
         missing,
@@ -2459,6 +2517,7 @@ fn package_configuration_client_package_rows_are_sanitized() {
                 request_id: request_id("list-package-configuration"),
             },
         )
+        .wait(&runtime)
         .expect("list packages");
     let HubClientResponseBody::Packages(rows) = response.body else {
         panic!("packages response expected");
@@ -2510,6 +2569,7 @@ fn package_navigation_uses_explicit_manifest_entries_and_route_diagnostics() {
                 request_id: request_id("list-package-navigation-explicit"),
             },
         )
+        .wait(&runtime)
         .expect("list package navigation");
     let HubClientResponseBody::PackageNavigation(rows) = response.body else {
         panic!("package navigation response expected");
@@ -2551,6 +2611,7 @@ fn package_navigation_derives_default_app_surface_entries_without_order_authorit
                 request_id: request_id("list-package-navigation-default"),
             },
         )
+        .wait(&runtime)
         .expect("list package navigation");
     let HubClientResponseBody::PackageNavigation(rows) = response.body else {
         panic!("package navigation response expected");
@@ -2589,6 +2650,7 @@ fn plugin_surface_admission_is_shared_by_the_in_process_client_api() {
                 payload: serde_json::json!({}),
             },
         )
+        .wait(&runtime)
         .expect_err("undeclared surfaces must be rejected before runtime dispatch");
     assert!(matches!(
         undeclared,
@@ -2606,6 +2668,7 @@ fn plugin_surface_admission_is_shared_by_the_in_process_client_api() {
                 payload: serde_json::json!({}),
             },
         )
+        .wait(&runtime)
         .expect_err("unsupported surface operations must be rejected before runtime dispatch");
     assert!(matches!(
         unsupported,
@@ -2638,6 +2701,7 @@ fn package_availability_projects_core_resolution_matrix_to_client_rows() {
                 request_id: request_id("list-package-availability"),
             },
         )
+        .wait(&runtime)
         .expect("list packages");
     let HubClientResponseBody::Packages(rows) = response.body else {
         panic!("packages response expected");
@@ -2717,6 +2781,7 @@ fn package_availability_reports_installed_but_disabled_dependency() {
                 request_id: request_id("list-disabled-dependency"),
             },
         )
+        .wait(&runtime)
         .expect("list packages");
     let HubClientResponseBody::Packages(rows) = response.body else {
         panic!("packages response expected");
@@ -2763,6 +2828,7 @@ fn package_availability_reports_capability_denial() {
                 request_id: request_id("list-capability-denial"),
             },
         )
+        .wait(&runtime)
         .expect("list packages");
     let HubClientResponseBody::Packages(rows) = response.body else {
         panic!("packages response expected");
@@ -2901,15 +2967,18 @@ fn drain_until(
     let needle_text = String::from_utf8_lossy(needle);
 
     while Instant::now() < deadline {
-        let _ = runtime.observe_lifecycle_slice(
-            *logical_clock,
-            None,
-            botster_core_daemon::ObserveLifecycleBudget {
-                max_sessions: 32,
-                max_encoded_result_bytes: 64 * 1024,
-                max_elapsed: Duration::from_millis(25),
-            },
-        );
+        let _ = runtime
+            .observe_lifecycle_slice(
+                *logical_clock,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(25),
+                },
+            )
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge");
         let response = api
             .handle_request(
                 runtime,
@@ -2920,6 +2989,7 @@ fn drain_until(
                     now_seconds: *logical_clock,
                 },
             )
+            .wait(runtime)
             .expect("read screen through client api");
         *logical_clock += 1;
         let HubClientResponseBody::ReadScreen(screen) = response.body else {
@@ -2944,15 +3014,18 @@ fn read_screen_until(
 ) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        let _ = runtime.observe_lifecycle_slice(
-            *logical_clock,
-            None,
-            botster_core_daemon::ObserveLifecycleBudget {
-                max_sessions: 32,
-                max_encoded_result_bytes: 64 * 1024,
-                max_elapsed: Duration::from_millis(25),
-            },
-        );
+        let _ = runtime
+            .observe_lifecycle_slice(
+                *logical_clock,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(25),
+                },
+            )
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge");
         let response = api
             .handle_request(
                 runtime,
@@ -2963,6 +3036,7 @@ fn read_screen_until(
                     now_seconds: *logical_clock,
                 },
             )
+            .wait(runtime)
             .expect("read screen through client api");
         *logical_clock += 1;
         let HubClientResponseBody::ReadScreen(screen) = response.body else {
@@ -2979,15 +3053,18 @@ fn read_screen_until(
 fn observe_for(runtime: &mut HubRuntime, logical_clock: &mut u64, duration: Duration) {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
-        let _ = runtime.observe_lifecycle_slice(
-            *logical_clock,
-            None,
-            botster_core_daemon::ObserveLifecycleBudget {
-                max_sessions: 32,
-                max_encoded_result_bytes: 64 * 1024,
-                max_elapsed: Duration::from_millis(25),
-            },
-        );
+        let _ = runtime
+            .observe_lifecycle_slice(
+                *logical_clock,
+                None,
+                botster_core_daemon::ObserveLifecycleBudget {
+                    max_sessions: 32,
+                    max_encoded_result_bytes: 64 * 1024,
+                    max_elapsed: Duration::from_millis(25),
+                },
+            )
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge");
         *logical_clock += 1;
         thread::sleep(Duration::from_millis(20));
     }
@@ -3014,7 +3091,7 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
                 command: "printf 'before-late\\n'; while IFS= read -r line; do printf 'after:%s\\n' \"$line\"; done".to_string(),
                 now_seconds: logical_clock,
             },
-        )
+        ).wait(&runtime)
         .expect("spawn late-history session");
     logical_clock += 1;
 
@@ -3054,6 +3131,7 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect("read screen between late attach and first drain");
     logical_clock += 1;
     let HubClientResponseBody::ReadScreen(screen) = readback.body else {
@@ -3079,6 +3157,8 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
     assert!(
         runtime
             .list_terminal_subscriptions()
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core inventory")
             .iter()
             .any(|row| row.subscription_id == late_subscription && row.adapter_bound),
         "late attach must be adapter-bound"
@@ -3108,6 +3188,7 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect("spawn no-history session");
     logical_clock += 1;
 
@@ -3139,6 +3220,7 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect("read blank screen before sending live output");
     logical_clock += 1;
     let HubClientResponseBody::ReadScreen(screen) = readback.body else {
@@ -3163,6 +3245,8 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
     assert!(
         runtime
             .list_terminal_subscriptions()
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core inventory")
             .iter()
             .any(|row| row.subscription_id == late_subscription && row.adapter_bound),
         "no-history late attach must be adapter-bound"
@@ -3188,6 +3272,7 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
                 request_id: request_id("status"),
             },
         )
+        .wait(&runtime)
         .expect("status through client api");
     let HubClientResponseBody::Status(status) = status.body else {
         panic!("status response expected");
@@ -3203,6 +3288,7 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
                 request_id: request_id("list-empty"),
             },
         )
+        .wait(&runtime)
         .expect("list through client api");
     assert!(
         matches!(sessions.body, HubClientResponseBody::Sessions(sessions) if sessions.is_empty())
@@ -3218,7 +3304,7 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
                 command: "printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done".to_string(),
                 now_seconds: logical_clock,
             },
-        )
+        ).wait(&runtime)
         .expect("spawn through client api");
     logical_clock += 1;
     let HubClientResponseBody::Spawned(spawned) = spawn.body else {
@@ -3271,6 +3357,8 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
     assert!(
         runtime
             .list_terminal_subscriptions()
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core inventory")
             .iter()
             .filter(|row| row.adapter_bound)
             .count()
@@ -3288,6 +3376,7 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
             now_seconds: logical_clock,
         },
     )
+    .wait(&runtime)
     .expect("detach through client api");
     logical_clock += 1;
 
@@ -3314,6 +3403,7 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect("shutdown through client api");
     let HubClientResponseBody::Events(events) = shutdown.body else {
         panic!("shutdown should return events");
@@ -3371,6 +3461,7 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
             now_seconds: logical_clock,
         },
     )
+    .wait(&runtime)
     .expect("spawn through client api");
     logical_clock += 1;
     attach_bound_subscription(
@@ -3408,6 +3499,7 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect("allowed package should write through core daemon");
     logical_clock += 1;
     let HubClientResponseBody::GuardedWrite(result) = response.body else {
@@ -3444,6 +3536,7 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect_err("ungranted package should be denied by hub policy");
     assert_eq!(
         denied,
@@ -3473,6 +3566,7 @@ fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
             now_seconds: logical_clock,
         },
     )
+    .wait(&runtime)
     .expect("spawn readback session");
     logical_clock += 1;
 
@@ -3488,6 +3582,7 @@ fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
                     now_seconds: logical_clock,
                 },
             )
+            .wait(&runtime)
             .expect("daemon-backed read_screen should return typed response");
         logical_clock += 1;
         let HubClientResponseBody::ReadScreen(screen) = read_screen.body else {
@@ -3514,6 +3609,7 @@ fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect("daemon-backed capture_snapshot should return typed response");
     let HubClientResponseBody::CaptureSnapshot(snapshot) = capture_snapshot.body else {
         panic!("capture_snapshot should return snapshot body");
@@ -3521,11 +3617,10 @@ fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
     assert_eq!(snapshot.session_id, session_id);
     assert_eq!(snapshot.rows, 24);
     assert_eq!(snapshot.cols, 80);
-    assert_eq!(
-        snapshot.payload_format.as_deref(),
-        Some("ghostty-terminal-snapshot-v1")
-    );
-    assert!(snapshot.payload_bytes > 0);
+    assert!(!snapshot.capture_id.is_empty());
+    assert!(snapshot.total_bytes > 0);
+    assert!(snapshot.pages >= 1);
+    assert!(snapshot.unavailable.is_none());
 
     logical_clock += 1;
     let shutdown = api
@@ -3538,6 +3633,7 @@ fn read_screen_and_snapshot_return_typed_daemon_readback_responses() {
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect("shutdown readback session through client api");
     let HubClientResponseBody::Events(events) = shutdown.body else {
         panic!("shutdown should return events");
@@ -3571,6 +3667,7 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect("spawn mode-flags session");
         logical_clock += 1;
     }
@@ -3585,6 +3682,7 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect("read authoritative mouse-off flags");
     logical_clock += 1;
     let HubClientResponseBody::ModeFlags(off) = off.body else {
@@ -3592,7 +3690,7 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
     };
     assert_eq!(off.session_id, off_session_id);
     assert_eq!(off.mouse_mode, 0);
-    assert_ne!(off.mode_generation, 0);
+    assert!(off.unavailable.is_none());
     // Full ModeFlags projection is present (not mouse-only).
     let _ = (
         off.kitty_enabled,
@@ -3601,7 +3699,8 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
         off.alt_screen,
         off.focus_reporting,
         off.application_cursor,
-        off.mode_revision,
+        off.rows,
+        off.cols,
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -3616,6 +3715,7 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
                     now_seconds: logical_clock,
                 },
             )
+            .wait(&runtime)
             .expect("read authoritative mouse-on flags");
         logical_clock += 1;
         let HubClientResponseBody::ModeFlags(mode_flags) = response.body else {
@@ -3633,8 +3733,7 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
     };
     assert_eq!(on.session_id, on_session_id);
     assert_eq!(on.mouse_mode, 9);
-    assert_ne!(on.mode_generation, 0);
-    assert!(on.mode_revision >= 1);
+    assert!(on.unavailable.is_none());
 
     let missing = api
         .handle_request(
@@ -3646,6 +3745,7 @@ fn read_mode_flags_returns_exact_authoritative_values_and_session_attribution() 
                 now_seconds: logical_clock,
             },
         )
+        .wait(&runtime)
         .expect_err("unknown session must not default to mouse-off");
     assert_eq!(
         missing,
@@ -3722,6 +3822,7 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
             now_seconds: 1,
         },
     )
+    .wait(&runtime)
     .expect_err("attach is a transport handshake and should not hydrate packages");
 
     let response = api
@@ -3732,6 +3833,7 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
                 request_id: request_id("packages"),
             },
         )
+        .wait(&runtime)
         .expect("package query through client api");
     let HubClientResponseBody::Packages(records) = response.body else {
         panic!("packages response expected");
@@ -3791,6 +3893,7 @@ fn package_and_lifecycle_queries_are_sanitized_and_explicitly_pulled() {
                 request_id: request_id("plugin-lifecycle"),
             },
         )
+        .wait(&runtime)
         .expect("plugin lifecycle status through client api");
     let HubClientResponseBody::PluginLifecycle(records) = response.body else {
         panic!("plugin lifecycle response expected");
@@ -3821,6 +3924,7 @@ fn denied_client_request_returns_typed_admission_error() {
                 request_id: request_id("denied-status"),
             },
         )
+        .wait(&runtime)
         .expect_err("denied client should fail");
 
     assert_eq!(
@@ -3842,6 +3946,7 @@ fn denied_client_request_returns_typed_admission_error() {
                 now_seconds: 1,
             },
         )
+        .wait(&runtime)
         .expect_err("denied client should not shut down sessions");
 
     assert_eq!(

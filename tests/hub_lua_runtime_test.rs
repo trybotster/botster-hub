@@ -75,7 +75,7 @@ fn explicit_runtime_in_with_cleanup(
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit runtime config should build");
 
-    HubRuntime::new(config)
+    HubRuntime::new(config).expect("hub runtime starts")
 }
 
 fn unique_short_test_dir(name: &str) -> PathBuf {
@@ -2232,9 +2232,12 @@ fn real_lua_plugin_spawns_session_type_through_worker_capability() {
         ])
     );
     assert!(
-        hub.session(&botster_core::SessionId("lua-template-session".to_string()))
+        hub.list_sessions()
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
             .expect("list spawned session")
-            .is_some(),
+            .iter()
+            .any(|session| session.session_id.0 == "lua-template-session"),
         "production core daemon should own the spawned PTY session"
     );
 }
@@ -2385,9 +2388,12 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
     assert_eq!(spawned["created_branch"], false);
     assert_eq!(spawned["created_worktree"], true);
     assert!(
-        hub.session(&SessionId(session_id.to_string()))
+        hub.list_sessions()
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
             .expect("read managed spawned session")
-            .is_some()
+            .iter()
+            .any(|session| session.session_id.0 == session_id)
     );
     let context = hub
         .session_context(session_id)
@@ -2681,11 +2687,12 @@ fn session_type_spawn_helper_works_from_non_mcp_plugin_invocation_path() {
         "lua-template-action-session"
     );
     assert!(
-        hub.session(&botster_core::SessionId(
-            "lua-template-action-session".to_string()
-        ))
-        .expect("list action-spawned session")
-        .is_some(),
+        hub.list_sessions()
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
+            .expect("list action-spawned session")
+            .iter()
+            .any(|session| session.session_id.0 == "lua-template-action-session"),
         "generic invoke_plugin pump should fulfill non-MCP helper requests"
     );
 }
@@ -2716,9 +2723,12 @@ fn lua_session_type_spawn_requires_exact_scoped_package_capability() {
     assert_eq!(error.code, "plugin_tool_failed");
     assert!(error.message.contains("session_type_spawn capability"));
     assert!(
-        hub.session(&botster_core::SessionId("lua-template-denied".to_string()))
+        hub.list_sessions()
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
             .expect("list denied session")
-            .is_none(),
+            .iter()
+            .all(|session| session.session_id.0 != "lua-template-denied"),
         "denied plugin call must not spawn a session"
     );
 }
@@ -2742,6 +2752,7 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
                 payload: serde_json::json!({}),
             },
         )
+        .wait(&hub)
         .expect("render project pipelines surface through client api");
     let HubClientResponseBody::PluginSurface(surface) = surface.body else {
         panic!("plugin surface response expected");
@@ -2776,6 +2787,7 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
                 ),
             },
         )
+        .wait(&hub)
         .expect("submit invalid project pipelines action through client api");
     let HubClientResponseBody::PluginActionResult(invalid) = invalid.body else {
         panic!("plugin action response expected");
@@ -2811,6 +2823,7 @@ fn project_pipelines_surface_action_round_trip_uses_client_api_and_plugin_worker
                 ),
             },
         )
+        .wait(&hub)
         .expect("submit valid project pipelines action through client api");
     let HubClientResponseBody::PluginActionResult(valid) = valid.body else {
         panic!("plugin action response expected");
@@ -2867,6 +2880,8 @@ fn lua_and_native_coordination_publish_into_coredaemon_router() {
             },
             41,
         ))
+        .wait(std::time::Duration::from_secs(30))
+        .expect("core bridge")
         .expect("publish native routed envelope");
     assert_eq!(
         native_publish.deliveries[0].status,
@@ -2874,6 +2889,8 @@ fn lua_and_native_coordination_publish_into_coredaemon_router() {
     );
     assert_eq!(
         hub.routed_envelope_delivery_state(&native_target, &native_envelope_id)
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
             .state
             .expect("CoreDaemon should record native delivery")
             .status,
@@ -2904,6 +2921,8 @@ fn lua_and_native_coordination_publish_into_coredaemon_router() {
     assert_eq!(lua_ack_native["state"]["status"], "acknowledged");
     assert_eq!(
         hub.routed_envelope_delivery_state(&native_target, &native_envelope_id)
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
             .state
             .expect("CoreDaemon should record Lua ack")
             .status,
@@ -2927,10 +2946,14 @@ fn lua_and_native_coordination_publish_into_coredaemon_router() {
 
     let native_drain_lua = hub
         .drain_routed_envelopes(lua_target.clone(), None, 1)
+        .wait(std::time::Duration::from_secs(30))
+        .expect("core bridge")
         .expect("drain Lua envelope through native HubRuntime");
     assert_eq!(native_drain_lua.envelopes[0].id, lua_envelope_id);
     let native_ack_lua = hub
         .acknowledge_routed_envelope(lua_target.clone(), lua_envelope_id.clone())
+        .wait(std::time::Duration::from_secs(30))
+        .expect("core bridge")
         .expect("ack Lua envelope through native HubRuntime");
     assert_eq!(
         native_ack_lua
@@ -2941,6 +2964,8 @@ fn lua_and_native_coordination_publish_into_coredaemon_router() {
     );
     assert_eq!(
         hub.routed_envelope_delivery_state(&lua_target, &lua_envelope_id)
+            .wait(std::time::Duration::from_secs(30))
+            .expect("core bridge")
             .state
             .expect("CoreDaemon should record Lua delivery")
             .status,
@@ -3098,7 +3123,6 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             worktrees: hub.worktrees(),
             package_event_router: hub.package_event_router().clone(),
             causal_scopes: hub.causal_scopes().clone(),
-            event_handler_hold_ms: None,
         },
         registry.packages().into_iter().cloned().collect(),
     )

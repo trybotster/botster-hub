@@ -1869,9 +1869,9 @@ mod tests {
         harness.spawn_and_attach_on_peer(&mut peer, session_id, subscription_id);
         let inventory = harness
             .daemon
-            .runtime_mut()
+            .runtime()
             .expect("runtime")
-            .list_terminal_subscriptions();
+            .list_terminal_subscriptions_for_test();
         let bound = inventory
             .iter()
             .find(|row| row.session_id.0 == session_id && row.subscription_id.0 == subscription_id);

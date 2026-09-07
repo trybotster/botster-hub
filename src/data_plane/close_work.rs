@@ -238,6 +238,7 @@ impl CloseWorkSource {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn live_count(&self) -> usize {
         self.inner
             .registry

@@ -237,15 +237,17 @@ impl WebRtcTerminalAdapter {
     }
 
     /// Create the production adapter and the peer-owned write handle.
-    #[must_use]
+    #[cfg(test)]
     pub(crate) fn pair() -> (Self, WebRtcTerminalAdapterHandle) {
         Self::pair_with_wake(AdapterWake::new())
     }
 
+    #[cfg(test)]
     fn pair_with_wake(wake: AdapterWake) -> (Self, WebRtcTerminalAdapterHandle) {
         Self::pair_with_wake_and_close_work(wake, Arc::new(AtomicBool::new(false)))
     }
 
+    #[cfg(test)]
     fn pair_with_wake_and_close_work(
         wake: AdapterWake,
         close_work: Arc<AtomicBool>,
@@ -708,10 +710,6 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.transfer_aggregate_permit(frame_len, usage)
     }
 
-    pub(crate) fn write_opaque_frame(&self, frame: &RoutedTerminalFrame) {
-        let _ = self.inner.try_write(frame);
-    }
-
     pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
         self.inner.slot.attach_close_hook(hook);
     }
@@ -937,7 +935,9 @@ mod tests {
         assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
         assert_eq!(adapter.try_write(&frame), Ok(()));
         assert_eq!(
-            handle.complete_active(),
+            handle
+                .complete_active()
+                .map(|completed| completed.frame.as_bytes().to_vec()),
             Some(frame.frame.as_bytes().to_vec())
         );
     }
@@ -965,11 +965,13 @@ mod tests {
         let subscription_id = SubscriptionId("terminal".into());
         let mut worker = ClientWorker::new();
         worker.set_wake_source(TerminalWakeSource::new());
-        let (generation, replacements) = worker.record_attach(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-        );
+        let (generation, replacements) = worker
+            .record_attach(
+                client_id.clone(),
+                session_id.clone(),
+                subscription_id.clone(),
+            )
+            .expect("record attach");
         assert!(replacements.is_empty());
         mux.register(
             session_id.0.clone(),
@@ -1003,7 +1005,7 @@ mod tests {
                 data: b"held-by-core".to_vec(),
             },
         )];
-        assert!(worker.ingest_bound_terminal_frames(&mut egress).is_empty());
+        assert!(worker.filter_bound_terminal_frames(&mut egress).is_empty());
         assert!(egress.is_empty());
 
         for attempt in 1..512 {

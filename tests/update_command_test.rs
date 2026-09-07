@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod support;
+use botster_terminal_protocol::TerminalKind;
 use support::ensure_session_worker_binary;
 
 #[test]
@@ -460,9 +461,10 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
     .expect("probe the pre-update worker");
     let old_is_incompatible = old_probe.kind
         != botster_hub_client::DaemonResponseKind::ReadModeFlags
-        || old_probe.mode_flags.as_ref().is_none_or(|flags| {
-            flags.mode_generation == 0 || flags.mode_generation > ((1_u64 << 53) - 1)
-        });
+        || old_probe
+            .mode_flags
+            .as_ref()
+            .is_none_or(|flags| flags.unavailable.is_some());
     assert!(
         old_is_incompatible,
         "fixed pre-update worker must reproduce the incompatibility: {old_probe:?}"
@@ -524,36 +526,34 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
             subscription_id: "postupdate-attach".to_string(),
         })
         .expect("attach updated session");
-    let mut events = attach.events;
-    events.extend(collect_attach_events(
-        &mut connection,
-        new_session,
-        "postupdate-attach",
-    ));
-    let attaching = event_position(&events, "postupdate-attach", "attaching");
-    let snapshot = events
+    assert_eq!(
+        attach.kind,
+        botster_hub_client::DaemonResponseKind::TerminalAttached
+    );
+    let frames = collect_attach_frames(&mut connection, new_session, "postupdate-attach");
+    let kinds: Vec<TerminalKind> = frames.iter().map(|frame| frame.kind()).collect();
+    let attached = kinds
         .iter()
-        .position(|event| {
-            matches!(event,
-            botster_hub_client::DaemonEvent::Snapshot { subscription_id, .. }
-                if subscription_id == "postupdate-attach")
-        })
-        .expect("production attach Snapshot");
-    let attached = event_position(&events, "postupdate-attach", "attached");
-    assert!(attaching < snapshot && snapshot < attached, "{events:?}");
-    let payload = events
+        .position(|kind| *kind == TerminalKind::AttachState)
+        .expect("production attach state frame");
+    let ready = kinds
         .iter()
-        .find_map(|event| match event {
-            botster_hub_client::DaemonEvent::Snapshot {
-                subscription_id,
-                history,
-                ..
-            } if subscription_id == "postupdate-attach" => {
-                Some(history.decoded_bytes().expect("decode GHOSTSNP").to_vec())
-            }
-            _ => None,
-        })
-        .expect("Snapshot payload");
+        .position(|kind| *kind == TerminalKind::SnapshotReady)
+        .expect("production SNAPSHOT_READY");
+    let finish = kinds
+        .iter()
+        .position(|kind| *kind == TerminalKind::SnapshotFinish)
+        .expect("production SNAPSHOT_FINISH");
+    assert!(attached < ready && ready < finish, "{kinds:?}");
+    let payload: Vec<u8> = frames
+        .iter()
+        .filter(|frame| frame.kind() == TerminalKind::SnapshotHistory)
+        .flat_map(|frame| frame.body().to_vec())
+        .collect();
+    assert!(
+        !payload.is_empty(),
+        "production attach carries GHOSTSNP history"
+    );
     let mut projection = botster_terminal_ghostty::GhosttyClientProjection::new(
         botster_core::TerminalScreenSize::new(24, 80),
     )
@@ -570,11 +570,14 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
         mode_flags.kind,
         botster_hub_client::DaemonResponseKind::ReadModeFlags
     );
-    let generation = mode_flags
-        .mode_flags
-        .expect("mode flags body")
-        .mode_generation;
-    assert!((1..=((1_u64 << 53) - 1)).contains(&generation));
+    assert!(
+        mode_flags
+            .mode_flags
+            .expect("mode flags body")
+            .unavailable
+            .is_none(),
+        "updated worker reads modes after the GHOSTSNP install"
+    );
 
     botster_hub_client::request(
         &endpoint,
@@ -738,53 +741,30 @@ fn wait_for_process_exit(pid: u32) {
     panic!("process {pid} did not exit");
 }
 
-fn collect_attach_events(
+/// Read the attach stream on one route until SNAPSHOT_FINISH.
+fn collect_attach_frames(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
     subscription_id: &str,
-) -> Vec<botster_hub_client::DaemonEvent> {
-    let mut events = Vec::new();
+) -> Vec<botster_terminal_protocol::TerminalFrame> {
+    let mut frames = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if let Ok(Some(envelope)) = connection.poll_terminal(Duration::from_millis(25))
-            && let Ok(bytes) = envelope.payload_bytes()
-            && let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
+        if let Ok(Some(frame)) = connection.poll_terminal(Duration::from_millis(25))
+            && frame.route == subscription_id
+            && let Ok(decoded) = botster_terminal_protocol::TerminalFrame::from_bytes(&frame.body)
         {
-            events.push(event);
-        }
-        events.extend(connection.take_skipped_events());
-        for envelope in connection.take_skipped_terminal() {
-            if let Ok(bytes) = envelope.payload_bytes()
-                && let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes)
-            {
-                events.push(event);
+            let finished = decoded.kind() == TerminalKind::SnapshotFinish;
+            frames.push(decoded);
+            if finished {
+                return frames;
             }
         }
-        if events.iter().any(|event| {
-            matches!(event,
-            botster_hub_client::DaemonEvent::AttachState { subscription_id: id, state, .. }
-                if id == subscription_id && state == "attached")
-        }) {
-            return events;
-        }
-        thread::sleep(Duration::from_millis(25));
     }
-    panic!("attach did not complete for {session_id}: {events:?}");
-}
-
-fn event_position(
-    events: &[botster_hub_client::DaemonEvent],
-    subscription_id: &str,
-    expected_state: &str,
-) -> usize {
-    events
-        .iter()
-        .position(|event| {
-            matches!(event,
-            botster_hub_client::DaemonEvent::AttachState { subscription_id: id, state, .. }
-                if id == subscription_id && state == expected_state)
-        })
-        .unwrap_or_else(|| panic!("missing {expected_state} event: {events:?}"))
+    panic!(
+        "attach history did not finish for {session_id}: {:?}",
+        frames.iter().map(|frame| frame.kind()).collect::<Vec<_>>()
+    );
 }
 
 fn create_direct_local_package(root: &Path) -> PathBuf {

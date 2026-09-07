@@ -53,7 +53,7 @@ fn explicit_runtime(name: &str) -> HubRuntime {
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit runtime config should build");
 
-    HubRuntime::new(config)
+    HubRuntime::new(config).expect("hub runtime starts")
 }
 
 fn request(
@@ -240,16 +240,21 @@ fn drain_session_until(
             },
         );
         *logical_clock += 1;
-        if let Ok(screen) = runtime.read_screen(
-            RequestId("capability-drain-screen".to_string()),
-            session_id.clone(),
-            *logical_clock,
-        ) && screen
-            .screen
-            .text
-            .as_bytes()
-            .windows(needle.len())
-            .any(|window| window == needle)
+        let screen = runtime
+            .begin_read_screen(
+                RequestId("capability-drain-screen".to_string()),
+                session_id.clone(),
+                *logical_clock,
+            )
+            .wait(runtime, Duration::from_secs(5));
+        if let Ok(botster_core_daemon::CoreCompletion::ReadScreen {
+            result: Ok(screen), ..
+        }) = screen
+            && screen
+                .text
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window == needle)
         {
             return;
         }
@@ -365,12 +370,7 @@ fn hub_runtime_serves_allowed_scoped_filesystem_requests_and_denies_escape_paths
 fn hub_runtime_stores_plugin_json_under_plugin_data_and_enforces_namespace() {
     let mut runtime = explicit_runtime("plugin-store");
     let plugin_key = PluginKey("project-pipelines".to_string());
-    let store_root = runtime
-        .capability_runtime()
-        .lock()
-        .expect("hub capability runtime lock")
-        .plugin_store_root()
-        .to_path_buf();
+    let store_db = runtime.config().data_directory.join("plugin-db.redb");
 
     runtime
         .submit_capability_request(request(
@@ -398,8 +398,10 @@ fn hub_runtime_stores_plugin_json_under_plugin_data_and_enforces_namespace() {
                 ))
             )
     )));
-    assert!(store_root.ends_with("plugin-data"));
-    assert!(store_root.join("project-pipelines").exists());
+    assert!(
+        store_db.exists(),
+        "the keyed plugin store must live in the data directory"
+    );
 
     let denied = runtime
         .submit_capability_request(request(
@@ -665,17 +667,9 @@ fn hub_runtime_reports_bounded_http_failures_without_blocking_hot_path() {
     let mut logical_clock = 100;
 
     runtime
-        .spawn_session(spawn, CoreSessionMetadata::new(), logical_clock)
+        .begin_spawn(spawn, CoreSessionMetadata::new())
+        .wait(&runtime, Duration::from_secs(30))
         .expect("spawn through core");
-    logical_clock += 1;
-    runtime
-        .attach_client(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            logical_clock,
-        )
-        .expect("attach through core");
     logical_clock += 1;
     let terminal_adapter = bind_shared_terminal_adapter(
         &mut runtime,
@@ -873,17 +867,9 @@ fn hub_runtime_keeps_session_hot_path_responsive_during_failing_http_transport()
     let mut logical_clock = 100;
 
     runtime
-        .spawn_session(spawn, CoreSessionMetadata::new(), logical_clock)
+        .begin_spawn(spawn, CoreSessionMetadata::new())
+        .wait(&runtime, Duration::from_secs(30))
         .expect("spawn through core");
-    logical_clock += 1;
-    runtime
-        .attach_client(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            logical_clock,
-        )
-        .expect("attach through core");
     logical_clock += 1;
     let terminal_adapter = bind_shared_terminal_adapter(
         &mut runtime,
@@ -1042,17 +1028,9 @@ fn capability_operations_do_not_block_session_hot_path() {
     let mut logical_clock = 100;
 
     runtime
-        .spawn_session(spawn, CoreSessionMetadata::new(), logical_clock)
+        .begin_spawn(spawn, CoreSessionMetadata::new())
+        .wait(&runtime, Duration::from_secs(30))
         .expect("spawn through core");
-    logical_clock += 1;
-    runtime
-        .attach_client(
-            client_id.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
-            logical_clock,
-        )
-        .expect("attach through core");
     logical_clock += 1;
     let terminal_adapter = bind_shared_terminal_adapter(
         &mut runtime,

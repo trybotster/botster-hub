@@ -36,7 +36,7 @@ use crate::admission::unix_hello::{UnixTerminalAdmission, unix_hello_admission};
 use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::control_request_operation_label;
 use crate::daemon::control::message::{
-    ControlMessage, ControlSender, DaemonDeliveryKind, daemon_delivery_kind, egress_write_class,
+    ControlMessage, ControlSender, daemon_delivery_kind, egress_write_class,
 };
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::{DaemonControlState, tick};
@@ -562,7 +562,6 @@ pub(crate) enum ConnectionTerminalReason {
     Eof,
     Protocol,
     WriteFailure,
-    Cancellation,
     Shutdown,
     NormalClose,
 }
@@ -573,7 +572,6 @@ impl ConnectionTerminalReason {
             Self::Eof => "eof",
             Self::Protocol => "protocol",
             Self::WriteFailure => "write_failure",
-            Self::Cancellation => "cancellation",
             Self::Shutdown => "shutdown",
             Self::NormalClose => "normal_close",
         }

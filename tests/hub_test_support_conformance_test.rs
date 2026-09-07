@@ -1,73 +1,63 @@
-use botster_core::{SessionId, TerminalAttachState, TransportEgress};
-use botster_hub_client::DaemonEvent;
+use botster_terminal_protocol::TerminalKind;
 
-#[derive(Debug, PartialEq, Eq)]
-enum AttachSequenceEvent {
-    Attaching,
-    History,
-    Attached,
-    Live,
+/// Kind order of one Hub late-attach fixture, as `TerminalKind` names.
+fn fixture_kinds(frames: &[botster_hub_test_support::TerminalStreamFixtureFrame]) -> Vec<&str> {
+    frames.iter().map(|frame| frame.kind.as_str()).collect()
 }
 
 #[test]
-fn hub_late_attach_fixture_matches_core_snapshot_before_live_ordering() {
-    let core = botster_core_test_support::fixtures::regression::regression_shapes::snapshot_before_live_output(
-        SessionId("fixture-ordering-session".to_string()),
-        b"history-before-live\r\n",
-        b"live-after-attach\r\n",
-    )
-    .into_iter()
-    .filter_map(|event| match event {
-        TransportEgress::AttachState {
-            state: TerminalAttachState::Attaching,
-            ..
-        } => Some(AttachSequenceEvent::Attaching),
-        TransportEgress::Snapshot { .. } | TransportEgress::Scrollback { .. } => {
-            Some(AttachSequenceEvent::History)
-        }
-        TransportEgress::AttachState {
-            state: TerminalAttachState::Attached,
-            ..
-        } => Some(AttachSequenceEvent::Attached),
-        TransportEgress::TerminalOutput { .. } => Some(AttachSequenceEvent::Live),
-        _ => None,
-    })
-    .collect::<Vec<_>>();
-
-    let hub = botster_hub_test_support::late_attach_history_events()
-        .into_iter()
-        .filter_map(|event| match event {
-            DaemonEvent::AttachState { state, .. } if state == "attaching" => {
-                Some(AttachSequenceEvent::Attaching)
-            }
-            DaemonEvent::Snapshot { .. } | DaemonEvent::Scrollback { .. } => {
-                Some(AttachSequenceEvent::History)
-            }
-            DaemonEvent::AttachState { state, .. } if state == "attached" => {
-                Some(AttachSequenceEvent::Attached)
-            }
-            DaemonEvent::TerminalOutput { .. } => Some(AttachSequenceEvent::Live),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    fn collapse_history(events: Vec<AttachSequenceEvent>) -> Vec<AttachSequenceEvent> {
-        let mut collapsed = Vec::new();
-        for event in events {
-            if event == AttachSequenceEvent::History
-                && collapsed.last() == Some(&AttachSequenceEvent::History)
-            {
-                continue;
-            }
-            collapsed.push(event);
-        }
-        collapsed
-    }
-
+fn hub_late_attach_fixtures_follow_the_terminal_stream_attach_order() {
+    // Protocol 9 delivers history on the terminal route: the attachment is
+    // acknowledged first, MODES and SNAPSHOT_READY follow, live OUTPUT may
+    // interleave before the SNAPSHOT_HISTORY pages, and SNAPSHOT_FINISH closes
+    // the history before later OUTPUT and PROCESS_EXIT.
+    let history = botster_hub_test_support::late_attach_history_frames();
     assert_eq!(
-        collapse_history(hub),
-        collapse_history(core),
-        "Hub late-attach fixtures may emit incremental history frames; the attach order must still be attaching, history, attached, live"
+        fixture_kinds(&history),
+        vec![
+            TerminalKind::AttachState.name(),
+            TerminalKind::Modes.name(),
+            TerminalKind::SnapshotReady.name(),
+            TerminalKind::Output.name(),
+            TerminalKind::SnapshotHistory.name(),
+            TerminalKind::SnapshotHistory.name(),
+            TerminalKind::SnapshotFinish.name(),
+            TerminalKind::Output.name(),
+            TerminalKind::ProcessExit.name(),
+        ]
+    );
+    assert!(
+        history
+            .iter()
+            .all(|frame| frame.route == history[0].route
+                && frame.generation == history[0].generation),
+        "one late-attach fixture stays on one route and one generation"
+    );
+
+    let no_history = botster_hub_test_support::late_attach_no_history_frames();
+    let kinds = fixture_kinds(&no_history);
+    assert_eq!(
+        kinds.first().copied(),
+        Some(TerminalKind::AttachState.name())
+    );
+    assert_eq!(
+        kinds.last().copied(),
+        Some(TerminalKind::ProcessExit.name())
+    );
+    let finish = kinds
+        .iter()
+        .position(|kind| *kind == TerminalKind::SnapshotFinish.name())
+        .expect("empty history still finishes the snapshot");
+    let ready = kinds
+        .iter()
+        .position(|kind| *kind == TerminalKind::SnapshotReady.name())
+        .expect("empty history still announces readiness");
+    assert!(ready < finish, "SNAPSHOT_READY precedes SNAPSHOT_FINISH");
+    assert!(
+        kinds[finish + 1..]
+            .iter()
+            .all(|kind| *kind != TerminalKind::SnapshotHistory.name()),
+        "no history page follows SNAPSHOT_FINISH"
     );
 }
 

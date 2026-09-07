@@ -2,7 +2,6 @@
 //! and post-processing.
 
 use std::sync::mpsc;
-use std::time::Instant;
 
 use botster_hub_client::{
     DaemonHubUpdate, DaemonHubUpdateState, DaemonRequest, DaemonResponse, DaemonResponseKind,
@@ -111,8 +110,6 @@ pub(crate) fn handle(
         reply_tx,
         response_delivery_rx,
         grant_id,
-        client_id,
-        accepted_at: Instant::now(),
         continuation: Box::new(|_, _| crate::daemon::control::pending::ControlPoll::Pending),
     };
     match step {

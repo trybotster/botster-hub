@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
-use std::os::unix::net::UnixListener;
+use std::io::{self, BufReader, IsTerminal};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -387,6 +386,7 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
         provider_count: stopped.provider_count,
         enabled_provider_count: stopped.enabled_provider_count,
         session_count: 0,
+        retention: None,
         recovered_sessions: stopped
             .recovered_sessions
             .iter()
@@ -2495,6 +2495,15 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
                 print_daemon_transport_status("status", &status);
             }
         }
+        DaemonResponseKind::TerminalAttached => {
+            println!("response=terminal_attached");
+        }
+        DaemonResponseKind::SnapshotPage => {
+            println!("response=snapshot_page");
+            if let Some(page) = response.snapshot_page {
+                println!("session_id={}", page.session_id);
+            }
+        }
         DaemonResponseKind::HubUpdate => {
             println!("response=hub_update");
             if let Some(update) = response.hub_update {
@@ -2927,9 +2936,6 @@ fn print_daemon_events(events: &[DaemonEvent]) {
                 println!(
                     "event=event_gap subscription_id={subscription_id} owner={owner} name={name}"
                 );
-            }
-            _ => {
-                println!("event=host_unrecognized");
             }
         }
     }

@@ -23,11 +23,11 @@ use botster_hub_client::{
     DaemonResponseKind,
 };
 
-use crate::client_api_dto::response::{daemon_events, daemon_response_base};
+use crate::HubDaemon;
+use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::pending::ControlStep;
-use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
+use crate::daemon::error::DaemonTransportError;
 use crate::daemon::owner_loop::{DaemonControlState, record_egress_write_failure};
-use crate::{HubClientResponseBody, HubDaemon};
 pub(crate) use message::{ControlMessage, ControlSender};
 
 /// Owned snapshot of owner diagnostics and connection identity for one
@@ -54,15 +54,6 @@ pub(crate) fn runtime_client_id(request: &DaemonRequest) -> String {
         } => format!("botster-hub-daemon-subscription-{subscription_id}"),
         _ => "botster-hub-daemon-socket".to_string(),
     }
-}
-
-pub(crate) fn events_response(
-    body: HubClientResponseBody,
-) -> DaemonTransportResult<DaemonResponse> {
-    let HubClientResponseBody::Events(events) = body else {
-        return Err(DaemonTransportError::UnexpectedResponse);
-    };
-    Ok(daemon_events(events::events_from_client(events)))
 }
 
 pub(crate) fn attach_bind_operator_error(code: &'static str, message: &str) -> DaemonResponse {

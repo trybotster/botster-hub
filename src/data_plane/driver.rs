@@ -50,7 +50,7 @@ type CoreRequest = Box<dyn FnOnce(&mut CoreDaemon) + Send + 'static>;
 
 /// Outcome of one non-blocking [`CoreTicket::poll`].
 #[derive(Debug)]
-pub(crate) enum CoreTicketPoll<T> {
+pub enum CoreTicketPoll<T> {
     /// The data-plane thread has not published the result yet.
     Pending,
     /// The result.
@@ -61,7 +61,7 @@ pub(crate) enum CoreTicketPoll<T> {
 
 /// Why a blocking [`CoreTicket::wait`] returned without a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CoreTicketError {
+pub enum CoreTicketError {
     /// The bound elapsed first.
     Timeout,
     /// The data-plane thread stopped before it ran the operation.
@@ -85,7 +85,7 @@ impl std::error::Error for CoreTicketError {}
 /// threads that do not serve the owner loop, such as the in-process CLI, may
 /// block on [`Self::wait`].
 #[derive(Debug)]
-pub(crate) struct CoreTicket<T> {
+pub struct CoreTicket<T> {
     receiver: Receiver<T>,
 }
 
@@ -105,7 +105,7 @@ impl<T> CoreTicket<T> {
     }
 
     /// Bounded blocking read for threads that do not serve the owner loop.
-    pub(crate) fn wait(self, timeout: Duration) -> Result<T, CoreTicketError> {
+    pub fn wait(self, timeout: Duration) -> Result<T, CoreTicketError> {
         match self.receiver.recv_timeout(timeout) {
             Ok(value) => Ok(value),
             Err(RecvTimeoutError::Timeout) => Err(CoreTicketError::Timeout),

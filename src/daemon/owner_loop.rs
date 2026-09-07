@@ -925,7 +925,6 @@ mod tests {
     };
     use crate::daemon::error::daemon_operator_error;
     use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-    use crate::subscription::entity::entity_subscription_error;
     use crate::transport::unix::connection::handle_connection;
     use botster_core::RequestId;
     use botster_core::contract::terminal_adapter::TerminalAdapter;

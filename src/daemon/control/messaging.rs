@@ -32,18 +32,22 @@ pub(crate) fn defer_client_step(
     map: impl Fn(HubClientResponseBody) -> DaemonTransportResult<DaemonResponse> + Send + 'static,
 ) -> ControlStep {
     match step {
-        HubClientStep::Ready(result) => {
-            ControlStep::Ready(result.map_err(DaemonTransportError::Client).and_then(map))
-        }
+        HubClientStep::Ready(result) => ControlStep::Ready(
+            result
+                .map_err(DaemonTransportError::Client)
+                .and_then(|response| map(response.body)),
+        ),
         HubClientStep::Pending(mut pending) => ControlStep::pending(move |daemon, _| {
             let Some(runtime) = daemon.runtime() else {
                 return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
             };
             match pending.poll(runtime) {
                 None => ControlPoll::Pending,
-                Some(result) => {
-                    ControlPoll::Ready(result.map_err(DaemonTransportError::Client).and_then(&map))
-                }
+                Some(result) => ControlPoll::Ready(
+                    result
+                        .map_err(DaemonTransportError::Client)
+                        .and_then(|response| map(response.body)),
+                ),
             }
         }),
     }
