@@ -43,11 +43,11 @@ use crate::daemon::owner_loop::{DaemonControlState, tick};
 use crate::daemon::control::pending::retire_abandoned_requests;
 use crate::daemon::owner_budget::OwnerPermit;
 use crate::subscription::attach_routes::{
-    AttachedSubscription, AttachedSubscriptionChange, apply_attached_subscription_change,
-    attached_subscription_change_for_response,
+    AttachStreamOwner, AttachedSubscription, AttachedSubscriptionChange,
+    apply_attached_subscription_change, attached_subscription_change_for_response,
 };
 use crate::subscription::route_cleanup::{
-    CleanupCandidate, candidate_from_registry, retain_route_cleanup,
+    CleanupCandidate, candidate_for_departing_owner, retain_route_cleanup,
 };
 use crate::subscription::entity::EntityFrameSender;
 use crate::transport::unix::UnixConnectionMux;
@@ -743,11 +743,24 @@ pub(crate) fn handle_connection_cleanup(
     for (session_id, subscription_id, _) in &unbound {
         keys.insert((session_id.clone(), subscription_id.clone()));
     }
+    keys.extend(
+        state
+            .pending_runtime
+            .take_acknowledged_routes(&cleanup.client_id),
+    );
+    // The departing owner is this connection; a route whose current stream
+    // belongs to a replacement is targeted only under this client's own
+    // Core id, never through the replacement's identity or generation.
+    let departing = AttachStreamOwner {
+        client_id: cleanup.client_id.clone(),
+        grant_id: None,
+    };
     let candidates: Vec<CleanupCandidate> = keys
         .iter()
-        .map(|(session_id, subscription_id)| {
-            candidate_from_registry(
+        .filter_map(|(session_id, subscription_id)| {
+            candidate_for_departing_owner(
                 &state.pending_runtime,
+                &departing,
                 &cleanup.client_id,
                 session_id,
                 subscription_id,

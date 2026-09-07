@@ -173,6 +173,7 @@ fn finish(
         reply_tx,
         response_delivery_rx,
         grant_id,
+        client,
         permit,
         ..
     } = entry;
@@ -257,6 +258,27 @@ fn finish(
             }
             (_, change) => change,
         };
+        // The owner's acknowledged route history: what its cleanup must
+        // cover, and what attach admission caps.
+        if let Some(budget_key) = client.as_deref() {
+            match change.as_ref() {
+                Some(AttachedSubscriptionChange::Attach(subscription)) => {
+                    state.pending_runtime.acknowledge_route(
+                        budget_key,
+                        &subscription.session_id,
+                        &subscription.subscription_id,
+                    );
+                }
+                Some(AttachedSubscriptionChange::Detach(subscription)) => {
+                    state.pending_runtime.forget_acknowledged_route(
+                        budget_key,
+                        &subscription.session_id,
+                        &subscription.subscription_id,
+                    );
+                }
+                None => {}
+            }
+        }
         record_attached_subscription_change(
             &mut state.pending_runtime,
             &mut state.attach_close,

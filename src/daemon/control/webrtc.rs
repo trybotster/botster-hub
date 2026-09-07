@@ -1,6 +1,6 @@
 //! Local WebRTC bootstrap, signal, and peer-closed control family.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -21,10 +21,11 @@ use crate::daemon::error::{DaemonTransportResult, local_webrtc_bootstrap_issue_e
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon_projection::app_local_url;
 use crate::subscription::attach_routes::{
-    AttachedSubscription, AttachedSubscriptionChange, record_attached_subscription_change,
+    AttachStreamOwner, AttachedSubscription, AttachedSubscriptionChange,
+    record_attached_subscription_change,
 };
 use crate::subscription::route_cleanup::{
-    CleanupCandidate, candidate_from_registry, retain_route_cleanup,
+    CleanupCandidate, candidate_for_departing_owner, retain_route_cleanup,
 };
 use crate::transport::webrtc::{
     LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES, LocalWebrtcAttachedSubscription,
@@ -304,23 +305,64 @@ pub(crate) fn handle_peer_closed(
     // Occupancy set is the counter source of truth. PeerClosed must release
     // live_attach_routes here so a replacement Attach can become live.
     // Capture Core ownership, stream identity, and generation for every route
-    // before the synchronous bookkeeping below mutates the registry. The
-    // obligation detaches these in Core after the peer is gone.
-    let candidates: Vec<CleanupCandidate> = detach_list
+    // before the synchronous bookkeeping below mutates the registry, grouped
+    // by the departing grant that owns it. A route whose current stream
+    // belongs to a grant that is not removed is a replacement and is skipped.
+    // Every removed grant's acknowledged history is covered as well.
+    let mut route_keys: BTreeSet<(String, String)> = detach_list
         .iter()
         .map(|subscription| {
-            let fallback = runtime_client_id(&DaemonRequest::Detach {
-                session_id: subscription.session_id.clone(),
-                subscription_id: subscription.subscription_id.clone(),
-            });
-            candidate_from_registry(
-                &state.pending_runtime,
-                &fallback,
-                &subscription.session_id,
-                &subscription.subscription_id,
+            (
+                subscription.session_id.clone(),
+                subscription.subscription_id.clone(),
             )
         })
         .collect();
+    for removed in &removed_grants {
+        route_keys.extend(state.pending_runtime.take_acknowledged_routes(removed));
+        for (session_id, subscription_id, _) in state.pending_runtime.unbound_routes_for_grant(removed) {
+            route_keys.insert((session_id, subscription_id));
+        }
+    }
+    let mut candidates_by_grant: BTreeMap<String, Vec<CleanupCandidate>> = BTreeMap::new();
+    for (session_id, subscription_id) in &route_keys {
+        let owner_grant = state
+            .pending_runtime
+            .attach_owner_grant_ids
+            .get(&(session_id.clone(), subscription_id.clone()))
+            .filter(|owner| removed_grants.contains(owner.as_str()))
+            .cloned()
+            .unwrap_or_else(|| grant_id.clone());
+        let departing = AttachStreamOwner {
+            client_id: String::new(),
+            grant_id: Some(owner_grant.clone()),
+        };
+        let core_client_id = runtime_client_id(&DaemonRequest::Detach {
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+        });
+        if let Some(candidate) = candidate_for_departing_owner(
+            &state.pending_runtime,
+            &departing,
+            &core_client_id,
+            session_id,
+            subscription_id,
+        ) {
+            candidates_by_grant
+                .entry(owner_grant)
+                .or_default()
+                .push(candidate);
+        }
+    }
+    // Unbound streams of removed grants are cancelled now so a late attach
+    // continuation finds an identity mismatch and releases its own generation.
+    for removed in &removed_grants {
+        for (session_id, subscription_id, identity) in state.pending_runtime.unbound_routes_for_grant(removed) {
+            let _ = state
+                .pending_runtime
+                .cancel_stream_if(&session_id, &subscription_id, &identity);
+        }
+    }
     for subscription in &detach_list {
         record_attached_subscription_change(
             &mut state.pending_runtime,
@@ -413,40 +455,39 @@ pub(crate) fn handle_peer_closed(
         .attach_owner_grant_ids
         .retain(|_, owner| !removed_grants.contains(owner.as_str()));
     let _ = control_tx;
-    retire_abandoned_requests(daemon, state, &grant_id);
-    // The permit reserved at peer admission carries the Core cleanup. A peer
-    // admitted Rejected for budget reasons holds no permit and can own no
-    // route (Attach requires an admitted adapter), so candidates are empty.
-    let permit = state.budget.take_peer_permit(&grant_id);
-    match (permit, candidates.is_empty(), daemon.runtime().is_some()) {
-        (Some(permit), true, _) | (Some(permit), _, false) => state.budget.release(permit),
-        (None, true, _) | (None, _, false) => {}
-        (None, false, true) => {
-            // Invariant break: routes exist for a peer without a permit.
-            // Fail closed: refuse to retain work past capacity and report.
-            state
-                .budget
-                .record_invariant_violation("webrtc peer cleanup without a permit");
-            state.lifecycle_counters.cleanup_failed =
-                state.lifecycle_counters.cleanup_failed.saturating_add(1);
-        }
-        (Some(permit), false, true) => {
-            let now = tick(&mut state.logical_clock);
-            retain_route_cleanup(
-                state,
-                permit,
-                "webrtc_peer_cleanup",
-                None,
-                candidates,
-                now,
-                |state, applied| {
-                    if applied.failed {
-                        state.lifecycle_counters.cleanup_failed =
-                            state.lifecycle_counters.cleanup_failed.saturating_add(1);
-                    }
-                },
+    // Every removed grant (primary and fail-closed siblings) retires its
+    // abandoned reads and hands its permit to its own cleanup obligation.
+    // Attach admission requires the grant to hold its permit, so a grant
+    // without one owns no route and has no candidates to carry.
+    for removed in &removed_grants {
+        retire_abandoned_requests(daemon, state, removed);
+        let candidates = candidates_by_grant.remove(removed).unwrap_or_default();
+        let Some(permit) = state.budget.take_peer_permit(removed) else {
+            debug_assert!(
+                candidates.is_empty(),
+                "attach admission requires the peer permit"
             );
+            continue;
+        };
+        if candidates.is_empty() || daemon.runtime().is_none() {
+            state.budget.release(permit);
+            continue;
         }
+        let now = tick(&mut state.logical_clock);
+        retain_route_cleanup(
+            state,
+            permit,
+            "webrtc_peer_cleanup",
+            None,
+            candidates,
+            now,
+            |state, applied| {
+                if applied.failed {
+                    state.lifecycle_counters.cleanup_failed =
+                        state.lifecycle_counters.cleanup_failed.saturating_add(1);
+                }
+            },
+        );
     }
     false
 }

@@ -83,10 +83,6 @@ pub(crate) struct OwnerBudgetCounters {
     pub requests_past_deadline: u64,
     /// Obligations still pending past the deadline (counted once).
     pub obligations_past_deadline: u64,
-    /// Cleanup work that arrived for a resource holding no permit. This is
-    /// an invariant break; the work is refused (fail closed), never retained
-    /// past capacity.
-    pub invariant_violations: u64,
 }
 
 pub(crate) struct OwnerBudget {
@@ -154,14 +150,6 @@ impl OwnerBudget {
         })
     }
 
-    /// Record cleanup work that arrived for a resource holding no permit.
-    /// The caller refuses the work; nothing is retained past capacity.
-    pub(crate) fn record_invariant_violation(&mut self, what: &str) {
-        self.counters.invariant_violations =
-            self.counters.invariant_violations.saturating_add(1);
-        eprintln!("botster-hub owner budget invariant violated: {what}");
-    }
-
     pub(crate) fn release(&mut self, permit: OwnerPermit) {
         drop(permit);
         self.outstanding = self.outstanding.saturating_sub(1);
@@ -190,6 +178,11 @@ impl OwnerBudget {
     /// Take the permit for one peer's cleanup, when the peer was admitted.
     pub(crate) fn take_peer_permit(&mut self, grant_id: &str) -> Option<OwnerPermit> {
         self.peer_permits.remove(grant_id)
+    }
+
+    /// Whether a peer still holds its permit; attach admission requires it.
+    pub(crate) fn peer_holds_permit(&self, grant_id: &str) -> bool {
+        self.peer_permits.contains_key(grant_id)
     }
 
     /// Retain owner work that must complete, holding `permit` until it does.
@@ -354,8 +347,7 @@ mod tests {
         assert!(budget.reserve_connection().is_none());
         assert!(!budget.reserve_peer("grant"));
         assert!(budget.take_peer_permit("grant").is_none());
-        budget.record_invariant_violation("test");
-        assert_eq!(budget.counters.invariant_violations, 1);
+        assert!(!budget.peer_holds_permit("grant"));
         assert_eq!(budget.outstanding(), 0);
     }
 

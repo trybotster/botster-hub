@@ -481,9 +481,13 @@ pub(crate) fn handle_runtime(
             let runtime = daemon.runtime().expect("runtime checked above");
             let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
             let id = request_id("daemon-sessions-read-screen");
-            let mut tracker =
-                runtime.begin_read_screen(id.clone(), SessionId(session_id.clone()), now);
-            ControlStep::pending(move |daemon, _| {
+            let tracker = std::sync::Arc::new(std::sync::Mutex::new(
+                runtime.begin_read_screen(id.clone(), SessionId(session_id.clone()), now),
+            ));
+            let retire_tracker = std::sync::Arc::clone(&tracker);
+            ControlStep::pending_retirable(
+                move |daemon, _| {
+                let mut tracker = tracker.lock().expect("read tracker lock");
                 let completion = match poll_tracker(&mut tracker, daemon, "read_screen", &id.0) {
                     Ok(completion) => completion,
                     Err(poll) => return poll,
@@ -503,15 +507,21 @@ pub(crate) fn handle_runtime(
                     }
                     Err(error) => core_operator_error("read_screen", &id.0, &error),
                 }))
-            })
+                },
+                move |_, state, permit| retain_operation_retirement(state, permit, retire_tracker),
+            )
         }
         DaemonRequest::ReadModeFlags { session_id } => {
             let runtime = daemon.runtime().expect("runtime checked above");
             let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
             let id = request_id("daemon-sessions-read-mode-flags");
-            let mut tracker =
-                runtime.begin_read_mode_flags(id.clone(), SessionId(session_id.clone()), now);
-            ControlStep::pending(move |daemon, _| {
+            let tracker = std::sync::Arc::new(std::sync::Mutex::new(
+                runtime.begin_read_mode_flags(id.clone(), SessionId(session_id.clone()), now),
+            ));
+            let retire_tracker = std::sync::Arc::clone(&tracker);
+            ControlStep::pending_retirable(
+                move |daemon, _| {
+                let mut tracker = tracker.lock().expect("read tracker lock");
                 let completion = match poll_tracker(&mut tracker, daemon, "read_mode_flags", &id.0)
                 {
                     Ok(completion) => completion,
@@ -541,7 +551,9 @@ pub(crate) fn handle_runtime(
                     }
                     Err(error) => core_operator_error("read_mode_flags", &id.0, &error),
                 }))
-            })
+                },
+                move |_, state, permit| retain_operation_retirement(state, permit, retire_tracker),
+            )
         }
         DaemonRequest::CaptureSnapshot { session_id } => {
             let runtime = daemon.runtime().expect("runtime checked above");
@@ -585,7 +597,7 @@ pub(crate) fn handle_runtime(
                     Err(error) => core_operator_error("capture_snapshot", &id.0, &error),
                 }))
                 },
-                move |_, state, permit| retain_capture_retirement(state, permit, retire_tracker),
+                move |_, state, permit| retain_operation_retirement(state, permit, retire_tracker),
             )
         }
         DaemonRequest::ReadSnapshotPage {
@@ -704,10 +716,12 @@ pub(crate) fn retain_exact_detach(
         });
 }
 
-/// Retire one capture request that still owns Core work: cancel the pending
-/// operation when it has not run, and release the capture when it has. The
-/// permit stays held until Core accepted the cancel or the release.
-fn retain_capture_retirement(
+/// Retire one deferred Core operation whose request was abandoned: cancel
+/// the pending operation when it has not run, keep the tracker until its
+/// completion is consumed (Core may still emit one after cancel admission),
+/// and release a capture the completion produced. The permit stays held
+/// until Core accepted the last of those.
+fn retain_operation_retirement(
     state: &mut DaemonControlState,
     permit: OwnerPermit,
     tracker: std::sync::Arc<std::sync::Mutex<CoreOperationTracker>>,
@@ -718,7 +732,7 @@ fn retain_capture_retirement(
     let mut release_capture: Option<CaptureId> = None;
     state
         .budget
-        .retain(permit, "capture_retirement", move |daemon, state| {
+        .retain(permit, "operation_retirement", move |daemon, state| {
             if let Some(capture) = release_capture.clone() {
                 return match drive_core_slot(&mut release_slot, daemon, state, |runtime, _| {
                     runtime.release_capture(capture)
@@ -848,6 +862,16 @@ fn handle_attach(
             client_id: client_id.clone(),
             grant_id: observability.grant_id.clone(),
         };
+        // A route can only be attached by a peer that holds its budget
+        // permit, so peer cleanup (the only place the permit is taken) is
+        // the only owner a WebRTC route can be left with.
+        let holds_permit = owner
+            .grant_id
+            .as_deref()
+            .is_some_and(|grant_id| state.budget.peer_holds_permit(grant_id));
+        if !holds_permit {
+            return ControlStep::ready(owner_budget_error());
+        }
         if !owner_has_attach_capacity(pending_runtime, &owner) {
             return ControlStep::ready(attach_route_limit_error());
         }
