@@ -131,6 +131,7 @@ pub(crate) struct InventoryReconcileProgress {
     pub validated: usize,
     pub more: bool,
     pub after: Option<(String, String)>,
+    pub retired: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -632,6 +633,7 @@ impl AttachStreamRegistry {
         }
         let mut last = after;
         let mut validated = 0;
+        let mut retired = Vec::new();
         for ((session_id, subscription_id), adapter_bound, identity) in visit {
             last = Some((session_id.clone(), subscription_id.clone()));
             if !adapter_bound || identity.epoch > read_epoch {
@@ -644,14 +646,16 @@ impl AttachStreamRegistry {
                 .and_then(|stream| stream.generation);
             let live = lookup(&identity.client_id, &session_id, &subscription_id);
             if Self::route_is_stale_against_live_generation(stream_generation, live) {
-                self.close_adapter(&session_id, &subscription_id);
-                self.cancel_stream(&session_id, &subscription_id);
+                if self.cancel_stream_if(&session_id, &subscription_id, &identity) {
+                    retired.push((session_id, subscription_id));
+                }
             }
         }
         InventoryReconcileProgress {
             validated,
             more,
             after: last,
+            retired,
         }
     }
 
@@ -1736,10 +1740,20 @@ mod tests {
         let (_adapter, handle) = bind_unix(&mut registry, &old, "s", "gone", 5);
         // Read submitted after the bind; Core ended the route before the read
         // ran, so the vector lacks it.
-        let read: Vec<TerminalSubscriptionRecord> = Vec::new();
-        registry.reconcile_inventory(&read, registry.attach_epoch());
+        let progress = registry.reconcile_inventory_slice(
+            |_, _, _| None,
+            registry.attach_epoch(),
+            None,
+            usize::MAX,
+        );
+        assert_eq!(
+            progress.retired,
+            vec![("s".to_string(), "gone".to_string())],
+            "reconcile reports the exact route it removed"
+        );
         assert!(handle.host_closed(), "Core-ended route is host-closed");
         assert!(registry.stream_identity("s", "gone").is_none());
+        assert!(!registry.stream_matches("s", "gone", &old));
     }
 
     /// Row 2 (red on the current implementation): a stream attached and
@@ -1756,7 +1770,23 @@ mod tests {
         // The newer attach lands (Core turn, then owner bind) before apply.
         let later = registry.start_attach(owner(), "s".into(), "later".into());
         let (_a2, later_handle) = bind_unix(&mut registry, &later, "s", "later", 2);
-        registry.reconcile_inventory(&read, read_epoch);
+        let progress = registry.reconcile_inventory_slice(
+            |client_id, session_id, subscription_id| {
+                read.iter().find_map(|row| {
+                    (row.client_id.0 == client_id
+                        && row.session_id.0 == session_id
+                        && row.subscription_id.0 == subscription_id)
+                        .then_some(row.generation)
+                })
+            },
+            read_epoch,
+            None,
+            usize::MAX,
+        );
+        assert!(
+            progress.retired.is_empty(),
+            "a newer surviving stream is not reported as retired"
+        );
         assert!(!before_handle.host_closed(), "present row survives");
         assert!(
             !later_handle.host_closed(),

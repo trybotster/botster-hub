@@ -35,7 +35,10 @@ use crate::daemon_maintenance::{
     MaintenanceState, OBSERVE_SLICE_BUDGET, PUMP_MAX_ROUTES_VALIDATED, PumpPhase, PumpScheduler,
     decide_background_slice, run_maintenance_kind,
 };
-use crate::subscription::attach_routes::AttachStreamRegistry;
+use crate::subscription::attach_routes::{
+    AttachStreamRegistry, AttachedSubscription, AttachedSubscriptionChange,
+    record_attached_subscription_change,
+};
 use crate::subscription::entity::{
     EntitySubscriptionState, drive_entity_subscriptions, drive_package_entity_fanout,
     drive_package_entity_resync, seed_lifecycle_reconciliation, session_subscribers_need_delivery,
@@ -714,6 +717,18 @@ pub(crate) fn run_inventory_reconcile_phase(
         state.pump.reconcile_after.clone(),
         PUMP_MAX_ROUTES_VALIDATED,
     );
+    for (session_id, subscription_id) in progress.retired {
+        record_attached_subscription_change(
+            &mut state.pending_runtime,
+            &mut state.attach_close,
+            &mut state.lifecycle_counters,
+            Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                session_id,
+                subscription_id,
+            })),
+            None,
+        );
+    }
     if progress.more {
         state.pump.reconcile_after = progress.after;
         true
@@ -2677,6 +2692,13 @@ mod tests {
         let handle = mux
             .route_handle(&session_id, "older", generation)
             .expect("registered route");
+        assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 1);
+        assert!(
+            state
+                .pending_runtime
+                .live_attach_routes
+                .contains(&(session_id.clone(), "older".to_string()))
+        );
         // The read is submitted after the attach; an empty result means Core
         // ended the route, and reconcile must close it.
         assert!(
@@ -2697,6 +2719,26 @@ mod tests {
             handle.host_closed(),
             "the absent older route is host-closed"
         );
+        assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 0);
+        assert_eq!(state.attach_close.released_attach_generations, 1);
+        assert!(state.pending_runtime.live_attach_routes.is_empty());
+        let occupancy = crate::subscription::attach_routes::live_attach_occupancy_rows(
+            &state.pending_runtime.live_attach_routes,
+            &[],
+            &state.pending_runtime,
+        );
+        assert!(
+            occupancy.is_empty(),
+            "the reconciled route must not remain in Status occupancy: {occupancy:?}"
+        );
+
+        // A later inventory read cannot retire or decrement the same route
+        // again because the first pass removed its exact stream.
+        assert!(run_inventory_reconcile_phase(&daemon, &mut state));
+        state.resolve_submitted_reconcile_inventory_for_test(Vec::new());
+        assert!(!run_inventory_reconcile_phase(&daemon, &mut state));
+        assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 0);
+        assert_eq!(state.attach_close.released_attach_generations, 1);
         let _ = daemon.stop();
     }
 }
