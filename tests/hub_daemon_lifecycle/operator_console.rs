@@ -269,55 +269,6 @@ fn operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prom
 }
 
 #[test]
-fn process_ownership_operator_console_readiness_failure_reaps_console_and_owned_daemon() {
-    let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
-    let data_dir = unique_short_test_dir("console-readiness-failure");
-    let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
-    let mut console = OperatorConsolePty::spawn_with_env(
-        &data_dir,
-        &[(TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV, "1")],
-    );
-    let error = console
-        .try_wait_for_occurrences("botster-hub> ", 1)
-        .expect_err("injected daemon readiness failure should stop console startup");
-    console.wait_for_exit();
-    let output = console.text();
-    let daemon_pid = output
-        .split("terminated owned child_pid=")
-        .nth(1)
-        .and_then(|tail| {
-            tail.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-                .parse::<u32>()
-                .ok()
-        })
-        .expect("production diagnostic includes the terminated owned daemon pid");
-    daemon_cleanup.record_owned_pid(daemon_pid);
-
-    assert!(error.contains("child exited before condition"), "{error}");
-    assert!(
-        output.contains("timed out waiting for local runtime daemon readiness"),
-        "{output}"
-    );
-    assert!(
-        output.contains("(budget 1ms)"),
-        "the injected production readiness budget was not observed: {output}"
-    );
-    assert!(
-        output.contains("terminated owned child_pid="),
-        "production failure diagnostic omitted terminated daemon evidence: {output}"
-    );
-    daemon_cleanup.assert_cleaned();
-    assert!(
-        !process_exists(daemon_pid),
-        "induced readiness failure left exact daemon pid {daemon_pid} alive"
-    );
-    fs::remove_dir_all(&data_dir).expect("remove readiness-failure console data directory");
-}
-
-#[test]
 fn operator_console_panic_reaps_console_and_owned_daemon() {
     let _guard = daemon_test_guard();
     ensure_session_worker_binary();

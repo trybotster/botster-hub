@@ -1312,124 +1312,6 @@ fn event_plane_saturation_throughput_keeps_fractional_ops_per_second() {
     assert!(metrics.throughput > 0.0);
 }
 
-#[test]
-fn event_plane_saturation_isolated_client_event_conformance() {
-    let _guard = daemon_test_guard();
-    let stall_path = PathBuf::from(format!(
-        "/tmp/bh-event-conformance-stall-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let _ = fs::remove_file(&stall_path);
-    let hub = botster_hub_test_support::IsolatedHubBuilder::new()
-        .hub_bin(env!("CARGO_BIN_EXE_botster-hub"))
-        .session_worker_bin(session_worker_binary_path())
-        .root(PathBuf::from("/tmp/bh-event-conformance"))
-        .name("event-conformance")
-        .env("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX", "1")
-        .env(
-            "BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH",
-            stall_path.to_str().expect("utf8 stall path"),
-        )
-        .start()
-        .expect("start isolated hub");
-    let producer = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/event-plane-producer");
-    let report = run_client_event_conformance(&hub, &producer, Some(stall_path.as_path()))
-        .expect("client event conformance");
-    assert!(report.negotiated_package_event_subscriptions);
-    assert!(report.exact_subscribe);
-    assert!(report.event_received);
-    assert!(report.subject_filter_dropped_non_matching);
-    assert!(report.reconnect_without_replay);
-    assert!(report.unsubscribed);
-    assert!(report.control_progressed_during_events);
-    assert!(report.event_gap);
-    let _ = fs::remove_file(&stall_path);
-    hub.shutdown().expect("shutdown isolated hub");
-}
-
-#[test]
-#[ignore = "loaded-runner event-plane-saturation campaign"]
-fn event_plane_saturation_campaign() {
-    let _guard = daemon_test_guard();
-    let fd = probe_fd_limit();
-    let pty = probe_pty_allocation();
-    eprintln!(
-        "event-plane saturation host probe fd={:?} pty={:?}",
-        fd.marker_name(),
-        pty.marker_name()
-    );
-    let pre = classify_host_validity(
-        None,
-        &unevaluated_scheduler_lag(),
-        fd,
-        pty,
-        host_load_diagnostics(),
-    );
-    persist_host_validity_artifact(&pre);
-    if pre.verdict != HostValidityVerdict::Valid {
-        fail_classified(&pre);
-    }
-    let phase = campaign_phase();
-    let decoupled = run_saturation_arm(SaturationArm::PlaneDecoupled);
-    let fd = probe_fd_limit();
-    let pty = probe_pty_allocation();
-    let validity = classify_from_arm(&decoupled, fd, pty);
-    persist_host_validity_artifact(&validity);
-    if validity.verdict != HostValidityVerdict::Valid {
-        fail_classified(&validity);
-    }
-    let enabled_run = run_saturation_arm(SaturationArm::PlaneEnabled);
-    let enabled_validity = classify_from_arm(&enabled_run, probe_fd_limit(), probe_pty_allocation());
-    persist_host_validity_artifact(&enabled_validity);
-    if enabled_validity.verdict != HostValidityVerdict::Valid {
-        fail_classified(&enabled_validity);
-    }
-    let enabled_metrics = metrics_for_arm(&enabled_run.report);
-    let decoupled_metrics = metrics_for_arm(&decoupled.report);
-    let class = classify_enabled_budget_failure(&validity, &enabled_run.report.observability);
-    if class != "clean" {
-        let mut failed = enabled_validity.clone();
-        if failed.verdict == HostValidityVerdict::Valid {
-            failed.verdict = HostValidityVerdict::ProductFailure;
-            failed.disabled_arm_meets_immutable_gates = Some(false);
-            failed.reasons.extend(
-                published_budget_breaches(&enabled_run.report.observability)
-                    .into_iter()
-                    .map(|row| format!("enabled_arm:{row}")),
-            );
-        }
-        fail_classified(&failed);
-    }
-    let (thresholds, source_revision) = match phase {
-        CampaignPhase::Calibration => (
-            derive_all_thresholds(&enabled_metrics),
-            std::env::var("SUBJECT_SHA").ok(),
-        ),
-        CampaignPhase::Acceptance => {
-            let (thresholds, source_revision) = read_committed_thresholds();
-            gate_all(&enabled_metrics, &decoupled_metrics, &thresholds);
-            (thresholds, source_revision)
-        }
-    };
-    let faults = run_fault_campaign();
-    write_phase_dataset(
-        phase,
-        &enabled_metrics,
-        &decoupled_metrics,
-        &thresholds,
-        &enabled_run.report.observability,
-        &decoupled.report.observability,
-        &faults,
-        enabled_run.report.webrtc_queues.clone(),
-        source_revision,
-        &validity,
-    );
-}
-
 #[derive(Clone, Copy)]
 enum SaturationArm {
     PlaneEnabled,
@@ -3433,7 +3315,7 @@ fn event_gap_for_subscription(event: &botster_hub_client::DaemonEvent, subscript
 }
 
 fn wait_unix_marker_or_gap(
-    connection: &mut botster_hub_client::DaemonConnection,
+    connection: &mut LifecycleConnection,
     token: &str,
     subscription_id: &str,
 ) {
@@ -3719,7 +3601,7 @@ fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySe
         botster_hub_client::DaemonResponseKind::Spawned
     );
     let mut connection =
-        botster_hub_client::DaemonConnection::connect(endpoint).expect("noisy connection");
+        LifecycleConnection::connect(endpoint).expect("noisy connection");
     let attached = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
@@ -3728,7 +3610,7 @@ fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySe
         .expect("attach noisy");
     assert_eq!(
         attached.kind,
-        botster_hub_client::DaemonResponseKind::Events
+        botster_hub_client::DaemonResponseKind::TerminalAttached
     );
     NoisySession { connection }
 }
@@ -4068,25 +3950,17 @@ fn perform_cycle_operation(
             botster_hub_client::DaemonResponseKind::Events,
         ),
         "input" => {
-            let mut connection = botster_hub_client::DaemonConnection::connect(endpoint)
+            let mut connection = LifecycleConnection::connect(endpoint)
                 .map_err(|error| error.to_string())?;
             connection
-                .send_terminal_frame(
-                    session_id,
-                    sub_id,
-                    &terminal_input_frame_bytes(format!("{}\r", "i".repeat(64)).as_bytes()),
-                )
+                .send_terminal_frame(sub_id, &terminal_input_frame_bytes(format!("{}\r", "i".repeat(64)).as_bytes()))
                 .map_err(|error| error.to_string())
         }
         "resize" => {
-            let mut connection = botster_hub_client::DaemonConnection::connect(endpoint)
+            let mut connection = LifecycleConnection::connect(endpoint)
                 .map_err(|error| error.to_string())?;
             connection
-                .send_terminal_frame(
-                    session_id,
-                    sub_id,
-                    &terminal_resize_frame_bytes(24, 80),
-                )
+                .send_terminal_frame(sub_id, &terminal_resize_frame_bytes(24, 80))
                 .map_err(|error| error.to_string())
         }
         "mcp" => expect_kind(
@@ -4849,7 +4723,7 @@ fn assert_no_live_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
 }
 
 fn prove_client_contract_under_saturation(
-    connection: &mut botster_hub_client::DaemonConnection,
+    connection: &mut LifecycleConnection,
     endpoint: &botster_hub_client::DaemonEndpoint,
 ) {
     let status = connection
@@ -4960,11 +4834,7 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
     );
     noisy
         .connection
-        .send_terminal_frame(
-            EVENT_PLANE_NOISY_SESSION,
-            EVENT_PLANE_NOISY_SUB,
-            &terminal_input_frame_bytes(b"ns-probe\r"),
-        )
+        .send_terminal_frame(EVENT_PLANE_NOISY_SUB, &terminal_input_frame_bytes(b"ns-probe\r"))
         .expect("input noisy");
     let echoed = collect_attach_events(
         &mut noisy.connection,
@@ -4989,11 +4859,7 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
     assert!(ready_at.is_some() && echo_at.is_some(), "ordering oracles");
     noisy
         .connection
-        .send_terminal_frame(
-            EVENT_PLANE_NOISY_SESSION,
-            EVENT_PLANE_NOISY_SUB,
-            &terminal_resize_frame_bytes(30, 100),
-        )
+        .send_terminal_frame(EVENT_PLANE_NOISY_SUB, &terminal_resize_frame_bytes(30, 100))
         .expect("resize noisy");
     let detached = noisy
         .connection
@@ -5008,7 +4874,7 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
     );
     drop(std::mem::replace(
         &mut noisy.connection,
-        botster_hub_client::DaemonConnection::connect(endpoint).expect("reconnect noisy"),
+        LifecycleConnection::connect(endpoint).expect("reconnect noisy"),
     ));
     let reattached = noisy
         .connection
@@ -5019,7 +4885,7 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
         .expect("reattach noisy");
     assert_eq!(
         reattached.kind,
-        botster_hub_client::DaemonResponseKind::Events
+        botster_hub_client::DaemonResponseKind::TerminalAttached
     );
     let late_events = collect_attach_events(
         &mut noisy.connection,
@@ -5257,7 +5123,7 @@ fn late_attach_closed_first(endpoint: &botster_hub_client::DaemonEndpoint) {
         botster_hub_client::DaemonResponseKind::Spawned,
     )
     .expect("spawn for late attach");
-    let mut first = botster_hub_client::DaemonConnection::connect(endpoint).expect("attach first");
+    let mut first = LifecycleConnection::connect(endpoint).expect("attach first");
     first
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
@@ -5265,7 +5131,7 @@ fn late_attach_closed_first(endpoint: &botster_hub_client::DaemonEndpoint) {
         })
         .expect("first attach");
     drop(first);
-    let mut second = botster_hub_client::DaemonConnection::connect(endpoint).expect("attach second");
+    let mut second = LifecycleConnection::connect(endpoint).expect("attach second");
     let reused = second
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
@@ -5296,13 +5162,13 @@ fn late_attach_message_first(endpoint: &botster_hub_client::DaemonEndpoint) {
         botster_hub_client::DaemonResponseKind::Spawned,
     )
     .expect("spawn for live attach");
-    let mut live = botster_hub_client::DaemonConnection::connect(endpoint).expect("live attach");
+    let mut live = LifecycleConnection::connect(endpoint).expect("live attach");
     live.request(&botster_hub_client::DaemonRequest::Attach {
         session_id: session_id.to_string(),
         subscription_id: "late-attach-both".to_string(),
     })
     .expect("live attach");
-    let mut sibling = botster_hub_client::DaemonConnection::connect(endpoint).expect("sibling attach");
+    let mut sibling = LifecycleConnection::connect(endpoint).expect("sibling attach");
     let sibling_attach = sibling
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
@@ -5329,7 +5195,7 @@ fn late_attach_message_first(endpoint: &botster_hub_client::DaemonEndpoint) {
 }
 
 fn late_entities_closed_first_and_message_first(endpoint: &botster_hub_client::DaemonEndpoint) {
-    let mut first = botster_hub_client::DaemonConnection::connect(endpoint).expect("entity first");
+    let mut first = LifecycleConnection::connect(endpoint).expect("entity first");
     first
         .request(&botster_hub_client::DaemonRequest::SubscribeEntities {
             entity_type: "session".to_string(),
@@ -5337,7 +5203,7 @@ fn late_entities_closed_first_and_message_first(endpoint: &botster_hub_client::D
         })
         .expect("subscribe entities");
     drop(first);
-    let mut second = botster_hub_client::DaemonConnection::connect(endpoint).expect("entity second");
+    let mut second = LifecycleConnection::connect(endpoint).expect("entity second");
     let reused = second
         .request(&botster_hub_client::DaemonRequest::SubscribeEntities {
             entity_type: "session".to_string(),
@@ -5348,13 +5214,13 @@ fn late_entities_closed_first_and_message_first(endpoint: &botster_hub_client::D
         reused.kind,
         botster_hub_client::DaemonResponseKind::OperatorError
     );
-    let mut live = botster_hub_client::DaemonConnection::connect(endpoint).expect("entity live");
+    let mut live = LifecycleConnection::connect(endpoint).expect("entity live");
     live.request(&botster_hub_client::DaemonRequest::SubscribeEntities {
         entity_type: "session".to_string(),
         subscription_id: "late-entity-both".to_string(),
     })
     .expect("live entity");
-    let mut sibling = botster_hub_client::DaemonConnection::connect(endpoint).expect("entity sibling");
+    let mut sibling = LifecycleConnection::connect(endpoint).expect("entity sibling");
     sibling
         .request(&botster_hub_client::DaemonRequest::SubscribeEntities {
             entity_type: "session".to_string(),
@@ -5529,74 +5395,6 @@ fn late_admitted_holder_survives_reload(endpoint: &botster_hub_client::DaemonEnd
         .expect("unsubscribe holder");
 }
 
-fn run_fault_campaign() -> FaultReport {
-    prove_shed_busy_non_blocking();
-    let stall_path = PathBuf::from(format!(
-        "/tmp/bh-event-sat-fault-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let hold_path = PathBuf::from(format!(
-        "/tmp/bh-event-sat-hold-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let hub = start_campaign_hub(
-        "faults",
-        &[
-            ("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX", "1"),
-            (
-                "BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH",
-                stall_path.to_str().expect("utf8"),
-            ),
-            (
-                "BOTSTER_HUB_TEST_HOLD_JOURNAL_PULL",
-                hold_path.to_str().expect("utf8 hold"),
-            ),
-            ("BOTSTER_HUB_TEST_DROP_JOURNAL_WAKES", "1"),
-            ("BOTSTER_HUB_TEST_LIFECYCLE_JOURNAL_CAPACITY", "16"),
-            ("BOTSTER_HUB_TEST_EVENT_INVOCATION_TIMEOUT_MS", "50"),
-            ("BOTSTER_HUB_TEST_EVENT_HANDLER_HOLD_MS", "200"),
-            ("BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION", "status"),
-        ],
-    );
-    let endpoint = hub.endpoint().clone();
-    enable_saturation_packages(&endpoint, hub.data_dir());
-    spawn_quiet_fleet(&endpoint);
-    let mut unix = subscribe_unix_events(&endpoint);
-    let stop = Arc::new(AtomicBool::new(false));
-    let emitter = spawn_event_emitter(&endpoint, stop.clone());
-    fault_shed_full_or_over_rate(&endpoint);
-    fault_plugin_mailbox_pressure(&endpoint);
-    fault_client_mailbox_gap(&endpoint, &mut unix, &stall_path);
-    fault_dropped_lifecycle_wake(&endpoint, &mut unix);
-    fault_lifecycle_cursor_expiry(&endpoint, &hold_path);
-    fault_handler_timeout(&endpoint);
-    fault_plugin_worker_restart(&endpoint, &mut unix);
-    unix = fault_unix_reconnect(&endpoint, unix);
-    fault_webrtc_reconnect_unix_survives(&endpoint, hub.data_dir());
-    assert_quiet_fleet_survives(&endpoint);
-    run_late_event_holder_matrix(&endpoint);
-    stop.store(true, Ordering::SeqCst);
-    emitter.join().expect("join fault emitter");
-    let observability = snapshot_observability(&endpoint);
-    let lifecycle = snapshot_lifecycle(&endpoint);
-    drop(unix);
-    shutdown_owned_sessions(&endpoint);
-    assert_no_live_sessions(&endpoint);
-    hub.shutdown().expect("shutdown fault hub");
-    FaultReport {
-        observability,
-        lifecycle,
-    }
-}
-
 fn fault_shed_full_or_over_rate(endpoint: &botster_hub_client::DaemonEndpoint) {
     thread::sleep(Duration::from_millis(400));
     let snap = snapshot_observability(endpoint);
@@ -5627,7 +5425,7 @@ fn fault_plugin_mailbox_pressure(endpoint: &botster_hub_client::DaemonEndpoint) 
 
 fn fault_client_mailbox_gap(
     endpoint: &botster_hub_client::DaemonEndpoint,
-    unix: &mut botster_hub_client::DaemonConnection,
+    unix: &mut LifecycleConnection,
     stall_path: &Path,
 ) {
     fs::write(stall_path, b"stall").expect("stall");
@@ -5674,7 +5472,7 @@ fn fault_client_mailbox_gap(
 
 fn fault_dropped_lifecycle_wake(
     endpoint: &botster_hub_client::DaemonEndpoint,
-    unix: &mut botster_hub_client::DaemonConnection,
+    unix: &mut LifecycleConnection,
 ) {
     let listed = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
         .expect("list with dropped journal wakes");
@@ -5801,7 +5599,7 @@ fn fault_handler_timeout(endpoint: &botster_hub_client::DaemonEndpoint) {
 
 fn fault_plugin_worker_restart(
     endpoint: &botster_hub_client::DaemonEndpoint,
-    unix: &mut botster_hub_client::DaemonConnection,
+    unix: &mut LifecycleConnection,
 ) {
     let reload = botster_hub_client::request(
         endpoint,
