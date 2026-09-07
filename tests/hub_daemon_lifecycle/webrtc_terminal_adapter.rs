@@ -1096,7 +1096,7 @@ fn webrtc_terminal_adapter_detach_peer_death_process_exit_and_shutdown_do_not_em
             .expect("hello");
         spawn_and_bind_webrtc(&mut peer, &key, "wnx-detach", "sub-detach", "sleep 30").await;
         // The producer cannot exit until this route reaches Attached and receives release input.
-        let (exit_channel, exit_label) = spawn_and_bind_webrtc_channel_with_label(
+        let (_exit_channel, exit_label) = spawn_and_bind_webrtc_channel_with_label(
             &mut peer, &key, "wnx-exit", "sub-exit",
             "IFS= read -r release && [ \"$release\" = \"wnx-release\" ] && printf 'done\\n'",
         ).await;
@@ -1375,7 +1375,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
             .expect("webrtc attach");
         bind_reserved_from_attach(&mut peer, &key, &webrtc_attach, session_id, webrtc_sub).await;
 
-        let occupied = sibling_status(&mut unix, &mut unix_reader, &mut unix_incomplete, &mut unix_envelopes);
+        let occupied = sibling_status(&mut unix, &mut unix_envelopes);
         assert!(
             occupied
                 .compatibility
@@ -1400,7 +1400,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
     });
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut after = sibling_status(&mut unix, &mut unix_reader, &mut unix_incomplete, &mut unix_envelopes);
+    let mut after = sibling_status(&mut unix, &mut unix_envelopes);
     while Instant::now() < deadline {
         if !occupancy_has_pair(&after.live_attach_occupancy, session_id, webrtc_sub)
             && occupancy_has_pair(&after.live_attach_occupancy, session_id, unix_sub)
@@ -1408,7 +1408,7 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
             break;
         }
         thread::sleep(Duration::from_millis(20));
-        after = sibling_status(&mut unix, &mut unix_reader, &mut unix_incomplete, &mut unix_envelopes);
+        after = sibling_status(&mut unix, &mut unix_envelopes);
     }
     assert!(
         !occupancy_has_pair(&after.live_attach_occupancy, session_id, webrtc_sub),
@@ -1437,7 +1437,6 @@ fn one_session_unix_and_webrtc_dual_attach_exposes_hub_occupancy() {
     );
 
     drop(unix);
-    drop(unix_reader);
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
 }

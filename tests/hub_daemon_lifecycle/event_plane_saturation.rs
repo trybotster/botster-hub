@@ -3287,7 +3287,7 @@ fn event_gap_for_subscription(event: &botster_hub_client::DaemonEvent, subscript
 }
 
 fn wait_unix_marker_or_gap(
-    connection: &mut LifecycleConnection,
+    connection: &mut botster_hub_client::DaemonConnection,
     token: &str,
     subscription_id: &str,
 ) {
@@ -3556,7 +3556,7 @@ fn spawn_quiet_fleet(endpoint: &botster_hub_client::DaemonEndpoint) -> usize {
 }
 
 struct NoisySession {
-    connection: botster_hub_client::DaemonConnection,
+    connection: LifecycleConnection,
 }
 
 fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySession {
@@ -4682,7 +4682,7 @@ fn assert_no_live_sessions(endpoint: &botster_hub_client::DaemonEndpoint) {
 }
 
 fn prove_client_contract_under_saturation(
-    connection: &mut LifecycleConnection,
+    connection: &mut botster_hub_client::DaemonConnection,
     endpoint: &botster_hub_client::DaemonEndpoint,
 ) {
     let status = connection
@@ -5365,7 +5365,7 @@ fn fault_plugin_mailbox_pressure(endpoint: &botster_hub_client::DaemonEndpoint) 
 
 fn fault_client_mailbox_gap(
     endpoint: &botster_hub_client::DaemonEndpoint,
-    unix: &mut LifecycleConnection,
+    unix: &mut botster_hub_client::DaemonConnection,
     stall_path: &Path,
 ) {
     fs::write(stall_path, b"stall").expect("stall");
@@ -5412,7 +5412,7 @@ fn fault_client_mailbox_gap(
 
 fn fault_dropped_lifecycle_wake(
     endpoint: &botster_hub_client::DaemonEndpoint,
-    unix: &mut LifecycleConnection,
+    unix: &mut botster_hub_client::DaemonConnection,
 ) {
     let listed = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::ListSessions)
         .expect("list with dropped journal wakes");
@@ -5539,7 +5539,7 @@ fn fault_handler_timeout(endpoint: &botster_hub_client::DaemonEndpoint) {
 
 fn fault_plugin_worker_restart(
     endpoint: &botster_hub_client::DaemonEndpoint,
-    unix: &mut LifecycleConnection,
+    unix: &mut botster_hub_client::DaemonConnection,
 ) {
     let reload = botster_hub_client::request(
         endpoint,

@@ -140,7 +140,9 @@ pub(crate) fn terminal_paste_frame_bytes(data: &[u8]) -> Vec<InputSpec> {
 pub(crate) const CORE_WAIT: Duration = Duration::from_secs(30);
 
 pub(crate) fn wait_ticket<T>(ticket: botster_hub::CoreTicket<T>) -> T {
-    ticket.wait(CORE_WAIT).expect("core bridge answers the ticket")
+    ticket
+        .wait(CORE_WAIT)
+        .expect("core bridge answers the ticket")
 }
 
 pub(crate) fn spawn_through_core(

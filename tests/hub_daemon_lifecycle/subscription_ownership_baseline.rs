@@ -594,7 +594,7 @@ fn attach_ready_precedes_history_finish() {
     let terminal =
         botster_terminal_protocol::TerminalCompatibilityRequirement::for_ready_then_history_attach(
         );
-    let (mut stream, ack) = botster_hub_client::connect_and_hello_with_terminal_requirement(
+    let (stream, ack) = botster_hub_client::connect_and_hello_with_terminal_requirement(
         &endpoint,
         &botster_hub_client::DaemonCompatibilityRequirement::for_unix_terminal_adapter(),
         Some(&terminal),

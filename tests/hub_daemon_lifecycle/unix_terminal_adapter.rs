@@ -628,7 +628,7 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         unix_envelope_contains_live_bytes(&envelopes_b, marker),
         "B must keep receiving opaque adapter frames after A disconnects: {envelopes_b:?}"
     );
-    let confirm = owner_b.request_skipping(&botster_hub_client::DaemonRequest::Status, &mut envelopes_b);
+    let _confirm = owner_b.request_skipping(&botster_hub_client::DaemonRequest::Status, &mut envelopes_b);
     let occupancy = owner_b.request_skipping(&botster_hub_client::DaemonRequest::Status, &mut envelopes_b)
     .status
     .expect("status after replacement-owner cleanup")
@@ -1032,7 +1032,7 @@ fn mismatched_terminal_hello_rejects_attach_before_core_ownership() {
     let mut terminal = botster_terminal_protocol::TerminalCompatibilityRequirement::current();
     terminal.protocol_version = terminal.protocol_version.saturating_add(1);
     terminal.client_name = "mismatch-client".to_string();
-    let (mut stream, ack) = botster_hub_client::connect_and_hello_with_terminal_requirement(
+    let (stream, ack) = botster_hub_client::connect_and_hello_with_terminal_requirement(
         &endpoint,
         &botster_hub_client::DaemonCompatibilityRequirement::for_unix_terminal_adapter(),
         Some(&terminal),
@@ -1543,7 +1543,7 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
     while Instant::now() < deadline
         && !unix_envelope_contains_live_bytes(&envelopes_b, "echo:after-replace")
     {
-        let drain = owner_b.request_collecting(&botster_hub_client::DaemonRequest::Status, &mut envelopes_b, &mut events_b);
+        let _drain = owner_b.request_collecting(&botster_hub_client::DaemonRequest::Status, &mut envelopes_b, &mut events_b);
         thread::sleep(Duration::from_millis(50));
     }
     assert!(

@@ -6,6 +6,20 @@ fn terminal_envelope_contains_marker(
         && decode_route_event(frame).is_some_and(|event| event.output_contains(marker))
 }
 
+/// Connect to the daemon socket named by `config` with attach-generation tracking.
+fn lifecycle_connection_for(
+    config: &botster_hub::HubConfig,
+) -> botster_hub_client::DaemonTransportResult<LifecycleConnection> {
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    LifecycleConnection::connect(&botster_hub_client::DaemonEndpoint::new(socket_path))
+}
+
 /// Send the first-party Hello on a raw socket and read its ack.
 fn write_raw_hello(stream: &mut UnixStream) -> botster_hub_client::DaemonHelloAck {
     botster_hub_client::write_client_frame(
@@ -655,7 +669,7 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
         "reattach must not return terminal bodies: {:?}",
         reattach.events
     );
-    let events = collect_attach_events(
+    let _events = collect_attach_events(
         &mut connection,
         "ghostsnp-order-session",
         "ghostsnp-order-resub",
@@ -1147,7 +1161,7 @@ fn external_hub_idle_attach_emits_ghostsnp_snapshot_before_attached() {
         "idle Attach must not return terminal bodies: {:?}",
         attach.events
     );
-    let events = collect_attach_events(
+    let _events = collect_attach_events(
         &mut connection,
         "idle-ghostsnp-session",
         "idle-ghostsnp-sub",
@@ -4576,7 +4590,7 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
     let mut connection =
-        LifecycleConnection::from_connection(botster_hub::DaemonConnection::connect(&config).expect("connect daemon socket"));
+        lifecycle_connection_for(&config).expect("connect daemon socket");
 
     let spawn = connection
         .request(&botster_hub::DaemonRequest::Spawn {
@@ -4649,7 +4663,7 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
 
     drop(connection);
     let mut connection =
-        LifecycleConnection::from_connection(botster_hub::DaemonConnection::connect(&config).expect("reconnect daemon socket"));
+        lifecycle_connection_for(&config).expect("reconnect daemon socket");
     let late_attach = connection
         .request(&botster_hub::DaemonRequest::Attach {
             session_id: "late-history-session".to_string(),
@@ -4743,7 +4757,7 @@ fn external_daemon_same_session_reattach_replays_opaque_history_before_live_outp
 
     drop(connection);
     let mut connection =
-        LifecycleConnection::from_connection(botster_hub::DaemonConnection::connect(&config).expect("reconnect idle daemon socket"));
+        lifecycle_connection_for(&config).expect("reconnect idle daemon socket");
     let late_no_history_attach = connection
         .request(&botster_hub::DaemonRequest::Attach {
             session_id: "no-history-session".to_string(),
@@ -4879,7 +4893,7 @@ fn daemon_detaches_subscription_when_attach_connection_drops() {
     thread::sleep(Duration::from_millis(150));
 
     let mut live =
-        LifecycleConnection::from_connection(botster_hub::DaemonConnection::connect(&config).expect("connect after dropped attach"));
+        lifecycle_connection_for(&config).expect("connect after dropped attach");
     live.request(&botster_hub::DaemonRequest::Attach {
         session_id: "eof-session".to_string(),
         subscription_id: "live-after-eof-subscription".to_string(),
@@ -4958,7 +4972,7 @@ fn daemon_notify_session_defers_without_observed_readiness_over_socket() {
     assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
 
     let mut connection =
-        LifecycleConnection::from_connection(botster_hub::DaemonConnection::connect(&config).expect("connect TUI-grade socket"));
+        lifecycle_connection_for(&config).expect("connect TUI-grade socket");
     connection
         .request(&botster_hub::DaemonRequest::Attach {
             session_id: "notify-socket-session".to_string(),
