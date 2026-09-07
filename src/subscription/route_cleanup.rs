@@ -594,11 +594,26 @@ mod tests {
         // A failed first attempt rolls back its own insertion, unless a live
         // stream of the owner holds the key.
         registry.start_attach(unix.clone(), "s1".into(), "sub".into());
-        release_failed_attach_route(&mut registry, &unix, "s1", "sub", RouteReservation::Inserted);
+        release_failed_attach_route(
+            &mut registry,
+            &unix,
+            "s1",
+            "sub",
+            RouteReservation::Inserted,
+        );
         assert_eq!(registry.owner_route_count("a"), MAX_ATTACH_ROUTES_PER_OWNER);
         registry.cancel_stream("s1", "sub");
-        release_failed_attach_route(&mut registry, &unix, "s1", "sub", RouteReservation::Inserted);
-        assert_eq!(registry.owner_route_count("a"), MAX_ATTACH_ROUTES_PER_OWNER - 1);
+        release_failed_attach_route(
+            &mut registry,
+            &unix,
+            "s1",
+            "sub",
+            RouteReservation::Inserted,
+        );
+        assert_eq!(
+            registry.owner_route_count("a"),
+            MAX_ATTACH_ROUTES_PER_OWNER - 1
+        );
     }
 
     /// Reviewer sequence: A acknowledged K; B now owns K; A reattaches K
