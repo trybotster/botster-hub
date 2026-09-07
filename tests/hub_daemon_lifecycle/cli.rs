@@ -43,7 +43,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{Receiver as AsyncReceiver, Sender as AsyncSender, channel, default_runtime};
 
 use crate::support::{
-    ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,
+    candidate_session_worker_binary_path, recovering_mutex_guard, validate_cli_daemon_shutdown,
     wait_for_cli_daemon_shutdown,
 };
 
@@ -52,7 +52,7 @@ use super::*;
 pub(crate) fn start_cli_daemon(data_dir: &Path) -> PanicSafeCliDaemon {
     let _guard = daemon_test_guard();
     check_harness_taint();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
@@ -75,7 +75,7 @@ pub(crate) fn start_cli_daemon_with_env(
 ) -> PanicSafeCliDaemon {
     let _guard = daemon_test_guard();
     check_harness_taint();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
@@ -102,7 +102,7 @@ pub(crate) fn start_cli_daemon_with_env(
 pub(crate) fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> PanicSafeCliDaemon {
     let _guard = daemon_test_guard();
     check_harness_taint();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
     command
         .arg("start")
@@ -693,7 +693,7 @@ pub(crate) fn ensure_runtime_packages(
     web_package_path: &Path,
     tui_package_path: &Path,
 ) {
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let config = explicit_config(data_dir);
     let mut setup_daemon =
         match botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::Status) {

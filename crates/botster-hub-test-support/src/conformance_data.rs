@@ -47,7 +47,7 @@ pub(crate) const LATE_ATTACH_GHOSTSNP_PROTOCOL_CRATE: &str = "botster-terminal-p
 pub(crate) const LATE_ATTACH_GHOSTSNP_PROTOCOL_GIT: &str =
     "https://github.com/trybotster/botster-core.git";
 /// Core revision that owns the consumed `botster-terminal-protocol` files.
-pub(crate) const LATE_ATTACH_GHOSTSNP_CORE_PIN: &str = "347bd99bf7fa59a62975111eedabe2db16479335";
+pub(crate) const LATE_ATTACH_GHOSTSNP_CORE_PIN: &str = "98a50ef43f62bd9da6e062bd4d44d961fa3c78c9";
 /// Ghostty submodule pin resolved by the locked Core revision.
 pub(crate) const LATE_ATTACH_GHOSTSNP_GHOSTTY_PIN: &str =
     "eb72ec61304ea256be1d86ed8fa961c84e43ecbd";

@@ -16,15 +16,17 @@ use botster_core::{
     TimerCapabilityRequest, WebSocketCapabilityRequest,
 };
 use botster_hub::{
-    DataDirectoryOption, HostIdentityOptions, HubRuntime, HubStartupOptions, RuntimeEnvironment,
-    SessionDefaults, TransportBindings,
+    CoreEngineOptions, DataDirectoryOption, HostIdentityOptions, HubRuntime, HubStartupOptions,
+    RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 
 mod support;
-use support::{bind_shared_terminal_adapter, ensure_session_worker_binary, send_terminal_input};
+use support::{
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, send_terminal_input,
+};
 
 fn explicit_runtime(name: &str) -> HubRuntime {
-    ensure_session_worker_binary();
+    let session_worker_path = candidate_session_worker_binary_path().to_path_buf();
     let config = HubStartupOptions {
         host: HostIdentityOptions {
             id: format!("hub-capability-{name}"),
@@ -47,6 +49,10 @@ fn explicit_runtime(name: &str) -> HubRuntime {
         transports: TransportBindings {
             local_socket: None,
             tcp: Vec::new(),
+        },
+        core_engine: CoreEngineOptions {
+            session_worker_path: Some(session_worker_path),
+            ..CoreEngineOptions::default()
         },
         ..HubStartupOptions::default()
     }

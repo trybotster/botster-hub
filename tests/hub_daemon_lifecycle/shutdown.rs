@@ -811,7 +811,7 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
 #[test]
 fn cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup() {
     let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let data_dir = unique_short_test_dir("cli-shutdown-owned-runtime");
     let web_package_dir = unique_test_dir("cli-shutdown-owned-web");
     let tui_package_dir = unique_test_dir("cli-shutdown-owned-tui");
@@ -890,7 +890,7 @@ fn cli_shutdown_waits_for_metadata_owned_runtime_daemon_cleanup() {
 #[test]
 fn cli_shutdown_waits_until_metadata_owned_daemon_is_reaped() {
     let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let data_dir = unique_short_test_dir("cli-shutdown-reaped-runtime");
     let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
     let socket_path = explicit_config(&data_dir)
@@ -1106,7 +1106,7 @@ fn process_ownership_cli_local_runtime_up_failure_stops_started_daemon() {
         serde_json::to_string_pretty(&web_manifest).expect("serialize invalid-port Web manifest"),
     )
     .expect("write invalid-port Web manifest");
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     ensure_runtime_packages(&data_dir, &web_package_dir, &tui_package_dir);
 
     let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
@@ -1167,7 +1167,7 @@ fn process_ownership_cli_local_runtime_up_failure_stops_started_daemon() {
 #[test]
 fn process_ownership_metadata_write_failure_reaps_started_daemon_group() {
     let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let data_dir = unique_short_test_dir("cli-up-metadata-write-failure");
     fs::create_dir_all(&data_dir).expect("create metadata failure data directory");
     let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
@@ -1257,7 +1257,7 @@ fn cli_daily_commands_share_canonical_default_data_directory() {
     }
     write_botster_web_package(&web_package_dir);
     write_botster_tui_package(&tui_package_dir);
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     ensure_runtime_packages(&data_dir, &web_package_dir, &tui_package_dir);
 
     let mut up_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
@@ -1579,7 +1579,7 @@ fn cli_home_runtime_start_does_not_reuse_dead_pid_metadata_and_rebinds_leftover_
     assert!(!process_exists(dead_pid), "fixture pid must be dead");
     write_local_runtime_daemon_metadata(&data_dir, dead_pid);
 
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .env("HOME", &home)
         .env_remove("BOTSTER_HUB_DATA_DIR")

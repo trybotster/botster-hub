@@ -225,9 +225,9 @@ fn wait_for_unix_ready_and_mode(
     }
 }
 
-fn assert_sink_bytes(sink: &Path, payload: &[u8]) {
+fn assert_sink_bytes(sink: &Path, expected: &[u8]) {
     let actual = fs::read(sink).expect("read paste sink");
-    assert_eq!(actual, payload, "PTY sink must receive byte-exact paste content");
+    assert_eq!(actual, expected, "PTY sink must receive encoded paste content");
 }
 
 #[test]
@@ -243,6 +243,9 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     let ready = "unix-paste-sink-ready";
     let done = "unix-paste-sink-done";
     let payload = live_paste_payload();
+    let expected_sink =
+        botster_core_test_support::fixtures::paste::encode_unbracketed_paste_for_pty(&payload)
+            .expect("encode expected unbracketed paste");
     let mut stream = RawUnixClient::connect_unix_terminal_adapter(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
@@ -254,12 +257,16 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
         &mut envelopes,
         &mut events,
     );
-    let _mode = wait_for_unix_ready_and_mode(
+    let mode = wait_for_unix_ready_and_mode(
         &mut stream,
         session_id,
         ready,
         &mut envelopes,
         &mut events,
+    );
+    assert!(
+        !mode.bracketed_paste,
+        "raw paste sink must keep bracketed paste disabled"
     );
     envelopes.clear();
     events.clear();
@@ -280,7 +287,7 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
 
     assert_admitted_paste_result(&unix_paste_results(&envelopes, operation_id), operation_id);
     assert_no_route_close(&events, session_id, subscription_id);
-    assert_sink_bytes(&sink, &payload);
+    assert_sink_bytes(&sink, &expected_sink);
     let status = stream.request_collecting(
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
@@ -309,6 +316,9 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     let ready = "webrtc-paste-sink-ready";
     let done = "webrtc-paste-sink-done";
     let payload = live_paste_payload();
+    let expected_sink =
+        botster_core_test_support::fixtures::paste::encode_unbracketed_paste_for_pty(&payload)
+            .expect("encode expected unbracketed paste");
 
     block_on(async {
         let (mut peer, key) = open_local_webrtc_peer(&endpoint, &bootstrap).await;
@@ -356,7 +366,7 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
             }
             assert!(Instant::now() < ready_deadline, "WebRTC paste sink did not become ready");
         }
-        let _mode = loop {
+        let mode = loop {
             let response = peer
                 .encrypted_request(
                     &key,
@@ -373,6 +383,10 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
             }
             assert!(Instant::now() < ready_deadline, "modes did not become readable");
         };
+        assert!(
+            !mode.bracketed_paste,
+            "raw paste sink must keep bracketed paste disabled"
+        );
 
         let frames = terminal_paste_frame_bytes_allowing_unsafe(&payload);
         assert_eq!(frames.len(), expected_paste_frames(&payload));
@@ -432,7 +446,7 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
         peer.peer.close().await.expect("close offer peer");
     });
 
-    assert_sink_bytes(&sink, &payload);
+    assert_sink_bytes(&sink, &expected_sink);
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
     let _ = fs::remove_dir_all(test_dir);

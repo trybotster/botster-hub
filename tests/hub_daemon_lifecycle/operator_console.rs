@@ -176,7 +176,7 @@ fn operator_console_readiness_backstop_outlives_policy_and_reports_context() {
 #[test]
 fn operator_console_detach_releases_reader_while_daemon_stays_running() {
     let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let data_dir = unique_short_test_dir("console-detach-reader");
     let mut daemon_cleanup = OwnedOperatorConsoleDaemon::new(&data_dir);
     let mut console = OperatorConsolePty::spawn(&data_dir);
@@ -213,7 +213,7 @@ fn operator_console_detach_releases_reader_while_daemon_stays_running() {
 #[test]
 fn operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prompt() {
     let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let data_dir = unique_short_test_dir("console-foreground-interrupt");
     let package_dir =
         unique_short_test_dir("console-foreground-interrupt-package").join("package with spaces");
@@ -271,7 +271,7 @@ fn operator_console_ctrl_c_reaches_foreground_app_process_group_and_returns_prom
 #[test]
 fn operator_console_panic_reaps_console_and_owned_daemon() {
     let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let data_dir = unique_short_test_dir("console-panic-cleanup");
     let observed_pids = Arc::new(Mutex::new((None, None)));
     let unwind_pids = Arc::clone(&observed_pids);
@@ -343,7 +343,7 @@ fn operator_console_panic_reaps_console_and_owned_daemon() {
 #[test]
 fn cli_shutdown_reaps_metadata_owned_daemon_started_by_live_operator_console() {
     let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let data_dir = unique_short_test_dir("external-shutdown-live-console");
     let metadata_path = data_dir.join(".botster-hub-runtime-daemon.json");
     let socket_path = explicit_config(&data_dir)
@@ -410,7 +410,7 @@ fn cli_shutdown_reaps_metadata_owned_daemon_started_by_live_operator_console() {
 #[test]
 fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
     let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let data_dir = unique_short_test_dir("console");
     let package_dir = unique_short_test_dir("console-package").join("package with spaces");
     let web_package_dir = unique_short_test_dir("console-web-package").join("web package");
@@ -682,7 +682,7 @@ fn cli_operator_console_starts_reuses_detaches_handles_ctrl_c_and_stops() {
 #[test]
 fn cli_operator_console_reuses_before_worker_lookup_and_reports_missing_worker() {
     let _guard = daemon_test_guard();
-    ensure_session_worker_binary();
+    candidate_session_worker_binary_path();
     let data_dir = unique_short_test_dir("console-worker-reuse");
     let child = start_cli_daemon(&data_dir);
     let isolated_bin_dir = unique_short_test_dir("console-bin");

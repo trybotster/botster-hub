@@ -42,7 +42,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{Receiver as AsyncReceiver, Sender as AsyncSender, channel, default_runtime};
 
 use crate::support::{
-    ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,
+    candidate_session_worker_binary_path, recovering_mutex_guard, validate_cli_daemon_shutdown,
     wait_for_cli_daemon_shutdown,
 };
 
@@ -1103,11 +1103,7 @@ pub(crate) fn configure_test_process_group(command: &mut Command) {
 }
 
 pub(crate) fn session_worker_binary_path() -> PathBuf {
-    ensure_session_worker_binary();
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join("botster-session-worker")
+    candidate_session_worker_binary_path().to_path_buf()
 }
 
 pub(crate) fn process_thread_count(pid: u32) -> Option<usize> {

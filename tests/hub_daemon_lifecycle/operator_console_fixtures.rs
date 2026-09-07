@@ -42,8 +42,8 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{Receiver as AsyncReceiver, Sender as AsyncSender, channel, default_runtime};
 
 use crate::support::{
-    ensure_session_worker_binary, recovering_mutex_guard, validate_cli_daemon_shutdown,
-    wait_for_cli_daemon_shutdown,
+    candidate_hub_binary_path, candidate_session_worker_binary_path, recovering_mutex_guard,
+    validate_cli_daemon_shutdown, wait_for_cli_daemon_shutdown,
 };
 
 use super::*;
@@ -324,7 +324,7 @@ impl Drop for OwnedOperatorConsoleDaemon {
 
 impl OperatorConsolePty {
     pub(crate) fn spawn(data_dir: &Path) -> Self {
-        Self::spawn_binary(Path::new(env!("CARGO_BIN_EXE_botster-hub")), data_dir)
+        Self::spawn_binary(candidate_hub_binary_path(), data_dir)
     }
 
     pub(crate) fn spawn_binary(binary: &Path, data_dir: &Path) -> Self {
@@ -332,11 +332,7 @@ impl OperatorConsolePty {
     }
 
     pub(crate) fn spawn_with_env(data_dir: &Path, environment: &[(&str, &str)]) -> Self {
-        Self::spawn_binary_with_env(
-            Path::new(env!("CARGO_BIN_EXE_botster-hub")),
-            data_dir,
-            environment,
-        )
+        Self::spawn_binary_with_env(candidate_hub_binary_path(), data_dir, environment)
     }
 
     pub(crate) fn spawn_binary_with_env(
