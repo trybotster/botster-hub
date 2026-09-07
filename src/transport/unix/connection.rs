@@ -743,11 +743,7 @@ pub(crate) fn handle_connection_cleanup(
     for (session_id, subscription_id, _) in &unbound {
         keys.insert((session_id.clone(), subscription_id.clone()));
     }
-    keys.extend(
-        state
-            .pending_runtime
-            .take_owner_routes(&cleanup.client_id),
-    );
+    keys.extend(state.pending_runtime.take_owner_routes(&cleanup.client_id));
     // The departing owner is this connection; a route whose current stream
     // belongs to a replacement is targeted only under this client's own
     // Core id, never through the replacement's identity or generation.

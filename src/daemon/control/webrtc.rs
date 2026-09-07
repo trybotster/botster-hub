@@ -28,8 +28,8 @@ use crate::subscription::route_cleanup::{
     CleanupCandidate, candidate_for_departing_owner, retain_route_cleanup,
 };
 use crate::transport::webrtc::{
-    LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
-    LocalWebrtcSenderTerminalRecord, LocalWebrtcSignalRequest,
+    LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES, LocalWebrtcSenderTerminalRecord,
+    LocalWebrtcSignalRequest,
 };
 
 pub(crate) fn handle_request(
@@ -317,12 +317,14 @@ pub(crate) fn handle_peer_closed(
                 {
                     bound_closes += 1;
                 }
-                let _ = state
-                    .pending_runtime
-                    .close_adapter_if(session_id, subscription_id, identity);
-                let _ = state
-                    .pending_runtime
-                    .cancel_stream_if(session_id, subscription_id, identity);
+                let _ =
+                    state
+                        .pending_runtime
+                        .close_adapter_if(session_id, subscription_id, identity);
+                let _ =
+                    state
+                        .pending_runtime
+                        .cancel_stream_if(session_id, subscription_id, identity);
             }
             record_attached_subscription_change(
                 &mut state.pending_runtime,

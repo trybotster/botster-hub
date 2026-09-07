@@ -195,6 +195,7 @@ impl AttachStreamRegistry {
         self.stream_identity(session_id, subscription_id).as_ref() == Some(identity)
     }
 
+    #[cfg(test)]
     /// Streams one owner holds: by grant for WebRTC, by client otherwise.
     pub(crate) fn stream_count_for_owner(&self, owner: &AttachStreamOwner) -> usize {
         self.streams
@@ -244,7 +245,12 @@ impl AttachStreamRegistry {
 
     /// Release one route key from the owner's set (explicit detach, or an
     /// attach that failed while no stream of this owner holds the key).
-    pub(crate) fn release_route(&mut self, budget_key: &str, session_id: &str, subscription_id: &str) {
+    pub(crate) fn release_route(
+        &mut self,
+        budget_key: &str,
+        session_id: &str,
+        subscription_id: &str,
+    ) {
         if let Some(routes) = self.owner_routes.get_mut(budget_key) {
             routes.remove(&(session_id.to_string(), subscription_id.to_string()));
             if routes.is_empty() {
@@ -253,6 +259,7 @@ impl AttachStreamRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn owner_route_count(&self, budget_key: &str) -> usize {
         self.owner_routes.get(budget_key).map_or(0, BTreeSet::len)
     }
@@ -511,23 +518,6 @@ impl AttachStreamRegistry {
     #[allow(dead_code)]
     pub(crate) fn close_adapters_for_client(&mut self, client_id: &str) {
         let keys = self.bound_route_keys_for_client(client_id);
-        for (session_id, subscription_id) in keys {
-            self.close_adapter(&session_id, &subscription_id);
-        }
-    }
-
-    pub(crate) fn bound_route_keys_for_grant(&self, grant_id: &str) -> BTreeSet<(String, String)> {
-        self.streams
-            .iter()
-            .filter(|(_, stream)| {
-                stream.owner.grant_id.as_deref() == Some(grant_id) && stream.adapter_bound
-            })
-            .map(|(key, _)| key.clone())
-            .collect()
-    }
-
-    pub(crate) fn close_adapters_for_grant(&mut self, grant_id: &str) {
-        let keys = self.bound_route_keys_for_grant(grant_id);
         for (session_id, subscription_id) in keys {
             self.close_adapter(&session_id, &subscription_id);
         }
