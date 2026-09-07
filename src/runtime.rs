@@ -3744,7 +3744,7 @@ impl HubRuntime {
 
     /// Detach one subscription generation without deleting a newer owner.
     pub fn detach_terminal_subscription(
-        &mut self,
+        &self,
         client_id: ClientId,
         session_id: SessionId,
         subscription_id: SubscriptionId,

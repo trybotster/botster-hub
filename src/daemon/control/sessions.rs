@@ -33,10 +33,11 @@ use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::shutdown::{
     ShutdownSessionClassification, begin_shutdown_classification, shutdown_error_response,
 };
-use crate::data_plane::driver::CoreTicketPoll;
+use crate::data_plane::driver::{CoreTicketError, CoreTicketPoll};
+use crate::runtime::core_bridge_error;
 use crate::runtime::{AttachBindFailure, AttachBindPlan, CoreOperationTracker};
 use crate::subscription::attach_routes::{
-    AttachStreamOwner, AttachmentIdentity, BoundAdapterHandle, overlay_live_attach_occupancy,
+    AttachStreamOwner, BoundAdapterHandle, overlay_live_attach_occupancy,
 };
 use crate::subscription::closed_events::{
     suppress_unix_session_close_events, suppress_webrtc_session_close_events,
@@ -175,9 +176,9 @@ fn poll_tracker(
     match tracker.poll(runtime) {
         CoreTicketPoll::Pending => Err(ControlPoll::Pending),
         CoreTicketPoll::Lost => Err(ControlPoll::Ready(Ok(lost_core(operation, request_id)))),
-        CoreTicketPoll::Refused => {
-            Err(ControlPoll::Ready(Ok(overloaded_core(operation, request_id))))
-        }
+        CoreTicketPoll::Refused => Err(ControlPoll::Ready(Ok(overloaded_core(
+            operation, request_id,
+        )))),
         CoreTicketPoll::Ready(Err(error)) => Err(ControlPoll::Ready(Ok(core_operator_error(
             operation, request_id, &error,
         )))),
@@ -769,9 +770,11 @@ fn handle_attach(
             let generation = match result {
                 Ok(generation) => generation,
                 Err(failure) => {
-                    let _ = state
-                        .pending_runtime
-                        .cancel_stream_if(&session_id, &subscription_id, &identity);
+                    let _ = state.pending_runtime.cancel_stream_if(
+                        &session_id,
+                        &subscription_id,
+                        &identity,
+                    );
                     return ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                         "invalid_request",
                         &attach_bind_failure_message(&failure),
@@ -843,9 +846,11 @@ fn handle_attach(
                 Err(error) => {
                     // The route exists in Core without an adapter; release
                     // exactly the generation this attach created.
-                    let _ = state
-                        .pending_runtime
-                        .cancel_stream_if(&session_id, &subscription_id, &identity);
+                    let _ = state.pending_runtime.cancel_stream_if(
+                        &session_id,
+                        &subscription_id,
+                        &identity,
+                    );
                     schedule_exact_generation_detach(
                         state,
                         client_id.clone(),
@@ -875,8 +880,7 @@ fn handle_attach(
         client_id: client_id.clone(),
         grant_id: None,
     };
-    let identity =
-        pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
+    let identity = pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
     let (adapter, handle) = mux.create_adapter();
     let runtime = daemon.runtime().expect("runtime checked by caller");
     let mut ticket = runtime.attach_and_bind_terminal(AttachBindPlan {
@@ -902,15 +906,16 @@ fn handle_attach(
                 // attachment and the connection mux must accept the route.
                 // `register` fails closed once `close_all` ran, so a bind
                 // that lands after connection teardown never outlives it.
-                let live = state
-                    .pending_runtime
-                    .stream_matches(&session_id, &subscription_id, &identity)
-                    && mux.register(
-                        session_id.clone(),
-                        subscription_id.clone(),
-                        generation.0,
-                        handle.clone(),
-                    );
+                let live =
+                    state
+                        .pending_runtime
+                        .stream_matches(&session_id, &subscription_id, &identity)
+                        && mux.register(
+                            session_id.clone(),
+                            subscription_id.clone(),
+                            generation.0,
+                            handle.clone(),
+                        );
                 let bound = live
                     && state.pending_runtime.mark_adapter_bound_if(
                         &session_id,
@@ -942,9 +947,11 @@ fn handle_attach(
             }
             Err(failure) => {
                 handle.close();
-                let _ = state
-                    .pending_runtime
-                    .cancel_stream_if(&session_id, &subscription_id, &identity);
+                let _ = state.pending_runtime.cancel_stream_if(
+                    &session_id,
+                    &subscription_id,
+                    &identity,
+                );
                 ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                     "invalid_request",
                     &attach_bind_failure_message(&failure),

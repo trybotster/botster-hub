@@ -81,6 +81,7 @@ impl AttachStream {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn owner_client_id(&self) -> String {
         self.owner.client_id.clone()
     }
@@ -174,7 +175,11 @@ impl AttachStreamRegistry {
             .iter()
             .filter(|(_, stream)| stream.owner.client_id == client_id && !stream.adapter_bound)
             .map(|((session_id, subscription_id), stream)| {
-                (session_id.clone(), subscription_id.clone(), stream.identity())
+                (
+                    session_id.clone(),
+                    subscription_id.clone(),
+                    stream.identity(),
+                )
             })
             .collect()
     }
@@ -1196,7 +1201,11 @@ mod tests {
                 Some(TerminalSubscriptionGeneration(2))
             );
             let bound = registry.take_connection_bound_routes(replacement_client);
-            assert_eq!(bound.len(), 1, "the replacement keeps its bound route claim");
+            assert_eq!(
+                bound.len(),
+                1,
+                "the replacement keeps its bound route claim"
+            );
         }
     }
 

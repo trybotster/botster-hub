@@ -626,6 +626,12 @@ pub(crate) fn run_inventory_reconcile_phase(
     };
     let inventory = match ticket.poll() {
         CoreTicketPoll::Pending => return true,
+        // Refused admission: clear the single slot; the cursor stays and the
+        // next pump resubmits (one ticket in flight, no queue).
+        CoreTicketPoll::Refused => {
+            state.reconcile_inventory = None;
+            return true;
+        }
         CoreTicketPoll::Lost => {
             state.reconcile_inventory = None;
             state.pump.reconcile_after = None;
@@ -676,6 +682,11 @@ fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
     };
     let slice = match ticket.poll() {
         CoreTicketPoll::Pending => return true,
+        // Refused admission: clear the single slot and resubmit next pump.
+        CoreTicketPoll::Refused => {
+            state.observe_read = None;
+            return true;
+        }
         CoreTicketPoll::Lost => {
             state.observe_read = None;
             state.observe_resume = None;

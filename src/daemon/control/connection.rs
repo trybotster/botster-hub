@@ -17,11 +17,11 @@ use crate::admission::unix_hello::{
 use crate::daemon::control::message::{
     BindReservedError, BoundSubscription, ControlMessage, ReservationInspectReply,
 };
+use crate::daemon::control::sessions::schedule_exact_generation_detach;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_loop::tick;
 use crate::data_plane::driver::CoreTicketPoll;
 use crate::runtime::BindRoutePlan;
-use crate::daemon::control::sessions::schedule_exact_generation_detach;
 use crate::subscription::attach_routes::{BoundAdapterHandle, negotiated_unix_capability_set};
 
 pub(crate) fn handle(
@@ -434,9 +434,10 @@ fn bind_reserved_subscription(
             // The adapter is bound in Core. Fence every owner-side mutation
             // on the attachment identity and on the reservation still being
             // live; on any failure release exactly this generation.
-            let still_owned = state
-                .pending_runtime
-                .stream_matches(&session_id, &subscription_id, &identity);
+            let still_owned =
+                state
+                    .pending_runtime
+                    .stream_matches(&session_id, &subscription_id, &identity);
             let reservation_bound = still_owned
                 && state
                     .pending_runtime
@@ -480,9 +481,11 @@ fn bind_reserved_subscription(
             {
                 // The channel gave up waiting: nobody will drive this
                 // adapter. Undo the bind for exactly this attachment.
-                let _ = state
-                    .pending_runtime
-                    .cancel_stream_if(&session_id, &subscription_id, &identity);
+                let _ = state.pending_runtime.cancel_stream_if(
+                    &session_id,
+                    &subscription_id,
+                    &identity,
+                );
                 schedule_exact_generation_detach(
                     state,
                     client_id.clone(),
