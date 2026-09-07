@@ -25,11 +25,16 @@ use crate::admission::budgets::{DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_INCOMPLETE_F
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapterHandle};
 
+/// Maximum serialized response storage retained by one Unix connection.
+pub(crate) const PENDING_RESPONSE_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
+
 #[derive(Default)]
 pub(crate) struct MuxWriteState {
     pending: Option<PendingMuxFrame>,
     queued_control: VecDeque<PendingMuxFrame>,
     queued_events: VecDeque<PendingMuxFrame>,
+    // Dropping this connection state drops all frames and this local charge.
+    pending_response_bytes: usize,
     last_host_class: Option<crate::transport::unix::host_write_order::HostControlClass>,
 }
 
@@ -59,6 +64,11 @@ impl MuxWriteState {
         pending + self.queued_control.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_response_bytes(&self) -> usize {
+        self.pending_response_bytes
+    }
+
     /// Queue one correlated response for `request_id`.
     pub(crate) fn enqueue_response(
         &mut self,
@@ -76,6 +86,16 @@ impl MuxWriteState {
             delivery_ack,
             close_after,
         )?;
+        let frame_bytes = frame.bytes.total_len();
+        if self.pending_response_bytes.saturating_add(frame_bytes) > PENDING_RESPONSE_BYTE_CAPACITY
+        {
+            return Err(DaemonTransportError::ResponseBackpressured {
+                pending_bytes: self.pending_response_bytes,
+                frame_bytes,
+                capacity: PENDING_RESPONSE_BYTE_CAPACITY,
+            });
+        }
+        self.pending_response_bytes += frame_bytes;
         self.queued_control.push_back(frame);
         Ok(())
     }
@@ -345,6 +365,12 @@ pub(crate) async fn resume_pending_mux_write(
     match write_frame_bytes_resumable(writer, pending).await? {
         MuxWrite::Written => {
             let pending = write_state.pending.take().expect("pending mux frame");
+            if pending.class == PendingMuxClass::Response {
+                write_state.pending_response_bytes = write_state
+                    .pending_response_bytes
+                    .checked_sub(pending.bytes.total_len())
+                    .expect("pending response storage charge");
+            }
             if let Some(delivery_ack) = pending.delivery_ack {
                 let _ = delivery_ack.send(());
             }
@@ -569,9 +595,9 @@ pub(crate) fn event_mux_frame(
 #[cfg(test)]
 pub(crate) mod mux_write_resume_tests {
     use super::{
-        MuxWrite, MuxWriteState, PendingMuxBytes, PendingMuxClass, PendingMuxFrame,
-        event_mux_frame, flush_pending_responses, flush_unix_mux_writes, resume_pending_mux_write,
-        write_frame_bytes_resumable,
+        MuxWrite, MuxWriteState, PENDING_RESPONSE_BYTE_CAPACITY, PendingMuxBytes, PendingMuxClass,
+        PendingMuxFrame, event_mux_frame, flush_pending_responses, flush_unix_mux_writes,
+        resume_pending_mux_write, write_frame_bytes_resumable,
     };
     use crate::client_api_dto::response::daemon_response_base;
     use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter};
@@ -591,6 +617,63 @@ pub(crate) mod mux_write_resume_tests {
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
     use tokio::io::AsyncWrite;
+
+    #[tokio::test]
+    async fn response_storage_charge_survives_partial_write_and_releases_after_full_write() {
+        let mux = UnixConnectionMux::new();
+        let mut state = MuxWriteState::default();
+        state
+            .enqueue_response(
+                "1",
+                daemon_response_base(DaemonResponseKind::Status),
+                None,
+                false,
+            )
+            .expect("enqueue response");
+        let charged = state.pending_response_bytes();
+        assert!(charged > 0);
+        let mut writer = PrefixStallWriter {
+            written: Vec::new(),
+            stall_after: 1,
+            allow_remainder: false,
+        };
+        flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
+            .await
+            .expect("partial response write");
+        assert_eq!(state.pending_response_bytes(), charged);
+        writer.allow_remainder = true;
+        flush_unix_mux_writes(&mut writer, &mux, &mut state, None)
+            .await
+            .expect("complete response write");
+        assert_eq!(state.pending_response_bytes(), 0);
+    }
+
+    #[test]
+    fn response_storage_refuses_a_frame_above_remaining_capacity() {
+        let mut state = MuxWriteState::default();
+        let mut refused = None;
+        for index in 0..16 {
+            let mut response = daemon_response_base(DaemonResponseKind::PluginMcpToolResult);
+            response.plugin_tool_result = serde_json::Value::String("x".repeat(800 * 1024));
+            match state.enqueue_response(&index.to_string(), response, None, false) {
+                Ok(()) => assert!(state.pending_response_bytes() <= PENDING_RESPONSE_BYTE_CAPACITY),
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+        assert!(matches!(
+            refused,
+            Some(
+                crate::daemon::error::DaemonTransportError::ResponseBackpressured {
+                    capacity: PENDING_RESPONSE_BYTE_CAPACITY,
+                    ..
+                }
+            )
+        ));
+        assert!(state.pending_response_bytes() <= PENDING_RESPONSE_BYTE_CAPACITY);
+    }
 
     pub(crate) struct PrefixStallWriter {
         written: Vec<u8>,
