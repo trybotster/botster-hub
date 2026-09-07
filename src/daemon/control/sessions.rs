@@ -39,6 +39,7 @@ use crate::daemon::shutdown::{
 use crate::data_plane::driver::{CoreTicket, CoreTicketError, CoreTicketPoll};
 use crate::runtime::core_bridge_error;
 use crate::runtime::{AttachBindFailure, AttachBindPlan, CoreOperationTracker};
+use crate::subscription::attach_routes::RouteReservation;
 use crate::subscription::attach_routes::{
     AttachStreamOwner, BoundAdapterHandle, overlay_live_attach_occupancy,
 };
@@ -49,7 +50,6 @@ use crate::subscription::entity::entity_subscription_error;
 use crate::subscription::route_cleanup::{
     ATTACH_ROUTE_LIMIT, release_failed_attach_route, reserve_attach_route,
 };
-use crate::subscription::attach_routes::RouteReservation;
 
 /// Typed operator error for one Core failure on a session request.
 /// Operator-facing text for one attach-and-bind failure, with the Core cause.
