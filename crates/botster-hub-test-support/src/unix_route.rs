@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use botster_core_test_support::{diagnostics::StepFailure, route_observer::RouteObserver};
 use botster_hub_client::{
-    DaemonCompatibilityRequirement, DaemonConnection, DaemonEndpoint, DaemonRequest,
+    DaemonCompatibilityRequirement, DaemonConnection, DaemonEndpoint, DaemonEvent, DaemonRequest,
     DaemonResponse, DaemonResponseKind, DaemonTransportResult, DaemonUnixTerminalFrame,
 };
 use botster_terminal_protocol::{AttachStateCode, InputOutcome, TerminalFrame};
@@ -388,6 +388,11 @@ impl UnixRouteClient {
 
     pub fn observer_mut(&mut self, route: &str) -> Option<&mut RouteObserver> {
         self.observers.get_mut(route)
+    }
+
+    /// Return host events that arrived while this client waited for a response.
+    pub fn take_skipped_events(&mut self) -> Vec<DaemonEvent> {
+        self.inner.take_skipped_events()
     }
 
     /// Unresolved operations that recent successful detaches made unknown.
