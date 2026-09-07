@@ -42,8 +42,8 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{Receiver as AsyncReceiver, Sender as AsyncSender, channel, default_runtime};
 
 use crate::support::{
-    candidate_session_worker_binary_path, recovering_mutex_guard, validate_cli_daemon_shutdown,
-    wait_for_cli_daemon_shutdown,
+    candidate_hub_binary_path, candidate_session_worker_binary_path, recovering_mutex_guard,
+    validate_cli_daemon_shutdown, wait_for_cli_daemon_shutdown,
 };
 
 use super::*;
@@ -323,6 +323,19 @@ pub(crate) fn session_ids_from_list(endpoint: &botster_hub_client::DaemonEndpoin
 
 pub(crate) fn start_isolated_live_output_hub(name: &str) -> botster_hub_test_support::IsolatedHub {
     start_isolated_live_output_hub_with_env(name, &[])
+}
+
+pub(crate) fn start_isolated_candidate_hub(name: &str) -> botster_hub_test_support::IsolatedHub {
+    let manifest = std::env::var_os("BOTSTER_CANDIDATE_MANIFEST")
+        .expect("BOTSTER_CANDIDATE_MANIFEST must identify the candidate");
+    start_isolated_hub(
+        botster_hub_test_support::IsolatedHubBuilder::new()
+            .hub_bin(candidate_hub_binary_path())
+            .session_worker_bin(candidate_session_worker_binary_path())
+            .manifest(manifest)
+            .root(unique_short_test_dir("route-smoke"))
+            .name(name),
+    )
 }
 
 pub(crate) fn start_isolated_live_output_hub_with_env(

@@ -89,3 +89,4 @@ include!("hub_daemon_lifecycle/subscription_ownership_baseline.rs");
 include!("hub_daemon_lifecycle/operator_console.rs");
 include!("hub_daemon_lifecycle/plugin_bounds.rs");
 include!("hub_daemon_lifecycle/harness_isolation.rs");
+include!("hub_daemon_lifecycle/unix_route_smokes.rs");

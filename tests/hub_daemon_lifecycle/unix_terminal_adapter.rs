@@ -527,7 +527,7 @@ fn wait_for_live_close_routes(path: &Path, expected: u64) {
 #[test]
 fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
     let _guard = daemon_test_guard();
-    let hub = start_isolated_live_output_hub("uso");
+    let hub = start_isolated_candidate_hub("h-s3");
     let endpoint = hub.endpoint().clone();
     let session_id = "uso-session";
     let subscription_id = "uso-sub";
@@ -551,6 +551,11 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         "owner A Attach must not return terminal bodies: {:?}",
         attach_a.events
     );
+    let generation_a = attach_a
+        .terminal_attach
+        .as_ref()
+        .expect("owner A attach body")
+        .generation;
     let detach_a = owner_a.request_skipping(&botster_hub_client::DaemonRequest::Detach {
             session_id: session_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -559,6 +564,33 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         detach_a.kind,
         botster_hub_client::DaemonResponseKind::Events
     );
+    let detach_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = owner_a.request_skipping(
+            &botster_hub_client::DaemonRequest::Status,
+            &mut envelopes_a,
+        );
+        let status = status.status.expect("status after owner A detach");
+        assert!(
+            status
+                .compatibility
+                .features
+                .iter()
+                .any(|feature| feature == botster_hub_client::FEATURE_ATTACH_OCCUPANCY),
+            "H-S3 requires advertised attach occupancy"
+        );
+        let occupancy = status.live_attach_occupancy;
+        if occupancy.iter().all(|row| {
+            row.session_id != session_id || row.subscription_id != subscription_id
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < detach_deadline,
+            "owner A route remained after detach: generation_a={generation_a} occupancy={occupancy:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 
     let mut owner_b = RawUnixClient::connect_unix_terminal_adapter(&endpoint);
     let mut envelopes_b = Vec::new();
@@ -575,11 +607,48 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         "replacement owner B must bind the same key with empty bodies: {:?}",
         attach_b.events
     );
+    let generation_b = attach_b
+        .terminal_attach
+        .as_ref()
+        .expect("owner B attach body")
+        .generation;
+    assert_ne!(
+        generation_b, generation_a,
+        "same-id reattach must mint a new generation"
+    );
 
-    let before = owner_b.request_skipping(&botster_hub_client::DaemonRequest::Status, &mut envelopes_b)
-    .status
-    .expect("status body")
-    .lifecycle_counters;
+    let reattach_deadline = Instant::now() + Duration::from_secs(5);
+    let before = loop {
+        let status = owner_b.request_skipping(
+            &botster_hub_client::DaemonRequest::Status,
+            &mut envelopes_b,
+        );
+        let status = status.status.expect("status after owner B attach");
+        assert!(
+            status
+                .compatibility
+                .features
+                .iter()
+                .any(|feature| feature == botster_hub_client::FEATURE_ATTACH_OCCUPANCY),
+            "H-S3 requires advertised attach occupancy"
+        );
+        let matching = status
+            .live_attach_occupancy
+            .iter()
+            .filter(|row| {
+                row.session_id == session_id && row.subscription_id == subscription_id
+            })
+            .collect::<Vec<_>>();
+        if matches!(matching.as_slice(), [row] if row.generation == generation_b) {
+            break status.lifecycle_counters;
+        }
+        assert!(
+            Instant::now() < reattach_deadline,
+            "owner B exact generation did not appear: generation_a={generation_a} generation_b={generation_b} occupancy={:?}",
+            status.live_attach_occupancy
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
     drop(owner_a);
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut after = before.clone();
@@ -628,17 +697,31 @@ fn unix_adapter_stale_disconnect_does_not_cancel_replacement_owner() {
         unix_envelope_contains_live_bytes(&envelopes_b, marker),
         "B must keep receiving opaque adapter frames after A disconnects: {envelopes_b:?}"
     );
-    let _confirm = owner_b.request_skipping(&botster_hub_client::DaemonRequest::Status, &mut envelopes_b);
-    let occupancy = owner_b.request_skipping(&botster_hub_client::DaemonRequest::Status, &mut envelopes_b)
-    .status
-    .expect("status after replacement-owner cleanup")
-    .live_attach_occupancy;
-    assert!(
-        occupancy
+    let occupancy_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let occupancy = owner_b
+            .request_skipping(
+                &botster_hub_client::DaemonRequest::Status,
+                &mut envelopes_b,
+            )
+            .status
+            .expect("status after replacement-owner cleanup")
+            .live_attach_occupancy;
+        let matching = occupancy
             .iter()
-            .any(|row| { row.session_id == session_id && row.subscription_id == subscription_id }),
-        "replacement owner occupancy must keep B's pair: {occupancy:?}"
-    );
+            .filter(|row| {
+                row.session_id == session_id && row.subscription_id == subscription_id
+            })
+            .collect::<Vec<_>>();
+        if matches!(matching.as_slice(), [row] if row.generation == generation_b) {
+            break;
+        }
+        assert!(
+            Instant::now() < occupancy_deadline,
+            "replacement owner occupancy must keep B's exact generation: generation_a={generation_a} generation_b={generation_b} occupancy={occupancy:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 
     drop(owner_b);
     shutdown_short_lived_session(&endpoint, session_id);

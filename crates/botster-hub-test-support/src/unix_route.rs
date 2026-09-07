@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
-use botster_core_test_support::route_observer::RouteObserver;
+use botster_core_test_support::{diagnostics::StepFailure, route_observer::RouteObserver};
 use botster_hub_client::{
     DaemonCompatibilityRequirement, DaemonConnection, DaemonEndpoint, DaemonRequest,
     DaemonResponse, DaemonResponseKind, DaemonTransportResult, DaemonUnixTerminalFrame,
@@ -112,6 +112,7 @@ pub fn decode_route_event(frame: &DaemonUnixTerminalFrame) -> Option<RouteEvent>
 }
 
 const MAX_ABANDONED_INPUTS: usize = 32;
+const MAX_PENDING_EVENTS: usize = 128;
 
 /// One unresolved operation that a successful detach made unobservable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +345,27 @@ impl UnixRouteClient {
     fn capture_skipped_route_events(&mut self) {
         for frame in self.inner.take_skipped_terminal() {
             let event = self.decode_and_observe(frame);
+            if self.pending_events.len() == MAX_PENDING_EVENTS {
+                let failure = self.observers.get(&event.route).map_or_else(
+                    || {
+                        StepFailure::new(
+                            "hub",
+                            "buffer_route_event",
+                            format!("pending route event limit {MAX_PENDING_EVENTS} was exceeded"),
+                        )
+                    },
+                    |observer| {
+                        observer.failure(
+                            "buffer_route_event",
+                            format!("pending route event limit {MAX_PENDING_EVENTS} was exceeded"),
+                        )
+                    },
+                );
+                panic!(
+                    "{failure} abandoned_input_count={} abandoned_inputs={:?}",
+                    self.abandoned_input_count, self.abandoned_inputs
+                );
+            }
             self.pending_events.push_back(event);
         }
     }
