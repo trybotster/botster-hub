@@ -121,7 +121,7 @@ impl Drop for SessionCleanupGuard {
 pub(crate) const GHOSTSNP_MAGIC: &[u8] = b"GHOSTSNP";
 
 pub(crate) fn wait_for_mode_flags<F>(
-    connection: &mut LifecycleConnection,
+    connection: &mut UnixRouteClient,
     session_id: &str,
     _subscription_id: &str,
     mut predicate: F,
@@ -161,7 +161,7 @@ where
 /// Route events on `subscription_id` until the live marker shows on the
 /// route or on the screen, or the deadline passes.
 pub(crate) fn collect_attach_events(
-    connection: &mut LifecycleConnection,
+    connection: &mut UnixRouteClient,
     session_id: &str,
     subscription_id: &str,
     until_live_marker: Option<&str>,
@@ -197,9 +197,9 @@ pub(crate) fn collect_attach_events(
 pub(crate) fn first_snapshot_payload(events: &[RouteEvent], subscription_id: &str) -> Vec<u8> {
     for event in events {
         if event.on_route(subscription_id)
-            && let StreamBody::SnapshotReady(bytes) = &event.body
+            && let TerminalEvent::SnapshotReady(frame) = &event.event
         {
-            return bytes.clone();
+            return frame.body().to_vec();
         }
     }
     panic!("expected SNAPSHOT_READY for {subscription_id}, got {events:?}");
@@ -221,21 +221,21 @@ pub(crate) fn install_incremental_attach_snapshots(
         .iter()
         .filter(|event| event.on_route(subscription_id))
     {
-        match &event.body {
-            StreamBody::SnapshotReady(bytes) => {
+        match &event.event {
+            TerminalEvent::SnapshotReady(frame) => {
                 assert!(!saw_ready, "one READY per attachment: {events:?}");
                 assert_eq!(
                     projection
-                        .install_ghostsnp_ready(bytes)
+                        .install_ghostsnp_ready(frame.body())
                         .expect("READY snapshot"),
                     botster_terminal_ghostty::GhosttySnapshotDecodeProgress::Ready
                 );
                 saw_ready = true;
             }
-            StreamBody::SnapshotHistory(bytes) => {
+            TerminalEvent::SnapshotHistory(frame) => {
                 assert!(saw_ready, "HISTORY before READY: {events:?}");
                 let _ = projection
-                    .apply_ghostsnp_history(bytes)
+                    .apply_ghostsnp_history(frame.body())
                     .expect("PAGE or FINISH snapshot");
             }
             _ => {}
@@ -602,7 +602,7 @@ pub(crate) fn python_script_command(script_path: &Path) -> String {
 }
 
 pub(crate) fn wait_until_adapter_event(
-    connection: &mut LifecycleConnection,
+    connection: &mut UnixRouteClient,
     session_id: &str,
     predicate: impl FnMut(&RouteEvent) -> bool,
 ) -> Vec<RouteEvent> {
@@ -610,7 +610,7 @@ pub(crate) fn wait_until_adapter_event(
 }
 
 pub(crate) fn wait_until_adapter_event_for_subscription(
-    connection: &mut LifecycleConnection,
+    connection: &mut UnixRouteClient,
     session_id: &str,
     subscription_id: Option<&str>,
     predicate: impl FnMut(&RouteEvent) -> bool,
@@ -625,7 +625,7 @@ pub(crate) fn wait_until_adapter_event_for_subscription(
 }
 
 pub(crate) fn wait_until_adapter_event_until(
-    connection: &mut LifecycleConnection,
+    connection: &mut UnixRouteClient,
     _session_id: &str,
     subscription_id: Option<&str>,
     timeout: Duration,
@@ -649,7 +649,7 @@ pub(crate) fn wait_until_adapter_event_until(
 
 /// Route events available now, optionally limited to one route.
 pub(crate) fn poll_adapter_events(
-    connection: &mut LifecycleConnection,
+    connection: &mut UnixRouteClient,
     _session_id: &str,
     subscription_id: Option<&str>,
 ) -> Vec<RouteEvent> {

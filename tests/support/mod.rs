@@ -107,28 +107,13 @@ pub fn bind_shared_terminal_adapter(
 }
 
 #[allow(dead_code)]
-pub fn send_terminal_input(
+pub fn inject_terminal_command(
     adapter: &botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter,
-    data: &[u8],
+    command: &botster_terminal_protocol_client::TerminalInputCommand,
 ) {
-    let body_len = u16::try_from(data.len()).expect("test terminal input fits u16");
-    let mut frame = Vec::with_capacity(4 + data.len());
-    frame.extend_from_slice(&[1, 1]);
-    frame.extend_from_slice(&body_len.to_be_bytes());
-    frame.extend_from_slice(data);
-    adapter.inject_ingress_frame(frame);
-    let _ = adapter.wake(botster_core::TerminalWakeKind::Writable);
-}
-
-#[allow(dead_code)]
-pub fn send_terminal_resize(
-    adapter: &botster_core_test_support::terminal_adapter::SharedFakeTerminalAdapter,
-    rows: u16,
-    cols: u16,
-) {
-    let mut frame = vec![1, 3, 0, 4];
-    frame.extend_from_slice(&rows.to_be_bytes());
-    frame.extend_from_slice(&cols.to_be_bytes());
+    let frame = botster_terminal_protocol_client::encode_terminal_input(command)
+        .expect("test terminal input encodes")
+        .into_bytes();
     adapter.inject_ingress_frame(frame);
     let _ = adapter.wake(botster_core::TerminalWakeKind::Writable);
 }

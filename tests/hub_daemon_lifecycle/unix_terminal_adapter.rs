@@ -17,7 +17,7 @@ fn unix_envelope_is_attached(
 }
 
 fn assert_host_session_retained(
-    connection: &mut LifecycleConnection,
+    connection: &mut UnixRouteClient,
     session_id: &str,
 ) {
     let listed = connection
@@ -289,7 +289,7 @@ fn unix_adapter_unbound_attach_delivers_terminal_output_on_adapter() {
     let session_id = "uud-session";
     let subscription_id = "uud-sub";
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("default hello");
+        UnixRouteClient::connect(&endpoint).expect("default hello");
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),
@@ -653,7 +653,7 @@ fn unix_adapter_unbound_attach_still_drains_snapshot() {
     let session_id = "uau-session";
     let subscription_id = "uau-sub";
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("default hello");
+        UnixRouteClient::connect(&endpoint).expect("default hello");
 
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -696,7 +696,7 @@ fn unix_adapter_unbound_printf_stream_attach_completes() {
     let marker = "botster-smoke-terminal-ok";
     let release_path = hub.data_dir().join("uap-release");
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("default hello");
+        UnixRouteClient::connect(&endpoint).expect("default hello");
     let spawned = connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: session_id.to_string(),

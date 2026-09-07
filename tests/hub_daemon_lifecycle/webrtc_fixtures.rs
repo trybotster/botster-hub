@@ -1234,7 +1234,7 @@ impl LocalWebrtcOfferPeer {
         &mut self,
         key: &AesGcmKey,
         label: &str,
-        input: &InputSpec,
+        input: &botster_terminal_protocol_client::TerminalInputCommand,
     ) -> Result<u64, Box<dyn std::error::Error>> {
         let index = self
             .subscription_labels
@@ -1253,7 +1253,7 @@ impl LocalWebrtcOfferPeer {
             key,
             generation,
             message_id,
-            &input.encode(operation_id),
+            &encode_input_with_operation_id(input, operation_id),
         )
         .await?;
         Ok(operation_id)

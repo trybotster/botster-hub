@@ -13,10 +13,11 @@ use botster_hub::{
     HubDaemon, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageRegistry,
     RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
+use botster_terminal_protocol_client::TerminalInputCommand;
 
 mod support;
 use support::{
-    bind_shared_terminal_adapter, candidate_session_worker_binary_path, send_terminal_input,
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, inject_terminal_command,
 };
 
 const RUNTIME_PACKAGE: &str = "runtime.synthetic-plugin";
@@ -285,7 +286,13 @@ fn spawn_attach_input_and_drain(
         logical_clock,
     );
 
-    send_terminal_input(&terminal_adapter, b"from-input\n");
+    inject_terminal_command(
+        &terminal_adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 1,
+            data: b"from-input\n".to_vec(),
+        },
+    );
     *logical_clock += 1;
 
     let observed = drain_until(

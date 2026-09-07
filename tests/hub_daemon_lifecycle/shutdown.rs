@@ -709,7 +709,7 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     );
 
     let live_idle_connection =
-        LifecycleConnection::connect(&botster_hub_client::DaemonEndpoint::new(
+        UnixRouteClient::connect(&botster_hub_client::DaemonEndpoint::new(
             config
                 .transports
                 .local_socket
@@ -1946,7 +1946,13 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
         subscription_id.clone(),
     );
     logical_clock += 1;
-    send_terminal_input(&terminal_adapter, b"after-restart\r");
+    inject_terminal_command(
+        &terminal_adapter,
+        &botster_terminal_protocol_client::TerminalInputCommand::RawBytes {
+            operation_id: 1,
+            data: b"after-restart\r".to_vec(),
+        },
+    );
     logical_clock += 1;
     let mut screen = String::new();
     for _ in 0..100 {
@@ -2280,7 +2286,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             .any(|session| session.session_id == session_id && session.lifecycle == "running")
     );
 
-    let mut pre_restart = LifecycleConnection::connect(&endpoint)
+    let mut pre_restart = UnixRouteClient::connect(&endpoint)
         .expect("connect before daemon restart");
     pre_restart
         .request(&botster_hub_client::DaemonRequest::Attach {
@@ -2346,7 +2352,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             .any(|session| session.session_id == session_id && session.lifecycle == "running")
     );
 
-    let mut connection = LifecycleConnection::connect(&endpoint)
+    let mut connection = UnixRouteClient::connect(&endpoint)
         .expect("connect after daemon restart");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {

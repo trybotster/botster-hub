@@ -3556,7 +3556,7 @@ fn spawn_quiet_fleet(endpoint: &botster_hub_client::DaemonEndpoint) -> usize {
 }
 
 struct NoisySession {
-    connection: LifecycleConnection,
+    connection: UnixRouteClient,
 }
 
 fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySession {
@@ -3573,7 +3573,7 @@ fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySe
         botster_hub_client::DaemonResponseKind::Spawned
     );
     let mut connection =
-        LifecycleConnection::connect(endpoint).expect("noisy connection");
+        UnixRouteClient::connect(endpoint).expect("noisy connection");
     let attached = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
@@ -3916,17 +3916,19 @@ fn perform_cycle_operation(
             botster_hub_client::DaemonResponseKind::Events,
         ),
         "input" => {
-            let mut connection = LifecycleConnection::connect(endpoint)
+            let mut connection = UnixRouteClient::connect(endpoint)
                 .map_err(|error| error.to_string())?;
             connection
                 .send_terminal_frame(sub_id, &terminal_input_frame_bytes(format!("{}\r", "i".repeat(64)).as_bytes()))
+                .map(|_| ())
                 .map_err(|error| error.to_string())
         }
         "resize" => {
-            let mut connection = LifecycleConnection::connect(endpoint)
+            let mut connection = UnixRouteClient::connect(endpoint)
                 .map_err(|error| error.to_string())?;
             connection
                 .send_terminal_frame(sub_id, &terminal_resize_frame_bytes(24, 80))
+                .map(|_| ())
                 .map_err(|error| error.to_string())
         }
         "mcp" => expect_kind(
@@ -4422,7 +4424,9 @@ fn terminal_output_event(bytes: &[u8]) -> RouteEvent {
         route: EVENT_PLANE_NOISY_SUB.to_string(),
         generation: 1,
         stream_epoch: 0,
-        body: StreamBody::Output(bytes.to_vec()),
+        event: TerminalEvent::Output(
+            botster_terminal_protocol::encode_output(bytes).expect("output fixture encodes"),
+        ),
     }
 }
 
@@ -4819,7 +4823,7 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
     );
     drop(std::mem::replace(
         &mut noisy.connection,
-        LifecycleConnection::connect(endpoint).expect("reconnect noisy"),
+        UnixRouteClient::connect(endpoint).expect("reconnect noisy"),
     ));
     let reattached = noisy
         .connection
@@ -5063,7 +5067,7 @@ fn late_attach_closed_first(endpoint: &botster_hub_client::DaemonEndpoint) {
         botster_hub_client::DaemonResponseKind::Spawned,
     )
     .expect("spawn for late attach");
-    let mut first = LifecycleConnection::connect(endpoint).expect("attach first");
+    let mut first = UnixRouteClient::connect(endpoint).expect("attach first");
     first
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
@@ -5071,7 +5075,7 @@ fn late_attach_closed_first(endpoint: &botster_hub_client::DaemonEndpoint) {
         })
         .expect("first attach");
     drop(first);
-    let mut second = LifecycleConnection::connect(endpoint).expect("attach second");
+    let mut second = UnixRouteClient::connect(endpoint).expect("attach second");
     let reused = second
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
@@ -5102,13 +5106,13 @@ fn late_attach_message_first(endpoint: &botster_hub_client::DaemonEndpoint) {
         botster_hub_client::DaemonResponseKind::Spawned,
     )
     .expect("spawn for live attach");
-    let mut live = LifecycleConnection::connect(endpoint).expect("live attach");
+    let mut live = UnixRouteClient::connect(endpoint).expect("live attach");
     live.request(&botster_hub_client::DaemonRequest::Attach {
         session_id: session_id.to_string(),
         subscription_id: "late-attach-both".to_string(),
     })
     .expect("live attach");
-    let mut sibling = LifecycleConnection::connect(endpoint).expect("sibling attach");
+    let mut sibling = UnixRouteClient::connect(endpoint).expect("sibling attach");
     let sibling_attach = sibling
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
@@ -5135,7 +5139,7 @@ fn late_attach_message_first(endpoint: &botster_hub_client::DaemonEndpoint) {
 }
 
 fn late_entities_closed_first_and_message_first(endpoint: &botster_hub_client::DaemonEndpoint) {
-    let mut first = LifecycleConnection::connect(endpoint).expect("entity first");
+    let mut first = UnixRouteClient::connect(endpoint).expect("entity first");
     first
         .request(&botster_hub_client::DaemonRequest::SubscribeEntities {
             entity_type: "session".to_string(),
@@ -5143,7 +5147,7 @@ fn late_entities_closed_first_and_message_first(endpoint: &botster_hub_client::D
         })
         .expect("subscribe entities");
     drop(first);
-    let mut second = LifecycleConnection::connect(endpoint).expect("entity second");
+    let mut second = UnixRouteClient::connect(endpoint).expect("entity second");
     let reused = second
         .request(&botster_hub_client::DaemonRequest::SubscribeEntities {
             entity_type: "session".to_string(),
@@ -5154,13 +5158,13 @@ fn late_entities_closed_first_and_message_first(endpoint: &botster_hub_client::D
         reused.kind,
         botster_hub_client::DaemonResponseKind::OperatorError
     );
-    let mut live = LifecycleConnection::connect(endpoint).expect("entity live");
+    let mut live = UnixRouteClient::connect(endpoint).expect("entity live");
     live.request(&botster_hub_client::DaemonRequest::SubscribeEntities {
         entity_type: "session".to_string(),
         subscription_id: "late-entity-both".to_string(),
     })
     .expect("live entity");
-    let mut sibling = LifecycleConnection::connect(endpoint).expect("entity sibling");
+    let mut sibling = UnixRouteClient::connect(endpoint).expect("entity sibling");
     sibling
         .request(&botster_hub_client::DaemonRequest::SubscribeEntities {
             entity_type: "session".to_string(),

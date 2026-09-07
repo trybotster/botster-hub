@@ -19,11 +19,11 @@ use botster_hub::{
     HubStartupOptions, HubStateStore, RuntimeEnvironment, SessionDefaults, TestFileCredentialStore,
     TransportBindings, TrustedBrowserIdentity, credential_key_id,
 };
+use botster_terminal_protocol_client::TerminalInputCommand;
 
 mod support;
 use support::{
-    bind_shared_terminal_adapter, candidate_session_worker_binary_path, send_terminal_input,
-    send_terminal_resize,
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, inject_terminal_command,
 };
 
 /// Bound wait for one Core ticket answered by the Hub data-plane driver.
@@ -259,7 +259,16 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
         &mut logical_clock,
     );
 
-    send_terminal_resize(&adapter, 30, 100);
+    inject_terminal_command(
+        &adapter,
+        &TerminalInputCommand::Resize {
+            operation_id: 1,
+            rows: 30,
+            cols: 100,
+            width_px: 0,
+            height_px: 0,
+        },
+    );
     logical_clock += 1;
     let deadline = Instant::now() + Duration::from_secs(5);
     let listed = loop {
@@ -273,7 +282,13 @@ fn hub_runtime_routes_production_session_verbs_through_core_daemon() {
     assert_eq!(listed[0].size.rows, 30);
     assert_eq!(listed[0].size.cols, 100);
 
-    send_terminal_input(&adapter, b"ping-hub\n");
+    inject_terminal_command(
+        &adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 2,
+            data: b"ping-hub\n".to_vec(),
+        },
+    );
     logical_clock += 1;
     drain_until(
         &mut runtime,
@@ -460,7 +475,13 @@ fn hub_runtime_uses_worker_backed_sessions_and_adopts_after_daemon_restart() {
         session_id.clone(),
         subscription_id.clone(),
     );
-    send_terminal_input(&adapter, b"after-adopt\n");
+    inject_terminal_command(
+        &adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 1,
+            data: b"after-adopt\n".to_vec(),
+        },
+    );
     logical_clock += 1;
     drain_until(
         &mut restarted,
