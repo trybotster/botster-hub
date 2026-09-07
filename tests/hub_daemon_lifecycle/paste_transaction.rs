@@ -55,6 +55,11 @@ fn live_paste_payload() -> Vec<u8> {
     (0..LIVE_PASTE_BYTES).map(|index| index as u8).collect()
 }
 
+/// BEGIN, one CHUNK per protocol-sized slice, COMMIT.
+fn expected_paste_frames(payload: &[u8]) -> usize {
+    payload.len().div_ceil(botster_terminal_protocol::MAX_PASTE_CHUNK_DATA_BYTES) + 2
+}
+
 fn paste_sink_command(sink: &Path, ready: &str, done: &str) -> String {
     format!(
         "stty raw -echo; printf '{ready}'; head -c {LIVE_PASTE_BYTES} > {}; printf '{done}'; sleep 30",
@@ -62,132 +67,108 @@ fn paste_sink_command(sink: &Path, ready: &str, done: &str) -> String {
     )
 }
 
+/// One raw terminal frame body carries OUTPUT containing `marker`.
 fn terminal_frame_contains(bytes: &[u8], marker: &str) -> bool {
-    if bytes
-        .windows(marker.len())
-        .any(|window| window == marker.as_bytes())
-    {
-        return true;
-    }
-    serde_json::from_slice::<botster_hub_client::DaemonEvent>(bytes).is_ok_and(|event| {
-        matches!(
-            event,
-            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                if live_output_contains(&payload, marker)
-        )
+    botster_terminal_protocol::TerminalFrame::from_bytes(bytes).is_ok_and(|frame| {
+        frame.kind() == botster_terminal_protocol::TerminalKind::Output
+            && bytes_contain(frame.body(), marker.as_bytes())
     })
 }
 
-fn input_result_for_operation(bytes: &[u8], operation_id: u32) -> Option<serde_json::Value> {
-    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
-    (value.get("type").and_then(serde_json::Value::as_str) == Some("input_result")
-        && value.get("operation_id").and_then(serde_json::Value::as_u64)
-            == Some(u64::from(operation_id)))
-    .then_some(value)
+/// The INPUT_RESULT body for `operation_id`, if this frame body carries one.
+fn input_result_for_operation(
+    bytes: &[u8],
+    operation_id: u64,
+) -> Option<botster_terminal_protocol::InputResultBody> {
+    let frame = botster_terminal_protocol::TerminalFrame::from_bytes(bytes).ok()?;
+    let result = botster_terminal_protocol::decode_input_result(&frame).ok()?;
+    (result.operation_id == operation_id).then_some(result)
 }
 
 fn unix_paste_results(
-    envelopes: &[botster_hub_client::DaemonUnixTerminalFrame],
-    operation_id: u32,
-) -> Vec<serde_json::Value> {
-    envelopes
+    frames: &[botster_hub_client::DaemonUnixTerminalFrame],
+    operation_id: u64,
+) -> Vec<botster_terminal_protocol::InputResultBody> {
+    frames
         .iter()
-        .filter_map(|envelope| envelope.payload_bytes().ok())
-        .filter_map(|bytes| input_result_for_operation(&bytes, operation_id))
+        .filter_map(|frame| input_result_for_operation(&frame.body, operation_id))
         .collect()
 }
 
 fn unix_terminal_has_marker(
-    envelopes: &[botster_hub_client::DaemonUnixTerminalFrame],
+    frames: &[botster_hub_client::DaemonUnixTerminalFrame],
     marker: &str,
 ) -> bool {
-    envelopes.iter().any(|envelope| {
-        envelope
-            .payload_bytes()
-            .is_ok_and(|bytes| terminal_frame_contains(&bytes, marker))
-    })
+    frames
+        .iter()
+        .any(|frame| terminal_frame_contains(&frame.body, marker))
 }
 
+/// Read every frame that arrives within `duration`. An unpaired control
+/// response is a proof failure.
 fn collect_unix_mux_for(
-    reader: &mut BufReader<UnixStream>,
-    incomplete: &mut String,
-    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalFrame>,
+    client: &mut RawUnixClient,
+    frames: &mut Vec<botster_hub_client::DaemonUnixTerminalFrame>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
     duration: Duration,
 ) {
-    reader
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .expect("set paste mux timeout");
+    client.set_read_timeout(Some(Duration::from_millis(50)));
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
-        match botster_hub_client::read_unix_mux_frame_from_reader(reader, incomplete) {
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(envelope)) => {
-                envelopes.push(envelope)
-            }
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Event(event)) => events.push(event),
-            Ok(botster_hub_client::DaemonUnixMuxFrame::Response(response)) => {
-                panic!("paste mux received an unpaired response: {response:?}")
-            }
-            Err(_) => {}
+        match client.read_frame() {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(frame)) => frames.push(frame),
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(
+                botster_hub_client::ServerFrame::Event { event },
+            )) => events.push(event),
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(
+                botster_hub_client::ServerFrame::Response { response, .. },
+            )) => panic!("paste mux received an unpaired response: {response:?}"),
+            Ok(_) | Err(_) => {}
         }
     }
-    reader
-        .get_ref()
-        .set_read_timeout(None)
-        .expect("clear paste mux timeout");
+    client.set_read_timeout(None);
 }
 
 fn collect_unix_paste_completion(
-    reader: &mut BufReader<UnixStream>,
-    incomplete: &mut String,
-    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalFrame>,
+    client: &mut RawUnixClient,
+    frames: &mut Vec<botster_hub_client::DaemonUnixTerminalFrame>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
-    operation_id: u32,
+    operation_id: u64,
     done: &str,
 ) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        collect_unix_mux_for(
-            reader,
-            incomplete,
-            envelopes,
-            events,
-            Duration::from_millis(100),
-        );
-        if unix_paste_results(envelopes, operation_id).len() == 1
-            && unix_terminal_has_marker(envelopes, done)
+        collect_unix_mux_for(client, frames, events, Duration::from_millis(100));
+        if unix_paste_results(frames, operation_id).len() == 1
+            && unix_terminal_has_marker(frames, done)
         {
-            collect_unix_mux_for(
-                reader,
-                incomplete,
-                envelopes,
-                events,
-                Duration::from_millis(500),
-            );
+            collect_unix_mux_for(client, frames, events, Duration::from_millis(500));
             return;
         }
     }
     panic!(
         "paste did not complete: results={:?} done={} events={events:?}",
-        unix_paste_results(envelopes, operation_id),
-        unix_terminal_has_marker(envelopes, done)
+        unix_paste_results(frames, operation_id),
+        unix_terminal_has_marker(frames, done)
     );
 }
 
-fn assert_admitted_paste_result(results: &[serde_json::Value], operation_id: u32) {
+/// One admitted paste result: written, with the whole payload accepted.
+fn assert_admitted_paste_result(
+    results: &[botster_terminal_protocol::InputResultBody],
+    operation_id: u64,
+) {
     assert_eq!(results.len(), 1, "one paste input_result: {results:?}");
-    assert_eq!(results[0]["operation_id"], operation_id, "{results:?}");
-    assert_eq!(results[0]["admitted"], true, "{results:?}");
+    assert_eq!(results[0].operation_id, operation_id, "{results:?}");
     assert_eq!(
-        results[0]["bytes_written"],
-        LIVE_PASTE_BYTES,
+        results[0].outcome,
+        botster_terminal_protocol::InputOutcome::Written,
         "{results:?}"
     );
-    assert!(
-        results[0].get("rejection").is_none(),
-        "admitted paste must omit rejection: {:?}",
-        results[0]
+    assert_eq!(
+        results[0].accepted_payload_bytes,
+        Some(LIVE_PASTE_BYTES as u64),
+        "{results:?}"
     );
 }
 
@@ -209,37 +190,36 @@ fn assert_no_route_close(
     );
 }
 
+/// Wait for the sink's ready marker on the route and a readable mode body.
 fn wait_for_unix_ready_and_mode(
-    stream: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    incomplete: &mut String,
+    client: &mut RawUnixClient,
     session_id: &str,
     ready: &str,
-    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalFrame>,
+    frames: &mut Vec<botster_hub_client::DaemonUnixTerminalFrame>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
 ) -> botster_hub_client::DaemonModeFlags {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        let response = request_collecting_mux(
-            stream,
-            reader,
-            incomplete,
+        let response = client.request_collecting(
             &botster_hub_client::DaemonRequest::ReadModeFlags {
                 session_id: session_id.to_string(),
             },
-            envelopes,
+            frames,
             events,
         );
-        if unix_terminal_has_marker(envelopes, ready)
+        if unix_terminal_has_marker(frames, ready)
             && response.kind == botster_hub_client::DaemonResponseKind::ReadModeFlags
             && response
                 .mode_flags
                 .as_ref()
-                .is_some_and(|flags| flags.mode_generation != 0)
+                .is_some_and(|flags| flags.unavailable.is_none())
         {
             return response.mode_flags.expect("mode flags body");
         }
-        assert!(Instant::now() < deadline, "raw paste sink did not become ready");
+        assert!(
+            Instant::now() < deadline,
+            "raw paste sink did not become ready"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -261,25 +241,20 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     let subscription_id = "unix-paste-sub";
     let ready = "unix-paste-sink-ready";
     let done = "unix-paste-sink-done";
-    let operation_id = 4101;
     let payload = live_paste_payload();
-    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
+    let mut stream = RawUnixClient::connect_unix_terminal_adapter(&endpoint);
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
     spawn_and_bind(
         &mut stream,
-        &mut reader,
-        &mut incomplete,
         session_id,
         subscription_id,
         &paste_sink_command(&sink, ready, done),
         &mut envelopes,
         &mut events,
     );
-    let mode = wait_for_unix_ready_and_mode(
+    let _mode = wait_for_unix_ready_and_mode(
         &mut stream,
-        &mut reader,
-        &mut incomplete,
         session_id,
         ready,
         &mut envelopes,
@@ -288,19 +263,14 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     envelopes.clear();
     events.clear();
 
-    let frames = terminal_paste_frame_bytes(
-        operation_id,
-        mode.mode_generation,
-        mode.mode_revision,
-        &payload,
-    );
-    assert_eq!(frames.len(), 19);
-    for frame in &frames {
-        write_unix_terminal_frame(&mut stream, session_id, subscription_id, frame);
+    let frames = terminal_paste_frame_bytes(&payload);
+    assert_eq!(frames.len(), expected_paste_frames(&payload));
+    let operation_id = stream.send_terminal_input(subscription_id, &frames[0]);
+    for frame in &frames[1..] {
+        stream.send_terminal_input(subscription_id, frame);
     }
     collect_unix_paste_completion(
-        &mut reader,
-        &mut incomplete,
+        &mut stream,
         &mut envelopes,
         &mut events,
         operation_id,
@@ -310,10 +280,7 @@ fn unix_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     assert_admitted_paste_result(&unix_paste_results(&envelopes, operation_id), operation_id);
     assert_no_route_close(&events, session_id, subscription_id);
     assert_sink_bytes(&sink, &payload);
-    let status = request_collecting_mux(
-        &mut stream,
-        &mut reader,
-        &mut incomplete,
+    let status = stream.request_collecting(
         &botster_hub_client::DaemonRequest::Status,
         &mut envelopes,
         &mut events,
@@ -340,7 +307,6 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     let subscription_id = "webrtc-paste-sub";
     let ready = "webrtc-paste-sink-ready";
     let done = "webrtc-paste-sink-done";
-    let operation_id = 4201;
     let payload = live_paste_payload();
 
     block_on(async {
@@ -374,8 +340,9 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
             .terminal_reservation
             .as_ref()
             .expect("terminal reservation");
-        let channel = peer
-            .open_reserved_terminal(&key, &reservation.label, &webrtc_terminal_adapter_hello())
+        let label = reservation.label.clone();
+        let _channel = peer
+            .open_reserved_terminal(&key, &label, &webrtc_terminal_adapter_hello())
             .await
             .expect("open reserved terminal channel");
 
@@ -388,7 +355,7 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
             }
             assert!(Instant::now() < ready_deadline, "WebRTC paste sink did not become ready");
         }
-        let mode = loop {
+        let _mode = loop {
             let response = peer
                 .encrypted_request(
                     &key,
@@ -399,22 +366,21 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
                 .await
                 .expect("read mode flags");
             if let Some(mode) = response.mode_flags
-                && mode.mode_generation != 0
+                && mode.unavailable.is_none()
             {
                 break mode;
             }
-            assert!(Instant::now() < ready_deadline, "mode token did not become ready");
+            assert!(Instant::now() < ready_deadline, "modes did not become readable");
         };
 
-        let frames = terminal_paste_frame_bytes(
-            operation_id,
-            mode.mode_generation,
-            mode.mode_revision,
-            &payload,
-        );
-        assert_eq!(frames.len(), 19);
-        for frame in &frames {
-            LocalWebrtcOfferPeer::send_reserved_terminal_frame(&channel, &key, frame)
+        let frames = terminal_paste_frame_bytes(&payload);
+        assert_eq!(frames.len(), expected_paste_frames(&payload));
+        let operation_id = peer
+            .send_terminal_input(&key, &label, &frames[0])
+            .await
+            .expect("send paste begin");
+        for frame in &frames[1..] {
+            peer.send_terminal_input(&key, &label, frame)
                 .await
                 .expect("send paste frame");
         }

@@ -203,7 +203,9 @@ pub use profile::{
     CoreRuntimeRole, HostProfileManifest, HostProfileTrust, PolicyArea, Responsibility,
     host_profile,
 };
-pub use runtime::{AttachBindFailure, AttachBindPlan, BindRoutePlan, CoreOperationTracker};
+pub use runtime::CoreOperationTracker;
+#[cfg(feature = "test-internals")]
+pub mod test_internals;
 pub use runtime::{
     HubLuaPluginLoadError, HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
     daemon_session_to_core_session,

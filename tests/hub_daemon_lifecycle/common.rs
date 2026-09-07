@@ -136,6 +136,40 @@ pub(crate) fn terminal_paste_frame_bytes(data: &[u8]) -> Vec<InputSpec> {
     frames
 }
 
+/// Bound for one Core ticket answered by the Hub data-plane driver.
+pub(crate) const CORE_WAIT: Duration = Duration::from_secs(30);
+
+pub(crate) fn wait_ticket<T>(ticket: botster_hub::CoreTicket<T>) -> T {
+    ticket.wait(CORE_WAIT).expect("core bridge answers the ticket")
+}
+
+pub(crate) fn spawn_through_core(
+    runtime: &botster_hub::HubRuntime,
+    request: SessionSpawnRequest,
+) -> botster_core::CoreSession {
+    match runtime
+        .begin_spawn(request, CoreSessionMetadata::new())
+        .wait(runtime, CORE_WAIT)
+    {
+        Ok(botster_core_daemon::CoreCompletion::Spawn { result, .. }) => {
+            result.expect("spawn through core daemon")
+        }
+        other => panic!("unexpected spawn completion: {other:?}"),
+    }
+}
+
+pub(crate) fn shutdown_through_core(runtime: &botster_hub::HubRuntime, session_id: SessionId) {
+    match runtime
+        .begin_shutdown_session(session_id)
+        .wait(runtime, CORE_WAIT)
+    {
+        Ok(botster_core_daemon::CoreCompletion::ShutdownSession { result, .. }) => {
+            result.expect("shutdown through core daemon")
+        }
+        other => panic!("unexpected shutdown completion: {other:?}"),
+    }
+}
+
 pub(crate) fn unique_test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -485,7 +485,8 @@ fn hub_runtime_guarded_write_delegates_readiness_and_delivery_state_to_core_daem
 
     spawn_through_core(&runtime, request);
     logical_clock += 1;
-    wait_ticket(runtime.attach_route(
+    wait_ticket(botster_hub::test_internals::attach_route(
+        &runtime,
         client_id.clone(),
         session_id.clone(),
         subscription_id.clone(),
@@ -573,7 +574,8 @@ fn bind_terminal_adapter_inventory_echoes_capability_set() {
 
     spawn_through_core(&runtime, request);
     logical_clock += 1;
-    let generation = wait_ticket(runtime.attach_route(
+    let generation = wait_ticket(botster_hub::test_internals::attach_route(
+        &runtime,
         client_id.clone(),
         session_id.clone(),
         subscription_id.clone(),
@@ -595,17 +597,20 @@ fn bind_terminal_adapter_inventory_echoes_capability_set() {
     let capabilities =
         botster_core::TerminalCapabilitySet::from_tokens(["terminal_streaming", "resize"])
             .expect("advertised tokens");
-    wait_ticket(runtime.bind_route_adapter(botster_hub::BindRoutePlan {
-        client_id: client_id.clone(),
-        session_id: session_id.clone(),
-        subscription_id: subscription_id.clone(),
-        generation,
-        capabilities: capabilities.clone(),
-        now_seconds: logical_clock,
-        adapter: Box::new(
-            botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default(),
-        ),
-    }))
+    wait_ticket(botster_hub::test_internals::bind_route_adapter(
+        &runtime,
+        botster_hub::test_internals::TestBindRoutePlan {
+            client_id: client_id.clone(),
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+            generation,
+            capabilities: capabilities.clone(),
+            now_seconds: logical_clock,
+            adapter: Box::new(
+                botster_core_test_support::terminal_adapter::FakeTerminalAdapter::default(),
+            ),
+        },
+    ))
     .expect("bind");
 
     let after = wait_ticket(runtime.list_terminal_subscriptions());

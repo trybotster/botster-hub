@@ -626,45 +626,22 @@ fn event_plane_saturation_parse_output_records_counts_malformed_bytes() {
         EVENT_PLANE_OUTPUT_RECORD_BYTES - EVENT_PLANE_OUTPUT_HEADER_BYTES - 1,
     ));
     valid.push(b'\n');
-    let identity = botster_hub_client::DaemonEvent::TerminalOutput {
-        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
-        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&[0x80, 0xff, b'\n']),
-    };
+    let identity = terminal_output_event(&[0x80, 0xff, b'\n']);
     let parsed_identity = parse_output_records(&[identity]);
     assert_eq!(parsed_identity.records.len(), 0);
     assert_eq!(parsed_identity.malformed, 0);
 
-    let valid_event = botster_hub_client::DaemonEvent::TerminalOutput {
-        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
-        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&valid),
-    };
+    let valid_event = terminal_output_event(&valid);
     let parsed_valid = parse_output_records(&[valid_event]);
     assert_eq!(parsed_valid.records.len(), 1);
     assert_eq!(parsed_valid.malformed, 0);
 
     let mut invalid = vec![b'N'; EVENT_PLANE_OUTPUT_RECORD_BYTES];
     invalid[9] = b'X';
-    let invalid_event = botster_hub_client::DaemonEvent::TerminalOutput {
-        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
-        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&invalid),
-    };
+    let invalid_event = terminal_output_event(&invalid);
     let parsed_invalid = parse_output_records(&[invalid_event]);
     assert!(parsed_invalid.malformed > 0);
     assert!(parsed_invalid.records.is_empty());
-
-    let mut mismatched = botster_hub_client::DaemonLiveOutputPayload::from_bytes(b"hello");
-    mismatched.bytes = 99;
-    let decode_event = botster_hub_client::DaemonEvent::TerminalOutput {
-        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
-        payload: mismatched,
-    };
-    let parsed_decode = parse_output_records(&[decode_event]);
-    assert_eq!(parsed_decode.malformed, 1);
-    assert!(parsed_decode.records.is_empty());
 }
 
 #[test]
@@ -1199,12 +1176,7 @@ fn event_plane_saturation_output_records_carry_emission_time() {
     ));
     line.push(b'\n');
     assert_eq!(line.len(), EVENT_PLANE_OUTPUT_RECORD_BYTES);
-    let payload = botster_hub_client::DaemonLiveOutputPayload::from_bytes(&line);
-    let events = [botster_hub_client::DaemonEvent::TerminalOutput {
-        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
-        payload,
-    }];
+    let events = [terminal_output_event(&line)];
     let records = output_records(&events);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].seq, 7);
@@ -3618,7 +3590,7 @@ fn spawn_noisy_session(endpoint: &botster_hub_client::DaemonEndpoint) -> NoisySe
 fn collect_noisy_attach(
     noisy: &mut NoisySession,
     until_live_marker: Option<&str>,
-) -> Result<Vec<botster_hub_client::DaemonEvent>, String> {
+) -> Result<Vec<RouteEvent>, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         collect_attach_events(
             &mut noisy.connection,
@@ -3630,8 +3602,11 @@ fn collect_noisy_attach(
     .map_err(|_| "noisy attach collect panicked".to_string())
 }
 
-fn noisy_events_have_gap(events: &[botster_hub_client::DaemonEvent]) -> bool {
-    events
+/// Event gaps are host events; the terminal route never carries them.
+fn noisy_host_events_have_gap(noisy: &mut NoisySession) -> bool {
+    noisy
+        .connection
+        .take_skipped_events()
         .iter()
         .any(|event| event_gap_for_subscription(event, EVENT_PLANE_NOISY_SUB))
 }
@@ -3793,16 +3768,12 @@ fn run_measurement_workers(
                 tx.send(MeasurementSample::Start("terminal_input".to_string()))
                     .expect("send terminal input start");
             }
-            let sent = noisy.connection.send_terminal_frame(
-                EVENT_PLANE_NOISY_SESSION,
-                EVENT_PLANE_NOISY_SUB,
-                &terminal_input_frame_bytes(payload.as_bytes()),
-            );
+            let sent = noisy.connection.send_terminal_frame(EVENT_PLANE_NOISY_SUB, &terminal_input_frame_bytes(payload.as_bytes()));
             let echo_marker = format!("ns-echo:{token}");
             let echoed = collect_noisy_attach(noisy, Some(&echo_marker));
             let ok = match echoed {
                 Ok(events) => {
-                    if noisy_events_have_gap(&events) {
+                    if noisy_host_events_have_gap(noisy) {
                         terminal.apply_unexpected_gap();
                     }
                     output_fold.ingest(
@@ -3813,14 +3784,9 @@ fn run_measurement_workers(
                         window_end_ns,
                     );
                     let echoed_ok = events.iter().any(|event| {
-                        matches!(
-                            event,
-                            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                                if payload
-                                    .decoded_bytes()
-                                    .ok()
-                                    .is_some_and(|bytes| payload_contains_exact_echo(&bytes, &token))
-                        )
+                        event
+                            .output()
+                            .is_some_and(|bytes| payload_contains_exact_echo(bytes, &token))
                     });
                     sent.is_ok() && echoed_ok
                 }
@@ -3859,7 +3825,7 @@ fn run_measurement_workers(
         } else {
             match collect_noisy_attach(noisy, None) {
                 Ok(drained) => {
-                    if noisy_events_have_gap(&drained) {
+                    if noisy_host_events_have_gap(noisy) {
                         terminal.apply_unexpected_gap();
                     }
                     output_fold.ingest(
@@ -4045,19 +4011,11 @@ impl OutputStreamParser {
         }
     }
 
-    fn feed(&mut self, events: &[botster_hub_client::DaemonEvent]) -> ParsedOutputRecords {
+    fn feed(&mut self, events: &[RouteEvent]) -> ParsedOutputRecords {
         let start_records = self.records.len();
         let start_malformed = self.malformed;
-        for event in events {
-            let botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } = event else {
-                continue;
-            };
-            match payload.decoded_bytes() {
-                Ok(bytes) => self.pending.extend_from_slice(&bytes),
-                Err(_) => {
-                    self.malformed = self.malformed.saturating_add(1);
-                }
-            }
+        for bytes in events.iter().filter_map(RouteEvent::output) {
+            self.pending.extend_from_slice(bytes);
         }
         self.consume(false);
         self.snapshot_since(start_records, start_malformed)
@@ -4326,7 +4284,7 @@ impl OutputStreamFold {
 
     fn ingest(
         &mut self,
-        events: &[botster_hub_client::DaemonEvent],
+        events: &[RouteEvent],
         terminal: &mut TerminalOracles,
         tx: Option<&mpsc::Sender<MeasurementSample>>,
         sample: bool,
@@ -4420,7 +4378,7 @@ impl OutputStreamFold {
             }
             match collect_noisy_attach(noisy, None) {
                 Ok(drained) => {
-                    if noisy_events_have_gap(&drained) {
+                    if noisy_host_events_have_gap(noisy) {
                         terminal.apply_unexpected_gap();
                     }
                     self.ingest(&drained, terminal, Some(tx), true, window_end_ns);
@@ -4459,15 +4417,16 @@ fn noisy_output_record(seq: u64, emit_ns: u64) -> Vec<u8> {
     record
 }
 
-fn terminal_output_event(bytes: &[u8]) -> botster_hub_client::DaemonEvent {
-    botster_hub_client::DaemonEvent::TerminalOutput {
-        session_id: EVENT_PLANE_NOISY_SESSION.to_string(),
-        subscription_id: EVENT_PLANE_NOISY_SUB.to_string(),
-        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(bytes),
+fn terminal_output_event(bytes: &[u8]) -> RouteEvent {
+    RouteEvent {
+        route: EVENT_PLANE_NOISY_SUB.to_string(),
+        generation: 1,
+        stream_epoch: 0,
+        body: StreamBody::Output(bytes.to_vec()),
     }
 }
 
-fn parse_output_records(events: &[botster_hub_client::DaemonEvent]) -> ParsedOutputRecords {
+fn parse_output_records(events: &[RouteEvent]) -> ParsedOutputRecords {
     let mut parser = OutputStreamParser::new();
     parser.feed(events);
     parser.finish();
@@ -4478,7 +4437,7 @@ fn parse_output_records(events: &[botster_hub_client::DaemonEvent]) -> ParsedOut
     }
 }
 
-fn output_records(events: &[botster_hub_client::DaemonEvent]) -> Vec<OutputRecord> {
+fn output_records(events: &[RouteEvent]) -> Vec<OutputRecord> {
     parse_output_records(events).records
 }
 
@@ -4815,20 +4774,14 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
         Some("ns-ready"),
     );
     assert!(
-        identity.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                if live_output_contains(payload, "ns-ready")
-        )),
+        identity.iter().any(|event| event.output_contains("ns-ready")),
         "noisy session identity marker must appear: {identity:?}"
     );
     assert!(
-        identity.iter().any(|event| match event {
-            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. } => payload
-                .decoded_bytes()
-                .ok()
-                .is_some_and(|bytes| bytes.windows(2).any(|window| window == [0x80, 0xff])),
-            _ => false,
+        identity.iter().any(|event| {
+            event
+                .output()
+                .is_some_and(|bytes| bytes.windows(2).any(|window| window == [0x80, 0xff]))
         }),
         "noisy session must preserve exact non-UTF-8 bytes"
     );
@@ -4842,20 +4795,12 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
         EVENT_PLANE_NOISY_SUB,
         Some("ns-echo:ns-probe"),
     );
-    let ready_at = identity.iter().position(|event| {
-        matches!(
-            event,
-            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                if live_output_contains(payload, "ns-ready")
-        )
-    });
-    let echo_at = echoed.iter().position(|event| {
-        matches!(
-            event,
-            botster_hub_client::DaemonEvent::TerminalOutput { payload, .. }
-                if live_output_contains(payload, "ns-echo:ns-probe")
-        )
-    });
+    let ready_at = identity
+        .iter()
+        .position(|event| event.output_contains("ns-ready"));
+    let echo_at = echoed
+        .iter()
+        .position(|event| event.output_contains("ns-echo:ns-probe"));
     assert!(ready_at.is_some() && echo_at.is_some(), "ordering oracles");
     noisy
         .connection
@@ -4894,11 +4839,9 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
         Some("ns-ready"),
     );
     assert!(
-        late_events.iter().any(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::Snapshot { .. }
-                | botster_hub_client::DaemonEvent::Scrollback { .. }
-        )),
+        late_events
+            .iter()
+            .any(|event| event.is_snapshot_ready() || event.is_snapshot_history()),
         "late attach must deliver history: {late_events:?}"
     );
     let shutdown = botster_hub_client::request(
@@ -4921,10 +4864,7 @@ fn prove_north_star(endpoint: &botster_hub_client::DaemonEndpoint, noisy: &mut N
             "event-plane-noisy-re",
             None,
         );
-        if events
-            .iter()
-            .any(|event| matches!(event, botster_hub_client::DaemonEvent::ProcessExit { .. }))
-        {
+        if events.iter().any(RouteEvent::is_process_exit) {
             saw_exit = true;
             break;
         }
