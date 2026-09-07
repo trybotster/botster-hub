@@ -548,18 +548,21 @@ pub(crate) fn handle_runtime(
             let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
             let id = request_id("daemon-sessions-capture-snapshot");
             let owner = CaptureOwner(capture_owner_id(&observability, &client_id));
-            let mut tracker = runtime.begin_capture_snapshot(
-                id.clone(),
-                SessionId(session_id.clone()),
-                now,
-                owner,
-            );
-            ControlStep::pending(move |daemon, _| {
-                let completion = match poll_tracker(&mut tracker, daemon, "capture_snapshot", &id.0)
-                {
-                    Ok(completion) => completion,
-                    Err(poll) => return poll,
-                };
+            // The tracker is shared with the retire hook: a retired capture
+            // request cancels the pending operation or releases the capture
+            // it produced, holding its permit until Core accepted that.
+            let tracker = std::sync::Arc::new(std::sync::Mutex::new(
+                runtime.begin_capture_snapshot(id.clone(), SessionId(session_id.clone()), now, owner),
+            ));
+            let retire_tracker = std::sync::Arc::clone(&tracker);
+            ControlStep::pending_retirable(
+                move |daemon, _| {
+                    let mut tracker = tracker.lock().expect("capture tracker lock");
+                    let completion = match poll_tracker(&mut tracker, daemon, "capture_snapshot", &id.0)
+                    {
+                        Ok(completion) => completion,
+                        Err(poll) => return poll,
+                    };
                 let CoreCompletion::CaptureSnapshot { result, .. } = completion else {
                     return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
                 };
@@ -581,7 +584,9 @@ pub(crate) fn handle_runtime(
                     }
                     Err(error) => core_operator_error("capture_snapshot", &id.0, &error),
                 }))
-            })
+                },
+                move |_, state, permit| retain_capture_retirement(state, permit, retire_tracker),
+            )
         }
         DaemonRequest::ReadSnapshotPage {
             session_id,
@@ -695,6 +700,68 @@ pub(crate) fn retain_exact_detach(
             }) {
                 CoreWorkPoll::Pending => ObligationPoll::Pending,
                 CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
+            }
+        });
+}
+
+/// Retire one capture request that still owns Core work: cancel the pending
+/// operation when it has not run, and release the capture when it has. The
+/// permit stays held until Core accepted the cancel or the release.
+fn retain_capture_retirement(
+    state: &mut DaemonControlState,
+    permit: OwnerPermit,
+    tracker: std::sync::Arc<std::sync::Mutex<CoreOperationTracker>>,
+) {
+    let mut cancel_slot: Option<CoreTicket<bool>> = None;
+    let mut release_slot: Option<CoreTicket<bool>> = None;
+    let mut cancel_requested = false;
+    let mut release_capture: Option<CaptureId> = None;
+    state
+        .budget
+        .retain(permit, "capture_retirement", move |daemon, state| {
+            if let Some(capture) = release_capture.clone() {
+                return match drive_core_slot(&mut release_slot, daemon, state, |runtime, _| {
+                    runtime.release_capture(capture)
+                }) {
+                    CoreWorkPoll::Pending => ObligationPoll::Pending,
+                    CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
+                };
+            }
+            let pending_id = tracker
+                .lock()
+                .expect("capture tracker lock")
+                .pending_id();
+            if !cancel_requested && let Some(id) = pending_id {
+                match drive_core_slot(&mut cancel_slot, daemon, state, |runtime, _| {
+                    runtime.cancel_core_operation(id)
+                }) {
+                    CoreWorkPoll::Pending => return ObligationPoll::Pending,
+                    CoreWorkPoll::Lost => return ObligationPoll::Done,
+                    CoreWorkPoll::Ready(_) => cancel_requested = true,
+                }
+            }
+            // Cancelled or not, the completion decides whether a capture
+            // exists that must be released.
+            let Some(runtime) = daemon.runtime() else {
+                return ObligationPoll::Done;
+            };
+            let poll = tracker
+                .lock()
+                .expect("capture tracker lock")
+                .poll(runtime);
+            match poll {
+                CoreTicketPoll::Pending => ObligationPoll::Pending,
+                CoreTicketPoll::Lost | CoreTicketPoll::Refused | CoreTicketPoll::Ready(Err(_)) => {
+                    ObligationPoll::Done
+                }
+                CoreTicketPoll::Ready(Ok(CoreCompletion::CaptureSnapshot {
+                    result: Ok(capture),
+                    ..
+                })) => {
+                    release_capture = Some(capture.capture_id);
+                    ObligationPoll::Pending
+                }
+                CoreTicketPoll::Ready(Ok(_)) => ObligationPoll::Done,
             }
         });
 }

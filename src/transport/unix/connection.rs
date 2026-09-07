@@ -41,6 +41,7 @@ use crate::daemon::control::message::{
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::{DaemonControlState, tick};
 use crate::daemon::control::pending::retire_abandoned_requests;
+use crate::daemon::owner_budget::OwnerPermit;
 use crate::subscription::attach_routes::{
     AttachedSubscription, AttachedSubscriptionChange, apply_attached_subscription_change,
     attached_subscription_change_for_response,
@@ -126,6 +127,7 @@ pub(crate) async fn handle_connection_async(
     cleanup_tx: SyncSender<ConnectionCleanup>,
     mut shutdown_rx: watch::Receiver<bool>,
     event_plane: std::sync::Arc<crate::subscription::package_events::ClientEventPlane>,
+    permit: OwnerPermit,
 ) -> DaemonTransportResult<()> {
     let client_id = format!(
         "botster-hub-daemon-socket-{}",
@@ -137,6 +139,7 @@ pub(crate) async fn handle_connection_async(
         cleanup_tx,
         client_id.clone(),
         ConnectionTerminalReason::Protocol,
+        permit,
     );
     let hello = match read_async_inbound(&mut reader, Some(DAEMON_HANDSHAKE_TIMEOUT)).await {
         Ok(UnixInbound::Hello(hello)) => hello,
@@ -587,6 +590,9 @@ pub(crate) struct ConnectionCleanup {
     attached_subscriptions: Vec<AttachedSubscription>,
     entity_subscription_ids: BTreeSet<String>,
     reason: ConnectionTerminalReason,
+    /// The owner budget permit reserved when the connection was accepted.
+    /// It returns to the owner with this message and carries the cleanup.
+    permit: OwnerPermit,
 }
 
 pub(crate) struct ConnectionCleanupGuard {
@@ -599,6 +605,7 @@ impl ConnectionCleanupGuard {
         cleanup_tx: SyncSender<ConnectionCleanup>,
         client_id: String,
         reason: ConnectionTerminalReason,
+        permit: OwnerPermit,
     ) -> Self {
         Self {
             cleanup_tx,
@@ -607,6 +614,7 @@ impl ConnectionCleanupGuard {
                 attached_subscriptions: Vec::new(),
                 entity_subscription_ids: BTreeSet::new(),
                 reason,
+                permit,
             }),
         }
     }
@@ -769,11 +777,11 @@ pub(crate) fn handle_connection_cleanup(
     }
     // Reads this client left pending are retired; requests that must finish
     // keep their permits and run to completion.
-    retire_abandoned_requests(state, &cleanup.client_id);
+    retire_abandoned_requests(daemon, state, &cleanup.client_id);
     // The permit reserved when the connection was accepted now carries the
     // cleanup obligation: captures released and every route detached in
     // Core, then identity-fenced owner bookkeeping.
-    let permit = state.budget.take_connection_permit(&cleanup.client_id);
+    let permit = cleanup.permit;
     if daemon.runtime().is_none() {
         state.budget.release(permit);
         state.lifecycle_counters.cleanup_completed =
@@ -829,12 +837,16 @@ pub(crate) fn handle_connection(
         let _runtime = runtime.enter();
         TokioUnixStream::from_std(stream).map_err(DaemonTransportError::Io)?
     };
+    let permit = crate::daemon::owner_budget::OwnerBudget::with_capacity(1)
+        .reserve_connection()
+        .expect("test permit");
     let result = runtime.block_on(handle_connection_async(
         stream,
         control_tx,
         cleanup_tx,
         shutdown_rx,
         std::sync::Arc::new(crate::subscription::package_events::ClientEventPlane::default()),
+        permit,
     ));
     let _ = cleanup_rx.try_recv();
     result

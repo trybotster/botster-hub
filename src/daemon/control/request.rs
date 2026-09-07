@@ -140,12 +140,14 @@ pub(crate) fn handle(
         accepted_at: Instant::now(),
         past_deadline: false,
         continuation: Box::new(|_, _| crate::daemon::control::pending::ControlPoll::Pending),
+        retire: None,
     };
     match step {
         ControlStep::Ready(response) => finish(daemon, state, entry, response),
-        ControlStep::Pending(continuation) => {
+        ControlStep::Pending(pending) => {
             state.pending_requests.push(PendingControlRequest {
-                continuation,
+                continuation: pending.continuation,
+                retire: pending.retire,
                 ..entry
             });
             false

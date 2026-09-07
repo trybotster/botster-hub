@@ -413,16 +413,24 @@ pub(crate) fn handle_peer_closed(
         .attach_owner_grant_ids
         .retain(|_, owner| !removed_grants.contains(owner.as_str()));
     let _ = control_tx;
-    retire_abandoned_requests(state, &grant_id);
+    retire_abandoned_requests(daemon, state, &grant_id);
     // The permit reserved at peer admission carries the Core cleanup. A peer
-    // rejected for budget reasons reserved nothing and owns nothing in Core.
+    // admitted Rejected for budget reasons holds no permit and can own no
+    // route (Attach requires an admitted adapter), so candidates are empty.
     let permit = state.budget.take_peer_permit(&grant_id);
     match (permit, candidates.is_empty(), daemon.runtime().is_some()) {
         (Some(permit), true, _) | (Some(permit), _, false) => state.budget.release(permit),
         (None, true, _) | (None, _, false) => {}
-        (permit, false, true) => {
-            let permit =
-                permit.unwrap_or_else(|| state.budget.take_peer_permit_or_force(&grant_id));
+        (None, false, true) => {
+            // Invariant break: routes exist for a peer without a permit.
+            // Fail closed: refuse to retain work past capacity and report.
+            state
+                .budget
+                .record_invariant_violation("webrtc peer cleanup without a permit");
+            state.lifecycle_counters.cleanup_failed =
+                state.lifecycle_counters.cleanup_failed.saturating_add(1);
+        }
+        (Some(permit), false, true) => {
             let now = tick(&mut state.logical_clock);
             retain_route_cleanup(
                 state,
