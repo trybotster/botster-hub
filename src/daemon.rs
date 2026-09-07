@@ -7,6 +7,7 @@
 
 pub(crate) mod control;
 pub(crate) mod error;
+pub(crate) mod owner_budget;
 pub(crate) mod owner_loop;
 pub(crate) mod shutdown;
 

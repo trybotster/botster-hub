@@ -52,21 +52,15 @@ use crate::transport::webrtc::LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE;
 
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 
-/// One owner continuation that returns `true` when its work is complete.
-pub(crate) type OwnerWork = Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> bool + Send>;
-
-/// Poll every pending owner work item once; finished items are dropped.
-pub(crate) fn poll_owner_work(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    if state.pending_owner_work.is_empty() {
-        return;
+/// Earliest deadline among retained obligations and pending requests, so the
+/// owner wakes to retire abandoned work even when no control traffic arrives.
+fn next_owner_deadline(state: &DaemonControlState) -> Option<Instant> {
+    let obligation = state.budget.next_obligation_deadline();
+    let request = crate::daemon::control::pending::next_request_deadline(&state.pending_requests);
+    match (obligation, request) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
     }
-    if let Some(runtime) = daemon.runtime() {
-        runtime.absorb_core_completions();
-    }
-    let mut work = std::mem::take(&mut state.pending_owner_work);
-    work.retain_mut(|item| !item(daemon, state));
-    work.append(&mut state.pending_owner_work);
-    state.pending_owner_work = work;
 }
 
 enum OwnerEvent {
@@ -276,9 +270,11 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             OwnerPollDecision::ServeControl(message) => Some(OwnerEvent::Control(message)),
             OwnerPollDecision::RunSlice => None,
             OwnerPollDecision::Block => {
-                let wait = control_state
-                    .next_reconciliation
-                    .saturating_duration_since(Instant::now());
+                let wake_at = match next_owner_deadline(&control_state) {
+                    Some(deadline) => control_state.next_reconciliation.min(deadline),
+                    None => control_state.next_reconciliation,
+                };
+                let wait = wake_at.saturating_duration_since(Instant::now());
                 match transport_runtime.block_on(receive_owner_event(&mut control_rx, wait)) {
                     OwnerEvent::Control(message) => Some(OwnerEvent::Control(message)),
                     OwnerEvent::Reconcile => None,
@@ -291,6 +287,22 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     stream,
                     admission_permit,
                 }) => {
+                    // The owner budget permit outlives the transport permit:
+                    // it is held until this connection's cleanup completes.
+                    if !control_state.budget.reserve_connection() {
+                        control_state.lifecycle_counters.rejected_connections = control_state
+                            .lifecycle_counters
+                            .rejected_connections
+                            .saturating_add(1);
+                        *control_state
+                            .lifecycle_counters
+                            .cleanup_by_reason
+                            .entry("owner_budget_refused_connection".to_string())
+                            .or_insert(0) += 1;
+                        drop(stream);
+                        drop(admission_permit);
+                        continue;
+                    }
                     control_state.lifecycle_counters.accepted_connections = control_state
                         .lifecycle_counters
                         .accepted_connections
@@ -356,7 +368,11 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         {
             run_one_owner_background_slice(&mut daemon, &mut control_state);
         }
-        poll_owner_work(&mut daemon, &mut control_state);
+        crate::daemon::owner_budget::poll_owner_obligations(
+            &mut daemon,
+            &mut control_state,
+            Instant::now(),
+        );
         if crate::daemon::control::request::poll_deferred(&mut daemon, &mut control_state) {
             let _ = shutdown_tx.send(true);
             wait_for_connection_tasks(
@@ -735,9 +751,10 @@ pub(crate) struct DaemonControlState {
     pub(crate) pending_hub_update_reply: Option<ControlReplySender>,
     /// Requests whose response waits on a Core owner-thread result.
     pub(crate) pending_requests: Vec<crate::daemon::control::pending::PendingControlRequest>,
-    /// Owner work that waits on a Core owner-thread result but answers no
-    /// request: reserved-channel binds, connection cleanup detaches.
-    pub(crate) pending_owner_work: Vec<OwnerWork>,
+    /// Bounded ownership of connections, pending requests, and cleanup
+    /// obligations (reserved-channel binds, connection and peer cleanup,
+    /// exact-generation releases).
+    pub(crate) budget: crate::daemon::owner_budget::OwnerBudget,
     /// Lifecycle reads the maintenance slices have in flight.
     pub(crate) maintenance_reads: crate::daemon_maintenance::MaintenanceCoreReads,
     /// Close-event registry decisions cached for the current pump pass.
@@ -768,7 +785,7 @@ impl fmt::Debug for DaemonControlState {
             .field("entity_subscriptions", &self.entity_subscriptions.len())
             .field("lifecycle_counters", &self.lifecycle_counters)
             .field("pending_requests", &self.pending_requests.len())
-            .field("pending_owner_work", &self.pending_owner_work.len())
+            .field("budget", &self.budget)
             .finish_non_exhaustive()
     }
 }
@@ -793,7 +810,7 @@ impl Default for DaemonControlState {
             attach_close: crate::subscription::closed_events::AttachCloseBookkeeping::default(),
             pending_hub_update_reply: None,
             pending_requests: Vec::new(),
-            pending_owner_work: Vec::new(),
+            budget: crate::daemon::owner_budget::OwnerBudget::default(),
             maintenance_reads: crate::daemon_maintenance::MaintenanceCoreReads::default(),
             close_event_decisions: crate::subscription::closed_events::CloseEventDecisions::default(
             ),

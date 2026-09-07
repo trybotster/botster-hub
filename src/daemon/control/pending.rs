@@ -8,12 +8,14 @@
 //! may mutate owner state exactly as the synchronous handlers did.
 
 use std::sync::mpsc;
+use std::time::Instant;
 
 use botster_hub_client::{DaemonRequest, DaemonResponse};
 
 use crate::HubDaemon;
 use crate::daemon::control::message::ControlReplySender;
 use crate::daemon::error::DaemonTransportResult;
+use crate::daemon::owner_budget::{OwnerPermit, RETAINED_OPERATION_DEADLINE};
 use crate::daemon::owner_loop::DaemonControlState;
 
 /// Outcome of one continuation poll.
@@ -55,12 +57,86 @@ impl From<DaemonTransportResult<DaemonResponse>> for ControlStep {
 }
 
 /// One request the owner accepted and is still waiting to answer.
+///
+/// The entry owns one budget permit for its whole life. `client` names the
+/// connection or grant that sent it, so cleanup can retire abandoned reads
+/// promptly; a request that must finish (it has Core side effects, or it
+/// owns cleanup) keeps running after its client left.
 pub(crate) struct PendingControlRequest {
     pub(crate) request: DaemonRequest,
     pub(crate) reply_tx: ControlReplySender,
     pub(crate) response_delivery_rx: Option<mpsc::Receiver<()>>,
     pub(crate) grant_id: Option<String>,
+    pub(crate) client: Option<String>,
+    pub(crate) permit: Option<OwnerPermit>,
+    pub(crate) accepted_at: Instant,
+    pub(crate) must_finish: bool,
+    pub(crate) past_deadline: bool,
     pub(crate) continuation: ControlContinuation,
+}
+
+/// Requests whose Core work has side effects the owner must observe, or
+/// that own cleanup for what they created. Everything else is a read that
+/// can be retired when its client left or the deadline passed; the Core
+/// answer is then dropped, and captures are released by connection cleanup.
+pub(crate) fn request_must_finish(request: &DaemonRequest) -> bool {
+    !matches!(
+        request,
+        DaemonRequest::Status { .. }
+            | DaemonRequest::ListSessions { .. }
+            | DaemonRequest::Whoami { .. }
+            | DaemonRequest::ReceiveMessages { .. }
+            | DaemonRequest::ReadScreen { .. }
+            | DaemonRequest::ReadModeFlags { .. }
+            | DaemonRequest::CaptureSnapshot { .. }
+            | DaemonRequest::Drain { .. }
+            | DaemonRequest::ListSessionTypes { .. }
+            | DaemonRequest::ListSessionTypesForTarget { .. }
+            | DaemonRequest::ShowSessionType { .. }
+            | DaemonRequest::ShowSessionTypeDefinition { .. }
+            | DaemonRequest::ResolveSessionType { .. }
+            | DaemonRequest::CheckHubUpdate { .. }
+            | DaemonRequest::GetHubUpdateExecution { .. }
+    )
+}
+
+/// Earliest deadline among pending requests not yet flagged.
+pub(crate) fn next_request_deadline(pending: &[PendingControlRequest]) -> Option<Instant> {
+    pending
+        .iter()
+        .filter(|entry| !entry.past_deadline)
+        .map(|entry| entry.accepted_at + RETAINED_OPERATION_DEADLINE)
+        .min()
+}
+
+fn retire(state: &mut DaemonControlState, mut entry: PendingControlRequest, reason: &str) {
+    if let Some(permit) = entry.permit.take() {
+        state.budget.release(permit);
+    }
+    state.budget.counters.retired_abandoned = state.budget.counters.retired_abandoned.saturating_add(1);
+    *state
+        .lifecycle_counters
+        .cleanup_by_reason
+        .entry(format!("request_retired:{reason}"))
+        .or_insert(0) += 1;
+    // Dropping the continuation drops its Core ticket; the Core answer is
+    // discarded. Dropping `reply_tx` closes the reply channel.
+    drop(entry);
+}
+
+/// Retire every retirable pending request `client` left behind.
+pub(crate) fn retire_abandoned_requests(state: &mut DaemonControlState, client: &str) {
+    let pending = std::mem::take(&mut state.pending_requests);
+    let mut retained = Vec::with_capacity(pending.len());
+    for entry in pending {
+        if !entry.must_finish && entry.client.as_deref() == Some(client) {
+            retire(state, entry, "client_left");
+        } else {
+            retained.push(entry);
+        }
+    }
+    retained.append(&mut state.pending_requests);
+    state.pending_requests = retained;
 }
 
 /// Poll every pending request once. Finished requests are answered through
@@ -69,6 +145,7 @@ pub(crate) struct PendingControlRequest {
 pub(crate) fn poll_pending_requests(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
+    now: Instant,
     mut finish: impl FnMut(
         &mut HubDaemon,
         &mut DaemonControlState,
@@ -89,6 +166,25 @@ pub(crate) fn poll_pending_requests(
         if shutdown {
             retained.push(entry);
             continue;
+        }
+        let expired = now.saturating_duration_since(entry.accepted_at) >= RETAINED_OPERATION_DEADLINE;
+        if !entry.must_finish && entry.reply_tx.is_closed() {
+            retire(state, entry, "reply_closed");
+            continue;
+        }
+        if !entry.must_finish && expired {
+            retire(state, entry, "deadline");
+            continue;
+        }
+        if expired && !entry.past_deadline {
+            entry.past_deadline = true;
+            state.budget.counters.requests_past_deadline =
+                state.budget.counters.requests_past_deadline.saturating_add(1);
+            *state
+                .lifecycle_counters
+                .cleanup_by_reason
+                .entry("request_past_deadline".to_string())
+                .or_insert(0) += 1;
         }
         match (entry.continuation)(daemon, state) {
             ControlPoll::Pending => retained.push(entry),

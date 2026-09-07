@@ -33,8 +33,12 @@ use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::shutdown::{
     ShutdownSessionClassification, begin_shutdown_classification, shutdown_error_response,
 };
-use crate::data_plane::driver::{CoreTicketError, CoreTicketPoll};
+use crate::daemon::owner_budget::{
+    CoreWorkPoll, OWNER_BUDGET_EXHAUSTED, ObligationPoll, OwnerPermit, drive_core_slot,
+};
+use crate::data_plane::driver::{CoreTicket, CoreTicketError, CoreTicketPoll};
 use crate::runtime::core_bridge_error;
+use crate::subscription::route_cleanup::{ATTACH_ROUTE_LIMIT, owner_has_attach_capacity};
 use crate::runtime::{AttachBindFailure, AttachBindPlan, CoreOperationTracker};
 use crate::subscription::attach_routes::{
     AttachStreamOwner, BoundAdapterHandle, overlay_live_attach_occupancy,
@@ -379,10 +383,17 @@ pub(crate) fn handle_runtime(
                     );
                 }
             }
-            let mut ticket = runtime.detach_client(
+            // The identity captured now fences every owner-side mutation
+            // after Core answers; the generation makes the Core detach exact
+            // so a same-client reattach keeps its own generation.
+            let identity = state
+                .pending_runtime
+                .stream_identity(&session_id, &subscription_id);
+            let mut ticket = runtime.detach_route_exact_or_owned(
                 ClientId(client_id),
                 SessionId(session_id.clone()),
                 SubscriptionId(subscription_id.clone()),
+                generation,
                 now,
             );
             let id = request_id("daemon-sessions-detach");
@@ -411,17 +422,34 @@ pub(crate) fn handle_runtime(
                                 );
                             }
                         }
-                        state
-                            .pending_runtime
-                            .close_adapter(&session_id, &subscription_id);
-                        state
-                            .pending_runtime
-                            .admission
-                            .reservations
-                            .forget_route(&session_id, &subscription_id);
-                        state
-                            .pending_runtime
-                            .cancel_stream(&session_id, &subscription_id);
+                        // Only the stream this request started against is
+                        // closed; a replacement attached meanwhile keeps its
+                        // adapter, reservation, and stream.
+                        let owned = identity.as_ref().is_some_and(|identity| {
+                            state.pending_runtime.stream_matches(
+                                &session_id,
+                                &subscription_id,
+                                identity,
+                            )
+                        });
+                        if owned {
+                            let identity = identity.as_ref().expect("owned");
+                            let _ = state.pending_runtime.close_adapter_if(
+                                &session_id,
+                                &subscription_id,
+                                identity,
+                            );
+                            state
+                                .pending_runtime
+                                .admission
+                                .reservations
+                                .forget_route(&session_id, &subscription_id);
+                            let _ = state.pending_runtime.cancel_stream_if(
+                                &session_id,
+                                &subscription_id,
+                                identity,
+                            );
+                        }
                         ControlPoll::Ready(Ok(daemon_events(Vec::new())))
                     }
                     Err(error) => {
@@ -634,51 +662,55 @@ fn capture_owner_id(observability: &DaemonObservability, client_id: &str) -> Str
         .unwrap_or_else(|| format!("client:{client_id}"))
 }
 
-/// Detach one exact Core generation as bounded owner work.
+/// Retain the release of one exact Core generation as a budgeted obligation.
 ///
-/// Used when a deferred attach or bind completed in Core after its owner
-/// stopped being the current attachment (connection closed, route replaced).
-/// The generation is exact, so a replacement stream's generation is never
-/// touched. At most one Core ticket is in flight; a refused admission is
-/// retried on the next owner turn, and a lost driver ends the work.
-pub(crate) fn schedule_exact_generation_detach(
+/// Used when a deferred attach completed in Core after its owner stopped
+/// being the current attachment (connection closed, route replaced). The
+/// generation is exact, so a replacement stream's generation is never
+/// touched. `permit` was reserved before the attach was admitted and stays
+/// held until Core accepts the release. One ticket is in flight; a refused
+/// admission resubmits on the next owner turn; a lost driver ends the work.
+pub(crate) fn retain_exact_detach(
     state: &mut DaemonControlState,
+    permit: OwnerPermit,
     client_id: String,
     session_id: String,
     subscription_id: String,
     generation: TerminalSubscriptionGeneration,
 ) {
-    let mut ticket: Option<
-        crate::data_plane::driver::CoreTicket<
-            Result<DetachTerminalSubscriptionResult, CoreDaemonError>,
-        >,
-    > = None;
+    let mut slot: Option<CoreTicket<Result<DetachTerminalSubscriptionResult, CoreDaemonError>>> =
+        None;
     state
-        .pending_owner_work
-        .push(Box::new(move |daemon, state| {
-            if ticket.is_none() {
-                let Some(runtime) = daemon.runtime() else {
-                    return true;
-                };
+        .budget
+        .retain(permit, "exact_generation_detach", move |daemon, state| {
+            match drive_core_slot(&mut slot, daemon, state, |runtime, state| {
                 let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
-                ticket = Some(runtime.detach_terminal_subscription(
+                runtime.detach_terminal_subscription(
                     ClientId(client_id.clone()),
                     SessionId(session_id.clone()),
                     SubscriptionId(subscription_id.clone()),
                     generation,
                     now,
-                ));
+                )
+            }) {
+                CoreWorkPoll::Pending => ObligationPoll::Pending,
+                CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
             }
-            match ticket.as_mut().expect("ticket submitted above").poll() {
-                CoreTicketPoll::Pending => false,
-                // One in-flight ticket; resubmit on the next turn.
-                CoreTicketPoll::Refused => {
-                    ticket = None;
-                    false
-                }
-                CoreTicketPoll::Lost | CoreTicketPoll::Ready(_) => true,
-            }
-        }));
+        });
+}
+
+fn attach_route_limit_error() -> DaemonResponse {
+    super::attach_bind_operator_error(
+        ATTACH_ROUTE_LIMIT,
+        "this connection already holds the maximum attach routes",
+    )
+}
+
+fn owner_budget_error() -> DaemonResponse {
+    super::attach_bind_operator_error(
+        OWNER_BUDGET_EXHAUSTED,
+        "the daemon holds its maximum retained requests and cleanup; retry later",
+    )
 }
 
 fn stale_attach_error() -> DaemonResponse {
@@ -749,8 +781,22 @@ fn handle_attach(
             client_id: client_id.clone(),
             grant_id: observability.grant_id.clone(),
         };
-        let identity =
-            pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
+        if !owner_has_attach_capacity(pending_runtime, &owner) {
+            return ControlStep::ready(attach_route_limit_error());
+        }
+        // Reserve the cleanup permit before Core work exists for this attach.
+        let Some(cleanup_permit) = state
+            .budget
+            .reserve(format!("attach-cleanup:{client_id}"))
+        else {
+            return ControlStep::ready(owner_budget_error());
+        };
+        let mut cleanup_permit = Some(cleanup_permit);
+        let identity = state.pending_runtime.start_attach(
+            owner,
+            session_id.clone(),
+            subscription_id.clone(),
+        );
         let runtime = daemon.runtime().expect("runtime checked by caller");
         let mut ticket = runtime.attach_route(
             ClientId(client_id.clone()),
@@ -767,9 +813,13 @@ fn handle_attach(
                 ))),
                 CoreTicketPoll::Ready(result) => result,
             };
+            let permit = cleanup_permit
+                .take()
+                .expect("cleanup permit held until the attach completes");
             let generation = match result {
                 Ok(generation) => generation,
                 Err(failure) => {
+                    state.budget.release(permit);
                     let _ = state.pending_runtime.cancel_stream_if(
                         &session_id,
                         &subscription_id,
@@ -789,8 +839,9 @@ fn handle_attach(
                 &identity,
                 generation,
             ) {
-                schedule_exact_generation_detach(
+                retain_exact_detach(
                     state,
+                    permit,
                     client_id.clone(),
                     session_id.clone(),
                     subscription_id.clone(),
@@ -842,7 +893,10 @@ fn handle_attach(
                 )),
             };
             match response {
-                Ok(response) => ControlPoll::Ready(Ok(response)),
+                Ok(response) => {
+                    state.budget.release(permit);
+                    ControlPoll::Ready(Ok(response))
+                }
                 Err(error) => {
                     // The route exists in Core without an adapter; release
                     // exactly the generation this attach created.
@@ -851,8 +905,9 @@ fn handle_attach(
                         &subscription_id,
                         &identity,
                     );
-                    schedule_exact_generation_detach(
+                    retain_exact_detach(
                         state,
+                        permit,
                         client_id.clone(),
                         session_id.clone(),
                         subscription_id.clone(),
@@ -880,7 +935,21 @@ fn handle_attach(
         client_id: client_id.clone(),
         grant_id: None,
     };
-    let identity = pending_runtime.start_attach(owner, session_id.clone(), subscription_id.clone());
+    if !owner_has_attach_capacity(pending_runtime, &owner) {
+        return ControlStep::ready(attach_route_limit_error());
+    }
+    // Reserve the cleanup permit before Core work exists for this attach.
+    let Some(cleanup_permit) = state
+        .budget
+        .reserve(format!("attach-cleanup:{client_id}"))
+    else {
+        return ControlStep::ready(owner_budget_error());
+    };
+    let mut cleanup_permit = Some(cleanup_permit);
+    let identity =
+        state
+            .pending_runtime
+            .start_attach(owner, session_id.clone(), subscription_id.clone());
     let (adapter, handle) = mux.create_adapter();
     let runtime = daemon.runtime().expect("runtime checked by caller");
     let mut ticket = runtime.attach_and_bind_terminal(AttachBindPlan {
@@ -900,6 +969,9 @@ fn handle_attach(
             ))),
             CoreTicketPoll::Ready(result) => result,
         };
+        let permit = cleanup_permit
+            .take()
+            .expect("cleanup permit held until the attach completes");
         match result {
             Ok(generation) => {
                 // Fence before any mutation: the stream must still be this
@@ -928,8 +1000,9 @@ fn handle_attach(
                     // Late success for a dead attachment: release exactly
                     // this generation and leave any replacement alone.
                     handle.close();
-                    schedule_exact_generation_detach(
+                    retain_exact_detach(
                         state,
+                        permit,
                         client_id.clone(),
                         session_id.clone(),
                         subscription_id.clone(),
@@ -937,6 +1010,7 @@ fn handle_attach(
                     );
                     return ControlPoll::Ready(Ok(stale_attach_error()));
                 }
+                state.budget.release(permit);
                 let mut response = daemon_response_base(DaemonResponseKind::TerminalAttached);
                 response.terminal_attach = Some(DaemonTerminalAttach::new(
                     session_id.clone(),
@@ -947,6 +1021,7 @@ fn handle_attach(
             }
             Err(failure) => {
                 handle.close();
+                state.budget.release(permit);
                 let _ = state.pending_runtime.cancel_stream_if(
                     &session_id,
                     &subscription_id,

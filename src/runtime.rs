@@ -3742,6 +3742,30 @@ impl HubRuntime {
             .submit(|daemon| daemon.list_terminal_subscriptions())
     }
 
+    /// Detach one route for a client: the exact generation when the owner
+    /// recorded one, otherwise whatever generation the client owns now.
+    pub(crate) fn detach_route_exact_or_owned(
+        &self,
+        client_id: ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+        generation: Option<TerminalSubscriptionGeneration>,
+        now_seconds: u64,
+    ) -> CoreTicket<Result<(), CoreDaemonError>> {
+        self.core_daemon.submit(move |daemon| match generation {
+            Some(generation) => daemon
+                .detach_terminal_subscription(
+                    client_id,
+                    session_id,
+                    subscription_id,
+                    generation,
+                    now_seconds,
+                )
+                .map(|_| ()),
+            None => daemon.detach(client_id, session_id, subscription_id, now_seconds),
+        })
+    }
+
     /// Detach one subscription generation without deleting a newer owner.
     pub fn detach_terminal_subscription(
         &self,
@@ -3835,13 +3859,6 @@ impl HubRuntime {
     ) -> CoreTicket<Result<SnapshotPage, CoreDaemonError>> {
         self.core_daemon
             .submit(move |daemon| daemon.read_snapshot_page(&capture, page))
-    }
-
-    /// Release every open capture one client owns, at disconnect.
-    pub fn release_owner_captures(&self, owner: CaptureOwner) {
-        let _ = self
-            .core_daemon
-            .submit(move |daemon| daemon.release_owner_captures(&owner));
     }
 
     /// Evaluate guarded-write readiness and inject only through the core daemon.

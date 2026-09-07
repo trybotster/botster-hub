@@ -491,6 +491,15 @@ impl PackageRegistry {
             ));
         }
 
+        if let Err(reason) = crate::capabilities::validate_package_namespace(&package_name) {
+            return Err(PackageRegistryError::without_record(
+                package_name,
+                PackageAction::Install,
+                PackageAdmissionReason::InvalidPluginNamespace(reason),
+                audit_reason,
+            ));
+        }
+
         manifest.validate_event_contracts().map_err(|error| {
             PackageRegistryError::without_record(
                 package_name.clone(),
@@ -691,6 +700,16 @@ impl PackageRegistry {
                     "reloaded package name {} does not match installed package {package_name}",
                     manifest.name
                 )),
+                current.state,
+                current.classification,
+                audit_reason,
+            ));
+        }
+        if let Err(reason) = crate::capabilities::validate_package_namespace(&package_name) {
+            return Err(PackageRegistryError::with_record(
+                package_name,
+                PackageAction::Reload,
+                PackageAdmissionReason::InvalidPluginNamespace(reason),
                 current.state,
                 current.classification,
                 audit_reason,
@@ -2304,6 +2323,8 @@ pub enum PackageAdmissionReason {
     MissingRequiredConfiguration(Vec<String>),
     /// Package name `hub` is reserved for built-in host contracts.
     ReservedPackageName,
+    /// The package name has no valid plugin database namespace (Core limit).
+    InvalidPluginNamespace(String),
     /// Event declarations failed bounded schema or audience admission.
     InvalidEventContract(String),
 }
