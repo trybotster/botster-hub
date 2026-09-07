@@ -174,6 +174,14 @@ impl AttachStreamRegistry {
         identity
     }
 
+    /// Epoch of the most recent attach. A Core inventory read submitted now
+    /// runs after every attach with epoch <= this value (one owner thread
+    /// submits both in program order; the Core bridge is one FIFO), so its
+    /// rows cover exactly those attachments.
+    pub(crate) fn attach_epoch(&self) -> u64 {
+        self.next_epoch
+    }
+
     pub(crate) fn stream_identity(
         &self,
         session_id: &str,
@@ -562,14 +570,20 @@ impl AttachStreamRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn reconcile_inventory(&mut self, inventory: &[TerminalSubscriptionRecord]) {
-        let lookup = |session_id: &str, subscription_id: &str| {
+    pub(crate) fn reconcile_inventory(
+        &mut self,
+        inventory: &[TerminalSubscriptionRecord],
+        read_epoch: u64,
+    ) {
+        let lookup = |client_id: &str, session_id: &str, subscription_id: &str| {
             inventory.iter().find_map(|row| {
-                (row.session_id.0 == session_id && row.subscription_id.0 == subscription_id)
+                (row.client_id.0 == client_id
+                    && row.session_id.0 == session_id
+                    && row.subscription_id.0 == subscription_id)
                     .then_some(row.generation)
             })
         };
-        let _ = self.reconcile_inventory_slice(lookup, None, usize::MAX);
+        let _ = self.reconcile_inventory_slice(lookup, read_epoch, None, usize::MAX);
     }
 
     /// Close a bound route when Core membership is absent or the generation
@@ -589,9 +603,17 @@ impl AttachStreamRegistry {
 
     /// Visit at most `max_entries` stream-map rows after `after`, exclusive.
     /// Unbound rows count toward the visit budget and advance the cursor.
+    ///
+    /// `read_epoch` is the attach epoch captured when the inventory read was
+    /// submitted. A bound stream whose attachment epoch is newer was
+    /// submitted after that read and cannot appear in its rows; it is not a
+    /// stale decision and is left untouched. `lookup` is keyed by the
+    /// stream's owning client plus the route, so another client's row for
+    /// the same route never reads as this stream's generation.
     pub(crate) fn reconcile_inventory_slice(
         &mut self,
-        mut lookup: impl FnMut(&str, &str) -> Option<TerminalSubscriptionGeneration>,
+        mut lookup: impl FnMut(&str, &str, &str) -> Option<TerminalSubscriptionGeneration>,
+        read_epoch: u64,
         after: Option<(String, String)>,
         max_entries: usize,
     ) -> InventoryReconcileProgress {
@@ -606,13 +628,13 @@ impl AttachStreamRegistry {
                 more = true;
                 break;
             }
-            visit.push((key.clone(), stream.adapter_bound));
+            visit.push((key.clone(), stream.adapter_bound, stream.identity()));
         }
         let mut last = after;
         let mut validated = 0;
-        for ((session_id, subscription_id), adapter_bound) in visit {
+        for ((session_id, subscription_id), adapter_bound, identity) in visit {
             last = Some((session_id.clone(), subscription_id.clone()));
-            if !adapter_bound {
+            if !adapter_bound || identity.epoch > read_epoch {
                 continue;
             }
             validated += 1;
@@ -620,7 +642,7 @@ impl AttachStreamRegistry {
                 .streams
                 .get(&(session_id.clone(), subscription_id.clone()))
                 .and_then(|stream| stream.generation);
-            let live = lookup(&session_id, &subscription_id);
+            let live = lookup(&identity.client_id, &session_id, &subscription_id);
             if Self::route_is_stale_against_live_generation(stream_generation, live) {
                 self.close_adapter(&session_id, &subscription_id);
                 self.cancel_stream(&session_id, &subscription_id);
@@ -1699,13 +1721,11 @@ mod tests {
     }
 
     // Inventory-reconcile timing table (architect0060 rows 1-6). Each test
-    // models one Core inventory read as the row vector that read returned:
-    // the vector is fixed at the moment the read is submitted, and applied
+    // models one Core inventory read as the row vector that read returned
+    // plus the attach epoch captured when it was submitted, and applies both
     // later through the real `reconcile_inventory_slice`. Rows that attach
-    // after the read was submitted cannot be in that vector; the current
-    // implementation closes them as stale. The production correction must
-    // carry the registry attach epoch captured at read submission and skip
-    // streams whose epoch is newer.
+    // after the read was submitted cannot be in that vector and are newer
+    // than its epoch; reconcile must leave them untouched.
 
     /// Row 1 (positive control): a stream bound before the read and absent
     /// from it was ended by Core; reconcile closes and cancels it.
@@ -1717,7 +1737,7 @@ mod tests {
         // Read submitted after the bind; Core ended the route before the read
         // ran, so the vector lacks it.
         let read: Vec<TerminalSubscriptionRecord> = Vec::new();
-        registry.reconcile_inventory(&read);
+        registry.reconcile_inventory(&read, registry.attach_epoch());
         assert!(handle.host_closed(), "Core-ended route is host-closed");
         assert!(registry.stream_identity("s", "gone").is_none());
     }
@@ -1732,10 +1752,11 @@ mod tests {
         let (_a1, before_handle) = bind_unix(&mut registry, &before, "s", "before", 1);
         // Read submitted now: it can only ever contain "before".
         let read = vec![inventory_row("client-a", "s", "before", 1)];
+        let read_epoch = registry.attach_epoch();
         // The newer attach lands (Core turn, then owner bind) before apply.
         let later = registry.start_attach(owner(), "s".into(), "later".into());
         let (_a2, later_handle) = bind_unix(&mut registry, &later, "s", "later", 2);
-        registry.reconcile_inventory(&read);
+        registry.reconcile_inventory(&read, read_epoch);
         assert!(!before_handle.host_closed(), "present row survives");
         assert!(
             !later_handle.host_closed(),
@@ -1756,7 +1777,12 @@ mod tests {
         let mut registry = AttachStreamRegistry::default();
         let pending = registry.start_attach(owner(), "s".into(), "pending".into());
         let read: Vec<TerminalSubscriptionRecord> = Vec::new();
-        let progress = registry.reconcile_inventory_slice(|_, _| None, None, usize::MAX);
+        let progress = registry.reconcile_inventory_slice(
+            |_, _, _| None,
+            registry.attach_epoch(),
+            None,
+            usize::MAX,
+        );
         let _ = read;
         assert_eq!(progress.validated, 0, "unbound rows are not validated");
         assert!(
@@ -1790,7 +1816,7 @@ mod tests {
         );
         let (_a2, new_handle) = bind_unix(&mut registry, &replacement, "s", "k", 2);
         let read = vec![inventory_row("client-b", "s", "k", 2)];
-        registry.reconcile_inventory(&read);
+        registry.reconcile_inventory(&read, registry.attach_epoch());
         assert!(!new_handle.host_closed());
         assert!(registry.stream_matches("s", "k", &replacement));
         assert_eq!(
@@ -1799,6 +1825,15 @@ mod tests {
                 .map(|identity| identity.client_id),
             Some("client-b".to_string())
         );
+        // A row for another client on the same key never reads as this
+        // stream's generation: absent under client-b, the stream is closed.
+        let foreign_only = vec![inventory_row("client-z", "s", "k", 2)];
+        registry.reconcile_inventory(&foreign_only, registry.attach_epoch());
+        assert!(
+            new_handle.host_closed(),
+            "another client's row must not keep this owner's stream alive"
+        );
+        assert!(registry.stream_identity("s", "k").is_none());
     }
 
     /// Row 5 (red on the current implementation): with one route per slice,
@@ -1810,8 +1845,9 @@ mod tests {
         let first = registry.start_attach(owner(), "s".into(), "a-first".into());
         let (_a1, first_handle) = bind_unix(&mut registry, &first, "s", "a-first", 1);
         let read_one = vec![inventory_row("client-a", "s", "a-first", 1)];
+        let read_one_epoch = registry.attach_epoch();
         let progress = registry.reconcile_inventory_slice(
-            |session_id, subscription_id| {
+            |_, session_id, subscription_id| {
                 read_one
                     .iter()
                     .find(|row| {
@@ -1819,17 +1855,20 @@ mod tests {
                     })
                     .map(|row| row.generation)
             },
+            read_one_epoch,
             None,
             1,
         );
         assert_eq!(progress.validated, 1);
         assert!(!first_handle.host_closed());
-        // Second read submitted before the next attach lands.
+        // Second read submitted before the next attach lands: its epoch is
+        // captured now, per ticket.
         let read_two = read_one.clone();
+        let read_two_epoch = registry.attach_epoch();
         let second = registry.start_attach(owner(), "s".into(), "b-second".into());
         let (_a2, second_handle) = bind_unix(&mut registry, &second, "s", "b-second", 2);
         let _ = registry.reconcile_inventory_slice(
-            |session_id, subscription_id| {
+            |_, session_id, subscription_id| {
                 read_two
                     .iter()
                     .find(|row| {
@@ -1837,6 +1876,7 @@ mod tests {
                     })
                     .map(|row| row.generation)
             },
+            read_two_epoch,
             progress.after,
             1,
         );
@@ -1855,7 +1895,8 @@ mod tests {
         let first = registry.start_attach(owner(), "s".into(), "a-first".into());
         let (_a1, _first_handle) = bind_unix(&mut registry, &first, "s", "a-first", 1);
         let progress = registry.reconcile_inventory_slice(
-            |_, _| Some(TerminalSubscriptionGeneration(1)),
+            |_, _, _| Some(TerminalSubscriptionGeneration(1)),
+            registry.attach_epoch(),
             None,
             1,
         );
@@ -1865,8 +1906,9 @@ mod tests {
             inventory_row("client-a", "s", "a-first", 1),
             inventory_row("client-a", "s", "b-second", 2),
         ];
+        let read_two_epoch = registry.attach_epoch();
         let _ = registry.reconcile_inventory_slice(
-            |session_id, subscription_id| {
+            |_, session_id, subscription_id| {
                 read_two
                     .iter()
                     .find(|row| {
@@ -1874,6 +1916,7 @@ mod tests {
                     })
                     .map(|row| row.generation)
             },
+            read_two_epoch,
             progress.after,
             1,
         );
@@ -1906,7 +1949,7 @@ mod tests {
             7,
         )];
         let (_adapter, handle) = bind_unix(&mut registry, &identity, "s", "w", 7);
-        registry.reconcile_inventory(&read);
+        registry.reconcile_inventory(&read, registry.attach_epoch());
         assert!(!handle.host_closed());
         assert!(registry.stream_matches("s", "w", &identity));
     }
@@ -1918,6 +1961,7 @@ mod tests {
     fn reconcile_must_not_close_a_split_attach_bind_stream_whose_attach_followed_the_read() {
         let mut registry = AttachStreamRegistry::default();
         let read: Vec<TerminalSubscriptionRecord> = Vec::new();
+        let read_epoch = registry.attach_epoch();
         let peer = AttachStreamOwner {
             client_id: "botster-hub-daemon-subscription-w".to_string(),
             grant_id: Some("grant-w".to_string()),
@@ -1930,7 +1974,7 @@ mod tests {
             TerminalSubscriptionGeneration(7)
         ));
         let (_adapter, handle) = bind_unix(&mut registry, &identity, "s", "w", 7);
-        registry.reconcile_inventory(&read);
+        registry.reconcile_inventory(&read, read_epoch);
         assert!(
             !handle.host_closed(),
             "a split attach/bind that followed the read must survive it"
@@ -1950,11 +1994,11 @@ mod tests {
             TerminalSubscriptionGeneration(1),
             BoundAdapterHandle::Unix(handle),
         );
-        registry.reconcile_inventory(&[]);
+        registry.reconcile_inventory(&[], registry.attach_epoch());
         assert_eq!(registry.stream_owner_client_id("s", "sub"), None);
 
         registry.start_attach(owner(), "s".into(), "unbound".into());
-        registry.reconcile_inventory(&[]);
+        registry.reconcile_inventory(&[], registry.attach_epoch());
         assert_eq!(
             registry.stream_owner_client_id("s", "unbound").as_deref(),
             Some("client-a"),
@@ -1975,12 +2019,12 @@ mod tests {
                 BoundAdapterHandle::Unix(handle),
             );
         }
-        let live = |session: &str, _: &str| match session {
+        let live = |_: &str, session: &str, _: &str| match session {
             "a" => Some(TerminalSubscriptionGeneration(1)),
             "b" => Some(TerminalSubscriptionGeneration(9)),
             _ => None,
         };
-        let first = registry.reconcile_inventory_slice(live, None, 2);
+        let first = registry.reconcile_inventory_slice(live, registry.attach_epoch(), None, 2);
         assert_eq!(first.validated, 2);
         assert!(first.more);
         assert_eq!(
@@ -1998,7 +2042,8 @@ mod tests {
             BoundAdapterHandle::Unix(handle),
         );
         let second = registry.reconcile_inventory_slice(
-            |session, _| (session == "c").then_some(TerminalSubscriptionGeneration(4)),
+            |_, session, _| (session == "c").then_some(TerminalSubscriptionGeneration(4)),
+            registry.attach_epoch(),
             first.after,
             8,
         );
@@ -2026,11 +2071,13 @@ mod tests {
             BoundAdapterHandle::Unix(handle),
         );
         let mut lookups = 0;
+        let read_epoch = registry.attach_epoch();
         let first = registry.reconcile_inventory_slice(
-            |_, _| {
+            |_, _, _| {
                 lookups += 1;
                 Some(TerminalSubscriptionGeneration(1))
             },
+            read_epoch,
             None,
             8,
         );
@@ -2042,11 +2089,12 @@ mod tests {
             Some("unbound-07")
         );
         let second = registry.reconcile_inventory_slice(
-            |session, _| {
+            |_, session, _| {
                 lookups += 1;
                 assert_eq!(session, "z-bound");
                 Some(TerminalSubscriptionGeneration(1))
             },
+            read_epoch,
             first.after,
             8,
         );
