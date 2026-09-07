@@ -1,38 +1,10 @@
 {
+  "control_delivery_kinds": [
+    "server_frame"
+  ],
   "maximum_delivery_bytes": 16777216,
   "maximum_frame_bytes_exclusive": 65536,
   "scenarios": {
-    "daemon_entity_frame": [
-      {
-        "chunk_count": 2,
-        "chunk_index": 0,
-        "delivery_kind": "daemon_entity_frame",
-        "message_id": "entity-multiple",
-        "payload": "encrypted-",
-        "total_bytes": 18,
-        "version": 2
-      },
-      {
-        "chunk_count": 2,
-        "chunk_index": 1,
-        "delivery_kind": "daemon_entity_frame",
-        "message_id": "entity-multiple",
-        "payload": "envelope",
-        "total_bytes": 18,
-        "version": 2
-      }
-    ],
-    "daemon_response": [
-      {
-        "chunk_count": 1,
-        "chunk_index": 0,
-        "delivery_kind": "daemon_response",
-        "message_id": "response-single",
-        "payload": "encrypted-envelope",
-        "total_bytes": 18,
-        "version": 2
-      }
-    ],
     "large_generated": {
       "chunk_payload_bytes": 12288,
       "expected_chunk_count": 22,
@@ -46,13 +18,60 @@
       {
         "chunk_count": 1,
         "chunk_index": 0,
-        "delivery_kind": "daemon_response",
+        "delivery_kind": "server_frame",
         "message_id": "response-over-budget",
         "payload": "encrypted-operator-error",
         "total_bytes": 24,
         "version": 2
       }
+    ],
+    "server_frame": [
+      {
+        "chunk_count": 1,
+        "chunk_index": 0,
+        "delivery_kind": "server_frame",
+        "message_id": "response-single",
+        "payload": "encrypted-envelope",
+        "total_bytes": 18,
+        "version": 2
+      }
+    ],
+    "server_frame_multiple": [
+      {
+        "chunk_count": 2,
+        "chunk_index": 0,
+        "delivery_kind": "server_frame",
+        "message_id": "entity-multiple",
+        "payload": "encrypted-",
+        "total_bytes": 18,
+        "version": 2
+      },
+      {
+        "chunk_count": 2,
+        "chunk_index": 1,
+        "delivery_kind": "server_frame",
+        "message_id": "entity-multiple",
+        "payload": "envelope",
+        "total_bytes": 18,
+        "version": 2
+      }
     ]
+  },
+  "terminal_chunk": {
+    "example": {
+      "chunk_count": 3,
+      "chunk_index": 1,
+      "generation": 11,
+      "header_hex": "0207000000000000000100000003000000307500000b0000000000000002000000",
+      "message_id": 7,
+      "stream_epoch": 2,
+      "total_bytes": 30000
+    },
+    "header_bytes": 33,
+    "layout": "[u8 version][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][u32 LE stream_epoch][12-byte nonce][ciphertext || 16-byte tag]",
+    "nonce_bytes": 12,
+    "route_identity": "subscription DataChannel label",
+    "tag_bytes": 16
   },
   "version": 2
 }
