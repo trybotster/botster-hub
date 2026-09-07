@@ -1,6 +1,6 @@
 {
   "package_name": "@trybotster/hub-test-support",
-  "package_version": "0.1.44",
+  "package_version": "0.1.45",
   "protocol": "botster-hub-daemon-v1",
   "protocol_version": 9,
   "conformance_fixture_revision": 49,
@@ -13,7 +13,7 @@
   "daemon_protocol": {
     "artifact_path": "daemon-protocol.ts",
     "source_artifact_path": "crates/botster-hub-client/generated/daemon-protocol.ts",
-    "sha256": "8bf9e2917063190c87f6c206476b6cdc269a5d9a8a8a68029d3120e8237dd769"
+    "sha256": "67fb9b4e9ec367967a17ec0fa80890e47620c754e0f21536ed44b32c27a7132f"
   },
   "first_party_client_support_matrix": {
     "artifact_path": "first-party-client-support-matrix.json",
@@ -38,7 +38,7 @@
   "local_webrtc_delivery_chunk_conformance_fixture": {
     "artifact_path": "local-webrtc-delivery-chunk-conformance-fixture.json",
     "source_artifact_path": "botster_hub_test_support::local_webrtc_delivery_chunk_conformance_fixture_json()",
-    "sha256": "44b37b433cced3b3e2e1becd57fcefc466a525419524008044f893cd2f1cd754"
+    "sha256": "d1c00ae85537c98488e7e3ca2e3d9459aaddae1e143ab7fccf739294bba7d476"
   },
   "mode_flags_conformance_fixture": {
     "artifact_path": "mode-flags-conformance-fixture.json",

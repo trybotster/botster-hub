@@ -12,7 +12,7 @@ use botster_hub_client::{
     DaemonDiagnostic, DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind,
     DaemonResponse, LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION, LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
     LOCAL_WEBRTC_MAX_FRAME_BYTES, LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES,
-    LocalWebrtcTerminalChunkHeader, ServerFrame,
+    LOCAL_WEBRTC_TERMINAL_CHUNK_MAX_PLAINTEXT_BYTES, LocalWebrtcTerminalChunkHeader, ServerFrame,
 };
 use botster_terminal_protocol::{MAX_TERMINAL_INPUT_FRAME_BYTES, RoutedTerminalFrame};
 
@@ -23,7 +23,8 @@ use crate::transport::webrtc::{LocalWebrtcError, LocalWebrtcResult};
 
 // The current Rust WebRTC peer's message receive path is bounded at 16 KiB;
 // 12 KiB leaves transport and framing headroom for every first-party peer.
-pub(crate) const LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES: usize = 12 * 1024;
+pub(crate) const LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES: usize =
+    LOCAL_WEBRTC_TERMINAL_CHUNK_MAX_PLAINTEXT_BYTES;
 
 /// Reassembles one binary terminal input message from ordered sealed chunks.
 ///
@@ -341,6 +342,17 @@ mod tests {
             stream_epoch,
             encode_output(body).expect("output frame"),
         )
+    }
+
+    #[test]
+    fn delivery_fixture_publishes_the_enforced_terminal_chunk_plaintext_limit() {
+        let fixture =
+            botster_hub_test_support::local_webrtc_delivery_chunk_conformance_fixture_json();
+
+        assert_eq!(
+            fixture.pointer("/terminal_chunk/maximum_plaintext_bytes"),
+            Some(&serde_json::json!(LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES))
+        );
     }
 
     #[test]

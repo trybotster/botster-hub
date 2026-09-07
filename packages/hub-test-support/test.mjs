@@ -132,7 +132,7 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.44");
+assert.equal(metadata.package_version, "0.1.45");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
 assert.equal(metadata.protocol_version, 9);
 assert.equal(metadata.conformance_fixture_revision, 49);

@@ -1880,6 +1880,7 @@ pub fn local_webrtc_delivery_chunk_conformance_fixture_json() -> serde_json::Val
         "terminal_chunk": {
             "layout": "[u8 version][u64 LE message_id][u32 LE chunk_index][u32 LE chunk_count][u32 LE total_bytes][u64 LE generation][u32 LE stream_epoch][12-byte nonce][ciphertext || 16-byte tag]",
             "header_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES,
+            "maximum_plaintext_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_MAX_PLAINTEXT_BYTES,
             "nonce_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_NONCE_BYTES,
             "tag_bytes": botster_hub_client::LOCAL_WEBRTC_TERMINAL_CHUNK_TAG_BYTES,
             "route_identity": "subscription DataChannel label",

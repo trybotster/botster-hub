@@ -145,6 +145,11 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     emit_const(
         &mut output,
+        "LOCAL_WEBRTC_TERMINAL_CHUNK_MAX_PLAINTEXT_BYTES",
+        &crate::LOCAL_WEBRTC_TERMINAL_CHUNK_MAX_PLAINTEXT_BYTES.to_string(),
+    );
+    emit_const(
+        &mut output,
         "LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES",
         &crate::LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES.to_string(),
     );
