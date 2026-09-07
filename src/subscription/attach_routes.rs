@@ -44,6 +44,14 @@ pub(crate) struct ConnectionBoundRoute {
     pub generation: TerminalSubscriptionGeneration,
 }
 
+/// Outcome of reserving a route key in an owner's route set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteReservation {
+    Inserted,
+    AlreadyHeld,
+    Full,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttachStreamOwner {
     pub client_id: String,
@@ -129,10 +137,11 @@ pub(crate) struct InventoryReconcileProgress {
 pub(crate) struct AttachStreamRegistry {
     streams: BTreeMap<(String, String), AttachStream>,
     next_epoch: u64,
-    /// Route keys each owner (budget key) has been told it attached and has
-    /// not detached. This is the history a connection's cleanup must cover;
-    /// attach admission caps it, so cleanup candidate vectors stay bounded.
-    acknowledged_routes: BTreeMap<String, BTreeSet<(String, String)>>,
+    /// Route keys each owner (budget key) reserved for an attach, holds
+    /// live, or was told it attached and has not detached. Attach admission
+    /// caps this union, and cleanup takes all of it, so candidate vectors
+    /// stay bounded.
+    owner_routes: BTreeMap<String, BTreeSet<(String, String)>>,
     pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
     pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
     pub(crate) live_attach_routes: BTreeSet<(String, String)>,
@@ -206,67 +215,100 @@ impl AttachStreamRegistry {
             .is_some_and(|stream| owner.matches(&stream.owner))
     }
 
-    pub(crate) fn acknowledge_route(
+    /// Reserve one route key in the owner's route set before an attach
+    /// starts. The set is the union of pending, live, and acknowledged keys,
+    /// so concurrent attaches cannot exceed `limit` between admission and
+    /// completion.
+    #[must_use]
+    pub(crate) fn reserve_route(
         &mut self,
         budget_key: &str,
         session_id: &str,
         subscription_id: &str,
-    ) {
-        self.acknowledged_routes
-            .entry(budget_key.to_string())
-            .or_default()
-            .insert((session_id.to_string(), subscription_id.to_string()));
+        limit: usize,
+    ) -> RouteReservation {
+        let routes = self.owner_routes.entry(budget_key.to_string()).or_default();
+        let key = (session_id.to_string(), subscription_id.to_string());
+        if routes.contains(&key) {
+            return RouteReservation::AlreadyHeld;
+        }
+        if routes.len() >= limit {
+            if routes.is_empty() {
+                self.owner_routes.remove(budget_key);
+            }
+            return RouteReservation::Full;
+        }
+        routes.insert(key);
+        RouteReservation::Inserted
     }
 
-    pub(crate) fn forget_acknowledged_route(
-        &mut self,
-        budget_key: &str,
-        session_id: &str,
-        subscription_id: &str,
-    ) {
-        if let Some(routes) = self.acknowledged_routes.get_mut(budget_key) {
+    /// Release one route key from the owner's set (explicit detach, or an
+    /// attach that failed while no stream of this owner holds the key).
+    pub(crate) fn release_route(&mut self, budget_key: &str, session_id: &str, subscription_id: &str) {
+        if let Some(routes) = self.owner_routes.get_mut(budget_key) {
             routes.remove(&(session_id.to_string(), subscription_id.to_string()));
             if routes.is_empty() {
-                self.acknowledged_routes.remove(budget_key);
+                self.owner_routes.remove(budget_key);
             }
         }
     }
 
-    pub(crate) fn acknowledged_route_count(&self, budget_key: &str) -> usize {
-        self.acknowledged_routes
-            .get(budget_key)
-            .map_or(0, BTreeSet::len)
+    pub(crate) fn owner_route_count(&self, budget_key: &str) -> usize {
+        self.owner_routes.get(budget_key).map_or(0, BTreeSet::len)
     }
 
-    /// Take every route key one owner was told it attached; cleanup covers
-    /// them all, so nothing historical outlives the owner.
-    pub(crate) fn take_acknowledged_routes(
-        &mut self,
-        budget_key: &str,
-    ) -> BTreeSet<(String, String)> {
-        self.acknowledged_routes
-            .remove(budget_key)
-            .unwrap_or_default()
+    /// Take every route key one owner reserved or was told it attached;
+    /// cleanup covers them all, so nothing historical outlives the owner.
+    pub(crate) fn take_owner_routes(&mut self, budget_key: &str) -> BTreeSet<(String, String)> {
+        self.owner_routes.remove(budget_key).unwrap_or_default()
     }
 
-    /// Streams one grant owns that never bound an adapter.
-    pub(crate) fn unbound_routes_for_grant(
+    /// The one validated set of routes departing grants own, keyed by the
+    /// departing grant. Sources: the peer-close snapshot, each removed
+    /// grant's route set, and every stream owned by a removed grant. A key
+    /// whose current stream belongs to anyone else (a Unix client or a live
+    /// grant) is a replacement and is excluded from every cleanup mutation.
+    /// A key with no stream is attributed to its removed index owner, else
+    /// to `primary`.
+    pub(crate) fn departing_routes_for_grants(
         &self,
-        grant_id: &str,
-    ) -> Vec<(String, String, AttachmentIdentity)> {
-        self.streams
-            .iter()
-            .filter(|(_, stream)| {
-                stream.owner.grant_id.as_deref() == Some(grant_id) && !stream.adapter_bound
-            })
-            .map(|((session_id, subscription_id), stream)| {
-                (
-                    session_id.clone(),
-                    subscription_id.clone(),
-                    stream.identity(),
-                )
-            })
-            .collect()
+        removed: &BTreeSet<String>,
+        primary: &str,
+        snapshot: &BTreeSet<(String, String)>,
+    ) -> BTreeMap<String, BTreeSet<(String, String)>> {
+        let mut keys = snapshot.clone();
+        for grant in removed {
+            if let Some(routes) = self.owner_routes.get(grant) {
+                keys.extend(routes.iter().cloned());
+            }
+        }
+        for (key, stream) in &self.streams {
+            if stream
+                .owner
+                .grant_id
+                .as_ref()
+                .is_some_and(|grant| removed.contains(grant))
+            {
+                keys.insert(key.clone());
+            }
+        }
+        let mut departing: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+        for key in keys {
+            let grant = match self.streams.get(&key) {
+                Some(stream) => match stream.owner.grant_id.as_deref() {
+                    Some(grant) if removed.contains(grant) => grant.to_string(),
+                    _ => continue,
+                },
+                None => self
+                    .attach_owner_grant_ids
+                    .get(&key)
+                    .filter(|grant| removed.contains(grant.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| primary.to_string()),
+            };
+            departing.entry(grant).or_default().insert(key);
+        }
+        departing
     }
 
     /// Streams one client owns that never bound an adapter. Cleanup cancels
@@ -1311,6 +1353,85 @@ mod tests {
                 "the replacement keeps its bound route claim"
             );
         }
+    }
+
+    /// H3: an old peer's close snapshot names a key a Unix client has since
+    /// replaced. The validated departing set excludes it, keeps the peer's
+    /// own bound route, and attributes a streamless snapshot key to the peer.
+    #[test]
+    fn departing_routes_exclude_a_unix_replacement() {
+        let mut registry = AttachStreamRegistry::default();
+        let peer = AttachStreamOwner {
+            client_id: "botster-hub-daemon-subscription-k2".to_string(),
+            grant_id: Some("grant-old".to_string()),
+        };
+        // K1: the peer's own live route.
+        let own = registry.start_attach(peer.clone(), "s".into(), "k1".into());
+        let (_, own_handle) = UnixTerminalAdapter::pair();
+        assert!(registry.mark_adapter_bound_if(
+            "s",
+            "k1",
+            &own,
+            TerminalSubscriptionGeneration(1),
+            BoundAdapterHandle::Unix(own_handle),
+        ));
+        // K2: the peer attached it once; a Unix client replaced it.
+        registry.start_attach(peer.clone(), "s".into(), "k2".into());
+        let unix = registry.start_attach(owner(), "s".into(), "k2".into());
+        let (_, unix_handle) = UnixTerminalAdapter::pair();
+        assert!(registry.mark_adapter_bound_if(
+            "s",
+            "k2",
+            &unix,
+            TerminalSubscriptionGeneration(2),
+            BoundAdapterHandle::Unix(unix_handle.clone()),
+        ));
+        let removed: BTreeSet<String> = ["grant-old".to_string()].into_iter().collect();
+        let snapshot: BTreeSet<(String, String)> = [
+            ("s".to_string(), "k1".to_string()),
+            ("s".to_string(), "k2".to_string()),
+            ("s".to_string(), "k3".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let departing = registry.departing_routes_for_grants(&removed, "grant-old", &snapshot);
+        let keys = departing.get("grant-old").expect("departing grant");
+        assert!(keys.contains(&("s".to_string(), "k1".to_string())));
+        assert!(keys.contains(&("s".to_string(), "k3".to_string())));
+        assert!(
+            !keys.contains(&("s".to_string(), "k2".to_string())),
+            "a key replaced by a Unix client is not the departing peer's"
+        );
+        assert_eq!(departing.len(), 1);
+        assert!(registry.is_adapter_bound("s", "k2"));
+        assert!(!unix_handle.is_closed());
+    }
+
+    #[test]
+    fn route_set_is_a_union_bounded_at_reservation() {
+        let mut registry = AttachStreamRegistry::default();
+        for index in 0..3 {
+            assert_eq!(
+                registry.reserve_route("a", &format!("s{index}"), "sub", 3),
+                RouteReservation::Inserted
+            );
+        }
+        assert_eq!(
+            registry.reserve_route("a", "s0", "sub", 3),
+            RouteReservation::AlreadyHeld
+        );
+        assert_eq!(
+            registry.reserve_route("a", "s3", "sub", 3),
+            RouteReservation::Full
+        );
+        assert_eq!(registry.owner_route_count("a"), 3);
+        registry.release_route("a", "s1", "sub");
+        assert_eq!(
+            registry.reserve_route("a", "s3", "sub", 3),
+            RouteReservation::Inserted
+        );
+        assert_eq!(registry.take_owner_routes("a").len(), 3);
+        assert_eq!(registry.owner_route_count("a"), 0);
     }
 
     #[test]

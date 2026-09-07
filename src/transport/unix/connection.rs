@@ -746,7 +746,7 @@ pub(crate) fn handle_connection_cleanup(
     keys.extend(
         state
             .pending_runtime
-            .take_acknowledged_routes(&cleanup.client_id),
+            .take_owner_routes(&cleanup.client_id),
     );
     // The departing owner is this connection; a route whose current stream
     // belongs to a replacement is targeted only under this client's own

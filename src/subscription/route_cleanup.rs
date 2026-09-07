@@ -16,7 +16,7 @@ use crate::daemon::owner_loop::DaemonControlState;
 use crate::data_plane::driver::CoreTicket;
 use crate::subscription::attach_routes::{
     AttachStreamOwner, AttachedSubscription, AttachedSubscriptionChange, AttachmentIdentity,
-    live_generation_for_route, record_attached_subscription_change,
+    RouteReservation, live_generation_for_route, record_attached_subscription_change,
 };
 
 /// Attach streams one owner (Unix client or WebRTC grant) may hold at once.
@@ -284,17 +284,36 @@ pub(crate) fn retain_route_cleanup(
     });
 }
 
-/// Whether `owner` may start another attach stream. Both the live streams
-/// and the acknowledged route history count, so a connection whose routes
-/// were replaced by others cannot accumulate unbounded cleanup work.
-pub(crate) fn owner_has_attach_capacity(
-    registry: &crate::subscription::attach_routes::AttachStreamRegistry,
+/// Reserve the route key in the owner's route set before the attach starts.
+/// The set is the union of pending, live, and acknowledged keys, capped at
+/// [`MAX_ATTACH_ROUTES_PER_OWNER`], so concurrent attaches cannot exceed
+/// it and cleanup candidate vectors stay bounded. `false` means refuse.
+#[must_use]
+pub(crate) fn reserve_attach_route(
+    registry: &mut crate::subscription::attach_routes::AttachStreamRegistry,
     owner: &AttachStreamOwner,
+    session_id: &str,
+    subscription_id: &str,
 ) -> bool {
-    registry
-        .stream_count_for_owner(owner)
-        .max(registry.acknowledged_route_count(&owner.budget_key()))
-        < MAX_ATTACH_ROUTES_PER_OWNER
+    registry.reserve_route(
+        &owner.budget_key(),
+        session_id,
+        subscription_id,
+        MAX_ATTACH_ROUTES_PER_OWNER,
+    ) != RouteReservation::Full
+}
+
+/// Release a route key after an attach failed, unless a stream of this
+/// owner still holds the key (a newer attach of the same route).
+pub(crate) fn release_failed_attach_route(
+    registry: &mut crate::subscription::attach_routes::AttachStreamRegistry,
+    owner: &AttachStreamOwner,
+    session_id: &str,
+    subscription_id: &str,
+) {
+    if !registry.stream_owner_matches(session_id, subscription_id, owner) {
+        registry.release_route(&owner.budget_key(), session_id, subscription_id);
+    }
 }
 
 #[cfg(test)]
@@ -541,29 +560,28 @@ mod tests {
         );
     }
 
+    /// Reserved (pending) keys count with live and acknowledged keys, so
+    /// concurrent attaches cannot exceed the cap; a failed attach releases
+    /// its key only when no stream of the owner still holds it.
     #[test]
-    fn acknowledged_history_counts_toward_attach_capacity() {
+    fn attach_reservation_is_a_bounded_union_per_owner() {
         let mut registry = crate::subscription::attach_routes::AttachStreamRegistry::default();
         let unix = owner("a");
         for index in 0..MAX_ATTACH_ROUTES_PER_OWNER {
-            registry.acknowledge_route("a", &format!("s{index}"), "sub");
+            assert!(reserve_attach_route(&mut registry, &unix, &format!("s{index}"), "sub"));
         }
-        assert_eq!(registry.stream_count_for_owner(&unix), 0);
-        assert!(!owner_has_attach_capacity(&registry, &unix));
-        let taken = registry.take_acknowledged_routes("a");
-        assert_eq!(taken.len(), MAX_ATTACH_ROUTES_PER_OWNER);
-        assert!(owner_has_attach_capacity(&registry, &unix));
-    }
-
-    #[test]
-    fn attach_capacity_is_per_owner_and_bounded() {
-        let mut registry = crate::subscription::attach_routes::AttachStreamRegistry::default();
-        let unix = owner("a");
-        for index in 0..MAX_ATTACH_ROUTES_PER_OWNER {
-            assert!(owner_has_attach_capacity(&registry, &unix));
-            registry.start_attach(unix.clone(), format!("s{index}"), "sub".into());
-        }
-        assert!(!owner_has_attach_capacity(&registry, &unix));
-        assert!(owner_has_attach_capacity(&registry, &owner("b")));
+        assert_eq!(registry.stream_count_for_owner(&unix), 0, "pending keys alone fill the cap");
+        assert!(!reserve_attach_route(&mut registry, &unix, "overflow", "sub"));
+        assert!(reserve_attach_route(&mut registry, &owner("b"), "overflow", "sub"));
+        // Re-attaching a held key is not a new reservation.
+        assert!(reserve_attach_route(&mut registry, &unix, "s0", "sub"));
+        // A failed attach releases the key unless a live stream holds it.
+        registry.start_attach(unix.clone(), "s0".into(), "sub".into());
+        release_failed_attach_route(&mut registry, &unix, "s0", "sub");
+        assert!(!reserve_attach_route(&mut registry, &unix, "overflow", "sub"));
+        registry.cancel_stream("s0", "sub");
+        release_failed_attach_route(&mut registry, &unix, "s0", "sub");
+        assert!(reserve_attach_route(&mut registry, &unix, "overflow", "sub"));
+        assert_eq!(registry.take_owner_routes("a").len(), MAX_ATTACH_ROUTES_PER_OWNER);
     }
 }
