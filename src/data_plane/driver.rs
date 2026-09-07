@@ -122,6 +122,17 @@ impl<T> CoreTicket<T> {
         }
     }
 
+    /// A ticket that already holds its answer. Test seams install a Core
+    /// result with it so an owner phase applies exactly that result.
+    #[cfg(test)]
+    pub(crate) fn resolved(value: T) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(value)
+            .expect("a resolved ticket holds exactly one value");
+        Self::queued(receiver)
+    }
+
     /// Non-blocking read; owner-thread use.
     pub(crate) fn poll(&mut self) -> CoreTicketPoll<T> {
         match &self.slot {

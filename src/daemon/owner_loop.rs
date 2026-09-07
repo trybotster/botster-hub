@@ -52,6 +52,33 @@ use crate::transport::webrtc::LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE;
 
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 
+/// One Core inventory read for the reconcile phase. `read_epoch` is the
+/// registry attach epoch at submission: the read's rows cover every attach
+/// with epoch <= read_epoch and none newer (one owner thread submits both in
+/// program order; the Core bridge is one FIFO consumed by one thread).
+pub(crate) struct InventoryRead {
+    read_epoch: u64,
+    ticket: crate::data_plane::driver::CoreTicket<Vec<botster_core::TerminalSubscriptionRecord>>,
+}
+
+impl DaemonControlState {
+    /// Install a read result as if the read had been submitted at
+    /// `read_epoch` and already answered. The next reconcile phase applies
+    /// exactly this inventory. Test-only: no production path resolves a read
+    /// without submitting it.
+    #[cfg(test)]
+    pub(crate) fn install_reconcile_inventory_for_test(
+        &mut self,
+        inventory: Vec<botster_core::TerminalSubscriptionRecord>,
+        read_epoch: u64,
+    ) {
+        self.reconcile_inventory = Some(InventoryRead {
+            read_epoch,
+            ticket: crate::data_plane::driver::CoreTicket::resolved(inventory),
+        });
+    }
+}
+
 /// Earliest deadline among retained obligations and pending requests, so the
 /// owner wakes to retire abandoned work even when no control traffic arrives.
 fn next_owner_deadline(state: &DaemonControlState) -> Option<Instant> {
@@ -643,11 +670,18 @@ pub(crate) fn run_inventory_reconcile_phase(
         state.reconcile_inventory = None;
         return false;
     };
-    let Some(ticket) = state.reconcile_inventory.as_mut() else {
-        state.reconcile_inventory = Some(runtime.list_terminal_subscriptions());
+    let Some(read) = state.reconcile_inventory.as_mut() else {
+        // The epoch is captured at submission, on this thread, before the
+        // request is enqueued: the read cannot cover any later attach.
+        let read_epoch = state.pending_runtime.attach_epoch();
+        state.reconcile_inventory = Some(InventoryRead {
+            read_epoch,
+            ticket: runtime.list_terminal_subscriptions(),
+        });
         return true;
     };
-    let inventory = match ticket.poll() {
+    let read_epoch = read.read_epoch;
+    let inventory = match read.ticket.poll() {
         CoreTicketPoll::Pending => return true,
         // Refused admission: clear the single slot; the cursor stays and the
         // next pump resubmits (one ticket in flight, no queue).
@@ -663,14 +697,21 @@ pub(crate) fn run_inventory_reconcile_phase(
         CoreTicketPoll::Ready(inventory) => inventory,
     };
     state.reconcile_inventory = None;
-    let lookup = |session_id: &str, subscription_id: &str| {
+    // Core keys ownership by (client, session, subscription); a row for
+    // another client on the same route is not this stream's row.
+    let lookup = |client_id: &str, session_id: &str, subscription_id: &str| {
         inventory
             .iter()
-            .find(|row| row.session_id.0 == session_id && row.subscription_id.0 == subscription_id)
+            .find(|row| {
+                row.client_id.0 == client_id
+                    && row.session_id.0 == session_id
+                    && row.subscription_id.0 == subscription_id
+            })
             .map(|row| row.generation)
     };
     let progress = state.pending_runtime.reconcile_inventory_slice(
         lookup,
+        read_epoch,
         state.pump.reconcile_after.clone(),
         PUMP_MAX_ROUTES_VALIDATED,
     );
@@ -768,10 +809,9 @@ pub(crate) struct DaemonControlState {
     pub(crate) close_event_decisions: crate::subscription::closed_events::CloseEventDecisions,
     /// Session-type catalog built off the owner thread.
     pub(crate) session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache,
-    /// Inventory read in flight for the pump reconcile phase.
-    reconcile_inventory: Option<
-        crate::data_plane::driver::CoreTicket<Vec<botster_core::TerminalSubscriptionRecord>>,
-    >,
+    /// Inventory read in flight for the pump reconcile phase, with the
+    /// attach epoch captured when it was submitted.
+    reconcile_inventory: Option<InventoryRead>,
     observe_resume: Option<botster_core_daemon::ObserveLifecycleCursor>,
     /// Observe slice in flight for the pump observe phase.
     observe_read: Option<
@@ -2491,5 +2531,167 @@ mod tests {
             "successful enable must advance session-type generation after commit"
         );
         daemon.stop();
+    }
+
+    /// Owner-loop wiring for the reconcile read: attach a route through the
+    /// real control path on an in-process daemon, install a read result that
+    /// was submitted (epoch captured) before that attach, apply it through
+    /// run_inventory_reconcile_phase, and require the newer route to survive.
+    /// The control captures the epoch after the attach and requires the
+    /// absent route to be closed.
+    fn reconcile_wiring_fixture(
+        name: &str,
+    ) -> (
+        HubDaemon,
+        DaemonControlState,
+        crate::transport::unix::UnixConnectionMux,
+        String,
+    ) {
+        let data_directory = std::env::temp_dir().join(format!(
+            "botster-hub-reconcile-wiring-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = package_control_config(data_directory);
+        let daemon = HubDaemon::start(config).expect("start reconcile wiring daemon");
+        let session_id = format!("reconcile-{name}-session");
+        daemon
+            .runtime()
+            .expect("runtime")
+            .spawn_session_for_test(
+                botster_core::SessionSpawnRequest {
+                    request_id: botster_core::RequestId(format!("reconcile-{name}-spawn")),
+                    session_id: botster_core::SessionId(session_id.clone()),
+                    executable: "/bin/sleep".to_string(),
+                    arguments: vec!["8".to_string()],
+                    working_directory: botster_core::SpawnWorkingDirectory {
+                        path: ".".to_string(),
+                    },
+                    environment: botster_core::SpawnEnvironment::default(),
+                    initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                },
+                botster_core::CoreSessionMetadata::new(),
+            )
+            .expect("spawn session");
+        let mut state = DaemonControlState::default();
+        let mux = crate::transport::unix::UnixConnectionMux::new();
+        let capabilities =
+            crate::subscription::attach_routes::negotiated_unix_capability_set(&[], None)
+                .expect("capabilities");
+        state.pending_runtime.admission.unix_admissions.insert(
+            "reconcile-client".to_string(),
+            crate::admission::unix_hello::UnixTerminalAdmission::Admitted {
+                required_features: Vec::new(),
+                capabilities,
+                mux: mux.clone(),
+            },
+        );
+        (daemon, state, mux, session_id)
+    }
+
+    /// Attach through the real control path and drive its continuation to
+    /// completion. Returns the Core generation the response carried.
+    fn attach_through_control(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> u64 {
+        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+        let observability = DaemonObservability {
+            egress: Vec::new(),
+            lifecycle: DaemonLifecycleCounters::default(),
+            client_id: Some("reconcile-client".to_string()),
+            grant_id: None,
+        };
+        let step = handle_control_request(
+            daemon,
+            state,
+            observability,
+            control_tx,
+            DaemonRequest::Attach {
+                session_id: session_id.to_string(),
+                subscription_id: subscription_id.to_string(),
+            },
+        );
+        let crate::daemon::control::pending::ControlStep::Pending(mut pending) = step else {
+            panic!("attach waits on a Core turn");
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let response = loop {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.absorb_core_completions();
+            }
+            match (pending.continuation)(daemon, state) {
+                crate::daemon::control::pending::ControlPoll::Ready(response) => {
+                    break response.expect("attach response");
+                }
+                crate::daemon::control::pending::ControlPoll::Pending => {
+                    assert!(Instant::now() < deadline, "attach continuation timed out");
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+        assert_eq!(
+            response.kind,
+            DaemonResponseKind::TerminalAttached,
+            "attach must bind: {response:?}"
+        );
+        response
+            .terminal_attach
+            .expect("terminal attach body")
+            .generation
+    }
+
+    #[test]
+    fn reconcile_read_submitted_before_an_attach_leaves_that_attach_bound() {
+        let (mut daemon, mut state, mux, session_id) = reconcile_wiring_fixture("before");
+        // The read is submitted now: epoch captured before the attach exists.
+        let read_epoch = state.pending_runtime.attach_epoch();
+        let generation = attach_through_control(&mut daemon, &mut state, &session_id, "newer");
+        assert!(state.pending_runtime.is_adapter_bound(&session_id, "newer"));
+        // The read's result cannot contain the newer route.
+        state.install_reconcile_inventory_for_test(Vec::new(), read_epoch);
+        let more = run_inventory_reconcile_phase(&daemon, &mut state);
+        assert!(!more);
+        assert!(
+            state.pending_runtime.is_adapter_bound(&session_id, "newer"),
+            "a route attached after the read was submitted stays bound"
+        );
+        let handle = mux
+            .route_handle(&session_id, "newer", generation)
+            .expect("registered route");
+        assert!(!handle.host_closed(), "the newer route is not host-closed");
+        let _ = daemon.stop();
+    }
+
+    #[test]
+    fn reconcile_read_submitted_after_an_attach_closes_it_when_absent() {
+        let (mut daemon, mut state, mux, session_id) = reconcile_wiring_fixture("after");
+        let generation = attach_through_control(&mut daemon, &mut state, &session_id, "older");
+        let handle = mux
+            .route_handle(&session_id, "older", generation)
+            .expect("registered route");
+        // The read is submitted after the attach; an empty result means
+        // Core ended the route, and reconcile must close it.
+        let read_epoch = state.pending_runtime.attach_epoch();
+        state.install_reconcile_inventory_for_test(Vec::new(), read_epoch);
+        let _ = run_inventory_reconcile_phase(&daemon, &mut state);
+        assert!(!state.pending_runtime.is_adapter_bound(&session_id, "older"));
+        assert!(
+            state
+                .pending_runtime
+                .stream_identity(&session_id, "older")
+                .is_none(),
+            "the absent older route is released from the registry"
+        );
+        assert!(
+            handle.host_closed(),
+            "the absent older route is host-closed"
+        );
+        let _ = daemon.stop();
     }
 }
