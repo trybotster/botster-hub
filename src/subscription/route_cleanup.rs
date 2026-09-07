@@ -519,7 +519,10 @@ mod tests {
             ],
             &mut applied,
         );
-        assert!(handle.host_closed(), "cleanup host-closed the owned adapter");
+        assert!(
+            handle.host_closed(),
+            "cleanup host-closed the owned adapter"
+        );
         assert!(state.pending_runtime.stream_identity("s", "sub").is_none());
         assert!(state.pending_runtime.live_attach_routes.is_empty());
         assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 0);
