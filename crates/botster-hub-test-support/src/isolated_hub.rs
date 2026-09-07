@@ -4,7 +4,7 @@
 //! socket paths, and child-process helpers. Root re-exports stay stable.
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -23,6 +23,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_hub_client::{DaemonDiagnostic, DaemonEndpoint, DaemonRequest, DaemonResponseKind};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::ConformanceFailureClass;
 
@@ -38,6 +40,8 @@ const REAP_POLL: Duration = Duration::from_millis(50);
 const WAIT_POLL: Duration = Duration::from_millis(20);
 const DRAIN_CAP: usize = 64 * 1024;
 const SESSION_WORKER_BASENAME: &str = "botster-session-worker";
+const HUB_BASENAME: &str = "botster-hub";
+const CANDIDATE_MANIFEST_ENV: &str = "BOTSTER_CANDIDATE_MANIFEST";
 
 /// Builder for one isolated local hub daemon test instance.
 ///
@@ -68,6 +72,7 @@ const SESSION_WORKER_BASENAME: &str = "botster-session-worker";
 pub struct IsolatedHubBuilder {
     hub_bin: Option<PathBuf>,
     session_worker_bin: Option<PathBuf>,
+    manifest: Option<PathBuf>,
     root: Option<PathBuf>,
     working_directory: Option<PathBuf>,
     name: String,
@@ -80,6 +85,7 @@ impl Default for IsolatedHubBuilder {
         Self {
             hub_bin: None,
             session_worker_bin: None,
+            manifest: None,
             root: None,
             working_directory: None,
             name: "external-client".to_string(),
@@ -107,6 +113,13 @@ impl IsolatedHubBuilder {
     #[must_use]
     pub fn session_worker_bin(mut self, path: impl Into<PathBuf>) -> Self {
         self.session_worker_bin = Some(path.into());
+        self
+    }
+
+    /// Set the candidate manifest that authenticates both executable files.
+    #[must_use]
+    pub fn manifest(mut self, path: impl Into<PathBuf>) -> Self {
+        self.manifest = Some(path.into());
         self
     }
 
@@ -168,6 +181,12 @@ impl IsolatedHubBuilder {
             explicit_path(self.session_worker_bin, "BOTSTER_SESSION_WORKER_BIN")?;
         ensure_file("botster-hub binary", &hub_bin)?;
         ensure_file("botster-session-worker binary", &session_worker_bin)?;
+        if let Some(manifest) = self
+            .manifest
+            .or_else(|| env::var_os(CANDIDATE_MANIFEST_ENV).map(PathBuf::from))
+        {
+            validate_candidate_manifest(&manifest, &hub_bin, &session_worker_bin)?;
+        }
 
         fs::create_dir_all(&data_dir).map_err(|source| IsolatedHubError::CreateDataDir {
             path: data_dir.clone(),
@@ -805,6 +824,33 @@ pub enum IsolatedHubError {
         label: &'static str,
         path: PathBuf,
     },
+    ReadCandidateManifest {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    InvalidCandidateManifest {
+        path: PathBuf,
+        reason: String,
+    },
+    CandidateArtifactCount {
+        name: &'static str,
+        count: usize,
+    },
+    CandidateArtifactRead {
+        name: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    CandidateArtifactSizeMismatch {
+        name: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    CandidateArtifactSha256Mismatch {
+        name: &'static str,
+        expected: String,
+        actual: String,
+    },
     CreateDataDir {
         path: PathBuf,
         source: std::io::Error,
@@ -868,6 +914,41 @@ impl fmt::Display for IsolatedHubError {
             Self::MissingBinary { label, path } => {
                 write!(formatter, "{label} does not exist at {}", path.display())
             }
+            Self::ReadCandidateManifest { path, source } => write!(
+                formatter,
+                "failed to read candidate manifest {}: {source}",
+                path.display()
+            ),
+            Self::InvalidCandidateManifest { path, reason } => write!(
+                formatter,
+                "invalid candidate manifest {}: {reason}",
+                path.display()
+            ),
+            Self::CandidateArtifactCount { name, count } => write!(
+                formatter,
+                "candidate manifest contains {count} artifacts named {name}; cross-layer runs require exactly one from script/build-dev-artifacts"
+            ),
+            Self::CandidateArtifactRead { name, path, source } => write!(
+                formatter,
+                "failed to read candidate artifact {name} at {}: {source}",
+                path.display()
+            ),
+            Self::CandidateArtifactSizeMismatch {
+                name,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "candidate artifact {name} size mismatch: expected {expected} bytes, got {actual} bytes"
+            ),
+            Self::CandidateArtifactSha256Mismatch {
+                name,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "candidate artifact {name} SHA-256 mismatch: expected {expected}, got {actual}"
+            ),
             Self::CreateDataDir { path, source } => {
                 write!(
                     formatter,
@@ -962,6 +1043,18 @@ impl IsolatedHubError {
                     "{label} is not available"
                 ));
             }
+            Self::ReadCandidateManifest { .. } => "failed to read the candidate manifest",
+            Self::InvalidCandidateManifest { .. } => "the candidate manifest is invalid",
+            Self::CandidateArtifactCount { .. } => {
+                "the candidate manifest does not identify each required artifact exactly once"
+            }
+            Self::CandidateArtifactRead { .. } => "failed to read a candidate artifact",
+            Self::CandidateArtifactSizeMismatch { .. } => {
+                "a candidate artifact size does not match the manifest"
+            }
+            Self::CandidateArtifactSha256Mismatch { .. } => {
+                "a candidate artifact SHA-256 does not match the manifest"
+            }
             Self::CreateDataDir { .. } => "failed to create isolated daemon data directory",
             Self::RemoveDataDir { .. } => "failed to remove isolated daemon data directory",
             Self::CleanupChild { .. } => "failed to clean up isolated daemon process",
@@ -993,12 +1086,18 @@ impl Error for IsolatedHubError {
             Self::CreateDataDir { source, .. }
             | Self::RemoveDataDir { source, .. }
             | Self::CleanupChild { source, .. }
+            | Self::ReadCandidateManifest { source, .. }
+            | Self::CandidateArtifactRead { source, .. }
             | Self::Spawn { source, .. }
             | Self::ShutdownCommand { source }
             | Self::Wait { source } => Some(source),
             Self::Clock(source) => Some(source),
             Self::MissingBinaryEnv { .. }
             | Self::MissingBinary { .. }
+            | Self::InvalidCandidateManifest { .. }
+            | Self::CandidateArtifactCount { .. }
+            | Self::CandidateArtifactSizeMismatch { .. }
+            | Self::CandidateArtifactSha256Mismatch { .. }
             | Self::CleanupTimeout { .. }
             | Self::ReadyTimeout { .. }
             | Self::DaemonExited { .. }
@@ -1008,6 +1107,234 @@ impl Error for IsolatedHubError {
             | Self::Tainted { .. }
             | Self::CensusFailed { .. } => None,
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateManifest {
+    artifacts: Vec<CandidateArtifact>,
+    source_revisions: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateArtifact {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+fn validate_candidate_manifest(
+    manifest_path: &Path,
+    hub_bin: &Path,
+    session_worker_bin: &Path,
+) -> Result<(), IsolatedHubError> {
+    let bytes =
+        fs::read(manifest_path).map_err(|source| IsolatedHubError::ReadCandidateManifest {
+            path: manifest_path.to_path_buf(),
+            source,
+        })?;
+    let manifest: CandidateManifest = serde_json::from_slice(&bytes).map_err(|source| {
+        IsolatedHubError::InvalidCandidateManifest {
+            path: manifest_path.to_path_buf(),
+            reason: source.to_string(),
+        }
+    })?;
+    for name in ["botster_hub", "botster_core"] {
+        if manifest
+            .source_revisions
+            .get(name)
+            .is_none_or(|revision| revision.trim().is_empty())
+        {
+            return Err(IsolatedHubError::InvalidCandidateManifest {
+                path: manifest_path.to_path_buf(),
+                reason: format!("source_revisions.{name} must be a non-empty string"),
+            });
+        }
+    }
+    validate_candidate_artifact(manifest_path, &manifest.artifacts, HUB_BASENAME, hub_bin)?;
+    validate_candidate_artifact(
+        manifest_path,
+        &manifest.artifacts,
+        SESSION_WORKER_BASENAME,
+        session_worker_bin,
+    )
+}
+
+fn validate_candidate_artifact(
+    manifest_path: &Path,
+    artifacts: &[CandidateArtifact],
+    name: &'static str,
+    path: &Path,
+) -> Result<(), IsolatedHubError> {
+    let matching = artifacts
+        .iter()
+        .filter(|artifact| artifact.name == name)
+        .collect::<Vec<_>>();
+    let [artifact] = matching.as_slice() else {
+        return Err(IsolatedHubError::CandidateArtifactCount {
+            name,
+            count: matching.len(),
+        });
+    };
+    if artifact.size == 0 {
+        return Err(IsolatedHubError::InvalidCandidateManifest {
+            path: manifest_path.to_path_buf(),
+            reason: format!("artifact {name} size must be positive"),
+        });
+    }
+    if artifact.sha256.len() != 64
+        || !artifact
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(IsolatedHubError::InvalidCandidateManifest {
+            path: manifest_path.to_path_buf(),
+            reason: format!("artifact {name} sha256 must be 64 lowercase hexadecimal characters"),
+        });
+    }
+    let actual_size = fs::metadata(path)
+        .map_err(|source| IsolatedHubError::CandidateArtifactRead {
+            name,
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if actual_size != artifact.size {
+        return Err(IsolatedHubError::CandidateArtifactSizeMismatch {
+            name,
+            expected: artifact.size,
+            actual: actual_size,
+        });
+    }
+    let mut file =
+        fs::File::open(path).map_err(|source| IsolatedHubError::CandidateArtifactRead {
+            name,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read =
+            file.read(&mut buffer)
+                .map_err(|source| IsolatedHubError::CandidateArtifactRead {
+                    name,
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != artifact.sha256 {
+        return Err(IsolatedHubError::CandidateArtifactSha256Mismatch {
+            name,
+            expected: artifact.sha256.clone(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod candidate_manifest_tests {
+    use super::*;
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "botster-candidate-manifest-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn write_manifest(path: &Path, hub_bytes: &[u8], worker_bytes: &[u8]) {
+        let manifest = serde_json::json!({
+            "source_revisions": {
+                "botster_hub": "0123456789abcdef0123456789abcdef01234567",
+                "botster_core": "89abcdef0123456789abcdef0123456789abcdef"
+            },
+            "artifacts": [
+                {
+                    "name": HUB_BASENAME,
+                    "size": hub_bytes.len(),
+                    "sha256": sha256(hub_bytes)
+                },
+                {
+                    "name": SESSION_WORKER_BASENAME,
+                    "size": worker_bytes.len(),
+                    "sha256": sha256(worker_bytes)
+                }
+            ]
+        });
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize candidate manifest"),
+        )
+        .expect("write candidate manifest");
+    }
+
+    #[test]
+    fn candidate_manifest_accepts_the_two_matching_artifacts() {
+        let root = fixture_dir("matching");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let hub = root.join(HUB_BASENAME);
+        let worker = root.join(SESSION_WORKER_BASENAME);
+        let manifest = root.join("install-manifest.json");
+        let hub_bytes = b"hub-candidate";
+        let worker_bytes = b"worker-candidate";
+        fs::write(&hub, hub_bytes).expect("write hub fixture");
+        fs::write(&worker, worker_bytes).expect("write worker fixture");
+        write_manifest(&manifest, hub_bytes, worker_bytes);
+
+        validate_candidate_manifest(&manifest, &hub, &worker).expect("matching candidate manifest");
+
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn builder_refuses_a_candidate_with_a_mismatched_hub_hash_before_spawn() {
+        let root = fixture_dir("hash-mismatch");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let hub = root.join(HUB_BASENAME);
+        let worker = root.join(SESSION_WORKER_BASENAME);
+        let manifest = root.join("install-manifest.json");
+        let expected_hub = b"hub-candidate-a";
+        let actual_hub = b"hub-candidate-b";
+        let worker_bytes = b"worker-candidate";
+        fs::write(&hub, actual_hub).expect("write hub fixture");
+        fs::write(&worker, worker_bytes).expect("write worker fixture");
+        write_manifest(&manifest, expected_hub, worker_bytes);
+
+        let error = IsolatedHubBuilder::new()
+            .hub_bin(&hub)
+            .session_worker_bin(&worker)
+            .manifest(&manifest)
+            .root(root.join("state"))
+            .start()
+            .err()
+            .expect("hash mismatch must stop before process spawn");
+        assert!(matches!(
+            error,
+            IsolatedHubError::CandidateArtifactSha256Mismatch {
+                name: HUB_BASENAME,
+                ..
+            }
+        ));
+
+        fs::remove_dir_all(root).expect("remove fixture directory");
     }
 }
 
