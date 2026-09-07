@@ -269,65 +269,88 @@ mod unix_route_smokes {
     }
 
     #[test]
-    fn h_s4_one_connection_carries_two_independent_subscriptions() {
+    fn h_s4_one_connection_multiplexes_two_sessions_and_converges_same_session_replacement() {
         let _guard = daemon_test_guard();
         let hub = start_isolated_candidate_hub("h-s4");
-        let session_id = "h-s4-session";
+        let replacement_session_id = "h-s4-replacement-session";
+        let replacement_a = "h-s4-replacement-a";
+        let replacement_b = "h-s4-replacement-b";
+        let session_a = "h-s4-session-a";
+        let session_b = "h-s4-session-b";
         let subscription_a = "h-s4-a";
         let subscription_b = "h-s4-b";
         let mut client = UnixRouteClient::connect(hub.endpoint()).expect("connect H-S4 client");
-        spawn_echo_session(&mut client, session_id);
-        let generation_a = attach_ready(&mut client, session_id, subscription_a);
-        let generation_b = attach_ready(&mut client, session_id, subscription_b);
-        wait_for_occupancy(&mut client, "H-S4 both attached", |rows| {
-            occupancy_has(rows, session_id, subscription_a, generation_a)
-                && occupancy_has(rows, session_id, subscription_b, generation_b)
+
+        spawn_echo_session(&mut client, replacement_session_id);
+        let replaced_generation =
+            attach_ready(&mut client, replacement_session_id, replacement_a);
+        let replacement_generation =
+            attach_ready(&mut client, replacement_session_id, replacement_b);
+        assert_ne!(replaced_generation, replacement_generation);
+        wait_for_occupancy(&mut client, "H-S4 same-session replacement", |rows| {
+            rows.len() == 1
+                && occupancy_has(
+                    rows,
+                    replacement_session_id,
+                    replacement_b,
+                    replacement_generation,
+                )
+        });
+        shutdown_session(&mut client, replacement_session_id);
+        wait_for_occupancy(&mut client, "H-S4 replacement session stopped", |rows| {
+            rows.is_empty()
         });
 
-        set_marker(&mut client, subscription_a, "echo:h-s4-first");
-        set_marker(&mut client, subscription_b, "echo:h-s4-first");
-        let operation_id = client
-            .send_terminal_frame(subscription_b, &raw_input(b"h-s4-first\r"))
-            .expect("send H-S4 input");
-        let deadline = Instant::now() + ROUTE_DEADLINE;
-        loop {
-            client.poll_route_events(Duration::from_millis(25));
-            let a_seen = client
+        spawn_echo_session(&mut client, session_a);
+        spawn_echo_session(&mut client, session_b);
+        let generation_a = attach_ready(&mut client, session_a, subscription_a);
+        let generation_b = attach_ready(&mut client, session_b, subscription_b);
+        wait_for_occupancy(&mut client, "H-S4 both attached", |rows| {
+            rows.len() == 2
+                && occupancy_has(rows, session_a, subscription_a, generation_a)
+                && occupancy_has(rows, session_b, subscription_b, generation_b)
+        });
+
+        set_marker(&mut client, subscription_a, "echo:h-s4-a");
+        set_marker(&mut client, subscription_b, "echo:h-s4-a");
+        let operation_a = client
+            .send_terminal_frame(subscription_a, &raw_input(b"h-s4-a\r"))
+            .expect("send H-S4 route A input");
+        wait_for_marker_and_result(&mut client, subscription_a, Some(operation_a));
+        client.poll_route_events(Duration::from_millis(100));
+        assert!(
+            !client
+                .observer(subscription_b)
+                .expect("H-S4 B observer after A input")
+                .state()
+                .marker_seen(),
+            "session A output must not appear on session B's route"
+        );
+        set_marker(&mut client, subscription_a, "echo:h-s4-b");
+        set_marker(&mut client, subscription_b, "echo:h-s4-b");
+        let operation_b = client
+            .send_terminal_frame(subscription_b, &raw_input(b"h-s4-b\r"))
+            .expect("send H-S4 route B input");
+        wait_for_marker_and_result(&mut client, subscription_b, Some(operation_b));
+        client.poll_route_events(Duration::from_millis(100));
+        assert!(
+            !client
                 .observer(subscription_a)
-                .is_some_and(|observer| observer.state().marker_seen());
-            let b_seen = client.observer(subscription_b).is_some_and(|observer| {
-                observer.state().marker_seen() && observer.state().has_result(operation_id)
-            });
-            if a_seen && b_seen {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "H-S4 routes did not both receive the echo: observer_a={:?} observer_b={:?} abandoned_input_count={} abandoned_inputs={:?}",
-                client.observer(subscription_a),
-                client.observer(subscription_b),
-                client.abandoned_input_count(),
-                client.abandoned_inputs().collect::<Vec<_>>()
-            );
-        }
-        let result = client
-            .observer_mut(subscription_b)
-            .expect("H-S4 B observer")
-            .take_result(operation_id)
-            .expect("H-S4 B result");
-        assert_eq!(result.outcome, InputOutcome::Written, "{result:?}");
+                .expect("H-S4 A observer after B input")
+                .state()
+                .marker_seen(),
+            "session B output must not appear on session A's route"
+        );
 
         let detached = client
             .request(&DaemonRequest::Detach {
-                session_id: session_id.to_string(),
+                session_id: session_a.to_string(),
                 subscription_id: subscription_a.to_string(),
             })
             .expect("detach H-S4 route A");
         assert_eq!(detached.kind, DaemonResponseKind::Events, "{detached:?}");
         wait_for_occupancy(&mut client, "H-S4 route A detached", |rows| {
-            !rows.iter().any(|row| {
-                row.session_id == session_id && row.subscription_id == subscription_a
-            }) && occupancy_has(rows, session_id, subscription_b, generation_b)
+            rows.len() == 1 && occupancy_has(rows, session_b, subscription_b, generation_b)
         });
         let stale_input =
             encode_input_with_operation_id(&raw_input(b"h-s4-stale-generation\r"), 1);
@@ -341,7 +364,7 @@ mod unix_route_smokes {
         wait_for_marker_and_result(&mut client, subscription_b, Some(operation_id));
         let screen = client
             .request(&DaemonRequest::ReadScreen {
-                session_id: session_id.to_string(),
+                session_id: session_a.to_string(),
             })
             .expect("read H-S4 screen after stale-generation input");
         assert_eq!(screen.kind, DaemonResponseKind::ReadScreen, "{screen:?}");
@@ -354,7 +377,8 @@ mod unix_route_smokes {
             "stale-generation input must not reach the PTY"
         );
         assert_eq!(client.abandoned_input_count(), 0);
-        shutdown_session(&mut client, session_id);
+        shutdown_session(&mut client, session_a);
+        shutdown_session(&mut client, session_b);
         drop(client);
         hub.shutdown().expect("shutdown H-S4 hub");
     }
