@@ -38,18 +38,18 @@ use crate::daemon::control::control_request_operation_label;
 use crate::daemon::control::message::{
     ControlMessage, ControlSender, daemon_delivery_kind, egress_write_class,
 };
-use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
-use crate::daemon::owner_loop::{DaemonControlState, tick};
 use crate::daemon::control::pending::retire_abandoned_requests;
+use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_budget::OwnerPermit;
+use crate::daemon::owner_loop::{DaemonControlState, tick};
 use crate::subscription::attach_routes::{
     AttachStreamOwner, AttachedSubscription, AttachedSubscriptionChange,
     apply_attached_subscription_change, attached_subscription_change_for_response,
 };
+use crate::subscription::entity::EntityFrameSender;
 use crate::subscription::route_cleanup::{
     CleanupCandidate, candidate_for_departing_owner, retain_route_cleanup,
 };
-use crate::subscription::entity::EntityFrameSender;
 use crate::transport::unix::UnixConnectionMux;
 use crate::transport::unix::listener::{NEXT_SOCKET_CLIENT_ID, daemon_endpoint};
 use crate::transport::unix::mux_write::{

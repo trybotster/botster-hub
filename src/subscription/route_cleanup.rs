@@ -11,7 +11,6 @@
 use botster_core::{ClientId, SessionId, SubscriptionId, TerminalSubscriptionGeneration};
 use botster_core_daemon::{CaptureOwner, CoreDaemon, DetachTerminalSubscriptionResult};
 
-use crate::HubDaemon;
 use crate::daemon::owner_budget::{CoreWorkPoll, ObligationPoll, OwnerPermit, drive_core_slot};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::data_plane::driver::CoreTicket;
@@ -367,7 +366,11 @@ mod tests {
             }],
             &mut applied,
         );
-        assert!(state.pending_runtime.stream_matches("s", "sub", &replacement));
+        assert!(
+            state
+                .pending_runtime
+                .stream_matches("s", "sub", &replacement)
+        );
         assert!(
             state
                 .pending_runtime
@@ -406,7 +409,10 @@ mod tests {
         let candidate =
             candidate_for_departing_owner(&state.pending_runtime, &owner("a"), "a", "s", "sub")
                 .expect("owned candidate");
-        assert_eq!(candidate.generation, Some(TerminalSubscriptionGeneration(1)));
+        assert_eq!(
+            candidate.generation,
+            Some(TerminalSubscriptionGeneration(1))
+        );
         let replacement = state
             .pending_runtime
             .start_attach(owner("a"), "s".into(), "sub".into());
@@ -460,8 +466,9 @@ mod tests {
                 None,
             );
         }
-        let owned = candidate_for_departing_owner(&state.pending_runtime, &owner("a"), "a", "s", "sub")
-            .expect("owned candidate");
+        let owned =
+            candidate_for_departing_owner(&state.pending_runtime, &owner("a"), "a", "s", "sub")
+                .expect("owned candidate");
         let streamless =
             candidate_for_departing_owner(&state.pending_runtime, &owner("a"), "a", "s", "gone")
                 .expect("streamless candidate");
@@ -523,8 +530,14 @@ mod tests {
             "sub".into(),
         );
         assert!(
-            candidate_for_departing_owner(&registry, &peer, "botster-hub-daemon-subscription-sub", "s", "sub")
-                .is_none()
+            candidate_for_departing_owner(
+                &registry,
+                &peer,
+                "botster-hub-daemon-subscription-sub",
+                "s",
+                "sub"
+            )
+            .is_none()
         );
     }
 

@@ -206,7 +206,12 @@ impl AttachStreamRegistry {
             .is_some_and(|stream| owner.matches(&stream.owner))
     }
 
-    pub(crate) fn acknowledge_route(&mut self, budget_key: &str, session_id: &str, subscription_id: &str) {
+    pub(crate) fn acknowledge_route(
+        &mut self,
+        budget_key: &str,
+        session_id: &str,
+        subscription_id: &str,
+    ) {
         self.acknowledged_routes
             .entry(budget_key.to_string())
             .or_default()
@@ -235,7 +240,10 @@ impl AttachStreamRegistry {
 
     /// Take every route key one owner was told it attached; cleanup covers
     /// them all, so nothing historical outlives the owner.
-    pub(crate) fn take_acknowledged_routes(&mut self, budget_key: &str) -> BTreeSet<(String, String)> {
+    pub(crate) fn take_acknowledged_routes(
+        &mut self,
+        budget_key: &str,
+    ) -> BTreeSet<(String, String)> {
         self.acknowledged_routes
             .remove(budget_key)
             .unwrap_or_default()
@@ -252,7 +260,11 @@ impl AttachStreamRegistry {
                 stream.owner.grant_id.as_deref() == Some(grant_id) && !stream.adapter_bound
             })
             .map(|((session_id, subscription_id), stream)| {
-                (session_id.clone(), subscription_id.clone(), stream.identity())
+                (
+                    session_id.clone(),
+                    subscription_id.clone(),
+                    stream.identity(),
+                )
             })
             .collect()
     }

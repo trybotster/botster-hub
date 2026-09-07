@@ -16,9 +16,9 @@ use crate::client_api_dto::response::{
 use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::daemon::control::pending::retire_abandoned_requests;
 use crate::daemon::control::runtime_client_id;
-use crate::daemon::owner_loop::tick;
 use crate::daemon::error::{DaemonTransportResult, local_webrtc_bootstrap_issue_error};
 use crate::daemon::owner_loop::DaemonControlState;
+use crate::daemon::owner_loop::tick;
 use crate::daemon_projection::app_local_url;
 use crate::subscription::attach_routes::{
     AttachStreamOwner, AttachedSubscription, AttachedSubscriptionChange,
@@ -320,7 +320,9 @@ pub(crate) fn handle_peer_closed(
         .collect();
     for removed in &removed_grants {
         route_keys.extend(state.pending_runtime.take_acknowledged_routes(removed));
-        for (session_id, subscription_id, _) in state.pending_runtime.unbound_routes_for_grant(removed) {
+        for (session_id, subscription_id, _) in
+            state.pending_runtime.unbound_routes_for_grant(removed)
+        {
             route_keys.insert((session_id, subscription_id));
         }
     }
@@ -357,10 +359,13 @@ pub(crate) fn handle_peer_closed(
     // Unbound streams of removed grants are cancelled now so a late attach
     // continuation finds an identity mismatch and releases its own generation.
     for removed in &removed_grants {
-        for (session_id, subscription_id, identity) in state.pending_runtime.unbound_routes_for_grant(removed) {
-            let _ = state
-                .pending_runtime
-                .cancel_stream_if(&session_id, &subscription_id, &identity);
+        for (session_id, subscription_id, identity) in
+            state.pending_runtime.unbound_routes_for_grant(removed)
+        {
+            let _ =
+                state
+                    .pending_runtime
+                    .cancel_stream_if(&session_id, &subscription_id, &identity);
         }
     }
     for subscription in &detach_list {

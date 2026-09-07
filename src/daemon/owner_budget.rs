@@ -45,15 +45,7 @@ pub(crate) const OWNER_BUDGET_EXHAUSTED: &str = "owner_budget_exhausted";
 /// One unit of the owner budget. Not `Clone`: it is returned through
 /// [`OwnerBudget::release`] or converted into an obligation.
 #[derive(Debug)]
-pub(crate) struct OwnerPermit {
-    owner: String,
-}
-
-impl OwnerPermit {
-    pub(crate) fn owner(&self) -> &str {
-        &self.owner
-    }
-}
+pub(crate) struct OwnerPermit(());
 
 /// Outcome of one obligation poll.
 pub(crate) enum ObligationPoll {
@@ -124,30 +116,26 @@ impl OwnerBudget {
         }
     }
 
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Permits held by connections, pending requests, and obligations.
+    /// Permits held by connections, peers, pending requests, and obligations.
+    #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
         self.outstanding
     }
 
+    #[cfg(test)]
     pub(crate) fn queued_obligations(&self) -> usize {
         self.obligations.len()
     }
 
     /// Reserve one permit, or refuse when the budget is exhausted.
     #[must_use]
-    pub(crate) fn reserve(&mut self, owner: impl Into<String>) -> Option<OwnerPermit> {
+    pub(crate) fn reserve(&mut self) -> Option<OwnerPermit> {
         if self.outstanding >= self.capacity {
             self.counters.refused = self.counters.refused.saturating_add(1);
             return None;
         }
         self.outstanding += 1;
-        Some(OwnerPermit {
-            owner: owner.into(),
-        })
+        Some(OwnerPermit(()))
     }
 
     pub(crate) fn release(&mut self, permit: OwnerPermit) {
@@ -160,13 +148,13 @@ impl OwnerBudget {
     /// be refused.
     #[must_use]
     pub(crate) fn reserve_connection(&mut self) -> Option<OwnerPermit> {
-        self.reserve("connection")
+        self.reserve()
     }
 
     /// Reserve the permit an admitted WebRTC peer holds until peer cleanup.
     #[must_use]
     pub(crate) fn reserve_peer(&mut self, grant_id: &str) -> bool {
-        match self.reserve(format!("peer:{grant_id}")) {
+        match self.reserve() {
             Some(permit) => {
                 self.peer_permits.insert(grant_id.to_string(), permit);
                 true
@@ -208,14 +196,6 @@ impl OwnerBudget {
             .filter(|obligation| !obligation.past_deadline)
             .map(|obligation| obligation.started + RETAINED_OPERATION_DEADLINE)
             .min()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn obligation_labels(&self) -> Vec<&'static str> {
-        self.obligations
-            .iter()
-            .map(|obligation| obligation.label)
-            .collect()
     }
 }
 
@@ -315,13 +295,13 @@ mod tests {
     #[test]
     fn budget_refuses_at_capacity_and_counts_it() {
         let mut budget = OwnerBudget::with_capacity(2);
-        let first = budget.reserve("a").expect("first");
-        let second = budget.reserve("b").expect("second");
-        assert!(budget.reserve("c").is_none());
+        let first = budget.reserve().expect("first");
+        let second = budget.reserve().expect("second");
+        assert!(budget.reserve().is_none());
         assert_eq!(budget.counters.refused, 1);
         assert_eq!(budget.outstanding(), 2);
         budget.release(first);
-        assert!(budget.reserve("c").is_some());
+        assert!(budget.reserve().is_some());
         budget.release(second);
     }
 
@@ -343,7 +323,7 @@ mod tests {
     #[test]
     fn nothing_creates_a_permit_past_capacity() {
         let mut budget = OwnerBudget::with_capacity(0);
-        assert!(budget.reserve("x").is_none());
+        assert!(budget.reserve().is_none());
         assert!(budget.reserve_connection().is_none());
         assert!(!budget.reserve_peer("grant"));
         assert!(budget.take_peer_permit("grant").is_none());
@@ -364,7 +344,7 @@ mod tests {
     fn deadline_is_the_earliest_unflagged_obligation() {
         let mut budget = OwnerBudget::with_capacity(2);
         assert!(budget.next_obligation_deadline().is_none());
-        let permit = budget.reserve("x").expect("permit");
+        let permit = budget.reserve().expect("permit");
         budget.retain(permit, "first", |_, _| ObligationPoll::Pending);
         let deadline = budget.next_obligation_deadline().expect("deadline");
         assert!(deadline > Instant::now());

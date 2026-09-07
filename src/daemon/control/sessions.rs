@@ -29,16 +29,15 @@ use crate::client_api_dto::session::lifecycle_label;
 use crate::daemon::control::pending::{ControlPoll, ControlStep};
 use crate::daemon::control::{DaemonObservability, request_id};
 use crate::daemon::error::DaemonTransportError;
+use crate::daemon::owner_budget::{
+    CoreWorkPoll, OWNER_BUDGET_EXHAUSTED, ObligationPoll, OwnerPermit, drive_core_slot,
+};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::shutdown::{
     ShutdownSessionClassification, begin_shutdown_classification, shutdown_error_response,
 };
-use crate::daemon::owner_budget::{
-    CoreWorkPoll, OWNER_BUDGET_EXHAUSTED, ObligationPoll, OwnerPermit, drive_core_slot,
-};
 use crate::data_plane::driver::{CoreTicket, CoreTicketError, CoreTicketPoll};
 use crate::runtime::core_bridge_error;
-use crate::subscription::route_cleanup::{ATTACH_ROUTE_LIMIT, owner_has_attach_capacity};
 use crate::runtime::{AttachBindFailure, AttachBindPlan, CoreOperationTracker};
 use crate::subscription::attach_routes::{
     AttachStreamOwner, BoundAdapterHandle, overlay_live_attach_occupancy,
@@ -47,6 +46,7 @@ use crate::subscription::closed_events::{
     suppress_unix_session_close_events, suppress_webrtc_session_close_events,
 };
 use crate::subscription::entity::entity_subscription_error;
+use crate::subscription::route_cleanup::{ATTACH_ROUTE_LIMIT, owner_has_attach_capacity};
 
 /// Typed operator error for one Core failure on a session request.
 /// Operator-facing text for one attach-and-bind failure, with the Core cause.
@@ -481,32 +481,35 @@ pub(crate) fn handle_runtime(
             let runtime = daemon.runtime().expect("runtime checked above");
             let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
             let id = request_id("daemon-sessions-read-screen");
-            let tracker = std::sync::Arc::new(std::sync::Mutex::new(
-                runtime.begin_read_screen(id.clone(), SessionId(session_id.clone()), now),
-            ));
+            let tracker = std::sync::Arc::new(std::sync::Mutex::new(runtime.begin_read_screen(
+                id.clone(),
+                SessionId(session_id.clone()),
+                now,
+            )));
             let retire_tracker = std::sync::Arc::clone(&tracker);
             ControlStep::pending_retirable(
                 move |daemon, _| {
-                let mut tracker = tracker.lock().expect("read tracker lock");
-                let completion = match poll_tracker(&mut tracker, daemon, "read_screen", &id.0) {
-                    Ok(completion) => completion,
-                    Err(poll) => return poll,
-                };
-                let CoreCompletion::ReadScreen { result, .. } = completion else {
-                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
-                };
-                ControlPoll::Ready(Ok(match result {
-                    Ok(screen) => {
-                        let mut response = daemon_response_base(DaemonResponseKind::ReadScreen);
-                        response.read_screen = Some(DaemonReadScreen {
-                            session_id: session_id.clone(),
-                            text: screen.text.to_string(),
-                            unavailable: history_unavailable(screen.unavailable),
-                        });
-                        response
-                    }
-                    Err(error) => core_operator_error("read_screen", &id.0, &error),
-                }))
+                    let mut tracker = tracker.lock().expect("read tracker lock");
+                    let completion = match poll_tracker(&mut tracker, daemon, "read_screen", &id.0)
+                    {
+                        Ok(completion) => completion,
+                        Err(poll) => return poll,
+                    };
+                    let CoreCompletion::ReadScreen { result, .. } = completion else {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                    };
+                    ControlPoll::Ready(Ok(match result {
+                        Ok(screen) => {
+                            let mut response = daemon_response_base(DaemonResponseKind::ReadScreen);
+                            response.read_screen = Some(DaemonReadScreen {
+                                session_id: session_id.clone(),
+                                text: screen.text.to_string(),
+                                unavailable: history_unavailable(screen.unavailable),
+                            });
+                            response
+                        }
+                        Err(error) => core_operator_error("read_screen", &id.0, &error),
+                    }))
                 },
                 move |_, state, permit| retain_operation_retirement(state, permit, retire_tracker),
             )
@@ -521,36 +524,37 @@ pub(crate) fn handle_runtime(
             let retire_tracker = std::sync::Arc::clone(&tracker);
             ControlStep::pending_retirable(
                 move |daemon, _| {
-                let mut tracker = tracker.lock().expect("read tracker lock");
-                let completion = match poll_tracker(&mut tracker, daemon, "read_mode_flags", &id.0)
-                {
-                    Ok(completion) => completion,
-                    Err(poll) => return poll,
-                };
-                let CoreCompletion::ReadModeFlags { result, .. } = completion else {
-                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
-                };
-                ControlPoll::Ready(Ok(match result {
-                    Ok(readback) => {
-                        let mode = readback.mode_flags;
-                        let mut response = daemon_response_base(DaemonResponseKind::ReadModeFlags);
-                        response.mode_flags = Some(DaemonModeFlags::new(
-                            session_id.clone(),
-                            mode.kitty_enabled,
-                            mode.cursor_visible,
-                            mode.bracketed_paste,
-                            mode.mouse_mode,
-                            mode.alt_screen,
-                            mode.focus_reporting,
-                            mode.application_cursor,
-                            readback.rows,
-                            readback.cols,
-                            history_unavailable(readback.unavailable),
-                        ));
-                        response
-                    }
-                    Err(error) => core_operator_error("read_mode_flags", &id.0, &error),
-                }))
+                    let mut tracker = tracker.lock().expect("read tracker lock");
+                    let completion =
+                        match poll_tracker(&mut tracker, daemon, "read_mode_flags", &id.0) {
+                            Ok(completion) => completion,
+                            Err(poll) => return poll,
+                        };
+                    let CoreCompletion::ReadModeFlags { result, .. } = completion else {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                    };
+                    ControlPoll::Ready(Ok(match result {
+                        Ok(readback) => {
+                            let mode = readback.mode_flags;
+                            let mut response =
+                                daemon_response_base(DaemonResponseKind::ReadModeFlags);
+                            response.mode_flags = Some(DaemonModeFlags::new(
+                                session_id.clone(),
+                                mode.kitty_enabled,
+                                mode.cursor_visible,
+                                mode.bracketed_paste,
+                                mode.mouse_mode,
+                                mode.alt_screen,
+                                mode.focus_reporting,
+                                mode.application_cursor,
+                                readback.rows,
+                                readback.cols,
+                                history_unavailable(readback.unavailable),
+                            ));
+                            response
+                        }
+                        Err(error) => core_operator_error("read_mode_flags", &id.0, &error),
+                    }))
                 },
                 move |_, state, permit| retain_operation_retirement(state, permit, retire_tracker),
             )
@@ -563,39 +567,43 @@ pub(crate) fn handle_runtime(
             // The tracker is shared with the retire hook: a retired capture
             // request cancels the pending operation or releases the capture
             // it produced, holding its permit until Core accepted that.
-            let tracker = std::sync::Arc::new(std::sync::Mutex::new(
-                runtime.begin_capture_snapshot(id.clone(), SessionId(session_id.clone()), now, owner),
-            ));
+            let tracker =
+                std::sync::Arc::new(std::sync::Mutex::new(runtime.begin_capture_snapshot(
+                    id.clone(),
+                    SessionId(session_id.clone()),
+                    now,
+                    owner,
+                )));
             let retire_tracker = std::sync::Arc::clone(&tracker);
             ControlStep::pending_retirable(
                 move |daemon, _| {
                     let mut tracker = tracker.lock().expect("capture tracker lock");
-                    let completion = match poll_tracker(&mut tracker, daemon, "capture_snapshot", &id.0)
-                    {
-                        Ok(completion) => completion,
-                        Err(poll) => return poll,
+                    let completion =
+                        match poll_tracker(&mut tracker, daemon, "capture_snapshot", &id.0) {
+                            Ok(completion) => completion,
+                            Err(poll) => return poll,
+                        };
+                    let CoreCompletion::CaptureSnapshot { result, .. } = completion else {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
                     };
-                let CoreCompletion::CaptureSnapshot { result, .. } = completion else {
-                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
-                };
-                ControlPoll::Ready(Ok(match result {
-                    Ok(capture) => {
-                        let mut response =
-                            daemon_response_base(DaemonResponseKind::CaptureSnapshot);
-                        response.capture_snapshot = Some(DaemonCaptureSnapshot {
-                            session_id: session_id.clone(),
-                            capture_id: capture.capture_id.0,
-                            total_bytes: capture.total_bytes,
-                            page_bytes: capture.page_bytes,
-                            pages: capture.pages,
-                            rows: capture.rows,
-                            cols: capture.cols,
-                            unavailable: history_unavailable(capture.unavailable),
-                        });
-                        response
-                    }
-                    Err(error) => core_operator_error("capture_snapshot", &id.0, &error),
-                }))
+                    ControlPoll::Ready(Ok(match result {
+                        Ok(capture) => {
+                            let mut response =
+                                daemon_response_base(DaemonResponseKind::CaptureSnapshot);
+                            response.capture_snapshot = Some(DaemonCaptureSnapshot {
+                                session_id: session_id.clone(),
+                                capture_id: capture.capture_id.0,
+                                total_bytes: capture.total_bytes,
+                                page_bytes: capture.page_bytes,
+                                pages: capture.pages,
+                                rows: capture.rows,
+                                cols: capture.cols,
+                                unavailable: history_unavailable(capture.unavailable),
+                            });
+                            response
+                        }
+                        Err(error) => core_operator_error("capture_snapshot", &id.0, &error),
+                    }))
                 },
                 move |_, state, permit| retain_operation_retirement(state, permit, retire_tracker),
             )
@@ -699,21 +707,28 @@ pub(crate) fn retain_exact_detach(
         None;
     state
         .budget
-        .retain(permit, "exact_generation_detach", move |daemon, state| {
-            match drive_core_slot(&mut slot, daemon, state, |runtime, state| {
-                let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
-                runtime.detach_terminal_subscription(
-                    ClientId(client_id.clone()),
-                    SessionId(session_id.clone()),
-                    SubscriptionId(subscription_id.clone()),
-                    generation,
-                    now,
-                )
-            }) {
+        .retain(
+            permit,
+            "exact_generation_detach",
+            move |daemon, state| match drive_core_slot(
+                &mut slot,
+                daemon,
+                state,
+                |runtime, state| {
+                    let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
+                    runtime.detach_terminal_subscription(
+                        ClientId(client_id.clone()),
+                        SessionId(session_id.clone()),
+                        SubscriptionId(subscription_id.clone()),
+                        generation,
+                        now,
+                    )
+                },
+            ) {
                 CoreWorkPoll::Pending => ObligationPoll::Pending,
                 CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
-            }
-        });
+            },
+        );
 }
 
 /// Retire one deferred Core operation whose request was abandoned: cancel
@@ -741,10 +756,7 @@ fn retain_operation_retirement(
                     CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
                 };
             }
-            let pending_id = tracker
-                .lock()
-                .expect("capture tracker lock")
-                .pending_id();
+            let pending_id = tracker.lock().expect("capture tracker lock").pending_id();
             if !cancel_requested && let Some(id) = pending_id {
                 match drive_core_slot(&mut cancel_slot, daemon, state, |runtime, _| {
                     runtime.cancel_core_operation(id)
@@ -759,10 +771,7 @@ fn retain_operation_retirement(
             let Some(runtime) = daemon.runtime() else {
                 return ObligationPoll::Done;
             };
-            let poll = tracker
-                .lock()
-                .expect("capture tracker lock")
-                .poll(runtime);
+            let poll = tracker.lock().expect("capture tracker lock").poll(runtime);
             match poll {
                 CoreTicketPoll::Pending => ObligationPoll::Pending,
                 CoreTicketPoll::Lost | CoreTicketPoll::Refused | CoreTicketPoll::Ready(Err(_)) => {
@@ -876,18 +885,14 @@ fn handle_attach(
             return ControlStep::ready(attach_route_limit_error());
         }
         // Reserve the cleanup permit before Core work exists for this attach.
-        let Some(cleanup_permit) = state
-            .budget
-            .reserve(format!("attach-cleanup:{client_id}"))
-        else {
+        let Some(cleanup_permit) = state.budget.reserve() else {
             return ControlStep::ready(owner_budget_error());
         };
         let mut cleanup_permit = Some(cleanup_permit);
-        let identity = state.pending_runtime.start_attach(
-            owner,
-            session_id.clone(),
-            subscription_id.clone(),
-        );
+        let identity =
+            state
+                .pending_runtime
+                .start_attach(owner, session_id.clone(), subscription_id.clone());
         let runtime = daemon.runtime().expect("runtime checked by caller");
         let mut ticket = runtime.attach_route(
             ClientId(client_id.clone()),
@@ -1030,10 +1035,7 @@ fn handle_attach(
         return ControlStep::ready(attach_route_limit_error());
     }
     // Reserve the cleanup permit before Core work exists for this attach.
-    let Some(cleanup_permit) = state
-        .budget
-        .reserve(format!("attach-cleanup:{client_id}"))
-    else {
+    let Some(cleanup_permit) = state.budget.reserve() else {
         return ControlStep::ready(owner_budget_error());
     };
     let mut cleanup_permit = Some(cleanup_permit);

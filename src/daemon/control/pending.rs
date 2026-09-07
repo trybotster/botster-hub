@@ -152,7 +152,8 @@ fn retire(
         (Some(permit), None) => state.budget.release(permit),
         (None, _) => {}
     }
-    state.budget.counters.retired_abandoned = state.budget.counters.retired_abandoned.saturating_add(1);
+    state.budget.counters.retired_abandoned =
+        state.budget.counters.retired_abandoned.saturating_add(1);
     *state
         .lifecycle_counters
         .cleanup_by_reason
@@ -210,7 +211,8 @@ pub(crate) fn poll_pending_requests(
             retained.push(entry);
             continue;
         }
-        let expired = now.saturating_duration_since(entry.accepted_at) >= RETAINED_OPERATION_DEADLINE;
+        let expired =
+            now.saturating_duration_since(entry.accepted_at) >= RETAINED_OPERATION_DEADLINE;
         if !entry.must_finish && entry.reply_tx.is_closed() {
             retire(daemon, state, entry, "reply_closed");
             continue;
@@ -223,8 +225,11 @@ pub(crate) fn poll_pending_requests(
         // excluded from the wake calculation, so it cannot busy-wake.
         if expired && !entry.past_deadline {
             entry.past_deadline = true;
-            state.budget.counters.requests_past_deadline =
-                state.budget.counters.requests_past_deadline.saturating_add(1);
+            state.budget.counters.requests_past_deadline = state
+                .budget
+                .counters
+                .requests_past_deadline
+                .saturating_add(1);
             *state
                 .lifecycle_counters
                 .cleanup_by_reason
