@@ -50,17 +50,31 @@ pub(crate) struct AttachStreamOwner {
     pub grant_id: Option<String>,
 }
 
+/// Identity of one attach stream: the owning client and the registry epoch
+/// assigned when the stream started. A route key can be reused by a
+/// replacement stream (same client after a reattach, or another client); the
+/// epoch is never reused. Every deferred continuation (attach, bind,
+/// cleanup) captures the identity when it starts and must match it before
+/// mutating the stream, so a late completion cannot touch a replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttachmentIdentity {
+    pub client_id: String,
+    pub epoch: u64,
+}
+
 pub(crate) struct AttachStream {
     owner: AttachStreamOwner,
+    epoch: u64,
     generation: Option<TerminalSubscriptionGeneration>,
     adapter_bound: bool,
     adapter: Option<BoundAdapterHandle>,
 }
 
 impl AttachStream {
-    fn new(owner: AttachStreamOwner) -> Self {
+    fn new(owner: AttachStreamOwner, epoch: u64) -> Self {
         Self {
             owner,
+            epoch,
             generation: None,
             adapter_bound: false,
             adapter: None,
@@ -69,6 +83,13 @@ impl AttachStream {
 
     pub(crate) fn owner_client_id(&self) -> String {
         self.owner.client_id.clone()
+    }
+
+    fn identity(&self) -> AttachmentIdentity {
+        AttachmentIdentity {
+            client_id: self.owner.client_id.clone(),
+            epoch: self.epoch,
+        }
     }
 
     fn close_adapter(&mut self) {
@@ -89,6 +110,7 @@ pub(crate) struct InventoryReconcileProgress {
 #[derive(Default)]
 pub(crate) struct AttachStreamRegistry {
     streams: BTreeMap<(String, String), AttachStream>,
+    next_epoch: u64,
     pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
     pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
     pub(crate) live_attach_routes: BTreeSet<(String, String)>,
@@ -96,12 +118,15 @@ pub(crate) struct AttachStreamRegistry {
 }
 
 impl AttachStreamRegistry {
+    /// Start one attach stream and return its identity. Any earlier stream on
+    /// the route is cancelled, so a continuation holding the old identity
+    /// finds a mismatch afterwards.
     pub(crate) fn start_attach(
         &mut self,
         owner: AttachStreamOwner,
         session_id: String,
         subscription_id: String,
-    ) {
+    ) -> AttachmentIdentity {
         self.cancel_stream(&session_id, &subscription_id);
         if let Some(grant_id) = owner.grant_id.clone() {
             self.attach_owner_grant_ids
@@ -111,10 +136,117 @@ impl AttachStreamRegistry {
             .entry(session_id.clone())
             .or_default()
             .insert(subscription_id.clone());
-        self.streams
-            .insert((session_id, subscription_id), AttachStream::new(owner));
+        self.next_epoch += 1;
+        let stream = AttachStream::new(owner, self.next_epoch);
+        let identity = stream.identity();
+        self.streams.insert((session_id, subscription_id), stream);
+        identity
     }
 
+    pub(crate) fn stream_identity(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> Option<AttachmentIdentity> {
+        self.streams
+            .get(&(session_id.to_string(), subscription_id.to_string()))
+            .map(AttachStream::identity)
+    }
+
+    /// True when the route is still owned by exactly this attachment.
+    #[must_use]
+    pub(crate) fn stream_matches(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        identity: &AttachmentIdentity,
+    ) -> bool {
+        self.stream_identity(session_id, subscription_id).as_ref() == Some(identity)
+    }
+
+    /// Streams one client owns that never bound an adapter. Cleanup cancels
+    /// them before the Core turn so a late completion sees the mismatch.
+    pub(crate) fn unbound_routes_for_client(
+        &self,
+        client_id: &str,
+    ) -> Vec<(String, String, AttachmentIdentity)> {
+        self.streams
+            .iter()
+            .filter(|(_, stream)| stream.owner.client_id == client_id && !stream.adapter_bound)
+            .map(|((session_id, subscription_id), stream)| {
+                (session_id.clone(), subscription_id.clone(), stream.identity())
+            })
+            .collect()
+    }
+
+    /// Cancel the stream only when it is still this attachment. Returns
+    /// whether anything was removed.
+    #[must_use]
+    pub(crate) fn cancel_stream_if(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        identity: &AttachmentIdentity,
+    ) -> bool {
+        if !self.stream_matches(session_id, subscription_id, identity) {
+            return false;
+        }
+        self.cancel_stream(session_id, subscription_id);
+        true
+    }
+
+    /// Close the bound adapter only when the stream is still this attachment.
+    #[must_use]
+    pub(crate) fn close_adapter_if(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        identity: &AttachmentIdentity,
+    ) -> bool {
+        if !self.stream_matches(session_id, subscription_id, identity) {
+            return false;
+        }
+        self.close_adapter(session_id, subscription_id);
+        true
+    }
+
+    /// Record the Core generation only when the stream is still this
+    /// attachment.
+    #[must_use]
+    pub(crate) fn record_generation_if(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        identity: &AttachmentIdentity,
+        generation: TerminalSubscriptionGeneration,
+    ) -> bool {
+        if !self.stream_matches(session_id, subscription_id, identity) {
+            return false;
+        }
+        self.record_generation(session_id, subscription_id, generation);
+        true
+    }
+
+    /// Bind the adapter only when the stream is still this attachment. A
+    /// `false` return leaves the registry untouched; the caller owns the
+    /// handle and the Core generation it was bound with.
+    #[must_use]
+    pub(crate) fn mark_adapter_bound_if(
+        &mut self,
+        session_id: &str,
+        subscription_id: &str,
+        identity: &AttachmentIdentity,
+        generation: TerminalSubscriptionGeneration,
+        adapter: BoundAdapterHandle,
+    ) -> bool {
+        if !self.stream_matches(session_id, subscription_id, identity) {
+            return false;
+        }
+        self.mark_adapter_bound(session_id, subscription_id, generation, adapter);
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) fn stream_owner_client_id(
         &self,
         session_id: &str,
@@ -743,12 +875,12 @@ mod tests {
                 generation,
                 BoundAdapterHandle::Unix(handle.clone()),
             );
-            mux.register(
+            assert!(mux.register(
                 session_id.0.clone(),
                 subscription_id.to_string(),
                 generation.0,
                 handle,
-            );
+            ));
         }
 
         let lost_generation = registry
@@ -953,6 +1085,119 @@ mod tests {
         registry.cancel_stream("s", "sub");
         assert_eq!(registry.stream_owner_client_id("s", "sub"), None);
         assert!(!registry.active_subscriptions.contains_key("s"));
+    }
+
+    /// H2: the attaching connection is cleaned up before its deferred attach
+    /// completes. The late completion holds the original identity and must
+    /// not bind, and a replacement on the same route key is untouched.
+    #[test]
+    fn late_attach_completion_after_disconnect_cannot_bind_or_touch_a_replacement() {
+        let mut registry = AttachStreamRegistry::default();
+        let stale = registry.start_attach(owner(), "s".into(), "sub".into());
+        // Connection cleanup cancels the client's unbound streams first.
+        let pending = registry.unbound_routes_for_client("client-a");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].2, stale);
+        assert!(registry.cancel_stream_if("s", "sub", &stale));
+        assert!(!registry.stream_matches("s", "sub", &stale));
+
+        // A replacement client attaches the same route key.
+        let replacement = registry.start_attach(
+            AttachStreamOwner {
+                client_id: "client-b".to_string(),
+                grant_id: None,
+            },
+            "s".into(),
+            "sub".into(),
+        );
+        assert_ne!(replacement, stale);
+        assert_ne!(replacement.epoch, stale.epoch);
+
+        // The stale continuation now completes: every checked mutation refuses.
+        let (_, handle) = UnixTerminalAdapter::pair();
+        assert!(!registry.record_generation_if(
+            "s",
+            "sub",
+            &stale,
+            TerminalSubscriptionGeneration(7)
+        ));
+        assert!(!registry.mark_adapter_bound_if(
+            "s",
+            "sub",
+            &stale,
+            TerminalSubscriptionGeneration(7),
+            BoundAdapterHandle::Unix(handle),
+        ));
+        assert!(!registry.cancel_stream_if("s", "sub", &stale));
+        assert!(!registry.close_adapter_if("s", "sub", &stale));
+        assert!(registry.stream_matches("s", "sub", &replacement));
+        assert!(!registry.is_adapter_bound("s", "sub"));
+        assert_eq!(registry.recorded_generation("s", "sub"), None);
+        assert_eq!(
+            registry.stream_owner_client_id("s", "sub").as_deref(),
+            Some("client-b")
+        );
+        assert!(registry.take_connection_bound_routes("client-a").is_empty());
+    }
+
+    /// H3: cleanup for a closed connection reports back after a replacement
+    /// bound the same route key. Identity-checked close and cancel must leave
+    /// the replacement's adapter bound; the same identity rule applies to the
+    /// same client reattaching (a new epoch) as to a different client.
+    #[test]
+    fn delayed_old_cleanup_does_not_close_a_replacement_route() {
+        for replacement_client in ["client-a", "client-b"] {
+            let mut registry = AttachStreamRegistry::default();
+            let old = registry.start_attach(owner(), "s".into(), "sub".into());
+            let (_, old_handle) = UnixTerminalAdapter::pair();
+            assert!(registry.mark_adapter_bound_if(
+                "s",
+                "sub",
+                &old,
+                TerminalSubscriptionGeneration(1),
+                BoundAdapterHandle::Unix(old_handle),
+            ));
+            // Cleanup takes the old connection's bound routes and captures
+            // the identity before its Core turn.
+            let taken = registry.take_connection_bound_routes("client-a");
+            assert_eq!(taken.len(), 1);
+            let captured = registry.stream_identity("s", "sub").expect("old stream");
+            assert_eq!(captured, old);
+
+            // Meanwhile a replacement attaches and binds the same key.
+            let replacement = registry.start_attach(
+                AttachStreamOwner {
+                    client_id: replacement_client.to_string(),
+                    grant_id: None,
+                },
+                "s".into(),
+                "sub".into(),
+            );
+            let (_, new_handle) = UnixTerminalAdapter::pair();
+            assert!(registry.mark_adapter_bound_if(
+                "s",
+                "sub",
+                &replacement,
+                TerminalSubscriptionGeneration(2),
+                BoundAdapterHandle::Unix(new_handle.clone()),
+            ));
+
+            // The delayed cleanup outcome arrives with the captured identity.
+            assert!(!registry.stream_matches("s", "sub", &captured));
+            assert!(!registry.close_adapter_if("s", "sub", &captured));
+            assert!(!registry.cancel_stream_if("s", "sub", &captured));
+            assert!(
+                registry.is_adapter_bound("s", "sub"),
+                "replacement by {replacement_client} stays bound"
+            );
+            assert!(!new_handle.is_closed());
+            assert_eq!(
+                registry.recorded_generation("s", "sub"),
+                Some(TerminalSubscriptionGeneration(2))
+            );
+            let bound = registry.take_connection_bound_routes(replacement_client);
+            assert_eq!(bound.len(), 1, "the replacement keeps its bound route claim");
+        }
     }
 
     #[test]

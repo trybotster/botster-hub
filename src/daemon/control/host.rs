@@ -217,7 +217,7 @@ pub(crate) fn handle_runtime(
             ControlStep::pending(move |daemon, _| {
                 let accounting = match ticket.poll() {
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
-                    CoreTicketPoll::Lost => None,
+                    CoreTicketPoll::Lost | CoreTicketPoll::Refused => None,
                     CoreTicketPoll::Ready(accounting) => Some(accounting),
                 };
                 let Some(runtime) = daemon.runtime() else {

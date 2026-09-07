@@ -243,14 +243,24 @@ impl UnixConnectionMux {
         UnixTerminalAdapter::pair_with_wake_and_close_work(self.inner.wake.clone(), close_work)
     }
 
+    /// Register one bound route. Returns `false` without registering when
+    /// the connection is already dying, so a late bind cannot outlive
+    /// `close_all`.
+    #[must_use]
     pub(crate) fn register(
         &self,
         session_id: String,
         subscription_id: String,
         generation: u64,
         handle: UnixTerminalAdapterHandle,
-    ) {
+    ) -> bool {
         if let Ok(mut routes) = self.inner.routes.lock() {
+            // Checked under the routes lock: `close_all` sets `dying` before it
+            // drains the map, so a registration either lands before the drain
+            // or is refused here.
+            if self.inner.dying.load(Ordering::SeqCst) {
+                return false;
+            }
             let key = (session_id.clone(), subscription_id.clone(), generation);
             routes.insert(
                 key,
@@ -277,6 +287,7 @@ impl UnixConnectionMux {
             handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
         }
         self.inner.wake.wake();
+        true
     }
 
     #[cfg(test)]
@@ -576,6 +587,24 @@ mod tests {
     };
     use botster_terminal_protocol::{RouteId, encode_output};
 
+    /// H2: a bind that lands after the connection mux started dying must be
+    /// refused, so the route never outlives `close_all`.
+    #[test]
+    fn dying_mux_refuses_late_registration() {
+        let mux = UnixConnectionMux::new();
+        let (_adapter, early) = mux.create_adapter();
+        assert!(mux.register("s".to_string(), "early".to_string(), 1, early.clone()));
+        mux.close_all();
+        assert!(mux.is_dying());
+        assert!(early.is_closed(), "close_all closes registered routes");
+        let (_late_adapter, late) = mux.create_adapter();
+        assert!(
+            !mux.register("s".to_string(), "late".to_string(), 2, late.clone()),
+            "a dying mux fails registration closed"
+        );
+        assert!(mux.route_handle("s", "late", 2).is_none());
+    }
+
     pub(crate) fn output_frame(route: &str, marker: &str) -> RoutedTerminalFrame {
         RoutedTerminalFrame::new(
             RouteId::new(route).expect("route"),
@@ -672,7 +701,7 @@ mod tests {
     fn deferred_route_is_omitted_from_snapshot_writes() {
         let mux = UnixConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter();
-        mux.register("stall".to_string(), "sub".to_string(), 1, handle.clone());
+        assert!(mux.register("stall".to_string(), "sub".to_string(), 1, handle.clone()));
         assert_eq!(adapter.try_write(&output_frame("sub", "flood")), Ok(()));
         assert_eq!(mux.snapshot_writes().len(), 1);
         handle.defer_flush();
@@ -702,7 +731,7 @@ mod tests {
     fn ingress_lookup_requires_the_live_generation() {
         let mux = UnixConnectionMux::new();
         let (_adapter, handle) = mux.create_adapter();
-        mux.register("session".to_string(), "sub".to_string(), 3, handle.clone());
+        assert!(mux.register("session".to_string(), "sub".to_string(), 3, handle.clone()));
         assert!(mux.live_handle_for_route("sub", 3).is_some());
         assert!(
             mux.live_handle_for_route("sub", 2).is_none(),
@@ -741,24 +770,24 @@ mod tests {
         let mut open_adapters = Vec::new();
         for index in 0..8 {
             let (adapter, handle) = mux.create_adapter();
-            mux.register(format!("open-{index:02}"), "sub".to_string(), 1, handle);
+            assert!(mux.register(format!("open-{index:02}"), "sub".to_string(), 1, handle));
             open_adapters.push(adapter);
         }
         let mut reported_handles = Vec::new();
         for index in 0..4 {
             let (_adapter, handle) = mux.create_adapter();
-            mux.register(
+            assert!(mux.register(
                 format!("reported-{index:02}"),
                 "sub".to_string(),
                 1,
                 handle.clone(),
-            );
+            ));
             handle.close();
             reported_handles.push(handle);
         }
         assert_eq!(mux.queue_closed_subscription_events(|_| true), 4);
         let (_closed_adapter, closed) = mux.create_adapter();
-        mux.register("z-closed".to_string(), "sub".to_string(), 1, closed.clone());
+        assert!(mux.register("z-closed".to_string(), "sub".to_string(), 1, closed.clone()));
         closed.close();
         let first = mux.queue_closed_subscription_events_bounded(|_| Some(true), 8, None, 8);
         assert_eq!(first.classified, 0);

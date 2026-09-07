@@ -21,6 +21,7 @@ use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_loop::tick;
 use crate::data_plane::driver::CoreTicketPoll;
 use crate::runtime::BindRoutePlan;
+use crate::daemon::control::sessions::schedule_exact_generation_detach;
 use crate::subscription::attach_routes::{BoundAdapterHandle, negotiated_unix_capability_set};
 
 pub(crate) fn handle(
@@ -367,9 +368,11 @@ fn bind_reserved_subscription(
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
     };
-    let Some(client_id) = state
+    // The attachment identity captured here fences the deferred completion:
+    // a replacement stream on the same route has a different epoch.
+    let Some(identity) = state
         .pending_runtime
-        .stream_owner_client_id(&reservation.session_id, &reservation.subscription_id)
+        .stream_identity(&reservation.session_id, &reservation.subscription_id)
     else {
         retire_reserved_subscription(daemon, state, &grant_id, &label);
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
@@ -397,8 +400,9 @@ fn bind_reserved_subscription(
     let generation = botster_core::TerminalSubscriptionGeneration(reservation.generation);
     let (adapter, handle) = mux.create_adapter_with_aggregate(aggregate);
     // The bind runs on the Core owner thread; the reply follows as owner work.
+    let client_id = identity.client_id.clone();
     let mut ticket = runtime.bind_route_adapter(BindRoutePlan {
-        client_id: botster_core::ClientId(client_id),
+        client_id: botster_core::ClientId(client_id.clone()),
         session_id: botster_core::SessionId(reservation.session_id.clone()),
         subscription_id: botster_core::SubscriptionId(reservation.subscription_id.clone()),
         generation,
@@ -415,38 +419,78 @@ fn bind_reserved_subscription(
         .push(Box::new(move |daemon, state| {
             let bound = match ticket.poll() {
                 CoreTicketPoll::Pending => return false,
-                CoreTicketPoll::Lost => false,
+                CoreTicketPoll::Lost | CoreTicketPoll::Refused => false,
                 CoreTicketPoll::Ready(result) => result.is_ok(),
             };
             let (Some(reply_tx), Some(usage)) = (reply_tx.take(), usage.take()) else {
                 return true;
             };
-            if bound {
-                state.pending_runtime.mark_adapter_bound(
-                    &session_id,
-                    &subscription_id,
-                    generation,
-                    BoundAdapterHandle::WebRtc(handle.clone()),
-                );
-                mux.register(
-                    session_id.clone(),
-                    subscription_id.clone(),
-                    generation.0,
-                    handle.clone(),
-                );
-                let _ = state
-                    .pending_runtime
-                    .admission
-                    .reservations
-                    .mark_bound(&label, peer_generation);
-                let _ = reply_tx.send(Ok(BoundSubscription::Terminal {
-                    handle: handle.clone(),
-                    usage,
-                }));
-            } else {
+            if !bound {
                 handle.close();
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
                 let _ = reply_tx.send(Err(BindReservedError::BindFailed));
+                return true;
+            }
+            // The adapter is bound in Core. Fence every owner-side mutation
+            // on the attachment identity and on the reservation still being
+            // live; on any failure release exactly this generation.
+            let still_owned = state
+                .pending_runtime
+                .stream_matches(&session_id, &subscription_id, &identity);
+            let reservation_bound = still_owned
+                && state
+                    .pending_runtime
+                    .admission
+                    .reservations
+                    .mark_bound(&label, peer_generation)
+                    .is_some();
+            if !reservation_bound {
+                handle.close();
+                schedule_exact_generation_detach(
+                    state,
+                    client_id.clone(),
+                    session_id.clone(),
+                    subscription_id.clone(),
+                    generation,
+                );
+                retire_reserved_subscription(daemon, state, &grant_id, &label);
+                let _ = reply_tx.send(Err(BindReservedError::BindFailed));
+                return true;
+            }
+            let registered = state.pending_runtime.mark_adapter_bound_if(
+                &session_id,
+                &subscription_id,
+                &identity,
+                generation,
+                BoundAdapterHandle::WebRtc(handle.clone()),
+            );
+            debug_assert!(registered, "identity matched under the same owner turn");
+            mux.register(
+                session_id.clone(),
+                subscription_id.clone(),
+                generation.0,
+                handle.clone(),
+            );
+            if reply_tx
+                .send(Ok(BoundSubscription::Terminal {
+                    handle: handle.clone(),
+                    usage,
+                }))
+                .is_err()
+            {
+                // The channel gave up waiting: nobody will drive this
+                // adapter. Undo the bind for exactly this attachment.
+                let _ = state
+                    .pending_runtime
+                    .cancel_stream_if(&session_id, &subscription_id, &identity);
+                schedule_exact_generation_detach(
+                    state,
+                    client_id.clone(),
+                    session_id.clone(),
+                    subscription_id.clone(),
+                    generation,
+                );
+                retire_reserved_subscription(daemon, state, &grant_id, &label);
             }
             true
         }));

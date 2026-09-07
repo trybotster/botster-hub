@@ -1,9 +1,12 @@
 //! Unix listener, socket ownership, and accept-loop admission.
 //!
 //! Hub proves socket ownership with a nonblocking `flock` on `<socket>.owner`
-//! held for its lifetime. A socket path is reused only when the lock is held,
-//! the path is a socket owned by this user inside a directory this user owns,
-//! and nothing accepts connections on it. Any other existing path fails closed.
+//! held for its lifetime. The lock file inode is persistent: ownership is
+//! released by closing the locked descriptor, never by unlinking the path, so
+//! every contender locks the same inode and exclusivity cannot split. A socket
+//! path is reused only when the lock is held, the path is a socket owned by
+//! this user inside a directory this user owns, and nothing accepts
+//! connections on it. Any other existing path fails closed.
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
@@ -37,7 +40,8 @@ pub(crate) const SOCKET_OWNER_LOCK_SUFFIX: &str = ".owner";
 
 /// Exclusive ownership of one Hub socket path for this process lifetime.
 ///
-/// Dropping the lock releases the `flock` and removes the lock file.
+/// Dropping the lock closes the descriptor, which releases the `flock`. The
+/// lock file stays on disk so the next contender locks the same inode.
 pub(crate) struct SocketOwnerLock {
     file: fs::File,
     path: PathBuf,
@@ -63,8 +67,9 @@ impl SocketOwnerLock {
 
 impl Drop for SocketOwnerLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-        // Closing the file releases the lock.
+        // Closing the descriptor releases the lock. The pathname is kept: an
+        // unlink here would let one contender lock the orphaned inode while
+        // another locks a fresh file at the same path.
         let _ = self.file.sync_all();
     }
 }
@@ -313,8 +318,51 @@ mod tests {
         ));
         drop(first);
         let second = acquire_socket_owner_lock(&socket).expect("lock after release");
+        let lock_path = second.path().to_path_buf();
         drop(second);
-        assert!(!SocketOwnerLock::lock_path(&socket).exists());
+        assert!(
+            lock_path.exists(),
+            "the lock inode stays on disk so contenders share it"
+        );
+        let _ = fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn contender_holding_the_original_inode_excludes_a_later_contender() {
+        let socket = temp_socket_path("split");
+        let owner = acquire_socket_owner_lock(&socket).expect("owner lock");
+        // A contender opens the lock file while the owner still holds it.
+        let early = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(SocketOwnerLock::lock_path(&socket))
+            .expect("open the owner's lock inode");
+        // SAFETY: `flock` on an open descriptor with integer flags.
+        assert_ne!(
+            unsafe { libc::flock(early.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the owner still holds the lock"
+        );
+        drop(owner);
+        // The early contender now takes the same inode.
+        assert_eq!(
+            unsafe { libc::flock(early.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the released inode is lockable by the early contender"
+        );
+        // A later contender must see that lock, not create a second inode.
+        assert!(
+            matches!(
+                acquire_socket_owner_lock(&socket),
+                Err(DaemonTransportError::AlreadyRunning)
+            ),
+            "a later contender must contend on the same inode"
+        );
+        drop(early);
+        let later = acquire_socket_owner_lock(&socket).expect("lock after the early contender");
+        let lock_path = later.path().to_path_buf();
+        drop(later);
+        let _ = fs::remove_file(lock_path);
     }
 
     #[test]
