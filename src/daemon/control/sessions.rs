@@ -49,6 +49,7 @@ use crate::subscription::entity::entity_subscription_error;
 use crate::subscription::route_cleanup::{
     ATTACH_ROUTE_LIMIT, release_failed_attach_route, reserve_attach_route,
 };
+use crate::subscription::attach_routes::RouteReservation;
 
 /// Typed operator error for one Core failure on a session request.
 /// Operator-facing text for one attach-and-bind failure, with the Core cause.
@@ -885,7 +886,9 @@ fn handle_attach(
         }
         // Reserve the route key and the cleanup permit before any Core work
         // exists for this attach; both are released on every failure path.
-        if !reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id) {
+        let reservation =
+            reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id);
+        if reservation == RouteReservation::Full {
             return ControlStep::ready(attach_route_limit_error());
         }
         let Some(cleanup_permit) = state.budget.reserve() else {
@@ -894,6 +897,7 @@ fn handle_attach(
                 &owner,
                 &session_id,
                 &subscription_id,
+                reservation,
             );
             return ControlStep::ready(owner_budget_error());
         };
@@ -936,6 +940,7 @@ fn handle_attach(
                         &owner,
                         &session_id,
                         &subscription_id,
+                        reservation,
                     );
                     return ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                         "invalid_request",
@@ -964,6 +969,7 @@ fn handle_attach(
                     &owner,
                     &session_id,
                     &subscription_id,
+                    reservation,
                 );
                 return ControlPoll::Ready(Ok(stale_attach_error()));
             }
@@ -1036,6 +1042,7 @@ fn handle_attach(
                         &owner,
                         &session_id,
                         &subscription_id,
+                        reservation,
                     );
                     ControlPoll::Ready(Ok(error))
                 }
@@ -1061,7 +1068,8 @@ fn handle_attach(
     };
     // Reserve the route key and the cleanup permit before any Core work
     // exists for this attach; both are released on every failure path.
-    if !reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id) {
+    let reservation = reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id);
+    if reservation == RouteReservation::Full {
         return ControlStep::ready(attach_route_limit_error());
     }
     let Some(cleanup_permit) = state.budget.reserve() else {
@@ -1070,6 +1078,7 @@ fn handle_attach(
             &owner,
             &session_id,
             &subscription_id,
+            reservation,
         );
         return ControlStep::ready(owner_budget_error());
     };
@@ -1142,6 +1151,7 @@ fn handle_attach(
                         &owner,
                         &session_id,
                         &subscription_id,
+                        reservation,
                     );
                     return ControlPoll::Ready(Ok(stale_attach_error()));
                 }
@@ -1167,6 +1177,7 @@ fn handle_attach(
                     &owner,
                     &session_id,
                     &subscription_id,
+                    reservation,
                 );
                 ControlPoll::Ready(Ok(super::attach_bind_operator_error(
                     "invalid_request",

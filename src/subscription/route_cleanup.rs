@@ -294,24 +294,30 @@ pub(crate) fn reserve_attach_route(
     owner: &AttachStreamOwner,
     session_id: &str,
     subscription_id: &str,
-) -> bool {
+) -> RouteReservation {
     registry.reserve_route(
         &owner.budget_key(),
         session_id,
         subscription_id,
         MAX_ATTACH_ROUTES_PER_OWNER,
-    ) != RouteReservation::Full
+    )
 }
 
-/// Release a route key after an attach failed, unless a stream of this
-/// owner still holds the key (a newer attach of the same route).
+/// Roll back only the reservation a failed attach acquired: a key this
+/// attempt inserted is released, unless a stream of the owner holds it now
+/// (a newer attach of the same route). A key the owner already held
+/// (acknowledged history or an earlier attach) is untouched, so a failed
+/// reattach never drops cleanup coverage for the earlier attachment.
 pub(crate) fn release_failed_attach_route(
     registry: &mut crate::subscription::attach_routes::AttachStreamRegistry,
     owner: &AttachStreamOwner,
     session_id: &str,
     subscription_id: &str,
+    reservation: RouteReservation,
 ) {
-    if !registry.stream_owner_matches(session_id, subscription_id, owner) {
+    if reservation == RouteReservation::Inserted
+        && !registry.stream_owner_matches(session_id, subscription_id, owner)
+    {
         registry.release_route(&owner.budget_key(), session_id, subscription_id);
     }
 }
@@ -561,59 +567,73 @@ mod tests {
     }
 
     /// Reserved (pending) keys count with live and acknowledged keys, so
-    /// concurrent attaches cannot exceed the cap; a failed attach releases
-    /// its key only when no stream of the owner still holds it.
+    /// concurrent attaches cannot exceed the cap.
     #[test]
     fn attach_reservation_is_a_bounded_union_per_owner() {
         let mut registry = crate::subscription::attach_routes::AttachStreamRegistry::default();
         let unix = owner("a");
         for index in 0..MAX_ATTACH_ROUTES_PER_OWNER {
-            assert!(reserve_attach_route(
-                &mut registry,
-                &unix,
-                &format!("s{index}"),
-                "sub"
-            ));
+            assert_eq!(
+                reserve_attach_route(&mut registry, &unix, &format!("s{index}"), "sub"),
+                RouteReservation::Inserted
+            );
         }
+        assert_eq!(registry.stream_count_for_owner(&unix), 0);
         assert_eq!(
-            registry.stream_count_for_owner(&unix),
-            0,
-            "pending keys alone fill the cap"
+            reserve_attach_route(&mut registry, &unix, "overflow", "sub"),
+            RouteReservation::Full
         );
-        assert!(!reserve_attach_route(
-            &mut registry,
-            &unix,
-            "overflow",
-            "sub"
-        ));
-        assert!(reserve_attach_route(
-            &mut registry,
-            &owner("b"),
-            "overflow",
-            "sub"
-        ));
-        // Re-attaching a held key is not a new reservation.
-        assert!(reserve_attach_route(&mut registry, &unix, "s0", "sub"));
-        // A failed attach releases the key unless a live stream holds it.
-        registry.start_attach(unix.clone(), "s0".into(), "sub".into());
-        release_failed_attach_route(&mut registry, &unix, "s0", "sub");
-        assert!(!reserve_attach_route(
-            &mut registry,
-            &unix,
-            "overflow",
-            "sub"
-        ));
-        registry.cancel_stream("s0", "sub");
-        release_failed_attach_route(&mut registry, &unix, "s0", "sub");
-        assert!(reserve_attach_route(
-            &mut registry,
-            &unix,
-            "overflow",
-            "sub"
-        ));
         assert_eq!(
-            registry.take_owner_routes("a").len(),
-            MAX_ATTACH_ROUTES_PER_OWNER
+            reserve_attach_route(&mut registry, &owner("b"), "overflow", "sub"),
+            RouteReservation::Inserted
         );
+        assert_eq!(
+            reserve_attach_route(&mut registry, &unix, "s0", "sub"),
+            RouteReservation::AlreadyHeld
+        );
+        // A failed first attempt rolls back its own insertion, unless a live
+        // stream of the owner holds the key.
+        registry.start_attach(unix.clone(), "s1".into(), "sub".into());
+        release_failed_attach_route(&mut registry, &unix, "s1", "sub", RouteReservation::Inserted);
+        assert_eq!(registry.owner_route_count("a"), MAX_ATTACH_ROUTES_PER_OWNER);
+        registry.cancel_stream("s1", "sub");
+        release_failed_attach_route(&mut registry, &unix, "s1", "sub", RouteReservation::Inserted);
+        assert_eq!(registry.owner_route_count("a"), MAX_ATTACH_ROUTES_PER_OWNER - 1);
+    }
+
+    /// Reviewer sequence: A acknowledged K; B now owns K; A reattaches K
+    /// (AlreadyHeld); the cleanup-budget reservation fails before
+    /// start_attach. The rollback must leave A's historical K in place,
+    /// because A's cleanup snapshot still has to cover A's Core row.
+    #[test]
+    fn failed_reattach_keeps_acknowledged_history() {
+        let mut registry = crate::subscription::attach_routes::AttachStreamRegistry::default();
+        let a = owner("a");
+        assert_eq!(
+            reserve_attach_route(&mut registry, &a, "s", "k"),
+            RouteReservation::Inserted
+        );
+        registry.start_attach(a.clone(), "s".into(), "k".into());
+        // B replaces K.
+        let b = registry.start_attach(owner("b"), "s".into(), "k".into());
+        let (_, handle) = UnixTerminalAdapter::pair();
+        assert!(registry.mark_adapter_bound_if(
+            "s",
+            "k",
+            &b,
+            TerminalSubscriptionGeneration(2),
+            BoundAdapterHandle::Unix(handle),
+        ));
+        // A reattaches K; the admission fails after the route reservation.
+        let reattach = reserve_attach_route(&mut registry, &a, "s", "k");
+        assert_eq!(reattach, RouteReservation::AlreadyHeld);
+        release_failed_attach_route(&mut registry, &a, "s", "k", reattach);
+        assert!(
+            registry
+                .take_owner_routes("a")
+                .contains(&("s".to_string(), "k".to_string())),
+            "A's historical K survives the failed reattach"
+        );
+        assert!(registry.is_adapter_bound("s", "k"), "B is untouched");
     }
 }
