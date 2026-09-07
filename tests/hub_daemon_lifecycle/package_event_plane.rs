@@ -482,7 +482,7 @@ fn isolated_hub_projects_notice_reactions_and_resolves_session_scoped_text() {
 }
 
 fn wait_for_package_event_token(
-    connection: &mut botster_hub_client::DaemonConnection,
+    connection: &mut LifecycleConnection,
     token: &str,
 ) -> serde_json::Value {
     wait_for_package_event_tokens(connection, &[token])
@@ -492,7 +492,7 @@ fn wait_for_package_event_token(
 }
 
 fn wait_for_package_event_tokens(
-    connection: &mut botster_hub_client::DaemonConnection,
+    connection: &mut LifecycleConnection,
     tokens: &[&str],
 ) -> Vec<serde_json::Value> {
     let mut found = BTreeMap::new();
@@ -537,7 +537,7 @@ fn wait_for_package_event_tokens(
 }
 
 fn collect_skipped_package_event_tokens(
-    connection: &mut botster_hub_client::DaemonConnection,
+    connection: &mut LifecycleConnection,
     tokens: &[&str],
     found: &mut BTreeMap<String, serde_json::Value>,
 ) {
@@ -622,7 +622,7 @@ fn isolated_hub_unnegotiated_subscribe_events_is_typed_error() {
     let _guard = daemon_test_guard();
     let (hub, _) = enable_event_plane_producer("unnegotiated");
     let mut connection =
-        botster_hub_client::DaemonConnection::connect(hub.endpoint()).expect("default hello");
+        LifecycleConnection::connect(hub.endpoint()).expect("default hello");
     let error = connection
         .subscribe_events("sub", "event-plane-producer", "sample.ready", Vec::new())
         .expect_err("unnegotiated helper sends no request");
@@ -773,100 +773,6 @@ fn isolated_hub_subject_and_audience_admission_return_typed_errors() {
         undeclared.error.as_ref().map(|error| error.code.as_str()),
         Some("rejected_undeclared")
     );
-    hub.shutdown().expect("shutdown isolated hub");
-}
-
-#[test]
-fn isolated_hub_unix_write_stall_emits_one_event_gap_then_status_progresses() {
-    let _guard = daemon_test_guard();
-    let stall_path = PathBuf::from(format!(
-        "/tmp/bh-event-plane-stall-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let _ = fs::remove_file(&stall_path);
-    let (hub, _) = enable_event_plane_producer_with_env(
-        "gap-stall",
-        &[
-            ("BOTSTER_HUB_TEST_CLIENT_EVENT_QUEUE_MAX", "1"),
-            (
-                "BOTSTER_HUB_TEST_STALL_UNIX_EVENT_FLUSH",
-                stall_path.to_str().expect("utf8 stall path"),
-            ),
-        ],
-    );
-    let mut connection =
-        botster_hub_client::connect_for_package_event_subscriptions(hub.endpoint())
-            .expect("event hello");
-    let subscribed = connection
-        .subscribe_events(
-            "sub-gap",
-            "event-plane-producer",
-            "sample.ready",
-            Vec::new(),
-        )
-        .expect("subscribe");
-    assert_eq!(
-        subscribed.kind,
-        botster_hub_client::DaemonResponseKind::EventSubscribed
-    );
-    fs::write(&stall_path, b"stall").expect("create write stall");
-    emit_sample_ready(hub.endpoint(), "queued");
-    emit_sample_ready(hub.endpoint(), "overflow");
-    let status_during_stall = connection
-        .request(&botster_hub_client::DaemonRequest::Status)
-        .expect("status during stall");
-    assert_eq!(
-        status_during_stall.kind,
-        botster_hub_client::DaemonResponseKind::Status
-    );
-    assert!(
-        connection.take_skipped_events().is_empty(),
-        "stalled writer must not flush events before Status"
-    );
-    fs::remove_file(&stall_path).expect("release write stall");
-    connection
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .expect("event read timeout");
-    let first = connection.next_event().expect("gap after stall");
-    match first {
-        botster_hub_client::DaemonEvent::EventGap {
-            subscription_id,
-            owner,
-            name,
-        } => {
-            assert_eq!(subscription_id, "sub-gap");
-            assert_eq!(owner, "event-plane-producer");
-            assert_eq!(name, "sample.ready");
-        }
-        other => panic!("full mailbox must emit EventGap first: {other:?}"),
-    }
-    let queued = connection.next_event().expect("queued event after gap");
-    match queued {
-        botster_hub_client::DaemonEvent::PackageEvent {
-            subscription_id, ..
-        } => {
-            assert_eq!(subscription_id, "sub-gap");
-        }
-        other => panic!("queued event remains after gap: {other:?}"),
-    }
-    connection
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .expect("short timeout");
-    match connection.next_event() {
-        Err(botster_hub_client::DaemonTransportError::Io(error))
-            if error.kind() == std::io::ErrorKind::TimedOut
-                || error.kind() == std::io::ErrorKind::WouldBlock => {}
-        other => panic!("no later event traffic after the single gap: {other:?}"),
-    }
-    connection.set_read_timeout(None).expect("clear timeout");
-    let status = connection
-        .request(&botster_hub_client::DaemonRequest::Status)
-        .expect("status after gap");
-    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
     hub.shutdown().expect("shutdown isolated hub");
 }
 

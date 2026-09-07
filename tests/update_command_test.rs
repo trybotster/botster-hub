@@ -492,14 +492,20 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
         data_dir.join(format!(".botster-hub-update-{}.log", accepted.update_id)),
     )
     .expect("read detached updater log");
+    // The updater reports live workers and preserves them; it never
+    // terminates an old worker or removes its socket.
     assert!(
-        update_log.contains("\"code\":\"unsafe_mode_generation\"")
-            || update_log.contains("\"code\":\"read_mode_flags_rejected\"")
+        update_log.contains("\"action\":\"report\"") && update_log.contains(old_session),
+        "updater must report the live pre-update worker: {update_log}"
     );
-    wait_for_process_exit(old_identity.0);
     assert!(
-        !old_identity.1.exists(),
-        "old worker socket survived update"
+        unsafe { libc::kill(old_identity.0 as libc::pid_t, 0) } == 0,
+        "pre-update worker {} must be preserved across the update",
+        old_identity.0
+    );
+    assert!(
+        old_identity.1.exists(),
+        "pre-update worker socket must be preserved across the update"
     );
 
     let status = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)

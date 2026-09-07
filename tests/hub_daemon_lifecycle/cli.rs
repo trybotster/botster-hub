@@ -83,99 +83,6 @@ pub(crate) fn start_cli_daemon_with_env(
     daemon
 }
 
-pub(crate) fn start_cli_daemon_with_worker_egress_capacity(
-    data_dir: &Path,
-    egress_capacity: Option<usize>,
-) -> PanicSafeCliDaemon {
-    let _guard = daemon_test_guard();
-    check_harness_taint();
-    ensure_session_worker_binary();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-    command
-        .arg("start")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--session-worker-bin")
-        .arg(session_worker_binary_path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(capacity) = egress_capacity {
-        command.env(
-            "BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY",
-            capacity.to_string(),
-        );
-    }
-    configure_test_process_group(&mut command);
-    let child = command.spawn().expect("spawn botster-hub start");
-    let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "lifecycle daemon");
-    wait_for_status(data_dir, daemon.child_mut());
-    daemon
-}
-
-pub(crate) fn start_cli_daemon_with_runtime_drain_failure(
-    data_dir: &Path,
-    session_id: &str,
-    egress_capacity: Option<usize>,
-) -> PanicSafeCliDaemon {
-    let _guard = daemon_test_guard();
-    check_harness_taint();
-    ensure_session_worker_binary();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-    command
-        .arg("start")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--session-worker-bin")
-        .arg(session_worker_binary_path())
-        .env("BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_FOR", session_id)
-        .env(
-            "BOTSTER_HUB_TEST_FAIL_RUNTIME_DRAIN_MESSAGE",
-            format!("test-injected observe drain failure: {session_id}"),
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(capacity) = egress_capacity {
-        command.env(
-            "BOTSTER_HUB_TEST_WORKER_EGRESS_CAPACITY",
-            capacity.to_string(),
-        );
-    }
-    configure_test_process_group(&mut command);
-    let child = command
-        .spawn()
-        .expect("spawn botster-hub start with runtime drain failure");
-    let mut daemon =
-        PanicSafeCliDaemon::from_child(data_dir, child, "runtime-drain-failure daemon");
-    wait_for_status(data_dir, daemon.child_mut());
-    daemon
-}
-
-pub(crate) fn start_cli_daemon_with_snapshot_history_failure(
-    data_dir: &Path,
-) -> PanicSafeCliDaemon {
-    let _guard = daemon_test_guard();
-    check_harness_taint();
-    ensure_session_worker_binary();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-    command
-        .arg("start")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--session-worker-bin")
-        .arg(session_worker_binary_path())
-        .env("BOTSTER_HUB_TEST_FAIL_SNAPSHOT_HISTORY_AFTER_READY", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_test_process_group(&mut command);
-    let child = command
-        .spawn()
-        .expect("spawn botster-hub start with snapshot history failure");
-    let mut daemon =
-        PanicSafeCliDaemon::from_child(data_dir, child, "snapshot-history-failure daemon");
-    wait_for_status(data_dir, daemon.child_mut());
-    daemon
-}
-
 pub(crate) fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> PanicSafeCliDaemon {
     let _guard = daemon_test_guard();
     check_harness_taint();
@@ -343,32 +250,6 @@ pub(crate) fn spawn_timeout_release_metadata_fixture()
         accepted_rx,
         handle,
     )
-}
-
-pub(crate) fn start_owned_incompatible_local_runtime_daemon(data_dir: &Path) -> PanicSafeCliDaemon {
-    let _guard = daemon_test_guard();
-    check_harness_taint();
-    ensure_session_worker_binary();
-    fs::create_dir_all(data_dir).expect("create data dir");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-    command
-        .arg("start")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--session-worker-bin")
-        .arg(session_worker_binary_path())
-        .env("BOTSTER_HUB_TEST_INCOMPATIBLE_DAEMON", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_test_process_group(&mut command);
-    let child = command
-        .spawn()
-        .expect("spawn incompatible botster-hub start");
-    let mut daemon =
-        PanicSafeCliDaemon::from_child(data_dir, child, "incompatible local-runtime daemon");
-    wait_for_incompatible_status(data_dir, daemon.child_mut());
-    write_local_runtime_daemon_metadata(data_dir, daemon.id());
-    daemon
 }
 
 pub(crate) fn stable_path_string(path: &Path) -> String {

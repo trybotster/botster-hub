@@ -48,25 +48,12 @@ use crate::support::{
 
 use super::*;
 
-pub(crate) fn live_output_utf8(
-    payload: impl std::borrow::Borrow<botster_hub_client::DaemonLiveOutputPayload>,
-) -> String {
-    String::from_utf8_lossy(&payload.borrow().decoded_bytes().unwrap_or_default()).into_owned()
+pub(crate) fn live_output_utf8(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
-pub(crate) fn live_output_contains(
-    payload: impl std::borrow::Borrow<botster_hub_client::DaemonLiveOutputPayload>,
-    needle: &str,
-) -> bool {
-    payload
-        .borrow()
-        .decoded_bytes()
-        .map(|bytes| {
-            bytes
-                .windows(needle.len())
-                .any(|window| window == needle.as_bytes())
-        })
-        .unwrap_or(false)
+pub(crate) fn live_output_contains(bytes: &[u8], needle: &str) -> bool {
+    bytes_contain(bytes, needle.as_bytes())
 }
 
 pub(crate) const STALLED_ATTACH_MIN_BUFFERED_STDOUT_BYTES: usize = 8 * 1024;
@@ -134,7 +121,7 @@ impl Drop for SessionCleanupGuard {
 pub(crate) const GHOSTSNP_MAGIC: &[u8] = b"GHOSTSNP";
 
 pub(crate) fn wait_for_mode_flags<F>(
-    connection: &mut botster_hub_client::DaemonConnection,
+    connection: &mut LifecycleConnection,
     session_id: &str,
     _subscription_id: &str,
     mut predicate: F,
@@ -171,38 +158,32 @@ where
     }
 }
 
+/// Route events on `subscription_id` until the live marker shows on the
+/// route or on the screen, or the deadline passes.
 pub(crate) fn collect_attach_events(
-    connection: &mut botster_hub_client::DaemonConnection,
+    connection: &mut LifecycleConnection,
     session_id: &str,
     subscription_id: &str,
     until_live_marker: Option<&str>,
-) -> Vec<botster_hub_client::DaemonEvent> {
+) -> Vec<RouteEvent> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut events = Vec::new();
     while Instant::now() < deadline {
-        if let Ok(Some(envelope)) = connection.poll_terminal(Duration::from_millis(20)) {
-            push_terminal_envelope_event(&mut events, session_id, Some(subscription_id), envelope);
-        }
-        events.extend(connection.take_skipped_events());
-        for envelope in connection.take_skipped_terminal() {
-            push_terminal_envelope_event(&mut events, session_id, Some(subscription_id), envelope);
-        }
+        events.extend(
+            connection
+                .poll_route_events(Duration::from_millis(20))
+                .into_iter()
+                .filter(|event| event.on_route(subscription_id)),
+        );
         let saw_live = until_live_marker.is_none_or(|marker| {
-            events.iter().any(|event| {
-                matches!(
-                    event,
-                    botster_hub_client::DaemonEvent::TerminalOutput {
-                        payload,
-                        ..
-                    } if live_output_contains(payload, marker)
-                )
-            }) || connection
-                .request(&botster_hub_client::DaemonRequest::ReadScreen {
-                    session_id: session_id.to_string(),
-                })
-                .ok()
-                .and_then(|response| response.read_screen)
-                .is_some_and(|screen| screen.text.contains(marker))
+            events.iter().any(|event| event.output_contains(marker))
+                || connection
+                    .request(&botster_hub_client::DaemonRequest::ReadScreen {
+                        session_id: session_id.to_string(),
+                    })
+                    .ok()
+                    .and_then(|response| response.read_screen)
+                    .is_some_and(|screen| screen.text.contains(marker))
         });
         if saw_live {
             break;
@@ -212,29 +193,21 @@ pub(crate) fn collect_attach_events(
     events
 }
 
-pub(crate) fn first_snapshot_payload(
-    events: &[botster_hub_client::DaemonEvent],
-    subscription_id: &str,
-) -> Vec<u8> {
+/// The SNAPSHOT_READY payload of the route: the first history record.
+pub(crate) fn first_snapshot_payload(events: &[RouteEvent], subscription_id: &str) -> Vec<u8> {
     for event in events {
-        if let botster_hub_client::DaemonEvent::Snapshot {
-            subscription_id: sub,
-            history,
-            ..
-        } = event
-            && sub == subscription_id
+        if event.on_route(subscription_id)
+            && let StreamBody::SnapshotReady(bytes) = &event.body
         {
-            return history
-                .decoded_bytes()
-                .expect("snapshot payload decodes")
-                .to_vec();
+            return bytes.clone();
         }
     }
-    panic!("expected Snapshot event for {subscription_id}, got {events:?}");
+    panic!("expected SNAPSHOT_READY for {subscription_id}, got {events:?}");
 }
 
+/// Install SNAPSHOT_READY, then every SNAPSHOT_HISTORY page, on a fresh projection.
 pub(crate) fn install_incremental_attach_snapshots(
-    events: &[botster_hub_client::DaemonEvent],
+    events: &[RouteEvent],
     subscription_id: &str,
     rows: u16,
     cols: u16,
@@ -244,39 +217,33 @@ pub(crate) fn install_incremental_attach_snapshots(
     )
     .expect("create incremental client projection");
     let mut saw_ready = false;
-    for event in events {
-        let botster_hub_client::DaemonEvent::Snapshot {
-            subscription_id: event_subscription,
-            history,
-            ..
-        } = event
-        else {
-            continue;
-        };
-        if event_subscription != subscription_id {
-            continue;
-        }
-        let bytes = history
-            .decoded_bytes()
-            .expect("snapshot payload decodes")
-            .to_vec();
-        if !saw_ready {
-            assert_eq!(
-                projection
-                    .install_ghostsnp_ready(bytes)
-                    .expect("READY snapshot"),
-                botster_terminal_ghostty::GhosttySnapshotDecodeProgress::Ready
-            );
-            saw_ready = true;
-        } else {
-            let _ = projection
-                .apply_ghostsnp_history(bytes)
-                .expect("PAGE or FINISH snapshot");
+    for event in events
+        .iter()
+        .filter(|event| event.on_route(subscription_id))
+    {
+        match &event.body {
+            StreamBody::SnapshotReady(bytes) => {
+                assert!(!saw_ready, "one READY per attachment: {events:?}");
+                assert_eq!(
+                    projection
+                        .install_ghostsnp_ready(bytes)
+                        .expect("READY snapshot"),
+                    botster_terminal_ghostty::GhosttySnapshotDecodeProgress::Ready
+                );
+                saw_ready = true;
+            }
+            StreamBody::SnapshotHistory(bytes) => {
+                assert!(saw_ready, "HISTORY before READY: {events:?}");
+                let _ = projection
+                    .apply_ghostsnp_history(bytes)
+                    .expect("PAGE or FINISH snapshot");
+            }
+            _ => {}
         }
     }
     assert!(
         saw_ready,
-        "expected a READY Snapshot for {subscription_id}, got {events:?}"
+        "expected SNAPSHOT_READY for {subscription_id}, got {events:?}"
     );
     projection
 }
@@ -614,30 +581,12 @@ pub(crate) fn production_cleanup_after_authoritative_exit(
     );
 }
 
-pub(crate) fn live_output_decoded_bytes(
-    payload: impl std::borrow::Borrow<botster_hub_client::DaemonLiveOutputPayload>,
-) -> Vec<u8> {
-    payload
-        .borrow()
-        .decoded_bytes()
-        .expect("validated live payload decodes")
-}
-
 pub(crate) fn event_is_exact_live_payload(
-    event: &botster_hub_client::DaemonEvent,
+    event: &RouteEvent,
     subscription_id: &str,
     expected: &[u8],
 ) -> bool {
-    match event {
-        botster_hub_client::DaemonEvent::TerminalOutput {
-            subscription_id: event_subscription_id,
-            payload,
-            ..
-        } if event_subscription_id == subscription_id => {
-            live_output_decoded_bytes(payload) == expected
-        }
-        _ => false,
-    }
+    event.on_route(subscription_id) && event.output() == Some(expected)
 }
 
 pub(crate) fn python_bytes_literal(bytes: &[u8]) -> String {
@@ -653,19 +602,19 @@ pub(crate) fn python_script_command(script_path: &Path) -> String {
 }
 
 pub(crate) fn wait_until_adapter_event(
-    connection: &mut botster_hub_client::DaemonConnection,
+    connection: &mut LifecycleConnection,
     session_id: &str,
-    predicate: impl FnMut(&botster_hub_client::DaemonEvent) -> bool,
-) -> Vec<botster_hub_client::DaemonEvent> {
+    predicate: impl FnMut(&RouteEvent) -> bool,
+) -> Vec<RouteEvent> {
     wait_until_adapter_event_for_subscription(connection, session_id, None, predicate)
 }
 
 pub(crate) fn wait_until_adapter_event_for_subscription(
-    connection: &mut botster_hub_client::DaemonConnection,
+    connection: &mut LifecycleConnection,
     session_id: &str,
     subscription_id: Option<&str>,
-    predicate: impl FnMut(&botster_hub_client::DaemonEvent) -> bool,
-) -> Vec<botster_hub_client::DaemonEvent> {
+    predicate: impl FnMut(&RouteEvent) -> bool,
+) -> Vec<RouteEvent> {
     wait_until_adapter_event_until(
         connection,
         session_id,
@@ -676,63 +625,47 @@ pub(crate) fn wait_until_adapter_event_for_subscription(
 }
 
 pub(crate) fn wait_until_adapter_event_until(
-    connection: &mut botster_hub_client::DaemonConnection,
-    session_id: &str,
+    connection: &mut LifecycleConnection,
+    _session_id: &str,
     subscription_id: Option<&str>,
     timeout: Duration,
-    mut predicate: impl FnMut(&botster_hub_client::DaemonEvent) -> bool,
-) -> Vec<botster_hub_client::DaemonEvent> {
+    mut predicate: impl FnMut(&RouteEvent) -> bool,
+) -> Vec<RouteEvent> {
     let deadline = Instant::now() + timeout;
     let mut events = Vec::new();
     while Instant::now() < deadline {
-        if let Ok(Some(envelope)) = connection.poll_terminal(Duration::from_millis(20)) {
-            push_terminal_envelope_event(&mut events, session_id, subscription_id, envelope);
-        }
-        events.extend(connection.take_skipped_events());
-        for envelope in connection.take_skipped_terminal() {
-            push_terminal_envelope_event(&mut events, session_id, subscription_id, envelope);
-        }
+        events.extend(
+            connection
+                .poll_route_events(Duration::from_millis(20))
+                .into_iter()
+                .filter(|event| subscription_id.is_none_or(|route| event.on_route(route))),
+        );
         if events.iter().any(&mut predicate) {
             return events;
         }
     }
-    panic!("timed out waiting for live output predicate, events={events:?}");
+    panic!("timed out waiting for terminal route predicate, events={events:?}");
 }
 
+/// Route events available now, optionally limited to one route.
 pub(crate) fn poll_adapter_events(
-    connection: &mut botster_hub_client::DaemonConnection,
-    session_id: &str,
+    connection: &mut LifecycleConnection,
+    _session_id: &str,
     subscription_id: Option<&str>,
-) -> Vec<botster_hub_client::DaemonEvent> {
+) -> Vec<RouteEvent> {
     let mut events = Vec::new();
-    while let Ok(Some(envelope)) = connection.poll_terminal(Duration::from_millis(20)) {
-        push_terminal_envelope_event(&mut events, session_id, subscription_id, envelope);
-    }
-    events.extend(connection.take_skipped_events());
-    for envelope in connection.take_skipped_terminal() {
-        push_terminal_envelope_event(&mut events, session_id, subscription_id, envelope);
+    loop {
+        let batch = connection.poll_route_events(Duration::from_millis(20));
+        if batch.is_empty() {
+            break;
+        }
+        events.extend(
+            batch
+                .into_iter()
+                .filter(|event| subscription_id.is_none_or(|route| event.on_route(route))),
+        );
     }
     events
-}
-
-fn push_terminal_envelope_event(
-    events: &mut Vec<botster_hub_client::DaemonEvent>,
-    session_id: &str,
-    subscription_id: Option<&str>,
-    envelope: botster_hub_client::DaemonUnixTerminalEnvelope,
-) {
-    let Ok(bytes) = envelope.payload_bytes() else {
-        return;
-    };
-    if let Ok(event) = serde_json::from_slice::<botster_hub_client::DaemonEvent>(&bytes) {
-        events.push(event);
-        return;
-    }
-    events.push(botster_hub_client::DaemonEvent::TerminalOutput {
-        session_id: session_id.to_string(),
-        subscription_id: subscription_id.unwrap_or("").to_string(),
-        payload: botster_hub_client::DaemonLiveOutputPayload::from_bytes(&bytes),
-    });
 }
 
 pub(crate) fn wait_for_session_type_metadata(

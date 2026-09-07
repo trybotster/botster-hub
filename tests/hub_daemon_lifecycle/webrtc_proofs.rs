@@ -1612,7 +1612,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
     thread::sleep(Duration::from_millis(800));
 
     let mut connection =
-        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+        LifecycleConnection::connect(&endpoint).expect("external connect");
     let socket_attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "local-webrtc-drop-session".to_string(),
@@ -1621,14 +1621,10 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         .expect("attach socket client after WebRTC peer close");
     assert_eq!(
         socket_attach.kind,
-        botster_hub_client::DaemonResponseKind::Events
+        botster_hub_client::DaemonResponseKind::TerminalAttached
     );
     connection
-        .send_terminal_frame(
-            "local-webrtc-drop-session",
-            "socket-after-webrtc-close-subscription",
-            &terminal_input_frame_bytes(b"after-webrtc-close\n"),
-        )
+        .send_terminal_frame("socket-after-webrtc-close-subscription", &terminal_input_frame_bytes(b"after-webrtc-close\n"))
         .expect("send input after WebRTC peer close");
 
     let observed = wait_for_read_screen_contains(
@@ -1687,7 +1683,7 @@ fn external_hub_client_spawns_botster_web_runtime_session_request_shape() {
     let child = start_cli_daemon(&data_dir);
 
     let mut connection =
-        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+        LifecycleConnection::connect(&endpoint).expect("external connect");
     let spawn = connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "botster-web-runtime-session".to_string(),
@@ -1723,14 +1719,10 @@ fn external_hub_client_spawns_botster_web_runtime_session_request_shape() {
             subscription_id: "botster-web-runtime-subscription".to_string(),
         })
         .expect("attach botster-web runtime session");
-    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::TerminalAttached);
 
     connection
-        .send_terminal_frame(
-            "botster-web-runtime-session",
-            "botster-web-runtime-subscription",
-            &terminal_input_frame_bytes(b"from-web-action\n"),
-        )
+        .send_terminal_frame("botster-web-runtime-subscription", &terminal_input_frame_bytes(b"from-web-action\n"))
         .expect("send input to botster-web runtime session");
 
     let observed = wait_for_read_screen_contains(
@@ -1771,7 +1763,7 @@ fn external_hub_client_duplicate_botster_web_runtime_spawn_is_rejected_without_c
     let child = start_cli_daemon(&data_dir);
 
     let mut connection =
-        botster_hub_client::DaemonConnection::connect(&endpoint).expect("external connect");
+        LifecycleConnection::connect(&endpoint).expect("external connect");
     let first_spawn = connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "botster-web-runtime-session".to_string(),
@@ -1821,14 +1813,10 @@ fn external_hub_client_duplicate_botster_web_runtime_spawn_is_rejected_without_c
             subscription_id: "botster-web-runtime-duplicate-subscription".to_string(),
         })
         .expect("attach original botster-web runtime session after duplicate rejection");
-    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::TerminalAttached);
 
     connection
-        .send_terminal_frame(
-            "botster-web-runtime-session",
-            "botster-web-runtime-duplicate-subscription",
-            &terminal_input_frame_bytes(b"after-duplicate\n"),
-        )
+        .send_terminal_frame("botster-web-runtime-duplicate-subscription", &terminal_input_frame_bytes(b"after-duplicate\n"))
         .expect("existing session remains writable after duplicate rejection");
 
     let observed = wait_for_read_screen_contains(

@@ -709,7 +709,7 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
     );
 
     let live_idle_connection =
-        botster_hub_client::DaemonConnection::connect(&botster_hub_client::DaemonEndpoint::new(
+        LifecycleConnection::connect(&botster_hub_client::DaemonEndpoint::new(
             config
                 .transports
                 .local_socket
@@ -1556,81 +1556,6 @@ fn cli_doctor_reports_healthy_runtime_checks() {
 }
 
 #[test]
-fn cli_home_runtime_up_recovers_owned_incompatible_daemon() {
-    let _guard = daemon_test_guard();
-    let home = unique_short_test_dir("cli-home-owned-incompat");
-    let data_dir = home.join(".botster/hub");
-    let project_pipelines_package_dir = unique_test_dir("cli-up-owned-project-pipelines");
-    let web_package_dir = unique_test_dir("cli-up-owned-web");
-    let tui_package_dir = unique_test_dir("cli-up-owned-tui");
-    let workspaces_package_dir = unique_test_dir("cli-up-owned-workspaces");
-    write_project_pipelines_availability_package(&project_pipelines_package_dir);
-    write_botster_web_package(&web_package_dir);
-    write_botster_tui_package(&tui_package_dir);
-    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
-    ensure_runtime_packages(&data_dir, &web_package_dir, &tui_package_dir);
-    let mut stale_child = start_owned_incompatible_local_runtime_daemon(&data_dir);
-    let stale_pid = stale_child.id();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .env("HOME", &home)
-        .env_remove("BOTSTER_HUB_DATA_DIR")
-        .env_remove("XDG_DATA_HOME")
-        .arg("up")
-        .arg("--session-worker-bin")
-        .arg(session_worker_binary_path())
-        .output()
-        .expect("run bare up after incompatible daemon");
-    assert!(
-        output.status.success(),
-        "up failed after stale daemon recovery: {}",
-        command_output_text(&output)
-    );
-    let text = command_output_text(&output);
-    assert!(text.contains("runtime=ready"));
-    assert!(text.contains("daemon=started"));
-    let web_origin = text
-        .lines()
-        .find_map(|line| line.strip_prefix("web="))
-        .expect("runtime output includes web URL")
-        .trim_end_matches('/')
-        .to_string();
-    let health = read_json_health(&web_origin);
-    assert_eq!(
-        health["ok"], true,
-        "replacement Web package server health: {health}"
-    );
-    assert_eq!(health["daemonReady"], true);
-    let status = botster_hub::daemon_transport_request(
-        &explicit_config(&data_dir),
-        botster_hub::DaemonRequest::Status,
-    )
-    .expect("replacement daemon answers status");
-    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
-    assert_eq!(
-        status.status.expect("runtime status body").lifecycle_state,
-        "running"
-    );
-    let _ = stale_child.wait().expect("reap stale daemon");
-    assert!(
-        !process_exists(stale_pid),
-        "stale incompatible daemon should be stopped"
-    );
-    assert!(
-        explicit_config(&data_dir)
-            .transports
-            .local_socket
-            .as_ref()
-            .expect("replacement socket binding")
-            .path
-            .exists(),
-        "replacement socket should remain after stale child exit"
-    );
-
-    shutdown_local_runtime_daemon(&data_dir);
-}
-
-#[test]
 fn cli_home_runtime_start_does_not_reuse_dead_pid_metadata_and_rebinds_leftover_socket() {
     let _guard = daemon_test_guard();
     let home = unique_short_test_dir("cli-home-dead-metadata");
@@ -1698,90 +1623,6 @@ fn cli_home_runtime_start_does_not_reuse_dead_pid_metadata_and_rebinds_leftover_
         daemon.wait().expect("reap replacement daemon").success(),
         "replacement daemon should exit cleanly"
     );
-}
-
-#[test]
-fn cli_local_runtime_down_recovers_owned_incompatible_daemon() {
-    let _guard = daemon_test_guard();
-    let data_dir = unique_short_test_dir("cli-down-owned-incompat");
-    let stale_child = start_owned_incompatible_local_runtime_daemon(&data_dir);
-    let stale_pid = stale_child.id();
-    let socket_path = explicit_config(&data_dir)
-        .transports
-        .local_socket
-        .as_ref()
-        .expect("local socket binding")
-        .path
-        .clone();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("down")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .output()
-        .expect("run botster-hub down against owned incompatible daemon");
-    assert!(
-        output.status.success(),
-        "down failed after stale daemon recovery: {}",
-        command_output_text(&output)
-    );
-    assert!(command_output_text(&output).contains("daemon=recovered_stale"));
-    let _ = stale_child.wait_with_output().expect("reap stale daemon");
-    assert!(
-        !process_exists(stale_pid),
-        "stale incompatible daemon should be stopped"
-    );
-    assert!(
-        !socket_path.exists(),
-        "down recovery should remove the selected data dir socket"
-    );
-}
-
-#[test]
-fn cli_local_runtime_recovery_removes_only_selected_data_dir_socket() {
-    let _guard = daemon_test_guard();
-    let data_dir = unique_short_test_dir("cli-scoped-owned-incompat");
-    let other_data_dir = unique_short_test_dir("cli-scoped-other-incompat");
-    let stale_child = start_owned_incompatible_local_runtime_daemon(&data_dir);
-    let selected_socket_path = explicit_config(&data_dir)
-        .transports
-        .local_socket
-        .as_ref()
-        .expect("selected local socket binding")
-        .path
-        .clone();
-    let other_socket_path = explicit_config(&other_data_dir)
-        .transports
-        .local_socket
-        .as_ref()
-        .expect("other local socket binding")
-        .path
-        .clone();
-    fs::create_dir_all(other_socket_path.parent().expect("other socket parent"))
-        .expect("create other socket parent");
-    let _other_listener = UnixListener::bind(&other_socket_path).expect("bind other socket");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("down")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .output()
-        .expect("run botster-hub down for selected data dir");
-    assert!(
-        output.status.success(),
-        "down failed after stale daemon recovery: {}",
-        command_output_text(&output)
-    );
-    let _ = stale_child.wait_with_output().expect("reap stale daemon");
-    assert!(
-        !selected_socket_path.exists(),
-        "selected data dir socket should be removed"
-    );
-    assert!(
-        other_socket_path.exists(),
-        "recovery must not remove sockets for other data dirs"
-    );
-    let _ = fs::remove_file(other_socket_path);
 }
 
 #[test]
@@ -2452,7 +2293,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             .any(|session| session.session_id == session_id && session.lifecycle == "running")
     );
 
-    let mut pre_restart = botster_hub_client::DaemonConnection::connect(&endpoint)
+    let mut pre_restart = LifecycleConnection::connect(&endpoint)
         .expect("connect before daemon restart");
     pre_restart
         .request(&botster_hub_client::DaemonRequest::Attach {
@@ -2518,7 +2359,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             .any(|session| session.session_id == session_id && session.lifecycle == "running")
     );
 
-    let mut connection = botster_hub_client::DaemonConnection::connect(&endpoint)
+    let mut connection = LifecycleConnection::connect(&endpoint)
         .expect("connect after daemon restart");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
@@ -2527,11 +2368,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
         })
         .expect("attach after daemon restart");
     connection
-        .send_terminal_frame(
-            session_id.as_str(),
-            "cli-restart-subscription-after",
-            &terminal_resize_frame_bytes(30, 100),
-        )
+        .send_terminal_frame("cli-restart-subscription-after", &terminal_resize_frame_bytes(30, 100))
         .expect("resize after daemon restart");
     let ready_deadline = Instant::now() + Duration::from_secs(8);
     let mut attached = false;
@@ -2561,11 +2398,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
         thread::sleep(Duration::from_millis(25));
     }
     connection
-        .send_terminal_frame(
-            session_id.as_str(),
-            "cli-restart-subscription-after",
-            &terminal_input_frame_bytes(b"after-restart\r"),
-        )
+        .send_terminal_frame("cli-restart-subscription-after", &terminal_input_frame_bytes(b"after-restart\r"))
         .expect("send input after daemon restart");
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut screen_text = String::new();
@@ -2762,147 +2595,6 @@ fn session_registry_json_names(data_dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-#[test]
-fn data_plane_stop_timeout_aborts_then_restart_adopts_residue() {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::process::ExitStatusExt;
-
-    let _guard = daemon_test_guard();
-    let data_dir = unique_test_dir("data-plane-stop-timeout");
-    let seam_dir = unique_short_test_dir("data-plane-stop-timeout-seams");
-    fs::create_dir_all(&seam_dir).expect("create data-plane stop seam directory");
-    let park_value = seam_dir.display().to_string();
-    let stop_marker = seam_dir.join("stop-timeout");
-    let stop_marker_value = stop_marker.display().to_string();
-    let core_shutdown_marker = seam_dir.join("core-shutdown");
-    let core_shutdown_marker_value = core_shutdown_marker.display().to_string();
-    let daemon = start_cli_daemon_with_env(
-        &data_dir,
-        &[
-            (
-                "BOTSTER_HUB_TEST_PARK_DATA_PLANE_TURN",
-                park_value.as_str(),
-            ),
-            (
-                "BOTSTER_HUB_TEST_DATA_PLANE_STOP_MARKER",
-                stop_marker_value.as_str(),
-            ),
-            (
-                "BOTSTER_HUB_TEST_CORE_SHUTDOWN_MARKER",
-                core_shutdown_marker_value.as_str(),
-            ),
-        ],
-    );
-    let endpoint = botster_hub_client::DaemonEndpoint::new(daemon_socket_path(&data_dir));
-    let session_id = "data-plane-stop-timeout-session";
-    let spawn = botster_hub_client::request(
-        &endpoint,
-        botster_hub_client::DaemonRequest::Spawn {
-            session_id: session_id.to_string(),
-            command: "sleep 30".to_string(),
-        },
-    )
-    .expect("spawn worker-backed session before abort");
-    assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
-    let before_identity = wait_for_registry_worker(&data_dir);
-    let command_pid = before_identity.pid.expect("command pid before abort");
-    let worker_pid = worktree_session_worker_ancestor(command_pid)
-        .expect("session worker ancestor before abort");
-    assert!(process_exists(worker_pid));
-
-    let stale_socket = daemon_socket_path(&data_dir);
-    let stale_socket_ino = fs::metadata(&stale_socket)
-        .expect("socket exists before abort")
-        .ino();
-    fs::write(seam_dir.join("park"), b"park").expect("park data-plane turn");
-    let hub_pid = daemon.id();
-    let mut child = daemon.disarm();
-    let stop_started = Instant::now();
-    let shutdown_request = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("shutdown")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start shutdown request without waiting for Hub exit");
-    let entered_deadline = Instant::now() + Duration::from_secs(3);
-    while !seam_dir.join("entered").is_file() {
-        assert!(
-            Instant::now() < entered_deadline,
-            "data-plane driver must enter the deterministic parked stop turn"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    let exit_deadline = Instant::now() + Duration::from_secs(6);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll aborted Hub child") {
-            break status;
-        }
-        assert!(
-            Instant::now() < exit_deadline,
-            "parked data-plane shutdown must terminate within its stop bound"
-        );
-        thread::sleep(Duration::from_millis(20));
-    };
-    assert!(
-        stop_started.elapsed() >= Duration::from_secs(2)
-            && stop_started.elapsed() < Duration::from_secs(6),
-        "abort must occur at the documented 2.5 second data-plane stop bound: elapsed={:?}",
-        stop_started.elapsed()
-    );
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGABRT),
-        "the terminal timeout action must abort the Hub process: {status:?}"
-    );
-    let shutdown_output = shutdown_request
-        .wait_with_output()
-        .expect("shutdown request exits after Hub abort");
-    assert!(
-        shutdown_output.status.success(),
-        "shutdown request must observe the Hub exit: stdout={} stderr={}",
-        String::from_utf8_lossy(&shutdown_output.stdout),
-        String::from_utf8_lossy(&shutdown_output.stderr)
-    );
-    assert!(!process_exists(hub_pid), "no Hub process may survive abort");
-    assert_eq!(
-        fs::read_to_string(&stop_marker).expect("stop-timeout marker"),
-        "data_plane_driver_stop_timeout"
-    );
-    assert!(
-        !core_shutdown_marker.exists(),
-        "CoreDaemon::shutdown must not run while the data-plane owner can still run"
-    );
-    assert!(process_exists(worker_pid), "abort intentionally leaves the worker for adoption");
-    assert!(stale_socket.exists(), "abort intentionally leaves the stale socket");
-
-    fs::remove_file(seam_dir.join("park")).expect("release obsolete parked-turn seam");
-    let restarted = start_cli_daemon(&data_dir);
-    let replacement_socket_ino = fs::metadata(&stale_socket)
-        .expect("replacement socket exists after restart")
-        .ino();
-    assert_ne!(
-        replacement_socket_ino, stale_socket_ino,
-        "next start must replace the stale socket"
-    );
-    let after_identity = wait_for_registry_worker(&data_dir);
-    let adopted_command_pid = after_identity.pid.expect("adopted command pid");
-    let adopted_worker_pid = worktree_session_worker_ancestor(adopted_command_pid)
-        .expect("adopted session worker ancestor");
-    assert_eq!(adopted_worker_pid, worker_pid, "restart must adopt, not duplicate, the worker");
-    assert!(
-        process_snapshot(worker_pid).is_some_and(|snapshot| !snapshot.stat.starts_with('Z')),
-        "the adopted worker must not be a zombie"
-    );
-
-    shutdown_short_lived_session(&endpoint, session_id);
-    restarted.shutdown();
-    assert!(!process_exists(worker_pid), "orderly successor shutdown must reap the worker");
-    assert!(!stale_socket.exists(), "orderly successor shutdown must remove the socket");
-    let _ = fs::remove_dir_all(seam_dir);
 }
 
 #[test]

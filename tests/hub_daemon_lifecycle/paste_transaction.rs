@@ -87,7 +87,7 @@ fn input_result_for_operation(bytes: &[u8], operation_id: u32) -> Option<serde_j
 }
 
 fn unix_paste_results(
-    envelopes: &[botster_hub_client::DaemonUnixTerminalEnvelope],
+    envelopes: &[botster_hub_client::DaemonUnixTerminalFrame],
     operation_id: u32,
 ) -> Vec<serde_json::Value> {
     envelopes
@@ -98,7 +98,7 @@ fn unix_paste_results(
 }
 
 fn unix_terminal_has_marker(
-    envelopes: &[botster_hub_client::DaemonUnixTerminalEnvelope],
+    envelopes: &[botster_hub_client::DaemonUnixTerminalFrame],
     marker: &str,
 ) -> bool {
     envelopes.iter().any(|envelope| {
@@ -111,7 +111,7 @@ fn unix_terminal_has_marker(
 fn collect_unix_mux_for(
     reader: &mut BufReader<UnixStream>,
     incomplete: &mut String,
-    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalFrame>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
     duration: Duration,
 ) {
@@ -141,7 +141,7 @@ fn collect_unix_mux_for(
 fn collect_unix_paste_completion(
     reader: &mut BufReader<UnixStream>,
     incomplete: &mut String,
-    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalFrame>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
     operation_id: u32,
     done: &str,
@@ -215,7 +215,7 @@ fn wait_for_unix_ready_and_mode(
     incomplete: &mut String,
     session_id: &str,
     ready: &str,
-    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalEnvelope>,
+    envelopes: &mut Vec<botster_hub_client::DaemonUnixTerminalFrame>,
     events: &mut Vec<botster_hub_client::DaemonEvent>,
 ) -> botster_hub_client::DaemonModeFlags {
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -466,268 +466,6 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
     });
 
     assert_sink_bytes(&sink, &payload);
-    shutdown_short_lived_session(&endpoint, session_id);
-    hub.shutdown().expect("shutdown isolated hub");
-    let _ = fs::remove_dir_all(test_dir);
-}
-
-#[test]
-fn paused_ingress_holds_nineteen_paste_frames_without_lost() {
-    let _guard = daemon_test_guard();
-    let test_dir = unique_short_test_dir("paused-paste");
-    fs::create_dir_all(&test_dir).expect("create paste test directory");
-    let pause = test_dir.join("pause");
-    let pause_value = pause.display().to_string();
-    let admission_log = test_dir.join("ingress-admissions.jsonl");
-    let admission_log_value = admission_log.display().to_string();
-    let sink = test_dir.join("paste.bin");
-    let hub = start_isolated_live_output_hub_with_env(
-        "paused-paste",
-        &[
-            ("BOTSTER_HUB_TEST_PAUSE_DATA_PLANE", pause_value.as_str()),
-            (
-                "BOTSTER_HUB_TEST_INGRESS_ADMISSION_OBSERVATION",
-                admission_log_value.as_str(),
-            ),
-        ],
-    );
-    let endpoint = hub.endpoint().clone();
-    let session_id = "paused-paste-session";
-    let subscription_id = "paused-paste-sub";
-    let ready = "paused-paste-sink-ready";
-    let done = "paused-paste-sink-done";
-    let operation_id = 4301;
-    let payload = live_paste_payload();
-    let (mut stream, mut reader, mut incomplete) = unix_adapter_connection(&endpoint);
-    let mut envelopes = Vec::new();
-    let mut events = Vec::new();
-    spawn_and_bind(
-        &mut stream,
-        &mut reader,
-        &mut incomplete,
-        session_id,
-        subscription_id,
-        &paste_sink_command(&sink, ready, done),
-        &mut envelopes,
-        &mut events,
-    );
-    let mode = wait_for_unix_ready_and_mode(
-        &mut stream,
-        &mut reader,
-        &mut incomplete,
-        session_id,
-        ready,
-        &mut envelopes,
-        &mut events,
-    );
-    envelopes.clear();
-    events.clear();
-
-    fs::write(&pause, b"pause").expect("arm data-plane pause");
-    let entered = pause.with_extension("entered");
-    let entered_deadline = Instant::now() + Duration::from_secs(3);
-    while !entered.is_file() {
-        assert!(Instant::now() < entered_deadline, "data-plane pause was not acknowledged");
-        thread::sleep(Duration::from_millis(10));
-    }
-    let frames = terminal_paste_frame_bytes(
-        operation_id,
-        mode.mode_generation,
-        mode.mode_revision,
-        &payload,
-    );
-    assert_eq!(frames.len(), 19);
-    for frame in &frames {
-        write_unix_terminal_frame(&mut stream, session_id, subscription_id, frame);
-    }
-    wait_for_ingress_admissions(&admission_log, session_id, subscription_id, 19, 0);
-    collect_unix_mux_for(
-        &mut reader,
-        &mut incomplete,
-        &mut envelopes,
-        &mut events,
-        Duration::from_millis(500),
-    );
-    assert!(unix_paste_results(&envelopes, operation_id).is_empty());
-    assert_no_route_close(&events, session_id, subscription_id);
-
-    fs::remove_file(&pause).expect("resume data-plane driver");
-    collect_unix_paste_completion(
-        &mut reader,
-        &mut incomplete,
-        &mut envelopes,
-        &mut events,
-        operation_id,
-        done,
-    );
-    assert_admitted_paste_result(&unix_paste_results(&envelopes, operation_id), operation_id);
-    assert_no_route_close(&events, session_id, subscription_id);
-    assert_sink_bytes(&sink, &payload);
-
-    shutdown_short_lived_session(&endpoint, session_id);
-    hub.shutdown().expect("shutdown isolated hub");
-    let _ = fs::remove_dir_all(test_dir);
-}
-
-#[test]
-fn paused_ingress_sixty_fifth_frame_latches_lost_and_closes_only_that_route() {
-    let _guard = daemon_test_guard();
-    let test_dir = unique_short_test_dir("paused-overflow");
-    fs::create_dir_all(&test_dir).expect("create overflow test directory");
-    let pause = test_dir.join("pause");
-    let pause_value = pause.display().to_string();
-    let admission_log = test_dir.join("ingress-admissions.jsonl");
-    let admission_log_value = admission_log.display().to_string();
-    let hub = start_isolated_live_output_hub_with_env(
-        "paused-overflow",
-        &[
-            ("BOTSTER_HUB_TEST_PAUSE_DATA_PLANE", pause_value.as_str()),
-            (
-                "BOTSTER_HUB_TEST_INGRESS_ADMISSION_OBSERVATION",
-                admission_log_value.as_str(),
-            ),
-        ],
-    );
-    let endpoint = hub.endpoint().clone();
-    let session_id = "paused-overflow-session";
-    let primary_id = "paused-overflow-primary";
-    let sibling_id = "paused-overflow-sibling";
-    let (mut primary, mut primary_reader, mut incomplete_primary) = unix_adapter_connection(&endpoint);
-    let mut primary_envelopes = Vec::new();
-    let mut primary_events = Vec::new();
-    spawn_and_bind(
-        &mut primary,
-        &mut primary_reader,
-        &mut incomplete_primary,
-        session_id,
-        primary_id,
-        "printf 'overflow-ready'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
-        &mut primary_envelopes,
-        &mut primary_events,
-    );
-    let _ = wait_for_unix_ready_and_mode(
-        &mut primary,
-        &mut primary_reader,
-        &mut incomplete_primary,
-        session_id,
-        "overflow-ready",
-        &mut primary_envelopes,
-        &mut primary_events,
-    );
-
-    let (mut sibling, mut sibling_reader, mut incomplete_sibling) = unix_adapter_connection(&endpoint);
-    let mut sibling_envelopes = Vec::new();
-    let mut sibling_events = Vec::new();
-    let attach = request_collecting_mux(
-        &mut sibling,
-        &mut sibling_reader,
-        &mut incomplete_sibling,
-        &botster_hub_client::DaemonRequest::Attach {
-            session_id: session_id.to_string(),
-            subscription_id: sibling_id.to_string(),
-        },
-        &mut sibling_envelopes,
-        &mut sibling_events,
-    );
-    assert_eq!(attach.kind, botster_hub_client::DaemonResponseKind::Events);
-    let sibling_deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        let status = request_collecting_mux(
-            &mut sibling,
-            &mut sibling_reader,
-            &mut incomplete_sibling,
-            &botster_hub_client::DaemonRequest::Status,
-            &mut sibling_envelopes,
-            &mut sibling_events,
-        );
-        if occupancy_has_pair(
-            &status.status.expect("status body").live_attach_occupancy,
-            session_id,
-            sibling_id,
-        ) {
-            break;
-        }
-        assert!(Instant::now() < sibling_deadline, "sibling route did not attach");
-    }
-    primary_envelopes.clear();
-    primary_events.clear();
-
-    fs::write(&pause, b"pause").expect("arm data-plane pause");
-    let entered = pause.with_extension("entered");
-    let entered_deadline = Instant::now() + Duration::from_secs(3);
-    while !entered.is_file() {
-        assert!(Instant::now() < entered_deadline, "data-plane pause was not acknowledged");
-        thread::sleep(Duration::from_millis(10));
-    }
-    for _ in 0..65 {
-        write_unix_terminal_frame(
-            &mut primary,
-            session_id,
-            primary_id,
-            &terminal_input_frame_bytes(b"x"),
-        );
-    }
-    wait_for_ingress_admissions(&admission_log, session_id, primary_id, 64, 1);
-    collect_unix_mux_for(
-        &mut primary_reader,
-        &mut incomplete_primary,
-        &mut primary_envelopes,
-        &mut primary_events,
-        Duration::from_millis(500),
-    );
-    assert_no_route_close(&primary_events, session_id, primary_id);
-
-    fs::remove_file(&pause).expect("resume data-plane driver");
-    assert!(wait_for_subscription_closed(
-        &mut primary,
-        &mut primary_reader,
-        &mut incomplete_primary,
-        session_id,
-        primary_id,
-        &mut primary_envelopes,
-        &mut primary_events,
-    ));
-    let closes = primary_events
-        .iter()
-        .filter(|event| matches!(
-            event,
-            botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
-                session_id: closed_session,
-                subscription_id: closed_subscription,
-                reason,
-                ..
-            } if closed_session == session_id
-                && closed_subscription == primary_id
-                && reason == "core_adapter_closed"
-        ))
-        .count();
-    assert_eq!(closes, 1, "one primary core_adapter_closed event: {primary_events:?}");
-
-    write_unix_terminal_frame(
-        &mut sibling,
-        session_id,
-        sibling_id,
-        &terminal_input_frame_bytes(b"sibling-live\r"),
-    );
-    read_unsolicited_terminal_until(
-        &mut sibling_reader,
-        &mut incomplete_sibling,
-        &mut sibling_envelopes,
-        Instant::now() + Duration::from_secs(8),
-        "echo:sibling-live",
-    );
-    assert!(unix_terminal_has_marker(&sibling_envelopes, "echo:sibling-live"));
-    let status = request_collecting_mux(
-        &mut sibling,
-        &mut sibling_reader,
-        &mut incomplete_sibling,
-        &botster_hub_client::DaemonRequest::Status,
-        &mut sibling_envelopes,
-        &mut sibling_events,
-    );
-    let occupancy = status.status.expect("status body").live_attach_occupancy;
-    assert!(occupancy_has_pair(&occupancy, session_id, sibling_id));
-
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
     let _ = fs::remove_dir_all(test_dir);

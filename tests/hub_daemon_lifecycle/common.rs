@@ -53,83 +53,87 @@ pub(crate) static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 pub(crate) const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
-pub(crate) const TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS_ENV: &str =
-    "BOTSTER_HUB_TEST_LOCAL_RUNTIME_READINESS_BUDGET_MS";
 
-pub(crate) fn terminal_input_frame_bytes(data: &[u8]) -> Vec<u8> {
-    let mut bytes = vec![1, 1];
-    bytes.extend_from_slice(&(u16::try_from(data.len()).unwrap_or(0)).to_be_bytes());
-    bytes.extend_from_slice(data);
-    bytes
+/// One client input command without its operation id.
+///
+/// Operation ids are strictly increasing per attached route, so the
+/// connection that owns the route assigns them at send time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InputSpec {
+    Raw(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+    Focus(bool),
+    PasteBegin { total_len: u32, allow_unsafe: bool },
+    PasteChunk { index: u32, data: Vec<u8> },
+    PasteCommit,
+    PasteAbort,
 }
 
-pub(crate) fn terminal_resize_frame_bytes(rows: u16, cols: u16) -> Vec<u8> {
-    let mut bytes = vec![1, 3, 0, 4];
-    bytes.extend_from_slice(&rows.to_be_bytes());
-    bytes.extend_from_slice(&cols.to_be_bytes());
-    bytes
-}
-
-pub(crate) fn terminal_mode_gated_frame_bytes(
-    data: &[u8],
-    mode_generation: u64,
-    mode_revision: u64,
-) -> Vec<u8> {
-    let body_len = 16 + data.len();
-    let mut bytes = vec![1, 2];
-    bytes.extend_from_slice(&(u16::try_from(body_len).unwrap_or(0)).to_be_bytes());
-    bytes.extend_from_slice(&mode_generation.to_be_bytes());
-    bytes.extend_from_slice(&mode_revision.to_be_bytes());
-    bytes.extend_from_slice(data);
-    bytes
-}
-
-pub(crate) fn terminal_paste_frame_bytes(
-    operation_id: u32,
-    mode_generation: u64,
-    mode_revision: u64,
-    data: &[u8],
-) -> Vec<Vec<u8>> {
-    const CHUNK_BYTES: usize = 65_527;
-
-    let mut begin = vec![1, 4, 0, 24];
-    begin.extend_from_slice(&operation_id.to_be_bytes());
-    begin.extend_from_slice(&mode_generation.to_be_bytes());
-    begin.extend_from_slice(&mode_revision.to_be_bytes());
-    begin.extend_from_slice(&(data.len() as u32).to_be_bytes());
-
-    let mut frames = vec![begin];
-    for (index, chunk_data) in data.chunks(CHUNK_BYTES).enumerate() {
-        let body_len = u16::try_from(8 + chunk_data.len()).expect("paste chunk body fits");
-        let mut chunk = vec![1, 5];
-        chunk.extend_from_slice(&body_len.to_be_bytes());
-        chunk.extend_from_slice(&operation_id.to_be_bytes());
-        chunk.extend_from_slice(&(index as u32).to_be_bytes());
-        chunk.extend_from_slice(chunk_data);
-        frames.push(chunk);
+impl InputSpec {
+    /// Encode with `operation_id` into one input frame body.
+    pub(crate) fn encode(&self, operation_id: u64) -> Vec<u8> {
+        use botster_terminal_protocol_client::{TerminalInputCommand, encode_terminal_input};
+        let command = match self {
+            Self::Raw(data) => TerminalInputCommand::RawBytes {
+                operation_id,
+                data: data.clone(),
+            },
+            Self::Resize { rows, cols } => TerminalInputCommand::Resize {
+                operation_id,
+                rows: *rows,
+                cols: *cols,
+                width_px: 0,
+                height_px: 0,
+            },
+            Self::Focus(focused) => TerminalInputCommand::Focus {
+                operation_id,
+                focused: *focused,
+            },
+            Self::PasteBegin {
+                total_len,
+                allow_unsafe,
+            } => TerminalInputCommand::PasteBegin {
+                operation_id,
+                total_len: *total_len,
+                allow_unsafe: *allow_unsafe,
+            },
+            Self::PasteChunk { index, data } => TerminalInputCommand::PasteChunk {
+                operation_id,
+                index: *index,
+                data: data.clone(),
+            },
+            Self::PasteCommit => TerminalInputCommand::PasteCommit { operation_id },
+            Self::PasteAbort => TerminalInputCommand::PasteAbort { operation_id },
+        };
+        encode_terminal_input(&command)
+            .expect("test input command encodes")
+            .into_bytes()
     }
-
-    let mut commit = vec![1, 6, 0, 4];
-    commit.extend_from_slice(&operation_id.to_be_bytes());
-    frames.push(commit);
-    frames
 }
 
-pub(crate) fn write_unix_terminal_frame(
-    stream: &mut UnixStream,
-    session_id: impl Into<String>,
-    subscription_id: impl Into<String>,
-    frame_bytes: &[u8],
-) {
-    botster_hub_client::write_frame(
-        stream,
-        &botster_hub_client::DaemonUnixTerminalEnvelope::from_frame_bytes(
-            session_id,
-            subscription_id,
-            frame_bytes,
-        ),
-    )
-    .expect("write unix terminal frame");
+pub(crate) fn terminal_input_frame_bytes(data: &[u8]) -> InputSpec {
+    InputSpec::Raw(data.to_vec())
+}
+
+pub(crate) fn terminal_resize_frame_bytes(rows: u16, cols: u16) -> InputSpec {
+    InputSpec::Resize { rows, cols }
+}
+
+/// One paste transaction: BEGIN, the data in protocol-sized chunks, COMMIT.
+pub(crate) fn terminal_paste_frame_bytes(data: &[u8]) -> Vec<InputSpec> {
+    use botster_terminal_protocol::MAX_PASTE_CHUNK_DATA_BYTES;
+    let mut frames = vec![InputSpec::PasteBegin {
+        total_len: u32::try_from(data.len()).expect("paste fits u32"),
+        allow_unsafe: false,
+    }];
+    for (index, chunk) in data.chunks(MAX_PASTE_CHUNK_DATA_BYTES).enumerate() {
+        frames.push(InputSpec::PasteChunk {
+            index: u32::try_from(index).expect("chunk index fits u32"),
+            data: chunk.to_vec(),
+        });
+    }
+    frames.push(InputSpec::PasteCommit);
+    frames
 }
 
 pub(crate) fn unique_test_dir(name: &str) -> PathBuf {
@@ -595,41 +599,6 @@ pub(crate) fn daemon_test_guard() -> DaemonTestGuard {
             DaemonTestGuard { _inner: None }
         }
     })
-}
-
-pub(crate) fn wait_for_incompatible_status(data_dir: &Path, child: &mut Child) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut last_output = String::new();
-    while std::time::Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("check incompatible daemon child") {
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                let _ = pipe.read_to_string(&mut stdout);
-            }
-            if let Some(mut pipe) = child.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr);
-            }
-            panic!(
-                "incompatible daemon exited before ready with {status}: stdout={stdout:?} stderr={stderr:?}"
-            );
-        }
-        let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-            .arg("status")
-            .arg("--data-dir")
-            .arg(data_dir)
-            .output()
-            .expect("run botster-hub status against incompatible daemon");
-        last_output = command_output_text(&output);
-        if !output.status.success()
-            && (last_output.contains("running daemon is incompatible or stale")
-                || last_output.contains("hub predates compatibility handshake"))
-        {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("incompatible daemon did not become ready; last status output: {last_output}");
 }
 
 pub(crate) fn terminate_and_reap_child(child: &mut Child) -> String {
