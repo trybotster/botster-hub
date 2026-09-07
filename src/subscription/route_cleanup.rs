@@ -63,28 +63,44 @@ pub(crate) struct CleanupRouteReport {
     pub outcome: CleanupRouteOutcome,
 }
 
-/// Build a candidate from the current registry state. The generation and
-/// identity are read now so later mutations cannot change what cleanup
-/// targets.
-pub(crate) fn candidate_from_registry(
+/// Build a candidate for a route the departing `owner` was told it
+/// attached. The departing owner is preserved: the current stream's identity
+/// and generation are adopted only when that stream still belongs to the
+/// departing owner. A route whose current stream belongs to someone else is
+/// a replacement; it is never targeted through the replacement's identity.
+///
+/// `core_client_id` names the Core owner of the departing route when no
+/// stream of the departing owner exists any more. A Unix connection has a
+/// unique Core client id, so its routes are always looked up under it. A
+/// WebRTC peer shares its per-subscription Core client id with any
+/// replacement peer on the same subscription; when a replacement stream
+/// exists, Core already detached the departing generation on reattach and
+/// the candidate is dropped (`None`).
+pub(crate) fn candidate_for_departing_owner(
     registry: &crate::subscription::attach_routes::AttachStreamRegistry,
-    fallback_client_id: &str,
+    owner: &AttachStreamOwner,
+    core_client_id: &str,
     session_id: &str,
     subscription_id: &str,
-) -> CleanupCandidate {
-    let identity = registry.stream_identity(session_id, subscription_id);
-    let core_client_id = identity
-        .as_ref()
-        .map(|identity| identity.client_id.clone())
-        .unwrap_or_else(|| fallback_client_id.to_string());
-    CleanupCandidate {
-        core_client_id,
-        session_id: session_id.to_string(),
-        subscription_id: subscription_id.to_string(),
-        generation: identity
-            .as_ref()
-            .and_then(|_| registry.recorded_generation(session_id, subscription_id)),
-        identity,
+) -> Option<CleanupCandidate> {
+    let current = registry.stream_identity(session_id, subscription_id);
+    let owned = registry.stream_owner_matches(session_id, subscription_id, owner);
+    match (current, owned) {
+        (Some(identity), true) => Some(CleanupCandidate {
+            core_client_id: identity.client_id.clone(),
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+            generation: registry.recorded_generation(session_id, subscription_id),
+            identity: Some(identity),
+        }),
+        (Some(_), false) if owner.grant_id.is_some() => None,
+        _ => Some(CleanupCandidate {
+            core_client_id: core_client_id.to_string(),
+            session_id: session_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+            generation: None,
+            identity: None,
+        }),
     }
 }
 
@@ -269,12 +285,17 @@ pub(crate) fn retain_route_cleanup(
     });
 }
 
-/// Whether `owner` may start another attach stream.
+/// Whether `owner` may start another attach stream. Both the live streams
+/// and the acknowledged route history count, so a connection whose routes
+/// were replaced by others cannot accumulate unbounded cleanup work.
 pub(crate) fn owner_has_attach_capacity(
     registry: &crate::subscription::attach_routes::AttachStreamRegistry,
     owner: &AttachStreamOwner,
 ) -> bool {
-    registry.stream_count_for_owner(owner) < MAX_ATTACH_ROUTES_PER_OWNER
+    registry
+        .stream_count_for_owner(owner)
+        .max(registry.acknowledged_route_count(&owner.budget_key()))
+        < MAX_ATTACH_ROUTES_PER_OWNER
 }
 
 #[cfg(test)]
@@ -382,7 +403,9 @@ mod tests {
             TerminalSubscriptionGeneration(1),
             BoundAdapterHandle::Unix(old_handle),
         ));
-        let candidate = candidate_from_registry(&state.pending_runtime, "a", "s", "sub");
+        let candidate =
+            candidate_for_departing_owner(&state.pending_runtime, &owner("a"), "a", "s", "sub")
+                .expect("owned candidate");
         assert_eq!(candidate.generation, Some(TerminalSubscriptionGeneration(1)));
         let replacement = state
             .pending_runtime
@@ -437,8 +460,11 @@ mod tests {
                 None,
             );
         }
-        let owned = candidate_from_registry(&state.pending_runtime, "a", "s", "sub");
-        let streamless = candidate_from_registry(&state.pending_runtime, "a", "s", "gone");
+        let owned = candidate_for_departing_owner(&state.pending_runtime, &owner("a"), "a", "s", "sub")
+            .expect("owned candidate");
+        let streamless =
+            candidate_for_departing_owner(&state.pending_runtime, &owner("a"), "a", "s", "gone")
+                .expect("streamless candidate");
         assert!(streamless.identity.is_none());
         let mut applied = CleanupApplied::default();
         apply_cleanup_reports(
@@ -460,6 +486,60 @@ mod tests {
         assert!(state.pending_runtime.live_attach_routes.is_empty());
         assert_eq!(state.lifecycle_counters.live_attach_subscriptions, 0);
         assert_eq!(applied.bound_closes, 1);
+    }
+
+    /// H3: client B replaced client A's route before A's cleanup arrived.
+    /// A's candidate keeps A as the Core owner and adopts nothing from B.
+    #[test]
+    fn departing_owner_candidate_never_targets_a_replacement() {
+        let mut registry = crate::subscription::attach_routes::AttachStreamRegistry::default();
+        registry.start_attach(owner("a"), "s".into(), "sub".into());
+        let b = registry.start_attach(owner("b"), "s".into(), "sub".into());
+        let (_, handle) = UnixTerminalAdapter::pair();
+        assert!(registry.mark_adapter_bound_if(
+            "s",
+            "sub",
+            &b,
+            TerminalSubscriptionGeneration(9),
+            BoundAdapterHandle::Unix(handle),
+        ));
+        let candidate = candidate_for_departing_owner(&registry, &owner("a"), "a", "s", "sub")
+            .expect("unix departing candidate");
+        assert_eq!(candidate.core_client_id, "a");
+        assert_eq!(candidate.generation, None);
+        assert_eq!(candidate.identity, None);
+        // A WebRTC departing peer shares its Core client id with the
+        // replacement, so the candidate is dropped instead.
+        let peer = AttachStreamOwner {
+            client_id: "botster-hub-daemon-subscription-sub".into(),
+            grant_id: Some("grant-old".into()),
+        };
+        registry.start_attach(
+            AttachStreamOwner {
+                client_id: "botster-hub-daemon-subscription-sub".into(),
+                grant_id: Some("grant-new".into()),
+            },
+            "s".into(),
+            "sub".into(),
+        );
+        assert!(
+            candidate_for_departing_owner(&registry, &peer, "botster-hub-daemon-subscription-sub", "s", "sub")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn acknowledged_history_counts_toward_attach_capacity() {
+        let mut registry = crate::subscription::attach_routes::AttachStreamRegistry::default();
+        let unix = owner("a");
+        for index in 0..MAX_ATTACH_ROUTES_PER_OWNER {
+            registry.acknowledge_route("a", &format!("s{index}"), "sub");
+        }
+        assert_eq!(registry.stream_count_for_owner(&unix), 0);
+        assert!(!owner_has_attach_capacity(&registry, &unix));
+        let taken = registry.take_acknowledged_routes("a");
+        assert_eq!(taken.len(), MAX_ATTACH_ROUTES_PER_OWNER);
+        assert!(owner_has_attach_capacity(&registry, &unix));
     }
 
     #[test]

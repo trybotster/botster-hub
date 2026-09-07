@@ -50,6 +50,23 @@ pub(crate) struct AttachStreamOwner {
     pub grant_id: Option<String>,
 }
 
+impl AttachStreamOwner {
+    /// The key attach admission and cleanup budget by: the grant for WebRTC
+    /// peers, the connection client id otherwise.
+    pub(crate) fn budget_key(&self) -> String {
+        self.grant_id
+            .clone()
+            .unwrap_or_else(|| self.client_id.clone())
+    }
+
+    fn matches(&self, other: &AttachStreamOwner) -> bool {
+        match self.grant_id.as_deref() {
+            Some(grant_id) => other.grant_id.as_deref() == Some(grant_id),
+            None => other.grant_id.is_none() && other.client_id == self.client_id,
+        }
+    }
+}
+
 /// Identity of one attach stream: the owning client and the registry epoch
 /// assigned when the stream started. A route key can be reused by a
 /// replacement stream (same client after a reattach, or another client); the
@@ -112,6 +129,10 @@ pub(crate) struct InventoryReconcileProgress {
 pub(crate) struct AttachStreamRegistry {
     streams: BTreeMap<(String, String), AttachStream>,
     next_epoch: u64,
+    /// Route keys each owner (budget key) has been told it attached and has
+    /// not detached. This is the history a connection's cleanup must cover;
+    /// attach admission caps it, so cleanup candidate vectors stay bounded.
+    acknowledged_routes: BTreeMap<String, BTreeSet<(String, String)>>,
     pub(crate) active_subscriptions: BTreeMap<String, BTreeSet<String>>,
     pub(crate) attach_owner_grant_ids: BTreeMap<(String, String), String>,
     pub(crate) live_attach_routes: BTreeSet<(String, String)>,
@@ -169,11 +190,71 @@ impl AttachStreamRegistry {
     pub(crate) fn stream_count_for_owner(&self, owner: &AttachStreamOwner) -> usize {
         self.streams
             .values()
-            .filter(|stream| match owner.grant_id.as_deref() {
-                Some(grant_id) => stream.owner.grant_id.as_deref() == Some(grant_id),
-                None => stream.owner.client_id == owner.client_id,
-            })
+            .filter(|stream| owner.matches(&stream.owner))
             .count()
+    }
+
+    /// True when the route's current stream belongs to `owner`.
+    pub(crate) fn stream_owner_matches(
+        &self,
+        session_id: &str,
+        subscription_id: &str,
+        owner: &AttachStreamOwner,
+    ) -> bool {
+        self.streams
+            .get(&(session_id.to_string(), subscription_id.to_string()))
+            .is_some_and(|stream| owner.matches(&stream.owner))
+    }
+
+    pub(crate) fn acknowledge_route(&mut self, budget_key: &str, session_id: &str, subscription_id: &str) {
+        self.acknowledged_routes
+            .entry(budget_key.to_string())
+            .or_default()
+            .insert((session_id.to_string(), subscription_id.to_string()));
+    }
+
+    pub(crate) fn forget_acknowledged_route(
+        &mut self,
+        budget_key: &str,
+        session_id: &str,
+        subscription_id: &str,
+    ) {
+        if let Some(routes) = self.acknowledged_routes.get_mut(budget_key) {
+            routes.remove(&(session_id.to_string(), subscription_id.to_string()));
+            if routes.is_empty() {
+                self.acknowledged_routes.remove(budget_key);
+            }
+        }
+    }
+
+    pub(crate) fn acknowledged_route_count(&self, budget_key: &str) -> usize {
+        self.acknowledged_routes
+            .get(budget_key)
+            .map_or(0, BTreeSet::len)
+    }
+
+    /// Take every route key one owner was told it attached; cleanup covers
+    /// them all, so nothing historical outlives the owner.
+    pub(crate) fn take_acknowledged_routes(&mut self, budget_key: &str) -> BTreeSet<(String, String)> {
+        self.acknowledged_routes
+            .remove(budget_key)
+            .unwrap_or_default()
+    }
+
+    /// Streams one grant owns that never bound an adapter.
+    pub(crate) fn unbound_routes_for_grant(
+        &self,
+        grant_id: &str,
+    ) -> Vec<(String, String, AttachmentIdentity)> {
+        self.streams
+            .iter()
+            .filter(|(_, stream)| {
+                stream.owner.grant_id.as_deref() == Some(grant_id) && !stream.adapter_bound
+            })
+            .map(|((session_id, subscription_id), stream)| {
+                (session_id.clone(), subscription_id.clone(), stream.identity())
+            })
+            .collect()
     }
 
     /// Streams one client owns that never bound an adapter. Cleanup cancels
