@@ -6,139 +6,22 @@
 //! the test attached, and read raw sockets with the length-prefixed reader.
 
 use std::collections::BTreeMap;
-use std::ops::{Deref, DerefMut};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use super::common::InputSpec;
 use botster_hub_client::{
-    ClientFrame, DaemonCompatibilityRequirement, DaemonConnection, DaemonEndpoint, DaemonEvent,
-    DaemonRequest, DaemonResponse, DaemonTransportResult, DaemonUnixFrameReader,
-    DaemonUnixMuxFrame, DaemonUnixTerminalFrame, RequestIdSequence, ServerFrame,
-    connect_and_hello_with_requirement, write_client_frame, write_unix_terminal_frame,
+    ClientFrame, DaemonCompatibilityRequirement, DaemonEndpoint, DaemonEvent, DaemonRequest,
+    DaemonResponse, DaemonTransportResult, DaemonUnixFrameReader, DaemonUnixMuxFrame,
+    DaemonUnixTerminalFrame, RequestIdSequence, ServerFrame, connect_and_hello_with_requirement,
+    write_client_frame, write_unix_terminal_frame,
 };
-use botster_terminal_protocol::{
-    AttachStateCode, HistoryUnavailableReason, InputResultBody, ModesBody, RouteResyncBody,
-    TerminalFrame, TerminalKind, decode_attach_state, decode_history_unavailable,
-    decode_input_result, decode_modes, decode_process_exit, decode_route_resync,
+pub(crate) use botster_hub_test_support::unix_route::{
+    RouteEvent, RouteOperationIds, UnixRouteClient, bytes_contain, decode_route_event,
+    encode_input_with_operation_id,
 };
-
-/// One decoded terminal body, by Core `TerminalKind`.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StreamBody {
-    AttachState(AttachStateCode),
-    Modes(ModesBody),
-    SnapshotReady(Vec<u8>),
-    SnapshotHistory(Vec<u8>),
-    SnapshotFinish,
-    Output(Vec<u8>),
-    ProcessExit(Option<i32>),
-    InputResult(InputResultBody),
-    HistoryUnavailable(HistoryUnavailableReason),
-    RouteResync(RouteResyncBody),
-}
-
-/// One terminal frame read from a route, with its routing header.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RouteEvent {
-    pub(crate) route: String,
-    pub(crate) generation: u64,
-    pub(crate) stream_epoch: u32,
-    pub(crate) body: StreamBody,
-}
-
-impl RouteEvent {
-    pub(crate) fn on_route(&self, route: &str) -> bool {
-        self.route == route
-    }
-
-    pub(crate) fn attach_state(&self) -> Option<AttachStateCode> {
-        match self.body {
-            StreamBody::AttachState(state) => Some(state),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn is_attached(&self) -> bool {
-        self.attach_state() == Some(AttachStateCode::Attached)
-    }
-
-    pub(crate) fn is_attach_failed(&self) -> bool {
-        self.attach_state() == Some(AttachStateCode::Failed)
-    }
-
-    pub(crate) fn is_process_exit(&self) -> bool {
-        matches!(self.body, StreamBody::ProcessExit(_))
-    }
-
-    pub(crate) fn is_snapshot_ready(&self) -> bool {
-        matches!(self.body, StreamBody::SnapshotReady(_))
-    }
-
-    pub(crate) fn is_snapshot_history(&self) -> bool {
-        matches!(self.body, StreamBody::SnapshotHistory(_))
-    }
-
-    pub(crate) fn is_snapshot_finish(&self) -> bool {
-        matches!(self.body, StreamBody::SnapshotFinish)
-    }
-
-    /// READY or HISTORY payload bytes.
-    pub(crate) fn snapshot_bytes(&self) -> Option<&[u8]> {
-        match &self.body {
-            StreamBody::SnapshotReady(bytes) | StreamBody::SnapshotHistory(bytes) => {
-                Some(bytes.as_slice())
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn output(&self) -> Option<&[u8]> {
-        match &self.body {
-            StreamBody::Output(bytes) => Some(bytes.as_slice()),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn output_contains(&self, marker: &str) -> bool {
-        self.output()
-            .is_some_and(|bytes| bytes_contain(bytes, marker.as_bytes()))
-    }
-}
-
-pub(crate) fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
-/// Decode one route frame. Frames whose body fails the protocol codec are
-/// reported as `None`; a proof that needs the raw bytes reads the frame itself.
-pub(crate) fn decode_route_event(frame: &DaemonUnixTerminalFrame) -> Option<RouteEvent> {
-    let decoded = TerminalFrame::from_bytes(&frame.body).ok()?;
-    let body = match decoded.kind() {
-        TerminalKind::Output => StreamBody::Output(decoded.body().to_vec()),
-        TerminalKind::SnapshotReady => StreamBody::SnapshotReady(decoded.body().to_vec()),
-        TerminalKind::SnapshotHistory => StreamBody::SnapshotHistory(decoded.body().to_vec()),
-        TerminalKind::SnapshotFinish => StreamBody::SnapshotFinish,
-        TerminalKind::ProcessExit => {
-            StreamBody::ProcessExit(decode_process_exit(&decoded).ok()?.code)
-        }
-        TerminalKind::Modes => StreamBody::Modes(decode_modes(&decoded).ok()?),
-        TerminalKind::AttachState => StreamBody::AttachState(decode_attach_state(&decoded).ok()?),
-        TerminalKind::InputResult => StreamBody::InputResult(decode_input_result(&decoded).ok()?),
-        TerminalKind::HistoryUnavailable => {
-            StreamBody::HistoryUnavailable(decode_history_unavailable(&decoded).ok()?)
-        }
-        TerminalKind::RouteResync => StreamBody::RouteResync(decode_route_resync(&decoded).ok()?),
-    };
-    Some(RouteEvent {
-        route: frame.route.clone(),
-        generation: frame.generation,
-        stream_epoch: frame.stream_epoch,
-        body,
-    })
-}
+use botster_terminal_protocol::{TerminalFrame, TerminalKind};
+pub(crate) use botster_terminal_protocol_client::TerminalEvent;
+use botster_terminal_protocol_client::TerminalInputCommand;
 
 pub(crate) fn decode_route_events(frames: &[DaemonUnixTerminalFrame]) -> Vec<RouteEvent> {
     frames.iter().filter_map(decode_route_event).collect()
@@ -176,175 +59,6 @@ pub(crate) fn frame_output_bytes(frame: &DaemonUnixTerminalFrame) -> Option<Vec<
 pub(crate) fn terminal_body_output(bytes: &[u8]) -> Option<Vec<u8>> {
     let frame = TerminalFrame::from_bytes(bytes).ok()?;
     (frame.kind() == TerminalKind::Output).then(|| frame.body().to_vec())
-}
-
-/// Per-route input operation ids.
-///
-/// Ids are strictly increasing per route from 1. A paste transaction reuses
-/// the BEGIN id on every CHUNK, COMMIT, and ABORT, which is how Core
-/// correlates the transaction.
-#[derive(Debug, Default)]
-pub(crate) struct RouteOperationIds {
-    last: BTreeMap<String, u64>,
-    active_paste: BTreeMap<String, u64>,
-}
-
-impl RouteOperationIds {
-    fn next(&mut self, route: &str) -> u64 {
-        let last = self.last.entry(route.to_string()).or_insert(0);
-        *last += 1;
-        *last
-    }
-
-    /// The id `input` must carry on `route`.
-    pub(crate) fn assign(&mut self, route: &str, input: &InputSpec) -> u64 {
-        match input {
-            InputSpec::PasteBegin { .. } => {
-                let id = self.next(route);
-                self.active_paste.insert(route.to_string(), id);
-                id
-            }
-            InputSpec::PasteChunk { .. } => self.active_paste_id(route),
-            InputSpec::PasteCommit | InputSpec::PasteAbort => {
-                let id = self.active_paste_id(route);
-                self.active_paste.remove(route);
-                id
-            }
-            InputSpec::Raw(_) | InputSpec::Resize { .. } | InputSpec::Focus(_) => self.next(route),
-        }
-    }
-
-    fn active_paste_id(&self, route: &str) -> u64 {
-        *self
-            .active_paste
-            .get(route)
-            .unwrap_or_else(|| panic!("no paste transaction is open on route {route}"))
-    }
-}
-
-/// A client connection that remembers the generation of each route it attached.
-///
-/// Input frames need the fixed attachment generation Core minted at attach.
-/// The wrapper records it from every `TerminalAttached` response so proofs
-/// address a route by subscription id only.
-pub(crate) struct LifecycleConnection {
-    inner: DaemonConnection,
-    routes: BTreeMap<String, u64>,
-    operation_ids: RouteOperationIds,
-}
-
-impl LifecycleConnection {
-    pub(crate) fn connect(endpoint: &DaemonEndpoint) -> DaemonTransportResult<Self> {
-        DaemonConnection::connect(endpoint).map(Self::from_connection)
-    }
-
-    pub(crate) fn connect_with_requirement(
-        endpoint: &DaemonEndpoint,
-        requirement: &DaemonCompatibilityRequirement,
-    ) -> DaemonTransportResult<Self> {
-        DaemonConnection::connect_with_requirement(endpoint, requirement).map(Self::from_connection)
-    }
-
-    pub(crate) fn from_connection(inner: DaemonConnection) -> Self {
-        Self {
-            inner,
-            routes: BTreeMap::new(),
-            operation_ids: RouteOperationIds::default(),
-        }
-    }
-
-    pub(crate) fn into_inner(self) -> DaemonConnection {
-        self.inner
-    }
-
-    /// Send one request and record the route generation of an attach answer.
-    pub(crate) fn request(
-        &mut self,
-        request: &DaemonRequest,
-    ) -> DaemonTransportResult<DaemonResponse> {
-        let response = self.inner.request(request)?;
-        self.note_attach(&response);
-        Ok(response)
-    }
-
-    fn note_attach(&mut self, response: &DaemonResponse) {
-        if let Some(attach) = &response.terminal_attach {
-            self.routes
-                .insert(attach.subscription_id.clone(), attach.generation);
-        }
-    }
-
-    /// Generation of a route this connection attached.
-    pub(crate) fn route_generation(&self, route: &str) -> u64 {
-        *self
-            .routes
-            .get(route)
-            .unwrap_or_else(|| panic!("route {route} was not attached on this connection"))
-    }
-
-    /// Send one input command on an attached route. Input carries stream epoch 0.
-    pub(crate) fn send_terminal_frame(
-        &mut self,
-        route: &str,
-        input: &InputSpec,
-    ) -> DaemonTransportResult<()> {
-        self.send_terminal_frame_with_id(route, input).map(|_| ())
-    }
-
-    /// Send one input command and return the operation id it carried.
-    pub(crate) fn send_terminal_frame_with_id(
-        &mut self,
-        route: &str,
-        input: &InputSpec,
-    ) -> DaemonTransportResult<u64> {
-        let generation = self.route_generation(route);
-        let operation_id = self.operation_ids.assign(route, input);
-        self.inner
-            .send_terminal_frame(route, generation, 0, &input.encode(operation_id))?;
-        Ok(operation_id)
-    }
-
-    /// Send raw input body bytes with an explicit generation, for proofs of
-    /// stale routes or malformed input.
-    pub(crate) fn send_terminal_bytes_at_generation(
-        &mut self,
-        route: &str,
-        generation: u64,
-        body: &[u8],
-    ) -> DaemonTransportResult<()> {
-        self.inner.send_terminal_frame(route, generation, 0, body)
-    }
-
-    /// Decoded route events available within `timeout`, including frames the
-    /// connection skipped while waiting for a response.
-    pub(crate) fn poll_route_events(&mut self, timeout: Duration) -> Vec<RouteEvent> {
-        let mut events = Vec::new();
-        if let Ok(Some(frame)) = self.inner.poll_terminal(timeout)
-            && let Some(event) = decode_route_event(&frame)
-        {
-            events.push(event);
-        }
-        for frame in self.inner.take_skipped_terminal() {
-            if let Some(event) = decode_route_event(&frame) {
-                events.push(event);
-            }
-        }
-        events
-    }
-}
-
-impl Deref for LifecycleConnection {
-    type Target = DaemonConnection;
-
-    fn deref(&self) -> &DaemonConnection {
-        &self.inner
-    }
-}
-
-impl DerefMut for LifecycleConnection {
-    fn deref_mut(&mut self) -> &mut DaemonConnection {
-        &mut self.inner
-    }
 }
 
 /// A raw socket client for proofs that read every frame themselves.
@@ -511,7 +225,7 @@ impl RawUnixClient {
     }
 
     /// Send one input command on an attached route and return its operation id.
-    pub(crate) fn send_terminal_input(&mut self, route: &str, input: &InputSpec) -> u64 {
+    pub(crate) fn send_terminal_input(&mut self, route: &str, input: &TerminalInputCommand) -> u64 {
         let generation = self.route_generation(route);
         let operation_id = self.operation_ids.assign(route, input);
         write_unix_terminal_frame(
@@ -519,7 +233,7 @@ impl RawUnixClient {
             route,
             generation,
             0,
-            &input.encode(operation_id),
+            &encode_input_with_operation_id(input, operation_id),
         )
         .expect("write unix terminal frame");
         operation_id

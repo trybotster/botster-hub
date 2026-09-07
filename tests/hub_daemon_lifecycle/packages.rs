@@ -21,7 +21,7 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_operations(
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("external connect");
+        UnixRouteClient::connect(&endpoint).expect("external connect");
 
     let install_surface = connection
         .request(
@@ -1283,7 +1283,7 @@ fn daemon_session_types_use_only_the_explicit_execution_mode() {
             .clone(),
     );
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("connect to real daemon");
+        UnixRouteClient::connect(&endpoint).expect("connect to real daemon");
 
     let relative = connection
         .request(&botster_hub_client::DaemonRequest::SpawnSessionType {

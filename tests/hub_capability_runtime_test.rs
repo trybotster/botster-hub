@@ -19,10 +19,11 @@ use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, HostIdentityOptions, HubRuntime, HubStartupOptions,
     RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
+use botster_terminal_protocol_client::TerminalInputCommand;
 
 mod support;
 use support::{
-    bind_shared_terminal_adapter, candidate_session_worker_binary_path, send_terminal_input,
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, inject_terminal_command,
 };
 
 fn explicit_runtime(name: &str) -> HubRuntime {
@@ -705,7 +706,13 @@ fn hub_runtime_reports_bounded_http_failures_without_blocking_hot_path() {
         b"ready",
         &mut logical_clock,
     );
-    send_terminal_input(&terminal_adapter, b"ping-http-capability\n");
+    inject_terminal_command(
+        &terminal_adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 1,
+            data: b"ping-http-capability\n".to_vec(),
+        },
+    );
     logical_clock += 1;
     drain_session_until(
         &mut runtime,
@@ -905,7 +912,13 @@ fn hub_runtime_keeps_session_hot_path_responsive_during_failing_http_transport()
         b"ready",
         &mut logical_clock,
     );
-    send_terminal_input(&terminal_adapter, b"ping-http-failure-capability\n");
+    inject_terminal_command(
+        &terminal_adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 1,
+            data: b"ping-http-failure-capability\n".to_vec(),
+        },
+    );
     logical_clock += 1;
     drain_session_until(
         &mut runtime,
@@ -1070,7 +1083,13 @@ fn capability_operations_do_not_block_session_hot_path() {
         b"ready",
         &mut logical_clock,
     );
-    send_terminal_input(&terminal_adapter, b"ping-capability\n");
+    inject_terminal_command(
+        &terminal_adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 1,
+            data: b"ping-capability\n".to_vec(),
+        },
+    );
     logical_clock += 1;
     drain_session_until(
         &mut runtime,

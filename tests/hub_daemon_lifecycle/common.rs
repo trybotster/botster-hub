@@ -54,97 +54,64 @@ pub(crate) static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub(crate) const BOTSTER_WEB_READINESS_LIVENESS_BACKSTOP: Duration = Duration::from_secs(60);
 pub(crate) const BOTSTER_WEB_READINESS_STARTUP_DELAY_MS: u64 = 3_000;
 
-/// One client input command without its operation id.
-///
-/// Operation ids are strictly increasing per attached route, so the
-/// connection that owns the route assigns them at send time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum InputSpec {
-    Raw(Vec<u8>),
-    Resize { rows: u16, cols: u16 },
-    Focus(bool),
-    PasteBegin { total_len: u32, allow_unsafe: bool },
-    PasteChunk { index: u32, data: Vec<u8> },
-    PasteCommit,
-    PasteAbort,
-}
-
-impl InputSpec {
-    /// Encode with `operation_id` into one input frame body.
-    pub(crate) fn encode(&self, operation_id: u64) -> Vec<u8> {
-        use botster_terminal_protocol_client::{TerminalInputCommand, encode_terminal_input};
-        let command = match self {
-            Self::Raw(data) => TerminalInputCommand::RawBytes {
-                operation_id,
-                data: data.clone(),
-            },
-            Self::Resize { rows, cols } => TerminalInputCommand::Resize {
-                operation_id,
-                rows: *rows,
-                cols: *cols,
-                width_px: 0,
-                height_px: 0,
-            },
-            Self::Focus(focused) => TerminalInputCommand::Focus {
-                operation_id,
-                focused: *focused,
-            },
-            Self::PasteBegin {
-                total_len,
-                allow_unsafe,
-            } => TerminalInputCommand::PasteBegin {
-                operation_id,
-                total_len: *total_len,
-                allow_unsafe: *allow_unsafe,
-            },
-            Self::PasteChunk { index, data } => TerminalInputCommand::PasteChunk {
-                operation_id,
-                index: *index,
-                data: data.clone(),
-            },
-            Self::PasteCommit => TerminalInputCommand::PasteCommit { operation_id },
-            Self::PasteAbort => TerminalInputCommand::PasteAbort { operation_id },
-        };
-        encode_terminal_input(&command)
-            .expect("test input command encodes")
-            .into_bytes()
+pub(crate) fn terminal_input_frame_bytes(
+    data: &[u8],
+) -> botster_terminal_protocol_client::TerminalInputCommand {
+    botster_terminal_protocol_client::TerminalInputCommand::RawBytes {
+        operation_id: 0,
+        data: data.to_vec(),
     }
 }
 
-pub(crate) fn terminal_input_frame_bytes(data: &[u8]) -> InputSpec {
-    InputSpec::Raw(data.to_vec())
-}
-
-pub(crate) fn terminal_resize_frame_bytes(rows: u16, cols: u16) -> InputSpec {
-    InputSpec::Resize { rows, cols }
+pub(crate) fn terminal_resize_frame_bytes(
+    rows: u16,
+    cols: u16,
+) -> botster_terminal_protocol_client::TerminalInputCommand {
+    botster_terminal_protocol_client::TerminalInputCommand::Resize {
+        operation_id: 0,
+        rows,
+        cols,
+        width_px: 0,
+        height_px: 0,
+    }
 }
 
 /// One paste transaction: BEGIN, the data in protocol-sized chunks, COMMIT.
-pub(crate) fn terminal_paste_frame_bytes(data: &[u8]) -> Vec<InputSpec> {
+///
+/// Each operation identifier is a placeholder. A route client must assign the
+/// attachment-scoped identifier before it encodes these commands.
+pub(crate) fn terminal_paste_frame_bytes(
+    data: &[u8],
+) -> Vec<botster_terminal_protocol_client::TerminalInputCommand> {
     terminal_paste_frame_bytes_with_unsafe_opt_in(data, false)
 }
 
 /// One paste transaction that explicitly permits unsafe control bytes.
-pub(crate) fn terminal_paste_frame_bytes_allowing_unsafe(data: &[u8]) -> Vec<InputSpec> {
+pub(crate) fn terminal_paste_frame_bytes_allowing_unsafe(
+    data: &[u8],
+) -> Vec<botster_terminal_protocol_client::TerminalInputCommand> {
     terminal_paste_frame_bytes_with_unsafe_opt_in(data, true)
 }
 
 fn terminal_paste_frame_bytes_with_unsafe_opt_in(
     data: &[u8],
     allow_unsafe: bool,
-) -> Vec<InputSpec> {
+) -> Vec<botster_terminal_protocol_client::TerminalInputCommand> {
     use botster_terminal_protocol::MAX_PASTE_CHUNK_DATA_BYTES;
-    let mut frames = vec![InputSpec::PasteBegin {
+    use botster_terminal_protocol_client::TerminalInputCommand;
+    let mut frames = vec![TerminalInputCommand::PasteBegin {
+        operation_id: 0,
         total_len: u32::try_from(data.len()).expect("paste fits u32"),
         allow_unsafe,
     }];
     for (index, chunk) in data.chunks(MAX_PASTE_CHUNK_DATA_BYTES).enumerate() {
-        frames.push(InputSpec::PasteChunk {
+        frames.push(TerminalInputCommand::PasteChunk {
+            operation_id: 0,
             index: u32::try_from(index).expect("chunk index fits u32"),
             data: chunk.to_vec(),
         });
     }
-    frames.push(InputSpec::PasteCommit);
+    frames.push(TerminalInputCommand::PasteCommit { operation_id: 0 });
     frames
 }
 

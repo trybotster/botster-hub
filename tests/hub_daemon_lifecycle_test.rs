@@ -72,8 +72,8 @@ mod support;
 
 use hub_daemon_lifecycle::*;
 use support::{
-    bind_shared_terminal_adapter, candidate_session_worker_binary_path, recovering_mutex_guard,
-    send_terminal_input, validate_cli_daemon_shutdown, wait_for_cli_daemon_shutdown,
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, inject_terminal_command,
+    recovering_mutex_guard, validate_cli_daemon_shutdown, wait_for_cli_daemon_shutdown,
 };
 
 include!("hub_daemon_lifecycle/shutdown.rs");

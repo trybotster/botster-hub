@@ -25,6 +25,7 @@ use botster_hub::{
     PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory, RuntimeEnvironment,
     SessionDefaults, SessionTypeMutationSource, SpawnTarget, TransportBindings,
 };
+use botster_terminal_protocol_client::TerminalInputCommand;
 use botster_ui_contract::{
     PackageNavigationEntry, PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind,
     PackageSurfaceOperation,
@@ -32,8 +33,7 @@ use botster_ui_contract::{
 
 mod support;
 use support::{
-    bind_shared_terminal_adapter, candidate_session_worker_binary_path, send_terminal_input,
-    send_terminal_resize,
+    bind_shared_terminal_adapter, candidate_session_worker_binary_path, inject_terminal_command,
 };
 
 fn explicit_runtime(name: &str) -> HubRuntime {
@@ -3148,7 +3148,13 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
         screen.text
     );
 
-    send_terminal_input(&first_adapter, b"live-after-late\n");
+    inject_terminal_command(
+        &first_adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 1,
+            data: b"live-after-late\n".to_vec(),
+        },
+    );
     logical_clock += 1;
     read_screen_until(
         &late_api,
@@ -3236,7 +3242,13 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
         screen.text
     );
 
-    send_terminal_input(&first_adapter, b"live-only\n");
+    inject_terminal_command(
+        &first_adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 1,
+            data: b"live-only\n".to_vec(),
+        },
+    );
     logical_clock += 1;
     read_screen_until(
         &late_api,
@@ -3344,10 +3356,25 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
         &mut logical_clock,
     );
 
-    send_terminal_resize(&first_adapter, 30, 100);
+    inject_terminal_command(
+        &first_adapter,
+        &TerminalInputCommand::Resize {
+            operation_id: 1,
+            rows: 30,
+            cols: 100,
+            width_px: 0,
+            height_px: 0,
+        },
+    );
     logical_clock += 1;
 
-    send_terminal_input(&first_adapter, b"ping-hub\n");
+    inject_terminal_command(
+        &first_adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 2,
+            data: b"ping-hub\n".to_vec(),
+        },
+    );
     logical_clock += 1;
 
     read_screen_until(
@@ -3384,7 +3411,13 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
     .expect("detach through client api");
     logical_clock += 1;
 
-    send_terminal_input(&second_adapter, b"after-detach\n");
+    inject_terminal_command(
+        &second_adapter,
+        &TerminalInputCommand::RawBytes {
+            operation_id: 1,
+            data: b"after-detach\n".to_vec(),
+        },
+    );
     logical_clock += 1;
 
     read_screen_until(

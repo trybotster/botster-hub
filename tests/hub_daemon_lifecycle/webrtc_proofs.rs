@@ -1612,7 +1612,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
     thread::sleep(Duration::from_millis(800));
 
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("external connect");
+        UnixRouteClient::connect(&endpoint).expect("external connect");
     let socket_attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "local-webrtc-drop-session".to_string(),
@@ -1679,7 +1679,7 @@ fn external_hub_client_spawns_botster_web_runtime_session_request_shape() {
     let child = start_cli_daemon(&data_dir);
 
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("external connect");
+        UnixRouteClient::connect(&endpoint).expect("external connect");
     let spawn = connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "botster-web-runtime-session".to_string(),
@@ -1759,7 +1759,7 @@ fn external_hub_client_duplicate_botster_web_runtime_spawn_is_rejected_without_c
     let child = start_cli_daemon(&data_dir);
 
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("external connect");
+        UnixRouteClient::connect(&endpoint).expect("external connect");
     let first_spawn = connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "botster-web-runtime-session".to_string(),

@@ -1,15 +1,7 @@
-fn terminal_envelope_contains_marker(
-    frame: &botster_hub_client::DaemonUnixTerminalFrame,
-    marker: &str,
-) -> bool {
-    !marker.is_empty()
-        && decode_route_event(frame).is_some_and(|event| event.output_contains(marker))
-}
-
 /// Connect to the daemon socket named by `config` with attach-generation tracking.
 fn lifecycle_connection_for(
     config: &botster_hub::HubConfig,
-) -> botster_hub_client::DaemonTransportResult<LifecycleConnection> {
+) -> botster_hub_client::DaemonTransportResult<UnixRouteClient> {
     let socket_path = config
         .transports
         .local_socket
@@ -17,7 +9,7 @@ fn lifecycle_connection_for(
         .expect("test config has local socket")
         .path
         .clone();
-    LifecycleConnection::connect(&botster_hub_client::DaemonEndpoint::new(socket_path))
+    UnixRouteClient::connect(&botster_hub_client::DaemonEndpoint::new(socket_path))
 }
 
 /// Send the first-party Hello on a raw socket and read its ack.
@@ -65,35 +57,6 @@ fn wait_for_idle_lifecycle_window(
     lifecycle_counters(endpoint, "status before many-session idle window")
 }
 
-fn discard_unsolicited_terminal(connection: &mut LifecycleConnection) {
-    while let Ok(Some(_)) = connection.poll_terminal(Duration::from_millis(20)) {}
-    let _ = connection.take_skipped_terminal();
-}
-
-fn wait_for_sibling_terminal_envelope(
-    connection: &mut LifecycleConnection,
-    session_id: &str,
-    subscription_id: &str,
-    marker: &str,
-) -> botster_hub_client::DaemonUnixTerminalFrame {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut seen = Vec::new();
-    while Instant::now() < deadline {
-        while let Ok(Some(envelope)) = connection.poll_terminal(Duration::from_millis(25)) {
-            let matches_route = envelope.route == subscription_id;
-            let contains = terminal_envelope_contains_marker(&envelope, marker);
-            seen.push((session_id.to_string(), envelope.route.clone(), contains));
-            if matches_route && contains {
-                return envelope;
-            }
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!(
-        "timed out waiting for sibling terminal envelope marker={marker:?} session={session_id} subscription={subscription_id}; seen={seen:?}"
-    )
-}
-
 fn shutdown_failure_occupancy_has_pair(
     occupancy: &[botster_hub_client::DaemonAttachOccupancy],
     session_id: &str,
@@ -105,7 +68,7 @@ fn shutdown_failure_occupancy_has_pair(
 }
 
 fn wait_for_read_screen_contains(
-    connection: &mut LifecycleConnection,
+    connection: &mut UnixRouteClient,
     session_id: &str,
     needle: &str,
 ) -> String {
@@ -239,7 +202,7 @@ fn cli_sessions_spawn_and_list_route_through_client_api() {
             .clone(),
     );
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("connect after detach");
+        UnixRouteClient::connect(&endpoint).expect("connect after detach");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "runtime-session".to_string(),
@@ -297,7 +260,7 @@ fn cli_short_lived_session_shutdown_returns_structured_cleanup() {
             .clone(),
     );
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("connect short-lived");
+        UnixRouteClient::connect(&endpoint).expect("connect short-lived");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "runtime-session".to_string(),
@@ -451,7 +414,7 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
     );
 
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("external connect");
+        UnixRouteClient::connect(&endpoint).expect("external connect");
     let attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "external-client-session".to_string(),
@@ -588,7 +551,7 @@ fn external_hub_client_read_mode_flags_drives_real_daemon_socket_protocol() {
     drop(connection);
 
     let reconnect =
-        LifecycleConnection::connect(&endpoint).expect("external reconnect");
+        UnixRouteClient::connect(&endpoint).expect("external reconnect");
     drop(reconnect);
 
     let shutdown_session = botster_hub_client::request(
@@ -619,7 +582,7 @@ fn external_hub_ghostty_snapshot_install_before_live_rejects_scrollback_as_ghost
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
 
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -720,7 +683,7 @@ fn external_hub_live_output_preserves_exact_bytes() {
     let exit_release_path = unique_short_test_dir("live-exact-bytes-exit").join("go");
     let script_path =
         write_python_held_live_script(&release_path, &exit_release_path, expected);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "exact-bytes-session".to_string(),
@@ -778,7 +741,7 @@ fn external_hub_live_output_preserves_split_utf8_frames() {
     let second = [0x82, 0xAC];
     let hub = start_isolated_live_output_hub("live-split-utf8");
     let endpoint = hub.endpoint().clone();
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
     let first_release = unique_short_test_dir("live-split-first").join("go");
     let second_release = unique_short_test_dir("live-split-second").join("go");
     let exit_release = unique_short_test_dir("live-split-exit").join("go");
@@ -868,7 +831,7 @@ fn external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes() {
     let exit_release_path = unique_short_test_dir("live-order-exit").join("go");
     let script_path =
         write_python_held_live_script(&release_path, &exit_release_path, expected);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "order-bytes-session".to_string(),
@@ -922,7 +885,7 @@ fn external_hub_live_output_keeps_ghostsnp_then_attached_then_bytes() {
 }
 
 fn observe_exact_live_byte_window(
-    connection: &mut LifecycleConnection,
+    connection: &mut UnixRouteClient,
     session_id: &str,
     expected: &[u8],
 ) {
@@ -953,7 +916,7 @@ fn external_hub_finite_producer_completion_uses_production_lifecycle_signal() {
     let exit_release_path = unique_short_test_dir("finite-producer-exit-release").join("go");
     let script_path =
         write_python_held_live_script(&release_path, &exit_release_path, expected);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "finite-producer-exit".to_string(),
@@ -995,7 +958,7 @@ fn external_hub_held_live_producer_defers_completion_until_exit_release() {
     let exit_release_path = unique_short_test_dir("held-live-exit").join("go");
     let script_path =
         write_python_held_live_script(&release_path, &exit_release_path, expected);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "held-live-producer".to_string(),
@@ -1043,9 +1006,9 @@ fn external_hub_attach_response_owns_fresh_subscription_snapshot() {
     let screen_marker = "alternate-screen-owned-by-b";
     let output_marker = "pending-output-owned-by-a";
     let mut connection_a =
-        LifecycleConnection::connect(&endpoint).expect("connect A");
+        UnixRouteClient::connect(&endpoint).expect("connect A");
     let mut connection_b =
-        LifecycleConnection::connect(&endpoint).expect("connect B");
+        UnixRouteClient::connect(&endpoint).expect("connect B");
 
     connection_a
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -1139,7 +1102,7 @@ fn external_hub_idle_attach_emits_ghostsnp_snapshot_before_attached() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
 
     // Idle session: no prior renderable output before attach.
     connection
@@ -1222,7 +1185,7 @@ fn external_hub_mode_flags_report_kitty_and_mouse_after_enable() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
 
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -1310,7 +1273,7 @@ fn external_hub_mode_flags_report_mouse_after_enable() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
 
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -1396,7 +1359,7 @@ fn external_hub_ghostty_snapshot_reflects_osc_palette_and_specials() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
 
     connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
@@ -1866,7 +1829,7 @@ fn session_entity_subscription_pushes_snapshot_ordered_deltas_and_fresh_reconnec
     ));
 
     let mut terminal =
-        LifecycleConnection::connect(&endpoint).expect("terminal connection");
+        UnixRouteClient::connect(&endpoint).expect("terminal connection");
     terminal
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "entity-session".to_string(),
@@ -2523,7 +2486,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         "idle owner turns continue through observe and journal slices without terminal drains"
     );
 
-    let mut attached = LifecycleConnection::connect(&endpoint)
+    let mut attached = UnixRouteClient::connect(&endpoint)
         .expect("connect persistent attach counter fixture");
     attached
         .request(&botster_hub_client::DaemonRequest::Attach {
@@ -2668,7 +2631,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
     let mut idle_connections = Vec::new();
     for _ in 0..64 {
         idle_connections.push(
-            LifecycleConnection::connect(&endpoint)
+            UnixRouteClient::connect(&endpoint)
                 .expect("admit bounded idle connection"),
         );
     }
@@ -2694,7 +2657,7 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
     let stalled_rejection =
         UnixStream::connect(&endpoint.socket_path).expect("connect stalled over-cap peer");
     let rejection_started = Instant::now();
-    let mut rejected = LifecycleConnection::connect(&endpoint)
+    let mut rejected = UnixRouteClient::connect(&endpoint)
         .expect("over-cap client receives typed admission hello");
     assert!(
         rejection_started.elapsed() < Duration::from_secs(1),
@@ -3182,7 +3145,7 @@ fn shutdown_session_classifies_parked_exit_beyond_one_baseline_page() {
         },
     )
     .expect("spawn target session");
-    let mut connection = LifecycleConnection::connect(&endpoint)
+    let mut connection = UnixRouteClient::connect(&endpoint)
         .expect("open host connection for ReadScreen");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut screen = String::new();
@@ -3758,7 +3721,7 @@ fn shutdown_from_another_connection_preserves_process_exit_for_attached_subscrip
     )
     .expect("spawn cross-connection shutdown session");
     let mut attached =
-        LifecycleConnection::connect(&endpoint).expect("terminal connection");
+        UnixRouteClient::connect(&endpoint).expect("terminal connection");
     attached
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
@@ -3932,7 +3895,7 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
     ));
 
     let mut terminal =
-        LifecycleConnection::connect(&endpoint).expect("terminal connection");
+        UnixRouteClient::connect(&endpoint).expect("terminal connection");
     terminal
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "entity-attached-exit".to_string(),
@@ -4028,7 +3991,7 @@ fn session_entity_subscription_observes_attached_natural_exit_with_pending_egres
     assert!(
         retained_events
             .iter()
-            .any(|event| matches!(event.body, StreamBody::ProcessExit(Some(7)))),
+            .any(|event| matches!(&event.event, TerminalEvent::ProcessExit(exit) if exit.code == Some(7))),
         "bound adapter must deliver ProcessExit: drain={retained_events:?} screen={screen_text:?}"
     );
 
@@ -4083,7 +4046,7 @@ fn session_entity_subscription_recovers_after_terminal_disconnect_with_pending_e
     ));
 
     let mut terminal =
-        LifecycleConnection::connect(&endpoint).expect("terminal connection");
+        UnixRouteClient::connect(&endpoint).expect("terminal connection");
     terminal
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: "entity-terminal-disconnect".to_string(),
@@ -4161,7 +4124,7 @@ fn external_hub_client_spawn_failure_returns_actionable_diagnostics() {
     let child = start_cli_daemon_with_session_worker(&data_dir, &bad_worker);
 
     let mut connection =
-        LifecycleConnection::connect(&endpoint).expect("external connect");
+        UnixRouteClient::connect(&endpoint).expect("external connect");
     let spawn = connection
         .request(&botster_hub_client::DaemonRequest::Spawn {
             session_id: "botster-web-runtime-session".to_string(),
@@ -5117,7 +5080,7 @@ fn stalled_attach_stdout_does_not_block_other_daemon_commands() {
             .path
             .clone(),
     );
-    let mut connection = LifecycleConnection::connect(&endpoint)
+    let mut connection = UnixRouteClient::connect(&endpoint)
         .expect("connect while attach stdout was blocked");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
@@ -5219,7 +5182,7 @@ fn socket_attach_missing_session_emits_attach_failed() {
         .clone();
     let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
     let child = start_cli_daemon(&data_dir);
-    let mut connection = LifecycleConnection::connect(&endpoint).expect("connect");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect");
 
     let attach = connection
         .request(&botster_hub_client::DaemonRequest::Attach {
@@ -5301,4 +5264,3 @@ fn event_belongs_to_route(
         _ => true,
     }
 }
-

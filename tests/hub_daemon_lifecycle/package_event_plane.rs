@@ -622,7 +622,7 @@ fn isolated_hub_unnegotiated_subscribe_events_is_typed_error() {
     let _guard = daemon_test_guard();
     let (hub, _) = enable_event_plane_producer("unnegotiated");
     let mut connection =
-        LifecycleConnection::connect(hub.endpoint()).expect("default hello");
+        botster_hub_client::DaemonConnection::connect(hub.endpoint()).expect("default hello");
     let error = connection
         .subscribe_events("sub", "event-plane-producer", "sample.ready", Vec::new())
         .expect_err("unnegotiated helper sends no request");

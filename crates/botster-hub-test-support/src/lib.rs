@@ -78,6 +78,7 @@ fn terminal_attach_body(response: &DaemonResponse) -> Result<DaemonTerminalAttac
 }
 
 mod isolated_hub;
+pub mod unix_route;
 pub use isolated_hub::{
     IsolatedHub, IsolatedHubBuilder, IsolatedHubError, IsolatedHubStartGuard, TeardownPhase,
     clear_isolated_hub_taint, isolated_hub_start_guard, isolated_hub_taint,
