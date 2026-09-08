@@ -14,7 +14,7 @@ use botster_hub_client::{DaemonRequest, DaemonResponse};
 
 use crate::HubDaemon;
 use crate::daemon::control::message::ControlReplySender;
-use crate::daemon::control::reply::{ControlReply, RetainedPluginResult};
+use crate::daemon::control::reply::ControlReply;
 use crate::daemon::error::DaemonTransportResult;
 use crate::daemon::owner_budget::OwnerPermit;
 use crate::daemon::owner_loop::DaemonControlState;
@@ -36,8 +36,12 @@ pub(crate) enum ControlPoll {
     Pending,
     /// The response is complete.
     Ready(DaemonTransportResult<DaemonResponse>),
-    /// The response still owns the logical-byte charge for a plugin result.
-    ReadyRetained(RetainedPluginResult<DaemonTransportResult<DaemonResponse>>),
+    /// Transfer plugin shaping and delivery to the existing host executor.
+    PreparePluginResponse(
+        crate::plugin_response::PluginResponseInput,
+        crate::host_executor::HostWorkPermit,
+    ),
+    SubmitPluginHost(crate::host_executor::HostSubmissionFailure),
     /// The response owns a host prepared-byte charge through transport framing.
     ReadyHost(
         DaemonTransportResult<DaemonResponse>,
@@ -283,9 +287,8 @@ impl OwnerRequestCompletion {
 }
 
 /// Requests whose Core work has effects that require an owner continuation,
-/// or that consume state, must finish. Plugin actions are the exception.
-/// Their execution remains charged in the plugin worker after reply
-/// retirement, and a late completion is drained without replay or delivery.
+/// or that consume state, must finish. Plugin requests retain their row until
+/// a host worker completes delivery or discards the cancelled response.
 pub(crate) fn request_must_finish(request: &DaemonRequest) -> bool {
     !matches!(
         request,
@@ -302,9 +305,6 @@ pub(crate) fn request_must_finish(request: &DaemonRequest) -> bool {
             | DaemonRequest::ResolveSessionType { .. }
             | DaemonRequest::CheckHubUpdate { .. }
             | DaemonRequest::GetHubUpdateExecution { .. }
-            | DaemonRequest::PluginMcpCallTool { .. }
-            | DaemonRequest::PluginSurfaceRender { .. }
-            | DaemonRequest::PluginSurfaceAction { .. }
     )
 }
 
@@ -502,7 +502,11 @@ pub(crate) fn retire_abandoned_requests(
         .pending_requests
         .iter()
         .filter_map(|(waiter_id, entry)| {
-            (!entry.must_finish && entry.client.as_deref() == Some(client)).then_some(*waiter_id)
+            if entry.client.as_deref() != Some(client) {
+                return None;
+            }
+            state.plugin_controls.cancel_reply(*waiter_id);
+            (!entry.must_finish).then_some(*waiter_id)
         })
         .collect::<Vec<_>>();
     for waiter_id in waiter_ids {
@@ -534,6 +538,9 @@ pub(crate) fn poll_ready_request_item(
         return false;
     }
     let reasons = item.reasons();
+    if reasons.contains(READY_DEADLINE) {
+        state.plugin_controls.cancel_reply(waiter_id);
+    }
     let has_completion = reasons.contains(READY_INITIAL)
         || reasons.contains(READY_CORE_COMPLETION)
         || reasons.contains(READY_PLUGIN_COMPLETION)
@@ -545,7 +552,22 @@ pub(crate) fn poll_ready_request_item(
         let reply = match poll {
             ControlPoll::Pending => None,
             ControlPoll::Ready(response) => Some(ControlReply::plain(response)),
-            ControlPoll::ReadyRetained(response) => Some(ControlReply::retained(response)),
+            ControlPoll::PreparePluginResponse(input, permit) => {
+                crate::daemon::control::plugins::submit_response(
+                    daemon, state, &mut entry, input, permit,
+                );
+                None
+            }
+            ControlPoll::SubmitPluginHost(job) => {
+                crate::daemon::control::plugins::submit_host_job(
+                    daemon,
+                    state,
+                    job.identity,
+                    job.command,
+                    job.permit,
+                );
+                None
+            }
             ControlPoll::ReadyHost(response, charge) => Some(ControlReply::host(response, charge)),
         };
         if let Some(reply) = reply {

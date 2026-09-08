@@ -2090,7 +2090,7 @@ pub fn run_project_pipelines_conformance(
     }
     let surface_package_name = surface.package_name.clone();
     let rendered_surface_id = surface.surface_id.clone();
-    let surface_body = serde_json::to_value(&surface.body)?;
+    let surface_body = serde_json::to_value(&surface.ui_tree_snapshot.body)?;
     let surface_kind = value_string(&surface_body, "type", "project_pipelines_surface")?;
     let surface_id = value_string(&surface_body, "id", "project_pipelines_surface")?;
     let surface_node_kinds = ui_node_type_values(&surface_body);
@@ -2119,13 +2119,7 @@ pub fn run_project_pipelines_conformance(
         PROJECT_PIPELINES_ACTION,
         &form_action_id,
     )?;
-    let snapshot = surface
-        .ui_tree_snapshot
-        .as_ref()
-        .ok_or(ConformanceError::MissingBody {
-            operation: "project_pipelines_surface",
-            field: "plugin_surface.ui_tree_snapshot",
-        })?;
+    let snapshot = &surface.ui_tree_snapshot;
     let snapshot_package_name = snapshot.package_name.clone();
     let snapshot_surface_id = snapshot.surface_id.clone();
     let snapshot_body = serde_json::to_value(&snapshot.body)?;
@@ -2570,15 +2564,8 @@ pub fn run_plugin_contract_matrix_conformance(
         PLUGIN_CONTRACT_APP_SURFACE,
         "contract_matrix_render_app",
     )?;
-    let app_surface_snapshot =
-        app_surface
-            .ui_tree_snapshot
-            .as_ref()
-            .ok_or(ConformanceError::MissingBody {
-                operation: "contract_matrix_render_app",
-                field: "plugin_surface.ui_tree_snapshot",
-            })?;
-    let app_surface_body = serde_json::to_value(&app_surface.body)?;
+    let app_surface_snapshot = &app_surface.ui_tree_snapshot;
+    let app_surface_body = serde_json::to_value(&app_surface.ui_tree_snapshot.body)?;
     let app_surface_snapshot_body = serde_json::to_value(&app_surface_snapshot.body)?;
     let app_surface_kind = value_string(&app_surface_body, "type", "contract_matrix_render_app")?;
     let app_surface_node_id = value_string(&app_surface_body, "id", "contract_matrix_render_app")?;
@@ -2617,12 +2604,12 @@ pub fn run_plugin_contract_matrix_conformance(
         serde_json::json!({ "session_uuids": session_binding_scenario.references.clone() }),
         "contract_matrix_render_sessions",
     )?;
-    let session_surface_body = serde_json::to_value(&session_surface.body)?;
+    let session_surface_body = serde_json::to_value(&session_surface.ui_tree_snapshot.body)?;
     let session_surface_matches_fixture = session_surface_body == session_binding_scenario.surface;
     if !session_surface_matches_fixture {
         return Err(ConformanceError::UnexpectedValue {
             operation: "contract_matrix_render_sessions",
-            field: "surface.body",
+            field: "surface.ui_tree_snapshot.body",
             expected: session_binding_scenario.surface.to_string(),
             actual: session_surface_body.to_string(),
         });
@@ -2882,7 +2869,7 @@ pub fn run_plugin_contract_matrix_conformance(
         PLUGIN_CONTRACT_EMPTY_SURFACE,
         "contract_matrix_render_empty",
     )?;
-    let empty_surface_body = serde_json::to_value(&empty_surface.body)?;
+    let empty_surface_body = serde_json::to_value(&empty_surface.ui_tree_snapshot.body)?;
     let empty_surface_node_id =
         value_string(&empty_surface_body, "id", "contract_matrix_render_empty")?;
     let empty_surface_child_id = empty_surface_body
@@ -3016,7 +3003,7 @@ pub fn run_plugin_contract_matrix_conformance(
         PLUGIN_CONTRACT_SETTINGS_SURFACE,
         "contract_matrix_render_settings",
     )?;
-    let settings_surface_body = serde_json::to_value(&settings_surface.body)?;
+    let settings_surface_body = serde_json::to_value(&settings_surface.ui_tree_snapshot.body)?;
     let settings_surface_node_id = value_string(
         &settings_surface_body,
         "id",
@@ -3054,7 +3041,8 @@ pub fn run_plugin_contract_matrix_conformance(
         PLUGIN_CONTRACT_ENTITY_SURFACE,
         "contract_matrix_render_package_entities",
     )?;
-    let package_entity_surface_body = serde_json::to_value(&package_entity_surface.body)?;
+    let package_entity_surface_body =
+        serde_json::to_value(&package_entity_surface.ui_tree_snapshot.body)?;
     let package_entity_surface_node_id = value_string(
         &package_entity_surface_body,
         "id",

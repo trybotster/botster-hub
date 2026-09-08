@@ -95,7 +95,6 @@ paths.
 - Package lifecycle compatibility: hub conformance should prove install, enable, list, show, route descriptors, and action-state projection through the daemon package DTOs. The installed `DaemonPackage` row currently does not expose a separate protocol compatibility descriptor; that remains covered by package admission and lifecycle state.
 - Client notice reactions: the package declares one session-scoped notice on `contract.ready`. The emitted payload has exact `subject` and `notice` string properties. Generic clients read that declaration from this fixture instead of hardcoding a product event name.
 
-Successful render responses should expose the validated UI payload through
-`plugin_surface.ui_tree_snapshot`. The compatibility `plugin_surface.body` field
-is preserved, but browser and TUI clients should treat the hub-validated
-snapshot as the blessed rendering contract.
+Successful render responses contain one required validated tree in
+`plugin_surface.ui_tree_snapshot`. The snapshot contains the package identity,
+surface identity, and body. Browser and TUI clients render this tree.

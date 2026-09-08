@@ -36,8 +36,7 @@ use crate::admission::unix_hello::{UnixTerminalAdmission, unix_hello_admission};
 use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::control_request_operation_label;
 use crate::daemon::control::message::{
-    ControlMessage, ControlReplyReceiver, ControlSender, control_reply_channel,
-    daemon_delivery_kind, egress_write_class,
+    ControlMessage, ControlReplyReceiver, ControlSender, control_reply_channel, egress_write_class,
 };
 use crate::daemon::control::pending::retire_abandoned_requests;
 use crate::daemon::control::reply::ControlReply;
@@ -478,27 +477,45 @@ async fn deliver_completed_request(
     event_mailbox: Option<&crate::subscription::package_events::ClientEventMailbox>,
     completed: CompletedRequest,
 ) -> DaemonTransportResult<Option<ConnectionTerminalReason>> {
-    let (response, plugin_result_charge) = completed.response.into_parts();
-    let response = response?;
-    cleanup.apply_subscription_change(completed.projection.attached_subscription_change(&response));
-    match completed.projection.entity_subscription_change(&response) {
-        Some(EntitySubscriptionChange::Subscribe(subscription_id)) => {
-            cleanup.add_entity_subscription(subscription_id)
+    match completed.response {
+        ControlReply::Typed { response, charge } => {
+            let response = response?;
+            cleanup.apply_subscription_change(
+                completed.projection.attached_subscription_change(&response),
+            );
+            match completed.projection.entity_subscription_change(&response) {
+                Some(EntitySubscriptionChange::Subscribe(subscription_id)) => {
+                    cleanup.add_entity_subscription(subscription_id)
+                }
+                Some(EntitySubscriptionChange::Unsubscribe(subscription_id)) => {
+                    cleanup.remove_entity_subscription(&subscription_id)
+                }
+                None => {}
+            }
+            mux_write.enqueue_response(
+                &completed.request_id,
+                response,
+                completed.response_delivery_tx,
+                completed.close_after,
+            )?;
+            drop(charge);
         }
-        Some(EntitySubscriptionChange::Unsubscribe(subscription_id)) => {
-            cleanup.remove_entity_subscription(&subscription_id)
+        ControlReply::EncodedPlugin {
+            encoded_frame,
+            charge,
+            ..
+        } => {
+            let queued = mux_write.enqueue_encoded_response(
+                &encoded_frame,
+                completed.response_delivery_tx,
+                completed.close_after,
+            );
+            drop(encoded_frame);
+            drop(charge);
+            queued?;
         }
-        None => {}
     }
-    let delivery_kind = daemon_delivery_kind(&response);
-    mux_write.enqueue_response(
-        &completed.request_id,
-        response,
-        completed.response_delivery_tx,
-        completed.close_after,
-    )?;
-    // The framed response now owns its independent per-connection byte charge.
-    drop(plugin_result_charge);
+    let delivery_kind = crate::daemon::control::message::DaemonDeliveryKind::Control;
     if let Err(error) =
         flush_pending_responses(write_half, mux, mux_write, Instant::now(), event_mailbox).await
     {

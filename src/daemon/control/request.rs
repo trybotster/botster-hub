@@ -235,7 +235,13 @@ fn finish(
         state.budget.release(permit);
     }
     let reconcile_after_request = completion.reconciles_after_success();
-    let (response, plugin_result_charge) = response.into_parts();
+    let ControlReply::Typed {
+        response,
+        charge: plugin_result_charge,
+    } = response
+    else {
+        return send_control_reply(reply_tx, response, response_delivery_rx);
+    };
     let response = response.or_else(|error| match error {
         DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
         DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
@@ -380,7 +386,10 @@ fn finish(
     // other reads must not force an extra owner-loop slice.
     send_control_reply(
         reply_tx,
-        ControlReply::from_parts(response, plugin_result_charge),
+        ControlReply::Typed {
+            response,
+            charge: plugin_result_charge,
+        },
         response_delivery_rx,
     )
 }

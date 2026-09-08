@@ -335,8 +335,7 @@ export interface DaemonSnapshotPage {
 export interface DaemonPluginSurface {
   package_name: string;
   surface_id: string;
-  body: UiNode;
-  ui_tree_snapshot?: DaemonUiTreeSnapshot | null;
+  ui_tree_snapshot: DaemonUiTreeSnapshot;
 }
 
 export interface DaemonUiTreeSnapshot {

@@ -365,12 +365,11 @@ pub(crate) fn daemon_plugin_surface(plugin_surface: HubClientPluginSurface) -> D
     response.plugin_surface = Some(DaemonPluginSurface {
         package_name: plugin_surface.package_name.clone(),
         surface_id: plugin_surface.surface_id.clone(),
-        body: body.clone(),
-        ui_tree_snapshot: Some(DaemonUiTreeSnapshot {
+        ui_tree_snapshot: DaemonUiTreeSnapshot {
             package_name: plugin_surface.package_name,
             surface_id: plugin_surface.surface_id,
             body,
-        }),
+        },
     });
     response
 }

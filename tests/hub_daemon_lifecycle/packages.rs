@@ -115,15 +115,12 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_operations(
         .plugin_surface
         .expect("workspaces render includes plugin surface");
     let plugin_surface_body =
-        serde_json::to_value(&plugin_surface.body).expect("serialize typed workspaces surface");
+        serde_json::to_value(&plugin_surface.ui_tree_snapshot.body).expect("serialize typed workspaces surface");
     assert_eq!(plugin_surface.package_name, "botster-workspaces");
     assert_eq!(plugin_surface.surface_id, "workspaces");
     assert_eq!(plugin_surface_body["type"], "panel");
     assert_eq!(plugin_surface_body["id"], "botster-workspaces-panel");
-    let snapshot = plugin_surface
-        .ui_tree_snapshot
-        .as_ref()
-        .expect("workspaces render includes validated ui tree snapshot");
+    let snapshot = &plugin_surface.ui_tree_snapshot;
     assert_eq!(snapshot.package_name, "botster-workspaces");
     assert_eq!(snapshot.surface_id, "workspaces");
     let snapshot_body =
@@ -145,7 +142,7 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_operations(
         .plugin_surface
         .expect("iframe render includes plugin surface");
     let iframe_surface_body =
-        serde_json::to_value(&iframe_surface.body).expect("serialize typed iframe surface");
+        serde_json::to_value(&iframe_surface.ui_tree_snapshot.body).expect("serialize typed iframe surface");
     assert_eq!(iframe_surface_body["type"], "iframe");
     assert_eq!(iframe_surface_body["id"], "preview-frame");
     assert_eq!(
@@ -153,11 +150,8 @@ fn daemon_package_dtos_expose_declared_surfaces_and_validate_surface_operations(
         "/packages/iframe.plugin/assets/preview.html"
     );
     assert_eq!(iframe_surface_body["props"]["title"], "Preview");
-    let iframe_snapshot = iframe_surface
-        .ui_tree_snapshot
-        .as_ref()
-        .expect("iframe render includes validated ui tree snapshot");
-    assert_eq!(iframe_snapshot.body, iframe_surface.body);
+    let iframe_snapshot = &iframe_surface.ui_tree_snapshot;
+    assert_eq!(iframe_snapshot.surface_id, "preview");
     assert_no_raw_html_ui_fields(&iframe_surface_body);
 
     let undeclared = connection

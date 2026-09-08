@@ -46,6 +46,11 @@ impl HostError {
 }
 
 pub(crate) enum HostCommand {
+    PreparePluginResponse {
+        input: crate::plugin_response::PluginResponseInput,
+        reply_tx: crate::daemon::control::message::ControlReplySender,
+        reply_live: Arc<AtomicBool>,
+    },
     StopEntrypoints,
     BuildSessionTypeCatalog {
         generation: u64,
@@ -81,7 +86,7 @@ pub(crate) enum HostCommand {
 impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
-            Self::StopEntrypoints => 0,
+            Self::PreparePluginResponse { .. } | Self::StopEntrypoints => 0,
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
             Self::Mutation(_) => 0,
             Self::ReclaimSessionTypeCatalog(_) => 0,
@@ -97,6 +102,7 @@ impl HostCommand {
 impl std::fmt::Debug for HostCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PreparePluginResponse { .. } => formatter.write_str("PreparePluginResponse"),
             Self::StopEntrypoints => formatter.write_str("StopEntrypoints"),
             Self::BuildSessionTypeCatalog { generation, .. } => formatter
                 .debug_struct("BuildSessionTypeCatalog")
@@ -140,6 +146,10 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
+    PluginResponseAbandoned,
+    PluginResponseDelivered {
+        kind: botster_hub_client::DaemonResponseKind,
+    },
     EntrypointsStopped,
     SessionTypeCatalogReady {
         generation: u64,
@@ -163,7 +173,9 @@ pub(crate) enum HostResult {
 impl HostResult {
     fn generation(&self) -> u64 {
         match self {
-            Self::EntrypointsStopped => 0,
+            Self::PluginResponseAbandoned
+            | Self::PluginResponseDelivered { .. }
+            | Self::EntrypointsStopped => 0,
             Self::SessionTypeCatalogReady { generation, .. } | Self::Failed { generation, .. } => {
                 *generation
             }
@@ -242,7 +254,9 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
-        HostResult::EntrypointsStopped => 0,
+        HostResult::PluginResponseAbandoned
+        | HostResult::PluginResponseDelivered { .. }
+        | HostResult::EntrypointsStopped => 0,
         HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
         HostResult::Failed { .. } | HostResult::Mutation(_) => 0,
         HostResult::ManagedWorktreeCreated(_)
@@ -635,7 +649,7 @@ fn run_worker(
         let HostJob {
             identity,
             command,
-            permit,
+            mut permit,
         } = job;
         let command = match command {
             HostCommand::ReclaimSessionTypeCatalog(reclamation) => {
@@ -652,7 +666,7 @@ fn run_worker(
         };
         let generation = command.generation();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute(command, &entrypoints)
+            execute(command, &entrypoints, &mut permit)
         }))
         .unwrap_or_else(|_| HostResult::Failed {
             generation,
@@ -675,8 +689,46 @@ fn run_worker(
     }
 }
 
-fn execute(command: HostCommand, entrypoints: &Mutex<EntrypointSupervisor>) -> HostResult {
+fn execute(
+    command: HostCommand,
+    entrypoints: &Mutex<EntrypointSupervisor>,
+    permit: &mut HostWorkPermit,
+) -> HostResult {
     match command {
+        HostCommand::PreparePluginResponse {
+            input,
+            reply_tx,
+            reply_live,
+        } => {
+            if reply_tx.is_closed() || !reply_live.load(Ordering::Acquire) {
+                drop(input);
+                return HostResult::PluginResponseAbandoned;
+            }
+            let prepared = crate::plugin_response::prepare(input);
+            let kind = prepared.kind;
+            let charge = permit.take_prepared_charge(prepared.logical_bytes);
+            // This exchange orders publication against owner cancellation.
+            if reply_live.swap(false, Ordering::AcqRel) {
+                let reply = crate::daemon::control::reply::ControlReply::prepared(
+                    kind,
+                    prepared.encoded_frame,
+                    charge,
+                );
+                match reply_tx.send_reply(reply) {
+                    Ok(()) => HostResult::PluginResponseDelivered { kind },
+                    Err(reply) => {
+                        // A closed transport returns the allocation to this worker.
+                        drop(reply);
+                        HostResult::PluginResponseAbandoned
+                    }
+                }
+            } else {
+                drop(prepared);
+                drop(charge);
+                HostResult::PluginResponseAbandoned
+            }
+        }
+
         HostCommand::StopEntrypoints => {
             let mut entrypoints = entrypoints
                 .lock()
@@ -947,6 +999,112 @@ mod tests {
                     assert!(Instant::now() < deadline, "host completion must arrive");
                     std::thread::yield_now();
                 }
+            }
+        }
+    }
+
+    fn plugin_response_input() -> (
+        crate::plugin_response::PluginResponseInput,
+        crate::daemon::control::reply::RetainedPluginResultBudget,
+    ) {
+        use crate::daemon::control::reply::{RetainedPluginResult, RetainedPluginResultBudget};
+        let budget = RetainedPluginResultBudget::new();
+        let charge = budget
+            .try_reserve(128 * 1024)
+            .expect("raw result reservation");
+        let input = crate::plugin_response::PluginResponseInput {
+            kind: crate::plugin_response::PluginResponseKind::McpTool,
+            lifecycle: crate::lifecycle::HubPluginLifecycle::with_config(
+                botster_core::PluginWorkerEngineConfig::default(),
+            ),
+            result: RetainedPluginResult::new(Err("x".repeat(128 * 1024)), charge),
+            transport_request_id: "42".to_string(),
+            inconsistent: false,
+        };
+        (input, budget)
+    }
+
+    #[test]
+    fn plugin_response_delivery_keeps_slot_until_owner_consumes_terminal_outcome() {
+        let executor = HostExecutor::new();
+        let (input, raw_budget) = plugin_response_input();
+        let (reply_tx, mut reply_rx) = crate::daemon::control::message::control_reply_channel();
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(81),
+                    phase: 1,
+                },
+                HostCommand::PreparePluginResponse {
+                    input,
+                    reply_tx,
+                    reply_live: Arc::new(AtomicBool::new(true)),
+                },
+                executor.try_reserve().expect("host response slot"),
+            )
+            .expect("submit response");
+        let completion = receive_host_completion(&executor);
+        assert_eq!(raw_budget.retained_bytes(), 0);
+        assert_eq!(executor.outstanding(), 1);
+        assert!(executor.prepared.used.load(Ordering::Acquire) > 0);
+        let reply = reply_rx.try_recv().expect("worker delivered response");
+        let (response, charge, encoded) = reply.into_parts();
+        let decoded: botster_hub_client::ServerFrame =
+            serde_json::from_slice(encoded.as_ref().expect("encoded frame"))
+                .expect("complete frame");
+        assert!(
+            matches!(decoded, botster_hub_client::ServerFrame::Response { request_id, .. } if request_id == "42")
+        );
+        let (_, result, permit) = completion.into_parts();
+        assert!(matches!(result, HostResult::PluginResponseDelivered { .. }));
+        drop(permit);
+        assert_eq!(executor.outstanding(), 0);
+        assert!(executor.prepared.used.load(Ordering::Acquire) > 0);
+        drop(response);
+        drop(encoded);
+        drop(charge);
+        assert_eq!(executor.prepared.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cancelled_or_disconnected_plugin_response_reclaims_raw_result_on_worker() {
+        for disconnected in [false, true] {
+            let executor = HostExecutor::new();
+            let (input, raw_budget) = plugin_response_input();
+            let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+            let mut retained_receiver = Some(reply_rx);
+            if disconnected {
+                retained_receiver.take();
+            }
+            executor
+                .submit(
+                    HostJobIdentity {
+                        waiter_id: WaiterId(82),
+                        phase: 1,
+                    },
+                    HostCommand::PreparePluginResponse {
+                        input,
+                        reply_tx,
+                        reply_live: Arc::new(AtomicBool::new(disconnected)),
+                    },
+                    executor.try_reserve().expect("host response slot"),
+                )
+                .expect("submit cancelled response");
+            let completion = receive_host_completion(&executor);
+            assert_eq!(raw_budget.retained_bytes(), 0);
+            assert_eq!(executor.outstanding(), 1);
+            assert!(matches!(
+                completion.result,
+                HostResult::PluginResponseAbandoned
+            ));
+            drop(completion);
+            assert_eq!(executor.outstanding(), 0);
+            assert_eq!(executor.prepared.used.load(Ordering::Acquire), 0);
+            if let Some(mut receiver) = retained_receiver {
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                ));
             }
         }
     }

@@ -452,6 +452,11 @@ pub fn encode_unix_terminal_frame(
 /// Encode one control container carrying `frame` as UTF-8 JSON.
 pub fn encode_control_frame<T: Serialize>(frame: &T) -> DaemonTransportResult<Vec<u8>> {
     let json = serde_json::to_vec(frame).map_err(DaemonTransportError::Json)?;
+    encode_control_json(&json)
+}
+
+/// Wrap previously encoded control JSON in a Unix container.
+pub fn encode_control_json(json: &[u8]) -> DaemonTransportResult<Vec<u8>> {
     if json.len() > MAX_CONTROL_REQUEST_BYTES.max(MAX_CONTROL_RESPONSE_BYTES) {
         return Err(DaemonTransportError::Protocol(
             "control frame exceeds the protocol byte bound",
@@ -461,7 +466,7 @@ pub fn encode_control_frame<T: Serialize>(frame: &T) -> DaemonTransportResult<Ve
     let mut bytes = Vec::with_capacity(UNIX_FRAME_LENGTH_PREFIX_BYTES + frame_len);
     bytes.extend_from_slice(&(frame_len as u32).to_le_bytes());
     bytes.push(UNIX_CONTAINER_CONTROL);
-    bytes.extend_from_slice(&json);
+    bytes.extend_from_slice(json);
     Ok(bytes)
 }
 
@@ -2124,9 +2129,7 @@ pub struct DaemonResponse {
 pub struct DaemonPluginSurface {
     pub package_name: String,
     pub surface_id: String,
-    pub body: UiNode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ui_tree_snapshot: Option<DaemonUiTreeSnapshot>,
+    pub ui_tree_snapshot: DaemonUiTreeSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5889,18 +5892,14 @@ mod tests {
         let surface = DaemonPluginSurface {
             package_name: "workflow.plugin".to_string(),
             surface_id: "workflow.surface".to_string(),
-            body: serde_json::from_value(
-                serde_json::json!({ "type": "text", "props": { "text": "surface" } }),
-            )
-            .expect("typed surface"),
-            ui_tree_snapshot: Some(DaemonUiTreeSnapshot {
+            ui_tree_snapshot: DaemonUiTreeSnapshot {
                 package_name: "workflow.plugin".to_string(),
                 surface_id: "workflow.surface".to_string(),
                 body: serde_json::from_value(
                     serde_json::json!({ "type": "text", "props": { "text": "surface" } }),
                 )
                 .expect("typed snapshot"),
-            }),
+            },
         };
         let value = serde_json::to_value(&surface).expect("plugin surface serializes");
         assert_generated_interface_fields("DaemonPluginSurface", &value);
@@ -5912,20 +5911,20 @@ mod tests {
         );
         assert!(
             generated_interface("DaemonPluginSurface")
-                .contains("  ui_tree_snapshot?: DaemonUiTreeSnapshot | null;"),
-            "generated TypeScript should mark additive snapshot field optional"
+                .contains("  ui_tree_snapshot: DaemonUiTreeSnapshot;"),
+            "generated TypeScript must require the snapshot"
         );
 
-        let legacy_surface = DaemonPluginSurface {
-            ui_tree_snapshot: None,
-            ..surface
-        };
-        let legacy_value =
-            serde_json::to_value(&legacy_surface).expect("legacy plugin surface serializes");
-        assert!(
-            legacy_value.get("ui_tree_snapshot").is_none(),
-            "plugin surface should omit absent ui_tree_snapshot"
-        );
+        assert!(value.get("body").is_none());
+        let mut missing_snapshot = value.clone();
+        missing_snapshot
+            .as_object_mut()
+            .unwrap()
+            .remove("ui_tree_snapshot");
+        assert!(serde_json::from_value::<DaemonPluginSurface>(missing_snapshot).is_err());
+        let mut null_snapshot = value;
+        null_snapshot["ui_tree_snapshot"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<DaemonPluginSurface>(null_snapshot).is_err());
     }
 
     #[test]
@@ -7544,18 +7543,14 @@ mod tests {
             plugin_surface: Some(DaemonPluginSurface {
                 package_name: "workflow.plugin".to_string(),
                 surface_id: "workflow.surface".to_string(),
-                body: serde_json::from_value(
-                    serde_json::json!({ "type": "text", "props": { "text": "surface" } }),
-                )
-                .expect("typed surface"),
-                ui_tree_snapshot: Some(DaemonUiTreeSnapshot {
+                ui_tree_snapshot: DaemonUiTreeSnapshot {
                     package_name: "workflow.plugin".to_string(),
                     surface_id: "workflow.surface".to_string(),
                     body: serde_json::from_value(
                         serde_json::json!({ "type": "text", "props": { "text": "surface" } }),
                     )
                     .expect("typed snapshot"),
-                }),
+                },
             }),
             plugin_action_result: Some(
                 serde_json::from_value(serde_json::json!({

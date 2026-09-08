@@ -17,7 +17,7 @@ use botster_hub_client::{
     ClientFrame, DaemonEntityFrame, DaemonHello, DaemonProtocolErrorCode, DaemonRequest,
     DaemonResponse, DaemonUnixFrame, DaemonUnixTerminalFrame, MAX_CONTROL_REQUEST_BYTES,
     MAX_UNIX_FRAME_BYTES, ServerFrame, UNIX_FRAME_LENGTH_PREFIX_BYTES, UnixTerminalContainerHeader,
-    decode_unix_frame, encode_server_frame,
+    decode_unix_frame, encode_control_json, encode_server_frame,
 };
 use botster_terminal_protocol::MAX_TERMINAL_INPUT_FRAME_BYTES;
 
@@ -86,6 +86,27 @@ impl MuxWriteState {
             delivery_ack,
             close_after,
         )?;
+        self.enqueue_response_frame(frame)
+    }
+
+    pub(crate) fn enqueue_encoded_response(
+        &mut self,
+        encoded_frame: &[u8],
+        delivery_ack: Option<mpsc::Sender<()>>,
+        close_after: bool,
+    ) -> DaemonTransportResult<()> {
+        let bytes = encode_control_json(encoded_frame).map_err(DaemonTransportError::from)?;
+        self.enqueue_response_frame(PendingMuxFrame {
+            bytes: PendingMuxBytes::Control(bytes),
+            offset: 0,
+            complete_envelope: None,
+            class: PendingMuxClass::Response,
+            delivery_ack,
+            close_after,
+        })
+    }
+
+    fn enqueue_response_frame(&mut self, frame: PendingMuxFrame) -> DaemonTransportResult<()> {
         let frame_bytes = frame.bytes.total_len();
         if self.pending_response_bytes.saturating_add(frame_bytes) > PENDING_RESPONSE_BYTE_CAPACITY
         {
@@ -617,6 +638,31 @@ pub(crate) mod mux_write_resume_tests {
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
     use tokio::io::AsyncWrite;
+
+    #[test]
+    fn encoded_response_uses_exact_json_and_the_connection_storage_bound() {
+        let mut state = MuxWriteState::default();
+        // Whitespace distinguishes these bytes from a second serialization.
+        let encoded =
+            br#"{ "frame": "response", "request_id": "42", "response": { "kind": "status" } }"#;
+        state
+            .enqueue_encoded_response(encoded, None, false)
+            .expect("queue encoded response");
+        let first = state.queued_control.front().expect("queued frame");
+        let PendingMuxBytes::Control(bytes) = &first.bytes else {
+            panic!("control frame");
+        };
+        assert_eq!(
+            &bytes[botster_hub_client::UNIX_FRAME_LENGTH_PREFIX_BYTES + 1..],
+            encoded
+        );
+        state.pending_response_bytes = PENDING_RESPONSE_BYTE_CAPACITY;
+        assert!(matches!(
+            state.enqueue_encoded_response(encoded, None, false),
+            Err(crate::daemon::error::DaemonTransportError::ResponseBackpressured { .. }),
+        ));
+        assert_eq!(state.queued_control.len(), 1);
+    }
 
     #[tokio::test]
     async fn response_storage_charge_survives_partial_write_and_releases_after_full_write() {
