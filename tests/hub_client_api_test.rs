@@ -25,6 +25,12 @@ use botster_hub::{
     PackageSessionTypeWorkingDirectory, RuntimeEnvironment, SessionDefaults,
     SessionTypeMutationSource, SpawnTarget, TransportBindings,
 };
+use botster_hub_client::{
+    DaemonConnection, DaemonRequest, DaemonResponse, DaemonResponseKind,
+    DaemonSessionTypeDefinition, DaemonSessionTypeEditableDefinition,
+    DaemonSessionTypeMutationSource,
+};
+use botster_hub_test_support::{IsolatedHub, IsolatedHubBuilder};
 use botster_terminal_protocol_client::TerminalInputCommand;
 use botster_ui_contract::{
     PackageNavigationEntry, PackageNavigationTarget, PackageSurfaceDescriptor, PackageSurfaceKind,
@@ -34,8 +40,58 @@ use botster_ui_contract::{
 mod support;
 use botster_hub::test_internals::TestHubStateStoreExt;
 use support::{
-    bind_shared_terminal_adapter, candidate_session_worker_binary_path, inject_terminal_command,
+    bind_shared_terminal_adapter, candidate_hub_binary_path, candidate_session_worker_binary_path,
+    inject_terminal_command,
 };
+
+fn isolated_hub(name: &str) -> IsolatedHub {
+    IsolatedHubBuilder::new()
+        .hub_bin(candidate_hub_binary_path())
+        .session_worker_bin(candidate_session_worker_binary_path())
+        .root("/tmp/bhca")
+        .name(format!("client-api-{name}"))
+        .start()
+        .expect("start isolated hub")
+}
+
+fn daemon_definition(definition: &PackageSessionType) -> DaemonSessionTypeDefinition {
+    serde_json::from_value(serde_json::to_value(definition).expect("serialize session type"))
+        .expect("convert session type to daemon definition")
+}
+
+fn daemon_request(connection: &mut DaemonConnection, request: DaemonRequest) -> DaemonResponse {
+    let response = connection.request(&request).expect("daemon request");
+    assert_ne!(
+        response.kind,
+        DaemonResponseKind::OperatorError,
+        "daemon request failed: {:?}",
+        response.error
+    );
+    response
+}
+
+fn daemon_error_response(
+    connection: &mut DaemonConnection,
+    request: DaemonRequest,
+) -> DaemonResponse {
+    let response = connection.request(&request).expect("daemon request");
+    assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+    response
+}
+
+fn daemon_read_definition(
+    connection: &mut DaemonConnection,
+    session_type_id: &str,
+) -> DaemonSessionTypeEditableDefinition {
+    daemon_request(
+        connection,
+        DaemonRequest::ShowSessionTypeDefinition {
+            session_type_id: session_type_id.to_string(),
+        },
+    )
+    .session_type_definition
+    .expect("authoring response carries a definition")
+}
 
 fn explicit_runtime(name: &str) -> HubRuntime {
     let session_worker_path = candidate_session_worker_binary_path().to_path_buf();
@@ -137,25 +193,21 @@ fn hub_client_api_attach_fail_closes_without_unbound_inventory() {
 }
 
 #[test]
-fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only() {
-    let mut runtime = explicit_runtime("session-type-device-crud");
-    let config = runtime.config().clone();
-    let store = FileHubStateStore::for_data_directory(&config.data_directory);
-    store
-        .update_test_fixture(&config, |state| {
-            state.spawn_targets.push(SpawnTarget {
-                target_id: "repo:concurrent".to_string(),
-                label: "Concurrently persisted target".to_string(),
-                root: std::path::PathBuf::from("."),
-                enabled: false,
-                kind: "directory".to_string(),
-                base_ref: None,
-                metadata: BTreeMap::new(),
-            });
-        })
-        .expect("persist state after runtime loaded");
-    let packages = PackageRegistry::new(Vec::<Capability>::new().into_iter().collect());
-    let api = HubClientApi::local_operator("session-type-device-crud-client");
+fn session_type_device_crud_uses_unix_control_and_package_mutation_is_read_only() {
+    let hub = isolated_hub("session-type-device-crud");
+    let mut connection = DaemonConnection::connect(hub.endpoint()).expect("connect to daemon");
+    daemon_request(
+        &mut connection,
+        DaemonRequest::CreateSpawnTarget {
+            target_id: Some("repo:concurrent".to_string()),
+            label: Some("Concurrently persisted target".to_string()),
+            root: std::path::PathBuf::from("."),
+            enabled: false,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        },
+    );
     let mut definition = session_type("bin/accessory.sh", "accessory");
     definition.id = "terminal-accessory".to_string();
     definition.label = "Terminal accessory".to_string();
@@ -164,84 +216,62 @@ fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only()
     definition.traits = vec!["terminal".to_string()];
     definition.lifecycle = "persistent".to_string();
 
-    let created = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::CreateSessionType {
-                request_id: request_id("create-device-session-type"),
-                source: SessionTypeMutationSource::Device,
-                definition: definition.clone(),
-            },
-        )
-        .wait(&runtime)
-        .expect("create device session type");
-    let HubClientResponseBody::SessionTypes(created) = created.body else {
-        panic!("session type response expected");
-    };
-    assert_eq!(created.len(), 1);
-    assert!(created[0].editable);
-    assert_eq!(created[0].role, "botster.accessory");
-    assert_eq!(runtime.state().session_type_generation, 1);
-    assert_eq!(
-        runtime.state().spawn_targets[0].target_id,
-        "repo:concurrent",
-        "session type CRUD must mutate freshly loaded state without overwriting unrelated writes"
+    let created = daemon_request(
+        &mut connection,
+        DaemonRequest::CreateSessionType {
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: daemon_definition(&definition),
+        },
+    );
+    assert_eq!(created.kind, DaemonResponseKind::SessionTypes);
+    assert_eq!(created.session_types.len(), 1);
+    assert!(created.session_types[0].editable);
+    assert_eq!(created.session_types[0].role, "botster.accessory");
+    let targets = daemon_request(&mut connection, DaemonRequest::ListSpawnTargets);
+    assert!(
+        targets
+            .spawn_targets
+            .iter()
+            .any(|target| target.target_id == "repo:concurrent"),
+        "session type CRUD must preserve unrelated durable writes"
     );
 
     definition.label = "Updated terminal accessory".to_string();
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::UpdateSessionType {
-            request_id: request_id("update-device-session-type"),
-            source: SessionTypeMutationSource::Device,
-            definition,
+    let updated = daemon_request(
+        &mut connection,
+        DaemonRequest::UpdateSessionType {
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: daemon_definition(&definition),
         },
-    )
-    .wait(&runtime)
-    .expect("update device session type");
-    assert_eq!(runtime.state().session_type_generation, 2);
+    );
+    assert_eq!(updated.kind, DaemonResponseKind::SessionTypes);
+    assert_eq!(updated.session_types[0].label, "Updated terminal accessory");
 
-    let rejected = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::DeleteSessionType {
-                request_id: request_id("delete-package-session-type"),
-                source: SessionTypeMutationSource::Package {
-                    package_name: "read-only.plugin".to_string(),
-                },
-                session_type_id: "terminal-accessory".to_string(),
+    let rejected = daemon_error_response(
+        &mut connection,
+        DaemonRequest::DeleteSessionType {
+            source: DaemonSessionTypeMutationSource::Package {
+                package_name: "read-only.plugin".to_string(),
             },
-        )
-        .wait(&runtime)
-        .expect_err("package source is read-only");
-    assert!(matches!(
-        rejected,
-        HubClientError::SessionType {
-            kind: "read_only_session_type_source",
-            ..
-        }
-    ));
+            session_type_id: "terminal-accessory".to_string(),
+        },
+    );
+    assert_eq!(
+        rejected.error.as_ref().map(|error| error.code.as_str()),
+        Some("read_only_session_type_source")
+    );
 
-    let deleted = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::DeleteSessionType {
-                request_id: request_id("delete-device-session-type"),
-                source: SessionTypeMutationSource::Device,
-                session_type_id: "terminal-accessory".to_string(),
-            },
-        )
-        .wait(&runtime)
-        .expect("delete device session type");
-    let HubClientResponseBody::SessionTypes(deleted) = deleted.body else {
-        panic!("session type response expected");
-    };
-    assert!(deleted.is_empty());
-    assert_eq!(runtime.state().session_type_generation, 3);
+    let deleted = daemon_request(
+        &mut connection,
+        DaemonRequest::DeleteSessionType {
+            source: DaemonSessionTypeMutationSource::Device,
+            session_type_id: "terminal-accessory".to_string(),
+        },
+    );
+    assert_eq!(deleted.kind, DaemonResponseKind::SessionTypes);
+    assert!(deleted.session_types.is_empty());
+    drop(connection);
+    hub.shutdown().expect("shutdown isolated hub");
 }
 
 /// A definition that the sanitized row provably cannot reconstruct: a relative
@@ -299,36 +329,10 @@ fn read_definition(
     *definition
 }
 
-fn shown_row(
-    api: &HubClientApi,
-    runtime: &mut HubRuntime,
-    packages: &PackageRegistry,
-    label: &str,
-    session_type_id: &str,
-) -> botster_hub::HubSessionType {
-    let response = api
-        .handle_request(
-            runtime,
-            packages,
-            HubClientRequest::ShowSessionType {
-                request_id: request_id(label),
-                session_type_id: session_type_id.to_string(),
-            },
-        )
-        .wait(runtime)
-        .expect("show sanitized session type row");
-    let HubClientResponseBody::SessionTypes(mut rows) = response.body else {
-        panic!("session types response expected");
-    };
-    assert_eq!(rows.len(), 1);
-    rows.remove(0)
-}
-
 #[test]
 fn session_type_definition_round_trips_authored_path_and_environment() {
-    let mut runtime = explicit_runtime("session-type-definition-round-trip");
-    let packages = empty_registry();
-    let api = HubClientApi::local_operator("session-type-definition-round-trip-client");
+    let hub = isolated_hub("session-type-definition-round-trip");
+    let mut connection = DaemonConnection::connect(hub.endpoint()).expect("connect to daemon");
 
     // Two definitions: one with every optional field set, one with them all unset,
     // so a `skip_serializing_if` None-versus-absent slip cannot pass silently.
@@ -341,95 +345,83 @@ fn session_type_definition_round_trips_authored_path_and_environment() {
     sparse.traits = Vec::new();
 
     for definition in [populated.clone(), sparse.clone()] {
-        api.handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::CreateSessionType {
-                request_id: request_id(&format!("create-{}", definition.id)),
-                source: SessionTypeMutationSource::Device,
-                definition,
+        daemon_request(
+            &mut connection,
+            DaemonRequest::CreateSessionType {
+                source: DaemonSessionTypeMutationSource::Device,
+                definition: daemon_definition(&definition),
             },
-        )
-        .wait(&runtime)
-        .expect("create authored device session type");
+        );
     }
 
     for authored in [populated, sparse] {
-        let read = read_definition(
-            &api,
-            &mut runtime,
-            &packages,
-            &format!("definition-{}", authored.id),
-            &authored.id,
-        );
+        let read = daemon_read_definition(&mut connection, &authored.id);
 
         // The read is lossless and carries the exact mutation source Update needs.
-        assert_eq!(read.definition, authored, "authoring read must be lossless");
-        assert_eq!(read.source, SessionTypeMutationSource::Device);
+        assert_eq!(
+            read.definition,
+            daemon_definition(&authored),
+            "authoring read must be lossless"
+        );
+        assert_eq!(read.source, DaemonSessionTypeMutationSource::Device);
         assert_eq!(read.session_type_id, format!("device/{}", authored.id));
         assert_eq!(
             read.definition.id, authored.id,
             "definition.id must be the bare id Update matches on, not the composite id"
         );
 
-        // Submit the read back unchanged; the stored definition must be identical.
-        api.handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::UpdateSessionType {
-                request_id: request_id(&format!("round-trip-{}", authored.id)),
+        // Change one field and submit every other authored field unchanged.
+        let mut updated = read.definition.clone();
+        updated.label = format!("Updated {}", authored.id);
+        daemon_request(
+            &mut connection,
+            DaemonRequest::UpdateSessionType {
                 source: read.source.clone(),
-                definition: read.definition.clone(),
+                definition: updated.clone(),
             },
-        )
-        .wait(&runtime)
-        .expect("submit the authoring read back through Update");
-
-        let stored = runtime
-            .state()
-            .device_session_type_sources
-            .iter()
-            .flat_map(|source| source.session_types.iter())
-            .find(|stored| stored.id == authored.id)
-            .cloned()
-            .expect("round-tripped definition is still stored");
+        );
+        let stored = daemon_read_definition(&mut connection, &authored.id).definition;
         assert_eq!(
-            stored, authored,
+            stored, updated,
             "read-modify-write must not lose the authored working-directory path or environment"
         );
         assert_eq!(
             stored.working_directory,
-            PackageSessionTypeWorkingDirectory::Relative {
+            botster_hub_client::DaemonSessionTypeWorkingDirectory::Relative {
                 path: "nested/dir".to_string()
             }
         );
         assert!(!stored.environment.is_empty());
     }
+    drop(connection);
+    hub.shutdown().expect("shutdown isolated hub");
 }
 
 #[test]
 fn sanitized_session_type_row_still_cannot_reconstruct_the_authored_definition() {
-    let mut runtime = explicit_runtime("session-type-sanitized-row-is-lossy");
-    let packages = empty_registry();
-    let api = HubClientApi::local_operator("session-type-sanitized-row-client");
+    let hub = isolated_hub("session-type-sanitized-row-is-lossy");
+    let mut connection = DaemonConnection::connect(hub.endpoint()).expect("connect to daemon");
     let authored = authored_session_type("authored-lossy");
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::CreateSessionType {
-            request_id: request_id("create-lossy-source"),
-            source: SessionTypeMutationSource::Device,
-            definition: authored.clone(),
+    daemon_request(
+        &mut connection,
+        DaemonRequest::CreateSessionType {
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: daemon_definition(&authored),
         },
-    )
-    .wait(&runtime)
-    .expect("create authored device session type");
+    );
 
     // What a client could reconstruct before this seam existed: the row derives a
     // policy string and has no environment field at all, so both are destroyed.
-    let row = shown_row(&api, &mut runtime, &packages, "show-lossy", &authored.id);
+    let shown = daemon_request(
+        &mut connection,
+        DaemonRequest::ShowSessionType {
+            session_type_id: authored.id.clone(),
+        },
+    );
+    assert_eq!(shown.session_types.len(), 1);
+    let row = shown.session_types[0].clone();
     assert_eq!(row.working_directory_policy, "relative");
-    let reconstructed_from_row = PackageSessionType {
+    let reconstructed_from_row = DaemonSessionTypeDefinition {
         id: row.id.clone(),
         label: row.label.clone(),
         description: row.description.clone(),
@@ -441,38 +433,27 @@ fn sanitized_session_type_row_still_cannot_reconstruct_the_authored_definition()
         execution: row.execution.clone(),
         command: row.command.clone(),
         args: row.args.clone(),
-        working_directory: PackageSessionTypeWorkingDirectory::default(),
+        working_directory: botster_hub_client::DaemonSessionTypeWorkingDirectory::default(),
         environment: BTreeMap::new(),
         allowed_environment_overrides: row.allowed_environment_overrides.clone(),
         context: row.context_keys.clone(),
         target_id: None,
     };
     assert_ne!(
-        reconstructed_from_row, authored,
+        reconstructed_from_row,
+        daemon_definition(&authored),
         "the sanitized row must remain insufficient to rebuild an authored definition"
     );
     assert_eq!(
         reconstructed_from_row.working_directory,
-        PackageSessionTypeWorkingDirectory::PackageRoot
+        botster_hub_client::DaemonSessionTypeWorkingDirectory::PackageRoot
     );
     assert!(reconstructed_from_row.environment.is_empty());
 
     // And the sanitized surfaces did not move: no authored environment value and no
     // authored path appears in the published row, in list, or in the entity payload.
-    let listed = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessionTypes {
-                request_id: request_id("list-lossy"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list session types");
-    let HubClientResponseBody::SessionTypes(listed) = listed.body else {
-        panic!("session types response expected");
-    };
-    assert_eq!(listed, vec![row.clone()]);
+    let listed = daemon_request(&mut connection, DaemonRequest::ListSessionTypes);
+    assert_eq!(listed.session_types, vec![row.clone()]);
 
     let published = serde_json::to_value(&row).expect("session_type entity payload serializes");
     let published_keys = published
@@ -514,6 +495,8 @@ fn sanitized_session_type_row_still_cannot_reconstruct_the_authored_definition()
     assert!(!published_text.contains("nested/dir"));
     assert!(!published_text.contains("authored-value"));
     assert!(!published_text.contains("AUTHORED_SECRET_NAME"));
+    drop(connection);
+    hub.shutdown().expect("shutdown isolated hub");
 }
 
 #[test]
@@ -602,9 +585,8 @@ fn session_type_definition_refuses_package_sources_and_denied_admission() {
 
 #[test]
 fn session_type_role_interaction_traits_and_lifecycle_are_orthogonal() {
-    let mut runtime = explicit_runtime("session-type-orthogonal-semantics");
-    let packages = empty_registry();
-    let api = HubClientApi::local_operator("session-type-orthogonal-semantics-client");
+    let hub = isolated_hub("session-type-orthogonal-semantics");
+    let mut connection = DaemonConnection::connect(hub.endpoint()).expect("connect to daemon");
     let cases = [
         (
             "interactive-agent",
@@ -637,33 +619,18 @@ fn session_type_role_interaction_traits_and_lifecycle_are_orthogonal() {
         definition.interaction = interaction.to_string();
         definition.traits = traits.into_iter().map(str::to_string).collect();
         definition.lifecycle = lifecycle.to_string();
-        api.handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::CreateSessionType {
-                request_id: request_id(&format!("create-{id}")),
-                source: SessionTypeMutationSource::Device,
-                definition,
+        daemon_request(
+            &mut connection,
+            DaemonRequest::CreateSessionType {
+                source: DaemonSessionTypeMutationSource::Device,
+                definition: daemon_definition(&definition),
             },
-        )
-        .wait(&runtime)
-        .expect("orthogonal session type should be accepted");
+        );
     }
 
-    let response = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ListSessionTypes {
-                request_id: request_id("list-orthogonal-session-types"),
-            },
-        )
-        .wait(&runtime)
-        .expect("list orthogonal session types");
-    let HubClientResponseBody::SessionTypes(session_types) = response.body else {
-        panic!("session type response expected");
-    };
-    let semantics = session_types
+    let response = daemon_request(&mut connection, DaemonRequest::ListSessionTypes);
+    let semantics = response
+        .session_types
         .into_iter()
         .map(|session_type| {
             (
@@ -705,6 +672,8 @@ fn session_type_role_interaction_traits_and_lifecycle_are_orthogonal() {
             "persistent".to_string(),
         )
     );
+    drop(connection);
+    hub.shutdown().expect("shutdown isolated hub");
 }
 
 fn request_id(value: &str) -> RequestId {
@@ -1575,46 +1544,75 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
             ..
         }
     ));
+}
+
+#[test]
+fn repo_session_type_mutations_use_unix_control_admission() {
+    let repo_root = std::path::PathBuf::from(
+        "target/botster-hub-test-data/client-api-session-type-repo-mutation",
+    );
+    let _ = fs::remove_dir_all(&repo_root);
+    write_repo_session_types(
+        &repo_root,
+        serde_json::to_value([session_type("bin/repo.sh", "repo")])
+            .expect("serialize repo definition"),
+    );
+    let repo_root = repo_root.canonicalize().expect("canonical repo root");
+    let hub = isolated_hub("session-type-repo-mutation");
+    let mut connection = DaemonConnection::connect(hub.endpoint()).expect("connect to daemon");
+
+    daemon_request(
+        &mut connection,
+        DaemonRequest::CreateSessionType {
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: daemon_definition(&session_type("bin/device.sh", "device")),
+        },
+    );
+    daemon_request(
+        &mut connection,
+        DaemonRequest::CreateSpawnTarget {
+            target_id: Some("repo:main".to_string()),
+            label: Some("repo:main".to_string()),
+            root: repo_root.clone(),
+            enabled: true,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        },
+    );
 
     let mut updated_repo = session_type("bin/repo.sh", "repo-updated");
     updated_repo.label = "Updated repo agent".to_string();
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::UpdateSessionType {
-            request_id: request_id("update-admitted-repo-session-type"),
-            source: SessionTypeMutationSource::Repo {
+    daemon_request(
+        &mut connection,
+        DaemonRequest::UpdateSessionType {
+            source: DaemonSessionTypeMutationSource::Repo {
                 target_id: "repo:main".to_string(),
             },
-            definition: updated_repo,
+            definition: daemon_definition(&updated_repo),
         },
-    )
-    .wait(&runtime)
-    .expect("update repo definition through admitted target policy");
+    );
     assert!(
         fs::read_to_string(repo_root.join(".botster/session-types.json"))
             .expect("read Hub-written repo session types")
             .contains("Updated repo agent")
     );
-    let deleted = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::DeleteSessionType {
-                request_id: request_id("delete-admitted-repo-session-type"),
-                source: SessionTypeMutationSource::Repo {
-                    target_id: "repo:main".to_string(),
-                },
-                session_type_id: "init".to_string(),
+
+    let deleted = daemon_request(
+        &mut connection,
+        DaemonRequest::DeleteSessionType {
+            source: DaemonSessionTypeMutationSource::Repo {
+                target_id: "repo:main".to_string(),
             },
-        )
-        .wait(&runtime)
-        .expect("delete repo definition through admitted target policy");
-    let HubClientResponseBody::SessionTypes(after_delete) = deleted.body else {
-        panic!("session type response expected");
-    };
-    assert_eq!(after_delete[0].source, "device");
-    assert_eq!(runtime.state().session_type_generation, 2);
+            session_type_id: "init".to_string(),
+        },
+    );
+    assert_eq!(deleted.session_types.len(), 1);
+    assert_eq!(deleted.session_types[0].source, "device");
+
+    drop(connection);
+    hub.shutdown().expect("shutdown isolated hub");
+    fs::remove_dir_all(&repo_root).expect("remove repo fixture");
 }
 
 #[test]
@@ -1655,89 +1653,72 @@ fn session_type_definition_round_trips_repo_sources_and_preserves_selection() {
         serde_json::to_value([&repo_authored]).expect("serialize repo definitions"),
     );
 
-    let config = explicit_runtime("session-type-definition-repo")
-        .config()
-        .clone();
-    let store = FileHubStateStore::for_data_directory(&config.data_directory);
-    store
-        .update_test_fixture(&config, |state| {
-            state.device_session_type_sources = vec![DeviceSessionTypeSource {
-                root: device_root.clone(),
-                session_types: vec![device_authored.clone()],
-            }];
-            state.spawn_targets = vec![SpawnTarget {
-                target_id: "repo:authoring".to_string(),
-                label: "repo:authoring".to_string(),
-                root: repo_root.clone(),
-                enabled: true,
-                kind: "directory".to_string(),
-                base_ref: None,
-                metadata: BTreeMap::new(),
-            }];
-        })
-        .expect("persist authored session type sources");
-
-    let mut runtime = HubRuntime::load_from_store(config, &store).expect("reload runtime state");
-    let packages = empty_registry();
-    let api = HubClientApi::local_operator("session-type-definition-repo-client");
+    let repo_root = repo_root.canonicalize().expect("canonical repo root");
+    let hub = isolated_hub("session-type-definition-repo");
+    let mut connection = DaemonConnection::connect(hub.endpoint()).expect("connect to daemon");
+    daemon_request(
+        &mut connection,
+        DaemonRequest::CreateSessionType {
+            source: DaemonSessionTypeMutationSource::Device,
+            definition: daemon_definition(&device_authored),
+        },
+    );
+    daemon_request(
+        &mut connection,
+        DaemonRequest::CreateSpawnTarget {
+            target_id: Some("repo:authoring".to_string()),
+            label: Some("repo:authoring".to_string()),
+            root: repo_root.clone(),
+            enabled: true,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        },
+    );
 
     // A bare id selects the effective winner, matching ShowSessionType.
-    let effective = read_definition(
-        &api,
-        &mut runtime,
-        &packages,
-        "definition-bare-id",
-        "authored-shared",
-    );
-    assert_eq!(effective.definition, repo_authored);
+    let effective = daemon_read_definition(&mut connection, "authored-shared");
+    assert_eq!(effective.definition, daemon_definition(&repo_authored));
     assert_eq!(
         effective.source,
-        SessionTypeMutationSource::Repo {
+        DaemonSessionTypeMutationSource::Repo {
             target_id: "repo:authoring".to_string()
         }
     );
     assert_eq!(effective.session_type_id, "repo:authoring/authored-shared");
 
     // A qualified id still reaches the overridden source's authored definition.
-    let overridden = read_definition(
-        &api,
-        &mut runtime,
-        &packages,
-        "definition-qualified-id",
-        "device/authored-shared",
-    );
-    assert_eq!(overridden.definition, device_authored);
-    assert_eq!(overridden.source, SessionTypeMutationSource::Device);
+    let overridden = daemon_read_definition(&mut connection, "device/authored-shared");
+    assert_eq!(overridden.definition, daemon_definition(&device_authored));
+    assert_eq!(overridden.source, DaemonSessionTypeMutationSource::Device);
     assert_eq!(overridden.session_type_id, "device/authored-shared");
 
     // Repo round trip through the atomic file-write path.
-    api.handle_request(
-        &mut runtime,
-        &packages,
-        HubClientRequest::UpdateSessionType {
-            request_id: request_id("round-trip-repo-definition"),
+    let mut updated = effective.definition.clone();
+    updated.label = "Updated repo authored agent".to_string();
+    daemon_request(
+        &mut connection,
+        DaemonRequest::UpdateSessionType {
             source: effective.source.clone(),
-            definition: effective.definition.clone(),
+            definition: updated.clone(),
         },
-    )
-    .wait(&runtime)
-    .expect("submit the repo authoring read back through Update");
+    );
     let written = fs::read_to_string(repo_root.join(".botster/session-types.json"))
         .expect("read Hub-written repo session types");
     let written: serde_json::Value =
         serde_json::from_str(&written).expect("repo session types parse");
     let stored: Vec<PackageSessionType> =
         serde_json::from_value(written["session_types"].clone()).expect("repo definitions decode");
-    assert_eq!(stored, vec![repo_authored.clone()]);
+    let mut expected_repo = repo_authored.clone();
+    expected_repo.label = updated.label.clone();
+    assert_eq!(stored, vec![expected_repo]);
 
-    let round_tripped = read_definition(
-        &api,
-        &mut runtime,
-        &packages,
-        "definition-after-repo-round-trip",
-        "authored-shared",
-    );
-    assert_eq!(round_tripped.definition, repo_authored);
+    let round_tripped = daemon_read_definition(&mut connection, "authored-shared");
+    assert_eq!(round_tripped.definition, updated);
+    drop(connection);
+    hub.shutdown().expect("shutdown isolated hub");
+    fs::remove_dir_all(&device_root).expect("remove device fixture");
+    fs::remove_dir_all(&repo_root).expect("remove repo fixture");
 }
 
 #[test]

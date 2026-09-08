@@ -15,7 +15,6 @@ pub(crate) mod reply;
 pub(crate) mod request;
 pub(crate) mod session_types;
 pub(crate) mod sessions;
-pub(crate) mod spawn_targets;
 pub(crate) mod webrtc;
 
 use botster_core::RequestId;
@@ -240,7 +239,7 @@ pub(crate) fn handle_control_request(
         | DaemonRequest::ShowWorktree { .. }
         | DaemonRequest::CreateWorktree { .. }
         | DaemonRequest::DeleteWorktree { .. } => {
-            spawn_targets::handle_request(daemon, request).into()
+            unreachable!("spawn-target and worktree requests use the host executor")
         }
         DaemonRequest::PluginLifecycleStatus => plugins::handle_request(daemon, request).into(),
         DaemonRequest::IssueLocalWebrtcBootstrap { .. }
@@ -285,8 +284,10 @@ pub(crate) fn handle_runtime_control_request(
         | DaemonRequest::CreateSessionType { .. }
         | DaemonRequest::UpdateSessionType { .. }
         | DaemonRequest::DeleteSessionType { .. }
-        | DaemonRequest::ResolveSessionType { .. }
-        | DaemonRequest::SpawnSessionType { .. } => {
+        | DaemonRequest::ResolveSessionType { .. } => {
+            unreachable!("session-type reads and mutations use the host executor")
+        }
+        DaemonRequest::SpawnSessionType { .. } => {
             session_types::handle_runtime(daemon, state, observability, request)
         }
         DaemonRequest::Whoami { .. }

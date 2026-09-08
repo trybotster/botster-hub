@@ -70,10 +70,8 @@ use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, Pack
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 use crate::session_types::{
     EnsuredManagedWorktree, HubSessionContext, HubSessionType, ManagedSessionTypeRequest,
-    SessionTypeError, SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest,
-    commit_repo_session_type_mutation, list_session_types_for_target,
-    materialize_managed_session_type, materialize_session_type, prepare_session_type_mutation,
-    show_session_type_for_target,
+    SessionTypeRequest, list_session_types_for_target, materialize_managed_session_type,
+    materialize_session_type, show_session_type_for_target,
 };
 use crate::shared_view::{SharedView, SharedViewBudget};
 
@@ -82,24 +80,6 @@ use package_effect::{HostPackageCleanup, HostPackageRuntime};
 
 /// Allocation-owned immutable durable state view.
 pub type HubStateView = SharedView<HubState>;
-
-fn session_type_state_write_error(error: HubStateStoreError) -> SessionTypeError {
-    match error {
-        HubStateStoreError::ViewCapacity {
-            requested,
-            available,
-        } => SessionTypeError::new(
-            "shared_view_capacity_exhausted",
-            format!(
-                "session type state needs {requested} logical bytes but only {available} remain"
-            ),
-        ),
-        _ => SessionTypeError::new(
-            "session_type_state_write_failed",
-            "session type state could not be persisted",
-        ),
-    }
-}
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -573,29 +553,6 @@ impl HubRuntime {
         state: HubState,
     ) -> Result<SharedView<HubState>, HubStateStoreError> {
         self.state.prepare(state)
-    }
-
-    /// Apply and persist one Hub-authorized session type mutation.
-    pub fn mutate_session_type(
-        &self,
-        source: SessionTypeMutationSource,
-        mutation: SessionTypeMutation,
-    ) -> Result<HubState, SessionTypeError> {
-        let store = FileHubStateStore::for_data_directory(&self.config.data_directory);
-        let current = store
-            .load_for_update(&self.config)
-            .map_err(session_type_state_write_error)?;
-        let prepared = prepare_session_type_mutation(&self.config, &current, source, mutation)?;
-        let (next, repo_write) = prepared.into_parts();
-        let prepared_state = store
-            .prepare_shared(next, &self.shared_view_budget())
-            .map_err(session_type_state_write_error)?;
-        commit_repo_session_type_mutation(repo_write)?;
-        let next = store
-            .commit_shared(prepared_state)
-            .map_err(session_type_state_write_error)?;
-        self.publish_state_view(next.clone());
-        Ok((*next).clone())
     }
 
     /// Return the shared spawn-target projection used by Lua helpers.
