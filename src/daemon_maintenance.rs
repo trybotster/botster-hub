@@ -21,6 +21,7 @@ use botster_core_daemon::{
 
 use crate::HubRuntime;
 use crate::data_plane::driver::{CoreTicket, CoreTicketPoll};
+use crate::lifecycle::{PACKAGE_EVENT_INVOCATION_ORIGIN, SESSION_FAMILY_INVOCATION_ORIGIN};
 use crate::session_projection::SessionProjection;
 
 /// Published owner-turn budget after isolated-path measurement.
@@ -1209,7 +1210,7 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
                 session_id: None,
                 subscription_id: None,
                 surface_id: None,
-                origin: Some("session-family".to_string()),
+                origin: Some(SESSION_FAMILY_INVOCATION_ORIGIN.to_string()),
                 metadata: None,
             },
             payload: BoundaryJson(payload),
@@ -1362,7 +1363,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     session_id: None,
                     subscription_id: None,
                     surface_id: None,
-                    origin: Some("package-event".to_string()),
+                    origin: Some(PACKAGE_EVENT_INVOCATION_ORIGIN.to_string()),
                     metadata,
                 },
                 payload: BoundaryJson(delivery.payload_json.clone()),

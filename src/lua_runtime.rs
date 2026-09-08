@@ -29,7 +29,10 @@ use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, 
 use serde_json::json;
 
 use crate::capabilities::{HubCapabilityRuntime, PluginStoreBatchMutation, PluginStoreBatchResult};
-use crate::lifecycle::{HubPluginEventHandler, HubPluginRuntimeBundle, package_entity_owner_token};
+use crate::lifecycle::{
+    HubPluginEventHandler, HubPluginRuntimeBundle, PACKAGE_EVENT_INVOCATION_ORIGIN,
+    SESSION_FAMILY_INVOCATION_ORIGIN, package_entity_owner_token,
+};
 use crate::package_event_router::{
     CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, CausalScopeTable, EventPlaneStatus,
     PackageEventRouter,
@@ -707,7 +710,7 @@ impl PluginRuntime for LuaPluginRuntime {
         }
 
         #[cfg(test)]
-        if request.context.origin.as_deref() == Some("package-event") {
+        if request.context.origin.as_deref() == Some(PACKAGE_EVENT_INVOCATION_ORIGIN) {
             let hold_ms = TEST_EVENT_HANDLER_HOLD_MS.load(Ordering::Relaxed);
             if hold_ms > 0 {
                 thread::sleep(Duration::from_millis(hold_ms));
@@ -754,7 +757,20 @@ impl PluginRuntime for LuaPluginRuntime {
             .and_then(|metadata| metadata.0.get("causal_scope_id"))
             .and_then(serde_json::Value::as_u64);
         set_current_causal_scope(scope_id);
+        // These event consumers read success or failure, but never the return value.
+        let acknowledge_event = request.handler.kind == PluginHandlerKind::Event
+            && matches!(
+                request.context.origin.as_deref(),
+                Some(PACKAGE_EVENT_INVOCATION_ORIGIN | SESSION_FAMILY_INVOCATION_ORIGIN)
+            );
         let outcome = match function.call::<Value>(payload) {
+            Ok(_) if acknowledge_event => {
+                PluginInvocationResult::Completed(PluginInvocationSuccess {
+                    request_id: request.request_id,
+                    handler: request.handler,
+                    payload: None,
+                })
+            }
             Ok(Value::Nil) => PluginInvocationResult::Completed(PluginInvocationSuccess {
                 request_id: request.request_id,
                 handler: request.handler,
@@ -2005,4 +2021,122 @@ fn sanitize_lua_error(error: mlua::Error) -> String {
         .next()
         .unwrap_or("lua runtime error")
         .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use botster_core::{
+        PluginCompletion, PluginInvocationClass, PluginInvocationContext, RequestId,
+    };
+
+    fn invoke_lua(source: &str, origin: &str, kind: PluginHandlerKind) -> PluginInvocationResult {
+        let lua = Lua::new();
+        let handlers = lua.create_table().expect("create handler registry");
+        let handler = lua
+            .load(source)
+            .eval::<Function>()
+            .expect("load Lua handler");
+        handlers.set("run", handler).expect("register Lua handler");
+        lua.globals()
+            .set("__botster_handlers", handlers)
+            .expect("install handler registry");
+        let plugin_key = PluginKey("completion-test".to_string());
+        let runtime = LuaPluginRuntime {
+            plugin_key: plugin_key.clone(),
+            lua: Mutex::new(lua),
+            instruction_budget: Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET)),
+            stopped: AtomicBool::new(false),
+        };
+        runtime.invoke(
+            PluginInvocationRequest {
+                request_id: RequestId("completion-test-request".to_string()),
+                handler: PluginHandlerRef {
+                    plugin_key,
+                    kind,
+                    handler_id: "run".to_string(),
+                },
+                timeout_ms: 1_000,
+                context: PluginInvocationContext {
+                    client_id: None,
+                    session_id: None,
+                    subscription_id: None,
+                    surface_id: None,
+                    origin: Some(origin.to_string()),
+                    metadata: None,
+                },
+                payload: BoundaryJson(json!({})),
+            },
+            PluginCancellationToken::new(),
+        )
+    }
+
+    #[test]
+    fn large_background_returns_produce_unit_acknowledgements() {
+        for origin in [
+            PACKAGE_EVENT_INVOCATION_ORIGIN,
+            SESSION_FAMILY_INVOCATION_ORIGIN,
+        ] {
+            let result = invoke_lua(
+                "return function() return { value = string.rep('x', 2 * 1024 * 1024) } end",
+                origin,
+                PluginHandlerKind::Event,
+            );
+            assert!(matches!(
+                &result,
+                PluginInvocationResult::Completed(PluginInvocationSuccess { payload: None, .. })
+            ));
+            let completion = PluginCompletion {
+                class: PluginInvocationClass::Background,
+                result,
+            };
+            assert!(
+                serde_json::to_vec(&completion)
+                    .expect("encode acknowledgement")
+                    .len()
+                    < 4 * 1024
+            );
+        }
+    }
+
+    #[test]
+    fn background_lua_errors_remain_handler_failures() {
+        for origin in [
+            PACKAGE_EVENT_INVOCATION_ORIGIN,
+            SESSION_FAMILY_INVOCATION_ORIGIN,
+        ] {
+            let result = invoke_lua(
+                "return function() error('background execution failed') end",
+                origin,
+                PluginHandlerKind::Event,
+            );
+            let PluginInvocationResult::Failed(failure) = result else {
+                panic!("a Lua error must remain a failure");
+            };
+            assert_eq!(failure.kind, PluginInvocationFailureKind::HandlerFailed);
+            assert!(failure.reason.contains("background execution failed"));
+        }
+    }
+
+    #[test]
+    fn request_response_lua_results_keep_their_payloads() {
+        for (origin, kind) in [
+            ("request-response", PluginHandlerKind::McpTool),
+            ("request-response", PluginHandlerKind::Event),
+            (PACKAGE_EVENT_INVOCATION_ORIGIN, PluginHandlerKind::McpTool),
+        ] {
+            let result = invoke_lua(
+                "return function() return { value = string.rep('x', 8192), count = 7 } end",
+                origin,
+                kind,
+            );
+            let PluginInvocationResult::Completed(success) = result else {
+                panic!("the request must succeed");
+            };
+            assert_eq!(
+                success.payload.expect("retain the response payload").0,
+                json!({ "value": "x".repeat(8192), "count": 7 })
+            );
+        }
+    }
 }

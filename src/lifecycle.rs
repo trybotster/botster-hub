@@ -19,6 +19,9 @@ use botster_core::{
 
 use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
 
+pub(crate) const PACKAGE_EVENT_INVOCATION_ORIGIN: &str = "package-event";
+pub(crate) const SESSION_FAMILY_INVOCATION_ORIGIN: &str = "session-family";
+
 const PACKAGE_ENTITY_NAMESPACE_V1_MARKER: &str = "bns1_";
 
 /// Map an exact package id to its canonical single-segment entity owner token.
