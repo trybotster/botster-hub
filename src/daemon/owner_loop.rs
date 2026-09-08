@@ -3566,6 +3566,102 @@ return botster.register({
     }
 
     #[test]
+    fn second_session_subscriber_receives_snapshot_without_a_new_journal_change() {
+        let root = unique_package_control_dir("second-session-subscriber");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+            .expect("start the session subscription daemon");
+        let session_id = botster_core::SessionId("shared-session".into());
+        daemon
+            .runtime_mut()
+            .unwrap()
+            .spawn_session_for_test(
+                botster_core::SessionSpawnRequest {
+                    request_id: botster_core::RequestId("shared-session-spawn".into()),
+                    session_id: session_id.clone(),
+                    executable: "/bin/sh".into(),
+                    arguments: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
+                    working_directory: botster_core::SpawnWorkingDirectory { path: ".".into() },
+                    environment: botster_core::SpawnEnvironment::default(),
+                    initial_pty_size: Some(botster_core::ResizePayload { rows: 24, cols: 80 }),
+                },
+                botster_core::CoreSessionMetadata::new(),
+            )
+            .expect("spawn the shared session");
+        let mut state = DaemonControlState::default();
+        seed_lifecycle_reconciliation(&mut daemon, &mut state);
+        let mut receivers = Vec::new();
+        let mut first_cursor = None;
+        for peer in ["peer-a", "peer-b"] {
+            let (sender, receiver) = mpsc::sync_channel(8);
+            let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+            crate::daemon::control::entities::handle(
+                &mut daemon,
+                &mut state,
+                ControlMessage::SubscribeEntities {
+                    entity_type: "session".into(),
+                    subscription_id: peer.into(),
+                    transport_request_id: Some("1".into()),
+                    client_id: Some(peer.into()),
+                    frame_tx: crate::subscription::entity::EntityFrameSender::Blocking(sender),
+                    frame_rx: None,
+                    reply_tx,
+                    grant_id: None,
+                },
+            );
+            let response =
+                receive_test_control_reply(reply_rx).expect("the daemon admits the subscriber");
+            assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
+            assert!(state.entity_subscriptions.contains_key(peer));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let frame = loop {
+                drive_ready_test_turn(&mut daemon, &mut state);
+                if let Ok(frame) = receiver.try_recv() {
+                    break frame;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{peer} must receive a snapshot through the production owner dispatcher"
+                );
+                thread::sleep(Duration::from_millis(1));
+            };
+            let botster_hub_client::DaemonEntityFrame::Snapshot {
+                subscription_id,
+                items,
+                ..
+            } = frame
+            else {
+                panic!("the first frame must be a snapshot");
+            };
+            assert_eq!(subscription_id, peer);
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item["session_uuid"] == session_id.0)
+            );
+            assert!(state.maintenance.projection_caught_up());
+            assert!(!state.maintenance.projection_dirty);
+            let cursor = state.maintenance.projection.cursor.clone();
+            if peer == "peer-a" {
+                first_cursor = cursor;
+            } else {
+                assert_eq!(
+                    cursor, first_cursor,
+                    "the second subscription must not need a new journal change"
+                );
+            }
+            receivers.push(receiver);
+        }
+        assert_eq!(state.entity_subscriptions.len(), 2);
+        daemon
+            .runtime_mut()
+            .unwrap()
+            .shutdown_session_for_test(session_id)
+            .expect("stop the shared session");
+        daemon.stop();
+        std::fs::remove_dir_all(root).expect("remove the session subscription test directory");
+    }
+
+    #[test]
     fn abandoned_plugin_entity_subscriptions_release_owner_capacity() {
         for retire_reason in ["connection_close", "deadline"] {
             let root =
