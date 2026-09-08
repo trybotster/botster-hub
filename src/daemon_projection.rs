@@ -833,6 +833,7 @@ pub(crate) fn daemon_status_from_status(
         live_attach_occupancy: Vec::new(),
         observability,
         retention,
+        local_webrtc_terminal_records: Vec::new(),
         diagnostics,
     }
 }

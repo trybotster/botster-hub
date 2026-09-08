@@ -1485,7 +1485,6 @@ mod tests {
                 handle_control_message(
                     &mut harness.daemon,
                     &mut harness.state,
-                    &harness.terminal_path,
                     &harness.transport_handle,
                     harness.control_tx.clone(),
                     message,
@@ -1863,7 +1862,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::BindReservedSubscription {
@@ -1935,7 +1933,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::AuthorizeSubscriptionSend {
@@ -2026,7 +2023,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             authorization,
@@ -2058,7 +2054,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::RetireReservedSubscription {
@@ -2150,7 +2145,6 @@ mod tests {
                     handle_control_message(
                         &mut harness.daemon,
                         &mut harness.state,
-                        &harness.terminal_path,
                         &harness.transport_handle,
                         harness.control_tx.clone(),
                         message,
@@ -2293,7 +2287,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::AuthorizeSubscriptionSend {
@@ -2347,7 +2340,6 @@ mod tests {
                     handle_control_message(
                         &mut harness.daemon,
                         &mut harness.state,
-                        &harness.terminal_path,
                         &harness.transport_handle,
                         harness.control_tx.clone(),
                         other,
@@ -2367,7 +2359,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             authorization,
@@ -2424,7 +2415,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             automatic_retirement,
@@ -2512,7 +2502,6 @@ mod tests {
             handle_control_message(
                 &mut harness.daemon,
                 &mut harness.state,
-                &harness.terminal_path,
                 &harness.transport_handle,
                 harness.control_tx.clone(),
                 message,

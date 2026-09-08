@@ -13,9 +13,9 @@ use botster_hub::{DaemonRequest, DaemonResponse, daemon_transport_request};
 use botster_hub_client::{
     ClientFrame, DaemonCompatibilityRequirement, DaemonHello, DaemonHelloAck,
     DaemonLocalWebrtcBootstrap, DaemonLocalWebrtcDeliveryChunk, DaemonLocalWebrtcDeliveryKind,
-    LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION, LOCAL_WEBRTC_MAX_DELIVERY_BYTES,
-    LOCAL_WEBRTC_MAX_FRAME_BYTES, LocalWebrtcTerminalChunkHeader, PROTOCOL, RequestIdSequence,
-    ServerFrame, encode_request_id,
+    DaemonLocalWebrtcTerminalRecord, LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
+    LOCAL_WEBRTC_MAX_DELIVERY_BYTES, LOCAL_WEBRTC_MAX_FRAME_BYTES, LocalWebrtcTerminalChunkHeader,
+    PROTOCOL, RequestIdSequence, ServerFrame, encode_request_id,
 };
 use botster_terminal_protocol_client::{TerminalInputCommand, encode_terminal_input};
 use bytes::BytesMut;
@@ -30,7 +30,6 @@ use webrtc::runtime::{
 
 use super::SmokeError;
 
-const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str = "local-webrtc-sender-terminal.json";
 const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT: Duration = Duration::from_secs(2);
 /// Plaintext bytes per sealed terminal chunk, matching the Hub bound.
 const TERMINAL_CHUNK_PAYLOAD_BYTES: usize = 12 * 1024;
@@ -169,7 +168,16 @@ pub(crate) fn smoke_local_webrtc_round_trip(
         }
     });
     if result.is_err() {
-        wait_for_local_webrtc_sender_terminal_record(config, &bootstrap.grant_id);
+        match wait_for_local_webrtc_sender_terminal_record(config, &bootstrap.grant_id) {
+            Some(record) => eprintln!(
+                "local_webrtc_terminal_record={}",
+                serde_json::to_string(&record).expect("terminal record serializes")
+            ),
+            None => eprintln!(
+                "local_webrtc_terminal_record=not_retained grant_id={}",
+                bootstrap.grant_id
+            ),
+        }
     }
     result
 }
@@ -177,28 +185,25 @@ pub(crate) fn smoke_local_webrtc_round_trip(
 fn wait_for_local_webrtc_sender_terminal_record(
     config: &botster_hub::HubConfig,
     expected_grant_id: &str,
-) {
-    let path = config
-        .data_directory
-        .join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+) -> Option<DaemonLocalWebrtcTerminalRecord> {
     let deadline = Instant::now() + LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_WAIT;
     loop {
-        if std::fs::read(&path)
+        let retained = daemon_transport_request(config, DaemonRequest::Status)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|record| {
-                record
-                    .get("grant_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .as_deref()
-            == Some(expected_grant_id)
+            .and_then(|response| response.status)
+            .and_then(|status| {
+                status
+                    .local_webrtc_terminal_records
+                    .into_iter()
+                    .find(|record| record.grant_id == expected_grant_id)
+            });
+        if let Some(record) = retained
+            && !record.cause.is_empty()
         {
-            return;
+            return Some(record);
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return;
+            return None;
         };
         thread::sleep(remaining.min(Duration::from_millis(10)));
     }

@@ -736,7 +736,6 @@ pub(crate) fn soft_wait_until(deadline: Instant, predicate: &mut dyn FnMut() -> 
 pub(crate) struct PeerHarness {
     pub(crate) daemon: HubDaemon,
     pub(crate) state: DaemonControlState,
-    pub(crate) terminal_path: PathBuf,
     pub(crate) control_tx: ControlSender,
     pub(crate) control_rx: tokio_mpsc::Receiver<ControlMessage>,
     pub(crate) transport_handle: tokio::runtime::Handle,
@@ -781,7 +780,6 @@ impl PeerHarness {
     ) -> Self {
         LAST_SESSION_CLEANUP_ERROR.with(|slot| *slot.borrow_mut() = None);
         let data_directory = unique_test_data_dir(label);
-        let terminal_path = data_directory.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
         let mut daemon =
             start_test_daemon_with_event_queue(data_directory.clone(), consumer_queue_max_events);
         let (control_tx, control_rx) = tokio_mpsc::channel(256);
@@ -798,7 +796,6 @@ impl PeerHarness {
         Self {
             daemon,
             state,
-            terminal_path,
             control_tx,
             control_rx,
             transport_handle,
@@ -815,7 +812,6 @@ impl PeerHarness {
         handle_control_message(
             &mut self.daemon,
             &mut self.state,
-            &self.terminal_path,
             &self.transport_handle,
             self.control_tx.clone(),
             ControlMessage::Request {
@@ -959,7 +955,6 @@ impl PeerHarness {
                     handle_control_message(
                         &mut self.daemon,
                         &mut self.state,
-                        &self.terminal_path,
                         &self.transport_handle,
                         self.control_tx.clone(),
                         message,
@@ -1047,7 +1042,6 @@ impl PeerHarness {
                     handle_control_message(
                         &mut self.daemon,
                         &mut self.state,
-                        &self.terminal_path,
                         &self.transport_handle,
                         self.control_tx.clone(),
                         message,
@@ -1098,7 +1092,6 @@ impl PeerHarness {
                     handle_control_message(
                         &mut self.daemon,
                         &mut self.state,
-                        &self.terminal_path,
                         &self.transport_handle,
                         self.control_tx.clone(),
                         message,
@@ -1197,7 +1190,6 @@ impl PeerHarness {
                     handle_control_message(
                         &mut self.daemon,
                         &mut self.state,
-                        &self.terminal_path,
                         &self.transport_handle,
                         self.control_tx.clone(),
                         message,
@@ -1250,7 +1242,6 @@ impl PeerHarness {
                     handle_control_message(
                         &mut self.daemon,
                         &mut self.state,
-                        &self.terminal_path,
                         &self.transport_handle,
                         self.control_tx.clone(),
                         message,
@@ -1301,7 +1292,6 @@ impl PeerHarness {
                     handle_control_message(
                         &mut self.daemon,
                         &mut self.state,
-                        &self.terminal_path,
                         &self.transport_handle,
                         self.control_tx.clone(),
                         message,
@@ -1346,7 +1336,6 @@ impl PeerHarness {
                     handle_control_message(
                         &mut self.daemon,
                         &mut self.state,
-                        &self.terminal_path,
                         &self.transport_handle,
                         self.control_tx.clone(),
                         message,
@@ -1404,7 +1393,6 @@ impl PeerHarness {
                     handle_control_message(
                         &mut self.daemon,
                         &mut self.state,
-                        &self.terminal_path,
                         &self.transport_handle,
                         self.control_tx.clone(),
                         message,
@@ -1440,7 +1428,6 @@ impl PeerHarness {
                     handle_control_message(
                         &mut self.daemon,
                         &mut self.state,
-                        &self.terminal_path,
                         &self.transport_handle,
                         self.control_tx.clone(),
                         message,
@@ -1946,11 +1933,6 @@ pub(crate) fn rewrite_package_source_path(package_dir: &Path) {
         serde_json::to_string_pretty(&value).expect("serialize"),
     )
     .expect("write manifest");
-}
-
-pub(crate) fn read_terminal_record(path: &Path) -> LocalWebrtcSenderTerminalRecord {
-    let bytes = std::fs::read(path).expect("read terminal record");
-    serde_json::from_slice(&bytes).expect("parse terminal record")
 }
 
 pub(crate) fn receive_test_runtime_message(

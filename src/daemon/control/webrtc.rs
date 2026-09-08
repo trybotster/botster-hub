@@ -1,8 +1,6 @@
 //! Local WebRTC bootstrap, signal, and peer-closed control family.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::Path;
 
 use botster_hub_client::{
     DaemonDiagnostic, DaemonOperatorError, DaemonRequest, DaemonResponse, DaemonResponseKind,
@@ -27,10 +25,7 @@ use crate::subscription::attach_routes::{
 use crate::subscription::route_cleanup::{
     CleanupCandidate, candidate_for_departing_owner, retain_route_cleanup,
 };
-use crate::transport::webrtc::{
-    LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES, LocalWebrtcSenderTerminalRecord,
-    LocalWebrtcSignalRequest,
-};
+use crate::transport::webrtc::LocalWebrtcSignalRequest;
 
 pub(crate) fn handle_request(
     daemon: &mut HubDaemon,
@@ -51,27 +46,6 @@ pub(crate) fn handle_request(
         } => signal_response(daemon, control_tx, grant_id, grant_secret, origin, offer),
         _ => unreachable!("webrtc family received a non-webrtc request"),
     }
-}
-
-fn persist_local_webrtc_terminal_record(
-    path: &Path,
-    record: &LocalWebrtcSenderTerminalRecord,
-) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(record)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if bytes.len() > LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "local WebRTC sender terminal record exceeded size bound",
-        ));
-    }
-    let temporary_path = path.with_extension("json.tmp");
-    fs::write(&temporary_path, bytes)?;
-    if let Err(error) = fs::rename(&temporary_path, path) {
-        let _ = fs::remove_file(&temporary_path);
-        return Err(error);
-    }
-    Ok(())
 }
 
 fn issue_local_webrtc_bootstrap_response(
@@ -183,7 +157,6 @@ fn signal_response(
 pub(crate) fn handle_peer_closed(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
-    local_webrtc_terminal_record_path: &Path,
     control_tx: ControlSender,
     message: ControlMessage,
 ) -> bool {
@@ -209,13 +182,11 @@ pub(crate) fn handle_peer_closed(
         state.lifecycle_counters.cleanup_completed =
             state.lifecycle_counters.cleanup_completed.saturating_add(1);
     }
-    if let Err(error) =
-        persist_local_webrtc_terminal_record(local_webrtc_terminal_record_path, &terminal_record)
+    if let Err(error) = daemon
+        .local_webrtc()
+        .retain_terminal_record(terminal_record)
     {
-        eprintln!(
-            "local WebRTC sender terminal record persistence failed: kind={:?}",
-            error.kind()
-        );
+        eprintln!("local WebRTC sender terminal record rejected: {error}");
     }
     let remove_result = daemon.local_webrtc().remove_peer(&grant_id);
     let mut removed_grants: BTreeSet<String> =

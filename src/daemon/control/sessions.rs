@@ -283,6 +283,8 @@ pub(crate) fn handle_runtime(
                         &state.pending_runtime.live_attach_routes,
                         &state.pending_runtime,
                     );
+                    let local_webrtc = daemon.local_webrtc();
+                    status.local_webrtc_terminal_records = local_webrtc.terminal_records();
                 }
                 ControlPoll::Ready(Ok(response))
             })

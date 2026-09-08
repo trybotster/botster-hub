@@ -2886,6 +2886,23 @@ pub struct DaemonLocalWebrtcAnswer {
     pub diagnostics: Vec<DaemonDiagnostic>,
 }
 
+/// Bounded diagnostic evidence for one closed local WebRTC peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonLocalWebrtcTerminalRecord {
+    pub schema_version: u32,
+    pub grant_id: String,
+    pub request_operation: String,
+    pub message_id: Option<String>,
+    pub next_chunk_index: usize,
+    pub last_sent_chunk_index: Option<usize>,
+    pub total_chunks: usize,
+    pub pressured: bool,
+    pub peer_connection_state: String,
+    pub channel_terminal_signal: String,
+    pub cause: String,
+    pub cleanup_disposition: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonPackageAvailability {
     pub state: DaemonPackageAvailabilityState,
@@ -3181,6 +3198,9 @@ pub struct DaemonStatus {
     /// Retained ended-session history policy and accounting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<DaemonRetentionAccounting>,
+    /// Recent local WebRTC peer-close evidence, bounded by the Hub.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_webrtc_terminal_records: Vec<DaemonLocalWebrtcTerminalRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
 }
@@ -7218,6 +7238,7 @@ mod tests {
                     sessions: 1,
                     evictions: 0,
                 }),
+                local_webrtc_terminal_records: Vec::new(),
                 diagnostics: vec![DaemonDiagnostic::connected("status")],
             }),
             sessions: vec![DaemonSession {

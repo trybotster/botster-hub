@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 #[cfg(test)]
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use botster_core::AesGcmKey;
-use botster_hub_client::{DaemonProtocolErrorCode, DaemonRequest};
+use botster_hub_client::{DaemonLocalWebrtcTerminalRecord, DaemonProtocolErrorCode, DaemonRequest};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use webrtc::data_channel::DataChannel;
@@ -47,9 +47,14 @@ pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_BOUND: Duration = Duration::from_millis
 /// Must be strictly greater than [`LOCAL_WEBRTC_PEER_CLOSE_BOUND`].
 #[cfg(test)]
 pub(crate) const LOCAL_WEBRTC_PEER_CLOSE_HANDLER_JOIN_DEADLINE: Duration = Duration::from_secs(2);
-pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
-    "local-webrtc-sender-terminal.json";
-pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
+pub(crate) const LOCAL_WEBRTC_TERMINAL_RECORD_MAX_BYTES: usize = 2 * 1024;
+pub(crate) const LOCAL_WEBRTC_TERMINAL_RECORD_MAX_ENTRIES: usize = 64;
+/// The status section uses at most one eighth of the 1 MiB response limit.
+pub(crate) const LOCAL_WEBRTC_TERMINAL_RECORD_MAX_TOTAL_BYTES: usize = 128 * 1024;
+const LOCAL_WEBRTC_TERMINAL_GRANT_ID_MAX_BYTES: usize = 64;
+const LOCAL_WEBRTC_TERMINAL_OPERATION_MAX_BYTES: usize = 64;
+const LOCAL_WEBRTC_TERMINAL_MESSAGE_ID_MAX_BYTES: usize = 64;
+const LOCAL_WEBRTC_TERMINAL_PEER_STATE_MAX_BYTES: usize = 32;
 /// Ephemeral local WebRTC admission and peer registry.
 #[derive(Clone)]
 pub(crate) struct SharedEventPlane(
@@ -74,6 +79,10 @@ pub struct LocalWebrtcTransport {
     /// Peers whose `close()` failed while siblings kept the shared runtime alive.
     /// Retained so a later empty-map park / `stop_all` can still force driver stop.
     pub(crate) stale_close_peers: BTreeMap<String, Arc<dyn PeerConnection>>,
+    /// The latest bounded close evidence for each retained grant, oldest first.
+    terminal_records: VecDeque<RetainedLocalWebrtcTerminalRecord>,
+    terminal_record_bytes: usize,
+    terminal_record_evictions: u64,
     pub(crate) runtime: Option<tokio::runtime::Runtime>,
     #[cfg(test)]
     pub(crate) close_completions: Mutex<Vec<String>>,
@@ -88,6 +97,12 @@ pub struct LocalWebrtcTransport {
     /// under default-concurrency lib load.
     #[cfg(test)]
     pub(crate) worker_threads: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct RetainedLocalWebrtcTerminalRecord {
+    record: DaemonLocalWebrtcTerminalRecord,
+    encoded_len: usize,
 }
 
 pub(crate) enum ClosePeerOutcome {
@@ -105,6 +120,74 @@ impl LocalWebrtcTransport {
     #[must_use]
     pub(crate) fn event_plane(&self) -> Arc<crate::subscription::package_events::ClientEventPlane> {
         self.event_plane.0.clone()
+    }
+
+    pub(crate) fn retain_terminal_record(
+        &mut self,
+        record: LocalWebrtcSenderTerminalRecord,
+    ) -> Result<(), &'static str> {
+        let record = record.into_daemon_record()?;
+        let encoded_len = serde_json::to_vec(&record)
+            .map_err(|_| "local WebRTC terminal record did not serialize")?
+            .len();
+        if encoded_len > LOCAL_WEBRTC_TERMINAL_RECORD_MAX_BYTES {
+            return Err("local WebRTC terminal record exceeded its byte bound");
+        }
+        if let Some(index) = self
+            .terminal_records
+            .iter()
+            .position(|retained| retained.record.grant_id == record.grant_id)
+        {
+            let replaced = self
+                .terminal_records
+                .remove(index)
+                .expect("terminal record index came from the same queue");
+            self.terminal_record_bytes = self
+                .terminal_record_bytes
+                .saturating_sub(replaced.encoded_len);
+        }
+        self.terminal_record_bytes = self.terminal_record_bytes.saturating_add(encoded_len);
+        self.terminal_records
+            .push_back(RetainedLocalWebrtcTerminalRecord {
+                record,
+                encoded_len,
+            });
+        while self.terminal_records.len() > LOCAL_WEBRTC_TERMINAL_RECORD_MAX_ENTRIES
+            || self.terminal_record_bytes > LOCAL_WEBRTC_TERMINAL_RECORD_MAX_TOTAL_BYTES
+        {
+            let evicted = self
+                .terminal_records
+                .pop_front()
+                .expect("a retained terminal record exceeds a nonzero bound");
+            self.terminal_record_bytes = self
+                .terminal_record_bytes
+                .saturating_sub(evicted.encoded_len);
+            self.terminal_record_evictions = self.terminal_record_evictions.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn terminal_records(&self) -> Vec<DaemonLocalWebrtcTerminalRecord> {
+        self.terminal_records
+            .iter()
+            .map(|retained| retained.record.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn terminal_record_evictions(&self) -> u64 {
+        self.terminal_record_evictions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_record(
+        &self,
+        grant_id: &str,
+    ) -> Option<&DaemonLocalWebrtcTerminalRecord> {
+        self.terminal_records
+            .iter()
+            .find(|retained| retained.record.grant_id == grant_id)
+            .map(|retained| &retained.record)
     }
     /// Close all active local peers. Used during daemon shutdown.
     pub fn stop_all(&mut self) {
@@ -520,6 +603,50 @@ pub(crate) struct LocalWebrtcSenderTerminalRecord {
     pub cleanup_disposition: LocalWebrtcCleanupDisposition,
 }
 
+impl LocalWebrtcSenderTerminalRecord {
+    fn into_daemon_record(self) -> Result<DaemonLocalWebrtcTerminalRecord, &'static str> {
+        if self.grant_id.len() > LOCAL_WEBRTC_TERMINAL_GRANT_ID_MAX_BYTES {
+            return Err("local WebRTC terminal grant id exceeded its byte bound");
+        }
+        if self.request_operation.len() > LOCAL_WEBRTC_TERMINAL_OPERATION_MAX_BYTES {
+            return Err("local WebRTC terminal operation exceeded its byte bound");
+        }
+        if self
+            .message_id
+            .as_ref()
+            .is_some_and(|message_id| message_id.len() > LOCAL_WEBRTC_TERMINAL_MESSAGE_ID_MAX_BYTES)
+        {
+            return Err("local WebRTC terminal message id exceeded its byte bound");
+        }
+        if self.peer_connection_state.len() > LOCAL_WEBRTC_TERMINAL_PEER_STATE_MAX_BYTES {
+            return Err("local WebRTC terminal peer state exceeded its byte bound");
+        }
+        Ok(DaemonLocalWebrtcTerminalRecord {
+            schema_version: self.schema_version,
+            grant_id: self.grant_id,
+            request_operation: self.request_operation,
+            message_id: self.message_id,
+            next_chunk_index: self.next_chunk_index,
+            last_sent_chunk_index: self.last_sent_chunk_index,
+            total_chunks: self.total_chunks,
+            pressured: self.pressured,
+            peer_connection_state: self.peer_connection_state,
+            channel_terminal_signal: match self.channel_terminal_signal {
+                LocalWebrtcChannelTerminalSignal::None => "none",
+                LocalWebrtcChannelTerminalSignal::OnClose => "on_close",
+                LocalWebrtcChannelTerminalSignal::OnError => "on_error",
+                LocalWebrtcChannelTerminalSignal::PollEnded => "poll_ended",
+            }
+            .to_string(),
+            cause: self.cause.to_string(),
+            cleanup_disposition: match self.cleanup_disposition {
+                LocalWebrtcCleanupDisposition::NewlySent => "newly_sent",
+            }
+            .to_string(),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LocalWebrtcTerminalState {
     pub(crate) request_operation: String,
@@ -918,6 +1045,90 @@ mod tests {
         Receiver as AsyncReceiver, Sender as AsyncSender, channel as webrtc_channel,
         default_runtime, timeout,
     };
+
+    fn retained_terminal_record(grant_id: impl Into<String>) -> LocalWebrtcSenderTerminalRecord {
+        LocalWebrtcSenderTerminalRecord {
+            schema_version: 1,
+            grant_id: grant_id.into(),
+            request_operation: "status".to_string(),
+            message_id: Some("response-terminal-record".to_string()),
+            next_chunk_index: 1,
+            last_sent_chunk_index: Some(0),
+            total_chunks: 2,
+            pressured: true,
+            peer_connection_state: "failed".to_string(),
+            channel_terminal_signal: LocalWebrtcChannelTerminalSignal::OnClose,
+            cause: LocalWebrtcTerminalCause::PeerFailed,
+            cleanup_disposition: LocalWebrtcCleanupDisposition::NewlySent,
+        }
+    }
+
+    #[test]
+    fn terminal_record_retention_is_bounded_correlated_and_oldest_evicted() {
+        assert!(
+            LOCAL_WEBRTC_TERMINAL_RECORD_MAX_TOTAL_BYTES
+                <= botster_hub_client::MAX_CONTROL_RESPONSE_BYTES / 8
+        );
+        let mut transport = LocalWebrtcTransport::default();
+        for serial in 0..=LOCAL_WEBRTC_TERMINAL_RECORD_MAX_ENTRIES {
+            transport
+                .retain_terminal_record(retained_terminal_record(format!("grant-{serial}")))
+                .expect("bounded terminal record");
+        }
+        assert_eq!(
+            transport.terminal_records.len(),
+            LOCAL_WEBRTC_TERMINAL_RECORD_MAX_ENTRIES
+        );
+        assert!(transport.terminal_record_bytes <= LOCAL_WEBRTC_TERMINAL_RECORD_MAX_TOTAL_BYTES);
+        assert_eq!(transport.terminal_record_evictions(), 1);
+        assert!(transport.terminal_record("grant-0").is_none());
+        assert!(transport.terminal_record("grant-other").is_none());
+        assert!(
+            transport
+                .terminal_record(&format!(
+                    "grant-{}",
+                    LOCAL_WEBRTC_TERMINAL_RECORD_MAX_ENTRIES
+                ))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn terminal_record_retention_rejects_oversized_variable_fields() {
+        let mut transport = LocalWebrtcTransport::default();
+
+        let record =
+            retained_terminal_record("x".repeat(LOCAL_WEBRTC_TERMINAL_GRANT_ID_MAX_BYTES + 1));
+        assert_eq!(
+            transport.retain_terminal_record(record),
+            Err("local WebRTC terminal grant id exceeded its byte bound")
+        );
+
+        let mut record = retained_terminal_record("grant-current");
+        record.request_operation = "x".repeat(LOCAL_WEBRTC_TERMINAL_OPERATION_MAX_BYTES + 1);
+        assert_eq!(
+            transport.retain_terminal_record(record),
+            Err("local WebRTC terminal operation exceeded its byte bound")
+        );
+
+        let mut record = retained_terminal_record("grant-current");
+        record.message_id = Some("x".repeat(LOCAL_WEBRTC_TERMINAL_MESSAGE_ID_MAX_BYTES + 1));
+        assert_eq!(
+            transport.retain_terminal_record(record),
+            Err("local WebRTC terminal message id exceeded its byte bound")
+        );
+
+        let mut record = retained_terminal_record("grant-current");
+        record.peer_connection_state = "x".repeat(LOCAL_WEBRTC_TERMINAL_PEER_STATE_MAX_BYTES + 1);
+        assert_eq!(
+            transport.retain_terminal_record(record),
+            Err("local WebRTC terminal peer state exceeded its byte bound")
+        );
+
+        assert!(transport.terminal_records().is_empty());
+        assert_eq!(transport.terminal_record_evictions(), 0);
+    }
+
     #[test]
     fn peer_admits_only_the_first_data_channel() {
         let peer_state = test_peer_state("grant-one-channel");
@@ -1108,9 +1319,13 @@ mod tests {
             .inject_peer_connection_state_for_test(&grant_id, RTCPeerConnectionState::Failed);
         harness.process_until_peer_closed(&grant_id, Instant::now() + Duration::from_secs(10));
 
-        let terminal = read_terminal_record(&harness.terminal_path);
+        let terminal = harness
+            .daemon
+            .local_webrtc()
+            .terminal_record(&grant_id)
+            .expect("peer close retains grant-correlated terminal evidence");
         assert_eq!(terminal.grant_id, grant_id);
-        assert_eq!(terminal.cause, LocalWebrtcTerminalCause::PeerFailed);
+        assert_eq!(terminal.cause, "peer_failed");
         assert_eq!(terminal.peer_connection_state, "failed");
 
         assert_eq!(harness.daemon.local_webrtc().active_peer_count(), 0);
@@ -1330,7 +1545,6 @@ mod tests {
             handle_control_message(
                 &mut harness.daemon,
                 &mut harness.state,
-                &harness.terminal_path,
                 &harness.transport_handle,
                 harness.control_tx.clone(),
                 ControlMessage::InspectReservation {
@@ -1804,7 +2018,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::SubscribeEntities {
@@ -2210,7 +2423,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::SubscribeEntities {
@@ -2254,7 +2466,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::LocalWebrtcPeerClosed {
@@ -2309,7 +2520,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::SubscribeEntities {
@@ -2364,7 +2574,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::LocalWebrtcPeerClosed {
@@ -2414,7 +2623,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::Request {
@@ -2488,7 +2696,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::Request {
@@ -2543,7 +2750,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::SubscribeEntities {
@@ -2582,7 +2788,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::SubscribeEntities {
@@ -2614,7 +2819,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::UnsubscribeEntities {
@@ -2706,7 +2910,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::LocalWebrtcPeerClosed {
@@ -2827,7 +3030,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::LocalWebrtcPeerClosed {
@@ -2943,7 +3145,6 @@ mod tests {
                         handle_control_message(
                             &mut harness.daemon,
                             &mut harness.state,
-                            &harness.terminal_path,
                             &harness.transport_handle,
                             harness.control_tx.clone(),
                             message,
@@ -2965,7 +3166,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             peer_closed_message,
@@ -3418,7 +3618,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::RegisterWebrtcAdmission {
@@ -3454,7 +3653,6 @@ mod tests {
         handle_control_message(
             &mut harness.daemon,
             &mut harness.state,
-            &harness.terminal_path,
             &harness.transport_handle,
             harness.control_tx.clone(),
             ControlMessage::LocalWebrtcPeerClosed {

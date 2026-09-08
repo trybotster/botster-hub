@@ -17,10 +17,7 @@ pub use peer::LocalWebrtcTransport;
 
 pub(crate) use crate::admission::grants::LocalWebrtcSignalRequest;
 pub(crate) use adapter::{WebRtcConnectionMux, WebRtcTerminalAdapterHandle};
-pub(crate) use peer::{
-    LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE, LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
-    LocalWebrtcSenderTerminalRecord,
-};
+pub(crate) use peer::LocalWebrtcSenderTerminalRecord;
 pub(crate) use subscription_channel::LocalWebrtcAttachedSubscription;
 
 pub(crate) type LocalWebrtcResult<T> = Result<T, LocalWebrtcError>;

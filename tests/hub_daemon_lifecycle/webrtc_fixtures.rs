@@ -64,9 +64,7 @@ use botster_hub_test_support::monotonic_now_ns;
 
 use super::*;
 
-pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE: &str =
-    "local-webrtc-sender-terminal.json";
-pub(crate) const LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES: usize = 4096;
+pub(crate) const LOCAL_WEBRTC_TERMINAL_RECORD_MAX_BYTES: usize = 2 * 1024;
 /// Match shipped client mailbox event bound so this fixture cannot hide lag.
 pub(crate) const WEBRTC_INBOUND_MAX_FRAMES: usize = 128;
 pub(crate) const WEBRTC_INBOUND_MAX_BYTES: usize = 512 * 1024;
@@ -2393,21 +2391,21 @@ pub(crate) fn local_webrtc_grant_id(output: &Output) -> Option<String> {
 }
 
 pub(crate) fn local_webrtc_sender_terminal_record(
-    data_dir: &Path,
+    output: &Output,
     expected_grant_id: &str,
 ) -> serde_json::Value {
-    let path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
+    let text = command_output_text(output);
+    let encoded = text
+        .lines()
+        .find_map(|line| line.strip_prefix("local_webrtc_terminal_record="))
+        .filter(|encoded| !encoded.starts_with("not_retained "))
+        .expect("smoke output includes retained local WebRTC terminal evidence");
     assert!(
-        !path.with_extension("json.tmp").exists(),
-        "same-directory replacement must not leave a temporary sender record"
-    );
-    let bytes = fs::read(&path).expect("read persisted local WebRTC sender terminal record");
-    assert!(
-        bytes.len() <= LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES,
+        encoded.len() <= LOCAL_WEBRTC_TERMINAL_RECORD_MAX_BYTES,
         "sender terminal record exceeded fixed size bound"
     );
-    let record: serde_json::Value = serde_json::from_slice(&bytes)
-        .expect("parse persisted local WebRTC sender terminal record");
+    let record: serde_json::Value = serde_json::from_str(encoded)
+        .expect("parse local WebRTC terminal record from smoke output");
     let object = record
         .as_object()
         .expect("sender terminal record has a fixed JSON object schema");
@@ -2498,7 +2496,6 @@ pub(crate) fn local_webrtc_sender_terminal_record(
         "sender record has a typed terminal cause: {record}"
     );
     assert_eq!(record["cleanup_disposition"], "newly_sent");
-    let text = String::from_utf8(bytes).expect("sender terminal record is UTF-8 JSON");
     for forbidden in [
         "grant_secret",
         "payload",
@@ -2507,14 +2504,10 @@ pub(crate) fn local_webrtc_sender_terminal_record(
         env!("CARGO_MANIFEST_DIR"),
     ] {
         assert!(
-            !text.contains(forbidden),
-            "sender terminal record contains forbidden data {forbidden:?}: {text}"
+            !encoded.contains(forbidden),
+            "sender terminal record contains forbidden data {forbidden:?}: {encoded}"
         );
     }
-    assert!(
-        !text.contains(&data_dir.display().to_string()),
-        "sender terminal record contains its data-directory path"
-    );
     record
 }
 
@@ -2523,13 +2516,19 @@ pub(crate) fn local_webrtc_smoke_failure_evidence(output: &Output, data_dir: &Pa
     let Some(grant_id) = local_webrtc_grant_id(output) else {
         return format!("smoke failed before local WebRTC bootstrap: {text}");
     };
-    let record_path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
-    if !record_path.is_file() {
-        return format!(
-            "smoke failed: {text}; sender_record=missing file={LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE}"
-        );
+    if !text
+        .lines()
+        .any(|line| line.starts_with("local_webrtc_terminal_record={"))
+    {
+        return format!("smoke failed: {text}; sender_record=not_retained");
     }
-    let terminal_record = local_webrtc_sender_terminal_record(data_dir, &grant_id);
+    let terminal_record = local_webrtc_sender_terminal_record(output, &grant_id);
+    assert!(
+        !terminal_record
+            .to_string()
+            .contains(&data_dir.display().to_string()),
+        "sender terminal record contains its data-directory path"
+    );
     format!("smoke failed: {text}; sender_record={terminal_record}")
 }
 

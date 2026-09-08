@@ -16,8 +16,6 @@ pub(crate) mod sessions;
 pub(crate) mod spawn_targets;
 pub(crate) mod webrtc;
 
-use std::path::Path;
-
 use botster_core::RequestId;
 use botster_hub_client::{
     DaemonDiagnostic, DaemonLifecycleCounters, DaemonOperatorError, DaemonRequest, DaemonResponse,
@@ -93,7 +91,6 @@ pub(crate) fn control_request_operation_label(request: &DaemonRequest) -> &'stat
 pub(crate) fn handle_control_message(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
-    local_webrtc_terminal_record_path: &Path,
     transport_handle: &tokio::runtime::Handle,
     control_tx: ControlSender,
     message: ControlMessage,
@@ -124,13 +121,9 @@ pub(crate) fn handle_control_message(
         ControlMessage::HubUpdateCheckCompleted { update } => {
             host::hub_update_check_completed(state, update)
         }
-        message @ ControlMessage::LocalWebrtcPeerClosed { .. } => webrtc::handle_peer_closed(
-            daemon,
-            state,
-            local_webrtc_terminal_record_path,
-            control_tx,
-            message,
-        ),
+        message @ ControlMessage::LocalWebrtcPeerClosed { .. } => {
+            webrtc::handle_peer_closed(daemon, state, control_tx, message)
+        }
         ControlMessage::EgressWriteFailed {
             delivery_kind,
             write_class,
