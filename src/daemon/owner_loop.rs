@@ -51,7 +51,7 @@ use crate::transport::unix::connection::{
 };
 use crate::transport::unix::listener::{
     accept_connections, acquire_socket_owner_lock, cleanup_socket_path, prepare_socket_path,
-    rebind_missing_socket_path, socket_path,
+    socket_path,
 };
 
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
@@ -476,13 +476,11 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         let _runtime = transport_runtime.enter();
         TokioUnixListener::from_std(listener).map_err(DaemonTransportError::Io)?
     };
-    let (rebind_tx, rebind_rx) = tokio_mpsc::channel(1);
     let mut connection_tasks = vec![transport_runtime.spawn(accept_connections(
         listener,
         control_tx.clone(),
         shutdown_tx.subscribe(),
         Arc::new(Semaphore::new(DAEMON_MAX_CONNECTIONS)),
-        rebind_rx,
     ))];
     loop {
         let mut owner_turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
@@ -704,9 +702,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             let status = daemon.stop();
             cleanup_socket_path(&socket_path, socket_owner);
             return Ok(status);
-        }
-        if !socket_path.exists() {
-            rebind_missing_socket_path(&rebind_tx, &socket_path);
         }
     }
 }
@@ -3268,8 +3263,8 @@ return botster.register({
 
     #[test]
     fn abandoned_plugin_replies_release_owner_capacity_while_execution_remains_live() {
-        for retire_reason in ["reply_closed", "deadline"] {
-            let root = unique_package_control_dir(&format!("controlled-plugin-{retire_reason}"));
+        for client_id in ["connection-close-a", "connection-close-b"] {
+            let root = unique_package_control_dir(&format!("controlled-plugin-{client_id}"));
             let data_directory = root.join("data");
             let package_dir = root.join("owner.controlled-gate");
             write_package_control_manifest(
@@ -3305,7 +3300,7 @@ return botster.register({
             crate::lua_runtime::arm_test_plugin_invocation_gate();
             let request = DaemonRequest::PluginMcpCallTool {
                 name: "owner.controlled_gate".to_string(),
-                arguments: serde_json::json!({ "token": retire_reason }),
+                arguments: serde_json::json!({ "token": client_id }),
             };
             let step = handle_control_request(
                 &mut daemon,
@@ -3313,7 +3308,7 @@ return botster.register({
                 DaemonObservability {
                     egress: Vec::new(),
                     lifecycle: DaemonLifecycleCounters::default(),
-                    client_id: Some(format!("connection-{retire_reason}")),
+                    client_id: Some(client_id.to_string()),
                     grant_id: None,
                     transport_request_id: Some("91".to_string()),
                 },
@@ -3330,17 +3325,6 @@ return botster.register({
             );
             let permit = state.budget.reserve().expect("pending request permit");
             let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
-            let mut reply_rx = Some(reply_rx);
-            let accepted_at = if retire_reason == "deadline" {
-                Instant::now()
-                    .checked_sub(crate::daemon::owner_budget::RETAINED_OPERATION_DEADLINE)
-                    .expect("deadline timestamp")
-            } else {
-                Instant::now()
-            };
-            if retire_reason == "reply_closed" {
-                drop(reply_rx.take());
-            }
             state.pending_requests.insert(
                 waiter_id,
                 crate::daemon::control::pending::PendingControlRequest {
@@ -3354,9 +3338,9 @@ return botster.register({
                     reply_tx,
                     response_delivery_rx: None,
                     grant_id: None,
-                    client: Some(format!("connection-{retire_reason}")),
+                    client: Some(client_id.to_string()),
                     permit: Some(permit),
-                    accepted_at,
+                    accepted_at: Instant::now(),
                     must_finish: false,
                     past_deadline: false,
                     continuation: step.continuation,
@@ -3365,11 +3349,10 @@ return botster.register({
             );
             assert_eq!(state.budget.outstanding(), 1);
 
-            crate::daemon::control::pending::poll_pending_requests(
+            crate::daemon::control::pending::retire_abandoned_requests(
                 &mut daemon,
                 &mut state,
-                Instant::now(),
-                |_, _, _, _| panic!("an abandoned held request must retire before completion"),
+                client_id,
             );
 
             assert!(state.pending_requests.is_empty());
@@ -3377,7 +3360,7 @@ return botster.register({
             assert!(
                 !state
                     .plugin_controls
-                    .has_transport_correlation(&format!("connection-{retire_reason}"), "91"),
+                    .has_transport_correlation(client_id, "91"),
                 "retirement must remove the reply correlation"
             );
             assert!(

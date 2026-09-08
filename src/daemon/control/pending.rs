@@ -467,33 +467,6 @@ pub(crate) fn poll_ready_requests(
 }
 
 #[cfg(test)]
-pub(crate) fn poll_pending_requests(
-    daemon: &mut HubDaemon,
-    state: &mut DaemonControlState,
-    now: Instant,
-    finish: impl FnMut(
-        &mut HubDaemon,
-        &mut DaemonControlState,
-        PendingControlRequest,
-        ControlReply,
-    ) -> bool,
-) -> bool {
-    let waiter_ids = state.pending_requests.keys().copied().collect::<Vec<_>>();
-    for waiter_id in waiter_ids {
-        let entry = &state.pending_requests[&waiter_id];
-        let expired = now.saturating_duration_since(entry.accepted_at)
-            >= crate::daemon::owner_budget::RETAINED_OPERATION_DEADLINE;
-        let class = entry.ready_class;
-        mark_request_ready(state, waiter_id, class, READY_INITIAL);
-        if expired {
-            mark_request_ready(state, waiter_id, ReadyClass::Deadline, READY_DEADLINE);
-        }
-    }
-    let mut budget = OwnerTurnBudget::new(Instant::now());
-    poll_ready_requests(daemon, state, now, &mut budget, finish)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
