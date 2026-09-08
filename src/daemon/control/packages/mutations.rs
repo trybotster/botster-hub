@@ -22,6 +22,7 @@ use crate::daemon::control::session_types::{
 };
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};
 use crate::entrypoint_supervisor::EntrypointSupervisorError;
+use crate::host_mutations::PackageRuntimeEffect;
 use crate::persistence::FileHubStateStore;
 use crate::{
     PackageAction, PackageAdmissionReason, PackageDecision, PackageRegistry, PackageRegistryError,
@@ -628,4 +629,127 @@ fn runnable_entrypoint_definition_changed(
         .find(|entrypoint| entrypoint.id == entrypoint_id);
 
     previous.manifest != refreshed.manifest || previous_entrypoint != refreshed_entrypoint
+}
+
+/// Apply the owner-only runtime phase after a package state commit.
+pub(crate) fn apply_committed_runtime_effect(
+    daemon: &mut HubDaemon,
+    effect: &PackageRuntimeEffect,
+) -> DaemonTransportResult<()> {
+    match effect {
+        PackageRuntimeEffect::Enable { package_name, .. } => {
+            load_package_after_enable(daemon, package_name)
+        }
+        PackageRuntimeEffect::Disable { package_name }
+        | PackageRuntimeEffect::Remove { package_name } => {
+            daemon.entrypoint_supervisor().stop_package(package_name);
+            unload_package_after_disable(daemon, package_name)?;
+            record_event_plane_unload(daemon, package_name);
+            Ok(())
+        }
+        PackageRuntimeEffect::Reload {
+            package_name,
+            reload_plugin,
+            running_entrypoints,
+            ..
+        } => {
+            if *reload_plugin {
+                reload_package_after_reload(daemon, package_name)?;
+            }
+            let packages = daemon.package_registry().clone();
+            restart_running_package_entrypoints(
+                daemon,
+                &packages,
+                package_name,
+                running_entrypoints,
+            )
+        }
+        PackageRuntimeEffect::Refresh { packages, .. } => {
+            for package in packages {
+                if package.reload_plugin {
+                    reload_package_after_reload(daemon, &package.package_name)?;
+                }
+                let registry = daemon.package_registry().clone();
+                restart_running_package_entrypoints(
+                    daemon,
+                    &registry,
+                    &package.package_name,
+                    &package.restart_entrypoints,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Restore owner-only runtime state after the host restored durable package state.
+pub(crate) fn restore_runtime_after_failed_effect(
+    daemon: &mut HubDaemon,
+    effect: &PackageRuntimeEffect,
+) -> Vec<PackageRollbackFailure> {
+    let mut rollbacks = Vec::new();
+    match effect {
+        PackageRuntimeEffect::Enable { package_name, .. } => {
+            if let Err(error) = unload_package_after_disable(daemon, package_name) {
+                rollbacks.push(PackageRollbackFailure {
+                    step: "plugin",
+                    package_name: Some(package_name.clone()),
+                    error: Box::new(error),
+                });
+            }
+        }
+        PackageRuntimeEffect::Reload {
+            package_name,
+            previous_packages,
+            running_entrypoints,
+            ..
+        } => restore_registry_runtime(
+            daemon,
+            previous_packages,
+            &BTreeMap::from([(package_name.clone(), running_entrypoints.clone())]),
+            &mut rollbacks,
+        ),
+        PackageRuntimeEffect::Refresh {
+            previous_packages,
+            running_entrypoints,
+            ..
+        } => restore_registry_runtime(
+            daemon,
+            previous_packages,
+            running_entrypoints,
+            &mut rollbacks,
+        ),
+        PackageRuntimeEffect::Disable { .. } | PackageRuntimeEffect::Remove { .. } => {}
+    }
+    rollbacks
+}
+
+fn restore_registry_runtime(
+    daemon: &mut HubDaemon,
+    previous: &PackageRegistry,
+    running_entrypoints: &BTreeMap<String, Vec<String>>,
+    rollbacks: &mut Vec<PackageRollbackFailure>,
+) {
+    for record in previous.packages() {
+        let package_name = record.manifest.name.as_str();
+        if record.state == PackageState::Enabled
+            && let Err(error) = restore_plugin_from_registry(daemon, previous, package_name)
+        {
+            rollbacks.push(PackageRollbackFailure {
+                step: "plugin",
+                package_name: Some(package_name.to_string()),
+                error: Box::new(error),
+            });
+        }
+        if let Some(entrypoint_ids) = running_entrypoints.get(package_name)
+            && let Err(error) =
+                restart_running_package_entrypoints(daemon, previous, package_name, entrypoint_ids)
+        {
+            rollbacks.push(PackageRollbackFailure {
+                step: "entrypoint",
+                package_name: Some(package_name.to_string()),
+                error: Box::new(error),
+            });
+        }
+    }
 }

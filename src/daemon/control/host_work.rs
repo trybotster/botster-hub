@@ -4,14 +4,16 @@ use botster_hub_client::{DaemonDiagnostic, DaemonOperatorError, DaemonRequest, D
 
 use crate::HubDaemon;
 use crate::daemon::control::pending::{ControlPoll, ControlStep};
+use crate::daemon::error::{DaemonTransportError, PackageRollbackFailure};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::ReadyClass;
 use crate::host_executor::{
     HostCommand, HostJobIdentity, HostResult, HostSubmitError, HostWorkPermit,
 };
 use crate::host_mutations::{
-    HostCommit, HostMutationCommand, HostMutationError, HostMutationResult, HostPrepare, HostRead,
-    HostRecover, PreparedMutation, RecoveryOutcome, SessionTypeRecovery,
+    HostCommit, HostMutationCommand, HostMutationError, HostMutationResult, HostPackageFinalize,
+    HostPrepare, HostRead, HostRecover, PackageRuntimeEffect, PreparedMutation, RecoveryOutcome,
+    SessionTypeRecovery,
 };
 use crate::owner_identity::WaiterId;
 
@@ -118,8 +120,10 @@ pub(crate) fn handle(
     }
 
     let mut retained_prepare: Option<(PreparedMutation, HostWorkPermit)> = None;
-    let mut retained_recovery: Option<(HostRecover, HostWorkPermit)> = None;
     let mut prior_compensation_failure: Option<HostMutationError> = None;
+    let mut failed_package_effect: Option<(PackageRuntimeEffect, DaemonTransportError)> = None;
+    let mut prior_package_compensation_failure: Option<PackageRollbackFailure> = None;
+    let mut finalizing_package = false;
     let mut next_phase = 2;
     Some(ControlStep::pending_in(
         ReadyClass::HostCompletion,
@@ -133,17 +137,6 @@ pub(crate) fn handle(
                     permit,
                     must_finish,
                     &mut retained_prepare,
-                    &mut next_phase,
-                );
-            }
-            if let Some((recovery, permit)) = retained_recovery.take() {
-                state.host_recovery_waiters.remove(&waiter_id);
-                return submit_phase(
-                    daemon,
-                    state,
-                    waiter_id,
-                    HostMutationCommand::Recover(recovery),
-                    permit,
                     &mut next_phase,
                 );
             }
@@ -161,7 +154,13 @@ pub(crate) fn handle(
                 );
             };
             match result {
-                HostMutationResult::ReadReady(reply) => finish_reply(permit, reply),
+                HostMutationResult::ReadReady(reply) => {
+                    if finalizing_package {
+                        finalizing_package = false;
+                        release_document(state, waiter_id);
+                    }
+                    finish_reply(permit, reply)
+                }
                 HostMutationResult::Prepared(prepared) => admit_or_park_commit(
                     daemon,
                     state,
@@ -189,8 +188,116 @@ pub(crate) fn handle(
                     if let Some(packages) = committed.packages {
                         daemon.publish_package_registry_view(packages);
                     }
+                    if let Some(effect) = committed.package_effect {
+                        if let Err(error) = crate::daemon::control::packages::mutations::apply_committed_runtime_effect(daemon, &effect) {
+                            let Some(runtime) = daemon.runtime() else {
+                                release_document(state, waiter_id);
+                                return finish_transport_error(
+                                    permit,
+                                    DaemonTransportError::PackageCompensation {
+                                        original: Box::new(error),
+                                        rollbacks: vec![PackageRollbackFailure {
+                                            step: "persist",
+                                            package_name: None,
+                                            error: Box::new(DaemonTransportError::DaemonNotRunning),
+                                        }],
+                                    },
+                                );
+                            };
+                            let restore = effect
+                                .restore_command(runtime.config().data_directory.clone())
+                                .expect("a fallible package effect retains its restore views");
+                            failed_package_effect = Some((effect, error));
+                            return submit_phase(
+                                daemon,
+                                state,
+                                waiter_id,
+                                HostMutationCommand::RestorePackage(restore),
+                                permit,
+                                &mut next_phase,
+                            );
+                        }
+                        finalizing_package = true;
+                        let entrypoint_processes = daemon.entrypoint_supervisor().snapshots();
+                        return submit_phase(
+                            daemon,
+                            state,
+                            waiter_id,
+                            HostMutationCommand::FinalizePackage(HostPackageFinalize {
+                                reply: committed.reply,
+                                entrypoint_processes,
+                            }),
+                            permit,
+                            &mut next_phase,
+                        );
+                    }
                     release_document(state, waiter_id);
                     finish_reply(permit, committed.reply)
+                }
+                HostMutationResult::PackageRestored(restored) => {
+                    daemon.publish_state(restored.view);
+                    daemon.publish_package_registry_view(restored.packages);
+                    let (effect, original) = failed_package_effect
+                        .take()
+                        .expect("a package restore follows one failed runtime effect");
+                    let mut rollbacks = prior_package_compensation_failure
+                        .take()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    rollbacks.extend(
+                        crate::daemon::control::packages::mutations::restore_runtime_after_failed_effect(
+                            daemon,
+                            &effect,
+                        ),
+                    );
+                    release_document(state, waiter_id);
+                    let error = if rollbacks.is_empty() {
+                        original
+                    } else {
+                        DaemonTransportError::PackageCompensation {
+                            original: Box::new(original),
+                            rollbacks,
+                        }
+                    };
+                    finish_transport_error(permit, error)
+                }
+                HostMutationResult::PackageRestoreFailed(error) => {
+                    let (effect, _) = failed_package_effect
+                        .as_ref()
+                        .expect("a package restore failure follows one failed runtime effect");
+                    let Some(runtime) = daemon.runtime() else {
+                        release_document(state, waiter_id);
+                        let (_effect, original) = failed_package_effect
+                            .take()
+                            .expect("the failed package effect remains retained");
+                        return finish_transport_error(
+                            permit,
+                            DaemonTransportError::PackageCompensation {
+                                original: Box::new(original),
+                                rollbacks: vec![PackageRollbackFailure {
+                                    step: "persist",
+                                    package_name: None,
+                                    error: Box::new(DaemonTransportError::State(error)),
+                                }],
+                            },
+                        );
+                    };
+                    let restore = effect
+                        .restore_command(runtime.config().data_directory.clone())
+                        .expect("a fallible package effect retains its restore views");
+                    prior_package_compensation_failure = Some(PackageRollbackFailure {
+                        step: "persist",
+                        package_name: None,
+                        error: Box::new(DaemonTransportError::State(error)),
+                    });
+                    submit_phase(
+                        daemon,
+                        state,
+                        waiter_id,
+                        HostMutationCommand::RestorePackage(restore),
+                        permit,
+                        &mut next_phase,
+                    )
                 }
                 HostMutationResult::Recovered(outcome) => match outcome {
                     RecoveryOutcome::PackageConfiguration { failure, .. }
@@ -222,19 +329,21 @@ pub(crate) fn handle(
                         state
                             .blocked_session_type_roots
                             .insert(rollback.root.clone(), waiter_id);
-                        state.host_recovery_waiters.insert(waiter_id);
                         prior_compensation_failure = Some(compensation_failure);
-                        retained_recovery = Some((
-                            HostRecover {
+                        submit_phase(
+                            daemon,
+                            state,
+                            waiter_id,
+                            HostMutationCommand::Recover(HostRecover {
                                 rollback: crate::host_mutations::RollbackDescriptor::SessionType {
                                     previous: view,
                                     repo_file: Some(rollback),
                                 },
                                 failure,
-                            },
+                            }),
                             permit,
-                        ));
-                        ControlPoll::Pending
+                            &mut next_phase,
+                        )
                     }
                 },
                 HostMutationResult::Failed(error) => {
@@ -391,6 +500,11 @@ fn finish_error(permit: HostWorkPermit, error: HostMutationError) -> ControlPoll
     ControlPoll::ReadyHost(Ok(host_error_response(error)), charge)
 }
 
+fn finish_transport_error(permit: HostWorkPermit, error: DaemonTransportError) -> ControlPoll {
+    let charge = permit.into_prepared_charge(0);
+    ControlPoll::ReadyHost(Err(error), charge)
+}
+
 fn host_error_response(error: HostMutationError) -> DaemonResponse {
     error_response(&error.code, "host_execution", &error.message)
 }
@@ -464,12 +578,34 @@ fn blocked_session_type_waiter(
 fn is_package_read(request: &DaemonRequest) -> bool {
     matches!(
         request,
-        DaemonRequest::ListApps | DaemonRequest::ListPackages | DaemonRequest::ShowPackage { .. }
+        DaemonRequest::ListApps
+            | DaemonRequest::ResolveAppLaunch { .. }
+            | DaemonRequest::ResolvePackageRoute { .. }
+            | DaemonRequest::ListPackageNavigation
+            | DaemonRequest::ListPackages
+            | DaemonRequest::ListAvailablePackages { .. }
+            | DaemonRequest::InspectAvailablePackage { .. }
+            | DaemonRequest::PreviewPackageInstall { .. }
+            | DaemonRequest::CheckPackageUpdate { .. }
+            | DaemonRequest::PreviewPackageUpdate { .. }
+            | DaemonRequest::ShowPackage { .. }
     )
 }
 
 fn is_package_prepare(request: &DaemonRequest) -> bool {
-    matches!(request, DaemonRequest::SetPackageConfiguration { .. })
+    matches!(
+        request,
+        DaemonRequest::InstallPackageRegistryEntry { .. }
+            | DaemonRequest::InstallPackageLocalPath { .. }
+            | DaemonRequest::ApplyPackageUpdate { .. }
+            | DaemonRequest::SetPackageConfiguration { .. }
+            | DaemonRequest::ReloadPackage { .. }
+            | DaemonRequest::RefreshLocalPackages
+            | DaemonRequest::EnablePackageLocalPath { .. }
+            | DaemonRequest::EnablePackage { .. }
+            | DaemonRequest::DisablePackage { .. }
+            | DaemonRequest::RemovePackage { .. }
+    )
 }
 
 fn is_spawn_target_read(request: &DaemonRequest) -> bool {

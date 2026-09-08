@@ -62,7 +62,13 @@ const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 /// program order; the Core bridge is one FIFO consumed by one thread).
 pub(crate) struct InventoryRead {
     read_epoch: u64,
-    ticket: crate::data_plane::driver::CoreTicket<Vec<botster_core::TerminalSubscriptionRecord>>,
+    ticket: crate::data_plane::driver::CoreTicket<
+        Vec<(
+            String,
+            String,
+            Option<botster_core::TerminalSubscriptionGeneration>,
+        )>,
+    >,
 }
 
 impl DaemonControlState {
@@ -78,7 +84,18 @@ impl DaemonControlState {
             .reconcile_inventory
             .as_mut()
             .expect("the reconcile read must be submitted before its result is controlled");
-        read.ticket = crate::data_plane::driver::CoreTicket::resolved(inventory);
+        read.ticket = crate::data_plane::driver::CoreTicket::resolved(
+            inventory
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.session_id.0,
+                        row.subscription_id.0,
+                        Some(row.generation),
+                    )
+                })
+                .collect(),
+        );
     }
 
     pub(crate) fn note_terminal_inventory_changed(&mut self) {
@@ -835,9 +852,14 @@ pub(crate) fn run_inventory_reconcile_phase(
         // The epoch is captured at submission, on this thread, before the
         // request is enqueued: the read cannot cover any later attach.
         let read_epoch = state.pending_runtime.attach_epoch();
+        let routes = state.pending_runtime.inventory_reconcile_routes(
+            read_epoch,
+            state.pump.reconcile_after.as_ref(),
+            PUMP_MAX_ROUTES_VALIDATED,
+        );
         state.reconcile_inventory = Some(InventoryRead {
             read_epoch,
-            ticket: runtime.list_terminal_subscriptions(),
+            ticket: runtime.terminal_subscription_generations(routes),
         });
         return true;
     };
@@ -858,17 +880,13 @@ pub(crate) fn run_inventory_reconcile_phase(
         CoreTicketPoll::Ready(inventory) => inventory,
     };
     state.reconcile_inventory = None;
-    // Core keys ownership by (client, session, subscription); a row for
-    // another client on the same route is not this stream's row.
-    let lookup = |client_id: &str, session_id: &str, subscription_id: &str| {
+    let lookup = |_client_id: &str, session_id: &str, subscription_id: &str| {
         inventory
             .iter()
-            .find(|row| {
-                row.client_id.0 == client_id
-                    && row.session_id.0 == session_id
-                    && row.subscription_id.0 == subscription_id
+            .find(|(live_session, live_subscription, _)| {
+                live_session == session_id && live_subscription == subscription_id
             })
-            .map(|row| row.generation)
+            .and_then(|(_, _, generation)| *generation)
     };
     let progress = state.pending_runtime.reconcile_inventory_slice(
         lookup,
@@ -2147,12 +2165,46 @@ mod tests {
             grant_id: None,
             transport_request_id: None,
         };
-        let mut state = DaemonControlState::default();
+        let mut state = DaemonControlState {
+            current_waiter_id: daemon
+                .runtime()
+                .and_then(|runtime| runtime.next_waiter_id()),
+            ..DaemonControlState::default()
+        };
         match handle_control_request(daemon, &mut state, observability, control_tx, request) {
             crate::daemon::control::pending::ControlStep::Ready(response) => response,
-            crate::daemon::control::pending::ControlStep::Pending(_) => {
-                panic!("package requests answer without a Core turn")
-            }
+            crate::daemon::control::pending::ControlStep::Pending(mut step) => loop {
+                match (step.continuation)(daemon, &mut state) {
+                    crate::daemon::control::pending::ControlPoll::Pending => {}
+                    crate::daemon::control::pending::ControlPoll::Ready(response) => {
+                        break response;
+                    }
+                    crate::daemon::control::pending::ControlPoll::ReadyHost(response, charge) => {
+                        drop(charge);
+                        break response;
+                    }
+                    crate::daemon::control::pending::ControlPoll::ReadyRetained(response) => {
+                        break response.into_parts().0;
+                    }
+                }
+                let completion = loop {
+                    let runtime = daemon.runtime().expect("package test runtime");
+                    match runtime.host_executor().poll_completion() {
+                        crate::host_executor::HostCompletionPoll::Ready(completion) => {
+                            break completion;
+                        }
+                        crate::host_executor::HostCompletionPoll::Empty => {
+                            std::thread::yield_now();
+                        }
+                        crate::host_executor::HostCompletionPoll::Stopped => {
+                            panic!("package test host executor stopped")
+                        }
+                    }
+                };
+                state
+                    .host_completions
+                    .insert(completion.identity.waiter_id, completion);
+            },
         }
     }
 
@@ -2377,6 +2429,9 @@ return botster.register({
         transport_request_id: &str,
     ) -> DaemonTransportResult<DaemonResponse> {
         let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+        state.current_waiter_id = daemon
+            .runtime()
+            .and_then(|runtime| runtime.next_waiter_id());
         let step = handle_control_request(
             daemon,
             state,
@@ -2465,6 +2520,9 @@ return botster.register({
         let (control_tx, _control_rx) = tokio_mpsc::channel(8);
         let mut state = DaemonControlState::default();
         crate::lua_runtime::arm_test_plugin_invocation_gate();
+        state.current_waiter_id = daemon
+            .runtime()
+            .and_then(|runtime| runtime.next_waiter_id());
         let held = handle_control_request(
             &mut daemon,
             &mut state,
@@ -2498,6 +2556,9 @@ return botster.register({
 
         // Two seconds is a test safety bound. It is not a Status latency requirement.
         let status_started = Instant::now();
+        state.current_waiter_id = daemon
+            .runtime()
+            .and_then(|runtime| runtime.next_waiter_id());
         let status = handle_control_request(
             &mut daemon,
             &mut state,
@@ -3331,18 +3392,18 @@ return botster.register({
             PackageState::Installed
         );
 
-        FileHubStateStore::inject_next_save_failure();
-        let error = drive_package_request(
+        FileHubStateStore::inject_next_save_failure(&config.data_directory);
+        let response = drive_package_request(
             &mut daemon,
             DaemonRequest::EnablePackage {
                 package_name: "mutate.plugin".to_string(),
             },
         )
-        .expect_err("injected persist failure");
-        assert!(matches!(
-            error,
-            DaemonTransportError::State(crate::HubStateStoreError::InjectedWriteFailure)
-        ));
+        .expect("host failure response");
+        assert_eq!(
+            response.error.expect("host error").code,
+            "hub_state_commit_failed"
+        );
         assert_eq!(
             package_state(&daemon, "mutate.plugin"),
             PackageState::Installed
@@ -3404,14 +3465,18 @@ return botster.register({
             "sleeper must be running before failed disable"
         );
 
-        FileHubStateStore::inject_next_save_failure();
-        drive_package_request(
+        FileHubStateStore::inject_next_save_failure(&config.data_directory);
+        let response = drive_package_request(
             &mut daemon,
             DaemonRequest::DisablePackage {
                 package_name: "running.plugin".to_string(),
             },
         )
-        .expect_err("injected disable persist failure");
+        .expect("host failure response");
+        assert_eq!(
+            response.error.expect("host error").code,
+            "hub_state_commit_failed"
+        );
         assert_eq!(
             package_state(&daemon, "running.plugin"),
             PackageState::Enabled
@@ -3492,14 +3557,18 @@ return botster.register({
         )
         .expect("install reload package");
         let before = daemon.package_registry().snapshot();
-        FileHubStateStore::inject_next_save_failure();
-        drive_package_request(
+        FileHubStateStore::inject_next_save_failure(&config.data_directory);
+        let response = drive_package_request(
             &mut daemon,
             DaemonRequest::ReloadPackage {
                 package_name: "reload.plugin".to_string(),
             },
         )
-        .expect_err("injected reload persist failure");
+        .expect("host failure response");
+        assert_eq!(
+            response.error.expect("host error").code,
+            "hub_state_commit_failed"
+        );
         assert_eq!(daemon.package_registry().snapshot(), before);
         let (live, durable) = live_and_durable_registries(&daemon, &config);
         assert_eq!(live, durable);
@@ -3642,7 +3711,7 @@ return botster.register({
         )
         .expect("install");
         std::fs::remove_file(package_dir.join("plugin.lua")).expect("remove lua");
-        FileHubStateStore::inject_save_failure_after(1);
+        FileHubStateStore::inject_save_failure_after(&config.data_directory, 1);
         let error = drive_package_request(
             &mut daemon,
             DaemonRequest::EnablePackage {
@@ -3758,7 +3827,7 @@ return botster.register({
             .state()
             .session_type_generation;
 
-        FileHubStateStore::inject_next_save_failure();
+        FileHubStateStore::inject_next_save_failure(&config.data_directory);
         drive_package_request(
             &mut daemon,
             DaemonRequest::EnablePackage {
@@ -3869,6 +3938,9 @@ return botster.register({
             grant_id: None,
             transport_request_id: None,
         };
+        state.current_waiter_id = daemon
+            .runtime()
+            .and_then(|runtime| runtime.next_waiter_id());
         let step = handle_control_request(
             daemon,
             state,
