@@ -308,19 +308,6 @@ pub trait HubStateStore {
 
     /// Save state while startup has exclusive ownership and no shared view exists.
     fn save_exclusive_startup_state(&self, state: &HubState) -> HubStateStoreResult<()>;
-
-    /// Update a test fixture without a live runtime or retained shared views.
-    #[doc(hidden)]
-    fn update_unreserved_test_fixture(
-        &self,
-        config: &HubConfig,
-        update: impl FnOnce(&mut HubState),
-    ) -> HubStateStoreResult<HubState> {
-        let mut state = self.load_or_initialize(config)?;
-        update(&mut state);
-        self.save_exclusive_startup_state(&state)?;
-        Ok(state)
-    }
 }
 
 /// Local-first file-backed implementation of durable hub state.
@@ -357,6 +344,19 @@ impl FileHubStateStore {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Update a unit-test fixture without a live runtime or retained shared views.
+    #[cfg(test)]
+    pub(crate) fn update_unreserved_test_fixture(
+        &self,
+        config: &HubConfig,
+        update: impl FnOnce(&mut HubState),
+    ) -> HubStateStoreResult<HubState> {
+        let mut state = self.load_for_update(config)?;
+        update(&mut state);
+        let prepared = self.prepare_shared(state, &SharedViewBudget::new())?;
+        self.commit_shared(prepared).map(|state| (*state).clone())
     }
 
     fn write_atomically(&self, state: &HubState) -> HubStateStoreResult<()> {

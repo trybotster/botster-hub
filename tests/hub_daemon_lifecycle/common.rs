@@ -48,6 +48,7 @@ use crate::support::{
 };
 
 use super::*;
+pub(crate) use botster_hub::test_internals::TestHubStateStoreExt;
 
 pub(crate) static REAL_DAEMON_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
