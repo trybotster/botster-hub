@@ -126,6 +126,7 @@ pub struct HubRuntime {
     source_held: std::cell::RefCell<VecDeque<CausalOp>>,
     unsettled_op: std::cell::RefCell<Option<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
+    event_plane_owner_ops_changed: std::cell::Cell<bool>,
     acknowledged_spawn_ids: Mutex<BTreeSet<String>>,
     force_plugin_admit_backpressure: std::sync::atomic::AtomicBool,
     pending_test_event_settlements: Mutex<Vec<PendingTestEvent>>,
@@ -379,6 +380,7 @@ impl HubRuntime {
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
+            event_plane_owner_ops_changed: std::cell::Cell::new(false),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
             force_plugin_admit_backpressure: std::sync::atomic::AtomicBool::new(false),
             pending_test_event_settlements: Mutex::new(Vec::new()),
@@ -486,6 +488,7 @@ impl HubRuntime {
             event_plane_owner_ops: std::cell::RefCell::new(
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
+            event_plane_owner_ops_changed: std::cell::Cell::new(false),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
             force_plugin_admit_backpressure: std::sync::atomic::AtomicBool::new(false),
             pending_test_event_settlements: Mutex::new(Vec::new()),
@@ -619,6 +622,13 @@ impl HubRuntime {
             .event_plane_owner_ops
             .borrow_mut()
             .apply_ready(&self.package_event_router);
+        if !self.event_plane_owner_ops.borrow().is_empty() {
+            self.event_plane_owner_ops_changed.set(true);
+        }
+    }
+
+    pub(crate) fn take_event_plane_owner_ops_notification(&self) -> bool {
+        self.event_plane_owner_ops_changed.replace(false)
     }
 
     #[must_use]

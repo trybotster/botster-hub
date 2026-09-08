@@ -1845,6 +1845,7 @@ pub enum CausalAdmitResult {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EventPlaneOwnerOps {
     pending: BTreeMap<String, VecDeque<OwnerOp>>,
+    after: Option<String>,
 }
 
 impl EventPlaneOwnerOps {
@@ -1857,29 +1858,36 @@ impl EventPlaneOwnerOps {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pending.values().all(VecDeque::is_empty)
+        self.pending.is_empty()
     }
 
+    /// Attempt one operation. Retain the owner cursor when an operation blocks.
     pub fn apply_ready(&mut self, router: &PackageEventRouter) -> Vec<OwnerOp> {
-        let mut applied = Vec::new();
-        let owners: Vec<String> = self.pending.keys().cloned().collect();
-        for owner in owners {
-            let Some(queue) = self.pending.get_mut(&owner) else {
-                continue;
-            };
-            while let Some(front) = queue.front() {
-                match router.try_apply(front) {
-                    OwnerApplyResult::Applied => {
-                        if let Some(op) = queue.pop_front() {
-                            applied.push(op);
-                        }
-                    }
-                    OwnerApplyResult::WouldBlock => break,
-                }
-            }
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let next = self.after.as_deref().and_then(|after| {
+            self.pending
+                .range::<str, _>((Excluded(after), Unbounded))
+                .next()
+        });
+        let Some(owner) = next
+            .or_else(|| self.pending.first_key_value())
+            .map(|(owner, _)| owner.clone())
+        else {
+            self.after = None;
+            return Vec::new();
+        };
+        let queue = self.pending.get_mut(&owner).expect("selected owner exists");
+        let front = queue.front().expect("pending owner has an operation");
+        let applied = match router.try_apply(front) {
+            OwnerApplyResult::Applied => queue.pop_front(),
+            OwnerApplyResult::WouldBlock => None,
+        };
+        if queue.is_empty() {
+            self.pending.remove(&owner);
         }
-        self.pending.retain(|_, queue| !queue.is_empty());
-        applied
+        self.after = Some(owner);
+        applied.into_iter().collect()
     }
 
     #[cfg(test)]
@@ -2457,7 +2465,12 @@ mod tests {
             assert_eq!(ops.pending_for("two").len(), 1);
         });
         let applied = ops.apply_ready(&router);
-        assert_eq!(applied.len(), 2);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].owner, "one");
+        assert!(!ops.is_empty());
+        let applied = ops.apply_ready(&router);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].owner, "two");
         assert!(ops.is_empty());
     }
 
@@ -2479,8 +2492,13 @@ mod tests {
             generation: 2,
         });
         let applied = ops.apply_ready(&router);
+        assert_eq!(applied.len(), 1);
         assert_eq!(applied[0].kind, OwnerOpKind::Unload);
-        assert_eq!(applied[1].kind, OwnerOpKind::Reload);
+        assert!(!ops.is_empty());
+        let applied = ops.apply_ready(&router);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].kind, OwnerOpKind::Reload);
+        assert!(ops.is_empty());
         assert_eq!(
             router.try_ingress(
                 "producer",
@@ -2490,6 +2508,39 @@ mod tests {
             ),
             EventPlaneStatus::RejectedUndeclared
         );
+    }
+
+    #[test]
+    fn owner_operations_rotate_after_contention_and_preserve_each_owner_order() {
+        let router = router();
+        let mut ops = EventPlaneOwnerOps::default();
+        for generation in 1..=1_000 {
+            ops.record(OwnerOp {
+                kind: OwnerOpKind::Reload,
+                owner: "one".into(),
+                generation,
+            });
+        }
+        ops.record(OwnerOp {
+            kind: OwnerOpKind::Reload,
+            owner: "two".into(),
+            generation: 1,
+        });
+        router.test_with_inner_held(|| {
+            assert!(ops.apply_ready(&router).is_empty());
+        });
+        assert_eq!(ops.pending_for("one").len(), 1_000);
+        let applied = ops.apply_ready(&router);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].owner, "two");
+        for generation in 1..=1_000 {
+            let applied = ops.apply_ready(&router);
+            assert_eq!(applied.len(), 1);
+            assert_eq!(applied[0].owner, "one");
+            assert_eq!(applied[0].generation, generation);
+        }
+        assert!(ops.is_empty());
+        assert!(ops.apply_ready(&router).is_empty());
     }
 
     #[test]

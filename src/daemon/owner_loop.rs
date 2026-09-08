@@ -319,6 +319,12 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
     if let Some(runtime) = daemon.runtime() {
+        if runtime.take_event_plane_owner_ops_notification() {
+            state
+                .maintenance
+                .wakes
+                .mark(MaintenanceSliceKind::HostBridge);
+        }
         if runtime.take_package_entity_resync_notification() {
             crate::subscription::entity_resync::note_package_entity_resync_change(state);
         }
@@ -1609,6 +1615,40 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn queued_event_owner_operations_resume_without_control_traffic() {
+        use crate::package_event_router::{OwnerOp, OwnerOpKind};
+
+        let root = unique_package_control_dir("event-owner-wake");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+            .expect("start event owner test daemon");
+        let mut state = DaemonControlState::default();
+        let runtime = daemon.runtime().expect("runtime");
+        runtime.package_event_router().test_with_inner_held(|| {
+            for generation in 1..=1_000 {
+                runtime.record_event_plane_owner_op(OwnerOp {
+                    kind: OwnerOpKind::Reload,
+                    owner: "queued".into(),
+                    generation,
+                });
+            }
+        });
+        assert!(runtime.event_plane_owner_ops_pending());
+        drive_ready_test_turn(&mut daemon, &mut state);
+        assert!(
+            daemon.runtime().unwrap().event_plane_owner_ops_pending(),
+            "one owner turn cannot drain all queued operations"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while daemon.runtime().unwrap().event_plane_owner_ops_pending() {
+            drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(Instant::now() < deadline, "queued operations must finish");
+            thread::yield_now();
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(root).expect("remove event owner test directory");
+    }
 
     fn write_hello(client: &mut UnixStream) {
         write_client_frame(
