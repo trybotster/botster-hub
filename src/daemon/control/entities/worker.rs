@@ -220,6 +220,147 @@ impl EntityWork {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_executor::{
+        HOST_OPERATION_CAPACITY, HOST_PREPARED_BYTE_CAPACITY, HostCompletionPoll,
+    };
+    use crate::package_entity_fanout::PackageEntityMutation;
+    use std::time::{Duration, Instant};
+
+    fn receive(executor: &HostExecutor) -> HostCompletion {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match executor.poll_completion() {
+                HostCompletionPoll::Ready(completion) => return completion,
+                HostCompletionPoll::Empty => {
+                    assert!(Instant::now() < deadline, "the entity worker must complete");
+                    std::thread::yield_now();
+                }
+                HostCompletionPoll::Stopped => panic!("the Host executor stopped"),
+            }
+        }
+    }
+
+    fn assert_reserved_slots(executor: &HostExecutor, expected: usize) {
+        let mut available = Vec::new();
+        while let Some(permit) = executor.try_reserve() {
+            available.push(permit);
+        }
+        assert_eq!(available.len(), HOST_OPERATION_CAPACITY - expected);
+    }
+
+    fn mutation() -> PackageEntityMutation {
+        PackageEntityMutation::Upsert {
+            entity_type: "task".into(),
+            snapshot_seq: 17,
+            id: "a".into(),
+            entity: serde_json::json!({"body": "x".repeat(128 * 1024)}),
+        }
+    }
+
+    #[test]
+    fn cancelled_entity_retains_worker_capacity_until_reclamation_completes() {
+        let executor = HostExecutor::new();
+        let waiter = WaiterId(701);
+        let mut work = EntityWork::new(None);
+        work.stage = Stage::Begin;
+        assert!(matches!(work.reserve(&executor, waiter), Advance::Waiting));
+        let first = work.ready_identity().unwrap();
+        assert!(matches!(
+            work.submit(&executor, Command::PrepareMutation(mutation())),
+            Advance::Submitted
+        ));
+        let publication = Arc::new(AtomicBool::new(true));
+        work.publication = Some(Arc::clone(&publication));
+        work.cancel();
+        assert!(!publication.load(Ordering::Acquire));
+        assert!(!work.reply_live.load(Ordering::Acquire));
+        assert_reserved_slots(&executor, 1);
+        assert!(work.retain_completion(receive(&executor)).is_ok());
+        let (identity, result) = work.take_completion().unwrap();
+        assert_eq!(identity, first);
+        let Completion::Prepared { payload, .. } = result else {
+            panic!("the worker must prepare the mutation");
+        };
+        assert_eq!(payload.sequence(), Some(17));
+        let Phase::Ready { permit, .. } = &work.phase else {
+            panic!("the next phase must retain the operation permit");
+        };
+        assert_eq!(
+            permit.reserved_prepared_bytes(),
+            HOST_PREPARED_BYTE_CAPACITY
+        );
+        assert_reserved_slots(&executor, 1);
+        work.stage = Stage::Release;
+        assert!(matches!(
+            work.submit(&executor, Command::Reclaim(payload)),
+            Advance::Submitted
+        ));
+        assert_reserved_slots(&executor, 1);
+        assert!(work.retain_completion(receive(&executor)).is_ok());
+        assert_reserved_slots(&executor, 1);
+        assert!(matches!(
+            work.take_completion(),
+            Some((_, Completion::Reclaimed))
+        ));
+        assert_reserved_slots(&executor, 0);
+    }
+
+    #[test]
+    fn entity_completion_requires_the_exact_waiter_and_phase() {
+        let executor = HostExecutor::new();
+        let identity = HostJobIdentity::first(WaiterId(702));
+        let mut work = EntityWork::new(None);
+        work.phase = Phase::Running(identity);
+        for wrong in [
+            HostJobIdentity::first(WaiterId(703)),
+            identity.next_phase().unwrap(),
+        ] {
+            let completion = HostCompletion::for_test(
+                wrong,
+                HostResult::PluginEntity(Completion::Reclaimed),
+                executor.try_reserve().unwrap(),
+            );
+            let returned = work.retain_completion(completion).unwrap_err();
+            assert_eq!(returned.identity, wrong);
+            assert!(work.accepts(identity));
+            assert_reserved_slots(&executor, 1);
+            drop(returned);
+        }
+    }
+
+    #[test]
+    fn entity_phase_exhaustion_retains_the_completion_and_its_permit() {
+        let executor = HostExecutor::new();
+        let identity = HostJobIdentity {
+            waiter_id: WaiterId(704),
+            phase: u64::MAX,
+        };
+        let mut work = EntityWork::new(None);
+        work.phase = Phase::Running(identity);
+        let completion = HostCompletion::for_test(
+            identity,
+            HostResult::PluginEntity(Completion::Prepared {
+                payload: Payload::mutation(mutation()),
+                family: Arc::new("task".into()),
+                registration: None,
+            }),
+            executor.try_reserve().unwrap(),
+        );
+        assert!(work.retain_completion(completion).is_ok());
+        assert!(work.take_completion().is_none());
+        work.cancel();
+        assert!(matches!(work.phase, Phase::Exhausted { .. }));
+        assert!(matches!(
+            work.reserve(&executor, identity.waiter_id),
+            Advance::Degraded
+        ));
+        assert_reserved_slots(&executor, 1);
+    }
+}
+
 pub(super) enum Step {
     Waiting,
     Again,
