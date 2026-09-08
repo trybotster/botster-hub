@@ -221,6 +221,11 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
     (
         "src/daemon/control/session_types.rs",
         "session_types",
+        &["SpawnSessionType"],
+    ),
+    (
+        "src/daemon/control/host_work.rs",
+        "host_work",
         &[
             "ListSessionTypes",
             "ListSessionTypesForTarget",
@@ -230,13 +235,6 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
             "UpdateSessionType",
             "DeleteSessionType",
             "ResolveSessionType",
-            "SpawnSessionType",
-        ],
-    ),
-    (
-        "src/daemon/control/spawn_targets.rs",
-        "spawn_targets",
-        &[
             "ListSpawnTargets",
             "ShowSpawnTarget",
             "CreateSpawnTarget",
@@ -247,12 +245,6 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
             "ShowWorktree",
             "CreateWorktree",
             "DeleteWorktree",
-        ],
-    ),
-    (
-        "src/daemon/control/packages.rs",
-        "packages",
-        &[
             "ListApps",
             "ResolveAppLaunch",
             "ResolvePackageRoute",
@@ -278,6 +270,7 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
             "StopPackageEntrypoint",
             "RestartPackageEntrypoint",
             "PackageEntrypointStatus",
+            "IssueLocalWebrtcBootstrap",
         ],
     ),
     (
@@ -315,7 +308,7 @@ const FAMILY_OWNERS: &[(&str, &str, &[&str])] = &[
     (
         "src/daemon/control/webrtc.rs",
         "webrtc",
-        &["IssueLocalWebrtcBootstrap", "LocalWebrtcSignal"],
+        &["LocalWebrtcSignal"],
     ),
     (
         "src/daemon/control/host.rs",
@@ -363,7 +356,10 @@ fn each_daemon_request_has_exactly_one_family_owner() {
             }
             let named = request_variant_names(&hub_source(other_path));
             for variant in *variants {
-                if *other_path == "src/daemon/control/webrtc.rs" && *variant == "Detach" {
+                if *other_path == "src/daemon/control/webrtc.rs"
+                    && matches!(*variant, "Detach" | "IssueLocalWebrtcBootstrap")
+                {
+                    // WebRTC constructs detach requests and rejects bootstrap dispatch.
                     continue;
                 }
                 assert!(
