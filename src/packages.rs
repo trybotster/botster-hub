@@ -5276,7 +5276,7 @@ mod tests {
         .expect("explicit state config should build");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let state = store
-            .update(&config, |state| {
+            .update_unreserved_test_fixture(&config, |state| {
                 state.package_registry = registry.snapshot();
             })
             .expect("save package state through hub state");

@@ -442,7 +442,7 @@ fn local_package_install_persist_enable_prepare_and_load_crosses_core_worker() {
     .expect("explicit state config should build");
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     let state = store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.package_registry = installed_registry.snapshot();
         })
         .expect("save local package registry through hub state");
