@@ -19,6 +19,7 @@ pub(crate) struct OwnerTurnCharge {
 
 impl OwnerTurnCharge {
     /// Charge one typed buffer movement that does not access its payload.
+    /// This constructor and `inspection(0)` both charge one work item.
     pub(crate) const fn opaque_move() -> Self {
         Self { inspected_bytes: 0 }
     }

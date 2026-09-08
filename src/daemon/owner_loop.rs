@@ -307,6 +307,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     if let Some(runtime) = daemon.runtime() {
         runtime.bind_data_plane_owner_wake(control_tx.clone());
         runtime.bind_host_owner_wake(control_tx.clone());
+        runtime.bind_managed_spawn_owner_wake(control_tx.clone());
     }
     let mut control_state = DaemonControlState {
         event_plane: daemon.local_webrtc().event_plane(),
@@ -380,6 +381,17 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             &mut control_state,
             &mut owner_turn,
         );
+        if let Some(runtime) = daemon.runtime()
+            && owner_turn
+                .try_charge(
+                    Instant::now(),
+                    crate::daemon::owner_turn::OwnerTurnCharge::inspection(0),
+                )
+                .is_ok()
+            && runtime.take_managed_spawn_notification()
+        {
+            crate::daemon::control::managed_git::accept_one(&mut daemon, &mut control_state);
+        }
         crate::daemon::control::absorb_plugin_progress(&mut control_state, &mut owner_turn);
         crate::daemon::control::entities::retire_plugin_entity_replies(
             &daemon,

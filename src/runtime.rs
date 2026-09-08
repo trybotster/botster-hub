@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -54,9 +55,8 @@ use crate::lua_runtime::{
     SharedHubCapabilityRuntime,
 };
 use crate::managed_git_worktrees::{
-    MANAGED_GIT_OPERATION_TIMEOUT, ManagedGitError, ManagedGitRequest, PreparedManagedWorktree,
-    adopt_unrecorded_managed_worktrees, managed_worktree_id, prepare_managed_worktree,
-    rollback_prepared_worktree,
+    ManagedGitError, ManagedGitRequest, PreparedManagedWorktree,
+    adopt_unrecorded_managed_worktrees, managed_worktree_id,
 };
 use crate::package_entity_fanout::{
     EntityMutationLease, PackageEntityFamilyState, PackageEntityMutation,
@@ -77,8 +77,6 @@ use crate::session_types::{
     show_session_type_for_target,
 };
 use crate::shared_view::{SharedView, SharedViewBudget};
-#[cfg(test)]
-use crate::spawn_targets::SpawnTarget;
 
 /// Allocation-owned immutable durable state view.
 pub type HubStateView = SharedView<HubState>;
@@ -98,20 +96,6 @@ fn session_type_state_write_error(error: HubStateStoreError) -> SessionTypeError
             "session_type_state_write_failed",
             "session type state could not be persisted",
         ),
-    }
-}
-
-fn managed_git_state_write_error(
-    error: HubStateStoreError,
-    fallback_code: &'static str,
-    fallback: &str,
-) -> ManagedGitError {
-    match error {
-        HubStateStoreError::ViewCapacity { .. } => ManagedGitError::new(
-            "shared_view_capacity_exhausted",
-            "managed worktree state exceeds shared-view capacity",
-        ),
-        _ => ManagedGitError::new(fallback_code, fallback),
     }
 }
 
@@ -136,8 +120,6 @@ pub struct HubRuntime {
     capability_runtime: SharedHubCapabilityRuntime,
     session_type_spawner: SharedSessionTypeSpawner,
     host_executor: crate::host_executor::HostExecutor,
-    managed_git_coordinator: ManagedGitCoordinator,
-    managed_git_operations: Mutex<Vec<PendingManagedGitOperation>>,
     coordination_bridge: HubCoordinationBridge,
     entity_publish_bridge: HubEntityPublishBridge,
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
@@ -273,6 +255,8 @@ pub struct HubSessionTypeSpawner {
     pending: Mutex<VecDeque<PendingSessionTypeSpawn>>,
     reads: Mutex<VecDeque<PendingSessionTypeRead>>,
     managed: Mutex<VecDeque<PendingManagedSessionSpawn>>,
+    managed_pending: AtomicBool,
+    managed_owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
 }
 
 struct PendingSessionTypeSpawn {
@@ -295,62 +279,21 @@ struct PendingSessionTypeRead {
     response: mpsc::Sender<Result<Vec<HubSessionType>, String>>,
 }
 
-struct PendingManagedSessionSpawn {
-    plugin_key: PluginKey,
-    target_id: String,
-    branch: String,
-    session_type_id: String,
-    request: ManagedSessionTypeRequest,
-    package_records: Vec<PackageRecord>,
-    accepted_at: Instant,
-    response: mpsc::Sender<Result<PluginManagedSessionSpawned, ManagedGitError>>,
-}
-
-struct ManagedGitWorkerJob {
-    request: ManagedGitRequest,
-    prepared: mpsc::Sender<Result<PreparedManagedWorktree, ManagedGitError>>,
-    decision: mpsc::Receiver<ManagedGitDecision>,
-    finalized: mpsc::Sender<Result<(), ManagedGitError>>,
-}
-
-enum ManagedGitDecision {
-    Commit,
-    Rollback,
-    Preserve,
-}
-
-struct ManagedGitCoordinator {
-    sender: mpsc::SyncSender<ManagedGitWorkerJob>,
-}
-
-type ManagedGitSubmission = (
-    mpsc::Receiver<Result<PreparedManagedWorktree, ManagedGitError>>,
-    mpsc::Sender<ManagedGitDecision>,
-    mpsc::Receiver<Result<(), ManagedGitError>>,
-);
-
-enum ManagedGitOwnerPhase {
-    Preparing,
-    /// Core is launching the session; the owner polls the spawn tracker.
-    Spawning(ManagedSessionSpawnStart),
-    Finalizing,
+pub(crate) struct PendingManagedSessionSpawn {
+    pub(crate) plugin_key: PluginKey,
+    pub(crate) target_id: String,
+    pub(crate) branch: String,
+    pub(crate) session_type_id: String,
+    pub(crate) request: ManagedSessionTypeRequest,
+    pub(crate) package_records: Vec<PackageRecord>,
+    pub(crate) accepted_at: Instant,
+    pub(crate) response: mpsc::Sender<Result<PluginManagedSessionSpawned, ManagedGitError>>,
 }
 
 /// One managed session spawn in flight on the Core owner thread.
-struct ManagedSessionSpawnStart {
-    tracker: CoreOperationTracker,
-    context: HubSessionContext,
-}
-
-struct PendingManagedGitOperation {
-    pending: PendingManagedSessionSpawn,
-    prepared_receiver: mpsc::Receiver<Result<PreparedManagedWorktree, ManagedGitError>>,
-    decision: mpsc::Sender<ManagedGitDecision>,
-    finalized_receiver: mpsc::Receiver<Result<(), ManagedGitError>>,
-    prepared: Option<PreparedManagedWorktree>,
-    phase: ManagedGitOwnerPhase,
-    deferred_error: Option<ManagedGitError>,
-    response_delivered: bool,
+pub(crate) struct ManagedSessionSpawnStart {
+    pub(crate) tracker: CoreOperationTracker,
+    pub(crate) context: HubSessionContext,
 }
 
 /// Structured Lua-facing session-type spawn response.
@@ -410,8 +353,6 @@ impl HubRuntime {
             )),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             host_executor: crate::host_executor::HostExecutor::new(),
-            managed_git_coordinator: ManagedGitCoordinator::new(),
-            managed_git_operations: Mutex::new(Vec::new()),
             coordination_bridge: HubCoordinationBridge::new(),
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
@@ -517,8 +458,6 @@ impl HubRuntime {
             )),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             host_executor: crate::host_executor::HostExecutor::new(),
-            managed_git_coordinator: ManagedGitCoordinator::new(),
-            managed_git_operations: Mutex::new(Vec::new()),
             coordination_bridge: HubCoordinationBridge::new(),
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2055,44 +1994,7 @@ impl HubRuntime {
         }
     }
 
-    fn accept_pending_managed_git_operations(&self) {
-        while let Some(pending) = self.session_type_spawner.take_managed() {
-            let validation = self.validate_managed_git_request(&pending);
-            let request = match validation {
-                Ok(request) => request,
-                Err(error) => {
-                    let _ = pending.response.send(Err(error));
-                    continue;
-                }
-            };
-            match self.managed_git_coordinator.submit(request) {
-                Ok((prepared_receiver, decision, finalized_receiver)) => {
-                    if let Ok(mut operations) = self.managed_git_operations.lock() {
-                        operations.push(PendingManagedGitOperation {
-                            pending,
-                            prepared_receiver,
-                            decision,
-                            finalized_receiver,
-                            prepared: None,
-                            phase: ManagedGitOwnerPhase::Preparing,
-                            deferred_error: None,
-                            response_delivered: false,
-                        });
-                    } else {
-                        let _ = pending.response.send(Err(ManagedGitError::new(
-                            "ensure_unavailable",
-                            "managed Git owner state is unavailable",
-                        )));
-                    }
-                }
-                Err(error) => {
-                    let _ = pending.response.send(Err(error));
-                }
-            }
-        }
-    }
-
-    fn validate_managed_git_request(
+    pub(crate) fn validate_managed_git_request(
         &self,
         pending: &PendingManagedSessionSpawn,
     ) -> Result<ManagedGitRequest, ManagedGitError> {
@@ -2134,236 +2036,11 @@ impl HubRuntime {
         })
     }
 
-    fn advance_managed_git_operations(&self) {
-        let mut operations = match self.managed_git_operations.lock() {
-            Ok(operations) => operations,
-            Err(_) => return,
-        };
-        let mut retained = Vec::with_capacity(operations.len());
-        for mut operation in operations.drain(..) {
-            let complete = match operation.phase {
-                ManagedGitOwnerPhase::Preparing => {
-                    self.advance_preparing_managed_operation(&mut operation)
-                }
-                ManagedGitOwnerPhase::Spawning(_) => {
-                    self.advance_spawning_managed_operation(&mut operation)
-                }
-                ManagedGitOwnerPhase::Finalizing => {
-                    self.advance_finalizing_managed_operation(&mut operation)
-                }
-            };
-            if !complete {
-                retained.push(operation);
-            }
-        }
-        *operations = retained;
-    }
-
-    fn advance_preparing_managed_operation(
-        &self,
-        operation: &mut PendingManagedGitOperation,
-    ) -> bool {
-        let prepared = match operation.prepared_receiver.try_recv() {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err(error)) => {
-                let _ = operation.pending.response.send(Err(error));
-                return true;
-            }
-            Err(mpsc::TryRecvError::Empty) => return false,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                let _ = operation.pending.response.send(Err(ManagedGitError::new(
-                    "ensure_unavailable",
-                    "managed Git worker stopped before preparing the worktree",
-                )));
-                return true;
-            }
-        };
-        operation.prepared = Some(prepared.clone());
-        if Instant::now() >= operation.pending.accepted_at + MANAGED_GIT_OPERATION_TIMEOUT {
-            operation.deferred_error = Some(ManagedGitError::new(
-                "reconciliation_required",
-                "managed Git owner deadline elapsed; prepared resources were preserved",
-            ));
-            let _ = operation.decision.send(ManagedGitDecision::Preserve);
-            operation.phase = ManagedGitOwnerPhase::Finalizing;
-            return false;
-        }
-        let started = self
-            .persist_managed_worktree(&prepared)
-            .and_then(|()| self.spawn_prepared_managed_session(&operation.pending, &prepared));
-        match started {
-            Ok(start) => {
-                operation.phase = ManagedGitOwnerPhase::Spawning(start);
-                return false;
-            }
-            Err(error) => {
-                operation.deferred_error = Some(error);
-                let _ = operation.decision.send(ManagedGitDecision::Rollback);
-            }
-        }
-        operation.phase = ManagedGitOwnerPhase::Finalizing;
-        false
-    }
-
-    fn advance_spawning_managed_operation(
-        &self,
-        operation: &mut PendingManagedGitOperation,
-    ) -> bool {
-        let ManagedGitOwnerPhase::Spawning(start) = &mut operation.phase else {
-            return false;
-        };
-        let completion = match start.tracker.poll(self) {
-            CoreTicketPoll::Pending => return false,
-            CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
-            CoreTicketPoll::Refused => Err(core_bridge_error(CoreTicketError::Overloaded)),
-            CoreTicketPoll::Ready(Err(error)) => Err(error),
-            CoreTicketPoll::Ready(Ok(CoreCompletion::Spawn { result, .. })) => result,
-            CoreTicketPoll::Ready(Ok(_)) => Err(CoreDaemonError::Shutdown),
-        };
-        let prepared = operation
-            .prepared
-            .clone()
-            .expect("spawning managed operation has prepared worktree");
-        let result = self.finish_managed_session_spawn(start, &prepared, completion);
-        match result {
-            Ok(spawned) => {
-                if Instant::now() >= operation.pending.accepted_at + MANAGED_GIT_OPERATION_TIMEOUT {
-                    self.cleanup_managed_session(&spawned);
-                    operation.deferred_error = Some(ManagedGitError::new(
-                        "reconciliation_required",
-                        "managed Git owner deadline elapsed; prepared resources were preserved",
-                    ));
-                    let _ = operation.decision.send(ManagedGitDecision::Preserve);
-                    operation.phase = ManagedGitOwnerPhase::Finalizing;
-                    return false;
-                }
-                operation.response_delivered =
-                    operation.pending.response.send(Ok(spawned.clone())).is_ok();
-                if operation.response_delivered {
-                    let _ = operation.decision.send(ManagedGitDecision::Commit);
-                    // The worker owns lane release. Once success is delivered
-                    // and commit is decided, owner bookkeeping is complete.
-                    return true;
-                } else {
-                    self.cleanup_managed_session(&spawned);
-                    let _ = operation.decision.send(ManagedGitDecision::Rollback);
-                }
-            }
-            Err(error) => {
-                operation.deferred_error = Some(error);
-                let _ = operation.decision.send(ManagedGitDecision::Rollback);
-            }
-        }
-        operation.phase = ManagedGitOwnerPhase::Finalizing;
-        false
-    }
-
-    fn advance_finalizing_managed_operation(
-        &self,
-        operation: &mut PendingManagedGitOperation,
-    ) -> bool {
-        let finalized = match operation.finalized_receiver.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => return false,
-            Err(mpsc::TryRecvError::Disconnected) => Err(ManagedGitError::new(
-                "reconciliation_failed",
-                "managed Git worker stopped before reconciliation completed",
-            )),
-        };
-        let prepared = operation
-            .prepared
-            .as_ref()
-            .expect("finalizing managed operation has prepared worktree");
-        if !operation.response_delivered {
-            match finalized {
-                Ok(()) => {
-                    if prepared.created_worktree {
-                        let _ = self.remove_managed_worktree_record(&prepared.worktree_id);
-                    }
-                    if let Some(error) = operation.deferred_error.take() {
-                        let _ = operation.pending.response.send(Err(error));
-                    }
-                }
-                Err(error) => {
-                    let _ = operation.pending.response.send(Err(error));
-                }
-            }
-        }
-        true
-    }
-
-    fn persist_managed_worktree(
-        &self,
-        prepared: &PreparedManagedWorktree,
-    ) -> Result<(), ManagedGitError> {
-        let config = self.config.clone();
-        let store = FileHubStateStore::for_data_directory(&config.data_directory);
-        let row = prepared.worktree();
-        let current_state = self.state().clone();
-        let mut conflict = None;
-        let state = store
-            .update_shared(&config, &self.shared_view_budget(), |state| {
-                state.spawn_targets = current_state.spawn_targets.clone();
-                state.device_session_type_sources =
-                    current_state.device_session_type_sources.clone();
-                if let Some(existing) = state
-                    .worktrees
-                    .iter_mut()
-                    .find(|worktree| worktree.worktree_id == row.worktree_id)
-                {
-                    if existing.target_id != row.target_id
-                        || existing.path != row.path
-                        || existing.management != "hub_managed_git"
-                    {
-                        conflict = Some(ManagedGitError::new(
-                            "worktree_record_mismatch",
-                            "managed worktree record conflicts with the prepared worktree",
-                        ));
-                    } else {
-                        *existing = row.clone();
-                    }
-                } else {
-                    state.worktrees.push(row.clone());
-                }
-            })
-            .map_err(|error| {
-                managed_git_state_write_error(
-                    error,
-                    "persistence_failed",
-                    "managed worktree state could not be persisted",
-                )
-            })?;
-        if let Some(conflict) = conflict {
-            return Err(conflict);
-        }
-        self.publish_state_view(state);
-        Ok(())
-    }
-
-    fn remove_managed_worktree_record(&self, worktree_id: &str) -> Result<(), ManagedGitError> {
-        let config = self.config.clone();
-        let store = FileHubStateStore::for_data_directory(&config.data_directory);
-        let state = store
-            .update_shared(&config, &self.shared_view_budget(), |state| {
-                state.worktrees.retain(|worktree| {
-                    worktree.worktree_id != worktree_id || worktree.management != "hub_managed_git"
-                });
-            })
-            .map_err(|error| {
-                managed_git_state_write_error(
-                    error,
-                    "reconciliation_failed",
-                    "managed worktree rollback state could not be persisted",
-                )
-            })?;
-        self.publish_state_view(state);
-        Ok(())
-    }
-
-    fn spawn_prepared_managed_session(
+    pub(crate) fn spawn_prepared_managed_session(
         &self,
         pending: &PendingManagedSessionSpawn,
         prepared: &PreparedManagedWorktree,
+        owner_waiter: Option<crate::owner_identity::WaiterId>,
     ) -> Result<ManagedSessionSpawnStart, ManagedGitError> {
         let session_id = generated_session_uuid()?;
         let records = pending.package_records.iter().collect::<Vec<_>>();
@@ -2395,12 +2072,17 @@ impl HubRuntime {
             contexts.insert(context.context_id.clone(), context.clone());
             contexts.insert(context.session_id.0.clone(), context.clone());
         }
-        let tracker = self.begin_spawn(materialized.spawn_request, metadata);
+        let tracker = match owner_waiter {
+            Some(waiter_id) => {
+                self.begin_spawn_for_owner(waiter_id, materialized.spawn_request, metadata)
+            }
+            None => self.begin_spawn(materialized.spawn_request, metadata),
+        };
         Ok(ManagedSessionSpawnStart { tracker, context })
     }
 
     /// Finish one managed session spawn from its Core completion.
-    fn finish_managed_session_spawn(
+    pub(crate) fn finish_managed_session_spawn(
         &self,
         start: &ManagedSessionSpawnStart,
         prepared: &PreparedManagedWorktree,
@@ -2433,7 +2115,7 @@ impl HubRuntime {
         })
     }
 
-    fn cleanup_managed_session(&self, spawned: &PluginManagedSessionSpawned) {
+    pub(crate) fn cleanup_managed_session(&self, spawned: &PluginManagedSessionSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
         self.shutdown_session_detached(session_id.clone());
         if let Ok(mut contexts) = self.session_contexts.lock() {
@@ -2447,8 +2129,6 @@ impl HubRuntime {
         self.fulfill_pending_entity_publish_requests();
         self.fulfill_pending_session_type_reads();
         self.fulfill_pending_session_type_spawns();
-        self.accept_pending_managed_git_operations();
-        self.advance_managed_git_operations();
     }
 
     fn fulfill_pending_entity_publish_requests(&self) {
@@ -4034,6 +3714,23 @@ impl HubRuntime {
         self.host_executor.bind_owner_wake(sender);
     }
 
+    pub(crate) fn bind_managed_spawn_owner_wake(
+        &self,
+        sender: crate::daemon::control::message::ControlSender,
+    ) {
+        self.session_type_spawner.bind_managed_owner_wake(sender);
+    }
+
+    pub(crate) fn take_managed_spawn_notification(&self) -> bool {
+        self.session_type_spawner
+            .managed_pending
+            .swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_pending_managed_spawn(&self) -> Option<PendingManagedSessionSpawn> {
+        self.session_type_spawner.take_managed()
+    }
+
     pub(crate) fn host_executor(&self) -> &crate::host_executor::HostExecutor {
         &self.host_executor
     }
@@ -4514,6 +4211,37 @@ impl HubSessionTypeSpawner {
             pending: Mutex::new(VecDeque::new()),
             reads: Mutex::new(VecDeque::new()),
             managed: Mutex::new(VecDeque::new()),
+            managed_pending: AtomicBool::new(false),
+            managed_owner: Mutex::new(None),
+        }
+    }
+
+    fn bind_managed_owner_wake(&self, sender: crate::daemon::control::message::ControlSender) {
+        let mut owner = self
+            .managed_owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *owner = Some(sender.clone());
+        let pending = self.managed_pending.load(Ordering::Acquire);
+        drop(owner);
+        if pending {
+            let _ = sender.try_send(
+                crate::daemon::control::message::ControlMessage::ManagedSessionSpawnQueued,
+            );
+        }
+    }
+
+    fn publish_managed_spawn(&self) {
+        self.managed_pending.store(true, Ordering::Release);
+        if let Some(owner) = self
+            .managed_owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            let _ = owner.try_send(
+                crate::daemon::control::message::ControlMessage::ManagedSessionSpawnQueued,
+            );
         }
     }
 
@@ -4635,6 +4363,7 @@ impl HubSessionTypeSpawner {
             response,
         });
         drop(managed);
+        self.publish_managed_spawn();
         receiver
             .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
             .map_err(|_| {
@@ -4653,72 +4382,17 @@ impl HubSessionTypeSpawner {
     }
 
     fn take_managed(&self) -> Option<PendingManagedSessionSpawn> {
-        self.managed
+        let mut pending = self
+            .managed
             .lock()
-            .expect("managed session spawn queue lock")
-            .pop_front()
-    }
-}
-
-impl ManagedGitCoordinator {
-    fn new() -> Self {
-        let (sender, receiver) = mpsc::sync_channel::<ManagedGitWorkerJob>(1);
-        thread::Builder::new()
-            .name("botster-managed-git".to_string())
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    let accepted_at = job.request.accepted_at;
-                    match prepare_managed_worktree(&job.request) {
-                        Ok(prepared) => {
-                            if job.prepared.send(Ok(prepared.clone())).is_err() {
-                                let _ = rollback_prepared_worktree(
-                                    &prepared,
-                                    accepted_at + MANAGED_GIT_OPERATION_TIMEOUT,
-                                );
-                                let _ = job.finalized.send(Ok(()));
-                                continue;
-                            }
-                            let remaining = (accepted_at + MANAGED_GIT_OPERATION_TIMEOUT)
-                                .saturating_duration_since(Instant::now());
-                            let decision = job.decision.recv_timeout(remaining);
-                            let finalized = finalize_prepared_managed_worktree(
-                                &prepared,
-                                decision,
-                                accepted_at + MANAGED_GIT_OPERATION_TIMEOUT,
-                            );
-                            let _ = job.finalized.send(finalized);
-                        }
-                        Err(error) => {
-                            let _ = job.prepared.send(Err(error));
-                        }
-                    }
-                }
-            })
-            .expect("managed Git worker thread");
-        Self { sender }
-    }
-
-    fn submit(&self, request: ManagedGitRequest) -> Result<ManagedGitSubmission, ManagedGitError> {
-        let (prepared, prepared_receiver) = mpsc::channel();
-        let (decision, decision_receiver) = mpsc::channel();
-        let (finalized, finalized_receiver) = mpsc::channel();
-        self.sender
-            .try_send(ManagedGitWorkerJob {
-                request,
-                prepared,
-                decision: decision_receiver,
-                finalized,
-            })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => ManagedGitError::new(
-                    "ensure_backpressured",
-                    "managed Git worker already has an active and waiting operation",
-                ),
-                mpsc::TrySendError::Disconnected(_) => {
-                    ManagedGitError::new("ensure_unavailable", "managed Git worker is unavailable")
-                }
-            })?;
-        Ok((prepared_receiver, decision, finalized_receiver))
+            .expect("managed session spawn queue lock");
+        let result = pending.pop_front();
+        let has_more = !pending.is_empty();
+        drop(pending);
+        if has_more {
+            self.publish_managed_spawn();
+        }
+        result
     }
 }
 
@@ -4786,27 +4460,6 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
                 "bind_terminal_adapter.control_plane_failed"
             }
         },
-    }
-}
-
-fn finalize_prepared_managed_worktree(
-    prepared: &PreparedManagedWorktree,
-    decision: Result<ManagedGitDecision, mpsc::RecvTimeoutError>,
-    deadline: Instant,
-) -> Result<(), ManagedGitError> {
-    match decision {
-        Ok(ManagedGitDecision::Commit) => Ok(()),
-        Ok(ManagedGitDecision::Rollback) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-            rollback_prepared_worktree(prepared, deadline)
-        }
-        Ok(ManagedGitDecision::Preserve) => Err(ManagedGitError::new(
-            "reconciliation_required",
-            "managed Git owner deadline elapsed; prepared resources were preserved",
-        )),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(ManagedGitError::new(
-            "reconciliation_required",
-            "managed Git owner decision timed out; prepared resources were preserved",
-        )),
     }
 }
 
@@ -5880,8 +5533,6 @@ mod tests {
         DataDirectoryOption, HostIdentityOptions, HubStartupOptions, RuntimeEnvironment,
         SessionDefaults, TransportBindings,
     };
-    use std::fs;
-    use std::process::Command;
 
     fn binding_test_node(child: serde_json::Value) -> UiNode {
         serde_json::from_value(serde_json::json!({
@@ -6429,146 +6080,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_git_coordinator_serializes_one_active_and_one_waiting_job() {
-        let root = std::env::temp_dir().join(format!(
-            "botster-managed-coordinator-{}-{}",
-            std::process::id(),
-            current_unix_nanos()
-        ));
-        let repository = root.join("repository");
-        let managed_root = root.join("managed");
-        fs::create_dir_all(&repository).expect("create repository");
-        run_git(None, &["init", "-b", "main", path_str(&repository)]);
-        run_git(
-            Some(&repository),
-            &["config", "user.email", "botster@example.invalid"],
-        );
-        run_git(Some(&repository), &["config", "user.name", "Botster Test"]);
-        fs::write(repository.join("README.md"), "fixture\n").expect("write fixture");
-        run_git(Some(&repository), &["add", "README.md"]);
-        run_git(Some(&repository), &["commit", "-m", "fixture"]);
-
-        let request = || ManagedGitRequest {
-            target: SpawnTarget {
-                target_id: "tgt_coordinator".to_string(),
-                label: "Coordinator".to_string(),
-                root: repository.clone(),
-                enabled: true,
-                kind: "git".to_string(),
-                base_ref: Some("main".to_string()),
-                metadata: BTreeMap::new(),
-            },
-            branch: "feature/coordinated".to_string(),
-            managed_root: managed_root.clone(),
-            persisted_worktree: None,
-            accepted_at: Instant::now(),
-        };
-        let coordinator = ManagedGitCoordinator::new();
-        let (first_prepared, first_decision, first_finalized) =
-            coordinator.submit(request()).expect("submit active job");
-        let first = first_prepared
-            .recv_timeout(Duration::from_secs(5))
-            .expect("active preparation response")
-            .expect("active preparation");
-        assert!(first.created_branch);
-        assert!(first.created_worktree);
-
-        let (second_prepared, second_decision, second_finalized) = coordinator
-            .submit(request())
-            .expect("submit one waiting job");
-        let third = coordinator
-            .submit(request())
-            .expect_err("third job must be backpressured");
-        assert_eq!(third.kind, "ensure_backpressured");
-        first_decision
-            .send(ManagedGitDecision::Commit)
-            .expect("commit active job");
-        first_finalized
-            .recv_timeout(Duration::from_secs(5))
-            .expect("active finalization")
-            .expect("active commit");
-
-        let second = second_prepared
-            .recv_timeout(Duration::from_secs(5))
-            .expect("waiting preparation response")
-            .expect("waiting preparation");
-        assert!(!second.created_branch);
-        assert!(!second.created_worktree);
-        second_decision
-            .send(ManagedGitDecision::Commit)
-            .expect("commit waiting job");
-        second_finalized
-            .recv_timeout(Duration::from_secs(5))
-            .expect("waiting finalization")
-            .expect("waiting commit");
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn managed_git_decision_timeout_preserves_prepared_worktree() {
-        let root = std::env::temp_dir().join(format!(
-            "botster-managed-decision-timeout-{}-{}",
-            std::process::id(),
-            current_unix_nanos()
-        ));
-        let repository = root.join("repository");
-        let managed_root = root.join("managed");
-        fs::create_dir_all(&repository).expect("create repository");
-        run_git(None, &["init", "-b", "main", path_str(&repository)]);
-        run_git(
-            Some(&repository),
-            &["config", "user.email", "botster@example.invalid"],
-        );
-        run_git(Some(&repository), &["config", "user.name", "Botster Test"]);
-        fs::write(repository.join("README.md"), "fixture\n").expect("write fixture");
-        run_git(Some(&repository), &["add", "README.md"]);
-        run_git(Some(&repository), &["commit", "-m", "fixture"]);
-        let request = ManagedGitRequest {
-            target: SpawnTarget {
-                target_id: "tgt_timeout".to_string(),
-                label: "Timeout".to_string(),
-                root: repository.clone(),
-                enabled: true,
-                kind: "git".to_string(),
-                base_ref: Some("main".to_string()),
-                metadata: BTreeMap::new(),
-            },
-            branch: "feature/preserve".to_string(),
-            managed_root,
-            persisted_worktree: None,
-            accepted_at: Instant::now(),
-        };
-        let prepared = prepare_managed_worktree(&request).expect("prepare managed worktree");
-        let error = finalize_prepared_managed_worktree(
-            &prepared,
-            Err(mpsc::RecvTimeoutError::Timeout),
-            Instant::now(),
-        )
-        .expect_err("missing owner decision must preserve the prepared worktree");
-        assert_eq!(error.kind, "reconciliation_required");
-        assert!(
-            prepared.path.exists(),
-            "a decision timeout must not remove the worktree later reported by the owner"
-        );
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(&repository)
-                .args([
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    "refs/heads/feature/preserve"
-                ])
-                .status()
-                .expect("inspect preserved branch")
-                .success()
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn settle_entity_publish_transfers_exact_seq_and_closes_on_error() {
         let scopes = crate::package_event_router::CausalScopeTable::new();
         let mut family = PackageEntityFamilyState::default();
@@ -6633,27 +6144,5 @@ mod tests {
         );
         assert!(!scopes.is_live(errored));
         assert_eq!(scopes.lease_count(errored), None);
-    }
-
-    fn current_unix_nanos() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default()
-    }
-
-    fn path_str(path: &std::path::Path) -> &str {
-        path.to_str().expect("test path is UTF-8")
-    }
-
-    fn run_git(root: Option<&std::path::Path>, args: &[&str]) {
-        let mut command = Command::new("git");
-        if let Some(root) = root {
-            command.arg("-C").arg(root);
-        }
-        assert!(
-            command.args(args).status().expect("run git").success(),
-            "git command failed: {args:?}"
-        );
     }
 }

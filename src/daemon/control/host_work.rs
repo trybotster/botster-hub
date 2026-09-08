@@ -15,7 +15,7 @@ use crate::host_mutations::{
 };
 use crate::owner_identity::WaiterId;
 
-enum DocumentAdmission {
+pub(crate) enum DocumentAdmission {
     Granted,
     Busy,
     Stale,
@@ -337,7 +337,7 @@ fn submit_phase(
     }
 }
 
-fn admit_document(
+pub(crate) fn admit_document(
     state: &mut DaemonControlState,
     waiter_id: WaiterId,
     base_revision: u64,
@@ -358,7 +358,7 @@ fn admit_document(
     }
 }
 
-fn release_document(state: &mut DaemonControlState, waiter_id: WaiterId) {
+pub(crate) fn release_document(state: &mut DaemonControlState, waiter_id: WaiterId) {
     if state.document_owner != Some(waiter_id) {
         return;
     }
