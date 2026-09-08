@@ -230,7 +230,7 @@ fn operation_label(kind: &PluginResponseKind) -> &'static str {
     }
 }
 
-fn encode_response(
+pub(crate) fn encode_response(
     response: DaemonResponse,
     transport_request_id: &str,
 ) -> Result<PreparedPluginResponse, EncodeResponseError> {
@@ -258,7 +258,7 @@ fn encode_response(
     })
 }
 
-fn encode_protocol_bounded_error(
+pub(crate) fn encode_protocol_bounded_error(
     response: DaemonResponse,
     transport_request_id: &str,
     error_kind: &str,

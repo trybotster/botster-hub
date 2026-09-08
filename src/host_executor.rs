@@ -258,6 +258,7 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
+        HostResult::PluginEntity(crate::plugin_entity::Completion::Finished { .. }) => 0,
         HostResult::PluginEntity(_) => HOST_PREPARED_BYTE_CAPACITY,
         HostResult::PluginResponseAbandoned
         | HostResult::PluginResponseDelivered { .. }
@@ -425,7 +426,7 @@ impl HostWorkPermit {
         self.take_prepared_charge(logical_bytes)
     }
 
-    fn take_prepared_charge(&mut self, logical_bytes: usize) -> HostPreparedCharge {
+    pub(crate) fn take_prepared_charge(&mut self, logical_bytes: usize) -> HostPreparedCharge {
         let reservation = self
             .prepared
             .take()

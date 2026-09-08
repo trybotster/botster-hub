@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use botster_core::{EntityKind, PluginInvocationResult};
+use botster_core::PluginInvocationResult;
 use botster_hub_client::{DaemonEntityFrame, ServerFrame};
 use serde_json::Value;
 
@@ -17,9 +17,11 @@ use crate::{HubRuntime, McpToolError};
 
 pub(crate) enum Command {
     Prepare {
-        entity_kind: EntityKind,
+        invocation: crate::runtime::PluginEntitySnapshotInvocation,
         result: RetainedPluginResult<Result<PluginInvocationResult, String>>,
+        target: Option<Arc<Target>>,
     },
+    PrepareMutation(PackageEntityMutation),
     Deliver {
         payload: Payload,
         target: Arc<Target>,
@@ -28,6 +30,23 @@ pub(crate) enum Command {
         resync_reason: Option<String>,
     },
     Reclaim(Payload),
+    Finish {
+        payload: Option<Payload>,
+        target: Arc<Target>,
+        reservation: Option<botster_hub_client::DaemonSubscriptionReservation>,
+        error: Option<(&'static str, &'static str)>,
+        transport_request_id: String,
+        reply_tx: crate::daemon::control::message::ControlReplySender,
+        publication_live: Arc<AtomicBool>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct Registration {
+    pub(crate) subscription_id: String,
+    pub(crate) target_key: String,
+    pub(crate) entity_type: String,
+    pub(crate) reservation: crate::admission::reservations::PreparedSubscriptionIdentity,
 }
 
 /// The owner shares this identity without copying protocol strings.
@@ -40,12 +59,19 @@ pub(crate) struct Target {
 
 #[derive(Debug)]
 pub(crate) enum Completion {
-    Prepared(Payload),
+    Prepared {
+        payload: Payload,
+        family: Arc<String>,
+        registration: Option<Registration>,
+    },
     Delivered {
         payload: Payload,
         status: DeliveryStatus,
     },
     Reclaimed,
+    Finished {
+        sent: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,18 +217,32 @@ impl Payload {
     }
 }
 
-pub(crate) fn execute(command: Command, permit: &HostWorkPermit) -> Completion {
+pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completion {
+    // Every phase retains the full reservation until the terminal reply consumes it.
     assert!(permit.reserved_prepared_bytes() >= crate::host_executor::HOST_PREPARED_BYTE_CAPACITY);
     match command {
         Command::Prepare {
-            entity_kind,
+            invocation,
             result,
+            target,
         } => {
+            let family = Arc::new(invocation.expected_entity_kind().as_str().to_string());
+            let registration = target.map(|target| Registration {
+                subscription_id: target.subscription_id.clone(),
+                target_key: target.subscription_id.clone(),
+                entity_type: target.entity_type.clone(),
+                reservation: crate::admission::reservations::PreparedSubscriptionIdentity::new(
+                    target.subscription_id.clone(),
+                ),
+            });
             let (result, charge) = result.into_parts();
             let converted = result
                 .map_err(|message| McpToolError::new("plugin_completion_inconsistent", message))
                 .and_then(|result| {
-                    HubRuntime::convert_plugin_entity_snapshot(&entity_kind, result)
+                    HubRuntime::convert_plugin_entity_snapshot(
+                        invocation.expected_entity_kind(),
+                        result,
+                    )
                 });
             let body = match converted {
                 Ok((sequence, items)) => {
@@ -223,8 +263,17 @@ pub(crate) fn execute(command: Command, permit: &HostWorkPermit) -> Completion {
                 Err(error) => Body::Error(error),
             };
             drop(charge);
-            Completion::Prepared(Payload { body })
+            Completion::Prepared {
+                payload: Payload { body },
+                family,
+                registration,
+            }
         }
+        Command::PrepareMutation(mutation) => Completion::Prepared {
+            family: Arc::new(mutation.entity_type().to_string()),
+            payload: Payload::mutation(mutation),
+            registration: None,
+        },
         Command::Deliver {
             payload,
             target,
@@ -271,6 +320,76 @@ pub(crate) fn execute(command: Command, permit: &HostWorkPermit) -> Completion {
             drop(payload);
             Completion::Reclaimed
         }
+        Command::Finish {
+            payload,
+            target,
+            reservation,
+            error,
+            transport_request_id,
+            reply_tx,
+            publication_live,
+        } => {
+            let provider_error = payload.and_then(|payload| match payload.body {
+                Body::Error(error) => Some(error),
+                _ => None,
+            });
+            let response = if let Some((code, message)) = error {
+                crate::subscription::entity::entity_subscription_error(
+                    code,
+                    &target.subscription_id,
+                    message,
+                )
+            } else if let Some(error) = provider_error {
+                crate::subscription::entity::entity_subscription_error(
+                    &error.code,
+                    &target.subscription_id,
+                    &error.message,
+                )
+            } else {
+                let mut response = crate::client_api_dto::response::daemon_response_base(
+                    botster_hub_client::DaemonResponseKind::EntitySubscribed,
+                );
+                response.subscription_reservation = reservation;
+                response
+            };
+            let prepared =
+                match crate::plugin_response::encode_response(response, &transport_request_id) {
+                    Ok(prepared) => prepared,
+                    Err(_) => {
+                        // The fallback omits protocol strings supplied by the subscription.
+                        let response = crate::subscription::entity::entity_subscription_error(
+                            "entity_provider_frame_too_large",
+                            "",
+                            "entity subscription response exceeds daemon frame limit",
+                        );
+                        crate::plugin_response::encode_protocol_bounded_error(
+                            response,
+                            &transport_request_id,
+                            "entity",
+                        )
+                    }
+                };
+            let charge = permit.take_prepared_charge(prepared.logical_bytes);
+            let sent = if publication_live.swap(false, Ordering::AcqRel) {
+                let reply = crate::daemon::control::reply::ControlReply::prepared(
+                    prepared.kind,
+                    prepared.encoded_frame,
+                    charge,
+                );
+                match reply_tx.send_reply(reply) {
+                    Ok(()) => true,
+                    Err(reply) => {
+                        drop(reply);
+                        false
+                    }
+                }
+            } else {
+                drop(prepared);
+                drop(charge);
+                false
+            };
+            Completion::Finished { sent }
+        }
     }
 }
 
@@ -280,6 +399,58 @@ mod tests {
     use crate::host_executor::{HostCommand, HostCompletionPoll, HostExecutor, HostResult};
     use crate::owner_identity::{OwnerWorkIdentity, WaiterId};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn terminal_reply_moves_the_charge_and_preserves_request_correlation() {
+        let executor = HostExecutor::new();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let target = Arc::new(Target {
+            subscription_id: "sub".into(),
+            entity_type: "task".into(),
+            sender: EntityFrameSender::Async(sender),
+        });
+        let (reply_tx, mut reply_rx) = crate::daemon::control::message::control_reply_channel();
+        executor
+            .submit(
+                OwnerWorkIdentity::first(WaiterId(903)),
+                HostCommand::PluginEntity(Command::Finish {
+                    payload: Some(Payload {
+                        body: Body::Error(McpToolError::new("provider_error", "provider detail")),
+                    }),
+                    target,
+                    reservation: None,
+                    error: None,
+                    transport_request_id: "42".into(),
+                    reply_tx,
+                    publication_live: Arc::new(AtomicBool::new(true)),
+                }),
+                executor.try_reserve().unwrap(),
+            )
+            .unwrap();
+        let (_, result, permit) = completion(&executor).into_parts();
+        assert!(matches!(
+            result,
+            HostResult::PluginEntity(Completion::Finished { sent: true })
+        ));
+        assert_eq!(permit.reserved_prepared_bytes(), 0);
+        let reply = reply_rx.try_recv().unwrap();
+        let (_, charge, encoded) = reply.into_parts();
+        let frame: ServerFrame = serde_json::from_slice(encoded.as_ref().unwrap()).unwrap();
+        let ServerFrame::Response {
+            request_id,
+            response,
+        } = frame
+        else {
+            panic!("expected response");
+        };
+        assert_eq!(request_id, "42");
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "provider_error");
+        assert_eq!(error.message, "provider detail");
+        drop(permit);
+        drop(encoded);
+        drop(charge);
+    }
 
     fn completion(executor: &HostExecutor) -> crate::host_executor::HostCompletion {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -375,7 +546,7 @@ mod tests {
     #[test]
     fn cancellation_and_full_queue_keep_the_payload_and_release_new_container_charge() {
         let executor = HostExecutor::new();
-        let permit = executor.try_reserve().unwrap();
+        let mut permit = executor.try_reserve().unwrap();
         let budget = SharedViewBudget::new();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let target = Arc::new(Target {
@@ -402,7 +573,7 @@ mod tests {
                     budget: Arc::clone(&budget),
                     resync_reason: None,
                 },
-                &permit,
+                &mut permit,
             );
             let Completion::Delivered {
                 payload: returned,
@@ -425,6 +596,6 @@ mod tests {
             0,
             "full queue must release the rejected container"
         );
-        drop(execute(Command::Reclaim(payload), &permit));
+        drop(execute(Command::Reclaim(payload), &mut permit));
     }
 }

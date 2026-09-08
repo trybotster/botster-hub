@@ -57,6 +57,26 @@ pub(crate) enum ReserveError {
     LabelConflict,
 }
 
+/// Workers prepare the protocol strings before the owner registers a subscription.
+#[derive(Debug)]
+pub(crate) struct PreparedSubscriptionIdentity {
+    key: String,
+    label_key: String,
+    record: String,
+    response: String,
+}
+
+impl PreparedSubscriptionIdentity {
+    pub(crate) fn new(subscription_id: String) -> Self {
+        Self {
+            key: subscription_id.clone(),
+            label_key: subscription_id.clone(),
+            record: subscription_id.clone(),
+            response: subscription_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReservationLookup {
     Unknown,
@@ -147,17 +167,36 @@ impl TerminalReservationRegistry {
         now_seconds: u64,
         binding: ReservationBinding,
     ) -> Result<DaemonSubscriptionReservation, ReserveError> {
+        self.reserve_subscription_prepared(
+            class,
+            PreparedSubscriptionIdentity::new(subscription_id),
+            generation,
+            peer_generation,
+            now_seconds,
+            binding,
+        )
+    }
+
+    pub(crate) fn reserve_subscription_prepared(
+        &mut self,
+        class: ChannelClass,
+        identity: PreparedSubscriptionIdentity,
+        generation: u64,
+        peer_generation: u64,
+        now_seconds: u64,
+        binding: ReservationBinding,
+    ) -> Result<DaemonSubscriptionReservation, ReserveError> {
         debug_assert!(matches!(class, ChannelClass::Entity | ChannelClass::Event));
         let key = (
             class,
             String::new(),
-            subscription_id.clone(),
+            identity.key,
             generation,
             peer_generation,
         );
         if self.by_key.values().any(|reservation| {
             reservation.class == class
-                && reservation.subscription_id == subscription_id
+                && reservation.subscription_id == identity.record
                 && reservation.peer_generation == peer_generation
                 && reservation.state == ReservationState::Live
                 && reservation.expires_at_seconds > now_seconds
@@ -166,13 +205,22 @@ impl TerminalReservationRegistry {
         }
         let expires_in_seconds = reservation_expires_in_seconds();
         let label = unique_label(&self.by_label);
-        self.by_label.insert(label.clone(), key.clone());
+        self.by_label.insert(
+            label.clone(),
+            (
+                class,
+                String::new(),
+                identity.label_key,
+                generation,
+                peer_generation,
+            ),
+        );
         self.by_key.insert(
             key,
             TerminalReservation {
                 class,
                 session_id: String::new(),
-                subscription_id: subscription_id.clone(),
+                subscription_id: identity.record,
                 generation,
                 peer_generation,
                 label: label.clone(),
@@ -189,7 +237,7 @@ impl TerminalReservationRegistry {
         };
         Ok(DaemonSubscriptionReservation::new(
             kind,
-            subscription_id,
+            identity.response,
             generation,
             peer_generation,
             label,
