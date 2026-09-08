@@ -39,6 +39,7 @@ pub(crate) fn handle(
     let command = if is_package_read(&request) {
         HostMutationCommand::Read(HostRead::Package {
             request,
+            config: config.clone(),
             packages,
             entrypoint_processes: entrypoint_processes.expect("package snapshots were captured"),
         })
