@@ -776,6 +776,11 @@ pub(crate) fn drive_plugin_entity_ready_item(
     let step = worker::step(daemon, state, &mut entry);
     match step {
         worker::Step::Done => {
+            if entry.work.snapshot
+                && let Some(runtime) = daemon.runtime()
+            {
+                runtime.note_package_entity_resync_changed();
+            }
             state.deadlines.retire(waiter_id);
             state.plugin_entities.capacity_waiters.remove(&waiter_id);
             state.plugin_entities.delivery_waiters.remove(&waiter_id);

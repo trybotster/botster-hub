@@ -41,8 +41,9 @@ use crate::subscription::attach_routes::{
 };
 use crate::subscription::entity::{
     EntitySubscriptionState, drive_entity_subscriptions, drive_package_entity_fanout,
-    drive_package_entity_resync, seed_lifecycle_reconciliation,
+    seed_lifecycle_reconciliation,
 };
+use crate::subscription::entity_resync::drive_package_entity_resync;
 use crate::transport::unix::connection::{
     handle_connection_async, handle_connection_cleanup, reap_finished_connection_tasks,
     wait_for_connection_tasks,
@@ -259,6 +260,53 @@ fn mark_background_ready(state: &mut DaemonControlState, work: BackgroundWork) -
         .is_ok()
 }
 
+/// Use the shared deadline index for the next resync policy deadline.
+pub(crate) fn arm_package_entity_resync_deadline(
+    state: &mut DaemonControlState,
+    deadline: Option<Instant>,
+) {
+    if let Some(key) = state.package_entity_resync_scan.deadline_key.take() {
+        state.deadlines.disarm(key);
+    }
+    let Some(deadline) = deadline else {
+        return;
+    };
+    let now = Instant::now();
+    if deadline <= now {
+        crate::subscription::entity_resync::note_package_entity_resync_change(state);
+        return;
+    }
+    let Some(waiter_id) = background_waiter_id(
+        state,
+        BackgroundWork::Maintenance(MaintenanceSliceKind::ProviderResync),
+    ) else {
+        return;
+    };
+    let arm = state
+        .deadlines
+        .arm(waiter_id, deadline, now)
+        .expect("a future resync deadline is later than every fired deadline");
+    state.package_entity_resync_scan.deadline_key = Some(arm.key());
+}
+
+pub(crate) fn mark_package_entity_resync_deadline_ready(
+    state: &mut DaemonControlState,
+    waiter_id: crate::owner_identity::WaiterId,
+) -> bool {
+    if state
+        .background_waiter_ids
+        .get(&BackgroundWork::Maintenance(
+            MaintenanceSliceKind::ProviderResync,
+        ))
+        != Some(&waiter_id)
+    {
+        return false;
+    }
+    state.package_entity_resync_scan.deadline_key = None;
+    crate::subscription::entity_resync::note_package_entity_resync_change(state);
+    true
+}
+
 fn publish_maintenance_wakes(state: &mut DaemonControlState) {
     for kind in MaintenanceSliceKind::ALL {
         if state.maintenance.wakes.take(kind) {
@@ -271,6 +319,9 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
     if let Some(runtime) = daemon.runtime() {
+        if runtime.take_package_entity_resync_notification() {
+            crate::subscription::entity_resync::note_package_entity_resync_change(state);
+        }
         if runtime.data_plane_progress_pending() {
             mark_background_ready(state, BackgroundWork::DataPlaneProgress);
         }
@@ -1316,6 +1367,8 @@ pub(crate) struct DaemonControlState {
     pub(crate) plugin_controls: crate::daemon::control::plugins::PluginControlState,
     /// Correlation and retained replies for asynchronous entity providers.
     pub(crate) plugin_entities: crate::daemon::control::entities::PluginEntityState,
+    pub(crate) package_entity_resync_scan:
+        crate::subscription::entity_resync::PackageEntityResyncScan,
     /// Global logical-byte ownership for drained plugin results and replies.
     pub(crate) plugin_result_budget: crate::daemon::control::reply::RetainedPluginResultBudget,
     /// Bounded ownership of connections, pending requests, and cleanup
@@ -1393,6 +1446,8 @@ impl Default for DaemonControlState {
             blocked_session_type_roots: BTreeMap::new(),
             plugin_controls: crate::daemon::control::plugins::PluginControlState::default(),
             plugin_entities: crate::daemon::control::entities::PluginEntityState::default(),
+            package_entity_resync_scan:
+                crate::subscription::entity_resync::PackageEntityResyncScan::default(),
             plugin_result_budget:
                 crate::daemon::control::reply::RetainedPluginResultBudget::default(),
             budget: crate::daemon::owner_budget::OwnerBudget::default(),

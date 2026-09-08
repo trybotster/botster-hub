@@ -253,6 +253,24 @@ impl PackageEntityResyncState {
         self.attempts_in_last_second(now) < PACKAGE_ENTITY_RESYNC_MAX_PER_SECOND
     }
 
+    /// Return the next policy deadline without scanning the family collection.
+    #[must_use]
+    pub(crate) fn next_attempt_at(&self) -> Option<Instant> {
+        if !self.needed || self.degraded {
+            return None;
+        }
+        let mut deadline = self.next_eligible_at;
+        if let Some(at) = self
+            .attempt_times
+            .iter()
+            .rev()
+            .nth(PACKAGE_ENTITY_RESYNC_MAX_PER_SECOND.saturating_sub(1) as usize)
+        {
+            deadline = deadline.max(at.checked_add(Duration::from_secs(1))?);
+        }
+        Some(deadline)
+    }
+
     #[must_use]
     fn attempts_in_last_second(&self, now: Instant) -> u32 {
         self.attempt_times
@@ -634,6 +652,37 @@ fn validate_mutation_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_resync_deadline_preserves_backoff_and_the_rolling_rate_limit() {
+        let now = Instant::now();
+        let mut resync = PackageEntityResyncState::default();
+        assert_eq!(resync.next_attempt_at(), None);
+        resync.mark_needed(now);
+        assert_eq!(resync.next_attempt_at(), Some(now));
+        resync.record_attempt(now);
+        assert_eq!(
+            resync.next_attempt_at(),
+            Some(now + PACKAGE_ENTITY_RESYNC_INITIAL_BACKOFF)
+        );
+        let second = now + PACKAGE_ENTITY_RESYNC_INITIAL_BACKOFF;
+        assert!(resync.can_attempt(second));
+        resync.record_attempt(second);
+        assert_eq!(resync.next_attempt_at(), Some(now + Duration::from_secs(1)));
+        resync.rearm(now + Duration::from_millis(60));
+        assert_eq!(resync.next_attempt_at(), Some(now + Duration::from_secs(1)));
+        for millis in [0, 49, 50, 60, 999, 1000, 1050] {
+            let at = now + Duration::from_millis(millis);
+            assert_eq!(
+                resync.can_attempt(at),
+                resync
+                    .next_attempt_at()
+                    .is_some_and(|deadline| at >= deadline)
+            );
+        }
+        resync.clear_needed();
+        assert_eq!(resync.next_attempt_at(), None);
+    }
     use serde_json::json;
 
     fn pending_mutation(seq: u64, id: &str) -> PackageEntityMutation {
