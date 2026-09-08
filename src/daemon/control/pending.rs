@@ -387,6 +387,10 @@ pub(crate) fn poll_ready_requests(
             .try_charge(Instant::now(), OwnerTurnCharge::opaque_move())
             .is_ok()
     {
+        // One host continuation may release the document and mark one parked
+        // waiter ready. That bounded handoff belongs to this charged item. If
+        // the charge fails, the continuation does not run and the waiter stays
+        // parked in `document_waiters`.
         let Some(item) = state.request_ready.pop_next() else {
             break;
         };
@@ -643,5 +647,74 @@ mod tests {
     #[test]
     fn deadline_then_completion_flags_and_finishes_must_finish_waiter_once() {
         run_coalesced_completion_deadline(ReadyClass::Deadline, true);
+    }
+
+    #[test]
+    fn exhausted_budget_preserves_a_waiter_parked_by_a_host_continuation() {
+        let (mut daemon, directory) = test_daemon("parked-document-waiter");
+        let mut state = DaemonControlState::default();
+        let host_waiter = WaiterId(1);
+        let parked_waiter = WaiterId(2);
+        let permit = state.budget.reserve().expect("reserve owner permit");
+        let (reply_tx, _reply_rx) = crate::daemon::control::message::control_reply_channel();
+        let now = Instant::now();
+        state.document_waiters.insert(parked_waiter);
+        state.pending_requests.insert(
+            host_waiter,
+            PendingControlRequest {
+                waiter_id: host_waiter,
+                ready_class: ReadyClass::HostCompletion,
+                ready_key: None,
+                deadline_key: None,
+                last_core_phase: 0,
+                last_host_phase: 0,
+                request: DaemonRequest::Status,
+                reply_tx,
+                response_delivery_rx: None,
+                grant_id: None,
+                client: None,
+                permit: Some(permit),
+                accepted_at: now,
+                must_finish: true,
+                past_deadline: false,
+                continuation: Box::new(|_, state| {
+                    state.document_waiters.pop_first();
+                    ControlPoll::Pending
+                }),
+                retire: None,
+            },
+        );
+        assert!(mark_request_ready(
+            &mut state,
+            host_waiter,
+            ReadyClass::HostCompletion,
+            READY_HOST_COMPLETION,
+        ));
+        let mut budget = OwnerTurnBudget::new(now);
+        budget
+            .try_charge(
+                now,
+                OwnerTurnCharge::inspection(
+                    crate::daemon::owner_turn::OWNER_TURN_INSPECTED_BYTE_LIMIT,
+                ),
+            )
+            .expect("fill the exact inspected-byte budget");
+
+        assert!(!poll_ready_requests(
+            &mut daemon,
+            &mut state,
+            now,
+            &mut budget,
+            |_, _, _, _| panic!("an exhausted turn cannot finish the request"),
+        ));
+
+        assert_eq!(
+            state.document_waiters,
+            [parked_waiter].into_iter().collect()
+        );
+        assert!(state.pending_requests.contains_key(&host_waiter));
+        assert!(!state.request_ready.is_empty());
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove owner ready test directory");
     }
 }

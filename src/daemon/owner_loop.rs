@@ -25,7 +25,9 @@ use crate::admission::budgets::{
     DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_CONTROL_QUEUE_CAPACITY, DAEMON_MAX_CONNECTIONS,
 };
 use crate::admission::unix_hello::{AdmissionState, WebrtcTerminalAdmission};
+#[cfg(test)]
 use crate::daemon::control::handle_control_message;
+use crate::daemon::control::handle_control_message_with_budget;
 use crate::daemon::control::message::{
     ControlMessage, ControlReplySender, ControlSender, DaemonDeliveryKind, EgressWriteClass,
 };
@@ -167,7 +169,20 @@ fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> 
         || state.event_plane.has_pending_cleanup()
 }
 
-fn mark_due_reconciliation(state: &mut DaemonControlState, now: Instant) {
+fn mark_due_reconciliation(
+    state: &mut DaemonControlState,
+    now: Instant,
+    owner_turn: &mut crate::daemon::owner_turn::OwnerTurnBudget,
+) {
+    if owner_turn
+        .try_charge(
+            Instant::now(),
+            crate::daemon::owner_turn::OwnerTurnCharge::inspection(0),
+        )
+        .is_err()
+    {
+        return;
+    }
     if state.next_reconciliation <= now {
         state.background.mark_pump();
         state.maintenance.try_wake();
@@ -341,6 +356,12 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         // Read the shared completion bit on every turn. If the bounded
         // doorbell queue was full, another owner event still exposes results.
         if let Some(runtime) = daemon.runtime()
+            && owner_turn
+                .try_charge(
+                    Instant::now(),
+                    crate::daemon::owner_turn::OwnerTurnCharge::inspection(0),
+                )
+                .is_ok()
             && runtime.take_core_completion_notification()
         {
             let identities = runtime
@@ -357,19 +378,9 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         crate::subscription::entity::absorb_session_type_catalog_completions(
             &daemon,
             &mut control_state,
+            &mut owner_turn,
         );
-        let completion_published = control_state
-            .plugin_result_budget
-            .take_completion_notification();
-        let result_capacity_released = control_state
-            .plugin_result_budget
-            .take_release_notification();
-        if completion_published || result_capacity_released {
-            control_state
-                .maintenance
-                .scheduler
-                .prefer_completion_drain();
-        }
+        crate::daemon::control::absorb_plugin_progress(&mut control_state, &mut owner_turn);
         crate::daemon::control::entities::retire_plugin_entity_replies(
             &daemon,
             &mut control_state,
@@ -380,7 +391,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             &mut control_state,
             Instant::now(),
         );
-        mark_due_reconciliation(&mut control_state, Instant::now());
+        mark_due_reconciliation(&mut control_state, Instant::now(), &mut owner_turn);
         crate::daemon::control::pending::mark_due_request_deadlines(
             &mut control_state,
             Instant::now(),
@@ -389,7 +400,9 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         let slice_due = control_state
             .background
             .has_pending(owner_maintenance_pending(&daemon, &control_state))
-            || !control_state.request_ready.is_empty();
+            || !control_state.request_ready.is_empty()
+            || control_state.host_completion_drain_pending
+            || control_state.host_capacity_wake_pending;
         let event = match classify_owner_poll(control_rx.try_recv(), slice_due) {
             OwnerPollDecision::ServeControl(message) => Some(OwnerEvent::Control(message)),
             OwnerPollDecision::RunSlice => None,
@@ -467,11 +480,12 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                         .saturating_add(1);
                 }
                 Some(message) => {
-                    if handle_control_message(
+                    if handle_control_message_with_budget(
                         &mut daemon,
                         &mut control_state,
                         transport_runtime.handle(),
                         control_tx.clone(),
+                        &mut owner_turn,
                         message,
                     ) {
                         let _ = shutdown_tx.send(true);
@@ -491,17 +505,23 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 None => return Err(DaemonTransportError::ControlThreadStopped),
             }
         }
-        mark_due_reconciliation(&mut control_state, Instant::now());
+        mark_due_reconciliation(&mut control_state, Instant::now(), &mut owner_turn);
         if control_state
             .background
             .has_pending(owner_maintenance_pending(&daemon, &control_state))
         {
             run_one_owner_background_slice(&mut daemon, &mut control_state);
         }
-        for waiter_id in control_state
-            .plugin_controls
-            .take_ready_waiters(crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT)
+        while owner_turn
+            .try_charge(
+                Instant::now(),
+                crate::daemon::owner_turn::OwnerTurnCharge::inspection(0),
+            )
+            .is_ok()
         {
+            let Some(waiter_id) = control_state.plugin_controls.take_ready_waiters(1).pop() else {
+                break;
+            };
             crate::daemon::control::pending::mark_request_ready(
                 &mut control_state,
                 waiter_id,
@@ -952,6 +972,8 @@ pub(crate) struct DaemonControlState {
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
     pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
     pub(crate) host_recovery_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
+    pub(crate) host_completion_drain_pending: bool,
+    pub(crate) host_capacity_wake_pending: bool,
     pub(crate) blocked_session_type_roots:
         BTreeMap<std::path::PathBuf, crate::owner_identity::WaiterId>,
     /// Correlation for non-blocking plugin request-response work.
@@ -1026,6 +1048,8 @@ impl Default for DaemonControlState {
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
             host_recovery_waiters: std::collections::BTreeSet::new(),
+            host_completion_drain_pending: false,
+            host_capacity_wake_pending: false,
             blocked_session_type_roots: BTreeMap::new(),
             plugin_controls: crate::daemon::control::plugins::PluginControlState::default(),
             plugin_entities: crate::daemon::control::entities::PluginEntityState::default(),

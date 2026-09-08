@@ -28,6 +28,7 @@ use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::pending::ControlStep;
 use crate::daemon::error::DaemonTransportError;
 use crate::daemon::owner_loop::{DaemonControlState, record_egress_write_failure};
+use crate::daemon::owner_turn::{OwnerTurnBudget, OwnerTurnCharge};
 pub(crate) use message::{ControlMessage, ControlSender};
 
 /// Owned snapshot of owner diagnostics and connection identity for one
@@ -89,11 +90,12 @@ pub(crate) fn control_request_operation_label(request: &DaemonRequest) -> &'stat
     }
 }
 
-pub(crate) fn handle_control_message(
+pub(crate) fn handle_control_message_with_budget(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     transport_handle: &tokio::runtime::Handle,
     control_tx: ControlSender,
+    owner_turn: &mut OwnerTurnBudget,
     message: ControlMessage,
 ) -> bool {
     match message {
@@ -140,19 +142,58 @@ pub(crate) fn handle_control_message(
             false
         }
         ControlMessage::PluginResultCapacityReleased => {
-            state.plugin_result_budget.take_release_notification();
-            state.maintenance.scheduler.prefer_completion_drain();
+            absorb_plugin_progress(state, owner_turn);
             false
         }
         ControlMessage::PluginCompletionPublished => {
-            state.plugin_result_budget.take_completion_notification();
-            state.maintenance.scheduler.prefer_completion_drain();
+            absorb_plugin_progress(state, owner_turn);
             false
         }
         ControlMessage::HostProgressPublished => {
-            crate::subscription::entity::absorb_session_type_catalog_completions(daemon, state);
+            crate::subscription::entity::absorb_session_type_catalog_completions(
+                daemon, state, owner_turn,
+            );
             false
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn handle_control_message(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    transport_handle: &tokio::runtime::Handle,
+    control_tx: ControlSender,
+    message: ControlMessage,
+) -> bool {
+    let mut owner_turn = OwnerTurnBudget::new(std::time::Instant::now());
+    handle_control_message_with_budget(
+        daemon,
+        state,
+        transport_handle,
+        control_tx,
+        &mut owner_turn,
+        message,
+    )
+}
+
+pub(crate) fn absorb_plugin_progress(
+    state: &mut DaemonControlState,
+    owner_turn: &mut OwnerTurnBudget,
+) {
+    if owner_turn
+        .try_charge(std::time::Instant::now(), OwnerTurnCharge::inspection(0))
+        .is_ok()
+        && state.plugin_result_budget.take_completion_notification()
+    {
+        state.maintenance.scheduler.prefer_completion_drain();
+    }
+    if owner_turn
+        .try_charge(std::time::Instant::now(), OwnerTurnCharge::inspection(0))
+        .is_ok()
+        && state.plugin_result_budget.take_release_notification()
+    {
+        state.maintenance.scheduler.prefer_completion_drain();
     }
 }
 
