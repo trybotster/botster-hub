@@ -689,6 +689,21 @@ export interface DaemonLocalWebrtcAnswer {
   diagnostics?: DaemonDiagnostic[];
 }
 
+export interface DaemonLocalWebrtcTerminalRecord {
+  schema_version: number;
+  grant_id: string;
+  request_operation: string;
+  message_id: string | null;
+  next_chunk_index: number;
+  last_sent_chunk_index: number | null;
+  total_chunks: number;
+  pressured: boolean;
+  peer_connection_state: string;
+  channel_terminal_signal: string;
+  cause: string;
+  cleanup_disposition: string;
+}
+
 export interface DaemonPackage {
   package_name: string;
   version: string;
@@ -919,6 +934,7 @@ export interface DaemonStatus {
   live_attach_occupancy?: DaemonAttachOccupancy[];
   observability?: DaemonObservabilityCounters;
   retention?: DaemonRetentionAccounting | null;
+  local_webrtc_terminal_records?: DaemonLocalWebrtcTerminalRecord[];
   diagnostics?: DaemonDiagnostic[];
 }
 

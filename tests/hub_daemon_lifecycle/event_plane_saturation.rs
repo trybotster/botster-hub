@@ -3382,13 +3382,21 @@ fn drain_webrtc_host_events(
 
 fn fail_webrtc_saturation(
     endpoint: &botster_hub_client::DaemonEndpoint,
-    data_dir: &Path,
+    _data_dir: &Path,
     peer: &LocalWebrtcOfferPeer,
     builder: &Mutex<ArmRunBuilder>,
     error: &str,
 ) -> ! {
-    let record_path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
-    let terminal = fs::read_to_string(&record_path).unwrap_or_else(|_| "missing".to_string());
+    let terminal = botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::Status)
+        .ok()
+        .and_then(|response| response.status)
+        .map(|status| {
+            serde_json::json!({
+                "records": status.local_webrtc_terminal_records,
+            })
+            .to_string()
+        })
+        .unwrap_or_else(|| "not_retained".to_string());
     let observability = snapshot_observability(endpoint);
     publish_builder(builder, |state| {
         state.terminal.apply_peer_loss();

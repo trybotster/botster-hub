@@ -64,62 +64,6 @@ fn botster_web_health_rejects_stale_daemon_socket_file() {
 }
 
 #[test]
-fn local_webrtc_sender_terminal_record_rejects_stale_malformed_and_oversized_evidence() {
-    let data_dir = unique_test_dir("local-webrtc-terminal-record-validation");
-    fs::create_dir_all(&data_dir).expect("create terminal record validation directory");
-    let path = data_dir.join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
-    let valid_record = serde_json::json!({
-        "schema_version": 1,
-        "grant_id": "grant-current",
-        "request_operation": "status",
-        "message_id": null,
-        "next_chunk_index": 0,
-        "last_sent_chunk_index": null,
-        "total_chunks": 0,
-        "pressured": false,
-        "peer_connection_state": "closed",
-        "channel_terminal_signal": "on_close",
-        "cause": "channel_closed",
-        "cleanup_disposition": "newly_sent",
-    });
-
-    fs::write(
-        &path,
-        serde_json::to_vec(&valid_record).expect("serialize validation fixture"),
-    )
-    .expect("write stale validation fixture");
-    assert!(
-        std::panic::catch_unwind(|| {
-            local_webrtc_sender_terminal_record(&data_dir, "grant-other")
-        })
-        .is_err(),
-        "a record for another grant must not satisfy the evidence gate"
-    );
-
-    fs::write(&path, b"{\"schema_version\":1").expect("write truncated validation fixture");
-    assert!(
-        std::panic::catch_unwind(|| {
-            local_webrtc_sender_terminal_record(&data_dir, "grant-current")
-        })
-        .is_err(),
-        "a truncated record must not satisfy the evidence gate"
-    );
-
-    fs::write(
-        &path,
-        vec![b'x'; LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_MAX_BYTES + 1],
-    )
-    .expect("write oversized validation fixture");
-    assert!(
-        std::panic::catch_unwind(|| {
-            local_webrtc_sender_terminal_record(&data_dir, "grant-current")
-        })
-        .is_err(),
-        "an oversized record must not satisfy the evidence gate"
-    );
-}
-
-#[test]
 fn local_webrtc_diagnostic_stderr_tail_is_bounded_and_redacts_paths() {
     let data_dir = std::env::temp_dir().join("local-webrtc-diagnostic-data");
     let mut lines = (0..25)
@@ -219,7 +163,7 @@ fn cli_smoke_persists_matching_sender_record_when_webrtc_response_closes() {
     ));
     let grant_id =
         local_webrtc_grant_id(&output).expect("faulted smoke reached local WebRTC bootstrap");
-    let terminal_record = local_webrtc_sender_terminal_record(&data_dir, &grant_id);
+    let terminal_record = local_webrtc_sender_terminal_record(&output, &grant_id);
     assert_eq!(terminal_record["request_operation"], "status");
     assert_eq!(terminal_record["next_chunk_index"], 0);
     assert_eq!(terminal_record["total_chunks"], 0);

@@ -387,6 +387,7 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
         enabled_provider_count: stopped.enabled_provider_count,
         session_count: 0,
         retention: None,
+        local_webrtc_terminal_records: Vec::new(),
         recovered_sessions: stopped
             .recovered_sessions
             .iter()

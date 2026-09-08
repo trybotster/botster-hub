@@ -51,7 +51,6 @@ use crate::transport::unix::listener::{
     accept_connections, acquire_socket_owner_lock, cleanup_socket_path, prepare_socket_path,
     rebind_missing_socket_path, socket_path,
 };
-use crate::transport::webrtc::LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE;
 
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -278,9 +277,6 @@ fn completion_drain_needs_followup(
 
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
     let socket_path = socket_path(&config)?;
-    let local_webrtc_terminal_record_path = config
-        .data_directory
-        .join(LOCAL_WEBRTC_SENDER_TERMINAL_RECORD_FILE);
     let socket_owner = acquire_socket_owner_lock(&socket_path)?;
     prepare_socket_path(&socket_path, &socket_owner)?;
     let listener = UnixListener::bind(&socket_path).map_err(DaemonTransportError::Io)?;
@@ -447,7 +443,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                     if handle_control_message(
                         &mut daemon,
                         &mut control_state,
-                        &local_webrtc_terminal_record_path,
                         transport_runtime.handle(),
                         control_tx.clone(),
                         message,
@@ -2534,7 +2529,6 @@ return botster.register({
             .enable_all()
             .build()
             .expect("build plugin pressure transport runtime");
-        let local_webrtc_terminal_record_path = root.join("local-webrtc-terminal.json");
         let registration = receive_test_control_message(&mut control_rx);
         let terminal_mux = match &registration {
             ControlMessage::RegisterUnixAdmission {
@@ -2553,7 +2547,6 @@ return botster.register({
         assert!(!handle_control_message(
             &mut daemon,
             &mut state,
-            &local_webrtc_terminal_record_path,
             transport_runtime.handle(),
             control_tx.clone(),
             registration,
@@ -2588,7 +2581,6 @@ return botster.register({
             assert!(!handle_control_message(
                 &mut daemon,
                 &mut state,
-                &local_webrtc_terminal_record_path,
                 transport_runtime.handle(),
                 control_tx.clone(),
                 message,
@@ -2647,7 +2639,6 @@ return botster.register({
         assert!(!handle_control_message(
             &mut daemon,
             &mut state,
-            &local_webrtc_terminal_record_path,
             transport_runtime.handle(),
             control_tx.clone(),
             sibling_registration,
@@ -2662,7 +2653,6 @@ return botster.register({
         assert!(!handle_control_message(
             &mut daemon,
             &mut state,
-            &local_webrtc_terminal_record_path,
             transport_runtime.handle(),
             control_tx.clone(),
             sibling_status,
