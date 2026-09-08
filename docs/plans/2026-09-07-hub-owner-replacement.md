@@ -336,6 +336,14 @@ Keep:
   guards naming symbols this plan deletes are removed; guards that parse a
   source file by splitting on a signature are rewritten to be robust rather than
   deleted wholesale.
+- Carry three known stale source guards into the scheduler replacement:
+  `dispatcher_names_request_variants_only_in_delegating_arms`,
+  `pump_phases_do_not_list_subscriptions_or_sessions`, and
+  `shutdown_handler_installs_exact_suppression_before_core_request`. Code moves
+  caused these guards to inspect old regions. The shutdown guard is corrected
+  before this replacement. Each later correction must anchor to the function
+  that owns the property. Each guard must require positive presence before it
+  checks order or absence.
 
 Replace:
 

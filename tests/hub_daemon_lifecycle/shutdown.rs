@@ -2169,7 +2169,7 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
         .expect("enable provider through admission");
 
     store
-        .update_unreserved_test_fixture(&config, |state| {
+        .update_test_fixture(&config, |state| {
             state.package_registry = policy.registry().snapshot();
         })
         .expect("seed existing state through store");
