@@ -21,9 +21,9 @@ use botster_hub::{
     HostIdentityOptions, HubClientAdmission, HubClientApi, HubClientError, HubClientIdentity,
     HubClientOperation, HubClientPackageClassification, HubClientPackageState, HubClientRequest,
     HubClientResponseBody, HubClientRole, HubPackageManifest, HubRuntime, HubStartupOptions,
-    HubStateStore, PackageProvenance, PackageRegistry, PackageSessionType,
-    PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory, RuntimeEnvironment,
-    SessionDefaults, SessionTypeMutationSource, SpawnTarget, TransportBindings,
+    PackageProvenance, PackageRegistry, PackageSessionType, PackageSessionTypeExecution,
+    PackageSessionTypeWorkingDirectory, RuntimeEnvironment, SessionDefaults,
+    SessionTypeMutationSource, SpawnTarget, TransportBindings,
 };
 use botster_terminal_protocol_client::TerminalInputCommand;
 use botster_ui_contract::{
@@ -32,6 +32,7 @@ use botster_ui_contract::{
 };
 
 mod support;
+use botster_hub::test_internals::TestHubStateStoreExt;
 use support::{
     bind_shared_terminal_adapter, candidate_session_worker_binary_path, inject_terminal_command,
 };

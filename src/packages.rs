@@ -3442,7 +3442,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
-    use crate::persistence::{FileHubStateStore, HubStateStore};
+    use crate::persistence::FileHubStateStore;
 
     fn capability(surface: CapabilitySurface, scope: Option<&str>) -> Capability {
         Capability {

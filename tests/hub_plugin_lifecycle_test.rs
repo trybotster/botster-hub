@@ -12,11 +12,12 @@ use botster_core::{
     PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor, PluginResourceKind,
     PluginResourceRef, PluginRuntime, RequestId, TimerCapabilityRequest,
 };
+use botster_hub::test_internals::TestHubStateStoreExt;
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions,
     HubLifecycleError, HubPackageManifest, HubPluginRuntimeBundle, HubRuntime, HubStartupOptions,
-    HubStateStore, LOCAL_PACKAGE_MANIFEST_FILE, PackageProvenance, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, TransportBindings,
+    LOCAL_PACKAGE_MANIFEST_FILE, PackageProvenance, PackageRegistry, RuntimeEnvironment,
+    SessionDefaults, TransportBindings,
 };
 
 #[derive(Clone)]

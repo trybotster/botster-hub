@@ -7,11 +7,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{RequestId, SessionId, SessionLifecycleState, SubscriptionId};
+use botster_hub::test_internals::TestHubStateStoreExt;
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
     HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
-    HubDaemon, HubStartupOptions, HubStateLoadSource, HubStateStore, PackageRegistry,
-    RuntimeEnvironment, SessionDefaults, TransportBindings,
+    HubDaemon, HubStartupOptions, HubStateLoadSource, PackageRegistry, RuntimeEnvironment,
+    SessionDefaults, TransportBindings,
 };
 use botster_terminal_protocol_client::TerminalInputCommand;
 

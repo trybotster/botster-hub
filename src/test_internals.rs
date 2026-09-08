@@ -14,6 +14,30 @@ use crate::runtime::{
     AttachBindPlan, BindRoutePlan, HubRuntime, attach_and_bind_on_core, attach_route_on_core,
     bind_route_on_core,
 };
+use crate::shared_view::SharedViewBudget;
+use crate::{FileHubStateStore, HubConfig, HubState, HubStateStoreResult};
+
+/// Test-only durable state fixture writes through the reserved production path.
+pub trait TestHubStateStoreExt {
+    fn update_unreserved_test_fixture(
+        &self,
+        config: &HubConfig,
+        update: impl FnOnce(&mut HubState),
+    ) -> HubStateStoreResult<HubState>;
+}
+
+impl TestHubStateStoreExt for FileHubStateStore {
+    fn update_unreserved_test_fixture(
+        &self,
+        config: &HubConfig,
+        update: impl FnOnce(&mut HubState),
+    ) -> HubStateStoreResult<HubState> {
+        let mut state = self.load_for_update(config)?;
+        update(&mut state);
+        let prepared = self.prepare_shared(state, &SharedViewBudget::new())?;
+        self.commit_shared(prepared).map(|state| (*state).clone())
+    }
+}
 
 /// A fake or real terminal adapter a test binds to one route.
 pub type TestTerminalAdapter = Box<dyn WakingTerminalAdapter + Send>;

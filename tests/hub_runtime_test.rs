@@ -13,10 +13,11 @@ use botster_core_daemon::{
     GuardedWriteDecision, GuardedWriteDeliveryState, GuardedWriteRequest, ReadinessEvidence,
     RegistrySessionState, SessionAdoptionState,
 };
+use botster_hub::test_internals::TestHubStateStoreExt;
 use botster_hub::{
     CoreEngineOptions, CredentialKeyPurpose, CredentialKeyReference, CredentialProviderKind,
     DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubRuntime, HubRuntimeError,
-    HubStartupOptions, HubStateStore, RuntimeEnvironment, SessionDefaults, TestFileCredentialStore,
+    HubStartupOptions, RuntimeEnvironment, SessionDefaults, TestFileCredentialStore,
     TransportBindings, TrustedBrowserIdentity, credential_key_id,
 };
 use botster_terminal_protocol_client::TerminalInputCommand;
