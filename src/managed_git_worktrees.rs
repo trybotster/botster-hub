@@ -21,11 +21,22 @@ use crate::worktrees::{Worktree, WorktreeGitMetadata};
 
 pub const MANAGED_GIT_OPERATION_TIMEOUT: Duration = Duration::from_secs(25);
 pub const MANAGED_GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const MANAGED_GIT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MANAGED_GIT_DISCOVERY_NAME_BYTE_CAPACITY: usize = 4096;
+const MANAGED_GIT_OUTPUT_BYTE_CAPACITY: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedWorktreeDecision {
+    Commit,
+    Rollback,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManagedGitError {
     pub kind: &'static str,
     pub message: String,
+    #[serde(skip)]
+    recovery: Option<Box<PreparedManagedWorktree>>,
 }
 
 impl ManagedGitError {
@@ -33,7 +44,17 @@ impl ManagedGitError {
         Self {
             kind,
             message: message.into(),
+            recovery: None,
         }
+    }
+
+    fn with_recovery(mut self, prepared: PreparedManagedWorktree) -> Self {
+        self.recovery = Some(Box::new(prepared));
+        self
+    }
+
+    pub(crate) fn take_recovery(&mut self) -> Option<PreparedManagedWorktree> {
+        self.recovery.take().map(|prepared| *prepared)
     }
 }
 
@@ -236,6 +257,33 @@ pub fn prepare_managed_worktree(
         deadline,
     )?
     .success();
+    let expected_head_commit = if branch_exists {
+        git_stdout(
+            Some(&repository_root),
+            &["rev-parse", "--verify", &format!("{branch_ref}^{{commit}}")],
+            deadline,
+            "worktree_conflict",
+        )?
+        .trim()
+        .to_string()
+    } else {
+        base_commit.clone()
+    };
+    // Arm the complete identity descriptor before `git worktree add`. Every
+    // later failure can then compensate the external effect without guessing.
+    let rollback = PreparedManagedWorktree {
+        target_id: request.target.target_id.clone(),
+        repository_root: repository_root.clone(),
+        common_dir: common_dir.clone(),
+        branch: request.branch.clone(),
+        path: path.clone(),
+        worktree_id: managed_worktree_id(&request.target.target_id, &request.branch),
+        base_ref: base_ref.clone(),
+        base_commit: base_commit.clone(),
+        head_commit: expected_head_commit,
+        created_worktree: true,
+        created_branch: !branch_exists,
+    };
     let mut args = vec!["worktree", "add"];
     if branch_exists {
         args.push(path.to_str().ok_or_else(|| {
@@ -252,21 +300,30 @@ pub fn prepare_managed_worktree(
             &base_commit,
         ]);
     }
-    git_status(Some(&repository_root), &args, deadline, "worktree_conflict")?;
-    let canonical_path = path.canonicalize().map_err(|_| {
-        ManagedGitError::new(
+    if let Err(failure) = git_status(Some(&repository_root), &args, deadline, "worktree_conflict") {
+        return compensate_failed_creation(&rollback, failure);
+    }
+    let reconciled = (|| {
+        let canonical_path = path.canonicalize().map_err(|_| {
+            ManagedGitError::new(
+                "worktree_reconciliation_failed",
+                "created worktree could not be reconciled",
+            )
+        })?;
+        let head_commit = git_stdout(
+            Some(&canonical_path),
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+            deadline,
             "worktree_reconciliation_failed",
-            "created worktree could not be reconciled",
-        )
-    })?;
-    let head_commit = git_stdout(
-        Some(&canonical_path),
-        &["rev-parse", "--verify", "HEAD^{commit}"],
-        deadline,
-        "worktree_reconciliation_failed",
-    )?
-    .trim()
-    .to_string();
+        )?
+        .trim()
+        .to_string();
+        Ok::<_, ManagedGitError>((canonical_path, head_commit))
+    })();
+    let (canonical_path, head_commit) = match reconciled {
+        Ok(reconciled) => reconciled,
+        Err(failure) => return compensate_failed_creation(&rollback, failure),
+    };
     Ok(PreparedManagedWorktree {
         target_id: request.target.target_id.clone(),
         repository_root,
@@ -280,6 +337,45 @@ pub fn prepare_managed_worktree(
         created_worktree: true,
         created_branch: !branch_exists,
     })
+}
+
+/// Create the managed-worktree external effect. The caller must retain cleanup
+/// ownership until it commits or rolls back the returned descriptor.
+pub(crate) fn create_managed_worktree_effect(
+    request: &ManagedGitRequest,
+) -> Result<PreparedManagedWorktree, ManagedGitError> {
+    prepare_managed_worktree(request)
+}
+
+fn compensate_failed_creation(
+    rollback: &PreparedManagedWorktree,
+    failure: ManagedGitError,
+) -> Result<PreparedManagedWorktree, ManagedGitError> {
+    if !rollback.path.exists() {
+        return Err(failure);
+    }
+    match rollback_prepared_worktree(rollback, Instant::now() + MANAGED_GIT_COMMAND_TIMEOUT) {
+        Ok(()) => Err(failure),
+        Err(compensation) => Err(ManagedGitError::new(
+            "reconciliation_failed",
+            format!(
+                "{}; managed worktree compensation failed: {}",
+                failure.message, compensation.message
+            ),
+        )
+        .with_recovery(rollback.clone())),
+    }
+}
+
+pub(crate) fn finalize_managed_worktree(
+    prepared: &PreparedManagedWorktree,
+    decision: ManagedWorktreeDecision,
+    deadline: Instant,
+) -> Result<(), ManagedGitError> {
+    match decision {
+        ManagedWorktreeDecision::Commit => Ok(()),
+        ManagedWorktreeDecision::Rollback => rollback_prepared_worktree(prepared, deadline),
+    }
 }
 
 pub fn rollback_prepared_worktree(
@@ -376,100 +472,197 @@ pub fn adopt_unrecorded_managed_worktrees(
         .iter_mut()
         .filter(|worktree| worktree.management == "hub_managed_git")
     {
-        let status = targets
-            .iter()
-            .find(|target| target.target_id == worktree.target_id)
-            .map_or("stale", |target| {
-                reconcile_managed_worktree(worktree, target)
-            });
+        let status = if worktree
+            .metadata
+            .get("recovery_required")
+            .map(String::as_str)
+            == Some("true")
+        {
+            if worktree.path.exists() {
+                "stale"
+            } else {
+                "missing"
+            }
+        } else {
+            targets
+                .iter()
+                .find(|target| target.target_id == worktree.target_id)
+                .map_or("stale", |target| {
+                    reconcile_managed_worktree(worktree, target)
+                })
+        };
         if worktree.status != status {
             worktree.status = status.to_string();
             changed = true;
         }
     }
-    for target in targets
-        .iter()
-        .filter(|target| target.enabled && target.kind == "git")
-    {
-        let target_root = managed_root.join(&target.target_id);
-        let Ok(entries) = fs::read_dir(&target_root) else {
+    changed |= discover_unrecorded_managed_worktrees(targets, worktrees, managed_root);
+    changed
+}
+
+fn discover_unrecorded_managed_worktrees(
+    targets: &[SpawnTarget],
+    worktrees: &mut Vec<Worktree>,
+    managed_root: &Path,
+) -> bool {
+    let Ok(owned_root) = managed_root.canonicalize() else {
+        return false;
+    };
+    let Ok(target_entries) = fs::read_dir(&owned_root) else {
+        return false;
+    };
+    let mut changed = false;
+    for target_entry in target_entries.flatten() {
+        let Ok(target_metadata) = fs::symlink_metadata(target_entry.path()) else {
             continue;
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let Ok(repository_root) = target.root.canonicalize() else {
+        if !target_metadata.is_dir() || target_metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Some(target_id) = target_entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        let Ok(common_dir) = resolve_common_dir(&repository_root, deadline) else {
+        let Ok(target_directory) = target_entry.path().canonicalize() else {
             continue;
         };
-        let Some(base_ref) = target.base_ref.clone() else {
+        if target_directory.parent() != Some(owned_root.as_path())
+            || !target_directory.starts_with(&owned_root)
+        {
+            report_unidentified_managed_entry(&target_entry.path(), "target_path_escape");
+            continue;
+        }
+        let Ok(worktree_entries) = fs::read_dir(&target_directory) else {
             continue;
         };
-        let Ok(base_commit) = git_stdout(
-            Some(&repository_root),
-            &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
-            deadline,
-            "invalid_base_ref",
-        ) else {
-            continue;
-        };
-        for path in entries.flatten().map(|entry| entry.path()) {
-            let Ok(path) = path.canonicalize() else {
+        for worktree_entry in worktree_entries.flatten() {
+            let Ok(worktree_metadata) = fs::symlink_metadata(worktree_entry.path()) else {
                 continue;
             };
-            let Ok(branch) = git_stdout(
-                Some(&path),
-                &["symbolic-ref", "--quiet", "--short", "HEAD"],
-                deadline,
-                "stale",
-            ) else {
-                continue;
-            };
-            let branch = branch.trim().to_string();
-            if managed_worktree_path(managed_root, &target.target_id, &branch)
-                .canonicalize()
-                .ok()
-                .as_ref()
-                != Some(&path)
-                || resolve_common_dir(&path, deadline).ok().as_ref() != Some(&common_dir)
-            {
+            if !worktree_metadata.is_dir() || worktree_metadata.file_type().is_symlink() {
                 continue;
             }
-            let worktree_id = managed_worktree_id(&target.target_id, &branch);
+            let Ok(path) = worktree_entry.path().canonicalize() else {
+                continue;
+            };
+            if path.parent() != Some(target_directory.as_path()) || !path.starts_with(&owned_root) {
+                report_unidentified_managed_entry(&worktree_entry.path(), "path_escape");
+                continue;
+            }
+            let encoded_branch_name = worktree_entry.file_name();
+            let Some(encoded_branch) = encoded_branch_name.to_str().filter(|name| {
+                name.len() <= MANAGED_GIT_DISCOVERY_NAME_BYTE_CAPACITY && is_well_formed_hex(name)
+            }) else {
+                report_unidentified_managed_entry(&path, "invalid_branch_encoding");
+                continue;
+            };
+            let worktree_id = format!("managed:{target_id}:{encoded_branch}");
             if worktrees
                 .iter()
                 .any(|worktree| worktree.worktree_id == worktree_id)
             {
                 continue;
             }
-            let Ok(head_commit) = git_stdout(
+            let branch = hex_decode(encoded_branch)
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|branch| !branch.is_empty());
+            if branch.as_ref().is_some_and(|branch| {
+                managed_worktree_path(&owned_root, &target_id, branch)
+                    .canonicalize()
+                    .ok()
+                    .as_ref()
+                    != Some(&path)
+            }) {
+                report_unidentified_managed_entry(&path, "path_identity_mismatch");
+                continue;
+            }
+            let deadline = Instant::now() + MANAGED_GIT_DISCOVERY_TIMEOUT;
+            let observed_branch = git_stdout(
+                Some(&path),
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                deadline,
+                "stale",
+            )
+            .ok()
+            .map(|value| value.trim().to_string());
+            let common_dir = resolve_common_dir(&path, deadline).ok();
+            let head_commit = git_stdout(
                 Some(&path),
                 &["rev-parse", "--verify", "HEAD^{commit}"],
                 deadline,
                 "stale",
-            ) else {
-                continue;
-            };
-            worktrees.push(
-                PreparedManagedWorktree {
-                    target_id: target.target_id.clone(),
-                    repository_root: repository_root.clone(),
-                    common_dir: common_dir.clone(),
-                    branch,
-                    path,
-                    worktree_id,
-                    base_ref: base_ref.clone(),
-                    base_commit: base_commit.trim().to_string(),
-                    head_commit: head_commit.trim().to_string(),
-                    created_worktree: false,
-                    created_branch: false,
+            )
+            .ok()
+            .map(|value| value.trim().to_string());
+            let target = targets.iter().find(|target| target.target_id == target_id);
+            let live_identity = observed_branch.as_deref() == branch.as_deref()
+                && branch.is_some()
+                && common_dir.is_some()
+                && head_commit.is_some();
+            let recovery_reason = match (live_identity, target) {
+                (false, _) => "git_identity_unavailable",
+                (true, None) => "target_unknown",
+                (true, Some(target)) if !target.enabled => "target_disabled",
+                (true, Some(target)) if target.kind != "git" || target.base_ref.is_none() => {
+                    "target_not_git"
                 }
-                .worktree(),
-            );
+                (true, Some(target)) => match resolve_common_dir(
+                    &target.root,
+                    Instant::now() + MANAGED_GIT_DISCOVERY_TIMEOUT,
+                ) {
+                    Ok(target_common_dir) if Some(&target_common_dir) == common_dir.as_ref() => {
+                        "unrecorded_create"
+                    }
+                    Ok(_) => "repository_mismatch",
+                    Err(_) => "target_identity_unavailable",
+                },
+            };
+            let git = common_dir.as_ref().and_then(|common_dir| {
+                live_identity.then(|| WorktreeGitMetadata {
+                    repository_root: repository_root_from_common_dir(common_dir),
+                    branch: branch.clone(),
+                    head: head_commit.clone(),
+                })
+            });
+            let mut metadata = BTreeMap::from([
+                ("recovery_required".to_string(), "true".to_string()),
+                ("recovery_reason".to_string(), recovery_reason.to_string()),
+            ]);
+            if let Some(common_dir) = common_dir {
+                metadata.insert("common_dir".to_string(), common_dir.display().to_string());
+            }
+            worktrees.push(Worktree {
+                worktree_id,
+                target_id: target_id.clone(),
+                label: branch.unwrap_or_else(|| encoded_branch.to_string()),
+                path,
+                status: "stale".to_string(),
+                management: "hub_managed_git".to_string(),
+                git,
+                metadata,
+            });
             changed = true;
         }
     }
     changed
+}
+
+fn repository_root_from_common_dir(common_dir: &Path) -> PathBuf {
+    if common_dir.file_name() == Some(OsStr::new(".git")) {
+        common_dir
+            .parent()
+            .map_or_else(|| common_dir.to_path_buf(), Path::to_path_buf)
+    } else {
+        common_dir.to_path_buf()
+    }
+}
+
+fn report_unidentified_managed_entry(path: &Path, reason: &str) {
+    let path = format!("{path:?}");
+    let bounded_path = path
+        .chars()
+        .take(MANAGED_GIT_DISCOVERY_NAME_BYTE_CAPACITY)
+        .collect::<String>();
+    eprintln!("managed_git_recovery_required reason={reason} path={bounded_path}");
 }
 
 #[must_use]
@@ -531,6 +724,39 @@ fn hex_encode(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])?;
+            let low = hex_nibble(pair[1])?;
+            Some((high << 4) | low)
+        })
+        .collect()
+}
+
+fn is_well_formed_hex(encoded: &str) -> bool {
+    !encoded.is_empty()
+        && encoded.len().is_multiple_of(2)
+        && encoded
+            .as_bytes()
+            .iter()
+            .copied()
+            .all(|byte| hex_nibble(byte).is_some())
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn preflight_git(deadline: Instant) -> Result<(), ManagedGitError> {
@@ -647,12 +873,15 @@ pub(crate) fn git_stdout_using(
     let mut child = command
         .spawn()
         .map_err(|_| ManagedGitError::new("git_unavailable", "Git is unavailable"))?;
-    let mut stdout = child.stdout.take().ok_or_else(|| {
+    let stdout = child.stdout.take().ok_or_else(|| {
         ManagedGitError::new(failure_kind, "managed Git output could not be captured")
     })?;
     let reader = thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
+        stdout
+            .take(MANAGED_GIT_OUTPUT_BYTE_CAPACITY + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
     });
     let status = wait_for_child(&mut child, deadline);
     let stdout = reader
@@ -660,6 +889,12 @@ pub(crate) fn git_stdout_using(
         .map_err(|_| ManagedGitError::new(failure_kind, "managed Git output reader failed"))?
         .map_err(|_| ManagedGitError::new(failure_kind, "managed Git output could not be read"))?;
     let status = status?;
+    if stdout.len() as u64 > MANAGED_GIT_OUTPUT_BYTE_CAPACITY {
+        return Err(ManagedGitError::new(
+            "git_output_too_large",
+            "managed Git output exceeds its bounded read capacity",
+        ));
+    }
     if !status.success() {
         return Err(ManagedGitError::new(
             failure_kind,
@@ -949,6 +1184,89 @@ mod tests {
     }
 
     #[test]
+    fn explicit_effect_decision_commits_or_rolls_back_the_created_worktree() {
+        let committed_fixture = GitFixture::new();
+        let committed = prepare_managed_worktree(
+            &committed_fixture.request(committed_fixture.target(), "feature/commit-effect"),
+        )
+        .expect("create committed worktree effect");
+        finalize_managed_worktree(
+            &committed,
+            ManagedWorktreeDecision::Commit,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("commit worktree effect");
+        assert!(committed.path.exists());
+
+        let rolled_back_fixture = GitFixture::new();
+        let rolled_back = prepare_managed_worktree(
+            &rolled_back_fixture.request(rolled_back_fixture.target(), "feature/rollback-effect"),
+        )
+        .expect("create rollback worktree effect");
+        finalize_managed_worktree(
+            &rolled_back,
+            ManagedWorktreeDecision::Rollback,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("roll back worktree effect");
+        assert!(!rolled_back.path.exists());
+    }
+
+    #[test]
+    fn a_failure_after_creation_compensates_with_the_prearmed_descriptor() {
+        let fixture = GitFixture::new();
+        let prepared =
+            prepare_managed_worktree(&fixture.request(fixture.target(), "feature/failed-effect"))
+                .expect("create failed worktree effect fixture");
+        let failure = ManagedGitError::new(
+            "worktree_reconciliation_failed",
+            "created worktree could not be reconciled",
+        );
+
+        let returned = compensate_failed_creation(&prepared, failure.clone())
+            .expect_err("compensated creation must return its original failure");
+
+        assert_eq!(returned, failure);
+        assert!(!prepared.path.exists());
+        assert!(
+            !fixture
+                .git_status(&[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/feature/failed-effect"
+                ])
+                .success(),
+            "compensation must remove the call-created branch"
+        );
+    }
+
+    #[test]
+    fn failed_creation_compensation_returns_the_recovery_descriptor() {
+        let fixture = GitFixture::new();
+        let prepared = prepare_managed_worktree(
+            &fixture.request(fixture.target(), "feature/failed-compensation"),
+        )
+        .expect("create compensation failure fixture");
+        fs::write(prepared.path.join("user-change"), "preserve\n")
+            .expect("change compensation fixture");
+        let failure = ManagedGitError::new(
+            "worktree_reconciliation_failed",
+            "created worktree could not be reconciled",
+        );
+
+        let mut returned = compensate_failed_creation(&prepared, failure)
+            .expect_err("unsafe compensation must require recovery");
+        let recovery = returned
+            .take_recovery()
+            .expect("compensation failure must retain its descriptor");
+
+        assert_eq!(returned.kind, "reconciliation_failed");
+        assert_eq!(recovery, prepared);
+        assert!(recovery.path.exists(), "changed user content must remain");
+    }
+
+    #[test]
     fn rollback_preserves_call_created_resources_when_content_changed() {
         let fixture = GitFixture::new();
         let prepared =
@@ -1182,6 +1500,27 @@ mod tests {
         .expect("large piped output must be drained while the child runs");
         assert_eq!(output.len(), 262_144);
 
+        let oversized = root.join("oversized-git");
+        fs::write(
+            &oversized,
+            "#!/bin/sh\ndd if=/dev/zero bs=1048577 count=1 2>/dev/null\n",
+        )
+        .expect("write oversized runner");
+        let mut permissions = fs::metadata(&oversized)
+            .expect("oversized runner metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&oversized, permissions).expect("chmod oversized runner");
+        let oversized_error = git_stdout_using(
+            oversized.as_os_str(),
+            None,
+            &["--version"],
+            Instant::now() + Duration::from_secs(2),
+            "git_failed",
+        )
+        .expect_err("oversized Git output must be bounded");
+        assert_eq!(oversized_error.kind, "git_output_too_large");
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1197,7 +1536,21 @@ mod tests {
             &mut rows,
             &fixture.managed_root
         ));
-        assert_eq!(rows, vec![prepared.worktree()]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worktree_id, prepared.worktree_id);
+        assert_eq!(rows[0].path, prepared.path);
+        assert_eq!(rows[0].status, "stale");
+        assert_eq!(
+            rows[0]
+                .metadata
+                .get("recovery_required")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            rows[0].metadata.get("recovery_reason").map(String::as_str),
+            Some("unrecorded_create")
+        );
         assert!(!adopt_unrecorded_managed_worktrees(
             &[fixture.target()],
             &mut rows,
@@ -1220,6 +1573,130 @@ mod tests {
             &fixture.managed_root
         ));
         assert_eq!(rows[0].status, "missing");
+    }
+
+    #[test]
+    fn restart_discovers_an_unrecorded_worktree_after_target_deletion() {
+        let fixture = GitFixture::new();
+        let prepared =
+            prepare_managed_worktree(&fixture.request(fixture.target(), "feature/deleted-target"))
+                .expect("prepare deleted-target recovery worktree");
+        let mut rows = Vec::new();
+
+        assert!(adopt_unrecorded_managed_worktrees(
+            &[],
+            &mut rows,
+            &fixture.managed_root,
+        ));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worktree_id, prepared.worktree_id);
+        assert_eq!(rows[0].status, "stale");
+        assert_eq!(
+            rows[0].metadata.get("recovery_reason").map(String::as_str),
+            Some("target_unknown")
+        );
+    }
+
+    #[test]
+    fn restart_discovers_an_unrecorded_worktree_after_target_disable() {
+        let fixture = GitFixture::new();
+        let mut disabled = fixture.target();
+        let prepared =
+            prepare_managed_worktree(&fixture.request(disabled.clone(), "feature/disabled-target"))
+                .expect("prepare disabled-target recovery worktree");
+        disabled.enabled = false;
+        let mut rows = Vec::new();
+
+        assert!(adopt_unrecorded_managed_worktrees(
+            &[disabled],
+            &mut rows,
+            &fixture.managed_root,
+        ));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worktree_id, prepared.worktree_id);
+        assert_eq!(
+            rows[0].metadata.get("recovery_reason").map(String::as_str),
+            Some("target_disabled")
+        );
+    }
+
+    #[test]
+    fn restart_reports_the_existing_id_when_git_identity_is_unavailable() {
+        let fixture = GitFixture::new();
+        let prepared = prepare_managed_worktree(
+            &fixture.request(fixture.target(), "feature/missing-repository"),
+        )
+        .expect("prepare missing-repository recovery worktree");
+        fs::remove_dir_all(&fixture.repository).expect("remove backing repository");
+        let mut rows = Vec::new();
+
+        assert!(adopt_unrecorded_managed_worktrees(
+            &[],
+            &mut rows,
+            &fixture.managed_root,
+        ));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worktree_id, prepared.worktree_id);
+        assert!(rows[0].git.is_none());
+        assert_eq!(
+            rows[0].metadata.get("recovery_reason").map(String::as_str),
+            Some("git_identity_unavailable")
+        );
+    }
+
+    #[test]
+    fn restart_keeps_an_already_recorded_managed_worktree_authoritative() {
+        let fixture = GitFixture::new();
+        let prepared = prepare_managed_worktree(
+            &fixture.request(fixture.target(), "feature/already-recorded"),
+        )
+        .expect("prepare recorded worktree");
+        let committed = prepared.worktree();
+        let mut rows = vec![committed.clone()];
+
+        assert!(!adopt_unrecorded_managed_worktrees(
+            &[fixture.target()],
+            &mut rows,
+            &fixture.managed_root,
+        ));
+
+        assert_eq!(rows, vec![committed]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_rejects_malformed_and_escaping_managed_entries() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = GitFixture::new();
+        let target_directory = fixture.managed_root.join("tgt_malformed");
+        fs::create_dir_all(target_directory.join("not-hex"))
+            .expect("create malformed managed entry");
+        let outside = fixture.root.join("outside");
+        fs::create_dir_all(outside.join("66656174757265")).expect("create outside managed entry");
+        symlink(&outside, fixture.managed_root.join("tgt_escape"))
+            .expect("create escaping target symlink");
+        symlink(
+            outside.join("66656174757265"),
+            target_directory.join("66656174757265"),
+        )
+        .expect("create escaping worktree symlink");
+        let mut rows = Vec::new();
+
+        assert!(!adopt_unrecorded_managed_worktrees(
+            &[],
+            &mut rows,
+            &fixture.managed_root,
+        ));
+
+        assert!(rows.is_empty());
+        assert!(
+            outside.exists(),
+            "recovery discovery must not delete unknown entries"
+        );
     }
 
     struct GitFixture {
