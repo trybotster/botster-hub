@@ -314,6 +314,8 @@ impl SessionTypeCatalogCache {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
             HostResult::EntrypointsStopped
+            | HostResult::PluginResponseAbandoned
+            | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)
             | HostResult::ManagedWorktreeCreated(_)
             | HostResult::ManagedWorktreeFailed(_)
@@ -373,6 +375,8 @@ impl SessionTypeCatalogCache {
                 self.failure = Some((generation, error));
             }
             HostResult::EntrypointsStopped
+            | HostResult::PluginResponseAbandoned
+            | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)
             | HostResult::ManagedWorktreeCreated(_)
             | HostResult::ManagedWorktreeFailed(_)
@@ -1158,13 +1162,29 @@ fn publish_catalog_capacity_wake(state: &mut DaemonControlState, owner_turn: &mu
     {
         return;
     }
-    state.host_capacity_wake_pending = false;
     if state.session_type_catalog.waiting_for_capacity() {
         state
             .maintenance
             .wakes
             .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
     }
+    while state.plugin_controls.has_capacity_waiters() {
+        if owner_turn
+            .try_charge(Instant::now(), OwnerTurnCharge::opaque_move())
+            .is_err()
+        {
+            return;
+        }
+        if let Some(waiter_id) = state.plugin_controls.pop_capacity_waiter() {
+            crate::daemon::control::pending::mark_owner_ready(
+                state,
+                waiter_id,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            );
+        }
+    }
+    state.host_capacity_wake_pending = false;
 }
 
 fn drive_session_type_catalog_failure(

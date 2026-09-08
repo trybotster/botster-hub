@@ -18,35 +18,43 @@ pub(crate) type ControlSender = tokio_mpsc::Sender<ControlMessage>;
 pub(crate) type ControlReplyReceiver = oneshot::Receiver<ControlReply>;
 
 #[derive(Debug)]
-pub(crate) struct ControlReplySender(oneshot::Sender<ControlReply>);
+pub(crate) struct ControlReplySender(Option<oneshot::Sender<ControlReply>>);
 
 impl ControlReplySender {
     pub(crate) fn send(
         self,
         response: DaemonTransportResult<DaemonResponse>,
     ) -> Result<(), ControlReply> {
-        self.0.send(ControlReply::plain(response))
+        self.send_reply(ControlReply::plain(response))
     }
 
     pub(crate) fn send_retained(
         self,
         response: RetainedPluginResult<DaemonTransportResult<DaemonResponse>>,
     ) -> Result<(), ControlReply> {
-        self.0.send(ControlReply::retained(response))
+        self.send_reply(ControlReply::retained(response))
     }
 
     pub(crate) fn send_reply(self, response: ControlReply) -> Result<(), ControlReply> {
-        self.0.send(response)
+        match self.0 {
+            Some(sender) => sender.send(response),
+            None => Err(response),
+        }
+    }
+
+    /// Transfer delivery while the owner keeps the request row for cleanup.
+    pub(crate) fn take(&mut self) -> Self {
+        Self(self.0.take())
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.0.is_closed()
+        self.0.as_ref().is_none_or(oneshot::Sender::is_closed)
     }
 }
 
 pub(crate) fn control_reply_channel() -> (ControlReplySender, ControlReplyReceiver) {
     let (sender, receiver) = oneshot::channel();
-    (ControlReplySender(sender), receiver)
+    (ControlReplySender(Some(sender)), receiver)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

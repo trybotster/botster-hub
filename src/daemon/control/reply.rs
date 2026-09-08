@@ -179,11 +179,18 @@ pub(crate) struct RetainedPluginResult<T> {
     charge: RetainedPluginResultCharge,
 }
 
-/// One control response with an optional charge for its raw plugin result.
+/// One control response whose charge remains until its owned values drop.
 #[derive(Debug)]
-pub(crate) struct ControlReply {
-    response: DaemonTransportResult<DaemonResponse>,
-    charge: Option<RetainedControlCharge>,
+pub(crate) enum ControlReply {
+    Typed {
+        response: DaemonTransportResult<DaemonResponse>,
+        charge: Option<RetainedControlCharge>,
+    },
+    EncodedPlugin {
+        kind: botster_hub_client::DaemonResponseKind,
+        encoded_frame: Vec<u8>,
+        charge: crate::host_executor::HostPreparedCharge,
+    },
 }
 
 #[derive(Debug)]
@@ -194,7 +201,7 @@ pub(crate) enum RetainedControlCharge {
 
 impl ControlReply {
     pub(crate) fn plain(response: DaemonTransportResult<DaemonResponse>) -> Self {
-        Self {
+        Self::Typed {
             response,
             charge: None,
         }
@@ -204,7 +211,7 @@ impl ControlReply {
         response: RetainedPluginResult<DaemonTransportResult<DaemonResponse>>,
     ) -> Self {
         let (response, charge) = response.into_parts();
-        Self {
+        Self::Typed {
             response,
             charge: Some(RetainedControlCharge::Plugin(charge)),
         }
@@ -214,40 +221,69 @@ impl ControlReply {
         response: DaemonTransportResult<DaemonResponse>,
         charge: crate::host_executor::HostPreparedCharge,
     ) -> Self {
-        Self {
+        Self::Typed {
             response,
             charge: Some(RetainedControlCharge::Host(charge)),
         }
     }
 
+    /// Keep only the complete frame that a host worker validated and encoded.
+    pub(crate) fn prepared(
+        kind: botster_hub_client::DaemonResponseKind,
+        encoded_frame: Vec<u8>,
+        charge: crate::host_executor::HostPreparedCharge,
+    ) -> Self {
+        Self::EncodedPlugin {
+            kind,
+            encoded_frame,
+            charge,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> Option<botster_hub_client::DaemonResponseKind> {
+        match self {
+            Self::Typed { response, .. } => response.as_ref().ok().map(|response| response.kind),
+            Self::EncodedPlugin { kind, .. } => Some(*kind),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn into_parts(
         self,
     ) -> (
         DaemonTransportResult<DaemonResponse>,
         Option<RetainedControlCharge>,
+        Option<Vec<u8>>,
     ) {
-        (self.response, self.charge)
-    }
-
-    pub(crate) fn from_parts(
-        response: DaemonTransportResult<DaemonResponse>,
-        charge: Option<RetainedControlCharge>,
-    ) -> Self {
-        Self { response, charge }
-    }
-
-    pub(crate) fn response(&self) -> &DaemonTransportResult<DaemonResponse> {
-        &self.response
+        match self {
+            Self::Typed { response, charge } => (response, charge, None),
+            Self::EncodedPlugin {
+                encoded_frame,
+                charge,
+                ..
+            } => {
+                let frame: botster_hub_client::ServerFrame = serde_json::from_slice(&encoded_frame)
+                    .expect("test reply contains a complete frame");
+                let botster_hub_client::ServerFrame::Response { response, .. } = frame else {
+                    panic!("test reply must contain a response");
+                };
+                (
+                    Ok(response),
+                    Some(RetainedControlCharge::Host(charge)),
+                    Some(encoded_frame),
+                )
+            }
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn expect(self, message: &str) -> DaemonResponse {
-        self.response.expect(message)
+        self.into_parts().0.expect(message)
     }
 
     #[cfg(test)]
     pub(crate) fn ok(self) -> Option<DaemonResponse> {
-        self.response.ok()
+        self.into_parts().0.ok()
     }
 }
 

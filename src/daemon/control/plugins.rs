@@ -1,19 +1,22 @@
 //! Plugin MCP and surface request family.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use botster_core::{
     PluginAdmissionResult, PluginHandlerRef, PluginInvocationClass, PluginInvocationResult,
     RequestId,
 };
 use botster_hub_client::{DaemonRequest, DaemonResponse, MAX_OUTSTANDING_REQUESTS};
-use botster_ui_contract::{PackageSurfaceOperation, UiActionRequest};
+use botster_ui_contract::PackageSurfaceOperation;
 
 use crate::HubDaemon;
-use crate::client_api::{HubClientApi, HubClientOperation, HubClientPluginSurface};
+use crate::client_api::{HubClientApi, HubClientOperation};
 use crate::client_api_dto::response::{
-    daemon_plugin_action_result, daemon_plugin_lifecycle, daemon_plugin_surface,
-    daemon_plugin_tool_result, daemon_plugin_tools,
+    daemon_plugin_lifecycle, daemon_plugin_tools, daemon_response_base,
 };
 use crate::daemon::control::pending::{ControlPoll, ControlStep};
 use crate::daemon::control::reply::RetainedPluginResult;
@@ -21,7 +24,9 @@ use crate::daemon::control::{DaemonObservability, request_id};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, daemon_plugin_tool_error};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::ReadyClass;
-use crate::owner_identity::WaiterId;
+use crate::host_executor::{HostCommand, HostResult, HostSubmissionFailure, HostWorkPermit};
+use crate::owner_identity::{OwnerWorkIdentity, WaiterId};
+use crate::plugin_response::{PluginResponseInput, PluginResponseKind as PendingPluginControlKind};
 use crate::{HubClientRequest, HubClientResponseBody, McpToolError};
 
 const OWNER_PLUGIN_REQUEST_PREFIX: &str = "daemon-owner-plugin-";
@@ -35,28 +40,18 @@ struct PluginInvocationIdentity {
     handler: PluginHandlerRef,
 }
 
-enum PendingPluginControlKind {
-    McpTool,
-    SurfaceRender {
-        package_name: String,
-        surface_id: String,
-    },
-    SurfaceAction {
-        package_name: String,
-        request: UiActionRequest,
-    },
-}
-
 struct PendingPluginControl {
     waiter_id: WaiterId,
     identity: PluginInvocationIdentity,
-    kind: PendingPluginControlKind,
+    kind: Option<PendingPluginControlKind>,
     result: Option<RoutedPluginControlCompletion>,
+    reply_live: Arc<AtomicBool>,
+    submission_failure: Option<HostSubmissionFailure>,
 }
 
 enum RoutedPluginControlCompletion {
     Invocation(RetainedPluginResult<PluginInvocationResult>),
-    Inconsistent(RetainedPluginResult<String>),
+    Inconsistent(RetainedPluginResult<PluginInvocationResult>),
 }
 
 /// Bounded owner-side correlation for asynchronous plugin control work.
@@ -66,6 +61,8 @@ pub(crate) struct PluginControlState {
     pending: BTreeMap<String, PendingPluginControl>,
     completion_inconsistencies: u64,
     ready_waiters: BTreeSet<WaiterId>,
+    by_waiter: BTreeMap<WaiterId, String>,
+    capacity_waiters: BTreeSet<WaiterId>,
 }
 
 impl std::fmt::Debug for PluginControlState {
@@ -109,6 +106,8 @@ impl PluginControlState {
 
     fn next_request_id(&mut self) -> Option<RequestId> {
         self.next_serial = self.next_serial.checked_add(1)?;
+        // The decimal suffix also supplies internal transport correlation.
+        // It must stay within MAX_REQUEST_ID_BYTES for bounded fallback frames.
         Some(RequestId(format!(
             "{OWNER_PLUGIN_REQUEST_PREFIX}{}",
             self.next_serial
@@ -122,13 +121,16 @@ impl PluginControlState {
         identity: PluginInvocationIdentity,
         kind: PendingPluginControlKind,
     ) {
+        self.by_waiter.insert(waiter_id, request_id.0.clone());
         self.pending.insert(
             request_id.0.clone(),
             PendingPluginControl {
                 waiter_id,
                 identity,
-                kind,
+                kind: Some(kind),
                 result: None,
+                reply_live: Arc::new(AtomicBool::new(true)),
+                submission_failure: None,
             },
         );
     }
@@ -152,14 +154,9 @@ impl PluginControlState {
         {
             self.completion_inconsistencies = self.completion_inconsistencies.saturating_add(1);
             if entry.result.is_none() {
-                entry.result = Some(RoutedPluginControlCompletion::Inconsistent(completion.map(
-                    |_| {
-                        format!(
-                            "plugin completion identity did not match admitted request {}",
-                            request_id.0
-                        )
-                    },
-                )));
+                entry.result = Some(RoutedPluginControlCompletion::Inconsistent(
+                    completion.map(|completion| completion.result),
+                ));
                 self.ready_waiters.insert(entry.waiter_id);
             }
             return None;
@@ -173,6 +170,7 @@ impl PluginControlState {
         None
     }
 
+    #[cfg(test)]
     fn take_ready(
         &mut self,
         request_id: &RequestId,
@@ -187,7 +185,8 @@ impl PluginControlState {
         }
         let mut entry = self.pending.remove(&request_id.0)?;
         self.ready_waiters.remove(&entry.waiter_id);
-        Some((entry.kind, entry.result.take()?))
+        self.by_waiter.remove(&entry.waiter_id);
+        Some((entry.kind.take()?, entry.result.take()?))
     }
 
     fn retire(&mut self, request_id: &RequestId, identity: &PluginInvocationIdentity) {
@@ -198,8 +197,30 @@ impl PluginControlState {
         {
             if let Some(entry) = self.pending.remove(&request_id.0) {
                 self.ready_waiters.remove(&entry.waiter_id);
+                self.by_waiter.remove(&entry.waiter_id);
+                self.capacity_waiters.remove(&entry.waiter_id);
             }
         }
+    }
+
+    pub(crate) fn cancel_reply(&self, waiter_id: WaiterId) -> bool {
+        let Some(entry) = self
+            .by_waiter
+            .get(&waiter_id)
+            .and_then(|key| self.pending.get(key))
+        else {
+            return false;
+        };
+        entry.reply_live.store(false, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn pop_capacity_waiter(&mut self) -> Option<WaiterId> {
+        self.capacity_waiters.pop_first()
+    }
+
+    pub(crate) fn has_capacity_waiters(&self) -> bool {
+        !self.capacity_waiters.is_empty()
     }
 
     pub(crate) fn take_ready_waiters(&mut self, limit: usize) -> Vec<WaiterId> {
@@ -455,7 +476,14 @@ fn start_plugin_control(
         transport_request_id: observability
             .transport_request_id
             .clone()
-            .unwrap_or_else(|| request.request_id.0.clone()),
+            .unwrap_or_else(|| {
+                request
+                    .request_id
+                    .0
+                    .strip_prefix(OWNER_PLUGIN_REQUEST_PREFIX)
+                    .expect("owner plugin request has a serial")
+                    .to_string()
+            }),
         plugin_key: request.handler.plugin_key.0.clone(),
         handler: request.handler.clone(),
     };
@@ -495,102 +523,128 @@ fn pending_plugin_control(
     request_id: RequestId,
     identity: PluginInvocationIdentity,
 ) -> ControlStep {
-    let retire_request_id = request_id.clone();
-    let retire_identity = identity.clone();
-    ControlStep::pending_retirable_in(
-        ReadyClass::PluginCompletion,
-        move |daemon, state| {
-            let Some((kind, result)) = state.plugin_controls.take_ready(&request_id, &identity)
-            else {
-                return ControlPoll::Pending;
-            };
-            ControlPoll::ReadyRetained(complete_plugin_control(daemon, kind, result))
-        },
-        move |_, state, _waiter_id, permit| {
-            state
-                .plugin_controls
-                .retire(&retire_request_id, &retire_identity);
-            // Core retains executor and completion capacity until execution
-            // terminates. Hub releases only the retired reply reservation.
-            state.budget.release(permit);
-        },
-    )
-}
-
-fn complete_plugin_control(
-    daemon: &HubDaemon,
-    kind: PendingPluginControlKind,
-    completion: RoutedPluginControlCompletion,
-) -> RetainedPluginResult<DaemonTransportResult<DaemonResponse>> {
-    match completion {
-        RoutedPluginControlCompletion::Inconsistent(message) => {
-            message.map(|message| plugin_control_inconsistent(&kind, message))
-        }
-        RoutedPluginControlCompletion::Invocation(result) => result.map(|result| {
-            let Some(runtime) = daemon.runtime() else {
-                return Err(DaemonTransportError::DaemonNotRunning);
-            };
-            match kind {
-                PendingPluginControlKind::McpTool => {
-                    Ok(match crate::HubRuntime::complete_plugin_mcp_tool(result) {
-                        Ok(value) => daemon_plugin_tool_result(value),
-                        Err(error) => daemon_plugin_tool_error(error),
-                    })
+    ControlStep::pending_in(ReadyClass::PluginCompletion, move |daemon, state| {
+        let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+        if let Some(completion) = state.host_completions.remove(&waiter_id) {
+            let (_, result, permit) = completion.into_parts();
+            state.plugin_controls.retire(&request_id, &identity);
+            drop(permit);
+            return match result {
+                HostResult::PluginResponseAbandoned => {
+                    ControlPoll::Ready(Err(DaemonTransportError::ControlThreadStopped))
                 }
-                PendingPluginControlKind::SurfaceRender {
-                    package_name,
-                    surface_id,
-                } => runtime
-                    .complete_plugin_surface_render(&package_name, result)
-                    .map(|body| {
-                        daemon_plugin_surface(HubClientPluginSurface {
-                            package_name,
-                            surface_id,
-                            body,
-                        })
-                    })
-                    .map_err(|error| {
-                        surface_plugin_error(
-                            HubClientOperation::PluginSurfaceRender,
-                            "daemon-plugin-surface-render",
-                            error,
-                        )
-                    }),
-                PendingPluginControlKind::SurfaceAction {
-                    package_name,
-                    request,
-                } => runtime
-                    .complete_plugin_surface_action(&package_name, &request, result)
-                    .map(daemon_plugin_action_result)
-                    .map_err(|error| {
-                        surface_plugin_error(
-                            HubClientOperation::PluginSurfaceAction,
-                            "daemon-plugin-surface-action",
-                            error,
-                        )
-                    }),
-            }
-        }),
-    }
+                HostResult::PluginResponseDelivered { kind } => {
+                    ControlPoll::Ready(Ok(daemon_response_base(kind)))
+                }
+                HostResult::Failed { error, .. } => ControlPoll::Ready(Ok(
+                    daemon_plugin_tool_error(McpToolError::new(error.code, error.message)),
+                )),
+                _ => ControlPoll::Ready(Ok(daemon_plugin_tool_error(McpToolError::new(
+                    "host_completion_kind_mismatch",
+                    "the host returned an invalid plugin response outcome",
+                )))),
+            };
+        }
+        let Some(entry) = state.plugin_controls.pending.get_mut(&request_id.0) else {
+            return ControlPoll::Pending;
+        };
+        if let Some(failure) = entry.submission_failure.take() {
+            return ControlPoll::SubmitPluginHost(failure);
+        }
+        if entry.identity != identity || entry.result.is_none() || entry.kind.is_none() {
+            return ControlPoll::Pending;
+        }
+        let Some(runtime) = daemon.runtime() else {
+            return ControlPoll::Pending;
+        };
+        let Some(permit) = runtime.host_executor().try_reserve() else {
+            state.plugin_controls.capacity_waiters.insert(waiter_id);
+            return ControlPoll::Pending;
+        };
+        let (result, inconsistent) = match entry.result.take().expect("ready result exists") {
+            RoutedPluginControlCompletion::Invocation(result) => (result.map(Ok), false),
+            RoutedPluginControlCompletion::Inconsistent(result) => (result.map(Ok), true),
+        };
+        let input = PluginResponseInput {
+            kind: entry.kind.take().expect("ready kind exists"),
+            lifecycle: runtime.plugin_lifecycle_handle(),
+            result,
+            inconsistent,
+            transport_request_id: identity.transport_request_id.clone(),
+        };
+        ControlPoll::PreparePluginResponse(input, permit)
+    })
 }
 
-fn plugin_control_inconsistent(
-    kind: &PendingPluginControlKind,
-    message: String,
-) -> DaemonTransportResult<DaemonResponse> {
-    let error = McpToolError::new("plugin_completion_inconsistent", message);
-    match kind {
-        PendingPluginControlKind::McpTool => Ok(daemon_plugin_tool_error(error)),
-        PendingPluginControlKind::SurfaceRender { .. } => Err(surface_plugin_error(
-            HubClientOperation::PluginSurfaceRender,
-            "daemon-plugin-surface-render",
-            error,
-        )),
-        PendingPluginControlKind::SurfaceAction { .. } => Err(surface_plugin_error(
-            HubClientOperation::PluginSurfaceAction,
-            "daemon-plugin-surface-action",
-            error,
-        )),
+pub(crate) fn submit_response(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    entry: &mut crate::daemon::control::pending::PendingControlRequest,
+    input: PluginResponseInput,
+    permit: HostWorkPermit,
+) {
+    let waiter_id = entry.waiter_id;
+    let key = state
+        .plugin_controls
+        .by_waiter
+        .get(&waiter_id)
+        .expect("plugin waiter exists");
+    let reply_live = Arc::clone(
+        &state
+            .plugin_controls
+            .pending
+            .get(key)
+            .expect("plugin row exists")
+            .reply_live,
+    );
+    let reply_tx = entry.reply_tx.take();
+    let command = HostCommand::PreparePluginResponse {
+        input,
+        reply_tx,
+        reply_live,
+    };
+    submit_host_job(
+        daemon,
+        state,
+        OwnerWorkIdentity {
+            waiter_id,
+            phase: 1,
+        },
+        command,
+        permit,
+    );
+}
+
+pub(crate) fn submit_host_job(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    identity: OwnerWorkIdentity,
+    command: HostCommand,
+    permit: HostWorkPermit,
+) {
+    let waiter_id = identity.waiter_id;
+    let result = match daemon.runtime() {
+        Some(runtime) => runtime.host_executor().submit(identity, command, permit),
+        None => Err(HostSubmissionFailure {
+            error: crate::host_executor::HostSubmitError::Stopped,
+            identity,
+            command,
+            permit,
+        }),
+    };
+    if let Err(failure) = result {
+        let key = state
+            .plugin_controls
+            .by_waiter
+            .get(&waiter_id)
+            .expect("plugin waiter exists");
+        state
+            .plugin_controls
+            .pending
+            .get_mut(key)
+            .expect("plugin row exists")
+            .submission_failure = Some(failure);
+        state.plugin_controls.capacity_waiters.insert(waiter_id);
     }
 }
 

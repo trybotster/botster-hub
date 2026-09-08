@@ -40,7 +40,8 @@ use crate::subscription::attach_routes::{
 use crate::subscription::entity::EntityFrameSender;
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::delivery::{
-    LocalWebrtcSendFailure, framed_daemon_response, framed_server_frame,
+    LocalWebrtcSendFailure, framed_daemon_response, framed_encoded_daemon_response,
+    framed_server_frame,
 };
 use crate::transport::webrtc::peer::{
     LOCAL_WEBRTC_PEER_CLOSE_BOUND, LocalWebrtcPeerState, LocalWebrtcTerminalCause, webrtc_runtime,
@@ -486,58 +487,70 @@ where
             terminal_cause = LocalWebrtcTerminalCause::RuntimeQueueClosed;
             break;
         }
-        let (response, plugin_result_charge) =
-            match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
-                Ok(Ok(reply)) => {
-                    let (response, charge) = reply.into_parts();
-                    let response = response.unwrap_or_else(|error| {
-                        response_with_diagnostic(DaemonDiagnostic::action_failure(
-                            "local_webrtc_data_channel",
-                            error.to_string(),
-                        ))
-                    });
-                    (response, charge)
+        use crate::daemon::control::reply::ControlReply;
+        let reply = match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(_)) => ControlReply::plain(Ok(response_with_diagnostic(
+                DaemonDiagnostic::action_failure(
+                    "local_webrtc_data_channel",
+                    "runtime reply channel closed",
+                ),
+            ))),
+            Err(_) => ControlReply::plain(Ok(response_with_diagnostic(
+                DaemonDiagnostic::action_failure(
+                    "local_webrtc_data_channel",
+                    "runtime request timed out",
+                ),
+            ))),
+        };
+        let (framed, response_kind) = match reply {
+            ControlReply::EncodedPlugin {
+                kind,
+                encoded_frame,
+                charge,
+            } => {
+                let framed =
+                    framed_encoded_daemon_response(stream_key, &request_id, &encoded_frame);
+                drop(encoded_frame);
+                drop(charge);
+                (framed, kind)
+            }
+            ControlReply::Typed { response, charge } => {
+                let response = response.unwrap_or_else(|error| {
+                    response_with_diagnostic(DaemonDiagnostic::action_failure(
+                        "local_webrtc_data_channel",
+                        error.to_string(),
+                    ))
+                });
+                // Failed attaches create no subscription ownership.
+                peer_state.apply_subscription_change(
+                    completion_projection
+                        .attached_subscription_change(&response)
+                        .map(Into::into),
+                );
+                match completion_projection.entity_subscription_change(&response) {
+                    Some(EntitySubscriptionChange::Subscribe(subscription_id)) => {
+                        peer_state.add_entity_subscription(subscription_id)
+                    }
+                    Some(EntitySubscriptionChange::Unsubscribe(subscription_id)) => {
+                        peer_state.remove_entity_subscription(&subscription_id)
+                    }
+                    None => {}
                 }
-                Ok(Err(_)) => (
-                    response_with_diagnostic(DaemonDiagnostic::action_failure(
-                        "local_webrtc_data_channel",
-                        "runtime reply channel closed",
-                    )),
-                    None,
-                ),
-                Err(_) => (
-                    response_with_diagnostic(DaemonDiagnostic::action_failure(
-                        "local_webrtc_data_channel",
-                        "runtime request timed out",
-                    )),
-                    None,
-                ),
-            };
-        // OperatorError and Attach attach_failed create no ownership. PeerClosed
-        // must not send Detach for a failed attach.
-        peer_state.apply_subscription_change(
-            completion_projection
-                .attached_subscription_change(&response)
-                .map(Into::into),
-        );
-        match completion_projection.entity_subscription_change(&response) {
-            Some(EntitySubscriptionChange::Subscribe(subscription_id)) => {
-                peer_state.add_entity_subscription(subscription_id);
+                let framed = framed_daemon_response(stream_key, &request_id, &response);
+                let kind = response.kind;
+                drop(response);
+                drop(charge);
+                (framed, kind)
             }
-            Some(EntitySubscriptionChange::Unsubscribe(subscription_id)) => {
-                peer_state.remove_entity_subscription(&subscription_id);
-            }
-            None => {}
-        }
-        let Ok(frames) = framed_daemon_response(stream_key, &request_id, &response) else {
+        };
+        let Ok(frames) = framed else {
             if let Some(response_delivery_tx) = response_delivery_tx {
                 let _ = response_delivery_tx.send(());
             }
             terminal_cause = LocalWebrtcTerminalCause::ResponseFraming;
             break;
         };
-        // The framed delivery now owns its independent transport storage.
-        drop(plugin_result_charge);
         let delivery = send_response_frames(
             data_channel,
             stream_key,
@@ -551,7 +564,7 @@ where
             let _ = response_delivery_tx.send(());
         }
         match delivery {
-            Ok(()) if daemon_shutdown && response.kind == DaemonResponseKind::Shutdown => {
+            Ok(()) if daemon_shutdown && response_kind == DaemonResponseKind::Shutdown => {
                 terminal_cause = LocalWebrtcTerminalCause::DaemonShutdown;
                 open = false;
             }

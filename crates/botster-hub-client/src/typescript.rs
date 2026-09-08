@@ -763,8 +763,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("package_name", "string"),
             ("surface_id", "string"),
-            ("body", "UiNode"),
-            ("ui_tree_snapshot?", "DaemonUiTreeSnapshot | null"),
+            ("ui_tree_snapshot", "DaemonUiTreeSnapshot"),
         ],
     );
     emit_interface(

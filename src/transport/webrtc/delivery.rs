@@ -202,7 +202,11 @@ pub(crate) fn encrypt_server_frame(
 ) -> LocalWebrtcResult<String> {
     let plaintext =
         serde_json::to_vec(frame).map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
-    let envelope = encrypt_aes_gcm(key, &plaintext, 1)
+    encrypt_encoded_server_frame(key, &plaintext)
+}
+
+fn encrypt_encoded_server_frame(key: &AesGcmKey, plaintext: &[u8]) -> LocalWebrtcResult<String> {
+    let envelope = encrypt_aes_gcm(key, plaintext, 1)
         .map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))?;
     serde_json::to_string(&envelope).map_err(|error| LocalWebrtcError::Webrtc(error.to_string()))
 }
@@ -219,6 +223,23 @@ pub(crate) fn framed_daemon_response(
         response: response.clone(),
     };
     let encrypted = encrypt_server_frame(key, &frame)?;
+    frame_correlated_response(key, request_id, encrypted)
+}
+
+pub(crate) fn framed_encoded_daemon_response(
+    key: &AesGcmKey,
+    request_id: &str,
+    encoded_frame: &[u8],
+) -> LocalWebrtcResult<Vec<String>> {
+    let encrypted = encrypt_encoded_server_frame(key, encoded_frame)?;
+    frame_correlated_response(key, request_id, encrypted)
+}
+
+fn frame_correlated_response(
+    key: &AesGcmKey,
+    request_id: &str,
+    encrypted: String,
+) -> LocalWebrtcResult<Vec<String>> {
     let encrypted = if encrypted.len() > LOCAL_WEBRTC_MAX_DELIVERY_BYTES {
         encrypt_server_frame(
             key,
@@ -342,6 +363,20 @@ mod tests {
             stream_epoch,
             encode_output(body).expect("output frame"),
         )
+    }
+
+    #[test]
+    fn encoded_response_encrypts_the_supplied_json_without_serializing_again() {
+        let key = AesGcmKey::from_slice(&[31; 32]).unwrap();
+        let encoded =
+            br#"{ "frame": "response", "request_id": "42", "response": { "kind": "status" } }"#;
+        let frames =
+            framed_encoded_daemon_response(&key, "42", encoded).expect("frame encoded response");
+        assert_eq!(frames.len(), 1);
+        let chunk: DaemonLocalWebrtcDeliveryChunk = serde_json::from_str(&frames[0]).unwrap();
+        let envelope: AesGcmEnvelope = serde_json::from_str(&chunk.payload).unwrap();
+        let plaintext = decrypt_aes_gcm(&key, &envelope).unwrap();
+        assert_eq!(plaintext, encoded);
     }
 
     #[test]
