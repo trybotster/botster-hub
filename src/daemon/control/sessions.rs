@@ -211,7 +211,10 @@ pub(crate) fn handle_runtime(
     match request {
         DaemonRequest::RemoveSession { session_id } => {
             let runtime = daemon.runtime().expect("runtime checked above");
-            let mut tracker = runtime.begin_remove_session(&SessionId(session_id.clone()));
+            let mut tracker = runtime.begin_remove_session_for_owner(
+                state.current_waiter_id.expect("owner waiter is assigned"),
+                &SessionId(session_id.clone()),
+            );
             let id = request_id("daemon-session-remove");
             ControlStep::pending(move |daemon, state| {
                 let completion = match poll_tracker(&mut tracker, daemon, "remove_session", &id.0) {
@@ -246,12 +249,15 @@ pub(crate) fn handle_runtime(
         DaemonRequest::Status => {
             let runtime = daemon.runtime().expect("runtime checked above");
             let policy = runtime.retention_policy();
-            let mut ticket = runtime.submit_core(|daemon| {
-                (
-                    daemon.retention_accounting(),
-                    daemon.list_terminal_subscriptions(),
-                )
-            });
+            let mut ticket = runtime.submit_core_for_owner(
+                state.current_waiter_id.expect("owner waiter is assigned"),
+                |daemon| {
+                    (
+                        daemon.retention_accounting(),
+                        daemon.list_terminal_subscriptions(),
+                    )
+                },
+            );
             let egress = observability.egress.clone();
             let lifecycle = observability.lifecycle.clone();
             ControlStep::pending(move |daemon, state| {
@@ -301,7 +307,11 @@ pub(crate) fn handle_runtime(
             let runtime = daemon.runtime().expect("runtime checked above");
             let id = request_id("daemon-sessions-spawn");
             let spawn = spawn_request(runtime, id.clone(), SessionId(session_id), command);
-            let mut tracker = runtime.begin_spawn(spawn, client_session_metadata());
+            let mut tracker = runtime.begin_spawn_for_owner(
+                state.current_waiter_id.expect("owner waiter is assigned"),
+                spawn,
+                client_session_metadata(),
+            );
             ControlStep::pending(move |daemon, state| {
                 let completion = match poll_tracker(&mut tracker, daemon, "spawn", &id.0) {
                     Ok(completion) => completion,
@@ -394,7 +404,8 @@ pub(crate) fn handle_runtime(
             let identity = state
                 .pending_runtime
                 .stream_identity(&session_id, &subscription_id);
-            let mut ticket = runtime.detach_route_exact_or_owned(
+            let mut ticket = runtime.detach_route_exact_or_owned_for_owner(
+                state.current_waiter_id.expect("owner waiter is assigned"),
                 ClientId(client_id),
                 SessionId(session_id.clone()),
                 SubscriptionId(subscription_id.clone()),
@@ -486,11 +497,13 @@ pub(crate) fn handle_runtime(
             let runtime = daemon.runtime().expect("runtime checked above");
             let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
             let id = request_id("daemon-sessions-read-screen");
-            let tracker = std::sync::Arc::new(std::sync::Mutex::new(runtime.begin_read_screen(
-                id.clone(),
-                SessionId(session_id.clone()),
-                now,
-            )));
+            let tracker =
+                std::sync::Arc::new(std::sync::Mutex::new(runtime.begin_read_screen_for_owner(
+                    state.current_waiter_id.expect("owner waiter is assigned"),
+                    id.clone(),
+                    SessionId(session_id.clone()),
+                    now,
+                )));
             let retire_tracker = std::sync::Arc::clone(&tracker);
             ControlStep::pending_retirable(
                 move |daemon, _| {
@@ -524,7 +537,12 @@ pub(crate) fn handle_runtime(
             let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
             let id = request_id("daemon-sessions-read-mode-flags");
             let tracker = std::sync::Arc::new(std::sync::Mutex::new(
-                runtime.begin_read_mode_flags(id.clone(), SessionId(session_id.clone()), now),
+                runtime.begin_read_mode_flags_for_owner(
+                    state.current_waiter_id.expect("owner waiter is assigned"),
+                    id.clone(),
+                    SessionId(session_id.clone()),
+                    now,
+                ),
             ));
             let retire_tracker = std::sync::Arc::clone(&tracker);
             ControlStep::pending_retirable(
@@ -572,13 +590,15 @@ pub(crate) fn handle_runtime(
             // The tracker is shared with the retire hook: a retired capture
             // request cancels the pending operation or releases the capture
             // it produced, holding its permit until Core accepted that.
-            let tracker =
-                std::sync::Arc::new(std::sync::Mutex::new(runtime.begin_capture_snapshot(
+            let tracker = std::sync::Arc::new(std::sync::Mutex::new(
+                runtime.begin_capture_snapshot_for_owner(
+                    state.current_waiter_id.expect("owner waiter is assigned"),
                     id.clone(),
                     SessionId(session_id.clone()),
                     now,
                     owner,
-                )));
+                ),
+            ));
             let retire_tracker = std::sync::Arc::clone(&tracker);
             ControlStep::pending_retirable(
                 move |daemon, _| {
@@ -620,7 +640,11 @@ pub(crate) fn handle_runtime(
         } => {
             let runtime = daemon.runtime().expect("runtime checked above");
             let id = request_id("daemon-sessions-read-snapshot-page");
-            let mut ticket = runtime.read_snapshot_page(CaptureId(capture_id.clone()), page);
+            let mut ticket = runtime.read_snapshot_page_for_owner(
+                state.current_waiter_id.expect("owner waiter is assigned"),
+                CaptureId(capture_id.clone()),
+                page,
+            );
             ControlStep::pending(move |_, _| {
                 let result = match ticket.poll() {
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
@@ -910,7 +934,8 @@ fn handle_attach(
             subscription_id.clone(),
         );
         let runtime = daemon.runtime().expect("runtime checked by caller");
-        let mut ticket = runtime.attach_route(
+        let mut ticket = runtime.attach_route_for_owner(
+            state.current_waiter_id.expect("owner waiter is assigned"),
             ClientId(client_id.clone()),
             SessionId(session_id.clone()),
             SubscriptionId(subscription_id.clone()),
@@ -1092,14 +1117,17 @@ fn handle_attach(
     );
     let (adapter, handle) = mux.create_adapter();
     let runtime = daemon.runtime().expect("runtime checked by caller");
-    let mut ticket = runtime.attach_and_bind_terminal(AttachBindPlan {
-        client_id: ClientId(client_id.clone()),
-        session_id: SessionId(session_id.clone()),
-        subscription_id: SubscriptionId(subscription_id.clone()),
-        capabilities,
-        now_seconds: now,
-        adapter: Box::new(adapter),
-    });
+    let mut ticket = runtime.attach_and_bind_terminal_for_owner(
+        state.current_waiter_id.expect("owner waiter is assigned"),
+        AttachBindPlan {
+            client_id: ClientId(client_id.clone()),
+            session_id: SessionId(session_id.clone()),
+            subscription_id: SubscriptionId(subscription_id.clone()),
+            capabilities,
+            now_seconds: now,
+            adapter: Box::new(adapter),
+        },
+    );
     ControlStep::pending(move |_, state| {
         let result = match ticket.poll() {
             CoreTicketPoll::Pending => return ControlPoll::Pending,
@@ -1250,9 +1278,10 @@ fn handle_shutdown_session(
                     let Some(runtime) = daemon.runtime() else {
                         return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
                     };
-                    stage = ShutdownStage::Shutdown(
-                        runtime.begin_shutdown_session(SessionId(session_id.clone())),
-                    );
+                    stage = ShutdownStage::Shutdown(runtime.begin_shutdown_session_for_owner(
+                        state.current_waiter_id.expect("owner waiter is assigned"),
+                        SessionId(session_id.clone()),
+                    ));
                 }
                 ShutdownStage::Shutdown(tracker) => {
                     let completion = match poll_tracker(tracker, daemon, "shutdown_session", &id.0)

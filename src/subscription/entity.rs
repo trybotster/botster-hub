@@ -28,7 +28,7 @@ use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::host_executor::{
     HostCommand, HostCompletion, HostCompletionPoll, HostError, HostJobIdentity, HostResult,
-    HostSubmitError, WaiterIdSequence,
+    HostSubmitError,
 };
 
 const SESSION_DELIVERY_MAX_ITEMS: usize = 16;
@@ -177,13 +177,12 @@ enum SessionTypeCatalogRefresh<'a> {
 }
 
 impl SessionTypeCatalogCache {
+    fn accepts(&self, identity: HostJobIdentity) -> bool {
+        self.pending
+            .is_some_and(|(expected, _)| expected == identity)
+    }
     /// Return the requested catalog or submit one bounded off-owner build.
-    fn refresh(
-        &mut self,
-        daemon: &HubDaemon,
-        generation: u64,
-        waiter_ids: &mut WaiterIdSequence,
-    ) -> SessionTypeCatalogRefresh<'_> {
+    fn refresh(&mut self, daemon: &HubDaemon, generation: u64) -> SessionTypeCatalogRefresh<'_> {
         self.requested_generation = Some(generation);
         if self.generation == Some(generation) {
             return SessionTypeCatalogRefresh::Ready(generation, &self.entities);
@@ -203,7 +202,7 @@ impl SessionTypeCatalogCache {
             self.waiting_for_capacity = true;
             return SessionTypeCatalogRefresh::Pending;
         };
-        let Some(waiter_id) = waiter_ids.next() else {
+        let Some(waiter_id) = runtime.next_waiter_id() else {
             drop(permit);
             self.generation = None;
             self.entities.clear();
@@ -288,6 +287,16 @@ impl SessionTypeCatalogCache {
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
+            HostResult::Mutation(_) => {
+                self.failure = Some((
+                    expected_generation,
+                    HostError::new(
+                        "host_completion_kind_mismatch",
+                        "a mutation completion used a catalog identity",
+                    ),
+                ));
+                return true;
+            }
         };
         if result_generation != expected_generation || result_generation != desired_generation {
             return true;
@@ -312,6 +321,7 @@ impl SessionTypeCatalogCache {
                 self.prepared_charge = None;
                 self.failure = Some((generation, error));
             }
+            HostResult::Mutation(_) => unreachable!("mutation result was handled above"),
         }
         true
     }
@@ -380,10 +390,9 @@ pub(crate) fn register_builtin_entity_subscription(
         let catalog = {
             let DaemonControlState {
                 session_type_catalog,
-                waiter_ids,
                 ..
             } = state;
-            match session_type_catalog.refresh(daemon, generation, waiter_ids) {
+            match session_type_catalog.refresh(daemon, generation) {
                 SessionTypeCatalogRefresh::Ready(generation, entities) => {
                     Ok(Some((generation, entities.clone())))
                 }
@@ -777,10 +786,9 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
         let outcome = {
             let DaemonControlState {
                 session_type_catalog,
-                waiter_ids,
                 ..
             } = state;
-            match session_type_catalog.refresh(daemon, generation, waiter_ids) {
+            match session_type_catalog.refresh(daemon, generation) {
                 SessionTypeCatalogRefresh::Ready(generation, entities) => {
                     Ok(Some((generation, entities)))
                 }
@@ -961,7 +969,11 @@ pub(crate) fn absorb_session_type_catalog_completions(
     loop {
         match executor.poll_completion() {
             HostCompletionPoll::Ready(completion) => {
-                catalog_changed |= state.session_type_catalog.absorb(completion);
+                if state.session_type_catalog.accepts(completion.identity) {
+                    catalog_changed |= state.session_type_catalog.absorb(completion);
+                } else {
+                    crate::daemon::control::pending::absorb_host_completion(state, completion);
+                }
             }
             HostCompletionPoll::Empty => break,
             HostCompletionPoll::Stopped => {
@@ -971,6 +983,21 @@ pub(crate) fn absorb_session_type_catalog_completions(
         }
     }
     let capacity_released = capacity_released || executor.take_capacity_notification();
+    if capacity_released {
+        let recovery_waiters = state
+            .host_recovery_waiters
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for waiter_id in recovery_waiters {
+            crate::daemon::control::pending::mark_request_ready(
+                state,
+                waiter_id,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            );
+        }
+    }
     if catalog_changed || (capacity_released && state.session_type_catalog.waiting_for_capacity()) {
         state.maintenance.scheduler.prefer_subscriber_delivery();
     }
@@ -2089,11 +2116,12 @@ mod tests {
 
     use crate::HubDaemon;
     use crate::daemon::owner_loop::DaemonControlState;
+    use crate::owner_identity::WaiterIdSource;
 
     #[test]
     fn stale_catalog_completion_releases_capacity_without_publishing() {
         let executor = crate::host_executor::HostExecutor::new();
-        let mut waiter_ids = WaiterIdSequence::default();
+        let waiter_ids = WaiterIdSource::default();
         let identity = HostJobIdentity {
             waiter_id: waiter_ids.next().expect("allocate waiter identity"),
             phase: 1,
@@ -2129,7 +2157,7 @@ mod tests {
     #[test]
     fn accepted_catalog_replaces_its_retained_charge_and_failure_releases_it() {
         let executor = crate::host_executor::HostExecutor::new();
-        let mut waiter_ids = WaiterIdSequence::default();
+        let waiter_ids = WaiterIdSource::default();
         let first_identity = HostJobIdentity {
             waiter_id: waiter_ids.next().expect("allocate first waiter identity"),
             phase: 1,
@@ -2182,7 +2210,7 @@ mod tests {
 
     #[test]
     fn stopped_executor_turns_a_pending_catalog_into_a_typed_failure() {
-        let mut waiter_ids = WaiterIdSequence::default();
+        let waiter_ids = WaiterIdSource::default();
         let mut cache = SessionTypeCatalogCache {
             pending: Some((
                 HostJobIdentity {
