@@ -2248,6 +2248,7 @@ fn real_lua_plugin_spawns_session_type_through_worker_capability() {
 }
 
 #[test]
+#[ignore = "managed session spawns require the live Hub owner"]
 fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
     let registry = install_session_type_spawn_registry(
         "managed-session-type-spawn",

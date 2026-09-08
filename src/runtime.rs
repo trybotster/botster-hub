@@ -2040,7 +2040,7 @@ impl HubRuntime {
         &self,
         pending: &PendingManagedSessionSpawn,
         prepared: &PreparedManagedWorktree,
-        owner_waiter: Option<crate::owner_identity::WaiterId>,
+        owner_waiter: crate::owner_identity::WaiterId,
     ) -> Result<ManagedSessionSpawnStart, ManagedGitError> {
         let session_id = generated_session_uuid()?;
         let records = pending.package_records.iter().collect::<Vec<_>>();
@@ -2072,12 +2072,8 @@ impl HubRuntime {
             contexts.insert(context.context_id.clone(), context.clone());
             contexts.insert(context.session_id.0.clone(), context.clone());
         }
-        let tracker = match owner_waiter {
-            Some(waiter_id) => {
-                self.begin_spawn_for_owner(waiter_id, materialized.spawn_request, metadata)
-            }
-            None => self.begin_spawn(materialized.spawn_request, metadata),
-        };
+        let tracker =
+            self.begin_spawn_for_owner(owner_waiter, materialized.spawn_request, metadata);
         Ok(ManagedSessionSpawnStart { tracker, context })
     }
 
@@ -4339,6 +4335,12 @@ impl HubSessionTypeSpawner {
         request: ManagedSessionTypeRequest,
         package_records: Vec<PackageRecord>,
     ) -> Result<PluginManagedSessionSpawned, ManagedGitError> {
+        if !package_allows_managed_git_spawn(&package_records, plugin_key) {
+            return Err(ManagedGitError::new(
+                "capability_denied",
+                "plugin package lacks managed session-type spawn capability",
+            ));
+        }
         let (response, receiver) = mpsc::channel();
         let mut managed = self.managed.lock().map_err(|_| {
             ManagedGitError::new(
