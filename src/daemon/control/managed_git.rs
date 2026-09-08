@@ -215,10 +215,7 @@ impl ManagedSpawnOperation {
             HostResult::ManagedWorktreeRecoveryRequired { error, .. } => {
                 self.finish_reconciliation(&format!("{}: {}", error.code, error.message))
             }
-            HostResult::Failed { error, .. } => self.finish_error(ManagedGitError::new(
-                "ensure_unavailable",
-                format!("{}: {}", error.code, error.message),
-            )),
+            HostResult::ManagedWorktreeFailed(error) => self.finish_error(error),
             _ => self.finish_reconciliation("the host executor returned an invalid create result"),
         }
     }

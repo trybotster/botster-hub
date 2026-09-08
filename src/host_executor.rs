@@ -138,6 +138,7 @@ pub(crate) enum HostResult {
     },
     Mutation(crate::host_mutations::HostMutationResult),
     ManagedWorktreeCreated(PreparedManagedWorktree),
+    ManagedWorktreeFailed(crate::managed_git_worktrees::ManagedGitError),
     ManagedWorktreeFinalized,
     ManagedWorktreeRecoveryRequired {
         prepared: PreparedManagedWorktree,
@@ -153,6 +154,7 @@ impl HostResult {
             }
             Self::Mutation(_) => 0,
             Self::ManagedWorktreeCreated(_)
+            | Self::ManagedWorktreeFailed(_)
             | Self::ManagedWorktreeFinalized
             | Self::ManagedWorktreeRecoveryRequired { .. } => 0,
         }
@@ -176,6 +178,7 @@ impl HostCompletion {
             HostResult::Failed { .. } => 0,
             HostResult::Mutation(_) => 0,
             HostResult::ManagedWorktreeCreated(_)
+            | HostResult::ManagedWorktreeFailed(_)
             | HostResult::ManagedWorktreeFinalized
             | HostResult::ManagedWorktreeRecoveryRequired { .. } => 0,
         };
@@ -194,6 +197,7 @@ impl HostCompletion {
             HostResult::Failed { .. } => 0,
             HostResult::Mutation(_) => 0,
             HostResult::ManagedWorktreeCreated(_)
+            | HostResult::ManagedWorktreeFailed(_)
             | HostResult::ManagedWorktreeFinalized
             | HostResult::ManagedWorktreeRecoveryRequired { .. } => 0,
         };
@@ -641,10 +645,7 @@ fn execute(command: HostCommand) -> HostResult {
                         prepared,
                         error: HostError::new(error.kind, error.message),
                     },
-                    None => HostResult::Failed {
-                        generation: 0,
-                        error: HostError::new(error.kind, error.message),
-                    },
+                    None => HostResult::ManagedWorktreeFailed(error),
                 },
             }
         }

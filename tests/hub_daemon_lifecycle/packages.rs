@@ -4288,7 +4288,12 @@ fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
                 arguments: serde_json::json!({
                     "target_id": "tgt_live_managed",
                     "branch": "feature/live-restart",
-                    "session_type_id": "managed-git.live-plugin/init"
+                    "session_type_id": "managed-git.live-plugin/init",
+                    "context": {
+                        "metadata": {
+                            "completion_reservation_padding": "x".repeat(512)
+                        }
+                    }
                 }),
             },
         )
@@ -4297,7 +4302,8 @@ fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
     let first = call(&data_dir);
     assert_eq!(
         first.kind,
-        botster_hub::DaemonResponseKind::PluginMcpToolResult
+        botster_hub::DaemonResponseKind::PluginMcpToolResult,
+        "managed Git response: {first:?}"
     );
     assert_eq!(first.plugin_tool_result["ok"], true);
     assert_eq!(first.plugin_tool_result["result"]["created_worktree"], true);

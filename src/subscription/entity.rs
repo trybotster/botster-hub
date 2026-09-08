@@ -290,6 +290,7 @@ impl SessionTypeCatalogCache {
             | HostResult::Failed { generation, .. } => *generation,
             HostResult::Mutation(_)
             | HostResult::ManagedWorktreeCreated(_)
+            | HostResult::ManagedWorktreeFailed(_)
             | HostResult::ManagedWorktreeFinalized
             | HostResult::ManagedWorktreeRecoveryRequired { .. } => {
                 self.failure = Some((
@@ -327,6 +328,7 @@ impl SessionTypeCatalogCache {
             }
             HostResult::Mutation(_)
             | HostResult::ManagedWorktreeCreated(_)
+            | HostResult::ManagedWorktreeFailed(_)
             | HostResult::ManagedWorktreeFinalized
             | HostResult::ManagedWorktreeRecoveryRequired { .. } => {
                 unreachable!("non-catalog result was handled above")
