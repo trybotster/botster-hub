@@ -134,11 +134,6 @@ impl ReadyItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadyError {
     EnqueueSerialExhausted,
-    ClassMismatch {
-        waiter_id: WaiterId,
-        queued: ReadyClass,
-        requested: ReadyClass,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,13 +175,6 @@ impl ReadyQueues {
         reasons: ReadyReasons,
     ) -> Result<ReadyKey, ReadyError> {
         if let Some(queued) = self.queued.get_mut(&waiter_id) {
-            if queued.key.class != class {
-                return Err(ReadyError::ClassMismatch {
-                    waiter_id,
-                    queued: queued.key.class,
-                    requested: class,
-                });
-            }
             queued.reasons.insert(reasons);
             return Ok(queued.key);
         }
@@ -364,6 +352,7 @@ impl DeadlineIndex {
     }
 
     /// Disarm one exact stored key without removing fired history.
+    /// The history prevents a disarm and re-arm from restoring a fired deadline.
     pub(crate) fn disarm(&mut self, key: DeadlineKey) -> bool {
         let Some(state) = self.states.get(&key.waiter_id).copied() else {
             return false;
@@ -534,40 +523,58 @@ mod tests {
     }
 
     #[test]
-    fn a_class_mismatch_keeps_the_original_row() {
+    fn completion_then_deadline_coalesces_into_the_completion_row() {
         let mut ready = ReadyQueues::new();
-        let key = ready
-            .mark(WaiterId(9), ReadyClass::Observe, FIRST_REASON)
+        let completion_key = ready
+            .mark(WaiterId(9), ReadyClass::CoreCompletion, FIRST_REASON)
+            .unwrap();
+        let deadline_key = ready
+            .mark(WaiterId(9), ReadyClass::Deadline, SECOND_REASON)
             .unwrap();
 
-        assert_eq!(
-            ready.mark(WaiterId(9), ReadyClass::Baseline, SECOND_REASON),
-            Err(ReadyError::ClassMismatch {
-                waiter_id: WaiterId(9),
-                queued: ReadyClass::Observe,
-                requested: ReadyClass::Baseline,
-            })
-        );
+        assert_eq!(deadline_key, completion_key);
         assert_eq!(ready.len(), 1);
         let item = ready.pop_next().unwrap();
-        assert_eq!(item.key(), key);
-        assert_eq!(item.reasons(), FIRST_REASON);
+        assert_eq!(item.key(), completion_key);
+        assert_eq!(item.key().class(), ReadyClass::CoreCompletion);
+        assert!(item.reasons().contains(FIRST_REASON));
+        assert!(item.reasons().contains(SECOND_REASON));
+    }
+
+    #[test]
+    fn deadline_then_completion_coalesces_into_the_deadline_row() {
+        let mut ready = ReadyQueues::new();
+        let deadline_key = ready
+            .mark(WaiterId(10), ReadyClass::Deadline, FIRST_REASON)
+            .unwrap();
+        let completion_key = ready
+            .mark(WaiterId(10), ReadyClass::CoreCompletion, SECOND_REASON)
+            .unwrap();
+
+        assert_eq!(completion_key, deadline_key);
+        assert_eq!(ready.len(), 1);
+        let item = ready.pop_next().unwrap();
+        assert_eq!(item.key(), deadline_key);
+        assert_eq!(item.key().class(), ReadyClass::Deadline);
+        assert!(item.reasons().contains(FIRST_REASON));
+        assert!(item.reasons().contains(SECOND_REASON));
     }
 
     #[test]
     fn removal_requires_the_exact_ready_key() {
         let mut ready = ReadyQueues::new();
-        let key = ready
+        let stale_key = ready
             .mark(WaiterId(12), ReadyClass::ProviderResync, FIRST_REASON)
             .unwrap();
-        let stale = ReadyKey {
-            enqueue_serial: key.enqueue_serial() + 1,
-            ..key
-        };
+        assert_eq!(ready.pop_next().unwrap().key(), stale_key);
+        let current_key = ready
+            .mark(WaiterId(12), ReadyClass::HostCompletion, SECOND_REASON)
+            .unwrap();
 
-        assert!(!ready.remove(stale));
+        assert_ne!(current_key, stale_key);
+        assert!(!ready.remove(stale_key));
         assert_eq!(ready.len(), 1);
-        assert!(ready.remove(key));
+        assert!(ready.remove(current_key));
         assert!(ready.is_empty());
     }
 
