@@ -12,10 +12,15 @@ use botster_hub_client::{DaemonEvent, DaemonRequest, DaemonResponse, MAX_CONTROL
 
 use crate::client_api::HubClientPackage;
 use crate::client_api_dto::response::{
-    daemon_apps, daemon_packages, daemon_spawn_target_validation, daemon_spawn_targets,
-    daemon_worktrees,
+    daemon_apps, daemon_packages, daemon_resolved_session_type, daemon_session_type_definition,
+    daemon_session_types, daemon_spawn_target_validation, daemon_spawn_targets, daemon_worktrees,
+};
+use crate::client_api_dto::session::{
+    session_type_definition_from_daemon, session_type_mutation_source_from_daemon,
+    session_type_request_from_daemon,
 };
 use crate::client_api_dto::workspace::worktree_lifecycle_event;
+use crate::config::HubConfig;
 use crate::daemon::control::session_types::{
     ensure_repo_session_types_valid_for_enabled_root, is_invalid_repo_session_types_error,
     session_type_catalog_entities,
@@ -26,6 +31,12 @@ use crate::entrypoint_supervisor::EntrypointProcessSnapshot;
 use crate::host_executor::HOST_PREPARED_BYTE_CAPACITY;
 use crate::packages::{PackageAction, PackageAdmissionReason, PackageRegistryError};
 use crate::persistence::{FileHubStateStore, HubState, PreparedHubStateWrite};
+use crate::session_types::{
+    PackageSessionType, RepoSessionTypeFileSnapshot, SessionTypeMutation,
+    SessionTypeMutationSource, commit_repo_session_type_mutation,
+    list_session_types_with_staged_repo, restore_repo_session_type_file,
+    snapshot_repo_session_type_file,
+};
 use crate::shared_view::SharedView;
 use crate::{
     PackageRegistry, SpawnTargetCreate, SpawnTargetError, SpawnTargetUpdate, WorktreeCreate,
@@ -59,8 +70,10 @@ impl std::fmt::Debug for HostMutationCommand {
         let name = match self {
             Self::Read(HostRead::Package { .. }) => "ReadPackage",
             Self::Read(HostRead::SpawnTarget { .. }) => "ReadSpawnTarget",
+            Self::Read(HostRead::SessionType { .. }) => "ReadSessionType",
             Self::Prepare(HostPrepare::Package { .. }) => "PreparePackage",
             Self::Prepare(HostPrepare::SpawnTarget { .. }) => "PrepareSpawnTarget",
+            Self::Prepare(HostPrepare::SessionType { .. }) => "PrepareSessionType",
             Self::Commit(_) => "Commit",
             Self::Recover(_) => "Recover",
         };
@@ -79,6 +92,12 @@ pub(crate) enum HostRead {
         request: DaemonRequest,
         state: SharedView<HubState>,
     },
+    SessionType {
+        request: DaemonRequest,
+        config: HubConfig,
+        state: SharedView<HubState>,
+        packages: SharedView<PackageRegistry>,
+    },
 }
 
 /// Owned inputs for mutation preparation.
@@ -94,6 +113,14 @@ pub(crate) enum HostPrepare {
     SpawnTarget {
         request: DaemonRequest,
         base_revision: u64,
+        state: SharedView<HubState>,
+        packages: SharedView<PackageRegistry>,
+        data_directory: PathBuf,
+    },
+    SessionType {
+        request: DaemonRequest,
+        base_revision: u64,
+        config: HubConfig,
         state: SharedView<HubState>,
         packages: SharedView<PackageRegistry>,
         data_directory: PathBuf,
@@ -177,6 +204,7 @@ pub(crate) enum PreparedChange {
     PackageConfiguration(PreparedStateChange),
     SpawnTarget(PreparedStateChange),
     RegisteredWorktree(PreparedStateChange),
+    SessionType(PreparedSessionTypeChange),
 }
 
 /// A prepared state write and the response produced by that write.
@@ -186,11 +214,33 @@ pub(crate) struct PreparedStateChange {
     reply: HostReply,
 }
 
+/// A prepared session-type write across Hub state and an optional repository file.
+pub(crate) struct PreparedSessionTypeChange {
+    state: PreparedStateChange,
+    repo_write: Option<(PathBuf, Vec<PackageSessionType>)>,
+}
+
+/// Exact repository file state retained for session-type compensation.
+pub(crate) struct RepoFileRollback {
+    pub(crate) root: PathBuf,
+    pub(crate) prior: RepoSessionTypeFileSnapshot,
+}
+
 /// A rollback descriptor that retains the previous published view.
 pub(crate) enum RollbackDescriptor {
-    PackageConfiguration { previous: SharedView<HubState> },
-    SpawnTarget { previous: SharedView<HubState> },
-    RegisteredWorktree { previous: SharedView<HubState> },
+    PackageConfiguration {
+        previous: SharedView<HubState>,
+    },
+    SpawnTarget {
+        previous: SharedView<HubState>,
+    },
+    RegisteredWorktree {
+        previous: SharedView<HubState>,
+    },
+    SessionType {
+        previous: SharedView<HubState>,
+        repo_file: Option<RepoFileRollback>,
+    },
 }
 
 /// A committed immutable state view and its reply.
@@ -213,6 +263,21 @@ pub(crate) enum RecoveryOutcome {
     RegisteredWorktree {
         view: SharedView<HubState>,
         failure: HostMutationError,
+    },
+    SessionType {
+        view: SharedView<HubState>,
+        failure: HostMutationError,
+        recovery: SessionTypeRecovery,
+    },
+}
+
+/// The repository compensation result for a session-type commit failure.
+pub(crate) enum SessionTypeRecovery {
+    NotRequired,
+    Restored,
+    Partial {
+        compensation_failure: HostMutationError,
+        rollback: RepoFileRollback,
     },
 }
 
@@ -247,8 +312,61 @@ fn execute_read(read: HostRead) -> Result<HostReply, HostMutationError> {
             entrypoint_processes,
         } => package_read(request, &packages, entrypoint_processes)?,
         HostRead::SpawnTarget { request, state } => spawn_target_read(request, &state)?,
+        HostRead::SessionType {
+            request,
+            config,
+            state,
+            packages,
+        } => session_type_read(request, &config, &state, &packages)?,
     };
     HostReply::try_new(response)
+}
+
+fn session_type_read(
+    request: DaemonRequest,
+    config: &HubConfig,
+    state: &HubState,
+    packages: &PackageRegistry,
+) -> Result<DaemonResponse, HostMutationError> {
+    let records = packages.packages();
+    match request {
+        DaemonRequest::ListSessionTypes => {
+            crate::session_types::list_session_types(&records, state)
+                .map(daemon_session_types)
+                .map_err(session_type_error)
+        }
+        DaemonRequest::ListSessionTypesForTarget { target_id } => {
+            crate::session_types::list_session_types_for_target(&records, state, &target_id)
+                .map(daemon_session_types)
+                .map_err(session_type_error)
+        }
+        DaemonRequest::ShowSessionType { session_type_id } => {
+            crate::session_types::show_session_type(&records, state, &session_type_id)
+                .map(|row| daemon_session_types(vec![row]))
+                .map_err(session_type_error)
+        }
+        DaemonRequest::ShowSessionTypeDefinition { session_type_id } => {
+            crate::session_types::show_session_type_definition(&records, state, &session_type_id)
+                .map(daemon_session_type_definition)
+                .map_err(session_type_error)
+        }
+        DaemonRequest::ResolveSessionType {
+            session_type_id,
+            request,
+        } => crate::session_types::materialize_session_type(
+            config,
+            &records,
+            state,
+            &session_type_id,
+            session_type_request_from_daemon(None, request),
+        )
+        .map(|materialized| daemon_resolved_session_type(materialized.resolved))
+        .map_err(session_type_error),
+        request => Err(HostMutationError::unsupported(
+            &request,
+            "session-type read",
+        )),
+    }
 }
 
 fn package_read(
@@ -342,6 +460,21 @@ fn execute_prepare(prepare: HostPrepare) -> Result<PreparedMutation, HostMutatio
             packages,
             data_directory,
         } => prepare_spawn_target(request, base_revision, state, packages, data_directory),
+        HostPrepare::SessionType {
+            request,
+            base_revision,
+            config,
+            state,
+            packages,
+            data_directory,
+        } => prepare_session_type(
+            request,
+            base_revision,
+            config,
+            state,
+            packages,
+            data_directory,
+        ),
     }
 }
 
@@ -558,6 +691,117 @@ fn prepare_spawn_target(
     )
 }
 
+fn prepare_session_type(
+    request: DaemonRequest,
+    base_revision: u64,
+    config: HubConfig,
+    state: SharedView<HubState>,
+    packages: SharedView<PackageRegistry>,
+    data_directory: PathBuf,
+) -> Result<PreparedMutation, HostMutationError> {
+    let (source, mutation) = match request {
+        DaemonRequest::CreateSessionType { source, definition } => (
+            session_type_mutation_source_from_daemon(source),
+            SessionTypeMutation::Create(session_type_definition_from_daemon(definition)),
+        ),
+        DaemonRequest::UpdateSessionType { source, definition } => (
+            session_type_mutation_source_from_daemon(source),
+            SessionTypeMutation::Update(session_type_definition_from_daemon(definition)),
+        ),
+        DaemonRequest::DeleteSessionType {
+            source,
+            session_type_id,
+        } => (
+            session_type_mutation_source_from_daemon(source),
+            SessionTypeMutation::Delete {
+                id: session_type_id,
+            },
+        ),
+        request => {
+            return Err(HostMutationError::unsupported(
+                &request,
+                "session-type prepare",
+            ));
+        }
+    };
+    let prepared = crate::session_types::prepare_session_type_mutation(
+        &config,
+        &state,
+        source.clone(),
+        mutation,
+    )
+    .map_err(session_type_error)?;
+    let (candidate, repo_write) = prepared.into_parts();
+    let repo_file = repo_write
+        .as_ref()
+        .map(|(root, _)| {
+            snapshot_repo_session_type_file(root, HOST_PREPARED_BYTE_CAPACITY).map(|prior| {
+                RepoFileRollback {
+                    root: root.clone(),
+                    prior,
+                }
+            })
+        })
+        .transpose()
+        .map_err(session_type_error)?;
+
+    let records = packages.packages();
+    let rows = match (&source, &repo_write) {
+        (SessionTypeMutationSource::Repo { target_id }, Some((_, definitions))) => {
+            list_session_types_with_staged_repo(&records, &candidate, target_id, definitions)
+        }
+        _ => crate::session_types::list_session_types(&records, &candidate),
+    }
+    .map_err(session_type_error)?;
+    let reply = HostReply::try_new(daemon_session_types(rows))?;
+    let state_bytes = pretty_encoded_len(&candidate, "host_prepared_state_encode_failed")?;
+    let repo_write_bytes = repo_write
+        .as_ref()
+        .map(|(root, definitions)| {
+            checked_total(&[
+                root.as_os_str().as_encoded_bytes().len(),
+                encoded_len(definitions, "host_prepared_session_types_encode_failed")?,
+            ])
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let repo_bytes = repo_file
+        .as_ref()
+        .map_or(0, |rollback| repo_rollback_bytes(rollback));
+    let logical_bytes = checked_total(&[
+        state_bytes,
+        rollback_descriptor_bytes(),
+        repo_write_bytes,
+        repo_bytes,
+    ])?;
+    if logical_bytes > HOST_PREPARED_BYTE_CAPACITY {
+        return Err(HostMutationError::new(
+            "host_prepared_too_large",
+            "prepared mutation exceeds its prepared-byte reservation",
+        ));
+    }
+    let store = FileHubStateStore::for_data_directory(data_directory);
+    let write = store
+        .prepare_shared(candidate, &state.budget())
+        .map_err(|error| HostMutationError::new("hub_state_prepare_failed", error.to_string()))?;
+    Ok(PreparedMutation {
+        base_revision,
+        change: PreparedChange::SessionType(PreparedSessionTypeChange {
+            state: PreparedStateChange {
+                store,
+                write,
+                reply,
+            },
+            repo_write,
+        }),
+        rollback: RollbackDescriptor::SessionType {
+            previous: state,
+            repo_file,
+        },
+        logical_bytes,
+    })
+}
+
 fn prepare_state_change(
     base_revision: u64,
     previous: SharedView<HubState>,
@@ -624,6 +868,9 @@ fn execute_commit(commit: HostCommit) -> HostMutationResult {
             "prepared change and rollback families do not match",
         ));
     }
+    if let PreparedChange::SessionType(change) = change {
+        return execute_session_type_commit(committed_revision, change, rollback);
+    }
     let PreparedStateChange {
         store,
         write,
@@ -639,6 +886,36 @@ fn execute_commit(commit: HostCommit) -> HostMutationResult {
             let failure = HostMutationError::new("hub_state_commit_failed", error.to_string());
             HostMutationResult::Recovered(execute_recovery(HostRecover { rollback, failure }))
         }
+    }
+}
+
+fn execute_session_type_commit(
+    committed_revision: u64,
+    change: PreparedSessionTypeChange,
+    rollback: RollbackDescriptor,
+) -> HostMutationResult {
+    let PreparedSessionTypeChange { state, repo_write } = change;
+    let PreparedStateChange {
+        store,
+        write,
+        reply,
+    } = state;
+    if let Err(error) = commit_repo_session_type_mutation(repo_write) {
+        return HostMutationResult::Recovered(execute_recovery(HostRecover {
+            rollback,
+            failure: session_type_error(error),
+        }));
+    }
+    match store.commit_shared(write) {
+        Ok(view) => HostMutationResult::Committed(CommittedView {
+            committed_revision,
+            view,
+            reply,
+        }),
+        Err(error) => HostMutationResult::Recovered(execute_recovery(HostRecover {
+            rollback,
+            failure: HostMutationError::new("hub_state_commit_failed", error.to_string()),
+        })),
     }
 }
 
@@ -660,6 +937,28 @@ fn execute_recovery(recover: HostRecover) -> RecoveryOutcome {
                 failure: recover.failure,
             }
         }
+        RollbackDescriptor::SessionType {
+            previous,
+            repo_file,
+        } => {
+            let recovery = match repo_file {
+                None => SessionTypeRecovery::NotRequired,
+                Some(rollback) => {
+                    match restore_repo_session_type_file(&rollback.root, &rollback.prior) {
+                        Ok(()) => SessionTypeRecovery::Restored,
+                        Err(error) => SessionTypeRecovery::Partial {
+                            compensation_failure: session_type_error(error),
+                            rollback,
+                        },
+                    }
+                }
+            };
+            RecoveryOutcome::SessionType {
+                view: previous,
+                failure: recover.failure,
+                recovery,
+            }
+        }
     }
 }
 
@@ -668,6 +967,7 @@ fn into_state_change(change: PreparedChange) -> PreparedStateChange {
         PreparedChange::PackageConfiguration(change)
         | PreparedChange::SpawnTarget(change)
         | PreparedChange::RegisteredWorktree(change) => change,
+        PreparedChange::SessionType(_) => unreachable!("session-type commit uses both stores"),
     }
 }
 
@@ -683,6 +983,9 @@ fn families_match(change: &PreparedChange, rollback: &RollbackDescriptor) -> boo
         ) | (
             PreparedChange::RegisteredWorktree(_),
             RollbackDescriptor::RegisteredWorktree { .. }
+        ) | (
+            PreparedChange::SessionType(_),
+            RollbackDescriptor::SessionType { .. }
         )
     )
 }
@@ -816,6 +1119,23 @@ fn worktree_error(error: crate::WorktreeError) -> HostMutationError {
     HostMutationError::new(error.kind, error.message)
 }
 
+fn session_type_error(error: crate::SessionTypeError) -> HostMutationError {
+    HostMutationError::new(error.kind, error.message)
+}
+
+fn repo_rollback_bytes(rollback: &RepoFileRollback) -> usize {
+    let prior_bytes = match &rollback.prior {
+        RepoSessionTypeFileSnapshot::Missing => 0,
+        RepoSessionTypeFileSnapshot::Present(bytes) => bytes.len(),
+    };
+    rollback
+        .root
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .saturating_add(prior_bytes)
+}
+
 fn rollback_descriptor_bytes() -> usize {
     mem::size_of::<RollbackDescriptor>()
 }
@@ -889,6 +1209,7 @@ mod tests {
         ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, PackageConfigurationField,
         PackageConfigurationFieldType, PackageConfigurationSchema, PackageSource,
     };
+    use botster_hub_client::DaemonSessionTypeMutationSource;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -993,6 +1314,76 @@ mod tests {
         )
     }
 
+    fn session_type_inputs(
+        name: &str,
+    ) -> (
+        HubConfig,
+        SharedView<HubState>,
+        SharedView<PackageRegistry>,
+        PathBuf,
+        String,
+    ) {
+        let (state, packages, data_directory) = inputs(name);
+        let repo_root = data_directory.join("repo");
+        fs::create_dir_all(&repo_root).expect("create repository fixture");
+        let config = HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(data_directory.clone()),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .expect("build session-type test config");
+        let mut candidate = (*state).clone();
+        let target_id = format!("{name}-target");
+        crate::create_spawn_target(
+            &mut candidate.spawn_targets,
+            SpawnTargetCreate {
+                target_id: Some(target_id.clone()),
+                label: None,
+                root: repo_root,
+                enabled: true,
+                kind: Some("directory".to_string()),
+                base_ref: None,
+                metadata: BTreeMap::new(),
+            },
+        )
+        .expect("create admitted target fixture");
+        let budget = SharedViewBudget::new();
+        (
+            config,
+            SharedView::try_new(&budget, candidate, 1).expect("state view fits"),
+            packages,
+            data_directory,
+            target_id,
+        )
+    }
+
+    fn session_type_create_request(target_id: String) -> DaemonRequest {
+        let definition = PackageSessionType {
+            id: "review".to_string(),
+            label: "Review".to_string(),
+            description: None,
+            icon: None,
+            role: "botster.agent".to_string(),
+            interaction: "interactive".to_string(),
+            traits: Vec::new(),
+            lifecycle: "durable".to_string(),
+            execution: crate::PackageSessionTypeExecution::RelativeExecutable,
+            command: "bin/review".to_string(),
+            args: Vec::new(),
+            working_directory: crate::PackageSessionTypeWorkingDirectory::PackageRoot,
+            environment: BTreeMap::new(),
+            allowed_environment_overrides: Vec::new(),
+            context: Vec::new(),
+            target_id: None,
+        };
+        DaemonRequest::CreateSessionType {
+            source: DaemonSessionTypeMutationSource::Repo { target_id },
+            definition: crate::client_api_dto::session::daemon_session_type_definition_from_client(
+                definition,
+            ),
+        }
+    }
+
     #[test]
     fn read_owns_input_and_has_a_deterministic_checked_reply() {
         let (state, _packages, _directory) = inputs("owned-read");
@@ -1043,6 +1434,25 @@ mod tests {
         };
         assert_eq!(reply.response.kind, DaemonResponseKind::Packages);
         assert!(reply.response.packages.is_empty());
+    }
+
+    #[test]
+    fn session_type_read_uses_the_owned_state_and_registry_views() {
+        let (config, state, packages, data_directory, _target_id) =
+            session_type_inputs("session-type-read");
+        let HostMutationResult::ReadReady(reply) =
+            execute(HostMutationCommand::Read(HostRead::SessionType {
+                request: DaemonRequest::ListSessionTypes,
+                config,
+                state,
+                packages,
+            }))
+        else {
+            panic!("session-type read must succeed");
+        };
+        assert_eq!(reply.response.kind, DaemonResponseKind::SessionTypes);
+        assert!(reply.response.session_types.is_empty());
+        fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
     #[test]
@@ -1166,6 +1576,108 @@ mod tests {
         assert_eq!(failure.code, "hub_state_commit_failed");
         assert!(!data_directory.join("hub-state.json").exists());
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
+    }
+
+    #[test]
+    fn repo_session_type_commit_writes_the_repo_before_publishing_state() {
+        let (config, state, packages, data_directory, target_id) =
+            session_type_inputs("session-type-commit");
+        let repo_file = data_directory.join("repo/.botster/session-types.json");
+        let HostMutationResult::Prepared(prepared) =
+            execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
+                request: session_type_create_request(target_id),
+                base_revision: 11,
+                config,
+                state,
+                packages,
+                data_directory: data_directory.clone(),
+            }))
+        else {
+            panic!("session-type prepare must succeed");
+        };
+        assert!(!repo_file.exists());
+        let HostMutationResult::Committed(committed) =
+            execute(HostMutationCommand::Commit(HostCommit { prepared }))
+        else {
+            panic!("session-type commit must succeed");
+        };
+        assert_eq!(committed.committed_revision, 12);
+        assert_eq!(committed.view.session_type_generation, 1);
+        assert_eq!(
+            committed.reply.response.kind,
+            DaemonResponseKind::SessionTypes
+        );
+        assert!(repo_file.is_file());
+        fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
+    }
+
+    #[test]
+    fn failed_state_commit_restores_the_exact_repo_file_state() {
+        let (config, state, packages, data_directory, target_id) =
+            session_type_inputs("session-type-recovery");
+        let expected = state.clone();
+        let repo_file = data_directory.join("repo/.botster/session-types.json");
+        let HostMutationResult::Prepared(prepared) =
+            execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
+                request: session_type_create_request(target_id),
+                base_revision: 4,
+                config,
+                state,
+                packages,
+                data_directory: data_directory.clone(),
+            }))
+        else {
+            panic!("session-type prepare must succeed");
+        };
+        FileHubStateStore::inject_next_save_failure();
+        let HostMutationResult::Recovered(RecoveryOutcome::SessionType {
+            view,
+            failure,
+            recovery: SessionTypeRecovery::Restored,
+        }) = execute(HostMutationCommand::Commit(HostCommit { prepared }))
+        else {
+            panic!("failed session-type state commit must restore the repository file");
+        };
+        assert!(SharedView::ptr_eq(&view, &expected));
+        assert_eq!(failure.code, "hub_state_commit_failed");
+        assert!(!repo_file.exists());
+        fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
+    }
+
+    #[test]
+    fn failed_session_type_compensation_retains_its_rollback() {
+        let (state, _packages, data_directory) = inputs("session-type-partial-recovery");
+        let unavailable_root = data_directory.join("unavailable-repo");
+        let failure = HostMutationError::new("commit_failed", "commit failed");
+        let HostMutationResult::Recovered(RecoveryOutcome::SessionType {
+            view,
+            failure: recovered_failure,
+            recovery:
+                SessionTypeRecovery::Partial {
+                    compensation_failure,
+                    rollback,
+                },
+        }) = execute(HostMutationCommand::Recover(HostRecover {
+            rollback: RollbackDescriptor::SessionType {
+                previous: state.clone(),
+                repo_file: Some(RepoFileRollback {
+                    root: unavailable_root.clone(),
+                    prior: RepoSessionTypeFileSnapshot::Missing,
+                }),
+            },
+            failure: failure.clone(),
+        }))
+        else {
+            panic!("failed compensation must retain the rollback");
+        };
+        assert!(SharedView::ptr_eq(&view, &state));
+        assert_eq!(recovered_failure, failure);
+        assert_eq!(compensation_failure.code, "target_not_admitted");
+        assert_eq!(rollback.root, unavailable_root);
+        assert!(matches!(
+            rollback.prior,
+            RepoSessionTypeFileSnapshot::Missing
+        ));
     }
 
     #[test]
