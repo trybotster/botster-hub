@@ -122,6 +122,8 @@ pub(crate) enum ControlMessage {
     PluginCompletionPublished,
     /// A host job completed or released bounded executor capacity.
     HostProgressPublished,
+    /// A Lua worker queued one managed worktree and session spawn operation.
+    ManagedSessionSpawnQueued,
     LocalWebrtcPeerClosed {
         grant_id: String,
         attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,

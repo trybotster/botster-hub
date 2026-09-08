@@ -5,6 +5,7 @@ pub(crate) mod entities;
 pub(crate) mod events;
 pub(crate) mod host;
 pub(crate) mod host_work;
+pub(crate) mod managed_git;
 pub(crate) mod message;
 pub(crate) mod messaging;
 pub(crate) mod packages;
@@ -153,6 +154,13 @@ pub(crate) fn handle_control_message_with_budget(
             crate::subscription::entity::absorb_session_type_catalog_completions(
                 daemon, state, owner_turn,
             );
+            false
+        }
+        ControlMessage::ManagedSessionSpawnQueued => {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.take_managed_spawn_notification();
+            }
+            managed_git::accept_one(daemon, state);
             false
         }
     }

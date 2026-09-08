@@ -62,6 +62,7 @@ pub(crate) enum HostCommand {
         prepared: PreparedManagedWorktree,
         decision: ManagedWorktreeDecision,
         deadline: Instant,
+        discard: Option<Box<crate::host_mutations::PreparedMutation>>,
     },
     #[cfg(test)]
     Panic {
@@ -651,13 +652,18 @@ fn execute(command: HostCommand) -> HostResult {
             prepared,
             decision,
             deadline,
-        } => match finalize_managed_worktree(&prepared, decision, deadline) {
-            Ok(()) => HostResult::ManagedWorktreeFinalized,
-            Err(error) => HostResult::ManagedWorktreeRecoveryRequired {
-                prepared,
-                error: HostError::new(error.kind, error.message),
-            },
-        },
+            discard,
+        } => {
+            let result = match finalize_managed_worktree(&prepared, decision, deadline) {
+                Ok(()) => HostResult::ManagedWorktreeFinalized,
+                Err(error) => HostResult::ManagedWorktreeRecoveryRequired {
+                    prepared,
+                    error: HostError::new(error.kind, error.message),
+                },
+            };
+            drop(discard);
+            result
+        }
         #[cfg(test)]
         HostCommand::Panic { .. } => panic!("host executor panic test"),
         #[cfg(test)]
@@ -1120,6 +1126,7 @@ mod tests {
                     prepared,
                     decision: ManagedWorktreeDecision::Rollback,
                     deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
+                    discard: None,
                 },
                 permit,
             )
@@ -1145,6 +1152,7 @@ mod tests {
                     prepared,
                     decision: ManagedWorktreeDecision::Rollback,
                     deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
+                    discard: None,
                 },
                 permit,
             )

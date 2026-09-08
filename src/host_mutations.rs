@@ -74,6 +74,10 @@ impl std::fmt::Debug for HostMutationCommand {
             Self::Prepare(HostPrepare::Package { .. }) => "PreparePackage",
             Self::Prepare(HostPrepare::SpawnTarget { .. }) => "PrepareSpawnTarget",
             Self::Prepare(HostPrepare::SessionType { .. }) => "PrepareSessionType",
+            Self::Prepare(HostPrepare::ManagedWorktree { .. }) => "PrepareManagedWorktree",
+            Self::Prepare(HostPrepare::RemoveManagedWorktree { .. }) => {
+                "PrepareRemoveManagedWorktree"
+            }
             Self::Commit(_) => "Commit",
             Self::Recover(_) => "Recover",
         };
@@ -109,6 +113,20 @@ pub(crate) enum HostPrepare {
         packages: SharedView<PackageRegistry>,
         entrypoint_processes: Vec<EntrypointProcessSnapshot>,
         data_directory: PathBuf,
+    },
+    ManagedWorktree {
+        worktree: crate::Worktree,
+        base_revision: u64,
+        state: SharedView<HubState>,
+        data_directory: PathBuf,
+        superseded: Option<Box<PreparedMutation>>,
+    },
+    RemoveManagedWorktree {
+        worktree_id: String,
+        base_revision: u64,
+        state: SharedView<HubState>,
+        data_directory: PathBuf,
+        superseded: Option<Box<PreparedMutation>>,
     },
     SpawnTarget {
         request: DaemonRequest,
@@ -477,7 +495,88 @@ fn execute_prepare(prepare: HostPrepare) -> Result<PreparedMutation, HostMutatio
             packages,
             data_directory,
         ),
+        HostPrepare::ManagedWorktree {
+            worktree,
+            base_revision,
+            state,
+            data_directory,
+            superseded,
+        } => {
+            let result =
+                prepare_managed_worktree_record(worktree, base_revision, state, data_directory);
+            drop(superseded);
+            result
+        }
+        HostPrepare::RemoveManagedWorktree {
+            worktree_id,
+            base_revision,
+            state,
+            data_directory,
+            superseded,
+        } => {
+            let result =
+                prepare_managed_worktree_removal(worktree_id, base_revision, state, data_directory);
+            drop(superseded);
+            result
+        }
     }
+}
+
+fn prepare_managed_worktree_removal(
+    worktree_id: String,
+    base_revision: u64,
+    state: SharedView<HubState>,
+    data_directory: PathBuf,
+) -> Result<PreparedMutation, HostMutationError> {
+    let mut candidate = (*state).clone();
+    candidate.worktrees.retain(|worktree| {
+        worktree.worktree_id != worktree_id || worktree.management != "hub_managed_git"
+    });
+    prepare_state_change(
+        base_revision,
+        state,
+        candidate,
+        data_directory,
+        HostReply::try_new(daemon_worktrees(Vec::new()))?,
+        MutationFamily::RegisteredWorktree,
+        None,
+    )
+}
+
+fn prepare_managed_worktree_record(
+    worktree: crate::Worktree,
+    base_revision: u64,
+    state: SharedView<HubState>,
+    data_directory: PathBuf,
+) -> Result<PreparedMutation, HostMutationError> {
+    let mut candidate = (*state).clone();
+    if let Some(existing) = candidate
+        .worktrees
+        .iter_mut()
+        .find(|existing| existing.worktree_id == worktree.worktree_id)
+    {
+        if existing.target_id != worktree.target_id
+            || existing.path != worktree.path
+            || existing.management != "hub_managed_git"
+        {
+            return Err(HostMutationError::new(
+                "worktree_record_mismatch",
+                "managed worktree record conflicts with the prepared worktree",
+            ));
+        }
+        *existing = worktree.clone();
+    } else {
+        candidate.worktrees.push(worktree.clone());
+    }
+    prepare_state_change(
+        base_revision,
+        state,
+        candidate,
+        data_directory,
+        HostReply::try_new(daemon_worktrees(vec![worktree]))?,
+        MutationFamily::RegisteredWorktree,
+        None,
+    )
 }
 
 fn prepare_package(
