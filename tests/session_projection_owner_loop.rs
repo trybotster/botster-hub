@@ -178,7 +178,6 @@ fn owner_loop_and_projection_sources_reject_unbounded_and_product_policy() {
         "src/daemon/control/connection.rs",
         "src/daemon/control/sessions.rs",
         "src/daemon/control/session_types.rs",
-        "src/daemon/control/spawn_targets.rs",
         "src/daemon/control/packages.rs",
         "src/daemon/control/packages/mutations.rs",
         "src/daemon/control/messaging.rs",

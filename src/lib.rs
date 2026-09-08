@@ -1038,10 +1038,6 @@ mod tests {
                 include_str!("daemon/control/session_types.rs"),
             ),
             (
-                "src/daemon/control/spawn_targets.rs",
-                include_str!("daemon/control/spawn_targets.rs"),
-            ),
-            (
                 "src/daemon/control/packages.rs",
                 include_str!("daemon/control/packages.rs"),
             ),

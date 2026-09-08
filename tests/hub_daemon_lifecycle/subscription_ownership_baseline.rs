@@ -443,7 +443,6 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
         "src/daemon/control/connection.rs",
         "src/daemon/control/sessions.rs",
         "src/daemon/control/session_types.rs",
-        "src/daemon/control/spawn_targets.rs",
         "src/daemon/control/packages.rs",
         "src/daemon/control/packages/mutations.rs",
         "src/daemon/control/messaging.rs",
