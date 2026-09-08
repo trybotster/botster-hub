@@ -5,6 +5,7 @@ use std::io;
 use botster_core::{PluginInvocationResult, RequestId};
 use botster_hub_client::{
     DaemonOperatorError, DaemonResponse, DaemonResponseKind, MAX_CONTROL_RESPONSE_BYTES,
+    MAX_REQUEST_ID_BYTES,
 };
 use botster_ui_contract::UiActionRequest;
 use serde::Serialize;
@@ -43,7 +44,7 @@ pub(crate) struct PluginResponseInput {
 }
 
 pub(crate) struct PreparedPluginResponse {
-    pub(crate) response: DaemonResponse,
+    pub(crate) kind: DaemonResponseKind,
     pub(crate) encoded_frame: Vec<u8>,
     pub(crate) logical_bytes: usize,
 }
@@ -69,13 +70,11 @@ pub(crate) fn prepare(input: PluginResponseInput) -> PreparedPluginResponse {
         Ok(prepared) => prepared,
         Err(EncodeResponseError::TooLarge) => {
             let response = oversized_response(&kind, &transport_request_id);
-            encode_response(response, &transport_request_id)
-                .expect("the bounded plugin oversize response must serialize")
+            encode_protocol_bounded_error(response, &transport_request_id, "oversize")
         }
         Err(EncodeResponseError::Serialize) => {
             let response = encoding_error_response(&kind, &transport_request_id);
-            encode_response(response, &transport_request_id)
-                .expect("the bounded plugin encoding-error response must serialize")
+            encode_protocol_bounded_error(response, &transport_request_id, "encoding")
         }
     };
     drop(retained_charge);
@@ -250,15 +249,36 @@ fn encode_response(
         response: &response,
     };
     let encoded_frame = capped_json(&frame)?;
-    let response_bytes = capped_json_len(&response)?;
-    let logical_bytes = response_bytes
-        .checked_add(encoded_frame.len())
-        .expect("two bounded response byte counts cannot overflow");
+    let kind = response.kind;
+    drop(response);
+    let logical_bytes = encoded_frame.len();
     Ok(PreparedPluginResponse {
-        response,
+        kind,
         encoded_frame,
         logical_bytes,
     })
+}
+
+fn encode_protocol_bounded_error(
+    response: DaemonResponse,
+    transport_request_id: &str,
+    error_kind: &str,
+) -> PreparedPluginResponse {
+    // Production ingress permits only canonical decimal u64 request IDs.
+    // The byte bound also covers any 20-byte internal ID with worst-case JSON escaping.
+    assert!(
+        transport_request_id.len() <= MAX_REQUEST_ID_BYTES,
+        "plugin {error_kind} fallback request id exceeds the {MAX_REQUEST_ID_BYTES}-byte protocol bound"
+    );
+    match encode_response(response, transport_request_id) {
+        Ok(prepared) => prepared,
+        Err(EncodeResponseError::TooLarge) => panic!(
+            "plugin {error_kind} fallback exceeded the {MAX_CONTROL_RESPONSE_BYTES}-byte response bound with a protocol-bounded request id"
+        ),
+        Err(EncodeResponseError::Serialize) => {
+            panic!("plugin {error_kind} fallback protocol serialization failed")
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,18 +289,6 @@ enum EncodeResponseError {
 
 fn capped_json(value: &impl Serialize) -> Result<Vec<u8>, EncodeResponseError> {
     let mut writer = CappedVecWriter::new(MAX_CONTROL_RESPONSE_BYTES);
-    if serde_json::to_writer(&mut writer, value).is_err() {
-        return Err(if writer.exceeded {
-            EncodeResponseError::TooLarge
-        } else {
-            EncodeResponseError::Serialize
-        });
-    }
-    Ok(writer.bytes)
-}
-
-fn capped_json_len(value: &impl Serialize) -> Result<usize, EncodeResponseError> {
-    let mut writer = CappedCountingWriter::new(MAX_CONTROL_RESPONSE_BYTES);
     if serde_json::to_writer(&mut writer, value).is_err() {
         return Err(if writer.exceeded {
             EncodeResponseError::TooLarge
@@ -314,37 +322,6 @@ impl io::Write for CappedVecWriter {
             return Err(io::Error::other("JSON byte limit exceeded"));
         }
         self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct CappedCountingWriter {
-    bytes: usize,
-    limit: usize,
-    exceeded: bool,
-}
-
-impl CappedCountingWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: 0,
-            limit,
-            exceeded: false,
-        }
-    }
-}
-
-impl io::Write for CappedCountingWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if buffer.len() > self.limit.saturating_sub(self.bytes) {
-            self.exceeded = true;
-            return Err(io::Error::other("JSON byte limit exceeded"));
-        }
-        self.bytes += buffer.len();
         Ok(buffer.len())
     }
 
@@ -403,6 +380,16 @@ mod tests {
         serde_json::from_slice(&prepared.encoded_frame).expect("encoded server frame")
     }
 
+    fn decode_response(prepared: &PreparedPluginResponse) -> (String, DaemonResponse) {
+        match decode_frame(prepared) {
+            ServerFrame::Response {
+                request_id,
+                response,
+            } => (request_id, response),
+            frame => panic!("expected response frame, got {frame:?}"),
+        }
+    }
+
     #[test]
     fn surface_response_keeps_one_canonical_snapshot_body() {
         let body = serde_json::json!({
@@ -421,10 +408,12 @@ mod tests {
 
         let prepared = prepare(input);
 
-        assert_eq!(prepared.response.kind, DaemonResponseKind::PluginSurface);
+        assert_eq!(prepared.kind, DaemonResponseKind::PluginSurface);
         assert!(prepared.encoded_frame.len() <= MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(prepared.logical_bytes, prepared.encoded_frame.len());
         assert_eq!(budget.retained_bytes(), 0);
-        let response_json = serde_json::to_value(&prepared.response).expect("response JSON");
+        let (_, response) = decode_response(&prepared);
+        let response_json = serde_json::to_value(response).expect("response JSON");
         let surface = &response_json["plugin_surface"];
         assert!(surface.get("body").is_none());
         assert_eq!(surface["ui_tree_snapshot"]["body"]["id"], "large-body");
@@ -448,16 +437,14 @@ mod tests {
 
         let prepared = prepare(input);
 
-        assert_eq!(
-            prepared.response.kind,
-            DaemonResponseKind::PluginMcpToolResult
-        );
+        assert_eq!(prepared.kind, DaemonResponseKind::PluginMcpToolResult);
         assert_eq!(prepared.encoded_frame.len(), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(prepared.logical_bytes, MAX_CONTROL_RESPONSE_BYTES);
     }
 
     #[test]
     fn oversized_frame_becomes_a_bounded_correlated_error() {
-        let request_id = "21";
+        let request_id = "18446744073709551615";
         let empty_response = daemon_plugin_tool_result(serde_json::Value::String(String::new()));
         let empty_frame = ServerFrame::Response {
             request_id: request_id.to_string(),
@@ -475,15 +462,37 @@ mod tests {
         let prepared = prepare(input);
 
         assert!(prepared.encoded_frame.len() <= MAX_CONTROL_RESPONSE_BYTES);
-        assert_eq!(prepared.response.kind, DaemonResponseKind::OperatorError);
-        let error = prepared.response.error.as_ref().expect("operator error");
+        assert_eq!(prepared.kind, DaemonResponseKind::OperatorError);
+        let (outer_request_id, response) = decode_response(&prepared);
+        let error = response.error.as_ref().expect("operator error");
         assert_eq!(error.code, "plugin_response_too_large");
         assert_eq!(error.request_id, request_id);
-        assert!(matches!(
-            decode_frame(&prepared),
-            ServerFrame::Response { request_id: outer, response }
-                if outer == request_id && response == prepared.response
-        ));
+        assert_eq!(outer_request_id, request_id);
+        assert_eq!(prepared.logical_bytes, prepared.encoded_frame.len());
+    }
+
+    #[test]
+    fn oversized_fallback_fits_with_a_worst_case_escaped_request_id() {
+        let request_id = "\0".repeat(MAX_REQUEST_ID_BYTES);
+        assert_eq!(request_id.len(), MAX_REQUEST_ID_BYTES);
+        let (input, _) = input(
+            PluginResponseKind::McpTool,
+            Ok(completed(serde_json::Value::String(
+                "x".repeat(MAX_CONTROL_RESPONSE_BYTES),
+            ))),
+            &request_id,
+        );
+
+        let prepared = prepare(input);
+        let (outer_request_id, response) = decode_response(&prepared);
+        let error = response.error.as_ref().expect("operator error");
+
+        assert_eq!(prepared.kind, DaemonResponseKind::OperatorError);
+        assert_eq!(error.code, "plugin_response_too_large");
+        assert_eq!(error.request_id, request_id);
+        assert_eq!(outer_request_id, request_id);
+        assert!(prepared.encoded_frame.len() <= MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(prepared.logical_bytes, prepared.encoded_frame.len());
     }
 
     #[test]
@@ -496,15 +505,10 @@ mod tests {
         );
 
         let prepared = prepare(input);
-        let response_bytes = serde_json::to_vec(&prepared.response)
-            .expect("response JSON")
-            .len();
+        let (_, response) = decode_response(&prepared);
 
-        assert_eq!(
-            prepared.logical_bytes,
-            response_bytes + prepared.encoded_frame.len()
-        );
-        assert_eq!(prepared.response.plugin_tool_result["metadata"], metadata);
+        assert_eq!(prepared.logical_bytes, prepared.encoded_frame.len());
+        assert_eq!(response.plugin_tool_result["metadata"], metadata);
         assert!(prepared.encoded_frame.len() > metadata.len());
     }
 
@@ -524,15 +528,14 @@ mod tests {
         input.inconsistent = true;
 
         let prepared = prepare(input);
-        let error = prepared.response.error.as_ref().expect("operator error");
+        let (outer_request_id, response) = decode_response(&prepared);
+        let error = response.error.as_ref().expect("operator error");
 
         assert_eq!(error.code, "plugin_completion_inconsistent");
         assert_eq!(error.request_id, request_id);
         assert_eq!(error.operation, "plugin_surface_render");
-        assert!(matches!(
-            decode_frame(&prepared),
-            ServerFrame::Response { request_id: outer, response }
-                if outer == request_id && response.error == prepared.response.error
-        ));
+        assert_eq!(outer_request_id, request_id);
+        assert_eq!(prepared.kind, DaemonResponseKind::OperatorError);
+        assert_eq!(prepared.logical_bytes, prepared.encoded_frame.len());
     }
 }
