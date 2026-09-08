@@ -1,0 +1,538 @@
+//! Bounded shaping and encoding for plugin control responses.
+
+use std::io;
+
+use botster_core::{PluginInvocationResult, RequestId};
+use botster_hub_client::{
+    DaemonOperatorError, DaemonResponse, DaemonResponseKind, MAX_CONTROL_RESPONSE_BYTES,
+};
+use botster_ui_contract::UiActionRequest;
+use serde::Serialize;
+
+use crate::client_api::{HubClientOperation, HubClientPluginSurface};
+use crate::client_api_dto::response::{
+    daemon_plugin_action_result, daemon_plugin_surface, daemon_plugin_tool_result,
+    daemon_response_base,
+};
+use crate::daemon::control::reply::RetainedPluginResult;
+use crate::daemon::error::{daemon_operator_error, daemon_plugin_tool_error};
+use crate::lifecycle::HubPluginLifecycle;
+use crate::runtime::{
+    complete_plugin_surface_action_with_lifecycle, complete_plugin_surface_render_with_lifecycle,
+};
+use crate::{HubRuntime, McpToolError};
+
+pub(crate) enum PluginResponseKind {
+    McpTool,
+    SurfaceRender {
+        package_name: String,
+        surface_id: String,
+    },
+    SurfaceAction {
+        package_name: String,
+        request: UiActionRequest,
+    },
+}
+
+pub(crate) struct PluginResponseInput {
+    pub(crate) kind: PluginResponseKind,
+    pub(crate) lifecycle: HubPluginLifecycle,
+    pub(crate) result: RetainedPluginResult<Result<PluginInvocationResult, String>>,
+    pub(crate) transport_request_id: String,
+    pub(crate) inconsistent: bool,
+}
+
+pub(crate) struct PreparedPluginResponse {
+    pub(crate) response: DaemonResponse,
+    pub(crate) encoded_frame: Vec<u8>,
+    pub(crate) logical_bytes: usize,
+}
+
+/// Shape and encode one plugin response while its raw-result charge remains held.
+pub(crate) fn prepare(input: PluginResponseInput) -> PreparedPluginResponse {
+    let PluginResponseInput {
+        kind,
+        lifecycle,
+        result,
+        transport_request_id,
+        inconsistent,
+    } = input;
+    let (result, retained_charge) = result.into_parts();
+    let response = shape_response(
+        &kind,
+        &lifecycle,
+        result,
+        &transport_request_id,
+        inconsistent,
+    );
+    let prepared = match encode_response(response, &transport_request_id) {
+        Ok(prepared) => prepared,
+        Err(EncodeResponseError::TooLarge) => {
+            let response = oversized_response(&kind, &transport_request_id);
+            encode_response(response, &transport_request_id)
+                .expect("the bounded plugin oversize response must serialize")
+        }
+        Err(EncodeResponseError::Serialize) => {
+            let response = encoding_error_response(&kind, &transport_request_id);
+            encode_response(response, &transport_request_id)
+                .expect("the bounded plugin encoding-error response must serialize")
+        }
+    };
+    drop(retained_charge);
+    prepared
+}
+
+fn shape_response(
+    kind: &PluginResponseKind,
+    lifecycle: &HubPluginLifecycle,
+    result: Result<PluginInvocationResult, String>,
+    transport_request_id: &str,
+    inconsistent: bool,
+) -> DaemonResponse {
+    if inconsistent {
+        let request_id = match &result {
+            Ok(PluginInvocationResult::Completed(success)) => &success.request_id.0,
+            Ok(PluginInvocationResult::Failed(failure)) => &failure.request_id.0,
+            Err(_) => transport_request_id,
+        };
+        return plugin_completion_inconsistent(
+            kind,
+            transport_request_id,
+            format!("plugin completion identity did not match admitted request {request_id}"),
+        );
+    }
+    let result =
+        result.map_err(|message| McpToolError::new("plugin_completion_inconsistent", message));
+    match kind {
+        PluginResponseKind::McpTool => {
+            match result.and_then(HubRuntime::complete_plugin_mcp_tool) {
+                Ok(value) => daemon_plugin_tool_result(value),
+                Err(error) => correlated_mcp_error(error, transport_request_id),
+            }
+        }
+        PluginResponseKind::SurfaceRender {
+            package_name,
+            surface_id,
+        } => match result.and_then(|result| {
+            complete_plugin_surface_render_with_lifecycle(lifecycle, package_name, result)
+        }) {
+            Ok(body) => daemon_plugin_surface(HubClientPluginSurface {
+                package_name: package_name.clone(),
+                surface_id: surface_id.clone(),
+                body,
+            }),
+            Err(error) => correlated_surface_error(
+                HubClientOperation::PluginSurfaceRender,
+                error,
+                transport_request_id,
+            ),
+        },
+        PluginResponseKind::SurfaceAction {
+            package_name,
+            request,
+        } => match result.and_then(|result| {
+            complete_plugin_surface_action_with_lifecycle(lifecycle, package_name, request, result)
+        }) {
+            Ok(result) => daemon_plugin_action_result(result),
+            Err(error) => correlated_surface_error(
+                HubClientOperation::PluginSurfaceAction,
+                error,
+                transport_request_id,
+            ),
+        },
+    }
+}
+
+fn plugin_completion_inconsistent(
+    kind: &PluginResponseKind,
+    transport_request_id: &str,
+    message: String,
+) -> DaemonResponse {
+    let error = McpToolError::new("plugin_completion_inconsistent", message);
+    match kind {
+        PluginResponseKind::McpTool => correlated_mcp_error(error, transport_request_id),
+        PluginResponseKind::SurfaceRender { .. } => correlated_surface_error(
+            HubClientOperation::PluginSurfaceRender,
+            error,
+            transport_request_id,
+        ),
+        PluginResponseKind::SurfaceAction { .. } => correlated_surface_error(
+            HubClientOperation::PluginSurfaceAction,
+            error,
+            transport_request_id,
+        ),
+    }
+}
+
+fn correlated_mcp_error(error: McpToolError, transport_request_id: &str) -> DaemonResponse {
+    let mut response = daemon_plugin_tool_error(error);
+    response
+        .error
+        .as_mut()
+        .expect("plugin tool errors carry an operator error")
+        .request_id = transport_request_id.to_string();
+    response
+}
+
+fn correlated_surface_error(
+    operation: HubClientOperation,
+    error: McpToolError,
+    transport_request_id: &str,
+) -> DaemonResponse {
+    daemon_operator_error(crate::client_api::plugin_error(
+        RequestId(transport_request_id.to_string()),
+        operation,
+        error,
+    ))
+}
+
+fn oversized_response(kind: &PluginResponseKind, transport_request_id: &str) -> DaemonResponse {
+    plugin_preparation_error(
+        kind,
+        transport_request_id,
+        "plugin_response_too_large",
+        "plugin response exceeds the control response limit",
+    )
+}
+
+fn encoding_error_response(
+    kind: &PluginResponseKind,
+    transport_request_id: &str,
+) -> DaemonResponse {
+    plugin_preparation_error(
+        kind,
+        transport_request_id,
+        "plugin_response_encode_failed",
+        "plugin response serialization failed",
+    )
+}
+
+fn plugin_preparation_error(
+    kind: &PluginResponseKind,
+    transport_request_id: &str,
+    code: &str,
+    message: &str,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: transport_request_id.to_string(),
+        operation: operation_label(kind).to_string(),
+        message: message.to_string(),
+        diagnostics: Vec::new(),
+    });
+    response
+}
+
+fn operation_label(kind: &PluginResponseKind) -> &'static str {
+    match kind {
+        PluginResponseKind::McpTool => "plugin_mcp_call",
+        PluginResponseKind::SurfaceRender { .. } => "plugin_surface_render",
+        PluginResponseKind::SurfaceAction { .. } => "plugin_surface_action",
+    }
+}
+
+fn encode_response(
+    response: DaemonResponse,
+    transport_request_id: &str,
+) -> Result<PreparedPluginResponse, EncodeResponseError> {
+    #[derive(Serialize)]
+    #[serde(tag = "frame", rename_all = "snake_case")]
+    enum BorrowedServerFrame<'a> {
+        Response {
+            request_id: &'a str,
+            response: &'a DaemonResponse,
+        },
+    }
+
+    let frame = BorrowedServerFrame::Response {
+        request_id: transport_request_id,
+        response: &response,
+    };
+    let encoded_frame = capped_json(&frame)?;
+    let response_bytes = capped_json_len(&response)?;
+    let logical_bytes = response_bytes
+        .checked_add(encoded_frame.len())
+        .expect("two bounded response byte counts cannot overflow");
+    Ok(PreparedPluginResponse {
+        response,
+        encoded_frame,
+        logical_bytes,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodeResponseError {
+    TooLarge,
+    Serialize,
+}
+
+fn capped_json(value: &impl Serialize) -> Result<Vec<u8>, EncodeResponseError> {
+    let mut writer = CappedVecWriter::new(MAX_CONTROL_RESPONSE_BYTES);
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return Err(if writer.exceeded {
+            EncodeResponseError::TooLarge
+        } else {
+            EncodeResponseError::Serialize
+        });
+    }
+    Ok(writer.bytes)
+}
+
+fn capped_json_len(value: &impl Serialize) -> Result<usize, EncodeResponseError> {
+    let mut writer = CappedCountingWriter::new(MAX_CONTROL_RESPONSE_BYTES);
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return Err(if writer.exceeded {
+            EncodeResponseError::TooLarge
+        } else {
+            EncodeResponseError::Serialize
+        });
+    }
+    Ok(writer.bytes)
+}
+
+struct CappedVecWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl CappedVecWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8 * 1024)),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl io::Write for CappedVecWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON byte limit exceeded"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct CappedCountingWriter {
+    bytes: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl CappedCountingWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl io::Write for CappedCountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes) {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON byte limit exceeded"));
+        }
+        self.bytes += buffer.len();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use botster_core::{
+        BoundaryJson, PluginHandlerKind, PluginHandlerRef, PluginInvocationSuccess, PluginKey,
+        PluginWorkerEngineConfig,
+    };
+    use botster_hub_client::ServerFrame;
+
+    use super::*;
+    use crate::daemon::control::reply::RetainedPluginResultBudget;
+
+    fn lifecycle() -> HubPluginLifecycle {
+        HubPluginLifecycle::with_config(PluginWorkerEngineConfig::default())
+    }
+
+    fn completed(payload: serde_json::Value) -> PluginInvocationResult {
+        PluginInvocationResult::Completed(PluginInvocationSuccess {
+            request_id: RequestId("core-request".to_string()),
+            handler: PluginHandlerRef {
+                plugin_key: PluginKey("example.plugin".to_string()),
+                kind: PluginHandlerKind::Command,
+                handler_id: "handler".to_string(),
+            },
+            payload: Some(BoundaryJson(payload)),
+        })
+    }
+
+    fn input(
+        kind: PluginResponseKind,
+        result: Result<PluginInvocationResult, String>,
+        transport_request_id: &str,
+    ) -> (PluginResponseInput, RetainedPluginResultBudget) {
+        let budget = RetainedPluginResultBudget::new();
+        let charge = budget.try_reserve(1).expect("test result charge");
+        (
+            PluginResponseInput {
+                kind,
+                lifecycle: lifecycle(),
+                result: RetainedPluginResult::new(result, charge),
+                transport_request_id: transport_request_id.to_string(),
+                inconsistent: false,
+            },
+            budget,
+        )
+    }
+
+    fn decode_frame(prepared: &PreparedPluginResponse) -> ServerFrame {
+        serde_json::from_slice(&prepared.encoded_frame).expect("encoded server frame")
+    }
+
+    #[test]
+    fn surface_response_keeps_one_canonical_snapshot_body() {
+        let body = serde_json::json!({
+            "type": "text",
+            "id": "large-body",
+            "props": { "text": "x".repeat(MAX_CONTROL_RESPONSE_BYTES / 2) }
+        });
+        let (input, budget) = input(
+            PluginResponseKind::SurfaceRender {
+                package_name: "example.plugin".to_string(),
+                surface_id: "example.surface".to_string(),
+            },
+            Ok(completed(body)),
+            "19",
+        );
+
+        let prepared = prepare(input);
+
+        assert_eq!(prepared.response.kind, DaemonResponseKind::PluginSurface);
+        assert!(prepared.encoded_frame.len() <= MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(budget.retained_bytes(), 0);
+        let response_json = serde_json::to_value(&prepared.response).expect("response JSON");
+        let surface = &response_json["plugin_surface"];
+        assert!(surface.get("body").is_none());
+        assert_eq!(surface["ui_tree_snapshot"]["body"]["id"], "large-body");
+    }
+
+    #[test]
+    fn exact_frame_limit_is_accepted() {
+        let request_id = "20";
+        let empty_response = daemon_plugin_tool_result(serde_json::Value::String(String::new()));
+        let empty_frame = ServerFrame::Response {
+            request_id: request_id.to_string(),
+            response: empty_response,
+        };
+        let empty_len = serde_json::to_vec(&empty_frame).expect("empty frame").len();
+        let padding = MAX_CONTROL_RESPONSE_BYTES - empty_len;
+        let (input, _) = input(
+            PluginResponseKind::McpTool,
+            Ok(completed(serde_json::Value::String("x".repeat(padding)))),
+            request_id,
+        );
+
+        let prepared = prepare(input);
+
+        assert_eq!(
+            prepared.response.kind,
+            DaemonResponseKind::PluginMcpToolResult
+        );
+        assert_eq!(prepared.encoded_frame.len(), MAX_CONTROL_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn oversized_frame_becomes_a_bounded_correlated_error() {
+        let request_id = "21";
+        let empty_response = daemon_plugin_tool_result(serde_json::Value::String(String::new()));
+        let empty_frame = ServerFrame::Response {
+            request_id: request_id.to_string(),
+            response: empty_response,
+        };
+        let padding = MAX_CONTROL_RESPONSE_BYTES
+            - serde_json::to_vec(&empty_frame).expect("empty frame").len()
+            + 1;
+        let (input, _) = input(
+            PluginResponseKind::McpTool,
+            Ok(completed(serde_json::Value::String("x".repeat(padding)))),
+            request_id,
+        );
+
+        let prepared = prepare(input);
+
+        assert!(prepared.encoded_frame.len() <= MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(prepared.response.kind, DaemonResponseKind::OperatorError);
+        let error = prepared.response.error.as_ref().expect("operator error");
+        assert_eq!(error.code, "plugin_response_too_large");
+        assert_eq!(error.request_id, request_id);
+        assert!(matches!(
+            decode_frame(&prepared),
+            ServerFrame::Response { request_id: outer, response }
+                if outer == request_id && response == prepared.response
+        ));
+    }
+
+    #[test]
+    fn metadata_escaping_uses_the_encoded_json_byte_count() {
+        let metadata = "quote=\" slash=\\ newline=\n snowman=☃";
+        let (input, _) = input(
+            PluginResponseKind::McpTool,
+            Ok(completed(serde_json::json!({ "metadata": metadata }))),
+            "22",
+        );
+
+        let prepared = prepare(input);
+        let response_bytes = serde_json::to_vec(&prepared.response)
+            .expect("response JSON")
+            .len();
+
+        assert_eq!(
+            prepared.logical_bytes,
+            response_bytes + prepared.encoded_frame.len()
+        );
+        assert_eq!(prepared.response.plugin_tool_result["metadata"], metadata);
+        assert!(prepared.encoded_frame.len() > metadata.len());
+    }
+
+    #[test]
+    fn completion_error_keeps_inner_and_outer_transport_correlation() {
+        let request_id = "23";
+        let (mut input, _) = input(
+            PluginResponseKind::SurfaceRender {
+                package_name: "example.plugin".to_string(),
+                surface_id: "example.surface".to_string(),
+            },
+            Ok(completed(serde_json::json!({
+                "wrong": "handler metadata must not be converted"
+            }))),
+            request_id,
+        );
+        input.inconsistent = true;
+
+        let prepared = prepare(input);
+        let error = prepared.response.error.as_ref().expect("operator error");
+
+        assert_eq!(error.code, "plugin_completion_inconsistent");
+        assert_eq!(error.request_id, request_id);
+        assert_eq!(error.operation, "plugin_surface_render");
+        assert!(matches!(
+            decode_frame(&prepared),
+            ServerFrame::Response { request_id: outer, response }
+                if outer == request_id && response.error == prepared.response.error
+        ));
+    }
+}
