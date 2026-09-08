@@ -105,6 +105,7 @@ pub struct HubRuntime {
     coordination_bridge: HubCoordinationBridge,
     entity_publish_bridge: HubEntityPublishBridge,
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
+    package_entity_resync_changed: std::cell::Cell<bool>,
     package_entity_fanout: Arc<Mutex<VecDeque<LeasedFanoutMutation>>>,
     package_entity_finishes: Arc<Mutex<VecDeque<CausalOp>>>,
     last_capability_cleanup: Option<PluginCleanupResult>,
@@ -346,6 +347,7 @@ impl HubRuntime {
             coordination_bridge: HubCoordinationBridge::new(),
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
+            package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
             package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
             config,
@@ -452,6 +454,7 @@ impl HubRuntime {
             coordination_bridge: HubCoordinationBridge::new(),
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
+            package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
             package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
             config,
@@ -2117,6 +2120,7 @@ impl HubRuntime {
                 .expect("package entity fanout lock");
             fanout.extend(leased_ready);
         }
+        self.note_package_entity_resync_changed();
         Ok(result)
     }
 
@@ -2237,6 +2241,7 @@ impl HubRuntime {
             family.resync.mark_needed(now);
             let added = family.remember_resync_lease(lease.scope_id, lease.family.clone());
             drop(families);
+            self.note_package_entity_resync_changed();
             if added {
                 return CausalOp::Transfer {
                     scope_id: lease.scope_id,
@@ -2272,6 +2277,7 @@ impl HubRuntime {
         entity_type: &str,
         snapshot_seq: u64,
     ) -> PackageEntityFamilyProgress {
+        self.note_package_entity_resync_changed();
         self.package_entity_families
             .lock()
             .expect("package entity family lock")
@@ -2340,6 +2346,7 @@ impl HubRuntime {
     /// No-ops while the family is `resync_degraded`; only [`Self::rearm_package_entity_resync`]
     /// or a new publish admission restarts a need cycle after degradation.
     pub fn mark_package_entity_resync_needed(&self, entity_type: &str) {
+        self.note_package_entity_resync_changed();
         let now = Instant::now();
         let mut families = self
             .package_entity_families
@@ -2355,6 +2362,7 @@ impl HubRuntime {
     /// Explicitly re-arm resync after a new catching-up subscription (or other
     /// progress event that must clear degradation).
     pub fn rearm_package_entity_resync(&self, entity_type: &str) {
+        self.note_package_entity_resync_changed();
         let now = Instant::now();
         let mut families = self
             .package_entity_families
@@ -2367,19 +2375,45 @@ impl HubRuntime {
             .rearm(now);
     }
 
-    /// Families with an eligible provider resync attempt right now.
-    #[must_use]
-    pub fn package_entity_resync_eligible_families(&self) -> Vec<String> {
-        let now = Instant::now();
+    /// Retain a resync change until the owner records the scheduling work.
+    pub(crate) fn note_package_entity_resync_changed(&self) {
+        self.package_entity_resync_changed.set(true);
+    }
+
+    pub(crate) fn take_package_entity_resync_notification(&self) -> bool {
+        self.package_entity_resync_changed.replace(false)
+    }
+
+    /// Inspect one family after the retained cursor, including inactive families.
+    pub(crate) fn next_package_entity_resync_family(
+        &self,
+        after: Option<&str>,
+    ) -> Option<(String, Option<Instant>, bool)> {
         let families = self
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        families
-            .iter()
-            .filter(|(_, state)| state.resync.can_attempt(now))
-            .map(|(entity_type, _)| entity_type.clone())
-            .collect()
+        let next = match after {
+            Some(after) => families
+                .range::<str, _>((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .next(),
+            None => families.first_key_value(),
+        };
+        next.map(|(name, family)| {
+            (
+                name.clone(),
+                family.resync.next_attempt_at(),
+                family.resync.degraded && !family.resync.leases.is_empty(),
+            )
+        })
+    }
+
+    pub(crate) fn package_entity_resync_next_attempt(&self, entity_type: &str) -> Option<Instant> {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(entity_type)
+            .and_then(|family| family.resync.next_attempt_at())
     }
 
     /// Record a resync attempt; returns whether the family entered degraded.
@@ -2391,37 +2425,39 @@ impl HubRuntime {
             .expect("package entity family lock");
         let family = families.entry(entity_type.to_string()).or_default();
         let degraded = family.resync.record_attempt(now);
-        if degraded || !family.resync.needed {
-            let started = Instant::now();
-            let mut applied = 0;
-            for (scope_id, family_name) in
-                self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
-            {
-                family.remember_resync_lease(scope_id, family_name);
-            }
+        drop(families);
+        if degraded {
+            self.release_one_degraded_package_entity_resync_lease(entity_type);
         }
         degraded
     }
 
-    /// Clear resync need after successful convergence when no gap remains.
-    pub fn recompute_package_entity_resync(&self, entity_type: &str) {
-        let now = Instant::now();
-        let mut families = self
-            .package_entity_families
-            .lock()
-            .expect("package entity family lock");
-        if let Some(family) = families.get_mut(entity_type) {
-            family.recompute_resync_need(now);
-            if !family.resync.needed {
-                let started = Instant::now();
-                let mut applied = 0;
-                for (scope_id, family_name) in
-                    self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
-                {
-                    family.remember_resync_lease(scope_id, family_name);
+    /// Release one degraded resync lease and retain any rejected causal operation.
+    pub(crate) fn release_one_degraded_package_entity_resync_lease(
+        &self,
+        entity_type: &str,
+    ) -> bool {
+        let lease = {
+            let mut families = self
+                .package_entity_families
+                .lock()
+                .expect("package entity family lock");
+            families.get_mut(entity_type).and_then(|family| {
+                if family.resync.degraded {
+                    family.resync.leases.pop_first()
+                } else {
+                    None
                 }
-            }
-        }
+            })
+        };
+        let Some((scope_id, family)) = lease else {
+            return false;
+        };
+        self.finish_package_entity_causal_op(CausalOp::Release {
+            scope_id,
+            identity: LeaseIdentity::ProviderResyncNeed { family },
+        });
+        true
     }
 
     /// Drop all package entity admission state for families owned by a package.
@@ -2431,6 +2467,7 @@ impl HubRuntime {
     }
 
     fn drop_package_entity_families(&self, package_name: &str, mut families: BTreeSet<String>) {
+        self.note_package_entity_resync_changed();
         let mut state = self
             .package_entity_families
             .lock()
