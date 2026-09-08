@@ -12,6 +12,7 @@ use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::daemon::control::session_types::{
     SessionTypeCatalogBuild, bounded_session_type_catalog_entities,
 };
+use crate::entrypoint_supervisor::EntrypointSupervisor;
 use crate::managed_git_worktrees::{
     ManagedGitRequest, ManagedWorktreeDecision, PreparedManagedWorktree,
     create_managed_worktree_effect, finalize_managed_worktree,
@@ -45,6 +46,7 @@ impl HostError {
 }
 
 pub(crate) enum HostCommand {
+    StopEntrypoints,
     BuildSessionTypeCatalog {
         generation: u64,
         packages: SharedView<PackageRegistry>,
@@ -79,6 +81,7 @@ pub(crate) enum HostCommand {
 impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
+            Self::StopEntrypoints => 0,
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
             Self::Mutation(_) => 0,
             Self::ReclaimSessionTypeCatalog(_) => 0,
@@ -94,6 +97,7 @@ impl HostCommand {
 impl std::fmt::Debug for HostCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::StopEntrypoints => formatter.write_str("StopEntrypoints"),
             Self::BuildSessionTypeCatalog { generation, .. } => formatter
                 .debug_struct("BuildSessionTypeCatalog")
                 .field("generation", generation)
@@ -136,6 +140,7 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
+    EntrypointsStopped,
     SessionTypeCatalogReady {
         generation: u64,
         entities: BTreeMap<String, Value>,
@@ -158,6 +163,7 @@ pub(crate) enum HostResult {
 impl HostResult {
     fn generation(&self) -> u64 {
         match self {
+            Self::EntrypointsStopped => 0,
             Self::SessionTypeCatalogReady { generation, .. } | Self::Failed { generation, .. } => {
                 *generation
             }
@@ -236,6 +242,7 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
+        HostResult::EntrypointsStopped => 0,
         HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
         HostResult::Failed { .. } | HostResult::Mutation(_) => 0,
         HostResult::ManagedWorktreeCreated(_)
@@ -249,6 +256,16 @@ fn result_logical_bytes(result: &HostResult) -> usize {
 pub(crate) enum HostSubmitError {
     Full,
     Stopped,
+    PhaseExhausted,
+}
+
+/// Submission failure retains the command and its operation slot.
+#[derive(Debug)]
+pub(crate) struct HostSubmissionFailure {
+    pub(crate) error: HostSubmitError,
+    pub(crate) identity: HostJobIdentity,
+    pub(crate) command: HostCommand,
+    pub(crate) permit: HostWorkPermit,
 }
 
 #[derive(Debug)]
@@ -440,15 +457,17 @@ impl HostExecutor {
             wake: Arc::clone(&wake),
         });
         let stopping = Arc::new(AtomicBool::new(false));
+        let entrypoints = Arc::new(Mutex::new(EntrypointSupervisor::default()));
         let workers = (0..HOST_WORKER_COUNT)
             .map(|index| {
                 let jobs = Arc::clone(&jobs_rx);
                 let completions = completions_tx.clone();
                 let wake = Arc::clone(&wake);
                 let stopping = Arc::clone(&stopping);
+                let entrypoints = Arc::clone(&entrypoints);
                 thread::Builder::new()
                     .name(format!("botster-hub-host-{index}"))
-                    .spawn(move || run_worker(jobs, completions, wake, stopping))
+                    .spawn(move || run_worker(jobs, completions, wake, stopping, entrypoints))
                     .expect("start bounded Hub host worker")
             })
             .collect();
@@ -519,65 +538,36 @@ impl HostExecutor {
         identity: HostJobIdentity,
         command: HostCommand,
         permit: HostWorkPermit,
-    ) -> Result<(), HostSubmitError> {
+    ) -> Result<(), HostSubmissionFailure> {
         let job = HostJob {
             identity,
             command,
             permit,
         };
-        self.jobs
-            .as_ref()
-            .ok_or(HostSubmitError::Stopped)?
-            .try_send(job)
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => HostSubmitError::Full,
-                mpsc::TrySendError::Disconnected(_) => HostSubmitError::Stopped,
-            })
-    }
-
-    pub(crate) fn submit_catalog_reclamation(
-        &self,
-        identity: HostJobIdentity,
-        reclamation: SessionTypeCatalogReclamation,
-        permit: HostWorkPermit,
-    ) -> Result<
-        (),
-        (
-            HostSubmitError,
-            SessionTypeCatalogReclamation,
-            HostWorkPermit,
-        ),
-    > {
-        let job = HostJob {
+        let failure = match self.jobs.as_ref() {
+            Some(jobs) => match jobs.try_send(job) {
+                Ok(()) => return Ok(()),
+                // Each queued command owns a permit. The queue and permit pool
+                // both hold eight operations, so a reserved command has space.
+                // Preserve the command if this invariant fails.
+                Err(mpsc::TrySendError::Full(job)) => (HostSubmitError::Full, job),
+                Err(mpsc::TrySendError::Disconnected(job)) => (HostSubmitError::Stopped, job),
+            },
+            None => (HostSubmitError::Stopped, job),
+        };
+        let (
+            error,
+            HostJob {
+                identity,
+                command,
+                permit,
+            },
+        ) = failure;
+        Err(HostSubmissionFailure {
+            error,
             identity,
-            command: HostCommand::ReclaimSessionTypeCatalog(reclamation),
+            command,
             permit,
-        };
-        let Some(jobs) = self.jobs.as_ref() else {
-            let HostJob {
-                command: HostCommand::ReclaimSessionTypeCatalog(reclamation),
-                permit,
-                ..
-            } = job
-            else {
-                unreachable!()
-            };
-            return Err((HostSubmitError::Stopped, reclamation, permit));
-        };
-        jobs.try_send(job).map_err(|error| {
-            let (kind, job) = match error {
-                mpsc::TrySendError::Full(job) => (HostSubmitError::Full, job),
-                mpsc::TrySendError::Disconnected(job) => (HostSubmitError::Stopped, job),
-            };
-            let HostJob {
-                command: HostCommand::ReclaimSessionTypeCatalog(reclamation),
-                permit,
-                ..
-            } = job
-            else {
-                unreachable!()
-            };
-            (kind, reclamation, permit)
         })
     }
 
@@ -628,6 +618,7 @@ fn run_worker(
     completions: mpsc::SyncSender<HostCompletion>,
     wake: Arc<HostWake>,
     stopping: Arc<AtomicBool>,
+    entrypoints: Arc<Mutex<EntrypointSupervisor>>,
 ) {
     loop {
         let job = jobs
@@ -660,11 +651,13 @@ fn run_worker(
             command => command,
         };
         let generation = command.generation();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(command)))
-            .unwrap_or_else(|_| HostResult::Failed {
-                generation,
-                error: HostError::new("host_worker_panicked", "host worker execution panicked"),
-            });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute(command, &entrypoints)
+        }))
+        .unwrap_or_else(|_| HostResult::Failed {
+            generation,
+            error: HostError::new("host_worker_panicked", "host worker execution panicked"),
+        });
         if completions
             .send(HostCompletion {
                 identity,
@@ -682,8 +675,15 @@ fn run_worker(
     }
 }
 
-fn execute(command: HostCommand) -> HostResult {
+fn execute(command: HostCommand, entrypoints: &Mutex<EntrypointSupervisor>) -> HostResult {
     match command {
+        HostCommand::StopEntrypoints => {
+            let mut entrypoints = entrypoints
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            drop(std::mem::take(&mut *entrypoints));
+            HostResult::EntrypointsStopped
+        }
         HostCommand::BuildSessionTypeCatalog {
             generation,
             packages,
@@ -720,7 +720,17 @@ fn execute(command: HostCommand) -> HostResult {
             },
         },
         HostCommand::Mutation(command) => {
-            HostResult::Mutation(crate::host_mutations::execute(command))
+            if command.uses_entrypoints() {
+                let mut entrypoints = entrypoints
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                HostResult::Mutation(crate::host_mutations::execute(
+                    command,
+                    Some(&mut entrypoints),
+                ))
+            } else {
+                HostResult::Mutation(crate::host_mutations::execute(command, None))
+            }
         }
         HostCommand::ReclaimSessionTypeCatalog(_) => {
             unreachable!("catalog reclamation completes without a result")
@@ -952,6 +962,49 @@ mod tests {
         assert!(executor.try_reserve().is_none());
         drop(permits);
         assert_eq!(executor.outstanding(), 0);
+    }
+
+    #[test]
+    fn rejected_submission_retains_command_and_both_reservations() {
+        for expected in [HostSubmitError::Stopped, HostSubmitError::Full] {
+            let mut executor = HostExecutor::new();
+            executor.jobs.take();
+            // A zero-capacity queue injects the reserved-queue invariant failure.
+            let (sender, receiver) = mpsc::sync_channel(0);
+            if expected == HostSubmitError::Full {
+                executor.jobs = Some(sender);
+            }
+            let permit = executor.try_reserve().expect("reserve rejected operation");
+            let gate = Arc::new(TestHostGate::default());
+            let identity = HostJobIdentity {
+                waiter_id: WaiterId(91),
+                phase: 4,
+            };
+            let failure = executor
+                .submit(
+                    identity,
+                    HostCommand::Wait {
+                        generation: 73,
+                        gate: Arc::clone(&gate),
+                    },
+                    permit,
+                )
+                .expect_err("submission must reject the injected queue state");
+            assert_eq!(failure.error, expected);
+            assert_eq!(failure.identity, identity);
+            assert!(
+                matches!(&failure.command, HostCommand::Wait { generation: 73, gate: retained } if Arc::ptr_eq(retained, &gate))
+            );
+            assert_eq!(executor.outstanding(), 1);
+            assert_eq!(
+                executor.prepared.used.load(Ordering::Acquire),
+                HOST_PREPARED_BYTE_CAPACITY
+            );
+            drop(failure);
+            assert_eq!(executor.outstanding(), 0);
+            assert_eq!(executor.prepared.used.load(Ordering::Acquire), 0);
+            drop(receiver);
+        }
     }
 
     #[test]
@@ -1278,6 +1331,7 @@ mod tests {
                     completions_tx,
                     wake,
                     stopping,
+                    Arc::new(Mutex::new(EntrypointSupervisor::default())),
                 )
             }
         });

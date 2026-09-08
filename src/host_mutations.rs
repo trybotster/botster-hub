@@ -43,12 +43,13 @@ use crate::daemon_projection::{
     apps_from_registry, package_route_descriptors, package_state_label,
     runnable_entrypoint_kind_label, runnable_launch_mode_label,
 };
-use crate::entrypoint_supervisor::EntrypointProcessSnapshot;
+use crate::entrypoint_supervisor::{EntrypointProcessSnapshot, EntrypointSupervisor};
 use crate::host_executor::HOST_PREPARED_BYTE_CAPACITY;
 use crate::packages::{
     PackageAction, PackageAdmissionReason, PackageDecision, PackageRegistryError, PackageState,
 };
 use crate::persistence::{FileHubStateStore, HubState, PreparedHubStateWrite};
+use crate::runtime::package_effect::{HostPackageCleanup, HostPackageRuntime};
 use crate::session_types::{
     PackageSessionType, RepoSessionTypeFileSnapshot, SessionTypeMutation,
     SessionTypeMutationSource, commit_repo_session_type_mutation,
@@ -62,37 +63,103 @@ use crate::{
 };
 
 /// Execute one owned host mutation command.
-pub(crate) fn execute(command: HostMutationCommand) -> HostMutationResult {
+pub(crate) fn execute(
+    command: HostMutationCommand,
+    entrypoints: Option<&mut EntrypointSupervisor>,
+) -> HostMutationResult {
     let result = match command {
-        HostMutationCommand::Read(read) => execute_read(read).map(HostMutationResult::ReadReady),
+        HostMutationCommand::ApplyPackageEffect(effect) => {
+            return execute_package_effect(
+                effect,
+                entrypoints.expect("package effect has the host supervisor"),
+            );
+        }
+        HostMutationCommand::RestorePackageRuntime(restore) => {
+            return execute_package_runtime_restore(
+                restore,
+                entrypoints.expect("package restore has the host supervisor"),
+            );
+        }
+        HostMutationCommand::ValidateBootstrap {
+            request,
+            base_revision,
+            packages,
+        } => {
+            let DaemonRequest::IssueLocalWebrtcBootstrap {
+                package_name,
+                entrypoint_id,
+                origin,
+            } = request
+            else {
+                unreachable!("bootstrap validation receives a bootstrap request")
+            };
+            match crate::daemon::control::webrtc::validate_local_webrtc_bootstrap(
+                &packages,
+                entrypoints.expect("bootstrap validation has the host supervisor"),
+                &package_name,
+                &entrypoint_id,
+                &origin,
+            ) {
+                Ok(origin) => {
+                    return HostMutationResult::BootstrapReady {
+                        base_revision,
+                        origin,
+                    };
+                }
+                Err(response) => HostReply::try_new(response).map(HostMutationResult::ReadReady),
+            }
+        }
+        HostMutationCommand::Read(read) => {
+            execute_read(read, entrypoints).map(HostMutationResult::ReadReady)
+        }
         HostMutationCommand::Prepare(prepare) => {
-            execute_prepare(prepare).map(HostMutationResult::Prepared)
+            execute_prepare(prepare, entrypoints).map(HostMutationResult::Prepared)
         }
         HostMutationCommand::Commit(commit) => return execute_commit(commit),
         HostMutationCommand::Recover(recover) => {
             Ok(HostMutationResult::Recovered(execute_recovery(recover)))
         }
         HostMutationCommand::RestorePackage(restore) => return execute_package_restore(restore),
-        HostMutationCommand::FinalizePackage(finalize) => {
-            finalize_package_reply(finalize).map(HostMutationResult::ReadReady)
-        }
     };
     result.unwrap_or_else(HostMutationResult::Failed)
 }
 
 /// One family-specific host command.
 pub(crate) enum HostMutationCommand {
+    ApplyPackageEffect(HostPackageEffect),
+    RestorePackageRuntime(HostPackageRuntimeRestore),
+    ValidateBootstrap {
+        request: DaemonRequest,
+        base_revision: u64,
+        packages: SharedView<PackageRegistry>,
+    },
     Read(HostRead),
     Prepare(HostPrepare),
     Commit(HostCommit),
     Recover(HostRecover),
     RestorePackage(HostPackageRestore),
-    FinalizePackage(HostPackageFinalize),
+}
+
+impl HostMutationCommand {
+    pub(crate) fn uses_entrypoints(&self) -> bool {
+        matches!(
+            self,
+            Self::ApplyPackageEffect(_)
+                | Self::RestorePackageRuntime(_)
+                | Self::ValidateBootstrap { .. }
+                | Self::Read(HostRead::Package { .. } | HostRead::Entrypoint { .. })
+                | Self::Prepare(HostPrepare::Package { .. })
+        )
+    }
 }
 
 impl std::fmt::Debug for HostMutationCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
+            Self::ApplyPackageEffect(_) => "ApplyPackageEffect",
+            Self::RestorePackageRuntime(_) => "RestorePackageRuntime",
+            Self::ValidateBootstrap { .. } => "ValidateBootstrap",
+            Self::Read(HostRead::Entrypoint { .. }) => "Entrypoint",
             Self::Read(HostRead::Package { .. }) => "ReadPackage",
             Self::Read(HostRead::SpawnTarget { .. }) => "ReadSpawnTarget",
             Self::Read(HostRead::SessionType { .. }) => "ReadSessionType",
@@ -106,7 +173,6 @@ impl std::fmt::Debug for HostMutationCommand {
             Self::Commit(_) => "Commit",
             Self::Recover(_) => "Recover",
             Self::RestorePackage(_) => "RestorePackage",
-            Self::FinalizePackage(_) => "FinalizePackage",
         };
         formatter.write_str(name)
     }
@@ -114,11 +180,15 @@ impl std::fmt::Debug for HostMutationCommand {
 
 /// Owned inputs for a host read.
 pub(crate) enum HostRead {
+    Entrypoint {
+        request: DaemonRequest,
+        config: HubConfig,
+        packages: SharedView<PackageRegistry>,
+    },
     Package {
         request: DaemonRequest,
         config: HubConfig,
         packages: SharedView<PackageRegistry>,
-        entrypoint_processes: Vec<EntrypointProcessSnapshot>,
     },
     SpawnTarget {
         request: DaemonRequest,
@@ -139,7 +209,6 @@ pub(crate) enum HostPrepare {
         base_revision: u64,
         state: SharedView<HubState>,
         packages: SharedView<PackageRegistry>,
-        entrypoint_processes: Vec<EntrypointProcessSnapshot>,
         data_directory: PathBuf,
     },
     ManagedWorktree {
@@ -200,11 +269,44 @@ pub(crate) struct RestoredPackageView {
 /// A committed package response that needs current entrypoint snapshots.
 pub(crate) struct HostPackageFinalize {
     pub(crate) reply: HostReply,
-    pub(crate) entrypoint_processes: Vec<EntrypointProcessSnapshot>,
+}
+
+pub(crate) struct HostPackageEffect {
+    pub(crate) effect: PackageRuntimeEffect,
+    pub(crate) runtime: HostPackageRuntime,
+    pub(crate) config: HubConfig,
+    pub(crate) packages: SharedView<PackageRegistry>,
+    pub(crate) reply: HostReply,
+}
+
+pub(crate) struct HostPackageRuntimeRestore {
+    pub(crate) effect: PackageRuntimeEffect,
+    pub(crate) original: DaemonTransportError,
+    pub(crate) runtime: HostPackageRuntime,
+    pub(crate) config: HubConfig,
 }
 
 /// One typed host result.
 pub(crate) enum HostMutationResult {
+    PackageEffectApplied {
+        reply: Result<HostReply, HostMutationError>,
+        cleanup: HostPackageCleanup,
+    },
+    PackageEffectFailed {
+        effect: PackageRuntimeEffect,
+        error: DaemonTransportError,
+        cleanup: HostPackageCleanup,
+    },
+    PackageRuntimeRestored {
+        effect: PackageRuntimeEffect,
+        original: DaemonTransportError,
+        rollbacks: Vec<crate::daemon::error::PackageRollbackFailure>,
+        cleanup: HostPackageCleanup,
+    },
+    BootstrapReady {
+        base_revision: u64,
+        origin: String,
+    },
     ReadReady(HostReply),
     Prepared(PreparedMutation),
     Committed(CommittedView),
@@ -217,6 +319,12 @@ pub(crate) enum HostMutationResult {
 impl std::fmt::Debug for HostMutationResult {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PackageEffectApplied { .. } => formatter.write_str("PackageEffectApplied(..)"),
+            Self::PackageEffectFailed { .. } => formatter.write_str("PackageEffectFailed(..)"),
+            Self::PackageRuntimeRestored { .. } => {
+                formatter.write_str("PackageRuntimeRestored(..)")
+            }
+            Self::BootstrapReady { .. } => formatter.write_str("BootstrapReady(..)"),
             Self::ReadReady(reply) => formatter
                 .debug_tuple("ReadReady")
                 .field(&reply.logical_bytes)
@@ -241,6 +349,88 @@ impl std::fmt::Debug for HostMutationResult {
     }
 }
 
+fn execute_package_effect(
+    job: HostPackageEffect,
+    entrypoints: &mut EntrypointSupervisor,
+) -> HostMutationResult {
+    let HostPackageEffect {
+        effect,
+        mut runtime,
+        config,
+        packages,
+        reply,
+    } = job;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::daemon::control::packages::mutations::apply_committed_runtime_effect(
+            &mut runtime,
+            entrypoints,
+            &config,
+            &packages,
+            &effect,
+        )
+    }))
+    .unwrap_or_else(|_| {
+        Err(DaemonTransportError::Protocol(
+            "host package runtime effect panicked",
+        ))
+    });
+    let cleanup = runtime.into_cleanup();
+    match result {
+        Ok(()) => {
+            let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                finalize_package_reply(HostPackageFinalize { reply }, entrypoints)
+            }))
+            .unwrap_or_else(|_| {
+                Err(HostMutationError::new(
+                    "host_package_reply_panicked",
+                    "package reply preparation panicked",
+                ))
+            });
+            HostMutationResult::PackageEffectApplied { reply, cleanup }
+        }
+        Err(error) => HostMutationResult::PackageEffectFailed {
+            effect,
+            error,
+            cleanup,
+        },
+    }
+}
+
+fn execute_package_runtime_restore(
+    job: HostPackageRuntimeRestore,
+    entrypoints: &mut EntrypointSupervisor,
+) -> HostMutationResult {
+    let HostPackageRuntimeRestore {
+        effect,
+        original,
+        mut runtime,
+        config,
+    } = job;
+    let rollbacks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::daemon::control::packages::mutations::restore_runtime_after_failed_effect(
+            &mut runtime,
+            entrypoints,
+            &config,
+            &effect,
+        )
+    }))
+    .unwrap_or_else(|_| {
+        vec![crate::daemon::error::PackageRollbackFailure {
+            step: "runtime",
+            package_name: None,
+            error: Box::new(DaemonTransportError::Protocol(
+                "host package runtime restore panicked",
+            )),
+        }]
+    });
+    HostMutationResult::PackageRuntimeRestored {
+        effect,
+        original,
+        rollbacks,
+        cleanup: runtime.into_cleanup(),
+    }
+}
+
 fn execute_package_restore(restore: HostPackageRestore) -> HostMutationResult {
     let HostPackageRestore {
         previous_state,
@@ -261,11 +451,12 @@ fn execute_package_restore(restore: HostPackageRestore) -> HostMutationResult {
     }
 }
 
-fn finalize_package_reply(finalize: HostPackageFinalize) -> Result<HostReply, HostMutationError> {
-    let HostPackageFinalize {
-        mut reply,
-        entrypoint_processes,
-    } = finalize;
+fn finalize_package_reply(
+    finalize: HostPackageFinalize,
+    entrypoints: &mut EntrypointSupervisor,
+) -> Result<HostReply, HostMutationError> {
+    let HostPackageFinalize { mut reply } = finalize;
+    let entrypoint_processes = entrypoints.snapshots();
     apply_daemon_entrypoint_processes(&mut reply.response, entrypoint_processes);
     HostReply::try_new(reply.response)
 }
@@ -277,7 +468,7 @@ pub(crate) struct HostReply {
 }
 
 impl HostReply {
-    fn try_new(response: DaemonResponse) -> Result<Self, HostMutationError> {
+    pub(crate) fn try_new(response: DaemonResponse) -> Result<Self, HostMutationError> {
         let logical_bytes = encoded_len(&response, "host_reply_encode_failed")?;
         if logical_bytes > MAX_CONTROL_RESPONSE_BYTES {
             return Err(HostMutationError::new(
@@ -317,7 +508,7 @@ pub(crate) struct PreparedStateChange {
     package_effect: Option<PackageRuntimeEffect>,
 }
 
-/// One live runtime effect that the owner must apply after a package commit.
+/// One runtime effect that a host worker applies after a package commit.
 pub(crate) enum PackageRuntimeEffect {
     Enable {
         package_name: String,
@@ -472,14 +663,44 @@ impl HostMutationError {
     }
 }
 
-fn execute_read(read: HostRead) -> Result<HostReply, HostMutationError> {
+fn execute_read(
+    read: HostRead,
+    entrypoints: Option<&mut EntrypointSupervisor>,
+) -> Result<HostReply, HostMutationError> {
     let response = match read {
+        HostRead::Entrypoint {
+            request,
+            config,
+            packages,
+        } => {
+            match crate::daemon::control::packages::handle_request(
+                &config,
+                &packages,
+                entrypoints.expect("entrypoint request has the host supervisor"),
+                request,
+            ) {
+                Ok(response) => response,
+                Err(DaemonTransportError::Entrypoint(error)) => {
+                    crate::daemon::error::daemon_entrypoint_error(error)
+                }
+                Err(DaemonTransportError::Package(error)) => {
+                    crate::daemon::error::daemon_package_error(error)
+                }
+                Err(error) => return Err(daemon_error(error)),
+            }
+        }
         HostRead::Package {
             request,
             config,
             packages,
-            entrypoint_processes,
-        } => package_read(request, &config, &packages, entrypoint_processes)?,
+        } => package_read(
+            request,
+            &config,
+            &packages,
+            entrypoints
+                .expect("package read has the host supervisor")
+                .snapshots(),
+        )?,
         HostRead::SpawnTarget { request, state } => spawn_target_read(request, &state)?,
         HostRead::SessionType {
             request,
@@ -1028,21 +1249,25 @@ fn spawn_target_read(
     }
 }
 
-fn execute_prepare(prepare: HostPrepare) -> Result<PreparedMutation, HostMutationError> {
+fn execute_prepare(
+    prepare: HostPrepare,
+    entrypoints: Option<&mut EntrypointSupervisor>,
+) -> Result<PreparedMutation, HostMutationError> {
     match prepare {
         HostPrepare::Package {
             request,
             base_revision,
             state,
             packages,
-            entrypoint_processes,
             data_directory,
         } => prepare_package(
             request,
             base_revision,
             state,
             packages,
-            entrypoint_processes,
+            entrypoints
+                .expect("package preparation has the host supervisor")
+                .snapshots(),
             data_directory,
         ),
         HostPrepare::SpawnTarget {
@@ -2167,6 +2392,11 @@ impl io::Write for CountingWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn execute(command: HostMutationCommand) -> HostMutationResult {
+        super::execute(command, Some(&mut EntrypointSupervisor::default()))
+    }
+
     use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
     use crate::packages::{HubPackageEvents, HubPackageManifest, PackageProvenance};
     use crate::shared_view::SharedViewBudget;
@@ -2414,7 +2644,6 @@ mod tests {
                 request: DaemonRequest::ListPackages,
                 config,
                 packages,
-                entrypoint_processes: Vec::new(),
             }))
         else {
             panic!("package read must succeed");
@@ -2462,7 +2691,6 @@ mod tests {
                 request,
                 config: config.clone(),
                 packages: packages.clone(),
-                entrypoint_processes: Vec::new(),
             }));
             if let HostMutationResult::Failed(error) = result {
                 assert_ne!(error.code, "unsupported_host_mutation");
@@ -2492,7 +2720,6 @@ mod tests {
                     base_revision: 3,
                     state: state.clone(),
                     packages: packages.clone(),
-                    entrypoint_processes: Vec::new(),
                     data_directory: data_directory.clone(),
                 }))
             else {
@@ -2526,18 +2753,15 @@ mod tests {
             diagnostics: Vec::new(),
             launch_result: None,
         };
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::Package {
-                request: DaemonRequest::RefreshLocalPackages,
-                base_revision: 5,
-                state: state.clone(),
-                packages: packages.clone(),
-                entrypoint_processes: vec![snapshot],
-                data_directory,
-            }))
-        else {
-            panic!("package refresh preparation must succeed");
-        };
+        let prepared = prepare_package(
+            DaemonRequest::RefreshLocalPackages,
+            5,
+            state.clone(),
+            packages.clone(),
+            vec![snapshot],
+            data_directory,
+        )
+        .expect("package refresh preparation must succeed");
         let PreparedChange::PackageConfiguration(change) = prepared.change else {
             panic!("package refresh must keep its mutation family");
         };
@@ -2585,7 +2809,6 @@ mod tests {
                 base_revision: 3,
                 state: state.clone(),
                 packages: packages.clone(),
-                entrypoint_processes: Vec::new(),
                 data_directory: data_directory.clone(),
             }));
             if let HostMutationResult::Failed(error) = result {
@@ -2632,7 +2855,6 @@ mod tests {
                 base_revision: 9,
                 state,
                 packages: packages.clone(),
-                entrypoint_processes: Vec::new(),
                 data_directory,
             }))
         else {

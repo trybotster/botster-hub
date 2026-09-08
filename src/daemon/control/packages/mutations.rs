@@ -1,27 +1,21 @@
-//! Owner-only package runtime effects and compensation.
+//! Typed package runtime effects executed by host workers.
 
 use std::collections::BTreeMap;
 
 use super::supervised_launch_contract;
 use crate::daemon::control::request_id;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};
-use crate::entrypoint_supervisor::EntrypointSupervisorError;
+use crate::entrypoint_supervisor::{EntrypointSupervisor, EntrypointSupervisorError};
 use crate::host_mutations::PackageRuntimeEffect;
-use crate::{HubDaemon, PackageRegistry, PackageState};
+use crate::runtime::package_effect::HostPackageRuntime;
+use crate::{HubConfig, PackageRegistry, PackageState};
 
 fn load_package_after_enable(
-    daemon: &mut HubDaemon,
+    runtime: &mut HostPackageRuntime,
+    registry: &PackageRegistry,
     package_name: &str,
 ) -> DaemonTransportResult<()> {
-    let registry = daemon.package_registry().clone();
-    let has_lua = registry.package(package_name).is_some_and(|record| {
-        record
-            .manifest
-            .entrypoints
-            .iter()
-            .any(|entrypoint| entrypoint.runtime == botster_core::ExtensionRuntime::Lua)
-    });
-    if !has_lua {
+    if !has_lua(registry, package_name) {
         return Ok(());
     }
     let prepared = registry.prepare_local_package(
@@ -29,31 +23,25 @@ fn load_package_after_enable(
         "daemon socket load enabled local plugin package",
     )?;
     if prepared.selected_lua_entrypoint().is_some() {
-        daemon
-            .runtime_mut()
-            .ok_or(DaemonTransportError::DaemonNotRunning)?
-            .load_lua_plugin_package(&registry, package_name)
+        runtime
+            .load_lua_plugin_package(registry, package_name)
             .map_err(crate::HubDaemonError::from)?;
     }
     Ok(())
 }
 
-fn reload_package_after_reload(
-    daemon: &mut HubDaemon,
+fn reload_package(
+    runtime: &mut HostPackageRuntime,
+    registry: &PackageRegistry,
     package_name: &str,
+    reason: &str,
 ) -> DaemonTransportResult<()> {
-    let registry = daemon.package_registry().clone();
-    let prepared = registry.prepare_local_package(
-        package_name,
-        "daemon socket reload enabled local plugin package",
-    )?;
+    let prepared = registry.prepare_local_package(package_name, reason)?;
     if prepared.selected_lua_entrypoint().is_some() {
-        daemon
-            .runtime_mut()
-            .ok_or(DaemonTransportError::DaemonNotRunning)?
+        runtime
             .reload_lua_plugin_package(
                 request_id(&format!("daemon-reload-{package_name}")),
-                &registry,
+                registry,
                 package_name,
             )
             .map_err(crate::HubDaemonError::from)?;
@@ -61,61 +49,33 @@ fn reload_package_after_reload(
     Ok(())
 }
 
-fn record_event_plane_unload(daemon: &HubDaemon, package_name: &str) {
-    let Some(runtime) = daemon.runtime() else {
-        return;
-    };
-    let generation = runtime
-        .package_event_router()
-        .current_package_generation(package_name)
-        .unwrap_or(0);
-    runtime.record_event_plane_owner_op(crate::package_event_router::OwnerOp {
-        kind: crate::package_event_router::OwnerOpKind::Unload,
-        owner: package_name.to_string(),
-        generation,
-    });
-}
-
-fn unload_package_after_disable(
-    daemon: &mut HubDaemon,
-    package_name: &str,
-) -> DaemonTransportResult<()> {
-    let _ = daemon
-        .runtime_mut()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?
-        .unload_plugin_package(
-            request_id(&format!("daemon-disable-{package_name}")),
-            package_name,
-        );
-    Ok(())
+fn has_lua(registry: &PackageRegistry, package_name: &str) -> bool {
+    registry.package(package_name).is_some_and(|record| {
+        record
+            .manifest
+            .entrypoints
+            .iter()
+            .any(|entrypoint| entrypoint.runtime == botster_core::ExtensionRuntime::Lua)
+    })
 }
 
 fn restart_running_package_entrypoints(
-    daemon: &mut HubDaemon,
+    supervisor: &mut EntrypointSupervisor,
+    config: &HubConfig,
     registry: &PackageRegistry,
     package_name: &str,
     entrypoint_ids: &[String],
 ) -> DaemonTransportResult<()> {
-    if entrypoint_ids.is_empty() {
-        return Ok(());
-    }
-    let config = daemon
-        .runtime()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?
-        .config()
-        .clone();
     for entrypoint_id in entrypoint_ids {
-        let environment = daemon
-            .entrypoint_supervisor()
-            .launch_environment(package_name, entrypoint_id);
+        let environment = supervisor.launch_environment(package_name, entrypoint_id);
         let launch = supervised_launch_contract(
-            &config,
+            config,
             registry,
             package_name,
             entrypoint_id,
             &environment,
         )?;
-        let snapshot = daemon.entrypoint_supervisor().restart(
+        let snapshot = supervisor.restart(
             registry,
             package_name,
             entrypoint_id,
@@ -135,53 +95,26 @@ fn restart_running_package_entrypoints(
     Ok(())
 }
 
-fn restore_plugin_from_registry(
-    daemon: &mut HubDaemon,
-    registry: &PackageRegistry,
-    package_name: &str,
-) -> DaemonTransportResult<()> {
-    let has_lua = registry.package(package_name).is_some_and(|record| {
-        record
-            .manifest
-            .entrypoints
-            .iter()
-            .any(|entrypoint| entrypoint.runtime == botster_core::ExtensionRuntime::Lua)
-    });
-    if !has_lua {
-        return Ok(());
-    }
-    let prepared = registry.prepare_local_package(
-        package_name,
-        "daemon socket restore plugin after failed mutation",
-    )?;
-    if prepared.selected_lua_entrypoint().is_some() {
-        daemon
-            .runtime_mut()
-            .ok_or(DaemonTransportError::DaemonNotRunning)?
-            .reload_lua_plugin_package(
-                request_id(&format!("daemon-restore-{package_name}")),
-                registry,
-                package_name,
-            )
-            .map_err(crate::HubDaemonError::from)?;
-    }
-    Ok(())
-}
-
-/// Apply the owner-only runtime phase after a package state commit.
+/// Apply one complete runtime effect after the durable package commit.
 pub(crate) fn apply_committed_runtime_effect(
-    daemon: &mut HubDaemon,
+    runtime: &mut HostPackageRuntime,
+    supervisor: &mut EntrypointSupervisor,
+    config: &HubConfig,
+    registry: &PackageRegistry,
     effect: &PackageRuntimeEffect,
 ) -> DaemonTransportResult<()> {
     match effect {
         PackageRuntimeEffect::Enable { package_name, .. } => {
-            load_package_after_enable(daemon, package_name)
+            load_package_after_enable(runtime, registry, package_name)
         }
         PackageRuntimeEffect::Disable { package_name }
         | PackageRuntimeEffect::Remove { package_name } => {
-            daemon.entrypoint_supervisor().stop_package(package_name);
-            unload_package_after_disable(daemon, package_name)?;
-            record_event_plane_unload(daemon, package_name);
+            supervisor.stop_package(package_name);
+            let _ = runtime.unload_plugin_package(
+                request_id(&format!("daemon-disable-{package_name}")),
+                package_name,
+            );
+            runtime.record_event_plane_unload(package_name);
             Ok(())
         }
         PackageRuntimeEffect::Reload {
@@ -191,12 +124,17 @@ pub(crate) fn apply_committed_runtime_effect(
             ..
         } => {
             if *reload_plugin {
-                reload_package_after_reload(daemon, package_name)?;
+                reload_package(
+                    runtime,
+                    registry,
+                    package_name,
+                    "daemon socket reload enabled local plugin package",
+                )?;
             }
-            let packages = daemon.package_registry().clone();
             restart_running_package_entrypoints(
-                daemon,
-                &packages,
+                supervisor,
+                config,
+                registry,
                 package_name,
                 running_entrypoints,
             )
@@ -204,12 +142,17 @@ pub(crate) fn apply_committed_runtime_effect(
         PackageRuntimeEffect::Refresh { packages, .. } => {
             for package in packages {
                 if package.reload_plugin {
-                    reload_package_after_reload(daemon, &package.package_name)?;
+                    reload_package(
+                        runtime,
+                        registry,
+                        &package.package_name,
+                        "daemon socket reload enabled local plugin package",
+                    )?;
                 }
-                let registry = daemon.package_registry().clone();
                 restart_running_package_entrypoints(
-                    daemon,
-                    &registry,
+                    supervisor,
+                    config,
+                    registry,
                     &package.package_name,
                     &package.restart_entrypoints,
                 )?;
@@ -219,50 +162,59 @@ pub(crate) fn apply_committed_runtime_effect(
     }
 }
 
-/// Restore owner-only runtime state after the host restored durable package state.
+/// Restore runtime effects after the host restores durable package state.
 pub(crate) fn restore_runtime_after_failed_effect(
-    daemon: &mut HubDaemon,
+    runtime: &mut HostPackageRuntime,
+    supervisor: &mut EntrypointSupervisor,
+    config: &HubConfig,
     effect: &PackageRuntimeEffect,
 ) -> Vec<PackageRollbackFailure> {
     let mut rollbacks = Vec::new();
     match effect {
         PackageRuntimeEffect::Enable { package_name, .. } => {
-            if let Err(error) = unload_package_after_disable(daemon, package_name) {
-                rollbacks.push(PackageRollbackFailure {
-                    step: "plugin",
-                    package_name: Some(package_name.clone()),
-                    error: Box::new(error),
-                });
-            }
+            let _ = runtime.unload_plugin_package(
+                request_id(&format!("daemon-disable-{package_name}")),
+                package_name,
+            );
         }
         PackageRuntimeEffect::Reload {
             package_name,
             previous_packages,
             running_entrypoints,
             ..
-        } => restore_registry_runtime(
-            daemon,
-            previous_packages,
-            &BTreeMap::from([(package_name.clone(), running_entrypoints.clone())]),
-            &mut rollbacks,
-        ),
+        } => {
+            restore_registry_runtime(
+                runtime,
+                supervisor,
+                config,
+                previous_packages,
+                &BTreeMap::from([(package_name.clone(), running_entrypoints.clone())]),
+                &mut rollbacks,
+            );
+        }
         PackageRuntimeEffect::Refresh {
             previous_packages,
             running_entrypoints,
             ..
-        } => restore_registry_runtime(
-            daemon,
-            previous_packages,
-            running_entrypoints,
-            &mut rollbacks,
-        ),
+        } => {
+            restore_registry_runtime(
+                runtime,
+                supervisor,
+                config,
+                previous_packages,
+                running_entrypoints,
+                &mut rollbacks,
+            );
+        }
         PackageRuntimeEffect::Disable { .. } | PackageRuntimeEffect::Remove { .. } => {}
     }
     rollbacks
 }
 
 fn restore_registry_runtime(
-    daemon: &mut HubDaemon,
+    runtime: &mut HostPackageRuntime,
+    supervisor: &mut EntrypointSupervisor,
+    config: &HubConfig,
     previous: &PackageRegistry,
     running_entrypoints: &BTreeMap<String, Vec<String>>,
     rollbacks: &mut Vec<PackageRollbackFailure>,
@@ -270,7 +222,13 @@ fn restore_registry_runtime(
     for record in previous.packages() {
         let package_name = record.manifest.name.as_str();
         if record.state == PackageState::Enabled
-            && let Err(error) = restore_plugin_from_registry(daemon, previous, package_name)
+            && has_lua(previous, package_name)
+            && let Err(error) = reload_package(
+                runtime,
+                previous,
+                package_name,
+                "daemon socket restore plugin after failed mutation",
+            )
         {
             rollbacks.push(PackageRollbackFailure {
                 step: "plugin",
@@ -279,8 +237,13 @@ fn restore_registry_runtime(
             });
         }
         if let Some(entrypoint_ids) = running_entrypoints.get(package_name)
-            && let Err(error) =
-                restart_running_package_entrypoints(daemon, previous, package_name, entrypoint_ids)
+            && let Err(error) = restart_running_package_entrypoints(
+                supervisor,
+                config,
+                previous,
+                package_name,
+                entrypoint_ids,
+            )
         {
             rollbacks.push(PackageRollbackFailure {
                 step: "entrypoint",

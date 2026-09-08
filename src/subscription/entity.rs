@@ -268,12 +268,12 @@ impl SessionTypeCatalogCache {
         if let Err(error) = submitted {
             self.pending = None;
             self.generation = None;
-            let (code, message) = match error {
+            let (code, message) = match error.error {
                 HostSubmitError::Full => (
                     "host_executor_full",
                     "host executor queue refused a reserved catalog build",
                 ),
-                HostSubmitError::Stopped => (
+                HostSubmitError::Stopped | HostSubmitError::PhaseExhausted => (
                     "host_executor_stopped",
                     "host executor is unavailable for the catalog build",
                 ),
@@ -313,7 +313,8 @@ impl SessionTypeCatalogCache {
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
-            HostResult::Mutation(_)
+            HostResult::EntrypointsStopped
+            | HostResult::Mutation(_)
             | HostResult::ManagedWorktreeCreated(_)
             | HostResult::ManagedWorktreeFailed(_)
             | HostResult::ManagedWorktreeFinalized
@@ -371,7 +372,8 @@ impl SessionTypeCatalogCache {
                 self.generation = None;
                 self.failure = Some((generation, error));
             }
-            HostResult::Mutation(_)
+            HostResult::EntrypointsStopped
+            | HostResult::Mutation(_)
             | HostResult::ManagedWorktreeCreated(_)
             | HostResult::ManagedWorktreeFailed(_)
             | HostResult::ManagedWorktreeFinalized
@@ -389,9 +391,17 @@ impl SessionTypeCatalogCache {
         reclamation: SessionTypeCatalogReclamation,
         permit: HostWorkPermit,
     ) {
-        match executor.submit_catalog_reclamation(identity, reclamation, permit) {
+        match executor.submit(
+            identity,
+            HostCommand::ReclaimSessionTypeCatalog(reclamation),
+            permit,
+        ) {
             Ok(()) => self.waiting_for_capacity = false,
-            Err((_error, reclamation, permit)) => {
+            Err(failure) => {
+                let HostCommand::ReclaimSessionTypeCatalog(reclamation) = failure.command else {
+                    unreachable!("catalog reclamation retains its command kind")
+                };
+                let permit = failure.permit;
                 self.retained_reclamation = Some((identity, reclamation, permit));
                 self.waiting_for_capacity = true;
             }

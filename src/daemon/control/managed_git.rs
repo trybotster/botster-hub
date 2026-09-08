@@ -5,14 +5,17 @@ use std::time::Instant;
 use botster_hub_client::DaemonResponseKind;
 
 use crate::HubDaemon;
-use crate::daemon::control::host_work::{DocumentAdmission, admit_document, release_document};
+use crate::daemon::control::host_work::{
+    DocumentAdmission, HostRecoveryRequired, admit_document, release_document, retain_submission,
+};
 use crate::daemon::control::pending::{
     ControlPoll, PendingControlRequest, READY_DEADLINE, READY_INITIAL, mark_owner_ready,
 };
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::ReadyClass;
 use crate::host_executor::{
-    HostCommand, HostJobIdentity, HostResult, HostSubmitError, HostWorkPermit,
+    HostCommand, HostJobIdentity, HostResult, HostSubmissionFailure, HostSubmitError,
+    HostWorkPermit,
 };
 use crate::host_mutations::{
     HostCommit, HostMutationCommand, HostMutationResult, HostPrepare, PreparedMutation,
@@ -68,11 +71,22 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     let Some(pending) = runtime.take_pending_managed_spawn() else {
         return;
     };
-    if let Some(recovery) = state.managed_git_recovery_required.as_ref() {
-        let _ = pending.response.send(Err(ManagedGitError::new(
-            "reconciliation_required",
-            format!("{}: {}", recovery.code, recovery.message),
-        )));
+    if let Some(detail) = state
+        .host_recovery
+        .values()
+        .find_map(|recovery| match recovery {
+            HostRecoveryRequired::ManagedGit(recovery) => {
+                Some(format!("{}: {}", recovery.code, recovery.message))
+            }
+            HostRecoveryRequired::Submission { failure, .. } => {
+                Some(submit_error_message(failure.error).to_string())
+            }
+            HostRecoveryRequired::Package(_) => None,
+        })
+    {
+        let _ = pending
+            .response
+            .send(Err(ManagedGitError::new("reconciliation_required", detail)));
         return;
     }
     let request = match runtime.validate_managed_git_request(&pending) {
@@ -698,12 +712,6 @@ impl ManagedSpawnOperation {
         phase: Phase,
         command: HostCommand,
     ) -> ControlPoll {
-        let Some(runtime) = daemon.runtime() else {
-            if state.document_owner == Some(self.waiter_id) {
-                release_document(state, self.waiter_id);
-            }
-            return self.finish_reconciliation("the Hub runtime stopped during managed Git work");
-        };
         let Some(permit) = self.permit.take() else {
             return self.finish_reconciliation("the managed Git operation lost its host permit");
         };
@@ -711,17 +719,38 @@ impl ManagedSpawnOperation {
             waiter_id: self.waiter_id,
             phase: self.next_host_phase,
         };
-        match runtime.host_executor().submit(identity, command, permit) {
+        let next_phase = self.next_host_phase.checked_add(1);
+        let submitted = match (daemon.runtime(), next_phase) {
+            (_, None) => Err(HostSubmissionFailure {
+                error: HostSubmitError::PhaseExhausted,
+                identity,
+                command,
+                permit,
+            }),
+            (None, _) => Err(HostSubmissionFailure {
+                error: HostSubmitError::Stopped,
+                identity,
+                command,
+                permit,
+            }),
+            (Some(runtime), Some(_)) => runtime.host_executor().submit(identity, command, permit),
+        };
+        match submitted {
             Ok(()) => {
-                self.next_host_phase = self.next_host_phase.saturating_add(1);
+                self.next_host_phase = next_phase.expect("submission requires a later phase");
                 self.phase = phase;
                 ControlPoll::Pending
             }
-            Err(error) => {
-                if state.document_owner == Some(self.waiter_id) {
-                    release_document(state, self.waiter_id);
+            Err(failure) => {
+                let detail = submit_error_message(failure.error);
+                retain_submission(state, failure);
+                if let Some(HostRecoveryRequired::Submission {
+                    managed_worktree, ..
+                }) = state.host_recovery.get_mut(&self.waiter_id)
+                {
+                    *managed_worktree = self.prepared.take();
                 }
-                self.finish_reconciliation(submit_error_message(error))
+                self.finish_reconciliation(detail)
             }
         }
     }
@@ -762,12 +791,15 @@ impl ManagedSpawnOperation {
                 .finish_reconciliation("the managed Git recovery result lost its host permit");
         };
         let detail = format!("{}: {}", error.code, error.message);
-        state.managed_git_recovery_required = Some(ManagedGitRecoveryRequired {
-            code: error.code,
-            message: error.message,
-            _prepared: prepared,
-            _permit: permit,
-        });
+        state.host_recovery.insert(
+            self.waiter_id,
+            HostRecoveryRequired::ManagedGit(ManagedGitRecoveryRequired {
+                code: error.code,
+                message: error.message,
+                _prepared: prepared,
+                _permit: permit,
+            }),
+        );
         self.finish_reconciliation(&detail)
     }
 
@@ -800,5 +832,6 @@ fn submit_error_message(error: HostSubmitError) -> &'static str {
     match error {
         HostSubmitError::Full => "the bounded host queue refused a reserved managed Git phase",
         HostSubmitError::Stopped => "the host executor stopped during managed Git work",
+        HostSubmitError::PhaseExhausted => "the managed Git host phase identity is exhausted",
     }
 }

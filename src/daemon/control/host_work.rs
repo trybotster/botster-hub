@@ -8,12 +8,13 @@ use crate::daemon::error::{DaemonTransportError, PackageRollbackFailure};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::ReadyClass;
 use crate::host_executor::{
-    HostCommand, HostJobIdentity, HostResult, HostSubmitError, HostWorkPermit,
+    HostCommand, HostJobIdentity, HostResult, HostSubmissionFailure, HostSubmitError,
+    HostWorkPermit,
 };
 use crate::host_mutations::{
-    HostCommit, HostMutationCommand, HostMutationError, HostMutationResult, HostPackageFinalize,
-    HostPackageRestore, HostPrepare, HostRead, HostRecover, PackageRuntimeEffect, PreparedMutation,
-    RecoveryOutcome, SessionTypeRecovery,
+    HostCommit, HostMutationCommand, HostMutationError, HostMutationResult, HostPackageEffect,
+    HostPackageRestore, HostPackageRuntimeRestore, HostPrepare, HostRead, HostRecover,
+    PackageRuntimeEffect, PreparedMutation, RecoveryOutcome, SessionTypeRecovery,
 };
 use crate::owner_identity::WaiterId;
 
@@ -21,6 +22,34 @@ pub(crate) enum DocumentAdmission {
     Granted,
     Busy,
     Stale,
+}
+
+/// One unresolved host operation. Each variant retains the original operation slot.
+pub(crate) enum HostRecoveryRequired {
+    Package(PackageRecoveryRequired),
+    ManagedGit(crate::daemon::control::managed_git::ManagedGitRecoveryRequired),
+    Submission {
+        failure: HostSubmissionFailure,
+        package_restore: Option<(PackageRuntimeEffect, DaemonTransportError)>,
+        managed_worktree: Option<crate::managed_git_worktrees::PreparedManagedWorktree>,
+    },
+}
+
+/// Retain a rejected phase without releasing its document reservation.
+pub(crate) fn retain_submission(
+    state: &mut DaemonControlState,
+    failure: HostSubmissionFailure,
+) -> ControlPoll {
+    let response = submit_error_response(failure.error);
+    state.host_recovery.insert(
+        failure.identity.waiter_id,
+        HostRecoveryRequired::Submission {
+            failure,
+            package_restore: None,
+            managed_worktree: None,
+        },
+    );
+    ControlPoll::Ready(Ok(response))
 }
 
 /// One package rollback that keeps one host slot until the daemon restarts.
@@ -42,17 +71,26 @@ pub(crate) fn handle(
     let must_finish = crate::daemon::control::pending::request_must_finish(&request);
     let (base_revision, state_view) = daemon.state_view();
     let packages = daemon.package_registry_view();
-    let entrypoint_processes = (is_package_read(&request) || is_package_prepare(&request))
-        .then(|| daemon.entrypoint_supervisor().snapshots());
     let runtime = daemon.runtime()?;
     let config = runtime.config().clone();
     let data_directory = config.data_directory.clone();
-    let command = if is_package_read(&request) {
+    let command = if matches!(request, DaemonRequest::IssueLocalWebrtcBootstrap { .. }) {
+        HostMutationCommand::ValidateBootstrap {
+            request,
+            base_revision,
+            packages,
+        }
+    } else if is_entrypoint_request(&request) {
+        HostMutationCommand::Read(HostRead::Entrypoint {
+            request,
+            config,
+            packages,
+        })
+    } else if is_package_read(&request) {
         HostMutationCommand::Read(HostRead::Package {
             request,
             config: config.clone(),
             packages,
-            entrypoint_processes: entrypoint_processes.expect("package snapshots were captured"),
         })
     } else if is_package_prepare(&request) {
         HostMutationCommand::Prepare(HostPrepare::Package {
@@ -60,7 +98,6 @@ pub(crate) fn handle(
             base_revision,
             state: state_view,
             packages,
-            entrypoint_processes: entrypoint_processes.expect("package snapshots were captured"),
             data_directory,
         })
     } else if is_spawn_target_read(&request) {
@@ -125,13 +162,12 @@ pub(crate) fn handle(
             .host_executor()
             .submit(identity, HostCommand::Mutation(command), permit)
     {
-        return Some(ControlStep::ready(submit_error_response(error)));
+        return Some(ControlStep::ready(submit_error_response(error.error)));
     }
 
     let mut retained_prepare: Option<(PreparedMutation, HostWorkPermit)> = None;
     let mut prior_compensation_failure: Option<HostMutationError> = None;
     let mut failed_package_effect: Option<(PackageRuntimeEffect, DaemonTransportError)> = None;
-    let mut finalizing_package = false;
     let mut next_phase = 2;
     Some(ControlStep::pending_in(
         ReadyClass::HostCompletion,
@@ -162,13 +198,37 @@ pub(crate) fn handle(
                 );
             };
             match result {
-                HostMutationResult::ReadReady(reply) => {
-                    if finalizing_package {
-                        finalizing_package = false;
-                        release_document(state, waiter_id);
+                HostMutationResult::BootstrapReady {
+                    base_revision,
+                    origin,
+                } => {
+                    if daemon.state_view().0 != base_revision {
+                        return submit_phase(
+                            daemon,
+                            state,
+                            waiter_id,
+                            HostMutationCommand::ValidateBootstrap {
+                                request: DaemonRequest::IssueLocalWebrtcBootstrap {
+                                    package_name: "botster-web".to_string(),
+                                    entrypoint_id: "web-client".to_string(),
+                                    origin,
+                                },
+                                base_revision: daemon.state_view().0,
+                                packages: daemon.package_registry_view(),
+                            },
+                            permit,
+                            &mut next_phase,
+                        );
                     }
-                    finish_reply(permit, reply)
+                    let response = daemon
+                        .local_webrtc()
+                        .issue_bootstrap("botster-web", "web-client", &origin)
+                        .map(crate::client_api_dto::response::daemon_local_webrtc_bootstrap)
+                        .map_err(DaemonTransportError::from);
+                    drop(permit);
+                    ControlPoll::Ready(response)
                 }
+                HostMutationResult::ReadReady(reply) => finish_reply(permit, reply),
                 HostMutationResult::Prepared(prepared) => admit_or_park_commit(
                     daemon,
                     state,
@@ -197,46 +257,21 @@ pub(crate) fn handle(
                         daemon.publish_package_registry_view(packages);
                     }
                     if let Some(effect) = committed.package_effect {
-                        if let Err(error) = crate::daemon::control::packages::mutations::apply_committed_runtime_effect(daemon, &effect) {
-                            let Some(runtime) = daemon.runtime() else {
-                                release_document(state, waiter_id);
-                                return finish_transport_error(
-                                    permit,
-                                    DaemonTransportError::PackageCompensation {
-                                        original: Box::new(error),
-                                        rollbacks: vec![PackageRollbackFailure {
-                                            step: "persist",
-                                            package_name: None,
-                                            error: Box::new(DaemonTransportError::DaemonNotRunning),
-                                        }],
-                                    },
-                                );
-                            };
-                            let restore = effect
-                                .restore_command(runtime.config().data_directory.clone())
-                                .expect("a fallible package effect retains its restore views");
-                            return submit_package_restore(
-                                daemon,
-                                state,
-                                waiter_id,
-                                restore,
-                                effect,
-                                error,
-                                permit,
-                                &mut next_phase,
-                                &mut failed_package_effect,
-                            );
-                        }
-                        finalizing_package = true;
-                        let entrypoint_processes = daemon.entrypoint_supervisor().snapshots();
+                        let runtime = daemon
+                            .runtime()
+                            .expect("a committed package has a running runtime");
+                        let command = HostMutationCommand::ApplyPackageEffect(HostPackageEffect {
+                            effect,
+                            runtime: runtime.host_package_runtime(),
+                            config: runtime.config().clone(),
+                            packages: daemon.package_registry_view(),
+                            reply: committed.reply,
+                        });
                         return submit_phase(
                             daemon,
                             state,
                             waiter_id,
-                            HostMutationCommand::FinalizePackage(HostPackageFinalize {
-                                reply: committed.reply,
-                                entrypoint_processes,
-                            }),
+                            command,
                             permit,
                             &mut next_phase,
                         );
@@ -250,21 +285,105 @@ pub(crate) fn handle(
                     let (effect, original) = failed_package_effect
                         .take()
                         .expect("a package restore follows one failed runtime effect");
-                    let rollbacks =
-                        crate::daemon::control::packages::mutations::restore_runtime_after_failed_effect(
-                            daemon,
-                            &effect,
-                        );
+                    let runtime = daemon
+                        .runtime()
+                        .expect("package recovery retains its runtime");
+                    let command =
+                        HostMutationCommand::RestorePackageRuntime(HostPackageRuntimeRestore {
+                            effect,
+                            original,
+                            runtime: runtime.host_package_runtime(),
+                            config: runtime.config().clone(),
+                        });
+                    submit_phase(daemon, state, waiter_id, command, permit, &mut next_phase)
+                }
+                HostMutationResult::PackageEffectApplied { reply, cleanup } => {
+                    daemon
+                        .runtime_mut()
+                        .expect("package effect retains its runtime")
+                        .apply_host_package_cleanup(cleanup);
                     release_document(state, waiter_id);
-                    let error = if rollbacks.is_empty() {
-                        original
+                    match reply {
+                        Ok(reply) => finish_reply(permit, reply),
+                        Err(error) => finish_error(permit, error),
+                    }
+                }
+                HostMutationResult::PackageEffectFailed {
+                    effect,
+                    error,
+                    cleanup,
+                } => {
+                    daemon
+                        .runtime_mut()
+                        .expect("package effect retains its runtime")
+                        .apply_host_package_cleanup(cleanup);
+                    let runtime = daemon
+                        .runtime()
+                        .expect("package recovery retains its runtime");
+                    if let Some(restore) =
+                        effect.restore_command(runtime.config().data_directory.clone())
+                    {
+                        submit_package_restore(
+                            daemon,
+                            state,
+                            waiter_id,
+                            restore,
+                            effect,
+                            error,
+                            permit,
+                            &mut next_phase,
+                            &mut failed_package_effect,
+                        )
                     } else {
-                        DaemonTransportError::PackageCompensation {
+                        release_document(state, waiter_id);
+                        retain_package_recovery(
+                            state,
+                            waiter_id,
+                            effect,
+                            error,
+                            PackageRollbackFailure {
+                                step: "runtime",
+                                package_name: None,
+                                error: Box::new(DaemonTransportError::Protocol(
+                                    "the package effect requires runtime recovery",
+                                )),
+                            },
+                            permit,
+                        )
+                    }
+                }
+                HostMutationResult::PackageRuntimeRestored {
+                    effect,
+                    original,
+                    rollbacks,
+                    cleanup,
+                } => {
+                    daemon
+                        .runtime_mut()
+                        .expect("package recovery retains its runtime")
+                        .apply_host_package_cleanup(cleanup);
+                    release_document(state, waiter_id);
+                    if rollbacks.is_empty() {
+                        finish_transport_error(permit, original)
+                    } else {
+                        state.host_recovery.insert(
+                            waiter_id,
+                            HostRecoveryRequired::Package(PackageRecoveryRequired {
+                                original: original.to_string(),
+                                compensation: rollbacks
+                                    .iter()
+                                    .map(|failure| failure.error.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("; "),
+                                _effect: effect,
+                                _permit: permit,
+                            }),
+                        );
+                        ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
                             original: Box::new(original),
                             rollbacks,
-                        }
-                    };
-                    finish_transport_error(permit, error)
+                        }))
+                    }
                 }
                 HostMutationResult::PackageRestoreFailed(error) => {
                     let failure = PackageRollbackFailure {
@@ -276,7 +395,7 @@ pub(crate) fn handle(
                         .take()
                         .expect("a package restore failure follows one failed runtime effect");
                     release_document(state, waiter_id);
-                    retain_package_recovery(state, effect, original, failure, permit)
+                    retain_package_recovery(state, waiter_id, effect, original, failure, permit)
                 }
                 HostMutationResult::Recovered(outcome) => match outcome {
                     RecoveryOutcome::PackageConfiguration { failure, .. }
@@ -355,35 +474,46 @@ fn submit_package_restore(
                 "package restore requires the original document reservation",
             )),
         };
-        return retain_package_recovery(state, effect, original, failure, permit);
+        return retain_package_recovery(state, waiter_id, effect, original, failure, permit);
     }
 
     // The document reservation remains held through the first whole-state
     // restore. No code can replay this snapshot after reservation release.
     *failed_package_effect = Some((effect, original));
-    submit_phase(
+    let poll = submit_phase(
         daemon,
         state,
         waiter_id,
         HostMutationCommand::RestorePackage(restore),
         permit,
         next_phase,
-    )
+    );
+    if let Some(HostRecoveryRequired::Submission {
+        package_restore, ..
+    }) = state.host_recovery.get_mut(&waiter_id)
+    {
+        *package_restore = failed_package_effect.take();
+    }
+    poll
 }
 
 fn retain_package_recovery(
     state: &mut DaemonControlState,
+    waiter_id: WaiterId,
     effect: PackageRuntimeEffect,
     original: DaemonTransportError,
     failure: PackageRollbackFailure,
     permit: HostWorkPermit,
 ) -> ControlPoll {
-    state.package_recovery_required = Some(PackageRecoveryRequired {
-        original: original.to_string(),
-        compensation: failure.error.to_string(),
-        _effect: effect,
-        _permit: permit,
-    });
+    state.host_recovery.insert(
+        waiter_id,
+        HostRecoveryRequired::Package(PackageRecoveryRequired {
+            original: original.to_string(),
+            compensation: failure.error.to_string(),
+            _effect: effect,
+            _permit: permit,
+        }),
+    );
     ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
         original: Box::new(original),
         rollbacks: vec![failure],
@@ -391,7 +521,9 @@ fn retain_package_recovery(
 }
 
 pub(crate) fn handles(request: &DaemonRequest) -> bool {
-    is_package_read(request)
+    matches!(request, DaemonRequest::IssueLocalWebrtcBootstrap { .. })
+        || is_entrypoint_request(request)
+        || is_package_read(request)
         || is_package_prepare(request)
         || is_spawn_target_read(request)
         || is_spawn_target_prepare(request)
@@ -412,6 +544,25 @@ fn admit_or_park_commit(
     // Anything that reaches this site can park on the document reservation.
     // Transport closure must not retire its handoff.
     debug_assert!(must_finish, "a parkable host mutation must finish");
+    if matches!(
+        prepared.change,
+        crate::host_mutations::PreparedChange::PackageConfiguration(_)
+    ) && state
+        .host_recovery
+        .values()
+        .any(|recovery| matches!(recovery, HostRecoveryRequired::Package(_)))
+    {
+        state.document_waiters.remove(&waiter_id);
+        wake_next_document_waiter(state);
+        return finish_error(
+            permit,
+            HostMutationError {
+                code: "package_recovery_required".to_string(),
+                message: "package recovery is required before this prepared mutation can commit"
+                    .to_string(),
+            },
+        );
+    }
     match admit_document(
         state,
         waiter_id,
@@ -452,31 +603,37 @@ fn submit_phase(
     permit: HostWorkPermit,
     next_phase: &mut u64,
 ) -> ControlPoll {
-    let Some(runtime) = daemon.runtime() else {
-        return finish_error(
-            permit,
-            HostMutationError {
-                code: "daemon_not_running".to_string(),
-                message: "the Hub runtime stopped before host work completed".to_string(),
+    let phase = *next_phase;
+    let identity = HostJobIdentity { waiter_id, phase };
+    let command = HostCommand::Mutation(command);
+    let Some(later_phase) = phase.checked_add(1) else {
+        return retain_submission(
+            state,
+            HostSubmissionFailure {
+                error: HostSubmitError::PhaseExhausted,
+                identity,
+                command,
+                permit,
             },
         );
     };
-    let phase = *next_phase;
-    let identity = HostJobIdentity { waiter_id, phase };
-    match runtime
-        .host_executor()
-        .submit(identity, HostCommand::Mutation(command), permit)
-    {
+    let Some(runtime) = daemon.runtime() else {
+        return retain_submission(
+            state,
+            HostSubmissionFailure {
+                error: HostSubmitError::Stopped,
+                identity,
+                command,
+                permit,
+            },
+        );
+    };
+    match runtime.host_executor().submit(identity, command, permit) {
         Ok(()) => {
-            *next_phase = next_phase.saturating_add(1);
+            *next_phase = later_phase;
             ControlPoll::Pending
         }
-        Err(error) => {
-            if state.document_owner == Some(waiter_id) {
-                release_document(state, waiter_id);
-            }
-            ControlPoll::Ready(Ok(submit_error_response(error)))
-        }
+        Err(failure) => retain_submission(state, failure),
     }
 }
 
@@ -549,6 +706,11 @@ fn submit_error_response(error: HostSubmitError) -> DaemonResponse {
             "host_execution",
             "the host executor queue refused a reserved operation",
         ),
+        HostSubmitError::PhaseExhausted => error_response(
+            "host_phase_exhausted",
+            "host_execution",
+            "host phase identity is exhausted; the operation requires recovery",
+        ),
         HostSubmitError::Stopped => error_response(
             "host_executor_stopped",
             "host_execution",
@@ -574,11 +736,35 @@ fn error_response(code: &str, operation: &str, message: &str) -> DaemonResponse 
 }
 
 /// Reject package operations that cannot use a possibly inconsistent registry.
-pub(crate) fn package_recovery_response(
+pub(crate) fn recovery_response(
     state: &DaemonControlState,
     request: &DaemonRequest,
 ) -> Option<DaemonResponse> {
-    let recovery = state.package_recovery_required.as_ref()?;
+    if handles(request)
+        && let Some(failure) = state
+            .host_recovery
+            .values()
+            .find_map(|recovery| match recovery {
+                HostRecoveryRequired::Submission { failure, .. } => Some(failure),
+                _ => None,
+            })
+    {
+        return Some(error_response(
+            "host_recovery_required",
+            "host_execution",
+            &format!(
+                "host phase {:?} requires recovery after {:?}",
+                failure.identity, failure.error,
+            ),
+        ));
+    }
+    let recovery = state
+        .host_recovery
+        .values()
+        .find_map(|recovery| match recovery {
+            HostRecoveryRequired::Package(recovery) => Some(recovery),
+            _ => None,
+        })?;
     let blocked = is_package_read(request)
         || is_package_prepare(request)
         || matches!(
@@ -631,6 +817,16 @@ fn blocked_session_type_waiter(
         .find(|target| target.target_id == *target_id)
         .map(|target| &target.root)?;
     state.blocked_session_type_roots.get(root).copied()
+}
+
+fn is_entrypoint_request(request: &DaemonRequest) -> bool {
+    matches!(
+        request,
+        DaemonRequest::StartPackageEntrypoint { .. }
+            | DaemonRequest::StopPackageEntrypoint { .. }
+            | DaemonRequest::RestartPackageEntrypoint { .. }
+            | DaemonRequest::PackageEntrypointStatus { .. }
+    )
 }
 
 fn is_package_read(request: &DaemonRequest) -> bool {
@@ -739,6 +935,73 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_phase_retains_package_effect_and_document_ownership() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let runtime = daemon.runtime().expect("runtime");
+        let permit = runtime.host_executor().try_reserve().expect("host slot");
+        let command = HostMutationCommand::ApplyPackageEffect(HostPackageEffect {
+            effect: PackageRuntimeEffect::Disable {
+                package_name: "retained.plugin".to_string(),
+            },
+            runtime: runtime.host_package_runtime(),
+            config: runtime.config().clone(),
+            packages: daemon.package_registry_view(),
+            reply: crate::host_mutations::HostReply::try_new(
+                crate::client_api_dto::response::daemon_response_base(
+                    botster_hub_client::DaemonResponseKind::Packages,
+                ),
+            )
+            .expect("bounded reply"),
+        });
+        let waiter_id = WaiterId(82);
+        let mut state = DaemonControlState::default();
+        state.document_owner = Some(waiter_id);
+        let mut next_phase = u64::MAX;
+        let result = submit_phase(
+            &daemon,
+            &mut state,
+            waiter_id,
+            command,
+            permit,
+            &mut next_phase,
+        );
+        assert!(
+            matches!(result, ControlPoll::Ready(Ok(response)) if response.error.as_ref().is_some_and(|error| error.code == "host_phase_exhausted"))
+        );
+        assert_eq!(next_phase, u64::MAX);
+        assert_eq!(state.document_owner, Some(waiter_id));
+        let Some(HostRecoveryRequired::Submission { failure, .. }) =
+            state.host_recovery.get(&waiter_id)
+        else {
+            panic!("the exhausted phase must retain its effect");
+        };
+        assert!(
+            matches!(&failure.command, HostCommand::Mutation(HostMutationCommand::ApplyPackageEffect(effect)) if matches!(&effect.effect, PackageRuntimeEffect::Disable { package_name } if package_name == "retained.plugin"))
+        );
+        let executor = daemon.runtime().expect("runtime").host_executor();
+        let remaining = (0..7)
+            .map(|_| executor.try_reserve().expect("seven slots remain"))
+            .collect::<Vec<_>>();
+        assert!(executor.try_reserve().is_none());
+        assert!(matches!(
+            executor.poll_completion(),
+            crate::host_executor::HostCompletionPoll::Empty
+        ));
+        assert_eq!(
+            recovery_response(&state, &DaemonRequest::ListPackages)
+                .expect("recovery refusal")
+                .error
+                .expect("error")
+                .code,
+            "host_recovery_required"
+        );
+        drop(remaining);
+        drop(state);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove phase test directory");
+    }
+
+    #[test]
     fn package_restore_without_document_ownership_retains_recovery_and_submits_nothing() {
         let (mut daemon, directory) = recovery_test_daemon();
         let previous_state = daemon.state_view().1;
@@ -782,7 +1045,12 @@ mod tests {
                 ..
             })) if rollbacks.len() == 1 && rollbacks[0].step == "restore_admission"
         ));
-        assert!(state.package_recovery_required.is_some());
+        assert!(
+            state
+                .host_recovery
+                .values()
+                .any(|recovery| matches!(recovery, HostRecoveryRequired::Package(_)))
+        );
         assert!(failed_package_effect.is_none());
         assert_eq!(next_phase, 7);
         assert!(matches!(

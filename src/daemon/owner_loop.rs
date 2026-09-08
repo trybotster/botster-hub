@@ -1295,6 +1295,7 @@ pub(crate) struct DaemonControlState {
     >,
     pub(crate) waiter_ids: crate::owner_identity::WaiterIdSource,
     pub(crate) current_waiter_id: Option<crate::owner_identity::WaiterId>,
+    pub(crate) shutdown_waiter: Option<crate::owner_identity::WaiterId>,
     pub(crate) owner_ready: crate::daemon::owner_schedule::ReadyQueues,
     control_ingress: BTreeMap<crate::owner_identity::WaiterId, ControlMessage>,
     pub(crate) deadlines: crate::daemon::owner_schedule::DeadlineIndex,
@@ -1304,12 +1305,15 @@ pub(crate) struct DaemonControlState {
     background_core_waiters: BTreeMap<crate::owner_identity::WaiterId, BackgroundWaiter>,
     pub(crate) host_completions:
         BTreeMap<crate::owner_identity::WaiterId, crate::host_executor::HostCompletion>,
+    // Each recovery record retains one of the eight host operation slots.
+    // Exclusive document admission limits package rollback to one record.
+    // Executor failure can retain all eight already-admitted operations.
+    pub(crate) host_recovery: BTreeMap<
+        crate::owner_identity::WaiterId,
+        crate::daemon::control::host_work::HostRecoveryRequired,
+    >,
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
     pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
-    pub(crate) package_recovery_required:
-        Option<crate::daemon::control::host_work::PackageRecoveryRequired>,
-    pub(crate) managed_git_recovery_required:
-        Option<crate::daemon::control::managed_git::ManagedGitRecoveryRequired>,
     pub(crate) host_completion_drain_pending: bool,
     pub(crate) host_capacity_wake_pending: bool,
     pub(crate) blocked_session_type_roots:
@@ -1378,6 +1382,7 @@ impl Default for DaemonControlState {
             pending_requests: BTreeMap::new(),
             waiter_ids: crate::owner_identity::WaiterIdSource::default(),
             current_waiter_id: None,
+            shutdown_waiter: None,
             owner_ready: crate::daemon::owner_schedule::ReadyQueues::new(),
             control_ingress: BTreeMap::new(),
             deadlines: crate::daemon::owner_schedule::DeadlineIndex::new(),
@@ -1386,10 +1391,9 @@ impl Default for DaemonControlState {
             background_waiter_ids: BTreeMap::new(),
             background_core_waiters: BTreeMap::new(),
             host_completions: BTreeMap::new(),
+            host_recovery: BTreeMap::new(),
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
-            package_recovery_required: None,
-            managed_git_recovery_required: None,
             host_completion_drain_pending: false,
             host_capacity_wake_pending: false,
             blocked_session_type_roots: BTreeMap::new(),
@@ -3733,15 +3737,20 @@ return botster.register({
     }
 
     fn entrypoint_is_running(daemon: &mut HubDaemon, package_name: &str) -> bool {
-        daemon
-            .entrypoint_supervisor()
-            .snapshots()
-            .iter()
-            .any(|snapshot| {
-                snapshot.package_name == package_name
-                    && snapshot.entrypoint_id == "sleeper"
-                    && snapshot.state == "running"
-            })
+        let response = drive_package_request(
+            daemon,
+            DaemonRequest::PackageEntrypointStatus {
+                package_name: package_name.to_string(),
+                entrypoint_id: "sleeper".to_string(),
+            },
+        )
+        .expect("read entrypoint status through the host executor");
+        response.packages.iter().any(|package| {
+            package.package_name == package_name
+                && package.runnable_entrypoints.iter().any(|entrypoint| {
+                    entrypoint.id == "sleeper" && entrypoint.process.state == "running"
+                })
+        })
     }
 
     fn entrypoint_command<'a>(daemon: &'a HubDaemon, package_name: &str) -> &'a str {
@@ -3755,6 +3764,94 @@ return botster.register({
             .expect("sleeper entrypoint")
             .command
             .as_str()
+    }
+
+    #[test]
+    fn shutdown_finishes_accepted_package_reload_before_stopping_entrypoints() {
+        let root = unique_package_control_dir("shutdown-package-reload");
+        let package_dir = root.join("shutdown.plugin");
+        write_package_control_manifest(&package_dir, "shutdown.plugin", sleeper_manifest(&["30"]));
+        write_sleeper_script(&package_dir);
+        let mut daemon =
+            HubDaemon::start(package_control_config(root.join("data"))).expect("daemon");
+        for request in [
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+            DaemonRequest::EnablePackage {
+                package_name: "shutdown.plugin".to_string(),
+            },
+            DaemonRequest::StartPackageEntrypoint {
+                package_name: "shutdown.plugin".to_string(),
+                entrypoint_id: "sleeper".to_string(),
+                environment_overrides: BTreeMap::new(),
+            },
+        ] {
+            assert!(
+                drive_package_request(&mut daemon, request)
+                    .expect("package setup")
+                    .error
+                    .is_none()
+            );
+        }
+        assert!(entrypoint_is_running(&mut daemon, "shutdown.plugin"));
+        let mut state = DaemonControlState::default();
+        let transport = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("transport runtime");
+        let (control_tx, _control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
+        let mut replies = Vec::new();
+        // Admit both requests before the first continuation can commit or reload.
+        for request in [
+            DaemonRequest::ReloadPackage {
+                package_name: "shutdown.plugin".to_string(),
+            },
+            DaemonRequest::DaemonShutdown,
+        ] {
+            let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+            assert!(!crate::daemon::control::request::handle(
+                &mut daemon,
+                &mut state,
+                transport.handle(),
+                control_tx.clone(),
+                ControlMessage::Request {
+                    request: Box::new(request),
+                    transport_request_id: None,
+                    reply_tx,
+                    response_delivery_rx: None,
+                    grant_id: None,
+                    client_id: None,
+                    enqueued_at: Instant::now(),
+                },
+            ));
+            replies.push(reply_rx);
+        }
+        assert_eq!(state.pending_requests.len(), 2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !drive_ready_test_turn(&mut daemon, &mut state) {
+            assert!(
+                Instant::now() < deadline,
+                "shutdown must finish through the production dispatcher"
+            );
+            thread::yield_now();
+        }
+        let shutdown = receive_test_control_reply(replies.pop().expect("shutdown reply"))
+            .expect("shutdown response");
+        let reload = receive_test_control_reply(replies.pop().expect("reload reply"))
+            .expect("reload response");
+        assert!(
+            reload.error.is_none(),
+            "accepted reload must finish: {:?}",
+            reload.error
+        );
+        assert_eq!(shutdown.kind, DaemonResponseKind::Shutdown);
+        assert!(state.pending_requests.is_empty());
+        assert_eq!(state.budget.outstanding(), 0);
+        assert!(
+            !entrypoint_is_running(&mut daemon, "shutdown.plugin"),
+            "shutdown cannot leave a reloaded process running"
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).expect("remove shutdown test directory");
     }
 
     #[test]
@@ -3836,15 +3933,7 @@ return botster.register({
         )
         .expect("start supervised sleeper");
         assert!(
-            daemon
-                .entrypoint_supervisor()
-                .snapshots()
-                .iter()
-                .any(|snapshot| {
-                    snapshot.package_name == "running.plugin"
-                        && snapshot.entrypoint_id == "sleeper"
-                        && snapshot.state == "running"
-                }),
+            entrypoint_is_running(&mut daemon, "running.plugin"),
             "sleeper must be running before failed disable"
         );
 
@@ -3865,15 +3954,7 @@ return botster.register({
             PackageState::Enabled
         );
         assert!(
-            daemon
-                .entrypoint_supervisor()
-                .snapshots()
-                .iter()
-                .any(|snapshot| {
-                    snapshot.package_name == "running.plugin"
-                        && snapshot.entrypoint_id == "sleeper"
-                        && snapshot.state == "running"
-                }),
+            entrypoint_is_running(&mut daemon, "running.plugin"),
             "failed disable must not stop the running entrypoint"
         );
         assert!(
@@ -4119,7 +4200,10 @@ return botster.register({
                 DaemonTransportError::State(crate::HubStateStoreError::InjectedWriteFailure)
             )));
         assert!(
-            state.package_recovery_required.is_some(),
+            state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Package(_)
+            )),
             "the failed restore must retain one bounded recovery row"
         );
         let entrypoint_cases = [
@@ -4278,13 +4362,17 @@ return botster.register({
             .session_type_generation;
 
         FileHubStateStore::inject_next_save_failure(&config.data_directory);
-        drive_package_request(
+        let failed = drive_package_request(
             &mut daemon,
             DaemonRequest::EnablePackage {
                 package_name: "types.plugin".to_string(),
             },
         )
-        .expect_err("injected enable persist failure");
+        .expect("typed enable failure");
+        assert_eq!(
+            failed.error.as_ref().map(|error| error.code.as_str()),
+            Some("hub_state_commit_failed")
+        );
         assert_eq!(
             daemon
                 .runtime()
