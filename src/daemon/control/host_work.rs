@@ -281,7 +281,7 @@ fn admit_or_park_commit(
             ControlPoll::Pending
         }
         DocumentAdmission::Stale => {
-            wake_document_waiters(state);
+            wake_next_document_waiter(state);
             finish_error(
                 permit,
                 HostMutationError {
@@ -359,12 +359,11 @@ fn release_document(state: &mut DaemonControlState, waiter_id: WaiterId) {
     state
         .blocked_session_type_roots
         .retain(|_, blocked_waiter| *blocked_waiter != waiter_id);
-    wake_document_waiters(state);
+    wake_next_document_waiter(state);
 }
 
-fn wake_document_waiters(state: &mut DaemonControlState) {
-    let waiters = std::mem::take(&mut state.document_waiters);
-    for next in waiters {
+fn wake_next_document_waiter(state: &mut DaemonControlState) {
+    if let Some(next) = state.document_waiters.pop_first() {
         crate::daemon::control::pending::mark_request_ready(
             state,
             next,
@@ -512,7 +511,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn document_release_wakes_every_parked_waiter() {
+    fn document_release_and_stale_handoff_wake_one_waiter_each() {
         let owner = WaiterId(1);
         let mut state = DaemonControlState::default();
         state.document_owner = Some(owner);
@@ -521,6 +520,10 @@ mod tests {
         release_document(&mut state, owner);
 
         assert_eq!(state.document_owner, None);
+        assert_eq!(state.document_waiters, [WaiterId(3)].into_iter().collect());
+
+        wake_next_document_waiter(&mut state);
+
         assert!(state.document_waiters.is_empty());
     }
 }
