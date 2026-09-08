@@ -98,25 +98,47 @@ pub(crate) fn acquire_socket_owner_lock(
 }
 
 pub(crate) fn accept_connections(
-    mut listener: TokioUnixListener,
+    listener: TokioUnixListener,
     control_tx: tokio_mpsc::Sender<ControlMessage>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
     admission: Arc<Semaphore>,
 ) -> impl Future<Output = ()> + Send {
     // Register the directory watch before returning the future. Besides making
     // startup deterministic, this closes the gap between binding the initial
     // listener and beginning to poll the accept loop.
     let socket_events = SocketPathEvents::new(&listener);
+    accept_connections_with_events(
+        listener,
+        control_tx,
+        shutdown_rx,
+        admission,
+        socket_events,
+    )
+}
+
+fn accept_connections_with_events(
+    mut listener: TokioUnixListener,
+    control_tx: tokio_mpsc::Sender<ControlMessage>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    admission: Arc<Semaphore>,
+    socket_events: Result<SocketPathEvents, String>,
+) -> impl Future<Output = ()> + Send {
     async move {
+        let watched_path = socket_events
+            .as_ref()
+            .ok()
+            .map(|events| events.path.clone());
         let mut socket_events = match socket_events {
-            Ok(events) => events,
+            Ok(events) => Some(events),
             Err(error) => {
                 eprintln!("botster-hub daemon socket watch error: {error}");
-                return;
+                None
             }
         };
-        if socket_events.missing_at_start {
-            rebind_listener(&mut listener, &socket_events.path);
+        if let Some(events) = socket_events.as_ref()
+            && events.missing_at_start
+        {
+            rebind_listener(&mut listener, &events.path);
         }
 
         let rejection_admission = Arc::new(Semaphore::new(DAEMON_MAX_REJECTION_TASKS));
@@ -166,14 +188,26 @@ pub(crate) fn accept_connections(
                         }
                     }
                 }
-                event = socket_events.events.recv() => {
-                    let Some(event) = event else {
-                        return;
-                    };
-                    if let Err(error) = event {
-                        eprintln!("botster-hub daemon socket watch error: {error}");
+                event = async {
+                    match socket_events.as_mut() {
+                        Some(events) => events.events.recv().await,
+                        None => std::future::pending().await,
                     }
-                    rebind_listener(&mut listener, &socket_events.path);
+                } => {
+                    match event {
+                        Some(Err(error)) => {
+                            eprintln!("botster-hub daemon socket watch error: {error}");
+                        }
+                        None => {
+                            eprintln!("botster-hub daemon socket watch stopped");
+                            socket_events = None;
+                            continue;
+                        }
+                        Some(Ok(_)) => {}
+                    }
+                    if let Some(path) = watched_path.as_ref() {
+                        rebind_listener(&mut listener, path);
+                    }
                 }
                 changed = shutdown_rx.changed() => {
                     let _ = changed;
@@ -225,6 +259,19 @@ impl SocketPathEvents {
             path,
             missing_at_start,
         })
+    }
+
+    #[cfg(test)]
+    fn closed(path: PathBuf) -> Self {
+        let watcher = notify::recommended_watcher(|_| {}).expect("create inert watcher");
+        let (events_tx, events) = tokio_mpsc::channel(1);
+        drop(events_tx);
+        Self {
+            _watcher: watcher,
+            events,
+            path,
+            missing_at_start: false,
+        }
     }
 }
 
@@ -345,10 +392,13 @@ mod tests {
     use super::*;
 
     fn temp_socket_path(tag: &str) -> PathBuf {
+        static NEXT_TEST_SOCKET: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
         let tag = tag.chars().next().unwrap_or('x');
         std::env::temp_dir().join(format!(
-            "bhl-{tag}-{}-{}.sock",
+            "bhl-{tag}-{}-{}-{}.sock",
             std::process::id(),
+            NEXT_TEST_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
@@ -495,5 +545,79 @@ mod tests {
             .expect("accept task should not panic");
         cleanup_socket_path(&socket, owner);
         let _ = fs::remove_file(SocketOwnerLock::lock_path(&socket));
+    }
+
+    async fn assert_degraded_watch_still_accepts(
+        socket: PathBuf,
+        owner: SocketOwnerLock,
+        listener: TokioUnixListener,
+        socket_events: Result<SocketPathEvents, String>,
+    ) {
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let accept_task = tokio::spawn(accept_connections_with_events(
+            listener,
+            control_tx,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+            socket_events,
+        ));
+
+        let client = TokioUnixStream::connect(&socket)
+            .await
+            .expect("connect to degraded listener");
+        let message = tokio::time::timeout(Duration::from_secs(2), control_rx.recv())
+            .await
+            .expect("degraded listener should accept promptly")
+            .expect("control channel remains open");
+        let ControlMessage::AcceptedConnection {
+            stream,
+            admission_permit,
+        } = message
+        else {
+            panic!("degraded listener returned an unexpected control message");
+        };
+        drop(stream);
+        drop(admission_permit);
+        drop(client);
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(1), accept_task)
+            .await
+            .expect("degraded accept loop should stop without spinning")
+            .expect("degraded accept loop should not panic");
+        cleanup_socket_path(&socket, owner);
+        let _ = fs::remove_file(SocketOwnerLock::lock_path(&socket));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watch_registration_failure_keeps_accepting_connections() {
+        let socket = temp_socket_path("watch-registration-failure");
+        let owner = acquire_socket_owner_lock(&socket).expect("lock");
+        prepare_socket_path(&socket, &owner).expect("prepare");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TokioUnixListener::from_std(listener).expect("Tokio listener");
+
+        assert_degraded_watch_still_accepts(
+            socket,
+            owner,
+            listener,
+            Err("injected watch registration failure".to_string()),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_watch_channel_keeps_accepting_without_spinning() {
+        let socket = temp_socket_path("watch-channel-closed");
+        let owner = acquire_socket_owner_lock(&socket).expect("lock");
+        prepare_socket_path(&socket, &owner).expect("prepare");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TokioUnixListener::from_std(listener).expect("Tokio listener");
+        let socket_events = SocketPathEvents::closed(socket.clone());
+
+        assert_degraded_watch_still_accepts(socket, owner, listener, Ok(socket_events)).await;
     }
 }
