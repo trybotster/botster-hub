@@ -1060,13 +1060,11 @@ pub(crate) fn absorb_session_type_catalog_completions(
         state.host_capacity_wake_pending = true;
     }
     let mut catalog_changed = false;
-    while state.host_completion_drain_pending {
-        if owner_turn
+    if state.host_completion_drain_pending
+        && owner_turn
             .try_charge(Instant::now(), OwnerTurnCharge::inspection(0))
-            .is_err()
-        {
-            break;
-        }
+            .is_ok()
+    {
         match executor.poll_completion() {
             HostCompletionPoll::Ready(completion) => {
                 if state.session_type_catalog.accepts(completion.identity) {
@@ -1088,12 +1086,10 @@ pub(crate) fn absorb_session_type_catalog_completions(
             }
             HostCompletionPoll::Empty => {
                 state.host_completion_drain_pending = false;
-                break;
             }
             HostCompletionPoll::Stopped => {
                 state.host_completion_drain_pending = false;
                 catalog_changed |= state.session_type_catalog.executor_stopped();
-                break;
             }
         }
     }
@@ -1104,7 +1100,7 @@ pub(crate) fn absorb_session_type_catalog_completions(
     {
         state.host_capacity_wake_pending = true;
     }
-    drain_host_capacity_wakes(state, owner_turn);
+    publish_catalog_capacity_wake(state, owner_turn);
     if catalog_changed {
         state
             .maintenance
@@ -1144,43 +1140,20 @@ pub(crate) fn drive_session_type_catalog_ready_item(
     true
 }
 
-fn drain_host_capacity_wakes(state: &mut DaemonControlState, owner_turn: &mut OwnerTurnBudget) {
-    while state.host_capacity_wake_pending {
-        let Some(waiter_id) = state.host_recovery_waiters.first().copied() else {
-            if state.session_type_catalog.waiting_for_capacity() {
-                if owner_turn
-                    .try_charge(Instant::now(), OwnerTurnCharge::inspection(0))
-                    .is_err()
-                {
-                    break;
-                }
-                state
-                    .maintenance
-                    .wakes
-                    .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
-            }
-            state.host_capacity_wake_pending = false;
-            break;
-        };
-        if owner_turn
+fn publish_catalog_capacity_wake(state: &mut DaemonControlState, owner_turn: &mut OwnerTurnBudget) {
+    if !state.host_capacity_wake_pending
+        || owner_turn
             .try_charge(Instant::now(), OwnerTurnCharge::inspection(0))
             .is_err()
-        {
-            break;
-        }
-        state.host_recovery_waiters.remove(&waiter_id);
-        if !state.pending_requests.contains_key(&waiter_id) {
-            continue;
-        }
-        if !crate::daemon::control::pending::mark_owner_ready(
-            state,
-            waiter_id,
-            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
-            crate::daemon::control::pending::READY_HOST_COMPLETION,
-        ) {
-            state.host_recovery_waiters.insert(waiter_id);
-            break;
-        }
+    {
+        return;
+    }
+    state.host_capacity_wake_pending = false;
+    if state.session_type_catalog.waiting_for_capacity() {
+        state
+            .maintenance
+            .wakes
+            .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
     }
 }
 
@@ -4746,7 +4719,47 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_budget_preserves_host_capacity_wake_progress() {
+    fn exhausted_budget_preserves_catalog_capacity_release() {
+        let directory = std::env::temp_dir().join(format!(
+            "botster-catalog-capacity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the system clock follows the epoch")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "catalog-capacity-test".into(),
+                display_name: "Catalog Capacity Test".into(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build the catalog capacity configuration");
+        let mut daemon = HubDaemon::start(config).expect("start the catalog capacity daemon");
+        let executor = daemon
+            .runtime()
+            .expect("the runtime is active")
+            .host_executor();
+        let mut permits = (0..crate::host_executor::HOST_OPERATION_CAPACITY)
+            .map(|_| executor.try_reserve().expect("reserve a host operation"))
+            .collect::<Vec<_>>();
+        let mut state = DaemonControlState::default();
+        let delivery = crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery;
+        state.maintenance.wakes.take(delivery);
+        assert!(matches!(
+            state
+                .session_type_catalog
+                .refresh(&daemon, 1, &state.waiter_ids),
+            SessionTypeCatalogRefresh::Pending
+        ));
+        assert!(state.session_type_catalog.waiting_for_capacity());
+        drop(permits.pop());
+        assert!(executor.take_capacity_notification());
+        state.host_capacity_wake_pending = true;
         let now = Instant::now();
         let mut budget = OwnerTurnBudget::new(now);
         budget
@@ -4756,24 +4769,27 @@ mod tests {
                     crate::daemon::owner_turn::OWNER_TURN_INSPECTED_BYTE_LIMIT,
                 ),
             )
-            .expect("fill the exact inspected-byte budget");
-        let mut state = DaemonControlState::default();
-        let waiter_id = crate::owner_identity::WaiterId(7);
-        state.host_capacity_wake_pending = true;
-        state.host_recovery_waiters.insert(waiter_id);
-
-        drain_host_capacity_wakes(&mut state, &mut budget);
-
+            .expect("consume the byte budget");
+        publish_catalog_capacity_wake(&mut state, &mut budget);
         assert!(state.host_capacity_wake_pending);
-        assert_eq!(
-            state.host_recovery_waiters,
-            [waiter_id].into_iter().collect()
-        );
+        assert!(!state.maintenance.wakes.take(delivery));
 
-        let mut fresh_budget = OwnerTurnBudget::new(Instant::now());
-        drain_host_capacity_wakes(&mut state, &mut fresh_budget);
-
+        let mut fresh = OwnerTurnBudget::new(Instant::now());
+        publish_catalog_capacity_wake(&mut state, &mut fresh);
         assert!(!state.host_capacity_wake_pending);
-        assert!(state.host_recovery_waiters.is_empty());
+        assert!(state.maintenance.wakes.take(delivery));
+        assert!(matches!(
+            state
+                .session_type_catalog
+                .refresh(&daemon, 1, &state.waiter_ids),
+            SessionTypeCatalogRefresh::Pending
+        ));
+        assert!(state.session_type_catalog.pending.is_some());
+        assert!(!state.session_type_catalog.waiting_for_capacity());
+        publish_catalog_capacity_wake(&mut state, &mut fresh);
+        assert!(!state.maintenance.wakes.take(delivery));
+        drop(permits);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove the catalog capacity directory");
     }
 }

@@ -32,8 +32,6 @@ use crate::daemon::owner_loop::{
     DaemonControlState, request_succeeded, send_control_reply, send_control_response,
 };
 use crate::daemon::owner_schedule::ReadyClass;
-#[cfg(test)]
-use crate::daemon::owner_turn::OwnerTurnBudget;
 use crate::maintenance::software_identity;
 use crate::subscription::attach_routes::{
     AttachedSubscriptionChange, record_attached_subscription_change,
@@ -204,37 +202,6 @@ pub(crate) fn poll_one_ready(
     item: crate::daemon::owner_schedule::ReadyItem,
 ) -> bool {
     poll_ready_request_item(daemon, state, item, &mut finish)
-}
-
-#[cfg(test)]
-pub(crate) fn poll_deferred(daemon: &mut HubDaemon, state: &mut DaemonControlState) -> bool {
-    let waiter_ids = state.pending_requests.keys().copied().collect::<Vec<_>>();
-    for waiter_id in waiter_ids {
-        let class = state.pending_requests[&waiter_id].ready_class;
-        mark_owner_ready(state, waiter_id, class, READY_INITIAL);
-    }
-    let mut budget = OwnerTurnBudget::new(Instant::now());
-    while budget
-        .try_charge(
-            Instant::now(),
-            crate::daemon::owner_turn::OwnerTurnCharge::opaque_move(),
-        )
-        .is_ok()
-    {
-        let Some(item) = state.owner_ready.pop_next() else {
-            return false;
-        };
-        if crate::daemon::owner_loop::run_background_ready_item(daemon, state, item) {
-            continue;
-        }
-        if crate::daemon::owner_budget::poll_owner_obligation_item(daemon, state, item) {
-            continue;
-        }
-        if poll_one_ready(daemon, state, item) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Post-process one complete response and send it. Returns `true` after a

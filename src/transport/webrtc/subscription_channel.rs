@@ -516,23 +516,42 @@ where
     let mut inbound_assembly = InboundTerminalChunkAssembly::new(generation);
     // Per-channel outbound message id; the first Hub-to-client message is 1.
     let mut next_message_id: u64 = 1;
+    let mut close_deadline = None;
     loop {
-        if let Err(exit) = flush_subscription_adapter_frames(
-            data_channel,
-            stream_key,
-            &handle,
-            &usage,
-            &mut next_message_id,
-        )
-        .await
-        {
+        if handle.is_closed() {
             close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
-            handle.close();
-            return exit;
+            return TerminalDriverExit::AdapterClosed;
         }
-        let _ = publish_channel_usage(data_channel, &usage).await;
-        peer_state.mux.refresh_aggregate_pressure();
+        if close_deadline.is_none() {
+            match flush_subscription_adapter_frames(
+                data_channel,
+                stream_key,
+                &handle,
+                &usage,
+                &mut next_message_id,
+            )
+            .await
+            {
+                Ok(TerminalFlushOutcome::Ready) => {}
+                Ok(TerminalFlushOutcome::ChannelClosed) => {
+                    // The dependency removes the channel before it delivers OnClose.
+                    // Keep reading accepted input until the terminal event arrives.
+                    close_deadline =
+                        Some(tokio::time::Instant::now() + LOCAL_WEBRTC_PEER_CLOSE_BOUND);
+                }
+                Err(exit) => {
+                    close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
+                    handle.close();
+                    return exit;
+                }
+            }
+        }
+        if close_deadline.is_none() {
+            let _ = publish_channel_usage(data_channel, &usage).await;
+            peer_state.mux.refresh_aggregate_pressure();
+        }
         tokio::select! {
+            biased;
             _ = handle.wait_for_write() => {}
             inbound = data_channel.local_poll() => {
                 match inbound {
@@ -575,6 +594,16 @@ where
                     }
                     Some(_) => {}
                 }
+            }
+            _ = async {
+                match close_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                handle.close();
+                close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
+                return TerminalDriverExit::SendFailed;
             }
         }
     }
@@ -841,17 +870,21 @@ fn apply_subscription_pressure_event(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalFlushOutcome {
+    Ready,
+    ChannelClosed,
+}
+
 /// Seal and send the adapter's active routed frame as ordered binary chunks.
-///
-/// The frame body is sealed slice by slice straight from the shared
-/// `TerminalBody` bytes; nothing is re-serialized or text-encoded.
+/// The sender seals the shared terminal bytes without text encoding or serialization.
 async fn flush_subscription_adapter_frames<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
     handle: &WebRtcTerminalAdapterHandle,
     usage: &std::sync::atomic::AtomicUsize,
     next_message_id: &mut u64,
-) -> Result<(), TerminalDriverExit>
+) -> Result<TerminalFlushOutcome, TerminalDriverExit>
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
@@ -859,7 +892,7 @@ where
         return if handle.is_closed() {
             Err(TerminalDriverExit::AdapterClosed)
         } else {
-            Ok(())
+            Ok(TerminalFlushOutcome::Ready)
         };
     };
     let message_id = *next_message_id;
@@ -888,23 +921,32 @@ where
                     biased;
                     _ = handle.wait_for_write() => {}
                     result = &mut send => {
-                        result.map_err(|_| TerminalDriverExit::SendFailed)?;
+                        match result {
+                            Ok(()) => {}
+                            Err(webrtc::error::Error::ErrDataChannelClosed) => {
+                                return Ok(TerminalFlushOutcome::ChannelClosed);
+                            }
+                            Err(_) => return Err(TerminalDriverExit::SendFailed),
+                        }
                         break;
                     }
                 }
             }
         }
-        Ok(())
+        Ok(TerminalFlushOutcome::Ready)
     }
     .await;
     // Cancellation keeps the conservative count until this refresh succeeds.
     let published = publish_channel_usage(data_channel, usage)
         .await
         .map_err(|()| TerminalDriverExit::UsageFailed);
-    sent?;
+    let outcome = sent?;
+    if outcome == TerminalFlushOutcome::ChannelClosed {
+        return Ok(outcome);
+    }
     published?;
     let _ = handle.complete_active();
-    Ok(())
+    Ok(TerminalFlushOutcome::Ready)
 }
 
 #[cfg(test)]
@@ -980,6 +1022,68 @@ mod tests {
         })));
         *channel.close_probe.lock().expect("close probe mutex") =
             Some(Arc::new(move || event_admitted.load(Ordering::Acquire)));
+    }
+
+    #[test]
+    fn terminal_closed_send_waits_for_close_event_without_replay() {
+        check_terminal_send_failure(true, true, TerminalDriverExit::RemoteClose);
+    }
+
+    #[test]
+    fn terminal_closed_send_without_close_event_is_bounded() {
+        check_terminal_send_failure(true, false, TerminalDriverExit::SendFailed);
+    }
+
+    #[test]
+    fn terminal_send_error_stays_send_failed() {
+        check_terminal_send_failure(false, false, TerminalDriverExit::SendFailed);
+    }
+
+    fn check_terminal_send_failure(
+        closed: bool,
+        deliver_close: bool,
+        expected: TerminalDriverExit,
+    ) {
+        let channel = FakeDataChannel::default();
+        channel.send_closed.store(closed, Ordering::Release);
+        channel.send_fails.store(!closed, Ordering::Release);
+        let peer_state = test_peer_state("send-close-order");
+        let (mut adapter, handle) =
+            crate::transport::webrtc::adapter::WebRtcTerminalAdapter::pair();
+        adapter
+            .try_write(&test_frame(b"pending output"))
+            .expect("queue terminal output");
+        let key = AesGcmKey::from_slice(&[19; 32]).expect("test key");
+        let usage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build the close-order runtime");
+        let exit = runtime.block_on(async {
+            let driver = run_bound_terminal_channel(&channel, &key, &peer_state, 1, handle.clone(), usage);
+            tokio::pin!(driver);
+            if closed {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::select! {
+                        exit = &mut driver => panic!("the driver exited before the close event: {exit:?}"),
+                        _ = channel.send_notify.notified() => {}
+                    }
+                }).await.expect("the driver attempted the closed send");
+                assert!(channel.send_entered.load(Ordering::Acquire));
+                assert!(!handle.is_closed());
+                // A retry would now succeed and appear in the send log.
+                channel.send_closed.store(false, Ordering::Release);
+                if deliver_close {
+                    channel.push_event(DataChannelEvent::OnClose);
+                }
+            }
+            tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND + Duration::from_secs(1), driver)
+                .await.expect("the driver has a bounded terminal exit")
+        });
+        assert_eq!(exit.as_str(), expected.as_str());
+        assert!(handle.is_closed());
+        assert!(channel.closed.load(Ordering::Acquire));
+        assert!(channel.sent.lock().expect("sent frames").is_empty());
     }
 
     #[test]
@@ -1481,7 +1585,7 @@ mod tests {
         // the driver's RetireReservedSubscription releases the label and budget.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            while let Ok(message) = harness.control_rx.try_recv() {
+            while let Ok(message) = harness.try_receive_owner_message() {
                 handle_control_message(
                     &mut harness.daemon,
                     &mut harness.state,
@@ -2006,7 +2110,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let authorization = loop {
-            match harness.control_rx.try_recv() {
+            match harness.try_receive_owner_message() {
                 Ok(message) => break message,
                 Err(tokio_mpsc::error::TryRecvError::Empty)
                     if std::time::Instant::now() < deadline =>
@@ -2140,7 +2244,7 @@ mod tests {
     ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !complete(harness) {
-            match harness.control_rx.try_recv() {
+            match harness.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut harness.daemon,
@@ -2334,7 +2438,7 @@ mod tests {
             .expect("queue target overflow frame");
         let authorization_deadline = std::time::Instant::now() + Duration::from_secs(10);
         let authorization = loop {
-            match harness.control_rx.try_recv() {
+            match harness.try_receive_owner_message() {
                 Ok(message @ ControlMessage::AuthorizeSubscriptionSend { .. }) => break message,
                 Ok(other) => {
                     handle_control_message(
@@ -2393,7 +2497,7 @@ mod tests {
 
         let retirement_deadline = std::time::Instant::now() + Duration::from_secs(10);
         let automatic_retirement = loop {
-            match harness.control_rx.try_recv() {
+            match harness.try_receive_owner_message() {
                 Ok(message @ ControlMessage::RetireReservedSubscription { .. }) => break message,
                 Ok(other) => panic!("expected automatic retirement, got {other:?}"),
                 Err(tokio_mpsc::error::TryRecvError::Empty)
@@ -2498,7 +2602,7 @@ mod tests {
                 .block_on(host)
                 .expect("sibling host joins");
         }
-        while let Ok(message) = harness.control_rx.try_recv() {
+        while let Ok(message) = harness.try_receive_owner_message() {
             handle_control_message(
                 &mut harness.daemon,
                 &mut harness.state,

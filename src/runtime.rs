@@ -3833,6 +3833,12 @@ impl HubRuntime {
             .unwrap_or_default()
     }
 
+    pub(crate) fn data_plane_progress_pending(&self) -> bool {
+        self.data_plane
+            .as_ref()
+            .is_some_and(crate::data_plane::driver::DataPlaneDriver::progress_pending)
+    }
+
     /// Control-plane terminal subscription inventory. No terminal bodies.
     #[must_use]
     pub fn list_terminal_subscriptions(&self) -> CoreTicket<Vec<TerminalSubscriptionRecord>> {
