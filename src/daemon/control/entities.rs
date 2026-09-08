@@ -1,6 +1,6 @@
 //! Entity subscription control-message family.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use botster_core::{
@@ -37,7 +37,6 @@ struct PluginEntityIdentity {
 struct PendingEntitySubscribe {
     request: EntitySubscribeRequest,
     permit: OwnerPermit,
-    accepted_at: Instant,
 }
 
 enum PendingPluginEntityKind {
@@ -45,11 +44,13 @@ enum PendingPluginEntityKind {
     Resync {
         entity_type: String,
         permit: OwnerPermit,
-        accepted_at: Instant,
     },
 }
 
 struct PendingPluginEntity {
+    waiter_id: crate::owner_identity::WaiterId,
+    ready_key: Option<crate::daemon::owner_schedule::ReadyKey>,
+    deadline_key: Option<crate::daemon::owner_schedule::DeadlineKey>,
     identity: PluginEntityIdentity,
     invocation: PluginEntitySnapshotInvocation,
     kind: PendingPluginEntityKind,
@@ -66,6 +67,8 @@ enum RoutedPluginEntityCompletion {
 pub(crate) struct PluginEntityState {
     next_serial: u64,
     pending: BTreeMap<String, PendingPluginEntity>,
+    by_waiter: BTreeMap<crate::owner_identity::WaiterId, String>,
+    ready: VecDeque<crate::owner_identity::WaiterId>,
     completion_inconsistencies: u64,
 }
 
@@ -104,13 +107,19 @@ impl PluginEntityState {
 
     fn insert(
         &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
         invocation: PluginEntitySnapshotInvocation,
         identity: PluginEntityIdentity,
         kind: PendingPluginEntityKind,
     ) {
+        let request_id = invocation.request.request_id.0.clone();
+        self.by_waiter.insert(waiter_id, request_id.clone());
         self.pending.insert(
-            invocation.request.request_id.0.clone(),
+            request_id,
             PendingPluginEntity {
+                waiter_id,
+                ready_key: None,
+                deadline_key: None,
                 identity,
                 invocation,
                 kind,
@@ -132,6 +141,7 @@ impl PluginEntityState {
         let Some(entry) = self.pending.get_mut(&request_id.0) else {
             return None;
         };
+        let mut became_ready = false;
         if completion.value().class != PluginInvocationClass::RequestResponse
             || entry.identity.plugin_key != handler.plugin_key.0
             || entry.identity.handler != handler
@@ -146,29 +156,27 @@ impl PluginEntityState {
                         )
                     },
                 )));
+                became_ready = true;
             }
-            return None;
-        }
-        if entry.result.is_none() {
+        } else if entry.result.is_none() {
             entry.result = Some(RoutedPluginEntityCompletion::Invocation(
                 completion.map(|completion| completion.result),
             ));
+            became_ready = true;
+        }
+        if became_ready {
+            self.ready.push_back(entry.waiter_id);
         }
         None
     }
 
-    pub(crate) fn next_reply_deadline(&self) -> Option<Instant> {
-        self.pending
-            .values()
-            .filter_map(|entry| match &entry.kind {
-                PendingPluginEntityKind::Subscribe(subscribe) => {
-                    Some(subscribe.accepted_at + RETAINED_OPERATION_DEADLINE)
-                }
-                PendingPluginEntityKind::Resync { accepted_at, .. } => {
-                    Some(*accepted_at + RETAINED_OPERATION_DEADLINE)
-                }
-            })
-            .min()
+    pub(crate) fn take_ready_waiters(
+        &mut self,
+        max_items: usize,
+    ) -> Vec<crate::owner_identity::WaiterId> {
+        self.ready
+            .drain(..self.ready.len().min(max_items))
+            .collect()
     }
 
     pub(crate) fn has_resync(&self, entity_type: &str) -> bool {
@@ -183,24 +191,36 @@ impl PluginEntityState {
         })
     }
 
-    fn ready_ids(&self, max_items: usize) -> Vec<String> {
-        self.pending
-            .iter()
-            .filter(|(_, entry)| entry.result.is_some())
-            .map(|(request_id, _)| request_id.clone())
-            .take(max_items)
-            .collect()
+    fn take_waiter(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> Option<PendingPluginEntity> {
+        let request_id = self.by_waiter.remove(&waiter_id)?;
+        let entry = self.pending.remove(&request_id)?;
+        self.ready.retain(|ready| *ready != waiter_id);
+        Some(entry)
     }
 
-    fn take_ready(&mut self, request_id: &str) -> Option<PendingPluginEntity> {
-        if !self
-            .pending
-            .get(request_id)
-            .is_some_and(|entry| entry.result.is_some())
-        {
-            return None;
-        }
+    fn entry_for_waiter_mut(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> Option<&mut PendingPluginEntity> {
+        let request_id = self.by_waiter.get(&waiter_id)?.clone();
+        self.pending.get_mut(&request_id)
+    }
+
+    pub(crate) fn clear_deadline(&mut self, waiter_id: crate::owner_identity::WaiterId) -> bool {
+        let Some(entry) = self.entry_for_waiter_mut(waiter_id) else {
+            return false;
+        };
+        entry.deadline_key = None;
+        true
+    }
+
+    fn remove_request_id(&mut self, request_id: &str) -> Option<PendingPluginEntity> {
         let entry = self.pending.remove(request_id)?;
+        self.by_waiter.remove(&entry.waiter_id);
+        self.ready.retain(|ready| *ready != entry.waiter_id);
         Some(entry)
     }
 
@@ -222,7 +242,7 @@ impl PluginEntityState {
             .collect();
         let removed = request_ids
             .into_iter()
-            .filter_map(|request_id| self.pending.remove(&request_id))
+            .filter_map(|request_id| self.remove_request_id(&request_id))
             .collect();
         removed
     }
@@ -236,27 +256,30 @@ impl PluginEntityState {
             )
         })
     }
+}
 
-    fn take_expired_resyncs(&mut self, now: Instant) -> Vec<PendingPluginEntity> {
-        let expired_pending: Vec<String> = self
-            .pending
-            .iter()
-            .filter_map(|(request_id, entry)| match &entry.kind {
-                PendingPluginEntityKind::Resync { accepted_at, .. }
-                    if now.saturating_duration_since(*accepted_at)
-                        >= RETAINED_OPERATION_DEADLINE =>
-                {
-                    Some(request_id.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        let removed = expired_pending
-            .into_iter()
-            .filter_map(|request_id| self.pending.remove(&request_id))
-            .collect();
-        removed
+pub(crate) fn mark_plugin_entity_ready(
+    state: &mut DaemonControlState,
+    waiter_id: crate::owner_identity::WaiterId,
+    class: crate::daemon::owner_schedule::ReadyClass,
+    reason: crate::daemon::owner_schedule::ReadyReasons,
+) -> bool {
+    if state
+        .plugin_entities
+        .entry_for_waiter_mut(waiter_id)
+        .is_none()
+    {
+        return false;
     }
+    let Ok(key) = state.owner_ready.mark(waiter_id, class, reason) else {
+        return false;
+    };
+    state
+        .plugin_entities
+        .entry_for_waiter_mut(waiter_id)
+        .expect("a marked entity waiter must exist")
+        .ready_key = Some(key);
+    true
 }
 
 fn plugin_completion_identity(result: &PluginInvocationResult) -> (&RequestId, &PluginHandlerRef) {
@@ -441,6 +464,15 @@ fn begin_plugin_entity_subscription(
         )));
         return false;
     };
+    let Some(waiter_id) = state.waiter_ids.next() else {
+        state.budget.release(permit);
+        let _ = request.reply_tx.send(Ok(entity_subscription_error(
+            "owner_waiter_id_exhausted",
+            &request.subscription_id,
+            "the daemon exhausted unique owner waiter identifiers",
+        )));
+        return false;
+    };
     let Some(request_id) = state.plugin_entities.next_request_id() else {
         state.budget.release(permit);
         let _ = request.reply_tx.send(Ok(entity_subscription_error(
@@ -490,15 +522,25 @@ fn begin_plugin_entity_subscription(
     ) {
         PluginAdmissionResult::Queued { .. } => {
             state.plugin_entities.insert(
+                waiter_id,
                 invocation,
                 identity,
-                PendingPluginEntityKind::Subscribe(PendingEntitySubscribe {
-                    request,
-                    permit,
-                    accepted_at: Instant::now(),
-                }),
+                PendingPluginEntityKind::Subscribe(PendingEntitySubscribe { request, permit }),
             );
-            state.maintenance.scheduler.prefer_completion_drain();
+            let now = Instant::now();
+            let arm = state
+                .deadlines
+                .arm(waiter_id, now + RETAINED_OPERATION_DEADLINE, now)
+                .expect("an initial entity deadline always makes progress");
+            state
+                .plugin_entities
+                .entry_for_waiter_mut(waiter_id)
+                .expect("the entity waiter was inserted")
+                .deadline_key = Some(arm.key());
+            state
+                .maintenance
+                .wakes
+                .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
         }
         admission => {
             runtime.retire_plugin_entity_snapshot(&invocation);
@@ -542,6 +584,10 @@ pub(crate) fn begin_plugin_entity_resync(
     let Some(permit) = state.budget.reserve() else {
         return;
     };
+    let Some(waiter_id) = state.waiter_ids.next() else {
+        state.budget.release(permit);
+        return;
+    };
     let Some(request_id) = state.plugin_entities.next_request_id() else {
         state.budget.release(permit);
         return;
@@ -575,15 +621,28 @@ pub(crate) fn begin_plugin_entity_resync(
     ) {
         PluginAdmissionResult::Queued { .. } => {
             state.plugin_entities.insert(
+                waiter_id,
                 invocation,
                 identity,
                 PendingPluginEntityKind::Resync {
                     entity_type,
                     permit,
-                    accepted_at: Instant::now(),
                 },
             );
-            state.maintenance.scheduler.prefer_completion_drain();
+            let now = Instant::now();
+            let arm = state
+                .deadlines
+                .arm(waiter_id, now + RETAINED_OPERATION_DEADLINE, now)
+                .expect("an initial entity deadline always makes progress");
+            state
+                .plugin_entities
+                .entry_for_waiter_mut(waiter_id)
+                .expect("the entity waiter was inserted")
+                .deadline_key = Some(arm.key());
+            state
+                .maintenance
+                .wakes
+                .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
         }
         _ => {
             runtime.retire_plugin_entity_snapshot(&invocation);
@@ -592,44 +651,46 @@ pub(crate) fn begin_plugin_entity_resync(
     }
 }
 
-/// Apply ready entity-provider completions without waiting on a worker.
-pub(crate) fn drive_plugin_entity_completions(
+/// Apply one exact entity-provider completion or deadline.
+pub(crate) fn drive_plugin_entity_ready_item(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
-) {
-    for request_id in state.plugin_entities.ready_ids(8) {
-        let Some(mut entry) = state.plugin_entities.take_ready(&request_id) else {
-            continue;
-        };
-        let completion = entry
-            .result
-            .take()
-            .expect("ready entity-provider entry has a completion");
-        match entry.kind {
-            PendingPluginEntityKind::Subscribe(subscribe) => {
-                let PendingEntitySubscribe {
-                    request, permit, ..
-                } = subscribe;
-                let EntitySubscribeRequest {
-                    entity_type,
-                    subscription_id,
-                    frame_rx,
-                    frame_tx,
-                    reply_tx,
-                    grant_id,
-                    ..
-                } = request;
-                let (completion, plugin_result_charge) = match completion {
-                    RoutedPluginEntityCompletion::Invocation(result) => {
-                        let (result, charge) = result.into_parts();
-                        (Ok(result), charge)
-                    }
-                    RoutedPluginEntityCompletion::Inconsistent(message) => {
-                        let (message, charge) = message.into_parts();
-                        (Err(message), charge)
-                    }
-                };
-                let mut response = match daemon.runtime() {
+    item: crate::daemon::owner_schedule::ReadyItem,
+) -> bool {
+    let waiter_id = item.key().waiter_id();
+    let Some(mut entry) = state.plugin_entities.take_waiter(waiter_id) else {
+        return false;
+    };
+    state.deadlines.retire(waiter_id);
+    let Some(completion) = entry.result.take() else {
+        retire_plugin_entity_entries(daemon, state, vec![entry], true);
+        return true;
+    };
+    match entry.kind {
+        PendingPluginEntityKind::Subscribe(subscribe) => {
+            let PendingEntitySubscribe {
+                request, permit, ..
+            } = subscribe;
+            let EntitySubscribeRequest {
+                entity_type,
+                subscription_id,
+                frame_rx,
+                frame_tx,
+                reply_tx,
+                grant_id,
+                ..
+            } = request;
+            let (completion, plugin_result_charge) = match completion {
+                RoutedPluginEntityCompletion::Invocation(result) => {
+                    let (result, charge) = result.into_parts();
+                    (Ok(result), charge)
+                }
+                RoutedPluginEntityCompletion::Inconsistent(message) => {
+                    let (message, charge) = message.into_parts();
+                    (Err(message), charge)
+                }
+            };
+            let mut response = match daemon.runtime() {
                     Some(runtime) => match completion {
                         Ok(result) => match runtime
                             .complete_plugin_entity_snapshot(entry.invocation, result)
@@ -663,74 +724,47 @@ pub(crate) fn drive_plugin_entity_completions(
                     },
                     None => Err(DaemonTransportError::DaemonNotRunning),
                 };
-                state.budget.release(permit);
-                finish_entity_subscribe_response(
-                    state,
-                    &subscription_id,
-                    frame_rx,
-                    grant_id,
-                    reply_tx,
-                    &mut response,
-                    Some(plugin_result_charge),
-                );
-            }
-            PendingPluginEntityKind::Resync {
-                entity_type,
-                permit,
-                accepted_at: _,
-            } => {
-                let completed = daemon.runtime().and_then(|runtime| match completion {
-                    RoutedPluginEntityCompletion::Invocation(result) => {
-                        let (result, _charge) = result.into_parts();
-                        runtime
-                            .complete_plugin_entity_snapshot(entry.invocation, result)
-                            .ok()
-                    }
-                    RoutedPluginEntityCompletion::Inconsistent(message) => {
-                        let (_message, _charge) = message.into_parts();
-                        runtime.retire_plugin_entity_snapshot(&entry.invocation);
-                        None
-                    }
-                });
-                state.budget.release(permit);
-                if let Some((snapshot_seq, items)) = completed {
-                    apply_package_entity_resync_snapshot(
-                        daemon,
-                        state,
-                        &entity_type,
-                        snapshot_seq,
-                        items,
-                    );
+            state.budget.release(permit);
+            finish_entity_subscribe_response(
+                state,
+                &subscription_id,
+                frame_rx,
+                grant_id,
+                reply_tx,
+                &mut response,
+                Some(plugin_result_charge),
+            );
+        }
+        PendingPluginEntityKind::Resync {
+            entity_type,
+            permit,
+        } => {
+            let completed = daemon.runtime().and_then(|runtime| match completion {
+                RoutedPluginEntityCompletion::Invocation(result) => {
+                    let (result, _charge) = result.into_parts();
+                    runtime
+                        .complete_plugin_entity_snapshot(entry.invocation, result)
+                        .ok()
                 }
+                RoutedPluginEntityCompletion::Inconsistent(message) => {
+                    let (_message, _charge) = message.into_parts();
+                    runtime.retire_plugin_entity_snapshot(&entry.invocation);
+                    None
+                }
+            });
+            state.budget.release(permit);
+            if let Some((snapshot_seq, items)) = completed {
+                apply_package_entity_resync_snapshot(
+                    daemon,
+                    state,
+                    &entity_type,
+                    snapshot_seq,
+                    items,
+                );
             }
         }
     }
-}
-
-/// Retire closed or expired entity-provider replies. Execution can continue.
-pub(crate) fn retire_plugin_entity_replies(
-    daemon: &HubDaemon,
-    state: &mut DaemonControlState,
-    now: Instant,
-) {
-    let retired = state
-        .plugin_entities
-        .take_matching_subscriptions(|subscribe, _| {
-            subscribe.request.reply_tx.is_closed()
-                || now.saturating_duration_since(subscribe.accepted_at)
-                    >= RETAINED_OPERATION_DEADLINE
-        });
-    retire_plugin_entity_entries(daemon, state, retired, true);
-}
-
-/// Retire expired entity-provider resync work. Execution can continue.
-pub(crate) fn expire_plugin_entity_resyncs(
-    daemon: &HubDaemon,
-    state: &mut DaemonControlState,
-    now: Instant,
-) {
-    let retired = state.plugin_entities.take_expired_resyncs(now);
-    retire_plugin_entity_entries(daemon, state, retired, false);
+    true
 }
 
 /// Retire pending entity-provider replies owned by one closed connection.
@@ -751,7 +785,11 @@ fn retire_plugin_entity_entries(
     entries: Vec<PendingPluginEntity>,
     count_abandoned: bool,
 ) {
-    for entry in entries {
+    for mut entry in entries {
+        if let Some(key) = entry.ready_key.take() {
+            state.owner_ready.remove(key);
+        }
+        state.deadlines.retire(entry.waiter_id);
         if let Some(runtime) = daemon.runtime() {
             runtime.retire_plugin_entity_snapshot(&entry.invocation);
         }
@@ -855,11 +893,26 @@ fn finish_entity_subscribe_response(
                             )
                             .ok()
                     });
-                if budget.is_some() {
+                if budget.is_some()
+                    && crate::daemon::owner_loop::arm_reservation_deadline(
+                        state,
+                        reservation.label.clone(),
+                        peer_generation,
+                        reservation.expires_in_seconds,
+                    )
+                {
                     if let Ok(response) = response.as_mut() {
                         response.subscription_reservation = Some(reservation);
                     }
                 } else {
+                    if let Some(budget) = state
+                        .pending_runtime
+                        .admission
+                        .connection_budgets
+                        .get_mut(&peer_generation)
+                    {
+                        let _ = budget.release(&reservation.label);
+                    }
                     let _ = state
                         .pending_runtime
                         .admission
@@ -969,6 +1022,7 @@ fn unsubscribe(
                 &subscription_id,
                 peer_generation,
             );
+        crate::daemon::owner_loop::retire_reservation_deadlines(state, labels.iter().cloned());
         if let Some(budget) = state
             .pending_runtime
             .admission

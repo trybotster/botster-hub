@@ -166,6 +166,7 @@ pub(crate) struct SessionTypeCatalogCache {
     logical_bytes: usize,
     prepared_charge: Option<crate::host_executor::HostPreparedCharge>,
     pending: Option<(HostJobIdentity, u64)>,
+    completion: Option<HostCompletion>,
     requested_generation: Option<u64>,
     waiting_for_capacity: bool,
     retained_reclamation: Option<(
@@ -187,8 +188,22 @@ impl SessionTypeCatalogCache {
         self.pending
             .is_some_and(|(expected, _)| expected == identity)
     }
+
+    fn retain_completion(&mut self, completion: HostCompletion) -> Option<HostJobIdentity> {
+        if !self.accepts(completion.identity) || self.completion.is_some() {
+            return None;
+        }
+        let identity = completion.identity;
+        self.completion = Some(completion);
+        Some(identity)
+    }
     /// Return the requested catalog or submit one bounded off-owner build.
-    fn refresh(&mut self, daemon: &HubDaemon, generation: u64) -> SessionTypeCatalogRefresh<'_> {
+    fn refresh(
+        &mut self,
+        daemon: &HubDaemon,
+        generation: u64,
+        waiter_ids: &crate::owner_identity::WaiterIdSource,
+    ) -> SessionTypeCatalogRefresh<'_> {
         self.requested_generation = Some(generation);
         let Some(runtime) = daemon.runtime() else {
             return SessionTypeCatalogRefresh::Pending;
@@ -213,7 +228,7 @@ impl SessionTypeCatalogCache {
             self.waiting_for_capacity = true;
             return SessionTypeCatalogRefresh::Pending;
         };
-        let Some(waiter_id) = runtime.next_waiter_id() else {
+        let Some(waiter_id) = waiter_ids.next() else {
             drop(permit);
             self.generation = None;
             self.failure = Some((
@@ -451,9 +466,10 @@ pub(crate) fn register_builtin_entity_subscription(
         let catalog = {
             let DaemonControlState {
                 session_type_catalog,
+                waiter_ids,
                 ..
             } = state;
-            match session_type_catalog.refresh(daemon, generation) {
+            match session_type_catalog.refresh(daemon, generation, waiter_ids) {
                 SessionTypeCatalogRefresh::Ready(generation, entities) => {
                     Ok(Some((generation, entities.clone())))
                 }
@@ -568,7 +584,10 @@ pub(crate) fn register_builtin_entity_subscription(
             .reconnect_registrations
             .saturating_add(1);
     }
-    state.maintenance.scheduler.prefer_journal_pull();
+    state
+        .maintenance
+        .wakes
+        .mark(crate::daemon_maintenance::MaintenanceSliceKind::JournalPull);
     Ok(daemon_response_base(DaemonResponseKind::EntitySubscribed))
 }
 
@@ -847,9 +866,10 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
         let outcome = {
             let DaemonControlState {
                 session_type_catalog,
+                waiter_ids,
                 ..
             } = state;
-            match session_type_catalog.refresh(daemon, generation) {
+            match session_type_catalog.refresh(daemon, generation, waiter_ids) {
                 SessionTypeCatalogRefresh::Ready(generation, entities) => {
                     Ok(Some((generation, entities)))
                 }
@@ -1050,7 +1070,18 @@ pub(crate) fn absorb_session_type_catalog_completions(
         match executor.poll_completion() {
             HostCompletionPoll::Ready(completion) => {
                 if state.session_type_catalog.accepts(completion.identity) {
-                    catalog_changed |= state.session_type_catalog.absorb(completion, executor);
+                    let waiter_id = completion.identity.waiter_id;
+                    if state
+                        .session_type_catalog
+                        .retain_completion(completion)
+                        .is_some()
+                    {
+                        let _ = state.owner_ready.mark(
+                            waiter_id,
+                            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                            crate::daemon::control::pending::READY_HOST_COMPLETION,
+                        );
+                    }
                 } else {
                     crate::daemon::control::pending::absorb_host_completion(state, completion);
                 }
@@ -1075,8 +1106,42 @@ pub(crate) fn absorb_session_type_catalog_completions(
     }
     drain_host_capacity_wakes(state, owner_turn);
     if catalog_changed {
-        state.maintenance.scheduler.prefer_subscriber_delivery();
+        state
+            .maintenance
+            .wakes
+            .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
     }
+}
+
+pub(crate) fn drive_session_type_catalog_ready_item(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    item: crate::daemon::owner_schedule::ReadyItem,
+) -> bool {
+    let waiter_id = item.key().waiter_id();
+    if !state
+        .session_type_catalog
+        .pending
+        .is_some_and(|(identity, _)| identity.waiter_id == waiter_id)
+    {
+        return false;
+    }
+    let Some(completion) = state.session_type_catalog.completion.take() else {
+        return true;
+    };
+    let Some(runtime) = daemon.runtime() else {
+        return true;
+    };
+    if state
+        .session_type_catalog
+        .absorb(completion, runtime.host_executor())
+    {
+        state
+            .maintenance
+            .wakes
+            .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
+    }
+    true
 }
 
 fn drain_host_capacity_wakes(state: &mut DaemonControlState, owner_turn: &mut OwnerTurnBudget) {
@@ -1089,7 +1154,10 @@ fn drain_host_capacity_wakes(state: &mut DaemonControlState, owner_turn: &mut Ow
                 {
                     break;
                 }
-                state.maintenance.scheduler.prefer_subscriber_delivery();
+                state
+                    .maintenance
+                    .wakes
+                    .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
             }
             state.host_capacity_wake_pending = false;
             break;
@@ -1104,7 +1172,7 @@ fn drain_host_capacity_wakes(state: &mut DaemonControlState, owner_turn: &mut Ow
         if !state.pending_requests.contains_key(&waiter_id) {
             continue;
         }
-        if !crate::daemon::control::pending::mark_request_ready(
+        if !crate::daemon::control::pending::mark_owner_ready(
             state,
             waiter_id,
             crate::daemon::owner_schedule::ReadyClass::HostCompletion,
@@ -2231,6 +2299,20 @@ mod tests {
     use crate::daemon::owner_loop::DaemonControlState;
     use crate::owner_identity::WaiterIdSource;
 
+    fn drive_all_maintenance(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+        for kind in crate::daemon_maintenance::MaintenanceSliceKind::ALL {
+            if kind == crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery {
+                drive_entity_subscriptions(daemon, state);
+            } else if let Some(runtime) = daemon.runtime() {
+                crate::daemon_maintenance::run_maintenance_kind_to_completion(
+                    runtime,
+                    &mut state.maintenance,
+                    kind,
+                );
+            }
+        }
+    }
+
     #[test]
     fn stale_catalog_completion_releases_capacity_without_publishing() {
         let executor = crate::host_executor::HostExecutor::new();
@@ -2537,14 +2619,7 @@ mod tests {
         let mut state = DaemonControlState::default();
         seed_lifecycle_reconciliation(&mut daemon, &mut state);
         for _ in 0..16 {
-            let kind = state.maintenance.scheduler.take_slice();
-            if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind_to_completion(
-                    runtime,
-                    &mut state.maintenance,
-                    kind,
-                );
-            }
+            drive_all_maintenance(&mut daemon, &mut state);
         }
         let (sender, receiver) = mpsc::sync_channel(4);
         let response = register_builtin_entity_subscription(
@@ -2562,15 +2637,7 @@ mod tests {
             if first.is_some() {
                 break;
             }
-            let kind = state.maintenance.scheduler.take_slice();
-            if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind_to_completion(
-                    runtime,
-                    &mut state.maintenance,
-                    kind,
-                );
-            }
-            drive_entity_subscriptions(&mut daemon, &mut state);
+            drive_all_maintenance(&mut daemon, &mut state);
             first = receiver.try_recv().ok();
         }
         let first = first.expect("initial authoritative snapshot");
@@ -2594,15 +2661,7 @@ mod tests {
             .mark_session_stale_for_test(&session_id, 2)
             .expect("mark live session stale through core daemon");
         for _ in 0..16 {
-            let kind = state.maintenance.scheduler.take_slice();
-            if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind_to_completion(
-                    runtime,
-                    &mut state.maintenance,
-                    kind,
-                );
-            }
-            drive_entity_subscriptions(&mut daemon, &mut state);
+            drive_all_maintenance(&mut daemon, &mut state);
         }
         assert!(matches!(
             receiver.recv().expect("stale transition patch"),
@@ -2659,14 +2718,7 @@ mod tests {
         let mut state = DaemonControlState::default();
         seed_lifecycle_reconciliation(&mut daemon, &mut state);
         for _ in 0..16 {
-            let kind = state.maintenance.scheduler.take_slice();
-            if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind_to_completion(
-                    runtime,
-                    &mut state.maintenance,
-                    kind,
-                );
-            }
+            drive_all_maintenance(&mut daemon, &mut state);
         }
         let (sender, receiver) = mpsc::sync_channel(8);
         let response = register_builtin_entity_subscription(
@@ -2684,16 +2736,7 @@ mod tests {
             if first.is_some() {
                 break;
             }
-            let kind = state.maintenance.scheduler.take_slice();
-            if kind == crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery {
-                drive_entity_subscriptions(&mut daemon, &mut state);
-            } else if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind_to_completion(
-                    runtime,
-                    &mut state.maintenance,
-                    kind,
-                );
-            }
+            drive_all_maintenance(&mut daemon, &mut state);
             first = receiver.try_recv().ok();
         }
         match first.expect("first snapshot before spawn") {
@@ -2722,16 +2765,7 @@ mod tests {
         state.maintenance.note_authoritative_mutation();
         let mut saw_ready = false;
         for _ in 0..16 {
-            let kind = state.maintenance.scheduler.take_slice();
-            if kind == crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery {
-                drive_entity_subscriptions(&mut daemon, &mut state);
-            } else if let Some(runtime) = daemon.runtime() {
-                crate::daemon_maintenance::run_maintenance_kind_to_completion(
-                    runtime,
-                    &mut state.maintenance,
-                    kind,
-                );
-            }
+            drive_all_maintenance(&mut daemon, &mut state);
             while let Ok(frame) = receiver.try_recv() {
                 match frame {
                     DaemonEntityFrame::Upsert { id, .. } | DaemonEntityFrame::Patch { id, .. }

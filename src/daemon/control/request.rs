@@ -13,8 +13,8 @@ use crate::client_api_dto::response::daemon_hub_update;
 use crate::daemon::control::attach_bind_operator_error;
 use crate::daemon::control::message::{ControlMessage, ControlReplySender, ControlSender};
 use crate::daemon::control::pending::{
-    ControlStep, PendingControlRequest, READY_DEADLINE, READY_INITIAL, mark_request_ready,
-    poll_ready_requests, request_must_finish,
+    ControlStep, OwnerRequestCompletion, PendingControlRequest, READY_DEADLINE, READY_INITIAL,
+    mark_owner_ready, poll_ready_request_item, request_must_finish,
 };
 use crate::daemon::control::reply::ControlReply;
 use crate::daemon::control::{
@@ -30,14 +30,13 @@ use crate::daemon::error::{
 use crate::daemon::owner_budget::OWNER_BUDGET_EXHAUSTED;
 use crate::daemon::owner_loop::{
     DaemonControlState, request_succeeded, send_control_reply, send_control_response,
-    should_mark_pump_after_control,
 };
 use crate::daemon::owner_schedule::ReadyClass;
+#[cfg(test)]
 use crate::daemon::owner_turn::OwnerTurnBudget;
 use crate::maintenance::software_identity;
 use crate::subscription::attach_routes::{
-    AttachedSubscriptionChange, attached_subscription_change_for_response,
-    record_attached_subscription_change,
+    AttachedSubscriptionChange, record_attached_subscription_change,
 };
 
 pub(crate) fn handle(
@@ -143,8 +142,10 @@ pub(crate) fn handle(
         grant_id: grant_id.clone(),
         transport_request_id,
     };
+    let must_finish = request_must_finish(&request);
+    let completion = OwnerRequestCompletion::from_request(&request);
     state.current_waiter_id = Some(waiter_id);
-    let step = handle_control_request(daemon, state, observability, control_tx, request.clone());
+    let step = handle_control_request(daemon, state, observability, control_tx, request);
     state.current_waiter_id = None;
     let entry = PendingControlRequest {
         waiter_id,
@@ -153,14 +154,13 @@ pub(crate) fn handle(
         deadline_key: None,
         last_core_phase: 0,
         last_host_phase: 0,
-        must_finish: request_must_finish(&request),
-        request,
+        completion,
+        must_finish,
         reply_tx,
         response_delivery_rx,
         grant_id,
         client,
         permit: Some(permit),
-        accepted_at: Instant::now(),
         past_deadline: false,
         continuation: Box::new(|_, _| crate::daemon::control::pending::ControlPoll::Pending),
         retire: None,
@@ -181,7 +181,7 @@ pub(crate) fn handle(
             let now = Instant::now();
             let deadline = now + crate::daemon::owner_budget::RETAINED_OPERATION_DEADLINE;
             let arm = state
-                .request_deadlines
+                .deadlines
                 .arm(waiter_id, deadline, now)
                 .expect("an initial owner deadline always makes progress");
             state
@@ -189,22 +189,21 @@ pub(crate) fn handle(
                 .get_mut(&waiter_id)
                 .expect("the pending waiter was inserted")
                 .deadline_key = Some(arm.key());
-            mark_request_ready(state, waiter_id, ready_class, READY_INITIAL);
+            mark_owner_ready(state, waiter_id, ready_class, READY_INITIAL);
             if arm.is_due() {
-                mark_request_ready(state, waiter_id, ReadyClass::Deadline, READY_DEADLINE);
+                mark_owner_ready(state, waiter_id, ReadyClass::Deadline, READY_DEADLINE);
             }
             false
         }
     }
 }
 
-/// Poll deferred requests and answer the finished ones.
-pub(crate) fn poll_deferred_with_budget(
+pub(crate) fn poll_one_ready(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
-    budget: &mut OwnerTurnBudget,
+    item: crate::daemon::owner_schedule::ReadyItem,
 ) -> bool {
-    poll_ready_requests(daemon, state, Instant::now(), budget, finish)
+    poll_ready_request_item(daemon, state, item, &mut finish)
 }
 
 #[cfg(test)]
@@ -212,10 +211,30 @@ pub(crate) fn poll_deferred(daemon: &mut HubDaemon, state: &mut DaemonControlSta
     let waiter_ids = state.pending_requests.keys().copied().collect::<Vec<_>>();
     for waiter_id in waiter_ids {
         let class = state.pending_requests[&waiter_id].ready_class;
-        mark_request_ready(state, waiter_id, class, READY_INITIAL);
+        mark_owner_ready(state, waiter_id, class, READY_INITIAL);
     }
     let mut budget = OwnerTurnBudget::new(Instant::now());
-    poll_ready_requests(daemon, state, Instant::now(), &mut budget, finish)
+    while budget
+        .try_charge(
+            Instant::now(),
+            crate::daemon::owner_turn::OwnerTurnCharge::opaque_move(),
+        )
+        .is_ok()
+    {
+        let Some(item) = state.owner_ready.pop_next() else {
+            return false;
+        };
+        if crate::daemon::owner_loop::run_background_ready_item(daemon, state, item) {
+            continue;
+        }
+        if crate::daemon::owner_budget::poll_owner_obligation_item(daemon, state, item) {
+            continue;
+        }
+        if poll_one_ready(daemon, state, item) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Post-process one complete response and send it. Returns `true` after a
@@ -227,7 +246,7 @@ fn finish(
     response: ControlReply,
 ) -> bool {
     let PendingControlRequest {
-        request,
+        completion,
         reply_tx,
         response_delivery_rx,
         grant_id,
@@ -238,13 +257,7 @@ fn finish(
     if let Some(permit) = permit {
         state.budget.release(permit);
     }
-    let reconcile_after_request = matches!(
-        request,
-        DaemonRequest::Spawn { .. }
-            | DaemonRequest::Attach { .. }
-            | DaemonRequest::ShutdownSession { .. }
-            | DaemonRequest::RemoveSession { .. }
-    );
+    let reconcile_after_request = completion.reconciles_after_success();
     let (response, plugin_result_charge) = response.into_parts();
     let response = response.or_else(|error| match error {
         DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
@@ -262,7 +275,7 @@ fn finish(
         }
         error => Err(error),
     });
-    if matches!(request, DaemonRequest::Detach { .. })
+    if completion.is_detach()
         && response
             .as_ref()
             .is_ok_and(|response| response.kind != DaemonResponseKind::OperatorError)
@@ -273,7 +286,7 @@ fn finish(
             .entry("explicit_detach".to_string())
             .or_insert(0) += 1;
     }
-    if let DaemonRequest::ShutdownSession { session_id } = &request
+    if let Some(session_id) = completion.shutdown_session_id()
         && response
             .as_ref()
             .is_ok_and(|response| response.kind == DaemonResponseKind::OperatorError)
@@ -298,24 +311,21 @@ fn finish(
         }
     }
     if let Ok(response) = response.as_ref() {
-        let change = attached_subscription_change_for_response(&request, response);
+        let change = (response.kind != DaemonResponseKind::OperatorError)
+            .then(|| completion.route_change())
+            .flatten();
         // A Detach whose route key is now owned by a replacement stream must
         // not remove the replacement's live-attach bookkeeping.
-        let change = match (&request, change) {
-            (
-                DaemonRequest::Detach {
-                    session_id,
-                    subscription_id,
-                },
-                Some(AttachedSubscriptionChange::Detach(_)),
-            ) if state
-                .pending_runtime
-                .stream_identity(session_id, subscription_id)
-                .is_some() =>
+        let change = match change {
+            Some(AttachedSubscriptionChange::Detach(ref subscription))
+                if state
+                    .pending_runtime
+                    .stream_identity(&subscription.session_id, &subscription.subscription_id)
+                    .is_some() =>
             {
                 None
             }
-            (_, change) => change,
+            change => change,
         };
         // An explicit detach releases the key from the owner's route set;
         // the attach reserved it before starting.
@@ -338,18 +348,18 @@ fn finish(
     }
     let succeeded = request_succeeded(response.as_ref());
     if succeeded {
-        if let DaemonRequest::Spawn { session_id, .. } = &request {
+        if let Some(session_id) = completion.spawned_session_id() {
             state
                 .maintenance
                 .acknowledged_spawn_ids
-                .insert(session_id.clone());
+                .insert(session_id.to_owned());
             if let Some(runtime) = daemon.runtime() {
-                runtime.record_acknowledged_spawn(session_id.clone());
+                runtime.record_acknowledged_spawn(session_id);
             }
         }
         if reconcile_after_request {
             state.maintenance.note_authoritative_mutation();
-        } else if matches!(request, DaemonRequest::PluginSurfaceAction { .. })
+        } else if completion.is_plugin_surface_action()
             && daemon
                 .runtime()
                 .is_some_and(crate::HubRuntime::package_entity_work_pending)
@@ -357,8 +367,8 @@ fn finish(
             state.maintenance.try_wake();
         }
     }
-    if should_mark_pump_after_control(&request, succeeded) {
-        state.background.mark_pump();
+    if completion.marks_pump(succeeded) {
+        crate::daemon::owner_loop::mark_pump_ready(state);
     }
     if daemon.runtime().is_some_and(|runtime| {
         runtime.package_event_router().peek_delivery_wake()

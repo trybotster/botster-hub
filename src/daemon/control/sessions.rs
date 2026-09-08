@@ -455,11 +455,12 @@ pub(crate) fn handle_runtime(
                                 &subscription_id,
                                 identity,
                             );
-                            state
+                            let labels = state
                                 .pending_runtime
                                 .admission
                                 .reservations
                                 .forget_route(&session_id, &subscription_id);
+                            crate::daemon::owner_loop::retire_reservation_deadlines(state, labels);
                             let _ = state.pending_runtime.cancel_stream_if(
                                 &session_id,
                                 &subscription_id,
@@ -529,7 +530,9 @@ pub(crate) fn handle_runtime(
                         Err(error) => core_operator_error("read_screen", &id.0, &error),
                     }))
                 },
-                move |_, state, permit| retain_operation_retirement(state, permit, retire_tracker),
+                move |_, state, waiter_id, permit| {
+                    retain_operation_retirement(state, waiter_id, permit, retire_tracker)
+                },
             )
         }
         DaemonRequest::ReadModeFlags { session_id } => {
@@ -579,7 +582,9 @@ pub(crate) fn handle_runtime(
                         Err(error) => core_operator_error("read_mode_flags", &id.0, &error),
                     }))
                 },
-                move |_, state, permit| retain_operation_retirement(state, permit, retire_tracker),
+                move |_, state, waiter_id, permit| {
+                    retain_operation_retirement(state, waiter_id, permit, retire_tracker)
+                },
             )
         }
         DaemonRequest::CaptureSnapshot { session_id } => {
@@ -630,7 +635,9 @@ pub(crate) fn handle_runtime(
                         Err(error) => core_operator_error("capture_snapshot", &id.0, &error),
                     }))
                 },
-                move |_, state, permit| retain_operation_retirement(state, permit, retire_tracker),
+                move |_, state, waiter_id, permit| {
+                    retain_operation_retirement(state, waiter_id, permit, retire_tracker)
+                },
             )
         }
         DaemonRequest::ReadSnapshotPage {
@@ -732,32 +739,38 @@ pub(crate) fn retain_exact_detach(
     subscription_id: String,
     generation: TerminalSubscriptionGeneration,
 ) {
-    let mut slot: Option<CoreTicket<Result<DetachTerminalSubscriptionResult, CoreDaemonError>>> =
-        None;
-    state
-        .budget
-        .retain(
-            permit,
-            "exact_generation_detach",
-            move |daemon, state| match drive_core_slot(
-                &mut slot,
-                daemon,
-                state,
-                |runtime, state| {
-                    let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
-                    runtime.detach_terminal_subscription(
-                        ClientId(client_id.clone()),
-                        SessionId(session_id.clone()),
-                        SubscriptionId(subscription_id.clone()),
-                        generation,
-                        now,
-                    )
-                },
-            ) {
-                CoreWorkPoll::Pending => ObligationPoll::Pending,
-                CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
+    let waiter_id = state
+        .waiter_ids
+        .next()
+        .expect("an admitted cleanup permit must have an available waiter identifier");
+    let mut slot: Option<CoreTicket<Result<(), CoreDaemonError>>> = None;
+    crate::daemon::owner_budget::retain_owner_obligation(
+        state,
+        waiter_id,
+        permit,
+        "exact_generation_detach",
+        move |daemon, state, waiter_id| match drive_core_slot(
+            &mut slot,
+            daemon,
+            state,
+            waiter_id,
+            |runtime, state, waiter_id| {
+                let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
+                runtime.detach_route_exact_or_owned_for_owner(
+                    waiter_id,
+                    ClientId(client_id.clone()),
+                    SessionId(session_id.clone()),
+                    SubscriptionId(subscription_id.clone()),
+                    Some(generation),
+                    now,
+                )
             },
-        );
+        ) {
+            CoreWorkPoll::Pending => ObligationPoll::Pending,
+            CoreWorkPoll::Retry => ObligationPoll::ReadyAgain,
+            CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
+        },
+    );
 }
 
 /// Retire one deferred Core operation whose request was abandoned: cancel
@@ -767,6 +780,7 @@ pub(crate) fn retain_exact_detach(
 /// until Core accepted the last of those.
 fn retain_operation_retirement(
     state: &mut DaemonControlState,
+    waiter_id: crate::owner_identity::WaiterId,
     permit: OwnerPermit,
     tracker: std::sync::Arc<std::sync::Mutex<CoreOperationTracker>>,
 ) {
@@ -774,23 +788,42 @@ fn retain_operation_retirement(
     let mut release_slot: Option<CoreTicket<bool>> = None;
     let mut cancel_requested = false;
     let mut release_capture: Option<CaptureId> = None;
-    state
-        .budget
-        .retain(permit, "operation_retirement", move |daemon, state| {
+    crate::daemon::owner_budget::retain_owner_obligation(
+        state,
+        waiter_id,
+        permit,
+        "operation_retirement",
+        move |daemon, state, waiter_id| {
             if let Some(capture) = release_capture.clone() {
-                return match drive_core_slot(&mut release_slot, daemon, state, |runtime, _| {
-                    runtime.release_capture(capture)
-                }) {
+                return match drive_core_slot(
+                    &mut release_slot,
+                    daemon,
+                    state,
+                    waiter_id,
+                    |runtime, _, waiter_id| {
+                        runtime.submit_core_for_owner(waiter_id, move |daemon| {
+                            daemon.release_capture(&capture)
+                        })
+                    },
+                ) {
                     CoreWorkPoll::Pending => ObligationPoll::Pending,
+                    CoreWorkPoll::Retry => ObligationPoll::ReadyAgain,
                     CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
                 };
             }
             let pending_id = tracker.lock().expect("capture tracker lock").pending_id();
             if !cancel_requested && let Some(id) = pending_id {
-                match drive_core_slot(&mut cancel_slot, daemon, state, |runtime, _| {
-                    runtime.cancel_core_operation(id)
-                }) {
+                match drive_core_slot(
+                    &mut cancel_slot,
+                    daemon,
+                    state,
+                    waiter_id,
+                    |runtime, _, waiter_id| {
+                        runtime.submit_core_for_owner(waiter_id, move |daemon| daemon.cancel(id))
+                    },
+                ) {
                     CoreWorkPoll::Pending => return ObligationPoll::Pending,
+                    CoreWorkPoll::Retry => return ObligationPoll::ReadyAgain,
                     CoreWorkPoll::Lost => return ObligationPoll::Done,
                     CoreWorkPoll::Ready(_) => cancel_requested = true,
                 }
@@ -811,11 +844,12 @@ fn retain_operation_retirement(
                     ..
                 })) => {
                     release_capture = Some(capture.capture_id);
-                    ObligationPoll::Pending
+                    ObligationPoll::ReadyAgain
                 }
                 CoreTicketPoll::Ready(Ok(_)) => ObligationPoll::Done,
             }
-        });
+        },
+    );
 }
 
 fn attach_route_limit_error() -> DaemonResponse {
@@ -1000,8 +1034,7 @@ fn handle_attach(
                 );
                 return ControlPoll::Ready(Ok(stale_attach_error()));
             }
-            let pending_runtime = &mut state.pending_runtime;
-            let reserved = pending_runtime.admission.reservations.reserve(
+            let reserved = state.pending_runtime.admission.reservations.reserve(
                 session_id.clone(),
                 subscription_id.clone(),
                 generation.0,
@@ -1010,7 +1043,8 @@ fn handle_attach(
             );
             let response = match reserved {
                 Ok(reservation) => {
-                    let budget_result = pending_runtime
+                    let budget_result = state
+                        .pending_runtime
                         .admission
                         .connection_budgets
                         .get_mut(&peer_generation)
@@ -1026,7 +1060,8 @@ fn handle_attach(
                                 .map(|_| ())
                         });
                     if budget_result.is_err() {
-                        let _ = pending_runtime
+                        let _ = state
+                            .pending_runtime
                             .admission
                             .reservations
                             .forget_label(&reservation.label, peer_generation);
@@ -1034,8 +1069,31 @@ fn handle_attach(
                             "connection_channel_limit",
                             "the WebRTC connection channel budget rejected the reservation",
                         ))
-                    } else {
+                    } else if crate::daemon::owner_loop::arm_reservation_deadline(
+                        state,
+                        reservation.label.clone(),
+                        peer_generation,
+                        reservation.expires_in_seconds,
+                    ) {
                         Ok(daemon_terminal_reservation(reservation))
+                    } else {
+                        if let Some(budget) = state
+                            .pending_runtime
+                            .admission
+                            .connection_budgets
+                            .get_mut(&peer_generation)
+                        {
+                            let _ = budget.release(&reservation.label);
+                        }
+                        let _ = state
+                            .pending_runtime
+                            .admission
+                            .reservations
+                            .forget_label(&reservation.label, peer_generation);
+                        Err(super::attach_bind_operator_error(
+                            "owner_budget_exhausted",
+                            "the daemon exhausted unique owner waiter identifiers",
+                        ))
                     }
                 }
                 Err(ReserveError::LabelConflict) => Err(super::attach_bind_operator_error(

@@ -21,12 +21,14 @@ use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::{DeadlineKey, ReadyClass, ReadyKey, ReadyReasons};
 use crate::daemon::owner_turn::{OwnerTurnBudget, OwnerTurnCharge};
 use crate::owner_identity::{OwnerWorkIdentity, WaiterId};
+use crate::subscription::attach_routes::{AttachedSubscription, AttachedSubscriptionChange};
 
 pub(crate) const READY_INITIAL: ReadyReasons = ReadyReasons::from_bits(1 << 0);
 pub(crate) const READY_CORE_COMPLETION: ReadyReasons = ReadyReasons::from_bits(1 << 1);
 pub(crate) const READY_PLUGIN_COMPLETION: ReadyReasons = ReadyReasons::from_bits(1 << 2);
 pub(crate) const READY_HOST_COMPLETION: ReadyReasons = ReadyReasons::from_bits(1 << 3);
 pub(crate) const READY_DEADLINE: ReadyReasons = ReadyReasons::from_bits(1 << 4);
+pub(crate) const READY_BACKGROUND: ReadyReasons = ReadyReasons::from_bits(1 << 5);
 
 /// Outcome of one continuation poll.
 pub(crate) enum ControlPoll {
@@ -51,7 +53,7 @@ pub(crate) type ControlContinuation =
 /// entry permit. It must cancel, release, or transfer the work to another
 /// bounded owner such as the plugin worker's executor and completion pools.
 pub(crate) type RetireHook =
-    Box<dyn FnOnce(&mut HubDaemon, &mut DaemonControlState, OwnerPermit) + Send>;
+    Box<dyn FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit) + Send>;
 
 /// A deferred request: its continuation, and how to retire it when its
 /// client leaves or its deadline passes. Without a hook, retirement drops
@@ -104,7 +106,9 @@ impl ControlStep {
         continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
         + Send
         + 'static,
-        retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, OwnerPermit) + Send + 'static,
+        retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit)
+        + Send
+        + 'static,
     ) -> Self {
         Self::Pending(PendingStep {
             continuation: Box::new(continuation),
@@ -118,7 +122,9 @@ impl ControlStep {
         continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
         + Send
         + 'static,
-        retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, OwnerPermit) + Send + 'static,
+        retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit)
+        + Send
+        + 'static,
     ) -> Self {
         Self::Pending(PendingStep {
             continuation: Box::new(continuation),
@@ -147,17 +153,133 @@ pub(crate) struct PendingControlRequest {
     pub(crate) deadline_key: Option<DeadlineKey>,
     pub(crate) last_core_phase: u64,
     pub(crate) last_host_phase: u64,
-    pub(crate) request: DaemonRequest,
+    pub(crate) completion: OwnerRequestCompletion,
     pub(crate) reply_tx: ControlReplySender,
     pub(crate) response_delivery_rx: Option<mpsc::Receiver<()>>,
     pub(crate) grant_id: Option<String>,
     pub(crate) client: Option<String>,
     pub(crate) permit: Option<OwnerPermit>,
-    pub(crate) accepted_at: Instant,
     pub(crate) must_finish: bool,
     pub(crate) past_deadline: bool,
     pub(crate) continuation: ControlContinuation,
     pub(crate) retire: Option<RetireHook>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OwnerRequestCompletion {
+    kind: OwnerRequestKind,
+    route_change: Option<AttachedSubscriptionChange>,
+}
+
+#[derive(Debug, Default)]
+enum OwnerRequestKind {
+    #[default]
+    Other,
+    Spawn {
+        session_id: String,
+    },
+    SpawnSessionType,
+    Attach,
+    Detach,
+    ShutdownSession {
+        session_id: String,
+    },
+    RemoveSession,
+    PluginSurfaceAction,
+}
+
+impl OwnerRequestCompletion {
+    pub(crate) fn from_request(request: &DaemonRequest) -> Self {
+        let (kind, route_change) = match request {
+            DaemonRequest::Spawn { session_id, .. } => (
+                OwnerRequestKind::Spawn {
+                    session_id: session_id.clone(),
+                },
+                None,
+            ),
+            DaemonRequest::SpawnSessionType { .. } => (OwnerRequestKind::SpawnSessionType, None),
+            DaemonRequest::Attach {
+                session_id,
+                subscription_id,
+            } => (
+                OwnerRequestKind::Attach,
+                Some(AttachedSubscriptionChange::Attach(AttachedSubscription {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                })),
+            ),
+            DaemonRequest::Detach {
+                session_id,
+                subscription_id,
+            } => (
+                OwnerRequestKind::Detach,
+                Some(AttachedSubscriptionChange::Detach(AttachedSubscription {
+                    session_id: session_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                })),
+            ),
+            DaemonRequest::ShutdownSession { session_id } => (
+                OwnerRequestKind::ShutdownSession {
+                    session_id: session_id.clone(),
+                },
+                None,
+            ),
+            DaemonRequest::RemoveSession { .. } => (OwnerRequestKind::RemoveSession, None),
+            DaemonRequest::PluginSurfaceAction { .. } => {
+                (OwnerRequestKind::PluginSurfaceAction, None)
+            }
+            _ => (OwnerRequestKind::Other, None),
+        };
+        Self { kind, route_change }
+    }
+
+    pub(crate) fn route_change(&self) -> Option<AttachedSubscriptionChange> {
+        self.route_change.clone()
+    }
+
+    pub(crate) fn is_detach(&self) -> bool {
+        matches!(self.kind, OwnerRequestKind::Detach)
+    }
+
+    pub(crate) fn shutdown_session_id(&self) -> Option<&str> {
+        match &self.kind {
+            OwnerRequestKind::ShutdownSession { session_id } => Some(session_id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn spawned_session_id(&self) -> Option<&str> {
+        match &self.kind {
+            OwnerRequestKind::Spawn { session_id } => Some(session_id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn reconciles_after_success(&self) -> bool {
+        matches!(
+            self.kind,
+            OwnerRequestKind::Spawn { .. }
+                | OwnerRequestKind::Attach
+                | OwnerRequestKind::ShutdownSession { .. }
+                | OwnerRequestKind::RemoveSession
+        )
+    }
+
+    pub(crate) fn marks_pump(&self, succeeded: bool) -> bool {
+        match self.kind {
+            OwnerRequestKind::Spawn { .. }
+            | OwnerRequestKind::SpawnSessionType
+            | OwnerRequestKind::Attach => succeeded,
+            OwnerRequestKind::Detach
+            | OwnerRequestKind::ShutdownSession { .. }
+            | OwnerRequestKind::RemoveSession => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_plugin_surface_action(&self) -> bool {
+        matches!(self.kind, OwnerRequestKind::PluginSurfaceAction)
+    }
 }
 
 /// Requests whose Core work has effects that require an owner continuation,
@@ -186,12 +308,7 @@ pub(crate) fn request_must_finish(request: &DaemonRequest) -> bool {
     )
 }
 
-/// Earliest deadline among pending requests not yet flagged.
-pub(crate) fn next_request_deadline(state: &DaemonControlState) -> Option<Instant> {
-    state.request_deadlines.next_deadline()
-}
-
-pub(crate) fn mark_request_ready(
+pub(crate) fn mark_owner_ready(
     state: &mut DaemonControlState,
     waiter_id: WaiterId,
     class: ReadyClass,
@@ -200,7 +317,7 @@ pub(crate) fn mark_request_ready(
     if !state.pending_requests.contains_key(&waiter_id) {
         return false;
     }
-    let Ok(key) = state.request_ready.mark(waiter_id, class, reasons) else {
+    let Ok(key) = state.owner_ready.mark(waiter_id, class, reasons) else {
         return false;
     };
     state
@@ -224,7 +341,9 @@ pub(crate) fn absorb_core_completions(
             return index;
         }
         let Some(entry) = state.pending_requests.get_mut(&identity.waiter_id) else {
-            state.absorb_background_core_completion(identity);
+            if !crate::daemon::owner_budget::absorb_obligation_core_completion(state, identity) {
+                state.absorb_background_core_completion(identity);
+            }
             continue;
         };
         let Some(expected) = entry.last_core_phase.checked_add(1) else {
@@ -234,7 +353,7 @@ pub(crate) fn absorb_core_completions(
             continue;
         }
         entry.last_core_phase = identity.phase;
-        mark_request_ready(
+        mark_owner_ready(
             state,
             identity.waiter_id,
             ReadyClass::CoreCompletion,
@@ -262,7 +381,7 @@ pub(crate) fn absorb_host_completion(
     state
         .host_completions
         .insert(identity.waiter_id, completion);
-    mark_request_ready(
+    mark_owner_ready(
         state,
         identity.waiter_id,
         ReadyClass::HostCompletion,
@@ -270,25 +389,44 @@ pub(crate) fn absorb_host_completion(
     );
 }
 
-pub(crate) fn mark_due_request_deadlines(
+pub(crate) fn mark_due_owner_deadlines(
     state: &mut DaemonControlState,
     now: Instant,
     budget: &mut OwnerTurnBudget,
 ) {
-    while state.request_deadlines.has_due(now) {
+    while state.deadlines.has_due(now) {
         if budget
             .try_charge(Instant::now(), OwnerTurnCharge::opaque_move())
             .is_err()
         {
             break;
         }
-        let Some(key) = state.request_deadlines.pop_due(now, 1).into_iter().next() else {
+        let Some(key) = state.deadlines.pop_due(now, 1).into_iter().next() else {
             break;
         };
         if let Some(entry) = state.pending_requests.get_mut(&key.waiter_id()) {
             entry.deadline_key = None;
+            mark_owner_ready(state, key.waiter_id(), ReadyClass::Deadline, READY_DEADLINE);
+            continue;
         }
-        mark_request_ready(state, key.waiter_id(), ReadyClass::Deadline, READY_DEADLINE);
+        if state.plugin_entities.clear_deadline(key.waiter_id()) {
+            crate::daemon::control::entities::mark_plugin_entity_ready(
+                state,
+                key.waiter_id(),
+                ReadyClass::Deadline,
+                READY_DEADLINE,
+            );
+            continue;
+        }
+        if state.budget.clear_obligation_deadline(key.waiter_id()) {
+            crate::daemon::owner_budget::mark_obligation_ready(
+                state,
+                key.waiter_id(),
+                READY_DEADLINE,
+            );
+            continue;
+        }
+        crate::daemon::owner_loop::mark_reservation_deadline_ready(state, key.waiter_id());
     }
 }
 
@@ -299,23 +437,25 @@ fn retire(
     reason: &str,
 ) {
     if let Some(key) = entry.ready_key.take() {
-        state.request_ready.remove(key);
+        state.owner_ready.remove(key);
     }
-    state.request_deadlines.retire(entry.waiter_id);
+    state.deadlines.retire(entry.waiter_id);
     state.host_completions.remove(&entry.waiter_id);
     state.document_waiters.remove(&entry.waiter_id);
     state.host_recovery_waiters.remove(&entry.waiter_id);
     state
         .blocked_session_type_roots
         .retain(|_, waiter_id| *waiter_id != entry.waiter_id);
-    if let Some(runtime) = daemon.runtime() {
-        runtime.retire_owner_core_waiter(entry.waiter_id);
-    }
     match (entry.permit.take(), entry.retire.take()) {
         // The request owns Core work: the hook keeps the permit in an
         // obligation that cancels or releases it.
-        (Some(permit), Some(hook)) => hook(daemon, state, permit),
-        (Some(permit), None) => state.budget.release(permit),
+        (Some(permit), Some(hook)) => hook(daemon, state, entry.waiter_id, permit),
+        (Some(permit), None) => {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.retire_owner_core_waiter(entry.waiter_id);
+            }
+            state.budget.release(permit);
+        }
         (None, _) => {}
     }
     state.budget.counters.retired_abandoned =
@@ -367,103 +507,64 @@ pub(crate) fn retire_abandoned_requests(
     }
 }
 
-/// Poll every pending request once. Finished requests are answered through
-/// `finish` in acceptance order. Returns `true` when a `shutdown` response
-/// was sent, matching the synchronous handler's return contract.
-pub(crate) fn poll_ready_requests(
+/// Apply one ready item for one retained control request.
+pub(crate) fn poll_ready_request_item(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
-    _now: Instant,
-    budget: &mut OwnerTurnBudget,
-    mut finish: impl FnMut(
+    item: crate::daemon::owner_schedule::ReadyItem,
+    finish: &mut impl FnMut(
         &mut HubDaemon,
         &mut DaemonControlState,
         PendingControlRequest,
         ControlReply,
     ) -> bool,
 ) -> bool {
-    let mut shutdown = false;
-    while !shutdown
-        && budget
-            .try_charge(Instant::now(), OwnerTurnCharge::opaque_move())
-            .is_ok()
-    {
-        // One host continuation may release the document and mark one parked
-        // waiter ready. That bounded handoff belongs to this charged item. If
-        // the charge fails, the continuation does not run and the waiter stays
-        // parked in `document_waiters`.
-        let Some(item) = state.request_ready.pop_next() else {
-            break;
-        };
-        let waiter_id = item.key().waiter_id();
-        let Some(mut entry) = state.pending_requests.remove(&waiter_id) else {
-            continue;
-        };
-        entry.ready_key = None;
-        if !entry.must_finish && entry.reply_tx.is_closed() {
-            retire(daemon, state, entry, "reply_closed");
-            continue;
-        }
-        let reasons = item.reasons();
-        let has_completion = reasons.contains(READY_INITIAL)
-            || reasons.contains(READY_CORE_COMPLETION)
-            || reasons.contains(READY_PLUGIN_COMPLETION)
-            || reasons.contains(READY_HOST_COMPLETION);
-        if has_completion {
-            state.current_waiter_id = Some(waiter_id);
-            let poll = (entry.continuation)(daemon, state);
-            state.current_waiter_id = None;
-            match poll {
-                ControlPoll::Pending => {}
-                ControlPoll::Ready(response) => {
-                    if reasons.contains(READY_DEADLINE) && entry.must_finish {
-                        flag_past_deadline(state, &mut entry);
-                    }
-                    state.request_deadlines.retire(waiter_id);
-                    state.host_completions.remove(&waiter_id);
-                    if let Some(runtime) = daemon.runtime() {
-                        runtime.retire_owner_core_waiter(waiter_id);
-                    }
-                    shutdown = finish(daemon, state, entry, ControlReply::plain(response));
-                    continue;
-                }
-                ControlPoll::ReadyRetained(response) => {
-                    if reasons.contains(READY_DEADLINE) && entry.must_finish {
-                        flag_past_deadline(state, &mut entry);
-                    }
-                    state.request_deadlines.retire(waiter_id);
-                    state.host_completions.remove(&waiter_id);
-                    if let Some(runtime) = daemon.runtime() {
-                        runtime.retire_owner_core_waiter(waiter_id);
-                    }
-                    shutdown = finish(daemon, state, entry, ControlReply::retained(response));
-                    continue;
-                }
-                ControlPoll::ReadyHost(response, charge) => {
-                    if reasons.contains(READY_DEADLINE) && entry.must_finish {
-                        flag_past_deadline(state, &mut entry);
-                    }
-                    state.request_deadlines.retire(waiter_id);
-                    state.host_completions.remove(&waiter_id);
-                    if let Some(runtime) = daemon.runtime() {
-                        runtime.retire_owner_core_waiter(waiter_id);
-                    }
-                    shutdown = finish(daemon, state, entry, ControlReply::host(response, charge));
-                    continue;
-                }
-            }
-        }
-        if reasons.contains(READY_DEADLINE) {
-            if entry.must_finish {
-                flag_past_deadline(state, &mut entry);
-            } else {
-                retire(daemon, state, entry, "deadline");
-                continue;
-            }
-        }
-        state.pending_requests.insert(waiter_id, entry);
+    let waiter_id = item.key().waiter_id();
+    let Some(mut entry) = state.pending_requests.remove(&waiter_id) else {
+        return false;
+    };
+    entry.ready_key = None;
+    if !entry.must_finish && entry.reply_tx.is_closed() {
+        retire(daemon, state, entry, "reply_closed");
+        return false;
     }
-    shutdown
+    let reasons = item.reasons();
+    let has_completion = reasons.contains(READY_INITIAL)
+        || reasons.contains(READY_CORE_COMPLETION)
+        || reasons.contains(READY_PLUGIN_COMPLETION)
+        || reasons.contains(READY_HOST_COMPLETION);
+    if has_completion {
+        state.current_waiter_id = Some(waiter_id);
+        let poll = (entry.continuation)(daemon, state);
+        state.current_waiter_id = None;
+        let reply = match poll {
+            ControlPoll::Pending => None,
+            ControlPoll::Ready(response) => Some(ControlReply::plain(response)),
+            ControlPoll::ReadyRetained(response) => Some(ControlReply::retained(response)),
+            ControlPoll::ReadyHost(response, charge) => Some(ControlReply::host(response, charge)),
+        };
+        if let Some(reply) = reply {
+            if reasons.contains(READY_DEADLINE) && entry.must_finish {
+                flag_past_deadline(state, &mut entry);
+            }
+            state.deadlines.retire(waiter_id);
+            state.host_completions.remove(&waiter_id);
+            if let Some(runtime) = daemon.runtime() {
+                runtime.retire_owner_core_waiter(waiter_id);
+            }
+            return finish(daemon, state, entry, reply);
+        }
+    }
+    if reasons.contains(READY_DEADLINE) {
+        if entry.must_finish {
+            flag_past_deadline(state, &mut entry);
+        } else {
+            retire(daemon, state, entry, "deadline");
+            return false;
+        }
+    }
+    state.pending_requests.insert(waiter_id, entry);
+    false
 }
 
 #[cfg(test)]
@@ -517,7 +618,7 @@ mod tests {
         let (reply_tx, _reply_rx) = crate::daemon::control::message::control_reply_channel();
         let now = Instant::now();
         let arm = state
-            .request_deadlines
+            .deadlines
             .arm(waiter_id, now + Duration::from_secs(1), now)
             .expect("arm request deadline");
         state.pending_requests.insert(
@@ -529,13 +630,12 @@ mod tests {
                 deadline_key: Some(arm.key()),
                 last_core_phase: 0,
                 last_host_phase: 0,
-                request: DaemonRequest::Status,
+                completion: OwnerRequestCompletion::default(),
                 reply_tx,
                 response_delivery_rx: None,
                 grant_id: None,
                 client: None,
                 permit: Some(permit),
-                accepted_at: now,
                 must_finish,
                 past_deadline: false,
                 continuation: Box::new(|_, _| {
@@ -561,13 +661,13 @@ mod tests {
         } else {
             READY_DEADLINE
         };
-        assert!(mark_request_ready(
+        assert!(mark_owner_ready(
             &mut state,
             waiter_id,
             first_class,
             first_reason,
         ));
-        assert!(mark_request_ready(
+        assert!(mark_owner_ready(
             &mut state,
             waiter_id,
             second_class,
@@ -575,13 +675,12 @@ mod tests {
         ));
 
         let mut finished = 0;
-        let mut budget = OwnerTurnBudget::new(Instant::now());
-        assert!(!poll_ready_requests(
+        let item = state.owner_ready.pop_next().expect("coalesced ready row");
+        assert!(!poll_ready_request_item(
             &mut daemon,
             &mut state,
-            Instant::now(),
-            &mut budget,
-            |_, state, mut entry, _| {
+            item,
+            &mut |_, state, mut entry, _| {
                 finished += 1;
                 state
                     .budget
@@ -593,8 +692,8 @@ mod tests {
         assert_eq!(finished, 1);
         assert_eq!(state.budget.outstanding(), 0);
         assert!(state.pending_requests.is_empty());
-        assert!(state.request_ready.is_empty());
-        assert!(state.request_deadlines.is_empty());
+        assert!(state.owner_ready.is_empty());
+        assert!(state.deadlines.is_empty());
         assert_eq!(
             state.budget.counters.requests_past_deadline,
             u64::from(must_finish),
@@ -642,13 +741,12 @@ mod tests {
                 deadline_key: None,
                 last_core_phase: 0,
                 last_host_phase: 0,
-                request: DaemonRequest::Status,
+                completion: OwnerRequestCompletion::default(),
                 reply_tx,
                 response_delivery_rx: None,
                 grant_id: None,
                 client: None,
                 permit: Some(permit),
-                accepted_at: now,
                 must_finish: true,
                 past_deadline: false,
                 continuation: Box::new(|_, state| {
@@ -658,7 +756,7 @@ mod tests {
                 retire: None,
             },
         );
-        assert!(mark_request_ready(
+        assert!(mark_owner_ready(
             &mut state,
             host_waiter,
             ReadyClass::HostCompletion,
@@ -674,20 +772,18 @@ mod tests {
             )
             .expect("fill the exact inspected-byte budget");
 
-        assert!(!poll_ready_requests(
-            &mut daemon,
-            &mut state,
-            now,
-            &mut budget,
-            |_, _, _, _| panic!("an exhausted turn cannot finish the request"),
-        ));
+        assert!(
+            budget
+                .try_charge(now, OwnerTurnCharge::opaque_move())
+                .is_err()
+        );
 
         assert_eq!(
             state.document_waiters,
             [parked_waiter].into_iter().collect()
         );
         assert!(state.pending_requests.contains_key(&host_waiter));
-        assert!(!state.request_ready.is_empty());
+        assert!(!state.owner_ready.is_empty());
         daemon.stop();
         std::fs::remove_dir_all(directory).expect("remove owner ready test directory");
     }

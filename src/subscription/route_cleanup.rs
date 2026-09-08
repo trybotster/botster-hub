@@ -249,39 +249,54 @@ pub(crate) fn retain_route_cleanup(
     let mut slot: Option<CoreTicket<Vec<CleanupRouteReport>>> = None;
     let mut applied = CleanupApplied::default();
     let mut page: Vec<CleanupCandidate> = Vec::new();
-    state.budget.retain(permit, label, move |daemon, state| {
-        if slot.is_none() {
-            if candidates.is_empty() && capture_owner.is_none() && page.is_empty() {
-                on_done(state, applied);
-                return ObligationPoll::Done;
+    crate::daemon::owner_budget::allocate_and_retain_owner_obligation(
+        state,
+        permit,
+        label,
+        move |daemon, state, waiter_id| {
+            if slot.is_none() {
+                if candidates.is_empty() && capture_owner.is_none() && page.is_empty() {
+                    on_done(state, applied);
+                    return ObligationPoll::Done;
+                }
+                if page.is_empty() {
+                    let take = candidates.len().min(MAX_CLEANUP_ROUTES_PER_TURN);
+                    page = candidates.split_off(candidates.len() - take);
+                    page.reverse();
+                }
             }
-            if page.is_empty() {
-                let take = candidates.len().min(MAX_CLEANUP_ROUTES_PER_TURN);
-                page = candidates.split_off(candidates.len() - take);
-                page.reverse();
+            let turn_page = page.clone();
+            let turn_owner = capture_owner.clone();
+            match drive_core_slot(
+                &mut slot,
+                daemon,
+                state,
+                waiter_id,
+                |runtime, _, waiter_id| {
+                    runtime.submit_core_for_owner(
+                        waiter_id,
+                        cleanup_core_turn(turn_page, turn_owner, now),
+                    )
+                },
+            ) {
+                CoreWorkPoll::Pending => ObligationPoll::Pending,
+                CoreWorkPoll::Retry => ObligationPoll::ReadyAgain,
+                CoreWorkPoll::Lost => {
+                    applied.failed = true;
+                    on_done(state, applied);
+                    ObligationPoll::Done
+                }
+                CoreWorkPoll::Ready(reports) => {
+                    // The page and the capture release are committed in Core;
+                    // a refused resubmit never repeats them.
+                    page.clear();
+                    capture_owner = None;
+                    apply_cleanup_reports(state, reports, &mut applied);
+                    ObligationPoll::ReadyAgain
+                }
             }
-        }
-        let turn_page = page.clone();
-        let turn_owner = capture_owner.clone();
-        match drive_core_slot(&mut slot, daemon, state, |runtime, _| {
-            runtime.submit_core(cleanup_core_turn(turn_page, turn_owner, now))
-        }) {
-            CoreWorkPoll::Pending => ObligationPoll::Pending,
-            CoreWorkPoll::Lost => {
-                applied.failed = true;
-                on_done(state, applied);
-                ObligationPoll::Done
-            }
-            CoreWorkPoll::Ready(reports) => {
-                // The page and the capture release are committed in Core;
-                // a refused resubmit never repeats them.
-                page.clear();
-                capture_owner = None;
-                apply_cleanup_reports(state, reports, &mut applied);
-                ObligationPoll::Pending
-            }
-        }
-    });
+        },
+    );
 }
 
 /// Reserve the route key in the owner's route set before the attach starts.

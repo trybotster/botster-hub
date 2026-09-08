@@ -8,7 +8,7 @@ use std::io::Write;
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -126,7 +126,7 @@ struct CompletedRequest {
 pub(crate) async fn handle_connection_async(
     stream: TokioUnixStream,
     control_tx: ControlSender,
-    cleanup_tx: SyncSender<ConnectionCleanup>,
+    cleanup_permit: tokio_mpsc::OwnedPermit<ControlMessage>,
     mut shutdown_rx: watch::Receiver<bool>,
     event_plane: std::sync::Arc<crate::subscription::package_events::ClientEventPlane>,
     permit: OwnerPermit,
@@ -138,7 +138,7 @@ pub(crate) async fn handle_connection_async(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = AsyncBufReader::new(read_half);
     let mut cleanup = ConnectionCleanupGuard::new(
-        cleanup_tx,
+        cleanup_permit,
         client_id.clone(),
         ConnectionTerminalReason::Protocol,
         permit,
@@ -597,19 +597,19 @@ pub(crate) struct ConnectionCleanup {
 }
 
 pub(crate) struct ConnectionCleanupGuard {
-    cleanup_tx: SyncSender<ConnectionCleanup>,
+    cleanup_permit: Option<tokio_mpsc::OwnedPermit<ControlMessage>>,
     cleanup: Option<ConnectionCleanup>,
 }
 
 impl ConnectionCleanupGuard {
     pub(crate) fn new(
-        cleanup_tx: SyncSender<ConnectionCleanup>,
+        cleanup_permit: tokio_mpsc::OwnedPermit<ControlMessage>,
         client_id: String,
         reason: ConnectionTerminalReason,
         permit: OwnerPermit,
     ) -> Self {
         Self {
-            cleanup_tx,
+            cleanup_permit: Some(cleanup_permit),
             cleanup: Some(ConnectionCleanup {
                 client_id,
                 attached_subscriptions: Vec::new(),
@@ -648,10 +648,8 @@ impl ConnectionCleanupGuard {
 
 impl Drop for ConnectionCleanupGuard {
     fn drop(&mut self) {
-        if let Some(cleanup) = self.cleanup.take()
-            && let Err(error) = self.cleanup_tx.try_send(cleanup)
-        {
-            eprintln!("botster-hub connection cleanup enqueue failed: {error}");
+        if let (Some(cleanup), Some(permit)) = (self.cleanup.take(), self.cleanup_permit.take()) {
+            permit.send(ControlMessage::ConnectionCleanup(cleanup));
         }
     }
 }
@@ -663,16 +661,14 @@ pub(crate) fn reap_finished_connection_tasks(tasks: &mut Vec<JoinHandle<()>>) {
 pub(crate) fn wait_for_connection_tasks(
     runtime: &tokio::runtime::Runtime,
     tasks: &mut Vec<JoinHandle<()>>,
-    cleanup_rx: &mpsc::Receiver<ConnectionCleanup>,
+    control_rx: &mut tokio_mpsc::Receiver<ControlMessage>,
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     control_tx: ControlSender,
 ) {
     let deadline = Instant::now() + DAEMON_CLIENT_WRITE_TIMEOUT;
     while !tasks.iter().all(JoinHandle::is_finished) && Instant::now() < deadline {
-        while let Ok(cleanup) = cleanup_rx.try_recv() {
-            handle_connection_cleanup(daemon, state, control_tx.clone(), cleanup);
-        }
+        drain_shutdown_cleanups(control_rx, daemon, state, control_tx.clone());
         thread::sleep(Duration::from_millis(10));
     }
     for task in tasks.iter() {
@@ -685,8 +681,19 @@ pub(crate) fn wait_for_connection_tasks(
             let _ = task.await;
         }
     });
-    while let Ok(cleanup) = cleanup_rx.try_recv() {
-        handle_connection_cleanup(daemon, state, control_tx.clone(), cleanup);
+    drain_shutdown_cleanups(control_rx, daemon, state, control_tx);
+}
+
+fn drain_shutdown_cleanups(
+    control_rx: &mut tokio_mpsc::Receiver<ControlMessage>,
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    control_tx: ControlSender,
+) {
+    while let Ok(message) = control_rx.try_recv() {
+        if let ControlMessage::ConnectionCleanup(cleanup) = message {
+            handle_connection_cleanup(daemon, state, control_tx.clone(), cleanup);
+        }
     }
 }
 
@@ -842,7 +849,10 @@ pub(crate) fn handle_connection(
     stream
         .set_nonblocking(true)
         .map_err(DaemonTransportError::Io)?;
-    let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(1);
+    let (cleanup_control_tx, mut cleanup_control_rx) = tokio_mpsc::channel(1);
+    let cleanup_permit = cleanup_control_tx
+        .try_reserve_owned()
+        .expect("cleanup channel capacity");
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -858,12 +868,12 @@ pub(crate) fn handle_connection(
     let result = runtime.block_on(handle_connection_async(
         stream,
         control_tx,
-        cleanup_tx,
+        cleanup_permit,
         shutdown_rx,
         std::sync::Arc::new(crate::subscription::package_events::ClientEventPlane::default()),
         permit,
     ));
-    let _ = cleanup_rx.try_recv();
+    let _ = cleanup_control_rx.try_recv();
     result
 }
 

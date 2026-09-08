@@ -50,17 +50,27 @@ pub(crate) struct OwnerPermit(());
 /// Outcome of one obligation poll.
 pub(crate) enum ObligationPoll {
     Pending,
+    ReadyAgain,
     Done,
 }
 
-type ObligationFn =
-    Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ObligationPoll + Send>;
+type ObligationFn = Box<
+    dyn FnMut(
+            &mut HubDaemon,
+            &mut DaemonControlState,
+            crate::owner_identity::WaiterId,
+        ) -> ObligationPoll
+        + Send,
+>;
 
 /// Owner work that must complete: it holds its permit until done.
 pub(crate) struct CleanupObligation {
+    waiter_id: crate::owner_identity::WaiterId,
     label: &'static str,
     permit: OwnerPermit,
-    started: Instant,
+    ready_key: Option<crate::daemon::owner_schedule::ReadyKey>,
+    deadline_key: Option<crate::daemon::owner_schedule::DeadlineKey>,
+    last_core_phase: u64,
     past_deadline: bool,
     poll: ObligationFn,
 }
@@ -82,7 +92,7 @@ pub(crate) struct OwnerBudget {
     outstanding: usize,
     /// Permits reserved by admitted WebRTC peers, keyed by grant id.
     peer_permits: std::collections::BTreeMap<String, OwnerPermit>,
-    obligations: Vec<CleanupObligation>,
+    obligations: std::collections::BTreeMap<crate::owner_identity::WaiterId, CleanupObligation>,
     pub(crate) counters: OwnerBudgetCounters,
 }
 
@@ -111,7 +121,7 @@ impl OwnerBudget {
             capacity,
             outstanding: 0,
             peer_permits: std::collections::BTreeMap::new(),
-            obligations: Vec::new(),
+            obligations: std::collections::BTreeMap::new(),
             counters: OwnerBudgetCounters::default(),
         }
     }
@@ -173,82 +183,180 @@ impl OwnerBudget {
         self.peer_permits.contains_key(grant_id)
     }
 
-    /// Retain owner work that must complete, holding `permit` until it does.
-    pub(crate) fn retain(
+    pub(crate) fn clear_obligation_deadline(
         &mut self,
-        permit: OwnerPermit,
-        label: &'static str,
-        poll: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ObligationPoll + Send + 'static,
-    ) {
-        self.obligations.push(CleanupObligation {
-            label,
-            permit,
-            started: Instant::now(),
-            past_deadline: false,
-            poll: Box::new(poll),
-        });
-    }
-
-    /// Earliest deadline among retained obligations that have not passed it.
-    pub(crate) fn next_obligation_deadline(&self) -> Option<Instant> {
-        self.obligations
-            .iter()
-            .filter(|obligation| !obligation.past_deadline)
-            .map(|obligation| obligation.started + RETAINED_OPERATION_DEADLINE)
-            .min()
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> bool {
+        let Some(obligation) = self.obligations.get_mut(&waiter_id) else {
+            return false;
+        };
+        obligation.deadline_key = None;
+        true
     }
 }
 
-/// Poll every retained obligation once. Finished obligations release their
-/// permit; the rest are kept in order, followed by any obligations retained
-/// while polling.
-pub(crate) fn poll_owner_obligations(
+pub(crate) fn retain_owner_obligation(
+    state: &mut DaemonControlState,
+    waiter_id: crate::owner_identity::WaiterId,
+    permit: OwnerPermit,
+    label: &'static str,
+    poll: impl FnMut(
+        &mut HubDaemon,
+        &mut DaemonControlState,
+        crate::owner_identity::WaiterId,
+    ) -> ObligationPoll
+    + Send
+    + 'static,
+) {
+    let now = Instant::now();
+    let arm = state
+        .deadlines
+        .arm(waiter_id, now + RETAINED_OPERATION_DEADLINE, now)
+        .expect("an initial obligation deadline always makes progress");
+    state.budget.obligations.insert(
+        waiter_id,
+        CleanupObligation {
+            waiter_id,
+            label,
+            permit,
+            ready_key: None,
+            deadline_key: Some(arm.key()),
+            last_core_phase: 0,
+            past_deadline: false,
+            poll: Box::new(poll),
+        },
+    );
+    mark_obligation_ready(
+        state,
+        waiter_id,
+        crate::daemon::control::pending::READY_INITIAL,
+    );
+}
+
+pub(crate) fn allocate_and_retain_owner_obligation(
+    state: &mut DaemonControlState,
+    permit: OwnerPermit,
+    label: &'static str,
+    poll: impl FnMut(
+        &mut HubDaemon,
+        &mut DaemonControlState,
+        crate::owner_identity::WaiterId,
+    ) -> ObligationPoll
+    + Send
+    + 'static,
+) {
+    let waiter_id = state
+        .waiter_ids
+        .next()
+        .expect("an admitted owner permit must have an available waiter identifier");
+    retain_owner_obligation(state, waiter_id, permit, label, poll);
+}
+
+pub(crate) fn mark_obligation_ready(
+    state: &mut DaemonControlState,
+    waiter_id: crate::owner_identity::WaiterId,
+    reason: crate::daemon::owner_schedule::ReadyReasons,
+) -> bool {
+    if !state.budget.obligations.contains_key(&waiter_id) {
+        return false;
+    }
+    let Ok(key) = state.owner_ready.mark(
+        waiter_id,
+        crate::daemon::owner_schedule::ReadyClass::Cleanup,
+        reason,
+    ) else {
+        return false;
+    };
+    state
+        .budget
+        .obligations
+        .get_mut(&waiter_id)
+        .expect("a marked obligation must exist")
+        .ready_key = Some(key);
+    true
+}
+
+pub(crate) fn absorb_obligation_core_completion(
+    state: &mut DaemonControlState,
+    identity: crate::owner_identity::OwnerWorkIdentity,
+) -> bool {
+    let Some(obligation) = state.budget.obligations.get_mut(&identity.waiter_id) else {
+        return false;
+    };
+    let Some(expected) = obligation.last_core_phase.checked_add(1) else {
+        return true;
+    };
+    if identity.phase == expected {
+        obligation.last_core_phase = identity.phase;
+        mark_obligation_ready(
+            state,
+            identity.waiter_id,
+            crate::daemon::control::pending::READY_CORE_COMPLETION,
+        );
+    }
+    true
+}
+
+pub(crate) fn poll_owner_obligation_item(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
-    now: Instant,
-) {
-    if state.budget.obligations.is_empty() {
-        return;
-    }
+    item: crate::daemon::owner_schedule::ReadyItem,
+) -> bool {
+    let waiter_id = item.key().waiter_id();
+    let Some(mut obligation) = state.budget.obligations.remove(&waiter_id) else {
+        return false;
+    };
+    obligation.ready_key = None;
     if let Some(runtime) = daemon.runtime() {
         runtime.reap_detached_core_operations();
     }
-    let obligations = std::mem::take(&mut state.budget.obligations);
-    let mut retained = Vec::with_capacity(obligations.len());
-    for mut obligation in obligations {
-        match (obligation.poll)(daemon, state) {
-            ObligationPoll::Done => {
-                state.budget.release(obligation.permit);
+    if item
+        .reasons()
+        .contains(crate::daemon::control::pending::READY_DEADLINE)
+        && !obligation.past_deadline
+    {
+        obligation.past_deadline = true;
+        state.budget.counters.obligations_past_deadline = state
+            .budget
+            .counters
+            .obligations_past_deadline
+            .saturating_add(1);
+        *state
+            .lifecycle_counters
+            .cleanup_by_reason
+            .entry(format!("past_deadline:{}", obligation.label))
+            .or_insert(0) += 1;
+    }
+    let result = (obligation.poll)(daemon, state, waiter_id);
+    match result {
+        ObligationPoll::Done => {
+            state.deadlines.retire(waiter_id);
+            if let Some(runtime) = daemon.runtime() {
+                runtime.retire_owner_core_waiter(waiter_id);
             }
-            ObligationPoll::Pending => {
-                if !obligation.past_deadline
-                    && now.saturating_duration_since(obligation.started)
-                        >= RETAINED_OPERATION_DEADLINE
-                {
-                    obligation.past_deadline = true;
-                    state.budget.counters.obligations_past_deadline = state
-                        .budget
-                        .counters
-                        .obligations_past_deadline
-                        .saturating_add(1);
-                    *state
-                        .lifecycle_counters
-                        .cleanup_by_reason
-                        .entry(format!("past_deadline:{}", obligation.label))
-                        .or_insert(0) += 1;
-                }
-                retained.push(obligation);
+            state.budget.release(obligation.permit);
+        }
+        ObligationPoll::Pending | ObligationPoll::ReadyAgain => {
+            let ready_again = matches!(result, ObligationPoll::ReadyAgain);
+            state.budget.obligations.insert(waiter_id, obligation);
+            if ready_again {
+                mark_obligation_ready(
+                    state,
+                    waiter_id,
+                    crate::daemon::control::pending::READY_INITIAL,
+                );
             }
         }
     }
-    retained.append(&mut state.budget.obligations);
-    state.budget.obligations = retained;
+    true
 }
 
 /// Result of driving one Core ticket slot.
 pub(crate) enum CoreWorkPoll<T> {
     /// No answer yet, or the admission was refused and will be retried.
     Pending,
+    /// Core refused admission. The caller must remain ready to retry.
+    Retry,
     /// The driver stopped; no answer will come.
     Lost,
     Ready(T),
@@ -263,19 +371,24 @@ pub(crate) fn drive_core_slot<T: Send + 'static>(
     slot: &mut Option<CoreTicket<T>>,
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
-    submit: impl FnOnce(&HubRuntime, &mut DaemonControlState) -> CoreTicket<T>,
+    waiter_id: crate::owner_identity::WaiterId,
+    submit: impl FnOnce(
+        &HubRuntime,
+        &mut DaemonControlState,
+        crate::owner_identity::WaiterId,
+    ) -> CoreTicket<T>,
 ) -> CoreWorkPoll<T> {
     if slot.is_none() {
         let Some(runtime) = daemon.runtime() else {
             return CoreWorkPoll::Lost;
         };
-        *slot = Some(submit(runtime, state));
+        *slot = Some(submit(runtime, state, waiter_id));
     }
     match slot.as_mut().expect("slot filled above").poll() {
         CoreTicketPoll::Pending => CoreWorkPoll::Pending,
         CoreTicketPoll::Refused => {
             *slot = None;
-            CoreWorkPoll::Pending
+            CoreWorkPoll::Retry
         }
         CoreTicketPoll::Lost => {
             *slot = None;
@@ -307,17 +420,27 @@ mod tests {
 
     #[test]
     fn connection_permit_survives_disconnect_until_cleanup_completes() {
-        let mut budget = OwnerBudget::with_capacity(1);
-        let permit = budget.reserve_connection().expect("connection permit");
+        let mut state = DaemonControlState::default();
+        state.budget = OwnerBudget::with_capacity(1);
+        let permit = state
+            .budget
+            .reserve_connection()
+            .expect("connection permit");
         // The transport permit is gone; the budget permit is not.
-        assert!(budget.reserve_connection().is_none());
-        budget.retain(permit, "test", |_, _| ObligationPoll::Pending);
+        assert!(state.budget.reserve_connection().is_none());
+        retain_owner_obligation(
+            &mut state,
+            crate::owner_identity::WaiterId(1),
+            permit,
+            "test",
+            |_, _, _| ObligationPoll::Pending,
+        );
         assert!(
-            budget.reserve_connection().is_none(),
+            state.budget.reserve_connection().is_none(),
             "a new connection cannot replenish the budget while cleanup remains"
         );
-        assert_eq!(budget.queued_obligations(), 1);
-        assert_eq!(budget.outstanding(), 1);
+        assert_eq!(state.budget.queued_obligations(), 1);
+        assert_eq!(state.budget.outstanding(), 1);
     }
 
     #[test]
@@ -341,12 +464,19 @@ mod tests {
     }
 
     #[test]
-    fn deadline_is_the_earliest_unflagged_obligation() {
-        let mut budget = OwnerBudget::with_capacity(2);
-        assert!(budget.next_obligation_deadline().is_none());
-        let permit = budget.reserve().expect("permit");
-        budget.retain(permit, "first", |_, _| ObligationPoll::Pending);
-        let deadline = budget.next_obligation_deadline().expect("deadline");
+    fn obligation_uses_the_shared_deadline_index() {
+        let mut state = DaemonControlState::default();
+        state.budget = OwnerBudget::with_capacity(2);
+        assert!(state.deadlines.next_deadline().is_none());
+        let permit = state.budget.reserve().expect("permit");
+        retain_owner_obligation(
+            &mut state,
+            crate::owner_identity::WaiterId(1),
+            permit,
+            "first",
+            |_, _, _| ObligationPoll::Pending,
+        );
+        let deadline = state.deadlines.next_deadline().expect("deadline");
         assert!(deadline > Instant::now());
         assert!(deadline <= Instant::now() + RETAINED_OPERATION_DEADLINE);
     }

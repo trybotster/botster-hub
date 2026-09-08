@@ -3,9 +3,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::os::unix::net::UnixListener;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,9 +32,8 @@ use crate::daemon::control::message::{
 };
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon_maintenance::{
-    BackgroundClass, BackgroundClassScheduler, BackgroundTurnDecision, MaintenanceSliceKind,
-    MaintenanceState, OBSERVE_SLICE_BUDGET, PUMP_MAX_ROUTES_VALIDATED, PumpPhase, PumpScheduler,
-    decide_background_slice, run_completion_drain_slice_for_owner, run_maintenance_kind_for_owner,
+    MaintenanceSliceKind, MaintenanceState, OBSERVE_SLICE_BUDGET, PUMP_MAX_ROUTES_VALIDATED,
+    PumpState, run_completion_drain_slice_for_owner, run_maintenance_kind_for_owner,
 };
 use crate::subscription::attach_routes::{
     AttachStreamRegistry, AttachedSubscription, AttachedSubscriptionChange,
@@ -43,7 +41,7 @@ use crate::subscription::attach_routes::{
 };
 use crate::subscription::entity::{
     EntitySubscriptionState, drive_entity_subscriptions, drive_package_entity_fanout,
-    drive_package_entity_resync, seed_lifecycle_reconciliation, session_subscribers_need_delivery,
+    drive_package_entity_resync, seed_lifecycle_reconciliation,
 };
 use crate::transport::unix::connection::{
     handle_connection_async, handle_connection_cleanup, reap_finished_connection_tasks,
@@ -54,49 +52,209 @@ use crate::transport::unix::listener::{
     socket_path,
 };
 
-const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum BackgroundCoreKind {
-    MaintenanceObserve,
-    JournalPull,
-    Baseline,
+enum BackgroundWork {
+    Maintenance(MaintenanceSliceKind),
     PumpObserve,
     InventoryReconcile,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BackgroundCoreWaiter {
-    kind: BackgroundCoreKind,
+struct BackgroundWaiter {
+    work: BackgroundWork,
     last_phase: u64,
+}
+
+#[derive(Debug)]
+struct ReservationDeadline {
+    label: String,
+    peer_generation: u64,
+    ready_key: Option<crate::daemon::owner_schedule::ReadyKey>,
+}
+
+pub(crate) fn arm_reservation_deadline(
+    state: &mut DaemonControlState,
+    label: String,
+    peer_generation: u64,
+    expires_in_seconds: u32,
+) -> bool {
+    let Some(waiter_id) = state.waiter_ids.next() else {
+        return false;
+    };
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(u64::from(expires_in_seconds));
+    let Ok(arm) = state.deadlines.arm(waiter_id, deadline, now) else {
+        return false;
+    };
+    state
+        .reservation_waiters_by_label
+        .insert(label.clone(), waiter_id);
+    state.reservation_deadlines.insert(
+        waiter_id,
+        ReservationDeadline {
+            label,
+            peer_generation,
+            ready_key: None,
+        },
+    );
+    true
+}
+
+pub(crate) fn retire_reservation_deadline(state: &mut DaemonControlState, label: &str) {
+    let Some(waiter_id) = state.reservation_waiters_by_label.remove(label) else {
+        return;
+    };
+    if let Some(deadline) = state.reservation_deadlines.remove(&waiter_id)
+        && let Some(key) = deadline.ready_key
+    {
+        state.owner_ready.remove(key);
+    }
+    state.deadlines.retire(waiter_id);
+}
+
+pub(crate) fn retire_reservation_deadlines(
+    state: &mut DaemonControlState,
+    labels: impl IntoIterator<Item = String>,
+) {
+    for label in labels {
+        retire_reservation_deadline(state, &label);
+    }
+}
+
+pub(crate) fn mark_reservation_deadline_ready(
+    state: &mut DaemonControlState,
+    waiter_id: crate::owner_identity::WaiterId,
+) -> bool {
+    if !state.reservation_deadlines.contains_key(&waiter_id) {
+        return false;
+    }
+    let Ok(key) = state.owner_ready.mark(
+        waiter_id,
+        crate::daemon::owner_schedule::ReadyClass::Deadline,
+        crate::daemon::control::pending::READY_DEADLINE,
+    ) else {
+        return true;
+    };
+    state
+        .reservation_deadlines
+        .get_mut(&waiter_id)
+        .expect("a reservation deadline remains registered")
+        .ready_key = Some(key);
+    true
+}
+
+fn run_reservation_deadline_item(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    item: crate::daemon::owner_schedule::ReadyItem,
+) -> bool {
+    let waiter_id = item.key().waiter_id();
+    let Some(deadline) = state.reservation_deadlines.remove(&waiter_id) else {
+        return false;
+    };
+    state.reservation_waiters_by_label.remove(&deadline.label);
+    state.deadlines.retire(waiter_id);
+    let Some(grant_id) = state
+        .pending_runtime
+        .admission
+        .grant_by_peer_generation
+        .get(&deadline.peer_generation)
+        .cloned()
+    else {
+        return true;
+    };
+    crate::daemon::control::connection::emit_reservation_expired(
+        daemon,
+        state,
+        &grant_id,
+        deadline.peer_generation,
+        &deadline.label,
+        crate::admission::reservations::now_seconds(),
+    );
+    true
 }
 
 fn background_waiter_id(
     state: &mut DaemonControlState,
-    kind: BackgroundCoreKind,
+    work: BackgroundWork,
 ) -> Option<crate::owner_identity::WaiterId> {
-    if let Some(waiter_id) = state.background_waiter_ids.get(&kind) {
+    if let Some(waiter_id) = state.background_waiter_ids.get(&work) {
         return Some(*waiter_id);
     }
     let waiter_id = state.waiter_ids.next()?;
-    state.background_waiter_ids.insert(kind, waiter_id);
+    state.background_waiter_ids.insert(work, waiter_id);
     state.background_core_waiters.insert(
         waiter_id,
-        BackgroundCoreWaiter {
-            kind,
+        BackgroundWaiter {
+            work,
             last_phase: 0,
         },
     );
     Some(waiter_id)
 }
 
-fn maintenance_core_kind(kind: MaintenanceSliceKind) -> Option<BackgroundCoreKind> {
+fn maintenance_core_work(kind: MaintenanceSliceKind) -> Option<BackgroundWork> {
     match kind {
-        MaintenanceSliceKind::Observe => Some(BackgroundCoreKind::MaintenanceObserve),
-        MaintenanceSliceKind::JournalPull => Some(BackgroundCoreKind::JournalPull),
-        MaintenanceSliceKind::Baseline => Some(BackgroundCoreKind::Baseline),
+        MaintenanceSliceKind::Observe
+        | MaintenanceSliceKind::JournalPull
+        | MaintenanceSliceKind::Baseline => Some(BackgroundWork::Maintenance(kind)),
         _ => None,
     }
+}
+
+fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule::ReadyClass {
+    use crate::daemon::owner_schedule::ReadyClass;
+
+    match work {
+        BackgroundWork::Maintenance(MaintenanceSliceKind::Observe)
+        | BackgroundWork::PumpObserve => ReadyClass::Observe,
+        BackgroundWork::InventoryReconcile => ReadyClass::InventoryReconcile,
+        BackgroundWork::Maintenance(MaintenanceSliceKind::JournalPull) => ReadyClass::JournalPull,
+        BackgroundWork::Maintenance(MaintenanceSliceKind::ProjectionApply) => {
+            ReadyClass::ProjectionApply
+        }
+        BackgroundWork::Maintenance(MaintenanceSliceKind::Baseline) => ReadyClass::Baseline,
+        BackgroundWork::Maintenance(MaintenanceSliceKind::HostBridge) => ReadyClass::HostBridge,
+        BackgroundWork::Maintenance(MaintenanceSliceKind::SubscriberDelivery) => {
+            ReadyClass::SubscriberDelivery
+        }
+        BackgroundWork::Maintenance(MaintenanceSliceKind::CompletionDrain) => {
+            ReadyClass::PluginCompletion
+        }
+        BackgroundWork::Maintenance(MaintenanceSliceKind::ProviderResync) => {
+            ReadyClass::ProviderResync
+        }
+        BackgroundWork::Maintenance(MaintenanceSliceKind::PackageEventDelivery) => {
+            ReadyClass::PackageEventDelivery
+        }
+    }
+}
+
+fn mark_background_ready(state: &mut DaemonControlState, work: BackgroundWork) -> bool {
+    let Some(waiter_id) = background_waiter_id(state, work) else {
+        return false;
+    };
+    state
+        .owner_ready
+        .mark(
+            waiter_id,
+            background_ready_class(work),
+            crate::daemon::control::pending::READY_BACKGROUND,
+        )
+        .is_ok()
+}
+
+fn publish_maintenance_wakes(state: &mut DaemonControlState) {
+    for kind in MaintenanceSliceKind::ALL {
+        if state.maintenance.wakes.take(kind) {
+            mark_background_ready(state, BackgroundWork::Maintenance(kind));
+        }
+    }
+}
+
+pub(crate) fn mark_pump_ready(state: &mut DaemonControlState) {
+    mark_background_ready(state, BackgroundWork::PumpObserve);
+    mark_background_ready(state, BackgroundWork::InventoryReconcile);
 }
 
 /// One Core inventory read for the reconcile phase. `read_epoch` is the
@@ -146,7 +304,7 @@ impl DaemonControlState {
             self.reconcile_inventory.is_some() || self.pump.reconcile_after.is_some();
         self.pump
             .note_inventory_change_during_reconcile(reconcile_active);
-        self.background.mark_pump();
+        mark_pump_ready(self);
     }
 
     pub(crate) fn absorb_background_core_completion(
@@ -161,7 +319,8 @@ impl DaemonControlState {
         };
         if identity.phase == expected {
             waiter.last_phase = identity.phase;
-            self.background_core_ready.insert(waiter.kind);
+            let work = waiter.work;
+            mark_background_ready(self, work);
         }
         true
     }
@@ -170,16 +329,7 @@ impl DaemonControlState {
 /// Earliest deadline among retained obligations and pending requests, so the
 /// owner wakes to retire abandoned work even when no control traffic arrives.
 fn next_owner_deadline(state: &DaemonControlState) -> Option<Instant> {
-    let obligation = state.budget.next_obligation_deadline();
-    let request = crate::daemon::control::pending::next_request_deadline(state);
-    [
-        obligation,
-        request,
-        state.plugin_entities.next_reply_deadline(),
-    ]
-    .into_iter()
-    .flatten()
-    .min()
+    state.deadlines.next_deadline()
 }
 
 enum OwnerEvent {
@@ -208,16 +358,62 @@ fn classify_owner_poll(
 
 async fn receive_owner_event(
     control_rx: &mut tokio_mpsc::Receiver<ControlMessage>,
-    reconciliation_wait: Duration,
+    deadline: Option<Instant>,
 ) -> OwnerEvent {
-    if reconciliation_wait.is_zero() {
-        return OwnerEvent::Reconcile;
+    match deadline {
+        Some(deadline) if deadline <= Instant::now() => OwnerEvent::Reconcile,
+        Some(deadline) => tokio::select! {
+            biased;
+            message = control_rx.recv() => OwnerEvent::Control(Box::new(message)),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                OwnerEvent::Reconcile
+            }
+        },
+        None => OwnerEvent::Control(Box::new(control_rx.recv().await)),
     }
-    tokio::select! {
-        biased;
-        message = control_rx.recv() => OwnerEvent::Control(Box::new(message)),
-        _ = tokio::time::sleep(reconciliation_wait) => OwnerEvent::Reconcile,
+}
+
+fn control_ready_class(message: &ControlMessage) -> crate::daemon::owner_schedule::ReadyClass {
+    use crate::daemon::owner_schedule::ReadyClass;
+
+    match message {
+        ControlMessage::ConnectionCleanup(_) => ReadyClass::Cleanup,
+        ControlMessage::CoreCompletionPublished | ControlMessage::DataPlaneProgress => {
+            ReadyClass::CoreCompletion
+        }
+        ControlMessage::HostProgressPublished | ControlMessage::ManagedSessionSpawnQueued => {
+            ReadyClass::HostCompletion
+        }
+        ControlMessage::PluginCompletionPublished
+        | ControlMessage::PluginResultCapacityReleased => ReadyClass::PluginCompletion,
+        _ => ReadyClass::ControlIngress,
     }
+}
+
+fn enqueue_control_message(
+    state: &mut DaemonControlState,
+    message: ControlMessage,
+) -> Result<(), ControlMessage> {
+    let Some(waiter_id) = state.waiter_ids.next() else {
+        return Err(message);
+    };
+    let class = control_ready_class(&message);
+    state.control_ingress.insert(waiter_id, message);
+    if state
+        .owner_ready
+        .mark(
+            waiter_id,
+            class,
+            crate::daemon::control::pending::READY_INITIAL,
+        )
+        .is_err()
+    {
+        return Err(state
+            .control_ingress
+            .remove(&waiter_id)
+            .expect("a failed ingress mark retains its message"));
+    }
+    Ok(())
 }
 
 fn retry_client_event_cleanups(daemon: &HubDaemon, state: &mut DaemonControlState) {
@@ -232,111 +428,13 @@ fn retry_client_event_cleanups(daemon: &HubDaemon, state: &mut DaemonControlStat
     }
 }
 
-fn owner_maintenance_pending(daemon: &HubDaemon, state: &DaemonControlState) -> bool {
-    state.maintenance.needs_work()
-        || session_subscribers_need_delivery(state)
-        || daemon
-            .runtime()
-            .is_some_and(crate::HubRuntime::package_entity_resync_still_needed)
-        || daemon.runtime().is_some_and(|runtime| {
-            runtime.package_event_router().peek_delivery_wake()
-                || runtime.event_plane_owner_ops_pending()
-                || runtime.package_entity_work_pending()
-        })
-        || state.event_plane.has_pending_cleanup()
-}
-
-fn mark_due_reconciliation(
-    state: &mut DaemonControlState,
-    now: Instant,
-    owner_turn: &mut crate::daemon::owner_turn::OwnerTurnBudget,
-) {
-    if owner_turn
-        .try_charge(
-            Instant::now(),
-            crate::daemon::owner_turn::OwnerTurnCharge::inspection(0),
-        )
-        .is_err()
-    {
-        return;
-    }
-    if state.next_reconciliation <= now {
-        state.background.mark_pump();
-        state.maintenance.try_wake();
-        state.next_reconciliation = now + ENTITY_RECONCILIATION_INTERVAL;
-    }
-}
-
-fn run_one_owner_background_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    if let Some(kind) = state.background_core_ready.pop_first() {
-        match kind {
-            BackgroundCoreKind::MaintenanceObserve => {
-                run_owner_maintenance_kind(daemon, state, MaintenanceSliceKind::Observe)
-            }
-            BackgroundCoreKind::JournalPull => {
-                run_owner_maintenance_kind(daemon, state, MaintenanceSliceKind::JournalPull)
-            }
-            BackgroundCoreKind::Baseline => {
-                run_owner_maintenance_kind(daemon, state, MaintenanceSliceKind::Baseline)
-            }
-            BackgroundCoreKind::PumpObserve => {
-                if run_pump_observe_phase(daemon, state) {
-                    state.background.mark_pump();
-                }
-            }
-            BackgroundCoreKind::InventoryReconcile => {
-                if run_inventory_reconcile_phase(daemon, state) {
-                    state.background.mark_pump();
-                }
-            }
-        }
-        return;
-    }
-    let maintenance_pending = owner_maintenance_pending(daemon, state);
-    let BackgroundTurnDecision::OneSlice(class) =
-        decide_background_slice(&mut state.background, maintenance_pending)
-    else {
-        return;
-    };
-    match class {
-        BackgroundClass::Maintenance => {
-            state.lifecycle_counters.reconciliation_wakes = state
-                .lifecycle_counters
-                .reconciliation_wakes
-                .saturating_add(1);
-            run_one_owner_maintenance_slice(daemon, state);
-        }
-        BackgroundClass::Pump => run_one_pump_phase(daemon, state),
-    }
-}
-
-fn run_owner_maintenance_kind(
+fn run_owner_maintenance_slice(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     kind: MaintenanceSliceKind,
 ) {
-    let Some(runtime) = daemon.runtime() else {
-        return;
-    };
-    let Some(core_kind) = maintenance_core_kind(kind) else {
-        return;
-    };
-    let Some(waiter_id) = background_waiter_id(state, core_kind) else {
-        return;
-    };
-    run_maintenance_kind_for_owner(
-        runtime,
-        &mut state.maintenance,
-        &mut state.maintenance_reads,
-        kind,
-        waiter_id,
-    );
-}
-
-fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     retry_client_event_cleanups(daemon, state);
     let started = Instant::now();
-    let kind = state.maintenance.scheduler.take_slice();
     match kind {
         MaintenanceSliceKind::SubscriberDelivery => {
             drive_entity_subscriptions(daemon, state);
@@ -364,6 +462,17 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
                     &mut state.plugin_entities,
                     &state.plugin_result_budget,
                 );
+                for waiter_id in state
+                    .plugin_entities
+                    .take_ready_waiters(crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT)
+                {
+                    crate::daemon::control::entities::mark_plugin_entity_ready(
+                        state,
+                        waiter_id,
+                        crate::daemon::owner_schedule::ReadyClass::PluginCompletion,
+                        crate::daemon::control::pending::READY_PLUGIN_COMPLETION,
+                    );
+                }
                 // A productive partial drain can continue. A zero-item drain
                 // waits for either a later Core publication or a retained-byte
                 // release. Core publishes each notifier after its mailbox push,
@@ -373,7 +482,10 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
                 // later drop because startup rejects any single completion
                 // larger than the full retained-result capacity.
                 if completion_drain_needs_followup(progress) {
-                    state.maintenance.scheduler.prefer_completion_drain();
+                    state
+                        .maintenance
+                        .wakes
+                        .mark(MaintenanceSliceKind::CompletionDrain);
                 }
             }
         }
@@ -385,8 +497,8 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
                 {
                     state.maintenance.try_wake();
                 }
-                if let Some(core_kind) = maintenance_core_kind(other) {
-                    if let Some(waiter_id) = background_waiter_id(state, core_kind) {
+                if let Some(core_work) = maintenance_core_work(other) {
+                    if let Some(waiter_id) = background_waiter_id(state, core_work) {
                         run_maintenance_kind_for_owner(
                             runtime,
                             &mut state.maintenance,
@@ -415,15 +527,123 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
     state.lifecycle_counters.lifecycle_change_reads = state.maintenance.journal_page_reads;
     state.lifecycle_counters.lifecycle_baseline_reads = state.maintenance.baseline_page_reads;
     state.lifecycle_counters.lifecycle_resync_reads = state.maintenance.resync_reads;
-    if owner_maintenance_pending(daemon, state) {
-        state.maintenance.try_wake();
-    }
 }
 
 fn completion_drain_needs_followup(
     progress: crate::daemon_maintenance::CompletionDrainProgress,
 ) -> bool {
     progress.item_count > 0 && progress.has_remaining
+}
+
+pub(crate) fn run_background_ready_item(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    item: crate::daemon::owner_schedule::ReadyItem,
+) -> bool {
+    let Some(waiter) = state
+        .background_core_waiters
+        .get(&item.key().waiter_id())
+        .copied()
+    else {
+        return false;
+    };
+    match waiter.work {
+        BackgroundWork::Maintenance(kind) => {
+            state.lifecycle_counters.reconciliation_wakes = state
+                .lifecycle_counters
+                .reconciliation_wakes
+                .saturating_add(1);
+            run_owner_maintenance_slice(daemon, state, kind);
+        }
+        BackgroundWork::PumpObserve => run_pump_observe_slice(daemon, state),
+        BackgroundWork::InventoryReconcile => run_inventory_reconcile_slice(daemon, state),
+    }
+    publish_maintenance_wakes(state);
+    true
+}
+
+fn run_control_ingress_item(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    transport_runtime: &tokio::runtime::Runtime,
+    control_tx: ControlSender,
+    shutdown_tx: &watch::Sender<bool>,
+    connection_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    owner_turn: &mut crate::daemon::owner_turn::OwnerTurnBudget,
+    item: crate::daemon::owner_schedule::ReadyItem,
+) -> Option<bool> {
+    let message = state.control_ingress.remove(&item.key().waiter_id())?;
+    match message {
+        ControlMessage::AcceptedConnection {
+            stream,
+            admission_permit,
+            cleanup_permit,
+        } => {
+            let Some(connection_permit) = state.budget.reserve_connection() else {
+                state.lifecycle_counters.rejected_connections = state
+                    .lifecycle_counters
+                    .rejected_connections
+                    .saturating_add(1);
+                *state
+                    .lifecycle_counters
+                    .cleanup_by_reason
+                    .entry("owner_budget_refused_connection".to_string())
+                    .or_insert(0) += 1;
+                drop(stream);
+                drop(admission_permit);
+                drop(cleanup_permit);
+                return Some(false);
+            };
+            state.lifecycle_counters.accepted_connections = state
+                .lifecycle_counters
+                .accepted_connections
+                .saturating_add(1);
+            let tx = control_tx.clone();
+            let shutdown = shutdown_tx.subscribe();
+            let event_plane = state.event_plane.clone();
+            state.lifecycle_counters.live_connections =
+                state.lifecycle_counters.live_connections.saturating_add(1);
+            state.lifecycle_counters.high_water_live_connections = state
+                .lifecycle_counters
+                .high_water_live_connections
+                .max(state.lifecycle_counters.live_connections);
+            connection_tasks.push(transport_runtime.spawn(async move {
+                let _admission_permit = admission_permit;
+                if let Err(error) = handle_connection_async(
+                    stream,
+                    tx,
+                    cleanup_permit,
+                    shutdown,
+                    event_plane,
+                    connection_permit,
+                )
+                .await
+                {
+                    eprintln!("botster-hub daemon connection error: {error}");
+                }
+            }));
+            Some(false)
+        }
+        ControlMessage::RejectedConnection => {
+            state.lifecycle_counters.rejected_connections = state
+                .lifecycle_counters
+                .rejected_connections
+                .saturating_add(1);
+            Some(false)
+        }
+        ControlMessage::ConnectionCleanup(cleanup) => {
+            handle_connection_cleanup(daemon, state, control_tx, cleanup);
+            Some(false)
+        }
+        message => Some(handle_control_message_with_budget(
+            daemon,
+            state,
+            transport_runtime.handle(),
+            control_tx,
+            owner_turn,
+            message,
+        )),
+    }
 }
 
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
@@ -436,7 +656,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         .map_err(DaemonTransportError::Io)?;
 
     let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
-    let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(DAEMON_MAX_CONNECTIONS);
     let (shutdown_tx, _) = watch::channel(false);
     install_signal_forwarder(control_tx.clone())?;
     let mut daemon = HubDaemon::start(config)?;
@@ -485,9 +704,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     loop {
         let mut owner_turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
         reap_finished_connection_tasks(&mut connection_tasks);
-        while let Ok(cleanup) = cleanup_rx.try_recv() {
-            handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
-        }
         // Read the shared completion bit on every turn. If the bounded
         // doorbell queue was full, another owner event still exposes results.
         if let Some(runtime) = daemon.runtime()
@@ -527,39 +743,23 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             crate::daemon::control::managed_git::accept_one(&mut daemon, &mut control_state);
         }
         crate::daemon::control::absorb_plugin_progress(&mut control_state, &mut owner_turn);
-        crate::daemon::control::entities::retire_plugin_entity_replies(
-            &daemon,
-            &mut control_state,
-            Instant::now(),
-        );
-        crate::daemon::control::entities::expire_plugin_entity_resyncs(
-            &daemon,
-            &mut control_state,
-            Instant::now(),
-        );
-        mark_due_reconciliation(&mut control_state, Instant::now(), &mut owner_turn);
-        crate::daemon::control::pending::mark_due_request_deadlines(
+        crate::daemon::control::pending::mark_due_owner_deadlines(
             &mut control_state,
             Instant::now(),
             &mut owner_turn,
         );
-        let slice_due = control_state
-            .background
-            .has_pending(owner_maintenance_pending(&daemon, &control_state))
-            || !control_state.background_core_ready.is_empty()
-            || !control_state.request_ready.is_empty()
+        publish_maintenance_wakes(&mut control_state);
+        let slice_due = !control_state.owner_ready.is_empty()
             || control_state.host_completion_drain_pending
             || control_state.host_capacity_wake_pending;
         let event = match classify_owner_poll(control_rx.try_recv(), slice_due) {
             OwnerPollDecision::ServeControl(message) => Some(OwnerEvent::Control(message)),
             OwnerPollDecision::RunSlice => None,
             OwnerPollDecision::Block => {
-                let wake_at = match next_owner_deadline(&control_state) {
-                    Some(deadline) => control_state.next_reconciliation.min(deadline),
-                    None => control_state.next_reconciliation,
-                };
-                let wait = wake_at.saturating_duration_since(Instant::now());
-                match transport_runtime.block_on(receive_owner_event(&mut control_rx, wait)) {
+                match transport_runtime.block_on(receive_owner_event(
+                    &mut control_rx,
+                    next_owner_deadline(&control_state),
+                )) {
                     OwnerEvent::Control(message) => Some(OwnerEvent::Control(message)),
                     OwnerEvent::Reconcile => None,
                 }
@@ -567,98 +767,26 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         };
         if let Some(OwnerEvent::Control(message)) = event {
             match *message {
-                Some(ControlMessage::AcceptedConnection {
-                    stream,
-                    admission_permit,
-                }) => {
-                    // The owner budget permit outlives the transport permit:
-                    // it travels in the connection's cleanup guard and comes
-                    // back with the cleanup message.
-                    let Some(connection_permit) = control_state.budget.reserve_connection() else {
-                        control_state.lifecycle_counters.rejected_connections = control_state
-                            .lifecycle_counters
-                            .rejected_connections
-                            .saturating_add(1);
-                        *control_state
-                            .lifecycle_counters
-                            .cleanup_by_reason
-                            .entry("owner_budget_refused_connection".to_string())
-                            .or_insert(0) += 1;
-                        drop(stream);
-                        drop(admission_permit);
-                        continue;
-                    };
-                    control_state.lifecycle_counters.accepted_connections = control_state
-                        .lifecycle_counters
-                        .accepted_connections
-                        .saturating_add(1);
-                    let tx = control_tx.clone();
-                    let cleanup = cleanup_tx.clone();
-                    let shutdown = shutdown_tx.subscribe();
-                    let event_plane = control_state.event_plane.clone();
-                    control_state.lifecycle_counters.live_connections = control_state
-                        .lifecycle_counters
-                        .live_connections
-                        .saturating_add(1);
-                    control_state.lifecycle_counters.high_water_live_connections = control_state
-                        .lifecycle_counters
-                        .high_water_live_connections
-                        .max(control_state.lifecycle_counters.live_connections);
-                    connection_tasks.push(transport_runtime.spawn(async move {
-                        let _admission_permit = admission_permit;
-                        if let Err(error) = handle_connection_async(
-                            stream,
-                            tx,
-                            cleanup,
-                            shutdown,
-                            event_plane,
-                            connection_permit,
-                        )
-                        .await
-                        {
-                            eprintln!("botster-hub daemon connection error: {error}");
-                        }
-                    }));
-                }
-                Some(ControlMessage::RejectedConnection) => {
-                    control_state.lifecycle_counters.rejected_connections = control_state
-                        .lifecycle_counters
-                        .rejected_connections
-                        .saturating_add(1);
-                }
                 Some(message) => {
-                    if handle_control_message_with_budget(
-                        &mut daemon,
-                        &mut control_state,
-                        transport_runtime.handle(),
-                        control_tx.clone(),
-                        &mut owner_turn,
-                        message,
-                    ) {
-                        let _ = shutdown_tx.send(true);
-                        wait_for_connection_tasks(
-                            &transport_runtime,
-                            &mut connection_tasks,
-                            &cleanup_rx,
-                            &mut daemon,
-                            &mut control_state,
-                            control_tx.clone(),
-                        );
-                        let status = daemon.stop();
-                        cleanup_socket_path(&socket_path, socket_owner);
-                        return Ok(status);
+                    if let Err(message) = enqueue_control_message(&mut control_state, message) {
+                        if let ControlMessage::ConnectionCleanup(cleanup) = message {
+                            handle_connection_cleanup(
+                                &mut daemon,
+                                &mut control_state,
+                                control_tx.clone(),
+                                cleanup,
+                            );
+                            continue;
+                        }
+                        return Err(DaemonTransportError::Protocol(
+                            "owner waiter identifiers are exhausted",
+                        ));
                     }
                 }
                 None => return Err(DaemonTransportError::ControlThreadStopped),
             }
         }
-        mark_due_reconciliation(&mut control_state, Instant::now(), &mut owner_turn);
-        if control_state
-            .background
-            .has_pending(owner_maintenance_pending(&daemon, &control_state))
-        {
-            run_one_owner_background_slice(&mut daemon, &mut control_state);
-        }
+        publish_maintenance_wakes(&mut control_state);
         while owner_turn
             .try_charge(
                 Instant::now(),
@@ -669,39 +797,98 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             let Some(waiter_id) = control_state.plugin_controls.take_ready_waiters(1).pop() else {
                 break;
             };
-            crate::daemon::control::pending::mark_request_ready(
+            crate::daemon::control::pending::mark_owner_ready(
                 &mut control_state,
                 waiter_id,
                 crate::daemon::owner_schedule::ReadyClass::PluginCompletion,
                 crate::daemon::control::pending::READY_PLUGIN_COMPLETION,
             );
         }
-        crate::daemon::control::entities::drive_plugin_entity_completions(
-            &mut daemon,
-            &mut control_state,
-        );
-        crate::daemon::owner_budget::poll_owner_obligations(
-            &mut daemon,
-            &mut control_state,
-            Instant::now(),
-        );
-        if crate::daemon::control::request::poll_deferred_with_budget(
-            &mut daemon,
-            &mut control_state,
-            &mut owner_turn,
-        ) {
-            let _ = shutdown_tx.send(true);
-            wait_for_connection_tasks(
-                &transport_runtime,
-                &mut connection_tasks,
-                &cleanup_rx,
+        loop {
+            if owner_turn
+                .try_charge(
+                    Instant::now(),
+                    crate::daemon::owner_turn::OwnerTurnCharge::opaque_move(),
+                )
+                .is_err()
+            {
+                break;
+            }
+            let Some(item) = control_state.owner_ready.pop_next() else {
+                break;
+            };
+            if let Some(shutdown) = run_control_ingress_item(
                 &mut daemon,
                 &mut control_state,
+                &transport_runtime,
                 control_tx.clone(),
-            );
-            let status = daemon.stop();
-            cleanup_socket_path(&socket_path, socket_owner);
-            return Ok(status);
+                &shutdown_tx,
+                &mut connection_tasks,
+                &mut owner_turn,
+                item,
+            ) {
+                if shutdown {
+                    let _ = shutdown_tx.send(true);
+                    wait_for_connection_tasks(
+                        &transport_runtime,
+                        &mut connection_tasks,
+                        &mut control_rx,
+                        &mut daemon,
+                        &mut control_state,
+                        control_tx.clone(),
+                    );
+                    let status = daemon.stop();
+                    cleanup_socket_path(&socket_path, socket_owner);
+                    return Ok(status);
+                }
+                continue;
+            }
+            if crate::subscription::entity::drive_session_type_catalog_ready_item(
+                &daemon,
+                &mut control_state,
+                item,
+            ) {
+                continue;
+            }
+            if run_reservation_deadline_item(&mut daemon, &mut control_state, item) {
+                continue;
+            }
+            if run_background_ready_item(&mut daemon, &mut control_state, item) {
+                continue;
+            }
+            if crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                &mut daemon,
+                &mut control_state,
+                item,
+            ) {
+                continue;
+            }
+            if crate::daemon::owner_budget::poll_owner_obligation_item(
+                &mut daemon,
+                &mut control_state,
+                item,
+            ) {
+                continue;
+            }
+            if crate::daemon::control::request::poll_one_ready(
+                &mut daemon,
+                &mut control_state,
+                item,
+            ) {
+                let _ = shutdown_tx.send(true);
+                wait_for_connection_tasks(
+                    &transport_runtime,
+                    &mut connection_tasks,
+                    &mut control_rx,
+                    &mut daemon,
+                    &mut control_state,
+                    control_tx.clone(),
+                );
+                let status = daemon.stop();
+                cleanup_socket_path(&socket_path, socket_owner);
+                return Ok(status);
+            }
+            publish_maintenance_wakes(&mut control_state);
         }
     }
 }
@@ -847,104 +1034,23 @@ impl PendingRuntimeState {
     }
 }
 
-fn run_one_pump_phase(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
-    let phase = state.pump.take_phase();
-    let incomplete = match phase {
-        PumpPhase::InventoryReconcile => {
-            let expired = state
-                .pending_runtime
-                .admission
-                .reservations
-                .retire_expired(crate::admission::reservations::now_seconds());
-            for reservation in expired {
-                let grant_id = state
-                    .pending_runtime
-                    .admission
-                    .webrtc_admissions
-                    .iter()
-                    .find_map(|(grant_id, admission)| match admission {
-                        WebrtcTerminalAdmission::Admitted {
-                            peer_generation, ..
-                        }
-                        | WebrtcTerminalAdmission::Rejected {
-                            peer_generation, ..
-                        } if *peer_generation == reservation.peer_generation => {
-                            Some(grant_id.clone())
-                        }
-                        _ => None,
-                    });
-                if let Some(grant_id) = grant_id.as_deref() {
-                    crate::daemon::control::connection::retire_route_owner(
-                        daemon,
-                        state,
-                        grant_id,
-                        &reservation,
-                    );
-                }
-                if let Some(budget) = state
-                    .pending_runtime
-                    .admission
-                    .connection_budgets
-                    .get_mut(&reservation.peer_generation)
-                {
-                    let _ = budget.release(&reservation.label);
-                }
-                if let Some(mux) = state
-                    .pending_runtime
-                    .admission
-                    .webrtc_admissions
-                    .values()
-                    .find_map(|admission| match admission {
-                        WebrtcTerminalAdmission::Admitted {
-                            mux,
-                            peer_generation,
-                            ..
-                        }
-                        | WebrtcTerminalAdmission::Rejected {
-                            mux,
-                            peer_generation,
-                            ..
-                        } if *peer_generation == reservation.peer_generation => Some(mux),
-                        _ => None,
-                    })
-                {
-                    let event = match reservation.class {
-                        crate::admission::connection_budget::ChannelClass::Terminal => {
-                            botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
-                                session_id: reservation.session_id,
-                                subscription_id: reservation.subscription_id,
-                                generation: reservation.generation,
-                                reason: botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_RESERVATION_EXPIRED.to_string(),
-                            }
-                        }
-                        crate::admission::connection_budget::ChannelClass::Entity => {
-                            botster_hub_client::DaemonEvent::RuntimeObservation {
-                                kind: format!(
-                                    "entity_subscription_closed:{}:{}:reservation_expired",
-                                    reservation.subscription_id, reservation.generation
-                                ),
-                            }
-                        }
-                        crate::admission::connection_budget::ChannelClass::Event => {
-                            botster_hub_client::DaemonEvent::RuntimeObservation {
-                                kind: format!(
-                                    "package_event_subscription_closed:{}:{}:reservation_expired",
-                                    reservation.subscription_id, reservation.generation
-                                ),
-                            }
-                        }
-                        crate::admission::connection_budget::ChannelClass::Control => continue,
-                    };
-                    mux.push_host_event(event);
-                }
-            }
-            run_inventory_reconcile_phase(daemon, state)
-        }
-        PumpPhase::Observe => run_pump_observe_phase(daemon, state),
-    };
-    if incomplete {
-        state.background.mark_pump();
+fn run_inventory_reconcile_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    if run_inventory_reconcile_phase_progress(daemon, state) == BackgroundProgress::Runnable {
+        mark_background_ready(state, BackgroundWork::InventoryReconcile);
     }
+}
+
+fn run_pump_observe_slice(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if run_pump_observe_phase(daemon, state) == BackgroundProgress::Runnable {
+        mark_background_ready(state, BackgroundWork::PumpObserve);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundProgress {
+    Waiting,
+    Runnable,
+    Done,
 }
 
 /// Validate owner route bookkeeping against one Core inventory read.
@@ -955,13 +1061,20 @@ pub(crate) fn run_inventory_reconcile_phase(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
 ) -> bool {
+    run_inventory_reconcile_phase_progress(daemon, state) != BackgroundProgress::Done
+}
+
+fn run_inventory_reconcile_phase_progress(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+) -> BackgroundProgress {
     use crate::data_plane::driver::CoreTicketPoll;
 
     let Some(runtime) = daemon.runtime() else {
         state.pump.reconcile_after = None;
         state.pump.take_inventory_reconcile_again();
         state.reconcile_inventory = None;
-        return false;
+        return BackgroundProgress::Done;
     };
     let Some(read) = state.reconcile_inventory.as_mut() else {
         // The epoch is captured at submission, on this thread, before the
@@ -972,29 +1085,29 @@ pub(crate) fn run_inventory_reconcile_phase(
             state.pump.reconcile_after.as_ref(),
             PUMP_MAX_ROUTES_VALIDATED,
         );
-        let Some(waiter_id) = background_waiter_id(state, BackgroundCoreKind::InventoryReconcile)
+        let Some(waiter_id) = background_waiter_id(state, BackgroundWork::InventoryReconcile)
         else {
-            return false;
+            return BackgroundProgress::Done;
         };
         state.reconcile_inventory = Some(InventoryRead {
             read_epoch,
             ticket: runtime.terminal_subscription_generations_for_owner(waiter_id, routes),
         });
-        return true;
+        return BackgroundProgress::Waiting;
     };
     let read_epoch = read.read_epoch;
     let inventory = match read.ticket.poll() {
-        CoreTicketPoll::Pending => return true,
+        CoreTicketPoll::Pending => return BackgroundProgress::Waiting,
         // Refused admission: clear the single slot; the cursor stays and the
         // next pump resubmits (one ticket in flight, no queue).
         CoreTicketPoll::Refused => {
             state.reconcile_inventory = None;
-            return true;
+            return BackgroundProgress::Runnable;
         }
         CoreTicketPoll::Lost => {
             state.reconcile_inventory = None;
             state.pump.reconcile_after = None;
-            return false;
+            return BackgroundProgress::Done;
         }
         CoreTicketPoll::Ready(inventory) => inventory,
     };
@@ -1029,28 +1142,35 @@ pub(crate) fn run_inventory_reconcile_phase(
     }
     if progress.more {
         state.pump.reconcile_after = progress.after;
-        true
+        BackgroundProgress::Runnable
     } else {
         state.pump.reconcile_after = None;
-        state.pump.take_inventory_reconcile_again()
+        if state.pump.take_inventory_reconcile_again() {
+            BackgroundProgress::Runnable
+        } else {
+            BackgroundProgress::Done
+        }
     }
 }
 
 /// Drive one bounded observe slice through a Core ticket.
 ///
 /// Returns `true` while the pass is incomplete or the read is in flight.
-fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool {
+fn run_pump_observe_phase(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+) -> BackgroundProgress {
     use crate::data_plane::driver::CoreTicketPoll;
 
     let Some(runtime) = daemon.runtime() else {
         state.observe_resume = None;
         state.observe_read = None;
-        return false;
+        return BackgroundProgress::Done;
     };
     let Some(ticket) = state.observe_read.as_mut() else {
         let now = tick(&mut state.logical_clock);
-        let Some(waiter_id) = background_waiter_id(state, BackgroundCoreKind::PumpObserve) else {
-            return false;
+        let Some(waiter_id) = background_waiter_id(state, BackgroundWork::PumpObserve) else {
+            return BackgroundProgress::Done;
         };
         state.observe_read = Some(runtime.observe_lifecycle_slice_for_owner(
             waiter_id,
@@ -1058,19 +1178,19 @@ fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
             state.observe_resume.as_ref(),
             OBSERVE_SLICE_BUDGET,
         ));
-        return true;
+        return BackgroundProgress::Waiting;
     };
     let slice = match ticket.poll() {
-        CoreTicketPoll::Pending => return true,
+        CoreTicketPoll::Pending => return BackgroundProgress::Waiting,
         // Refused admission: clear the single slot and resubmit next pump.
         CoreTicketPoll::Refused => {
             state.observe_read = None;
-            return true;
+            return BackgroundProgress::Runnable;
         }
         CoreTicketPoll::Lost => {
             state.observe_read = None;
             state.observe_resume = None;
-            return false;
+            return BackgroundProgress::Done;
         }
         CoreTicketPoll::Ready(slice) => slice,
     };
@@ -1090,11 +1210,15 @@ fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
         };
         if state.maintenance.take_journal_wake() {
             state.maintenance.note_authoritative_mutation();
-            state.background.mark_pump();
+            mark_pump_ready(state);
         }
-        state.observe_resume.is_some()
+        if state.observe_resume.is_some() {
+            BackgroundProgress::Runnable
+        } else {
+            BackgroundProgress::Done
+        }
     } else {
-        false
+        BackgroundProgress::Done
     }
 }
 
@@ -1107,9 +1231,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) pending_runtime: PendingRuntimeState,
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     pub(crate) maintenance: MaintenanceState,
-    pub(crate) background: BackgroundClassScheduler,
-    pub(crate) pump: PumpScheduler,
-    next_reconciliation: Instant,
+    pub(crate) pump: PumpState,
     pub(crate) released_entity_generations: u64,
     pub(crate) attach_close: crate::subscription::closed_events::AttachCloseBookkeeping,
     pub(crate) pending_hub_update_reply: Option<ControlReplySender>,
@@ -1120,11 +1242,13 @@ pub(crate) struct DaemonControlState {
     >,
     pub(crate) waiter_ids: crate::owner_identity::WaiterIdSource,
     pub(crate) current_waiter_id: Option<crate::owner_identity::WaiterId>,
-    pub(crate) request_ready: crate::daemon::owner_schedule::ReadyQueues,
-    pub(crate) request_deadlines: crate::daemon::owner_schedule::DeadlineIndex,
-    background_waiter_ids: BTreeMap<BackgroundCoreKind, crate::owner_identity::WaiterId>,
-    background_core_waiters: BTreeMap<crate::owner_identity::WaiterId, BackgroundCoreWaiter>,
-    background_core_ready: std::collections::BTreeSet<BackgroundCoreKind>,
+    pub(crate) owner_ready: crate::daemon::owner_schedule::ReadyQueues,
+    control_ingress: BTreeMap<crate::owner_identity::WaiterId, ControlMessage>,
+    pub(crate) deadlines: crate::daemon::owner_schedule::DeadlineIndex,
+    reservation_deadlines: BTreeMap<crate::owner_identity::WaiterId, ReservationDeadline>,
+    reservation_waiters_by_label: BTreeMap<String, crate::owner_identity::WaiterId>,
+    background_waiter_ids: BTreeMap<BackgroundWork, crate::owner_identity::WaiterId>,
+    background_core_waiters: BTreeMap<crate::owner_identity::WaiterId, BackgroundWaiter>,
     pub(crate) host_completions:
         BTreeMap<crate::owner_identity::WaiterId, crate::host_executor::HostCompletion>,
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
@@ -1132,6 +1256,8 @@ pub(crate) struct DaemonControlState {
     pub(crate) host_recovery_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
     pub(crate) package_recovery_required:
         Option<crate::daemon::control::host_work::PackageRecoveryRequired>,
+    pub(crate) managed_git_recovery_required:
+        Option<crate::daemon::control::managed_git::ManagedGitRecoveryRequired>,
     pub(crate) host_completion_drain_pending: bool,
     pub(crate) host_capacity_wake_pending: bool,
     pub(crate) blocked_session_type_roots:
@@ -1193,25 +1319,26 @@ impl Default for DaemonControlState {
             pending_runtime: PendingRuntimeState::default(),
             lifecycle_counters: DaemonLifecycleCounters::default(),
             maintenance: MaintenanceState::default(),
-            background: BackgroundClassScheduler::default(),
-            pump: PumpScheduler::default(),
-            next_reconciliation: Instant::now(),
+            pump: PumpState::default(),
             released_entity_generations: 0,
             attach_close: crate::subscription::closed_events::AttachCloseBookkeeping::default(),
             pending_hub_update_reply: None,
             pending_requests: BTreeMap::new(),
             waiter_ids: crate::owner_identity::WaiterIdSource::default(),
             current_waiter_id: None,
-            request_ready: crate::daemon::owner_schedule::ReadyQueues::new(),
-            request_deadlines: crate::daemon::owner_schedule::DeadlineIndex::new(),
+            owner_ready: crate::daemon::owner_schedule::ReadyQueues::new(),
+            control_ingress: BTreeMap::new(),
+            deadlines: crate::daemon::owner_schedule::DeadlineIndex::new(),
+            reservation_deadlines: BTreeMap::new(),
+            reservation_waiters_by_label: BTreeMap::new(),
             background_waiter_ids: BTreeMap::new(),
             background_core_waiters: BTreeMap::new(),
-            background_core_ready: std::collections::BTreeSet::new(),
             host_completions: BTreeMap::new(),
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
             host_recovery_waiters: std::collections::BTreeSet::new(),
             package_recovery_required: None,
+            managed_git_recovery_required: None,
             host_completion_drain_pending: false,
             host_capacity_wake_pending: false,
             blocked_session_type_roots: BTreeMap::new(),
@@ -1442,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn due_reconciliation_precedes_an_already_ready_control_message() {
+    fn due_deadline_precedes_an_already_ready_control_message() {
         let (control_tx, mut control_rx) = tokio_mpsc::channel(1);
         control_tx
             .try_send(ControlMessage::RejectedConnection)
@@ -1453,33 +1580,28 @@ mod tests {
             .expect("build owner event test runtime");
 
         assert!(matches!(
-            runtime.block_on(receive_owner_event(&mut control_rx, Duration::ZERO)),
+            runtime.block_on(receive_owner_event(&mut control_rx, Some(Instant::now()))),
             OwnerEvent::Reconcile
         ));
-        let OwnerEvent::Control(message) =
-            runtime.block_on(receive_owner_event(&mut control_rx, Duration::from_secs(1)))
-        else {
+        let OwnerEvent::Control(message) = runtime.block_on(receive_owner_event(
+            &mut control_rx,
+            Some(Instant::now() + Duration::from_secs(1)),
+        )) else {
             panic!("ready control message must win before a future reconciliation deadline");
         };
         assert!(matches!(*message, Some(ControlMessage::RejectedConnection)));
     }
 
     #[test]
-    fn queued_control_precedes_a_due_maintenance_slice() {
+    fn queued_control_precedes_ready_owner_work() {
         assert!(matches!(
             classify_owner_poll(Ok(ControlMessage::RejectedConnection), true),
             OwnerPollDecision::ServeControl(message)
                 if matches!(*message, Some(ControlMessage::RejectedConnection))
         ));
-        let mut scheduler = BackgroundClassScheduler::default();
-        scheduler.mark_pump();
         assert!(matches!(
             classify_owner_poll(Ok(ControlMessage::RejectedConnection), true),
             OwnerPollDecision::ServeControl(_)
-        ));
-        assert!(matches!(
-            decide_background_slice(&mut scheduler, true),
-            BackgroundTurnDecision::OneSlice(_)
         ));
     }
 
@@ -1591,12 +1713,12 @@ mod tests {
     }
 
     #[test]
-    fn pump_phases_do_not_list_subscriptions_or_sessions() {
+    fn pump_work_does_not_list_subscriptions_or_sessions() {
         const TRANSPORT: &str = include_str!("owner_loop.rs");
         let pump = TRANSPORT
-            .split("fn run_one_pump_phase")
+            .split("fn run_inventory_reconcile_slice")
             .nth(1)
-            .expect("pump runner");
+            .expect("inventory reconcile runner");
         let pump = pump
             .split("pub(crate) struct DaemonControlState")
             .next()
@@ -3240,10 +3362,21 @@ return botster.register({
                         plugin_result_budget,
                     );
                 }
-                crate::daemon::control::entities::drive_plugin_entity_completions(
-                    &mut daemon,
-                    &mut state,
-                );
+                for waiter_id in state.plugin_entities.take_ready_waiters(8) {
+                    crate::daemon::control::entities::mark_plugin_entity_ready(
+                        &mut state,
+                        waiter_id,
+                        crate::daemon::owner_schedule::ReadyClass::PluginCompletion,
+                        crate::daemon::control::pending::READY_PLUGIN_COMPLETION,
+                    );
+                }
+                if let Some(item) = state.owner_ready.pop_next() {
+                    let _ = crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                        &mut daemon,
+                        &mut state,
+                        item,
+                    );
+                }
                 match reply_rx.try_recv() {
                     Ok(reply) => break reply.into_parts().0.expect("entity response"),
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
@@ -3334,13 +3467,15 @@ return botster.register({
                     deadline_key: None,
                     last_core_phase: 0,
                     last_host_phase: 0,
-                    request,
+                    completion:
+                        crate::daemon::control::pending::OwnerRequestCompletion::from_request(
+                            &request,
+                        ),
                     reply_tx,
                     response_delivery_rx: None,
                     grant_id: None,
                     client: Some(client_id.to_string()),
                     permit: Some(permit),
-                    accepted_at: Instant::now(),
                     must_finish: false,
                     past_deadline: false,
                     continuation: step.continuation,
@@ -3439,15 +3574,24 @@ return botster.register({
                     &connection_id,
                 );
             } else {
-                crate::daemon::control::entities::retire_plugin_entity_replies(
-                    &daemon,
+                let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                crate::daemon::control::pending::mark_due_owner_deadlines(
                     &mut state,
                     Instant::now() + crate::daemon::owner_budget::RETAINED_OPERATION_DEADLINE,
+                    &mut budget,
+                );
+                let item = state.owner_ready.pop_next().expect("expired entity waiter");
+                assert!(
+                    crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                        &mut daemon,
+                        &mut state,
+                        item,
+                    )
                 );
             }
 
             assert_eq!(state.budget.outstanding(), baseline);
-            assert!(state.plugin_entities.next_reply_deadline().is_none());
+            assert!(state.deadlines.is_empty());
             assert!(
                 crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::ZERO),
                 "Core execution must remain live after Hub releases entity reply capacity"
@@ -4204,12 +4348,11 @@ return botster.register({
             state.maintenance.take_journal_wake(),
             "the Maintenance Observe path consumes the independent journal bit"
         );
-        assert!(
-            state.background.pump_pending(),
-            "journal consumption must not clear the terminal inventory Pump latch"
-        );
-        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
-        assert!(!state.background.pump_pending());
+        let classes = std::iter::from_fn(|| state.owner_ready.pop_next())
+            .map(|item| item.key().class())
+            .collect::<Vec<_>>();
+        assert!(classes.contains(&crate::daemon::owner_schedule::ReadyClass::Observe));
+        assert!(classes.contains(&crate::daemon::owner_schedule::ReadyClass::InventoryReconcile));
     }
 
     #[test]
@@ -4217,36 +4360,22 @@ return botster.register({
         let (mut daemon, mut state, _mux, _session_id) =
             reconcile_wiring_fixture("inventory-wake-during-reconcile");
 
-        state.background.mark_pump();
-        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
-        state.pump.force_next(PumpPhase::InventoryReconcile);
-        run_one_pump_phase(&mut daemon, &mut state);
+        assert!(run_inventory_reconcile_phase(&daemon, &mut state));
         assert!(state.reconcile_inventory.is_some());
-        assert!(state.background.pump_pending());
 
         state.note_terminal_inventory_changed();
         state.resolve_submitted_reconcile_inventory_for_test(Vec::new());
-        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
-        state.pump.force_next(PumpPhase::InventoryReconcile);
-        run_one_pump_phase(&mut daemon, &mut state);
         assert!(
-            state.background.pump_pending(),
+            run_inventory_reconcile_phase(&daemon, &mut state),
             "an inventory change during the read must schedule a fresh pass"
         );
 
-        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
-        state.pump.force_next(PumpPhase::InventoryReconcile);
-        run_one_pump_phase(&mut daemon, &mut state);
+        assert!(run_inventory_reconcile_phase(&daemon, &mut state));
         assert!(state.reconcile_inventory.is_some());
         state.resolve_submitted_reconcile_inventory_for_test(Vec::new());
-        assert_eq!(state.background.select(false), Some(BackgroundClass::Pump));
-        state.pump.force_next(PumpPhase::InventoryReconcile);
-        run_one_pump_phase(&mut daemon, &mut state);
+        assert!(!run_inventory_reconcile_phase(&daemon, &mut state));
         assert!(state.reconcile_inventory.is_none());
-        assert!(
-            !state.background.pump_pending(),
-            "a clean fresh pass must not create idle Pump work"
-        );
+        assert!(!state.pump.take_inventory_reconcile_again());
         let _ = daemon.stop();
     }
 

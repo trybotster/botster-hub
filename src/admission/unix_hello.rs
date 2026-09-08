@@ -56,6 +56,7 @@ pub(crate) struct HostCompatibilityRecord {
 pub(crate) struct AdmissionState {
     pub unix_admissions: BTreeMap<String, UnixTerminalAdmission>,
     pub webrtc_admissions: BTreeMap<String, WebrtcTerminalAdmission>,
+    pub grant_by_peer_generation: BTreeMap<u64, String>,
     pub host_compatibility: BTreeMap<String, HostCompatibilityRecord>,
     pub next_peer_generation: u64,
     pub next_subscription_generation: u64,

@@ -342,11 +342,17 @@ pub(crate) fn handle_peer_closed(
                 } => *peer_generation,
             });
         if let Some(peer_generation) = peer_generation {
+            state
+                .pending_runtime
+                .admission
+                .grant_by_peer_generation
+                .remove(&peer_generation);
             let labels = state
                 .pending_runtime
                 .admission
                 .reservations
                 .forget_peer(peer_generation);
+            crate::daemon::owner_loop::retire_reservation_deadlines(state, labels.iter().cloned());
             if let Some(mut budget) = state
                 .pending_runtime
                 .admission

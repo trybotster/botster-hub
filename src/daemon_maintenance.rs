@@ -1,15 +1,7 @@
-//! Bounded owner-loop background scheduling and maintenance slices.
+//! Bounded background work for the Hub owner loop.
 //!
-//! The owner loop has two policy-neutral background classes: Maintenance and
-//! Pump. Each class keeps one coalesced pending flag. Marks coalesce; they do
-//! not queue. When both classes are pending, selection is round-robin on the
-//! last-served class. Selection input is only {pending flags, last-served
-//! class}. One owner turn runs at most one selected slice.
-//!
-//! Maintenance keeps [`MaintenanceScheduler`] and [`MaintenanceSliceKind`]
-//! unchanged. Pump is its own three-phase rotation. This module does not
-//! import terminal semantic bodies and does not name package-owned product
-//! policy.
+//! Domain code records exact, coalesced wake bits. The owner moves each bit
+//! into its one central ready queue. This module contains no selection cursor.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -90,7 +82,7 @@ fn queued_queue_bytes(frames: &VecDeque<serde_json::Value>) -> usize {
 }
 
 /// Round-robin maintenance kinds. One owner turn runs one of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MaintenanceSliceKind {
     Observe,
     JournalPull,
@@ -104,96 +96,65 @@ pub enum MaintenanceSliceKind {
 }
 
 impl MaintenanceSliceKind {
-    fn next(self) -> Self {
+    pub const ALL: [Self; 9] = [
+        Self::Observe,
+        Self::JournalPull,
+        Self::ProjectionApply,
+        Self::Baseline,
+        Self::HostBridge,
+        Self::SubscriberDelivery,
+        Self::CompletionDrain,
+        Self::ProviderResync,
+        Self::PackageEventDelivery,
+    ];
+
+    const fn bit(self) -> u16 {
         match self {
-            Self::Observe => Self::JournalPull,
-            Self::JournalPull => Self::ProjectionApply,
-            Self::ProjectionApply => Self::Baseline,
-            Self::Baseline => Self::HostBridge,
-            Self::HostBridge => Self::SubscriberDelivery,
-            Self::SubscriberDelivery => Self::CompletionDrain,
-            Self::CompletionDrain => Self::ProviderResync,
-            Self::ProviderResync => Self::PackageEventDelivery,
-            Self::PackageEventDelivery => Self::Observe,
+            Self::Observe => 1 << 0,
+            Self::JournalPull => 1 << 1,
+            Self::ProjectionApply => 1 << 2,
+            Self::Baseline => 1 << 3,
+            Self::HostBridge => 1 << 4,
+            Self::SubscriberDelivery => 1 << 5,
+            Self::CompletionDrain => 1 << 6,
+            Self::ProviderResync => 1 << 7,
+            Self::PackageEventDelivery => 1 << 8,
         }
     }
 }
 
-/// Coalesced wake plus the next slice to run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaintenanceScheduler {
-    wake: bool,
-    next: MaintenanceSliceKind,
-}
+/// Exact coalesced wake bits for maintenance work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceWakes(u16);
 
-impl Default for MaintenanceScheduler {
+impl Default for MaintenanceWakes {
     fn default() -> Self {
-        Self {
-            wake: true,
-            next: MaintenanceSliceKind::Observe,
-        }
+        let mut wakes = Self(0);
+        wakes.mark_all();
+        wakes
     }
 }
 
-impl MaintenanceScheduler {
-    /// Set the coalesced wake bit. O(1).
-    pub fn try_wake(&mut self) {
-        self.wake = true;
+impl MaintenanceWakes {
+    pub fn mark(&mut self, kind: MaintenanceSliceKind) {
+        self.0 |= kind.bit();
     }
 
-    /// After an authoritative mutation, pull journal changes next.
-    pub fn prefer_journal_pull(&mut self) {
-        self.wake = true;
-        self.next = MaintenanceSliceKind::JournalPull;
+    pub fn mark_all(&mut self) {
+        for kind in MaintenanceSliceKind::ALL {
+            self.mark(kind);
+        }
     }
 
-    /// After a session subscriber registers, deliver a bounded page next.
-    pub fn prefer_subscriber_delivery(&mut self) {
-        self.wake = true;
-        self.next = MaintenanceSliceKind::SubscriberDelivery;
+    pub fn take(&mut self, kind: MaintenanceSliceKind) -> bool {
+        let present = self.0 & kind.bit() != 0;
+        self.0 &= !kind.bit();
+        present
     }
 
-    /// Drain plugin completions on the next maintenance slice.
-    pub fn prefer_completion_drain(&mut self) {
-        self.wake = true;
-        self.next = MaintenanceSliceKind::CompletionDrain;
-    }
-
-    /// True when an idle owner turn should run one slice.
     #[must_use]
-    pub fn has_wake(&self) -> bool {
-        self.wake
-    }
-
-    /// Consume the current slice and advance the round-robin pointer.
-    pub fn take_slice(&mut self) -> MaintenanceSliceKind {
-        let kind = self.next;
-        self.next = kind.next();
-        self.wake = false;
-        kind
-    }
-}
-
-/// Policy-neutral owner-loop background class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackgroundClass {
-    Maintenance,
-    Pump,
-}
-
-/// One Pump selection runs exactly one of these phases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PumpPhase {
-    Observe,
-    InventoryReconcile,
-}
-
-impl PumpPhase {
-    fn next(self) -> Self {
-        match self {
-            Self::Observe => Self::InventoryReconcile,
-            Self::InventoryReconcile => Self::Observe,
-        }
+    pub const fn has_any(self) -> bool {
+        self.0 != 0
     }
 }
 
@@ -220,19 +181,17 @@ impl Default for PumpAdmissionCursor {
     }
 }
 
-/// Continuation state for the Pump class rotation.
+/// Continuation state for causal inventory work.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PumpScheduler {
-    next: PumpPhase,
+pub struct PumpState {
     pub close_cursor: PumpAdmissionCursor,
     pub reconcile_after: Option<(String, String)>,
     inventory_reconcile_again: bool,
 }
 
-impl Default for PumpScheduler {
+impl Default for PumpState {
     fn default() -> Self {
         Self {
-            next: PumpPhase::Observe,
             close_cursor: PumpAdmissionCursor::default(),
             reconcile_after: None,
             inventory_reconcile_again: false,
@@ -240,96 +199,13 @@ impl Default for PumpScheduler {
     }
 }
 
-impl PumpScheduler {
-    /// Consume the current phase and advance the rotation.
-    pub fn take_phase(&mut self) -> PumpPhase {
-        let phase = self.next;
-        self.next = phase.next();
-        phase
-    }
-
+impl PumpState {
     pub(crate) fn note_inventory_change_during_reconcile(&mut self, active: bool) {
         self.inventory_reconcile_again |= active;
     }
 
     pub(crate) fn take_inventory_reconcile_again(&mut self) -> bool {
         std::mem::take(&mut self.inventory_reconcile_again)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn force_next(&mut self, phase: PumpPhase) {
-        self.next = phase;
-    }
-}
-
-/// Coalesced Pump pending plus last-served class. Maintenance pending is
-/// derived from [`MaintenanceState::needs_work`] and sibling wake sources.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BackgroundClassScheduler {
-    pump_pending: bool,
-    last_served: Option<BackgroundClass>,
-}
-
-impl BackgroundClassScheduler {
-    /// Coalesce a Pump mark. Repeated marks stay one pending flag.
-    pub fn mark_pump(&mut self) {
-        self.pump_pending = true;
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub fn pump_pending(&self) -> bool {
-        self.pump_pending
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub fn last_served(&self) -> Option<BackgroundClass> {
-        self.last_served
-    }
-
-    #[must_use]
-    pub fn has_pending(&self, maintenance_pending: bool) -> bool {
-        maintenance_pending || self.pump_pending
-    }
-
-    /// Select at most one class. Consumes Pump pending only when Pump wins.
-    pub fn select(&mut self, maintenance_pending: bool) -> Option<BackgroundClass> {
-        let selected = match (maintenance_pending, self.pump_pending) {
-            (false, false) => None,
-            (true, false) => Some(BackgroundClass::Maintenance),
-            (false, true) => Some(BackgroundClass::Pump),
-            (true, true) => match self.last_served {
-                Some(BackgroundClass::Maintenance) => Some(BackgroundClass::Pump),
-                _ => Some(BackgroundClass::Maintenance),
-            },
-        };
-        if selected == Some(BackgroundClass::Pump) {
-            self.pump_pending = false;
-        }
-        if selected.is_some() {
-            self.last_served = selected;
-        }
-        selected
-    }
-}
-
-/// One owner turn never returns two background slices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackgroundTurnDecision {
-    None,
-    OneSlice(BackgroundClass),
-}
-
-/// Fair background decision after control is served or skipped.
-#[must_use]
-pub fn decide_background_slice(
-    scheduler: &mut BackgroundClassScheduler,
-    maintenance_pending: bool,
-) -> BackgroundTurnDecision {
-    match scheduler.select(maintenance_pending) {
-        Some(class) => BackgroundTurnDecision::OneSlice(class),
-        None => BackgroundTurnDecision::None,
     }
 }
 
@@ -620,7 +496,7 @@ impl SessionFamilyBridge {
 /// Owner-loop maintenance state. Independent of subscriber count.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceState {
-    pub scheduler: MaintenanceScheduler,
+    pub wakes: MaintenanceWakes,
     pub projection: SessionProjection,
     pub observe_resume: Option<ObserveLifecycleCursor>,
     pub pending_changes: VecDeque<SessionLifecycleChange>,
@@ -712,7 +588,7 @@ fn event_flight(
 impl MaintenanceState {
     /// Coalesce one O(1) wake after an authoritative mutation.
     pub fn try_wake(&mut self) {
-        self.scheduler.try_wake();
+        self.wakes.mark_all();
     }
 
     /// Record Core's coalesced journal-advanced wake for the next consumer.
@@ -728,13 +604,13 @@ impl MaintenanceState {
     /// After an authoritative mutation, pull the journal on the next idle turn.
     pub fn note_authoritative_mutation(&mut self) {
         self.journal_caught_up_confirmed = false;
-        self.scheduler.prefer_journal_pull();
+        self.wakes.mark(MaintenanceSliceKind::JournalPull);
     }
 
     pub fn needs_work(&self) -> bool {
         // `observe_resume` is continuation state for the next Observe kind.
         // It must not rearm the whole nine-kind rotation as idle wakes.
-        self.scheduler.has_wake()
+        self.wakes.has_any()
             || self.baseline.is_some()
             || !self.pending_changes.is_empty()
             || self.session_family.has_work()
@@ -824,7 +700,7 @@ fn rewind_journal_cursor_for_omitted_recover(state: &mut MaintenanceState) {
         cursor.sequence = 0;
     }
     state.journal_caught_up_confirmed = false;
-    state.scheduler.prefer_journal_pull();
+    state.wakes.mark(MaintenanceSliceKind::JournalPull);
 }
 
 fn omitted_row_recover_key(state: &MaintenanceState) -> Option<SessionLifecycleCursor> {
@@ -1025,7 +901,7 @@ fn apply_observe_pass_result(
 ) {
     state.observe_resume = if complete { None } else { resume };
     if journal_advanced {
-        state.scheduler.prefer_journal_pull();
+        state.wakes.mark(MaintenanceSliceKind::JournalPull);
     }
 }
 
@@ -1096,9 +972,9 @@ fn run_observe_slice(
             );
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
-            state.scheduler.try_wake();
+            state.wakes.mark_all();
         }
-        Err(_) => state.scheduler.try_wake(),
+        Err(_) => state.wakes.mark_all(),
     }
 }
 
@@ -1170,15 +1046,15 @@ fn run_journal_pull_slice(
                 journal_caught_up_after_pull(received, at_watermark, journal_advanced);
             state.pending_changes.extend(page.changes);
             if state.journal_caught_up_confirmed && state.projection_dirty {
-                state.scheduler.prefer_subscriber_delivery();
+                state.wakes.mark(MaintenanceSliceKind::SubscriberDelivery);
             } else if journal_advanced && !received {
-                state.scheduler.prefer_journal_pull();
+                state.wakes.mark(MaintenanceSliceKind::JournalPull);
             } else if received || !at_watermark || journal_advanced {
-                state.scheduler.try_wake();
+                state.wakes.mark_all();
             }
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
-            state.scheduler.try_wake();
+            state.wakes.mark_all();
         }
         Err(_) => start_baseline_recovery(state),
     }
@@ -1203,9 +1079,9 @@ fn run_projection_apply_slice(runtime: Option<&HubRuntime>, state: &mut Maintena
     }
     if applied > 0 {
         state.projection_dirty = true;
-        state.scheduler.prefer_subscriber_delivery();
+        state.wakes.mark(MaintenanceSliceKind::SubscriberDelivery);
     } else if !state.pending_changes.is_empty() {
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
     }
 }
 
@@ -1278,16 +1154,16 @@ fn run_baseline_slice(
                 if acknowledged_spawns_missing_from_projection(state) {
                     start_omitted_row_recover(state);
                 } else {
-                    state.scheduler.prefer_journal_pull();
+                    state.wakes.mark(MaintenanceSliceKind::JournalPull);
                 }
                 state.projection_dirty = true;
                 begin_family_snapshots(state, snapshot.sequence);
             } else {
-                state.scheduler.try_wake();
+                state.wakes.mark_all();
             }
         }
         Err(SessionLifecyclePageError::BudgetTooSmall { .. }) => {
-            state.scheduler.try_wake();
+            state.wakes.mark_all();
         }
         Err(_) => start_baseline_recovery(state),
     }
@@ -1309,7 +1185,7 @@ fn run_host_bridge_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
         continue_consumer_prune(state, &mut budget);
     }
     if budget.exhausted() {
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
         return;
     }
     let Some((plugin_key, handler, payload)) = next_session_family_admission(state, &mut budget)
@@ -1375,7 +1251,7 @@ fn flush_pending_event_retirements(runtime: &HubRuntime, state: &mut Maintenance
     }
     state.pending_retirements = kept;
     if !state.pending_retirements.is_empty() {
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
     }
 }
 
@@ -1418,18 +1294,18 @@ fn retire_event_holder(runtime: &HubRuntime, flight: &mut EventDeliveryFlight) -
 
 fn queue_event_retirement(state: &mut MaintenanceState, flight: EventDeliveryFlight) {
     state.pending_retirements.push_back(flight);
-    state.scheduler.try_wake();
+    state.wakes.mark_all();
 }
 
 fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     flush_pending_event_retirements(runtime, state);
     let applied = runtime.apply_event_plane_owner_ops();
     if !applied.is_empty() || runtime.event_plane_owner_ops_pending() {
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
     }
     let woke = runtime.package_event_router().take_delivery_wake();
     if runtime.package_event_router().peek_delivery_wake() {
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
     }
     if !woke && applied.is_empty() {
         return;
@@ -1443,7 +1319,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         Ok(batch) => batch,
         Err(_) => {
             runtime.package_event_router().set_delivery_wake();
-            state.scheduler.try_wake();
+            state.wakes.mark_all();
             return;
         }
     };
@@ -1503,7 +1379,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     )
                     .is_err()
                 {
-                    state.scheduler.try_wake();
+                    state.wakes.mark_all();
                 }
                 state.event_in_flight.insert(
                     request_id.0.clone(),
@@ -1519,7 +1395,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                 });
                 match runtime.package_event_router().requeue_delivery(delivery) {
                     Ok(()) => {
-                        state.scheduler.try_wake();
+                        state.wakes.mark_all();
                     }
                     Err((delivery, _)) => {
                         let mut flight = event_flight(&delivery, None, request_id.0);
@@ -1541,7 +1417,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         || !state.event_in_flight.is_empty()
         || runtime.event_plane_owner_ops_pending()
     {
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
     }
 }
 
@@ -1662,7 +1538,7 @@ fn apply_plugin_completion(
         if !retire_event_holder(runtime, &mut flight) {
             queue_event_retirement(state, flight);
         }
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
         return;
     }
     let Some(plugin_key) = state
@@ -1691,7 +1567,7 @@ fn apply_plugin_completion(
         start_baseline_recovery(state);
         return;
     }
-    state.scheduler.try_wake();
+    state.wakes.mark_all();
 }
 
 /// Start a paged baseline recovery. Incomplete pages are not ended evidence.
@@ -1709,7 +1585,7 @@ pub fn start_baseline_recovery(state: &mut MaintenanceState) {
     state.session_family.snapshot_start_sequence = None;
     state.session_family.snapshot_start_after = None;
     state.baseline = None;
-    state.scheduler.try_wake();
+    state.wakes.mark_all();
 }
 
 fn continue_gap_pass(state: &mut MaintenanceState, budget: &mut HostBridgeBudget) {
@@ -1737,7 +1613,7 @@ fn continue_gap_pass(state: &mut MaintenanceState, budget: &mut HostBridgeBudget
     }
     if visited < keys.len() || keys.len() == max {
         state.session_family.gap_after = last_key;
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
         return;
     }
     state.session_family.need_gap_pass = false;
@@ -1746,7 +1622,7 @@ fn continue_gap_pass(state: &mut MaintenanceState, budget: &mut HostBridgeBudget
         snapshot: None,
         after: None,
     });
-    state.scheduler.try_wake();
+    state.wakes.mark_all();
 }
 
 fn continue_snapshot_starts(state: &mut MaintenanceState, budget: &mut HostBridgeBudget) {
@@ -1774,7 +1650,7 @@ fn continue_snapshot_starts(state: &mut MaintenanceState, budget: &mut HostBridg
     }
     if visited < keys.len() || keys.len() == max {
         state.session_family.snapshot_start_after = last_key;
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
         return;
     }
     state.session_family.snapshot_start_sequence = None;
@@ -1793,12 +1669,12 @@ fn continue_family_fanout(state: &mut MaintenanceState, budget: &mut HostBridgeB
             state.session_family.fanout_bytes =
                 state.session_family.fanout_bytes.saturating_add(job.bytes);
             state.session_family.pending_fanout.push_front(job);
-            state.scheduler.try_wake();
+            state.wakes.mark_all();
             return;
         }
     }
     if !state.session_family.pending_fanout.is_empty() {
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
     }
 }
 
@@ -1848,7 +1724,7 @@ fn refresh_session_family_consumers(
     }
     if more {
         state.session_family.refresh_after = last_visited;
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
         return;
     }
     state.session_family.refresh_after = None;
@@ -1898,7 +1774,7 @@ fn continue_consumer_prune(state: &mut MaintenanceState, budget: &mut HostBridge
     }
     if visited < keys.len() || keys.len() == max {
         state.session_family.prune_after = last_key;
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
         return;
     }
     state.session_family.need_prune = false;
@@ -1925,7 +1801,7 @@ fn next_session_family_admission(
     }
     for plugin_key in &keys {
         if !budget.take() {
-            state.scheduler.try_wake();
+            state.wakes.mark_all();
             return None;
         }
         let Some(peeked) = peek_session_family_payload(state, plugin_key) else {
@@ -1936,7 +1812,7 @@ fn next_session_family_admission(
             .map(|body| body.len())
             .unwrap_or(0);
         if !budget.add_bytes(bytes) {
-            state.scheduler.try_wake();
+            state.wakes.mark_all();
             return None;
         }
         commit_session_family_payload(state, plugin_key, peeked);
@@ -1950,7 +1826,7 @@ fn next_session_family_admission(
     }
     if keys.len() == max {
         state.session_family.admit_after = keys.last().cloned();
-        state.scheduler.try_wake();
+        state.wakes.mark_all();
     } else {
         state.session_family.admit_after = None;
     }
@@ -2122,7 +1998,7 @@ fn queue_family_delta(state: &mut MaintenanceState, change: &SessionLifecycleCha
         after: None,
         bytes,
     });
-    state.scheduler.try_wake();
+    state.wakes.mark_all();
 }
 
 fn fanout_family_frame(
@@ -2174,7 +2050,7 @@ fn fanout_family_frame(
 fn begin_family_snapshots(state: &mut MaintenanceState, sequence: u64) {
     state.session_family.snapshot_start_sequence = Some(sequence);
     state.session_family.snapshot_start_after = None;
-    state.scheduler.try_wake();
+    state.wakes.mark_all();
 }
 
 fn consumer_keys_page(
@@ -2442,14 +2318,15 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_round_robins_and_coalesces_wake() {
-        let mut scheduler = MaintenanceScheduler::default();
-        scheduler.try_wake();
-        scheduler.try_wake();
-        assert!(scheduler.has_wake());
-        assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::Observe);
-        assert!(!scheduler.has_wake());
-        assert_eq!(scheduler.take_slice(), MaintenanceSliceKind::JournalPull);
+    fn exact_wakes_coalesce_without_clearing_other_kinds() {
+        let mut wakes = MaintenanceWakes(0);
+        wakes.mark(MaintenanceSliceKind::Observe);
+        wakes.mark(MaintenanceSliceKind::Observe);
+        wakes.mark(MaintenanceSliceKind::JournalPull);
+        assert!(wakes.take(MaintenanceSliceKind::Observe));
+        assert!(!wakes.take(MaintenanceSliceKind::Observe));
+        assert!(wakes.take(MaintenanceSliceKind::JournalPull));
+        assert!(!wakes.has_any());
     }
 
     fn incomplete_resume() -> ObserveLifecycleCursor {
@@ -2460,16 +2337,14 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_observe_keeps_the_nine_kind_rotation() {
+    fn incomplete_observe_does_not_invent_an_unrelated_wake() {
         let mut state = MaintenanceState::default();
-        assert_eq!(state.scheduler.take_slice(), MaintenanceSliceKind::Observe);
+        for kind in MaintenanceSliceKind::ALL {
+            assert!(state.wakes.take(kind));
+        }
         apply_observe_pass_result(&mut state, false, false, Some(incomplete_resume()));
         assert!(state.observe_resume.is_some());
-        assert_eq!(
-            state.scheduler.take_slice(),
-            MaintenanceSliceKind::JournalPull,
-            "an incomplete Observe pass must not rewrite next to Observe"
-        );
+        assert!(!state.wakes.has_any());
     }
 
     #[test]
@@ -3334,12 +3209,13 @@ mod tests {
     #[test]
     fn projection_apply_prefers_subscriber_delivery_after_applied_changes() {
         let mut state = sealed_maintenance(0, Some(1));
+        for kind in MaintenanceSliceKind::ALL {
+            let _ = state.wakes.take(kind);
+        }
         state.pending_changes.push_back(pending_upsert(1, "new"));
         run_projection_apply_slice(None, &mut state);
-        assert_eq!(
-            state.scheduler.take_slice(),
-            MaintenanceSliceKind::SubscriberDelivery
-        );
+        assert!(state.wakes.take(MaintenanceSliceKind::SubscriberDelivery));
+        assert!(!state.wakes.has_any());
     }
 
     #[test]
@@ -3505,259 +3381,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
-    #[test]
-    fn background_selection_alternates_when_both_classes_are_pending() {
-        let mut scheduler = BackgroundClassScheduler::default();
-        scheduler.mark_pump();
-        let first = scheduler.select(true);
-        let second = scheduler.select(true);
-        let third = scheduler.select(true);
-        assert_eq!(first, Some(BackgroundClass::Maintenance));
-        assert_eq!(second, Some(BackgroundClass::Pump));
-        assert_eq!(third, Some(BackgroundClass::Maintenance));
-    }
-
-    #[test]
-    fn one_pending_class_runs_on_consecutive_turns() {
-        let mut scheduler = BackgroundClassScheduler::default();
-        scheduler.mark_pump();
-        assert_eq!(scheduler.select(false), Some(BackgroundClass::Pump));
-        scheduler.mark_pump();
-        assert_eq!(scheduler.select(false), Some(BackgroundClass::Pump));
-        assert_eq!(scheduler.select(true), Some(BackgroundClass::Maintenance));
-        assert_eq!(scheduler.select(true), Some(BackgroundClass::Maintenance));
-    }
-
-    #[test]
-    fn background_marks_coalesce_to_one_pending_flag() {
-        let mut scheduler = BackgroundClassScheduler::default();
-        scheduler.mark_pump();
-        scheduler.mark_pump();
-        scheduler.mark_pump();
-        assert_eq!(scheduler.select(false), Some(BackgroundClass::Pump));
-        assert_eq!(scheduler.select(false), None);
-    }
-
-    #[test]
-    fn one_turn_decision_never_returns_two_slices() {
-        let mut scheduler = BackgroundClassScheduler::default();
-        scheduler.mark_pump();
-        let decision = decide_background_slice(&mut scheduler, true);
-        assert!(matches!(
-            decision,
-            BackgroundTurnDecision::OneSlice(BackgroundClass::Maintenance)
-        ));
-        assert!(scheduler.pump_pending());
-        let second = decide_background_slice(&mut scheduler, true);
-        assert!(matches!(
-            second,
-            BackgroundTurnDecision::OneSlice(BackgroundClass::Pump)
-        ));
-    }
-
-    #[test]
-    fn selected_slice_survives_a_later_control_arrival() {
-        let mut scheduler = BackgroundClassScheduler::default();
-        scheduler.mark_pump();
-        let selected = scheduler.select(true);
-        assert_eq!(selected, Some(BackgroundClass::Maintenance));
-        scheduler.mark_pump();
-        assert_eq!(selected, Some(BackgroundClass::Maintenance));
-        assert_eq!(scheduler.last_served(), Some(BackgroundClass::Maintenance));
-    }
-
-    #[test]
-    fn inverted_reselection_after_control_cancels_the_chosen_slice() {
-        let mut scheduler = BackgroundClassScheduler::default();
-        scheduler.mark_pump();
-        let selected = scheduler.select(true);
-        assert_eq!(selected, Some(BackgroundClass::Maintenance));
-        let inverted = scheduler.select(true);
-        assert_eq!(inverted, Some(BackgroundClass::Pump));
-        assert_ne!(selected, inverted);
-    }
-
-    #[test]
-    fn composed_scheduler_executes_subscriber_delivery_and_host_bridge() {
-        let mut classes = BackgroundClassScheduler::default();
-        let mut maintenance = MaintenanceScheduler::default();
-        let mut subscriber_at = None;
-        let mut host_bridge_at = None;
-        for turn in 0..18 {
-            classes.mark_pump();
-            let class = classes.select(true).expect("both classes stay pending");
-            if class != BackgroundClass::Maintenance {
-                continue;
-            }
-            maintenance.try_wake();
-            let kind = maintenance.take_slice();
-            if kind == MaintenanceSliceKind::HostBridge && host_bridge_at.is_none() {
-                host_bridge_at = Some(turn);
-            }
-            if kind == MaintenanceSliceKind::SubscriberDelivery && subscriber_at.is_none() {
-                subscriber_at = Some(turn);
-            }
-        }
-        assert_eq!(host_bridge_at, Some(8));
-        assert_eq!(subscriber_at, Some(10));
-    }
-
-    fn drive_composed_incomplete_observe(
-        after_observe: fn(&mut MaintenanceState, bool, bool, Option<ObserveLifecycleCursor>),
-    ) -> (Option<usize>, Option<usize>, usize, MaintenanceState) {
-        let mut classes = BackgroundClassScheduler::default();
-        let mut maintenance = MaintenanceState::default();
-        let mut subscriber_at = None;
-        let mut host_bridge_at = None;
-        let mut observe_count = 0usize;
-        for turn in 0..18 {
-            classes.mark_pump();
-            let class = classes.select(true).expect("both classes stay pending");
-            if class != BackgroundClass::Maintenance {
-                continue;
-            }
-            maintenance.try_wake();
-            let kind = maintenance.scheduler.take_slice();
-            if kind == MaintenanceSliceKind::Observe {
-                observe_count = observe_count.saturating_add(1);
-                after_observe(&mut maintenance, false, false, Some(incomplete_resume()));
-            }
-            if kind == MaintenanceSliceKind::HostBridge && host_bridge_at.is_none() {
-                host_bridge_at = Some(turn);
-            }
-            if kind == MaintenanceSliceKind::SubscriberDelivery && subscriber_at.is_none() {
-                subscriber_at = Some(turn);
-            }
-        }
-        (host_bridge_at, subscriber_at, observe_count, maintenance)
-    }
-
-    fn apply_observe_pass_result_starving_later_kinds(
-        state: &mut MaintenanceState,
-        complete: bool,
-        journal_advanced: bool,
-        resume: Option<ObserveLifecycleCursor>,
-    ) {
-        apply_observe_pass_result(state, complete, journal_advanced, resume);
-        if state.observe_resume.is_some() && !journal_advanced {
-            state.scheduler.wake = true;
-            state.scheduler.next = MaintenanceSliceKind::Observe;
-        }
-    }
-
-    #[test]
-    fn composed_incomplete_observe_still_serves_host_bridge_and_subscriber_delivery() {
-        let (host_bridge_at, subscriber_at, observe_count, maintenance) =
-            drive_composed_incomplete_observe(apply_observe_pass_result);
-        assert!(
-            observe_count >= 1,
-            "the sequence must include at least one incomplete Observe pass"
-        );
-        assert!(
-            maintenance.observe_resume.is_some(),
-            "the resume cursor must survive the rotation"
-        );
-        assert!(
-            !maintenance.needs_work(),
-            "observe_resume alone must not keep Maintenance pending"
-        );
-        assert_eq!(host_bridge_at, Some(8));
-        assert_eq!(subscriber_at, Some(10));
-    }
-
-    #[test]
-    fn rewriting_next_to_observe_starves_host_bridge_and_subscriber_delivery() {
-        let (host_bridge_at, subscriber_at, observe_count, _) =
-            drive_composed_incomplete_observe(apply_observe_pass_result_starving_later_kinds);
-        assert!(
-            observe_count >= 1,
-            "the starved sequence still runs Observe"
-        );
-        assert_ne!(
-            host_bridge_at,
-            Some(8),
-            "rewriting next to Observe must miss the HostBridge bound"
-        );
-        assert_ne!(
-            subscriber_at,
-            Some(10),
-            "rewriting next to Observe must miss the SubscriberDelivery bound"
-        );
-        assert!(
-            host_bridge_at.is_none() && subscriber_at.is_none(),
-            "continuous Observe rewrite must starve later kinds"
-        );
-    }
-
-    #[test]
-    fn pump_phases_rotate_and_keep_cursors() {
-        let mut pump = PumpScheduler::default();
-        assert_eq!(pump.take_phase(), PumpPhase::Observe);
-        assert_eq!(pump.take_phase(), PumpPhase::InventoryReconcile);
-        pump.close_cursor = PumpAdmissionCursor::Unix {
-            after: Some("client-a".into()),
-            after_route: Some(("s".into(), "sub".into(), 1)),
-        };
-        pump.reconcile_after = Some(("s".into(), "sub".into()));
-        assert_eq!(pump.take_phase(), PumpPhase::Observe);
-        assert_eq!(pump.take_phase(), PumpPhase::InventoryReconcile);
-        assert_eq!(
-            pump.close_cursor,
-            PumpAdmissionCursor::Unix {
-                after: Some("client-a".into()),
-                after_route: Some(("s".into(), "sub".into(), 1)),
-            }
-        );
-        assert_eq!(pump.reconcile_after, Some(("s".into(), "sub".into())));
-    }
-
-    #[test]
-    fn continuous_close_work_still_serves_observe_and_inventory_reconcile() {
-        let mut classes = BackgroundClassScheduler::default();
-        let mut pump = PumpScheduler::default();
-        let mut observe_at = None;
-        let mut reconcile_at = None;
-        for turn in 0..6 {
-            classes.mark_pump();
-            assert_eq!(
-                classes.select(false),
-                Some(BackgroundClass::Pump),
-                "pump work keeps Pump pending without inventing Maintenance priority"
-            );
-            match pump.take_phase() {
-                PumpPhase::Observe if observe_at.is_none() => observe_at = Some(turn),
-                PumpPhase::InventoryReconcile if reconcile_at.is_none() => {
-                    reconcile_at = Some(turn)
-                }
-                PumpPhase::Observe | PumpPhase::InventoryReconcile => {}
-            }
-        }
-        assert_eq!(observe_at, Some(0));
-        assert_eq!(reconcile_at, Some(1));
-    }
-
-    #[test]
-    fn inverted_reconcile_phase_rewrite_starves_observe() {
-        let mut pump = PumpScheduler::default();
-        let mut saw_observe = false;
-        for _ in 0..6 {
-            pump.force_next(PumpPhase::InventoryReconcile);
-            match pump.take_phase() {
-                PumpPhase::Observe => saw_observe = true,
-                PumpPhase::InventoryReconcile => {}
-            }
-        }
-        assert!(
-            !saw_observe,
-            "rewriting next to InventoryReconcile every turn starves Observe"
-        );
-    }
-
-    #[test]
     fn projection_dirty_alone_does_not_keep_maintenance_pending() {
         let mut state = sealed_maintenance(1, Some(1));
         state.projection_dirty = true;
-        let _ = state.scheduler.take_slice();
+        for kind in MaintenanceSliceKind::ALL {
+            let _ = state.wakes.take(kind);
+        }
         assert!(
             !state.needs_work(),
             "dirty is a delivery hint, not a self-rearming maintenance wake"
@@ -3767,7 +3396,9 @@ mod tests {
     #[test]
     fn observe_resume_alone_does_not_keep_maintenance_pending() {
         let mut state = sealed_maintenance(1, Some(1));
-        let _ = state.scheduler.take_slice();
+        for kind in MaintenanceSliceKind::ALL {
+            let _ = state.wakes.take(kind);
+        }
         state.observe_resume = Some(ObserveLifecycleCursor {
             pass_id: ObserveLifecyclePassId("1".into()),
             last_visited: None,
@@ -3792,8 +3423,9 @@ mod tests {
             last_visited: None,
         });
         state.journal_caught_up_confirmed = true;
-        state.scheduler.try_wake();
-        let _ = state.scheduler.take_slice();
+        for kind in MaintenanceSliceKind::ALL {
+            let _ = state.wakes.take(kind);
+        }
         handle_unavailable_observe_pass(&mut state);
         assert!(state.observe_resume.is_none());
         assert!(state.baseline.is_none());

@@ -85,7 +85,7 @@ pub(crate) fn handle(
         })
     } else if is_session_type_prepare(&request) {
         if let Some(blocked_waiter) = blocked_session_type_waiter(state, &state_view, &request) {
-            crate::daemon::control::pending::mark_request_ready(
+            crate::daemon::control::pending::mark_owner_ready(
                 state,
                 blocked_waiter,
                 ReadyClass::HostCompletion,
@@ -514,7 +514,7 @@ pub(crate) fn release_document(state: &mut DaemonControlState, waiter_id: Waiter
 
 fn wake_next_document_waiter(state: &mut DaemonControlState) {
     if let Some(next) = state.document_waiters.pop_first() {
-        crate::daemon::control::pending::mark_request_ready(
+        crate::daemon::control::pending::mark_owner_ready(
             state,
             next,
             ReadyClass::HostCompletion,

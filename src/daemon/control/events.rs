@@ -141,9 +141,24 @@ pub(crate) fn handle_client_event_request(
                                             .ok()
                                     })
                                     .is_some();
-                                if charged {
+                                if charged
+                                    && crate::daemon::owner_loop::arm_reservation_deadline(
+                                        state,
+                                        reservation.label.clone(),
+                                        peer_generation,
+                                        reservation.expires_in_seconds,
+                                    )
+                                {
                                     response.subscription_reservation = Some(reservation);
                                 } else {
+                                    if let Some(budget) = state
+                                        .pending_runtime
+                                        .admission
+                                        .connection_budgets
+                                        .get_mut(&peer_generation)
+                                    {
+                                        let _ = budget.release(&reservation.label);
+                                    }
                                     let _ = state
                                         .pending_runtime
                                         .admission
@@ -221,6 +236,10 @@ pub(crate) fn handle_client_event_request(
                                 &subscription_id,
                                 peer_generation,
                             );
+                        crate::daemon::owner_loop::retire_reservation_deadlines(
+                            state,
+                            labels.iter().cloned(),
+                        );
                         if let Some(budget) = state
                             .pending_runtime
                             .admission

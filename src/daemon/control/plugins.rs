@@ -506,7 +506,7 @@ fn pending_plugin_control(
             };
             ControlPoll::ReadyRetained(complete_plugin_control(daemon, kind, result))
         },
-        move |_, state, permit| {
+        move |_, state, _waiter_id, permit| {
             state
                 .plugin_controls
                 .retire(&retire_request_id, &retire_identity);
