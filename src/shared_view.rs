@@ -103,10 +103,15 @@ impl<T> SharedView<T> {
         logical_bytes: usize,
     ) -> Result<Self, SharedViewCapacityError> {
         let charge = budget.reserve(logical_bytes)?;
-        Ok(Self(Arc::new(SharedViewAllocation {
+        Ok(Self::from_reserved(value, charge))
+    }
+
+    /// Attach a charge acquired before the caller allocated the value.
+    pub(crate) fn from_reserved(value: T, charge: SharedViewCharge) -> Self {
+        Self(Arc::new(SharedViewAllocation {
             value,
             _charge: charge,
-        })))
+        }))
     }
 
     pub(crate) fn budget(&self) -> Arc<SharedViewBudget> {

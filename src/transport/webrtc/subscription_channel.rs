@@ -613,7 +613,7 @@ async fn run_bound_entity_channel<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
     route: BoundSubscriptionRoute<'_>,
-    mut receiver: tokio::sync::mpsc::Receiver<DaemonEntityFrame>,
+    mut receiver: tokio::sync::mpsc::Receiver<crate::entity_delivery::EntityDelivery>,
     usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) where
     C: LocalWebrtcDataChannel + ?Sized,
@@ -624,8 +624,14 @@ async fn run_bound_entity_channel<C>(
             biased;
             frame = receiver.recv() => {
                 let Some(entity) = frame else { break };
-                let Ok(frames) = framed_server_frame(stream_key, &ServerFrame::Entity { entity })
-                else { break };
+                let (frames, retained_delivery) = match entity {
+                    crate::entity_delivery::EntityDelivery::Typed(entity) => (framed_server_frame(stream_key, &ServerFrame::Entity { entity }), None),
+                    crate::entity_delivery::EntityDelivery::Encoded(delivery) => {
+                        let frames = crate::transport::webrtc::delivery::framed_encoded_entity(stream_key, delivery.json());
+                        (frames, Some(delivery))
+                    }
+                };
+                let Ok(frames) = frames else { break };
                 for frame in frames {
                     let Some(permit) = authorize_subscription_send(
                         route.peer_state,
@@ -657,6 +663,7 @@ async fn run_bound_entity_channel<C>(
                     drop(permit);
                     route.peer_state.mux.refresh_aggregate_pressure();
                 }
+                drop(retained_delivery);
             }
             event = crate::transport::webrtc::control_channel::poll_data_channel_or_peer_terminal(
                 data_channel,
@@ -2083,13 +2090,16 @@ mod tests {
         );
         let (frame_tx, frame_rx) = tokio_mpsc::channel(1);
         frame_tx
-            .try_send(DaemonEntityFrame::Snapshot {
-                subscription_id: target.subscription_id.clone(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 1,
-                items: vec![serde_json::json!({"payload": "x".repeat(65_536)})],
-                resync_reason: None,
-            })
+            .try_send(
+                DaemonEntityFrame::Snapshot {
+                    subscription_id: target.subscription_id.clone(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 1,
+                    items: vec![serde_json::json!({"payload": "x".repeat(65_536)})],
+                    resync_reason: None,
+                }
+                .into(),
+            )
             .expect("queue overflowing entity frame");
         drop(frame_tx);
         let key = peer.stream_key.clone();

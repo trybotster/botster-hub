@@ -333,7 +333,7 @@ struct EntitySubscribeRequest {
     transport_request_id: Option<String>,
     client_id: Option<String>,
     frame_tx: EntityFrameSender,
-    frame_rx: Option<tokio_mpsc::Receiver<botster_hub_client::DaemonEntityFrame>>,
+    frame_rx: Option<tokio_mpsc::Receiver<crate::entity_delivery::EntityDelivery>>,
     reply_tx: ControlReplySender,
     grant_id: Option<String>,
 }
@@ -823,7 +823,7 @@ fn retire_plugin_entity_subscription(
 fn finish_entity_subscribe_response(
     state: &mut DaemonControlState,
     subscription_id: &str,
-    frame_rx: Option<tokio_mpsc::Receiver<botster_hub_client::DaemonEntityFrame>>,
+    frame_rx: Option<tokio_mpsc::Receiver<crate::entity_delivery::EntityDelivery>>,
     grant_id: Option<String>,
     reply_tx: ControlReplySender,
     response: &mut DaemonTransportResult<DaemonResponse>,

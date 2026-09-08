@@ -124,8 +124,22 @@ impl MuxWriteState {
     /// Queue one entity subscription frame on the event lane.
     pub(crate) fn enqueue_entity_frame(
         &mut self,
-        entity: DaemonEntityFrame,
+        entity: crate::entity_delivery::EntityDelivery,
     ) -> DaemonTransportResult<()> {
+        let entity = match entity {
+            crate::entity_delivery::EntityDelivery::Typed(entity) => entity,
+            crate::entity_delivery::EntityDelivery::Encoded(delivery) => {
+                self.queued_events.push_back(PendingMuxFrame {
+                    bytes: PendingMuxBytes::PreparedEntity(delivery),
+                    offset: 0,
+                    complete_envelope: None,
+                    class: PendingMuxClass::Event,
+                    delivery_ack: None,
+                    close_after: false,
+                });
+                return Ok(());
+            }
+        };
         self.queued_events.push_back(control_mux_frame(
             &ServerFrame::Entity { entity },
             PendingMuxClass::Event,
@@ -146,6 +160,7 @@ pub(crate) enum PendingMuxClass {
 pub(crate) enum PendingMuxBytes {
     /// One complete control container, length prefix included.
     Control(Vec<u8>),
+    PreparedEntity(crate::entity_delivery::PreparedEntityDelivery),
     /// One terminal container: stack header plus the shared body.
     Terminal {
         header: UnixTerminalContainerHeader,
@@ -157,6 +172,7 @@ impl PendingMuxBytes {
     fn total_len(&self) -> usize {
         match self {
             Self::Control(bytes) => bytes.len(),
+            Self::PreparedEntity(delivery) => delivery.container().len(),
             Self::Terminal { header, body } => header.as_bytes().len() + body.len(),
         }
     }
@@ -165,6 +181,13 @@ impl PendingMuxBytes {
     fn remaining(&self, offset: usize) -> ([IoSlice<'_>; 2], usize) {
         match self {
             Self::Control(bytes) => ([IoSlice::new(&bytes[offset..]), IoSlice::new(&[])], 1),
+            Self::PreparedEntity(delivery) => (
+                [
+                    IoSlice::new(&delivery.container()[offset..]),
+                    IoSlice::new(&[]),
+                ],
+                1,
+            ),
             Self::Terminal { header, body } => {
                 let header = header.as_bytes();
                 if offset < header.len() {
@@ -882,7 +905,9 @@ pub(crate) mod mux_write_resume_tests {
         assert_ne!(writer.written, [first_bytes.clone(), second_bytes].concat());
         match &pending.bytes {
             PendingMuxBytes::Control(bytes) => assert_eq!(bytes, &first_bytes),
-            PendingMuxBytes::Terminal { .. } => panic!("event frames are control containers"),
+            PendingMuxBytes::Terminal { .. } | PendingMuxBytes::PreparedEntity(_) => {
+                panic!("event frames are control containers")
+            }
         }
     }
 
@@ -1169,12 +1194,15 @@ pub(crate) mod mux_write_resume_tests {
         };
         let mut write_state = MuxWriteState::default();
         write_state
-            .enqueue_entity_frame(botster_hub_client::DaemonEntityFrame::Remove {
-                subscription_id: "entities".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 4,
-                id: "session".to_string(),
-            })
+            .enqueue_entity_frame(
+                botster_hub_client::DaemonEntityFrame::Remove {
+                    subscription_id: "entities".to_string(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 4,
+                    id: "session".to_string(),
+                }
+                .into(),
+            )
             .expect("enqueue entity frame");
         write_state
             .enqueue_response(
