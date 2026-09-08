@@ -450,6 +450,7 @@ const CONTROL_MESSAGE_OWNERS: &[(&str, &[&str])] = &[
         &[
             "AcceptedConnection",
             "RejectedConnection",
+            "ConnectionCleanup",
             "RegisterUnixAdmission",
             "RegisterWebrtcAdmission",
             "InspectReservation",
