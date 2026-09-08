@@ -83,7 +83,7 @@ pub struct HubDaemon {
     config: HubConfig,
     state: SharedHubState,
     state_source: HubStateLoadSource,
-    package_registry: PackageRegistry,
+    package_registry: Arc<PackageRegistry>,
     entrypoint_supervisor: EntrypointSupervisor,
     local_webrtc: LocalWebrtcTransport,
     runtime: Option<HubRuntime>,
@@ -120,7 +120,7 @@ impl HubDaemon {
             config,
             state,
             state_source,
-            package_registry,
+            package_registry: Arc::new(package_registry),
             entrypoint_supervisor: EntrypointSupervisor::default(),
             local_webrtc: LocalWebrtcTransport::default(),
             runtime: Some(runtime),
@@ -161,18 +161,23 @@ impl HubDaemon {
 
     /// Return the package registry restored for this daemon lifecycle.
     #[must_use]
-    pub const fn package_registry(&self) -> &PackageRegistry {
-        &self.package_registry
+    pub fn package_registry(&self) -> &PackageRegistry {
+        self.package_registry.as_ref()
     }
 
     /// Return the mutable package registry restored for this daemon lifecycle.
-    pub const fn package_registry_mut(&mut self) -> &mut PackageRegistry {
-        &mut self.package_registry
+    pub fn package_registry_mut(&mut self) -> &mut PackageRegistry {
+        Arc::make_mut(&mut self.package_registry)
     }
 
     /// Replace the daemon-owned package registry after a durable commit.
     pub fn replace_package_registry(&mut self, package_registry: PackageRegistry) {
-        self.package_registry = package_registry;
+        self.package_registry = Arc::new(package_registry);
+    }
+
+    /// Return one shared package-registry input for off-owner reads.
+    pub(crate) fn package_registry_view(&self) -> Arc<PackageRegistry> {
+        Arc::clone(&self.package_registry)
     }
 
     /// Return the local package entrypoint supervisor.

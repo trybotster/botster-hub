@@ -475,6 +475,7 @@ const CONTROL_MESSAGE_OWNERS: &[(&str, &[&str])] = &[
 const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &[
     "DataPlaneProgress",
     "EgressWriteFailed",
+    "HostProgressPublished",
     "PluginCompletionPublished",
     "PluginResultCapacityReleased",
 ];

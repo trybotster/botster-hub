@@ -24,9 +24,12 @@ use serde_json::Value;
 use crate::HubDaemon;
 use crate::admission::budgets::DAEMON_MAX_FRAME_BYTES;
 use crate::client_api_dto::response::daemon_response_base;
-use crate::daemon::control::session_types::session_type_catalog_entities;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
+use crate::host_executor::{
+    HostCommand, HostCompletion, HostCompletionPoll, HostError, HostJobIdentity, HostResult,
+    HostSubmitError, WaiterIdSequence,
+};
 
 const SESSION_DELIVERY_MAX_ITEMS: usize = 16;
 const SESSION_DELIVERY_MAX_BYTES: usize = 64 * 1024;
@@ -158,67 +161,185 @@ enum DeliveryPhase {
 pub(crate) struct SessionTypeCatalogCache {
     generation: Option<u64>,
     entities: BTreeMap<String, Value>,
-    pending: Option<(
-        u64,
-        std::sync::mpsc::Receiver<DaemonTransportResult<BTreeMap<String, Value>>>,
-    )>,
+    /// Logical encoded bytes retained by `entities` after its host permit releases.
+    logical_bytes: usize,
+    pending: Option<(HostJobIdentity, u64)>,
+    requested_generation: Option<u64>,
+    waiting_for_capacity: bool,
+    failure: Option<(u64, HostError)>,
+}
+
+enum SessionTypeCatalogRefresh<'a> {
+    Ready(u64, &'a BTreeMap<String, Value>),
+    Pending,
+    Failed(u64, HostError),
 }
 
 impl SessionTypeCatalogCache {
-    /// The catalog for `generation` when it is ready. Starts or polls the
-    /// off-owner build otherwise and returns `None` for this turn.
-    pub(crate) fn refresh(
+    /// Return the requested catalog or submit one bounded off-owner build.
+    fn refresh(
         &mut self,
         daemon: &HubDaemon,
         generation: u64,
-    ) -> Option<(u64, &BTreeMap<String, Value>)> {
-        if let Some((pending_generation, receiver)) = self.pending.as_ref() {
-            match receiver.try_recv() {
-                Ok(Ok(entities)) => {
-                    self.generation = Some(*pending_generation);
-                    self.entities = entities;
-                    self.pending = None;
-                }
-                Ok(Err(error)) => {
-                    eprintln!("session type catalog build failed: {error}");
-                    self.pending = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.pending = None;
-                }
-            }
-        }
+        waiter_ids: &mut WaiterIdSequence,
+    ) -> SessionTypeCatalogRefresh<'_> {
+        self.requested_generation = Some(generation);
         if self.generation == Some(generation) {
-            return Some((generation, &self.entities));
+            return SessionTypeCatalogRefresh::Ready(generation, &self.entities);
         }
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|(pending, _)| *pending == generation)
+        if let Some((failed_generation, error)) = self.failure.as_ref()
+            && *failed_generation == generation
         {
-            return None;
+            return SessionTypeCatalogRefresh::Failed(generation, error.clone());
+        }
+        if self.pending.is_some() {
+            return SessionTypeCatalogRefresh::Pending;
         }
         let Some(runtime) = daemon.runtime() else {
-            return None;
+            return SessionTypeCatalogRefresh::Pending;
         };
-        let records = daemon
-            .package_registry()
-            .packages()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let state = runtime.state().clone();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("botster-hub-session-type-catalog".to_string())
-            .spawn(move || {
-                let _ = sender.send(session_type_catalog_entities(&records, &state));
-            });
-        if spawned.is_ok() {
-            self.pending = Some((generation, receiver));
+        let Some(permit) = runtime.host_executor().try_reserve() else {
+            self.waiting_for_capacity = true;
+            return SessionTypeCatalogRefresh::Pending;
+        };
+        let Some(waiter_id) = waiter_ids.next() else {
+            drop(permit);
+            self.generation = None;
+            self.entities.clear();
+            self.logical_bytes = 0;
+            self.failure = Some((
+                generation,
+                HostError {
+                    code: "host_waiter_id_exhausted".to_string(),
+                    message: "host waiter identity capacity is exhausted".to_string(),
+                },
+            ));
+            return SessionTypeCatalogRefresh::Failed(
+                generation,
+                self.failure
+                    .as_ref()
+                    .expect("catalog failure was set")
+                    .1
+                    .clone(),
+            );
+        };
+        let identity = HostJobIdentity {
+            waiter_id,
+            phase: 1,
+        };
+        // The owner registers the identity before the job can publish completion.
+        self.pending = Some((identity, generation));
+        self.waiting_for_capacity = false;
+        // These Arcs retain existing shared allocations. The job does not clone
+        // the registry or state payload, so it adds no logical input bytes.
+        let submitted = runtime.host_executor().submit(
+            identity,
+            HostCommand::BuildSessionTypeCatalog {
+                generation,
+                packages: daemon.package_registry_view(),
+                state: runtime.state(),
+            },
+            permit,
+        );
+        if let Err(error) = submitted {
+            self.pending = None;
+            self.generation = None;
+            self.entities.clear();
+            self.logical_bytes = 0;
+            let (code, message) = match error {
+                HostSubmitError::Full => (
+                    "host_executor_full",
+                    "host executor queue refused a reserved catalog build",
+                ),
+                HostSubmitError::Stopped => (
+                    "host_executor_stopped",
+                    "host executor is unavailable for the catalog build",
+                ),
+            };
+            self.failure = Some((generation, HostError::new(code, message)));
+            return SessionTypeCatalogRefresh::Failed(
+                generation,
+                self.failure
+                    .as_ref()
+                    .expect("catalog failure was set")
+                    .1
+                    .clone(),
+            );
         }
-        None
+        SessionTypeCatalogRefresh::Pending
+    }
+
+    /// Apply one matching completion. Superseded and duplicate results are discarded.
+    fn absorb(&mut self, completion: HostCompletion) -> bool {
+        let Some((expected_identity, expected_generation)) = self.pending else {
+            drop(completion);
+            return false;
+        };
+        if completion.identity != expected_identity {
+            drop(completion);
+            return false;
+        }
+        self.pending = None;
+        let result = completion.release();
+        let desired_generation = self.requested_generation.unwrap_or(expected_generation);
+        let result_generation = match &result {
+            HostResult::SessionTypeCatalogReady { generation, .. }
+            | HostResult::Failed { generation, .. } => *generation,
+        };
+        if result_generation != expected_generation || result_generation != desired_generation {
+            return true;
+        }
+        match result {
+            HostResult::SessionTypeCatalogReady {
+                generation,
+                entities,
+                logical_bytes,
+            } => {
+                self.generation = Some(generation);
+                self.entities = entities;
+                self.logical_bytes = logical_bytes;
+                self.failure = None;
+            }
+            HostResult::Failed { generation, error } => {
+                eprintln!("session type catalog build failed: {}", error.message);
+                self.generation = None;
+                self.entities.clear();
+                self.logical_bytes = 0;
+                self.failure = Some((generation, error));
+            }
+        }
+        true
+    }
+
+    fn waiting_for_capacity(&self) -> bool {
+        self.waiting_for_capacity
+    }
+
+    fn executor_stopped(&mut self) -> bool {
+        let Some((_, generation)) = self.pending.take() else {
+            return false;
+        };
+        self.generation = None;
+        self.entities.clear();
+        self.logical_bytes = 0;
+        self.failure = Some((
+            generation,
+            HostError::new(
+                "host_executor_stopped",
+                "host executor stopped before the catalog build completed",
+            ),
+        ));
+        true
+    }
+
+    fn clear_failure(&mut self, generation: u64) {
+        if self
+            .failure
+            .as_ref()
+            .is_some_and(|(failed_generation, _)| *failed_generation == generation)
+        {
+            self.failure = None;
+        }
     }
 }
 
@@ -250,10 +371,29 @@ pub(crate) fn register_builtin_entity_subscription(
             .runtime()
             .map(|runtime| runtime.state().session_type_generation)
             .ok_or(DaemonTransportError::DaemonNotRunning)?;
-        let catalog = state
-            .session_type_catalog
-            .refresh(daemon, generation)
-            .map(|(generation, entities)| (generation, entities.clone()));
+        let catalog = {
+            let DaemonControlState {
+                session_type_catalog,
+                waiter_ids,
+                ..
+            } = state;
+            match session_type_catalog.refresh(daemon, generation, waiter_ids) {
+                SessionTypeCatalogRefresh::Ready(generation, entities) => {
+                    Ok(Some((generation, entities.clone())))
+                }
+                SessionTypeCatalogRefresh::Pending => Ok(None),
+                SessionTypeCatalogRefresh::Failed(generation, error) => {
+                    Err((generation, error.code.clone(), error.message.clone()))
+                }
+            }
+        };
+        let catalog = match catalog {
+            Ok(catalog) => catalog,
+            Err((generation, code, message)) => {
+                state.session_type_catalog.clear_failure(generation);
+                return Ok(entity_subscription_error(&code, &subscription_id, &message));
+            }
+        };
         if let Some((generation, entities)) = &catalog {
             let snapshot = DaemonEntityFrame::Snapshot {
                 subscription_id: subscription_id.clone(),
@@ -272,8 +412,6 @@ pub(crate) fn register_builtin_entity_subscription(
             sender
                 .try_send(snapshot)
                 .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
-        } else {
-            state.maintenance.try_wake();
         }
         let (snapshot_seq, entities, awaiting_initial_snapshot) = match catalog {
             Some((generation, entities)) => (generation, entities, false),
@@ -630,15 +768,45 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
         // The catalog refresh reads the daemon immutably; the mutable runtime
         // borrow below starts only after it.
         let generation = runtime.state().session_type_generation;
-        match state.session_type_catalog.refresh(daemon, generation) {
-            Some((generation, entities)) => {
+        let outcome = {
+            let DaemonControlState {
+                session_type_catalog,
+                waiter_ids,
+                ..
+            } = state;
+            match session_type_catalog.refresh(daemon, generation, waiter_ids) {
+                SessionTypeCatalogRefresh::Ready(generation, entities) => {
+                    Ok(Some((generation, entities)))
+                }
+                SessionTypeCatalogRefresh::Pending => Ok(None),
+                SessionTypeCatalogRefresh::Failed(generation, error) => {
+                    Err((generation, error.code.clone(), error.message.clone()))
+                }
+            }
+        };
+        match outcome {
+            Ok(Some((generation, entities))) => {
                 drive_session_type_subscriptions(
                     &mut state.entity_subscriptions,
                     generation,
                     entities,
                 );
             }
-            None => state.maintenance.try_wake(),
+            Ok(None) => {}
+            Err((generation, code, message)) => {
+                let before = state.entity_subscriptions.len();
+                let pending = drive_session_type_catalog_failure(
+                    &mut state.entity_subscriptions,
+                    &code,
+                    &message,
+                );
+                note_released_entity_generations(state, before);
+                if pending {
+                    state.maintenance.try_wake();
+                } else {
+                    state.session_type_catalog.clear_failure(generation);
+                }
+            }
         }
     }
     let Some(runtime) = daemon.runtime_mut() else {
@@ -770,6 +938,63 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
             });
     }
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
+}
+
+/// Drain bounded host completions and mark catalog delivery only after publication.
+pub(crate) fn absorb_session_type_catalog_completions(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let executor = runtime.host_executor();
+    executor.take_completion_notification();
+    let capacity_released = executor.take_capacity_notification();
+    let mut catalog_changed = false;
+    loop {
+        match executor.poll_completion() {
+            HostCompletionPoll::Ready(completion) => {
+                catalog_changed |= state.session_type_catalog.absorb(completion);
+            }
+            HostCompletionPoll::Empty => break,
+            HostCompletionPoll::Stopped => {
+                catalog_changed |= state.session_type_catalog.executor_stopped();
+                break;
+            }
+        }
+    }
+    let capacity_released = capacity_released || executor.take_capacity_notification();
+    if catalog_changed || (capacity_released && state.session_type_catalog.waiting_for_capacity()) {
+        state.maintenance.scheduler.prefer_subscriber_delivery();
+    }
+}
+
+fn drive_session_type_catalog_failure(
+    subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
+    code: &str,
+    message: &str,
+) -> bool {
+    let mut pending = false;
+    subscriptions.retain(|subscription_id, subscription| {
+        if subscription.entity_type != "session_type" {
+            return true;
+        }
+        let error = DaemonEntityFrame::Error {
+            subscription_id: subscription_id.clone(),
+            entity_type: "session_type".to_string(),
+            code: code.to_string(),
+            message: message.to_string(),
+        };
+        match subscription.sender.try_send_kind(error) {
+            Ok(()) | Err(EntityFrameTrySendError::Disconnected) => false,
+            Err(EntityFrameTrySendError::Full(_)) => {
+                pending = true;
+                true
+            }
+        }
+    });
+    pending
 }
 
 fn note_released_entity_generations(state: &mut DaemonControlState, before: usize) {
@@ -1858,6 +2083,171 @@ mod tests {
 
     use crate::HubDaemon;
     use crate::daemon::owner_loop::DaemonControlState;
+
+    #[test]
+    fn stale_catalog_completion_releases_capacity_without_publishing() {
+        let executor = crate::host_executor::HostExecutor::new();
+        let mut waiter_ids = WaiterIdSequence::default();
+        let identity = HostJobIdentity {
+            waiter_id: waiter_ids.next().expect("allocate waiter identity"),
+            phase: 1,
+        };
+        let permit = executor.try_reserve().expect("reserve catalog build");
+        let mut cache = SessionTypeCatalogCache {
+            generation: Some(0),
+            entities: BTreeMap::from([("current".to_string(), serde_json::json!({}))]),
+            logical_bytes: 9,
+            pending: Some((identity, 1)),
+            requested_generation: Some(2),
+            ..SessionTypeCatalogCache::default()
+        };
+        let completion = HostCompletion::for_test(
+            identity,
+            HostResult::SessionTypeCatalogReady {
+                generation: 1,
+                entities: BTreeMap::from([("old".to_string(), serde_json::json!({}))]),
+                logical_bytes: 5,
+            },
+            permit,
+        );
+
+        assert!(cache.absorb(completion));
+        assert!(cache.pending.is_none());
+        assert_eq!(cache.generation, Some(0));
+        assert!(cache.entities.contains_key("current"));
+        assert_eq!(cache.logical_bytes, 9);
+        assert!(executor.take_capacity_notification());
+        assert!(executor.try_reserve().is_some());
+    }
+
+    #[test]
+    fn accepted_catalog_replaces_its_retained_charge_and_failure_releases_it() {
+        let executor = crate::host_executor::HostExecutor::new();
+        let mut waiter_ids = WaiterIdSequence::default();
+        let first_identity = HostJobIdentity {
+            waiter_id: waiter_ids.next().expect("allocate first waiter identity"),
+            phase: 1,
+        };
+        let mut cache = SessionTypeCatalogCache {
+            generation: Some(1),
+            entities: BTreeMap::from([("old".to_string(), serde_json::json!({}))]),
+            logical_bytes: 5,
+            pending: Some((first_identity, 2)),
+            requested_generation: Some(2),
+            ..SessionTypeCatalogCache::default()
+        };
+        let replacement = HostCompletion::for_test(
+            first_identity,
+            HostResult::SessionTypeCatalogReady {
+                generation: 2,
+                entities: BTreeMap::from([("new".to_string(), serde_json::json!({}))]),
+                logical_bytes: 7,
+            },
+            executor.try_reserve().expect("reserve replacement"),
+        );
+
+        assert!(cache.absorb(replacement));
+        assert_eq!(cache.generation, Some(2));
+        assert!(cache.entities.contains_key("new"));
+        assert!(!cache.entities.contains_key("old"));
+        assert_eq!(cache.logical_bytes, 7);
+
+        let failure_identity = HostJobIdentity {
+            waiter_id: waiter_ids.next().expect("allocate failure waiter identity"),
+            phase: 1,
+        };
+        cache.pending = Some((failure_identity, 3));
+        cache.requested_generation = Some(3);
+        let failure = HostCompletion::for_test(
+            failure_identity,
+            HostResult::Failed {
+                generation: 3,
+                error: HostError::new("catalog_failed", "catalog failed"),
+            },
+            executor.try_reserve().expect("reserve failed replacement"),
+        );
+
+        assert!(cache.absorb(failure));
+        assert!(cache.generation.is_none());
+        assert!(cache.entities.is_empty());
+        assert_eq!(cache.logical_bytes, 0);
+        assert!(cache.failure.is_some());
+    }
+
+    #[test]
+    fn stopped_executor_turns_a_pending_catalog_into_a_typed_failure() {
+        let mut waiter_ids = WaiterIdSequence::default();
+        let mut cache = SessionTypeCatalogCache {
+            pending: Some((
+                HostJobIdentity {
+                    waiter_id: waiter_ids.next().expect("allocate waiter identity"),
+                    phase: 1,
+                },
+                4,
+            )),
+            requested_generation: Some(4),
+            ..SessionTypeCatalogCache::default()
+        };
+
+        assert!(cache.executor_stopped());
+        assert!(cache.pending.is_none());
+        assert!(matches!(
+            cache.failure,
+            Some((
+                4,
+                HostError {
+                    ref code,
+                    ref message,
+                },
+            )) if code == "host_executor_stopped"
+                && message.contains("before the catalog build completed")
+        ));
+    }
+
+    #[test]
+    fn catalog_failure_closes_only_session_type_subscriptions() {
+        let (session_type_sender, session_type_receiver) = mpsc::sync_channel(1);
+        let (session_sender, session_receiver) = mpsc::sync_channel(1);
+        let mut session =
+            session_type_subscription_state(session_sender, 0, 0, BTreeMap::new(), None);
+        session.entity_type = "session".to_string();
+        let mut subscriptions = BTreeMap::from([
+            (
+                "session-type".to_string(),
+                session_type_subscription_state(session_type_sender, 0, 0, BTreeMap::new(), None),
+            ),
+            ("session".to_string(), session),
+        ]);
+
+        assert!(!drive_session_type_catalog_failure(
+            &mut subscriptions,
+            "catalog_failed",
+            "catalog failed",
+        ));
+        assert_eq!(subscriptions.len(), 1);
+        assert!(subscriptions.contains_key("session"));
+        assert!(session_receiver.try_recv().is_err());
+        assert!(matches!(
+            session_type_receiver.try_recv(),
+            Ok(DaemonEntityFrame::Error {
+                ref subscription_id,
+                ref entity_type,
+                ref code,
+                ..
+            }) if subscription_id == "session-type"
+                && entity_type == "session_type"
+                && code == "catalog_failed"
+        ));
+
+        let mut cache = SessionTypeCatalogCache {
+            failure: Some((3, HostError::new("catalog_failed", "catalog failed"))),
+            ..SessionTypeCatalogCache::default()
+        };
+        cache.clear_failure(2);
+        assert!(cache.failure.is_some());
+        cache.clear_failure(3);
+        assert!(cache.failure.is_none());
+    }
 
     #[test]
     fn session_lifecycle_class_is_total_and_stale_first() {
