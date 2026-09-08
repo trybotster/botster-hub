@@ -59,6 +59,7 @@ pub(crate) struct FakeDataChannel {
     pub(crate) sent_binary: Mutex<Vec<Vec<u8>>>,
     pub(crate) closed: AtomicBool,
     pub(crate) send_fails: AtomicBool,
+    pub(crate) send_closed: AtomicBool,
     /// When nonzero, sends fail once this many sends have succeeded.
     pub(crate) fail_sends_after: std::sync::atomic::AtomicUsize,
     pub(crate) send_hangs: AtomicBool,
@@ -148,11 +149,17 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
         Ok(())
     }
 
-    async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), String> {
+    async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), webrtc::error::Error> {
+        if self.send_closed.load(Ordering::Acquire) {
+            self.send_entered.store(true, Ordering::Release);
+            self.send_notify.notify_one();
+            return Err(webrtc::error::Error::ErrDataChannelClosed);
+        }
         // The text log records the length so control tests keep one send
         // list; `sent_binary` keeps the chunk bytes for reassembly checks.
         self.local_send_text(&format!("<binary {} bytes>", bytes.len()))
-            .await?;
+            .await
+            .map_err(webrtc::error::Error::Other)?;
         self.sent_binary.lock().unwrap().push(bytes.to_vec());
         Ok(())
     }
@@ -315,6 +322,7 @@ pub(crate) struct TestOfferPeer {
     pub(crate) pending_host_events: VecDeque<DaemonEvent>,
     pub(crate) reserved_channels: HashMap<String, ReservedTestChannel>,
     pub(crate) next_request_id: u64,
+    hello_sent: bool,
 }
 
 pub(crate) struct ReservedTestChannel {
@@ -398,6 +406,7 @@ impl TestOfferPeer {
                 pending_host_events: VecDeque::new(),
                 reserved_channels: HashMap::new(),
                 next_request_id: 1,
+                hello_sent: false,
             },
             serde_json::to_value(offer).expect("serialize offer"),
         )
@@ -511,6 +520,7 @@ impl TestOfferPeer {
             .send_text(&encrypt_client_frame_text(key, &frame))
             .await
             .expect("send encrypted hello");
+        self.hello_sent = true;
         loop {
             match read_server_frame(key, &mut self.data_channel_message_rx, "hello ack").await {
                 ServerFrame::HelloAck { ack } => return ack,
@@ -826,6 +836,19 @@ impl PeerHarness {
         }
     }
 
+    pub(crate) fn try_receive_owner_message(
+        &mut self,
+    ) -> Result<ControlMessage, tokio_mpsc::error::TryRecvError> {
+        loop {
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut self.daemon, &mut self.state);
+            match self.control_rx.try_recv() {
+                Err(tokio_mpsc::error::TryRecvError::Empty)
+                    if !self.state.owner_ready.is_empty() => {}
+                message => return message,
+            }
+        }
+    }
+
     pub(crate) fn control_request(&mut self, request: DaemonRequest) -> Option<DaemonResponse> {
         let (reply_tx, mut reply_rx) = crate::daemon::control::message::control_reply_channel();
         handle_control_message(
@@ -853,7 +876,7 @@ impl PeerHarness {
             if Instant::now() >= deadline {
                 return None;
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut self.daemon,
@@ -992,7 +1015,7 @@ impl PeerHarness {
             if Instant::now() >= deadline {
                 panic!("timed out waiting for LocalWebrtcPeerClosed for {grant_id}");
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     let is_closed = matches!(
                         &message,
@@ -1084,7 +1107,7 @@ impl PeerHarness {
             if Instant::now() >= deadline {
                 panic!("timed out waiting for {label} response");
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut self.daemon,
@@ -1134,7 +1157,7 @@ impl PeerHarness {
             if Instant::now() >= deadline {
                 panic!("timed out waiting for {label} host event");
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut self.daemon,
@@ -1186,10 +1209,11 @@ impl PeerHarness {
     }
 
     pub(crate) fn ensure_webrtc_adapter_hello(&mut self, peer: &mut LiveSignaledPeer) {
-        if self
-            .state
-            .pending_runtime
-            .webrtc_is_admitted(&peer.grant_id)
+        if peer
+            .offer_peer
+            .as_ref()
+            .expect("the control channel is available")
+            .hello_sent
         {
             return;
         }
@@ -1226,13 +1250,20 @@ impl PeerHarness {
 
         let deadline = Instant::now() + Duration::from_secs(15);
         let (offer_peer, ack) = loop {
-            if let Ok(result) = response_rx.try_recv() {
-                break result;
+            match response_rx.try_recv() {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Err(panic) = worker.join() {
+                        std::panic::resume_unwind(panic);
+                    }
+                    panic!("the hello worker closed without a response");
+                }
             }
             if Instant::now() >= deadline {
                 panic!("timed out waiting for DataChannel HelloAck");
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut self.daemon,
@@ -1284,7 +1315,7 @@ impl PeerHarness {
             if Instant::now() >= deadline {
                 panic!("timed out waiting for reserved-channel bind");
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut self.daemon,
@@ -1334,7 +1365,7 @@ impl PeerHarness {
             if Instant::now() >= deadline {
                 panic!("timed out waiting for reserved event");
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut self.daemon,
@@ -1378,7 +1409,7 @@ impl PeerHarness {
             if Instant::now() >= deadline {
                 panic!("timed out waiting for reserved close");
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut self.daemon,
@@ -1435,7 +1466,7 @@ impl PeerHarness {
             if Instant::now() >= deadline {
                 panic!("timed out waiting for reserved subscription bind");
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut self.daemon,
@@ -1470,7 +1501,7 @@ impl PeerHarness {
                     "timed out waiting for reserved-channel adapter bind session={session_id} subscription={subscription_id}"
                 );
             }
-            match self.control_rx.try_recv() {
+            match self.try_receive_owner_message() {
                 Ok(message) => {
                     handle_control_message(
                         &mut self.daemon,
@@ -1495,13 +1526,7 @@ impl PeerHarness {
         peer: &mut LiveSignaledPeer,
         subscription_id: &str,
     ) -> DaemonResponse {
-        if !self
-            .state
-            .pending_runtime
-            .has_webrtc_admission_row(&peer.grant_id)
-        {
-            self.ensure_webrtc_adapter_hello(peer);
-        }
+        self.ensure_webrtc_adapter_hello(peer);
         self.request_on_peer(
             peer,
             DaemonRequest::SubscribeEntities {

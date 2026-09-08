@@ -24,9 +24,9 @@ use crate::admission::budgets::{
     DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_CONTROL_QUEUE_CAPACITY, DAEMON_MAX_CONNECTIONS,
 };
 use crate::admission::unix_hello::{AdmissionState, WebrtcTerminalAdmission};
+use crate::daemon::control::dispatch_control_message;
 #[cfg(test)]
 use crate::daemon::control::handle_control_message;
-use crate::daemon::control::handle_control_message_with_budget;
 use crate::daemon::control::message::{
     ControlMessage, ControlReplySender, ControlSender, DaemonDeliveryKind, EgressWriteClass,
 };
@@ -54,6 +54,13 @@ use crate::transport::unix::listener::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum BackgroundWork {
+    DataPlaneProgress,
+    CoreCompletion,
+    HostCompletion,
+    ManagedSpawn,
+    PluginReady,
+    PluginEntityReady,
+    Deadline,
     Maintenance(MaintenanceSliceKind),
     PumpObserve,
     InventoryReconcile,
@@ -206,6 +213,14 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
     use crate::daemon::owner_schedule::ReadyClass;
 
     match work {
+        BackgroundWork::CoreCompletion | BackgroundWork::DataPlaneProgress => {
+            ReadyClass::CoreCompletion
+        }
+        BackgroundWork::HostCompletion | BackgroundWork::ManagedSpawn => ReadyClass::HostCompletion,
+        BackgroundWork::PluginReady | BackgroundWork::PluginEntityReady => {
+            ReadyClass::PluginCompletion
+        }
+        BackgroundWork::Deadline => ReadyClass::Deadline,
         BackgroundWork::Maintenance(MaintenanceSliceKind::Observe)
         | BackgroundWork::PumpObserve => ReadyClass::Observe,
         BackgroundWork::InventoryReconcile => ReadyClass::InventoryReconcile,
@@ -249,6 +264,39 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
         if state.maintenance.wakes.take(kind) {
             mark_background_ready(state, BackgroundWork::Maintenance(kind));
         }
+    }
+}
+
+/// Read persistent notification bits before the owner can block.
+/// Collectors process their payloads through the shared ready queues.
+pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if let Some(runtime) = daemon.runtime() {
+        if runtime.data_plane_progress_pending() {
+            mark_background_ready(state, BackgroundWork::DataPlaneProgress);
+        }
+        if runtime.take_core_completion_notification() {
+            mark_background_ready(state, BackgroundWork::CoreCompletion);
+        }
+        let executor = runtime.host_executor();
+        state.host_completion_drain_pending |= executor.take_completion_notification();
+        state.host_capacity_wake_pending |= executor.take_capacity_notification();
+        if state.host_completion_drain_pending || state.host_capacity_wake_pending {
+            mark_background_ready(state, BackgroundWork::HostCompletion);
+        }
+        if runtime.take_managed_spawn_notification() {
+            mark_background_ready(state, BackgroundWork::ManagedSpawn);
+        }
+    }
+    let completed = state.plugin_result_budget.take_completion_notification();
+    let released = state.plugin_result_budget.take_release_notification();
+    if completed || released {
+        mark_background_ready(
+            state,
+            BackgroundWork::Maintenance(MaintenanceSliceKind::CompletionDrain),
+        );
+    }
+    if state.deadlines.has_due(Instant::now()) {
+        mark_background_ready(state, BackgroundWork::Deadline);
     }
 }
 
@@ -462,17 +510,6 @@ fn run_owner_maintenance_slice(
                     &mut state.plugin_entities,
                     &state.plugin_result_budget,
                 );
-                for waiter_id in state
-                    .plugin_entities
-                    .take_ready_waiters(crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT)
-                {
-                    crate::daemon::control::entities::mark_plugin_entity_ready(
-                        state,
-                        waiter_id,
-                        crate::daemon::owner_schedule::ReadyClass::PluginCompletion,
-                        crate::daemon::control::pending::READY_PLUGIN_COMPLETION,
-                    );
-                }
                 // A productive partial drain can continue. A zero-item drain
                 // waits for either a later Core publication or a retained-byte
                 // release. Core publishes each notifier after its mailbox push,
@@ -539,6 +576,7 @@ pub(crate) fn run_background_ready_item(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     item: crate::daemon::owner_schedule::ReadyItem,
+    owner_turn: &mut crate::daemon::owner_turn::OwnerTurnBudget,
 ) -> bool {
     let Some(waiter) = state
         .background_core_waiters
@@ -548,18 +586,129 @@ pub(crate) fn run_background_ready_item(
         return false;
     };
     match waiter.work {
+        BackgroundWork::DataPlaneProgress => {
+            crate::daemon::control::record_data_plane_progress(daemon, state);
+        }
+        BackgroundWork::CoreCompletion => {
+            if let Some(runtime) = daemon.runtime() {
+                let identities = runtime.take_owner_core_completions(1);
+                let consumed = crate::daemon::control::pending::absorb_core_completions(
+                    state,
+                    &identities,
+                    owner_turn,
+                );
+                runtime.restore_owner_core_completions(&identities[consumed..]);
+                runtime.reap_detached_core_operations();
+                if !identities.is_empty() {
+                    mark_background_ready(state, BackgroundWork::CoreCompletion);
+                }
+            }
+        }
+        BackgroundWork::HostCompletion => {
+            crate::subscription::entity::absorb_session_type_catalog_completions(
+                daemon, state, owner_turn,
+            );
+            if state.host_completion_drain_pending || state.host_capacity_wake_pending {
+                mark_background_ready(state, BackgroundWork::HostCompletion);
+            }
+        }
+        BackgroundWork::ManagedSpawn => {
+            crate::daemon::control::managed_git::accept_one(daemon, state);
+        }
+        BackgroundWork::PluginReady => {
+            if let Some(waiter_id) = state.plugin_controls.take_ready_waiters(1).pop() {
+                crate::daemon::control::pending::mark_owner_ready(
+                    state,
+                    waiter_id,
+                    crate::daemon::owner_schedule::ReadyClass::PluginCompletion,
+                    crate::daemon::control::pending::READY_PLUGIN_COMPLETION,
+                );
+                mark_background_ready(state, BackgroundWork::PluginReady);
+            }
+        }
+        BackgroundWork::PluginEntityReady => {
+            if let Some(waiter_id) = state.plugin_entities.take_ready_waiters(1).pop() {
+                crate::daemon::control::entities::mark_plugin_entity_ready(
+                    state,
+                    waiter_id,
+                    crate::daemon::owner_schedule::ReadyClass::PluginCompletion,
+                    crate::daemon::control::pending::READY_PLUGIN_COMPLETION,
+                );
+                mark_background_ready(state, BackgroundWork::PluginEntityReady);
+            }
+        }
+        BackgroundWork::Deadline => {
+            crate::daemon::control::pending::mark_due_owner_deadlines(
+                state,
+                Instant::now(),
+                owner_turn,
+            );
+            if state.deadlines.has_due(Instant::now()) {
+                mark_background_ready(state, BackgroundWork::Deadline);
+            }
+        }
         BackgroundWork::Maintenance(kind) => {
             state.lifecycle_counters.reconciliation_wakes = state
                 .lifecycle_counters
                 .reconciliation_wakes
                 .saturating_add(1);
             run_owner_maintenance_slice(daemon, state, kind);
+            if kind == MaintenanceSliceKind::CompletionDrain {
+                mark_background_ready(state, BackgroundWork::PluginReady);
+                mark_background_ready(state, BackgroundWork::PluginEntityReady);
+            }
         }
         BackgroundWork::PumpObserve => run_pump_observe_slice(daemon, state),
         BackgroundWork::InventoryReconcile => run_inventory_reconcile_slice(daemon, state),
     }
     publish_maintenance_wakes(state);
     true
+}
+
+/// Dispatch one ready item through the production owner handlers.
+pub(crate) fn dispatch_owner_ready_item(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    item: crate::daemon::owner_schedule::ReadyItem,
+    owner_turn: &mut crate::daemon::owner_turn::OwnerTurnBudget,
+) -> bool {
+    let handled =
+        crate::subscription::entity::drive_session_type_catalog_ready_item(daemon, state, item)
+            || run_reservation_deadline_item(daemon, state, item)
+            || run_background_ready_item(daemon, state, item, owner_turn)
+            || crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                daemon, state, item,
+            )
+            || crate::daemon::owner_budget::poll_owner_obligation_item(daemon, state, item);
+    let shutdown = !handled && crate::daemon::control::request::poll_one_ready(daemon, state, item);
+    publish_maintenance_wakes(state);
+    shutdown
+}
+
+/// Run a bounded test turn with the production wake and dispatch paths.
+#[cfg(test)]
+pub(crate) fn drive_ready_test_turn(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+) -> bool {
+    let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+    publish_completion_wakes(daemon, state);
+    publish_maintenance_wakes(state);
+    while budget
+        .try_charge(
+            Instant::now(),
+            crate::daemon::owner_turn::OwnerTurnCharge::opaque_move(),
+        )
+        .is_ok()
+    {
+        let Some(item) = state.owner_ready.pop_next() else {
+            break;
+        };
+        if dispatch_owner_ready_item(daemon, state, item, &mut budget) {
+            return true;
+        }
+    }
+    false
 }
 
 fn run_control_ingress_item(
@@ -569,7 +718,6 @@ fn run_control_ingress_item(
     control_tx: ControlSender,
     shutdown_tx: &watch::Sender<bool>,
     connection_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-    owner_turn: &mut crate::daemon::owner_turn::OwnerTurnBudget,
     item: crate::daemon::owner_schedule::ReadyItem,
 ) -> Option<bool> {
     let message = state.control_ingress.remove(&item.key().waiter_id())?;
@@ -635,12 +783,11 @@ fn run_control_ingress_item(
             handle_connection_cleanup(daemon, state, control_tx, cleanup);
             Some(false)
         }
-        message => Some(handle_control_message_with_budget(
+        message => Some(dispatch_control_message(
             daemon,
             state,
             transport_runtime.handle(),
             control_tx,
-            owner_turn,
             message,
         )),
     }
@@ -704,54 +851,9 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     loop {
         let mut owner_turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
         reap_finished_connection_tasks(&mut connection_tasks);
-        // Read the shared completion bit on every turn. If the bounded
-        // doorbell queue was full, another owner event still exposes results.
-        if let Some(runtime) = daemon.runtime()
-            && owner_turn
-                .try_charge(
-                    Instant::now(),
-                    crate::daemon::owner_turn::OwnerTurnCharge::inspection(0),
-                )
-                .is_ok()
-            && runtime.take_core_completion_notification()
-        {
-            let identities = runtime
-                .take_owner_core_completions(crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT);
-            let consumed = crate::daemon::control::pending::absorb_core_completions(
-                &mut control_state,
-                &identities,
-                &mut owner_turn,
-            );
-            runtime.restore_owner_core_completions(&identities[consumed..]);
-            runtime.reap_detached_core_operations();
-        }
-        crate::daemon::control::record_data_plane_progress(&daemon, &mut control_state);
-        crate::subscription::entity::absorb_session_type_catalog_completions(
-            &daemon,
-            &mut control_state,
-            &mut owner_turn,
-        );
-        if let Some(runtime) = daemon.runtime()
-            && owner_turn
-                .try_charge(
-                    Instant::now(),
-                    crate::daemon::owner_turn::OwnerTurnCharge::inspection(0),
-                )
-                .is_ok()
-            && runtime.take_managed_spawn_notification()
-        {
-            crate::daemon::control::managed_git::accept_one(&mut daemon, &mut control_state);
-        }
-        crate::daemon::control::absorb_plugin_progress(&mut control_state, &mut owner_turn);
-        crate::daemon::control::pending::mark_due_owner_deadlines(
-            &mut control_state,
-            Instant::now(),
-            &mut owner_turn,
-        );
+        publish_completion_wakes(&daemon, &mut control_state);
         publish_maintenance_wakes(&mut control_state);
-        let slice_due = !control_state.owner_ready.is_empty()
-            || control_state.host_completion_drain_pending
-            || control_state.host_capacity_wake_pending;
+        let slice_due = !control_state.owner_ready.is_empty();
         let event = match classify_owner_poll(control_rx.try_recv(), slice_due) {
             OwnerPollDecision::ServeControl(message) => Some(OwnerEvent::Control(message)),
             OwnerPollDecision::RunSlice => None,
@@ -787,23 +889,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             }
         }
         publish_maintenance_wakes(&mut control_state);
-        while owner_turn
-            .try_charge(
-                Instant::now(),
-                crate::daemon::owner_turn::OwnerTurnCharge::inspection(0),
-            )
-            .is_ok()
-        {
-            let Some(waiter_id) = control_state.plugin_controls.take_ready_waiters(1).pop() else {
-                break;
-            };
-            crate::daemon::control::pending::mark_owner_ready(
-                &mut control_state,
-                waiter_id,
-                crate::daemon::owner_schedule::ReadyClass::PluginCompletion,
-                crate::daemon::control::pending::READY_PLUGIN_COMPLETION,
-            );
-        }
         loop {
             if owner_turn
                 .try_charge(
@@ -824,7 +909,6 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 control_tx.clone(),
                 &shutdown_tx,
                 &mut connection_tasks,
-                &mut owner_turn,
                 item,
             ) {
                 if shutdown {
@@ -843,38 +927,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 }
                 continue;
             }
-            if crate::subscription::entity::drive_session_type_catalog_ready_item(
-                &daemon,
-                &mut control_state,
-                item,
-            ) {
-                continue;
-            }
-            if run_reservation_deadline_item(&mut daemon, &mut control_state, item) {
-                continue;
-            }
-            if run_background_ready_item(&mut daemon, &mut control_state, item) {
-                continue;
-            }
-            if crate::daemon::control::entities::drive_plugin_entity_ready_item(
-                &mut daemon,
-                &mut control_state,
-                item,
-            ) {
-                continue;
-            }
-            if crate::daemon::owner_budget::poll_owner_obligation_item(
-                &mut daemon,
-                &mut control_state,
-                item,
-            ) {
-                continue;
-            }
-            if crate::daemon::control::request::poll_one_ready(
-                &mut daemon,
-                &mut control_state,
-                item,
-            ) {
+            if dispatch_owner_ready_item(&mut daemon, &mut control_state, item, &mut owner_turn) {
                 let _ = shutdown_tx.send(true);
                 wait_for_connection_tasks(
                     &transport_runtime,
@@ -1253,7 +1306,6 @@ pub(crate) struct DaemonControlState {
         BTreeMap<crate::owner_identity::WaiterId, crate::host_executor::HostCompletion>,
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
     pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
-    pub(crate) host_recovery_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
     pub(crate) package_recovery_required:
         Option<crate::daemon::control::host_work::PackageRecoveryRequired>,
     pub(crate) managed_git_recovery_required:
@@ -1336,7 +1388,6 @@ impl Default for DaemonControlState {
             host_completions: BTreeMap::new(),
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
-            host_recovery_waiters: std::collections::BTreeSet::new(),
             package_recovery_required: None,
             managed_git_recovery_required: None,
             host_completion_drain_pending: false,
@@ -1603,6 +1654,84 @@ mod tests {
             classify_owner_poll(Ok(ControlMessage::RejectedConnection), true),
             OwnerPollDecision::ServeControl(_)
         ));
+    }
+
+    #[test]
+    fn deadline_collector_preserves_work_after_budget_exhaustion_and_yields_to_control() {
+        let directory = unique_package_control_dir("deadline-collector");
+        let mut daemon = HubDaemon::start(package_control_config(directory.clone()))
+            .expect("start the collector test daemon");
+        let mut state = DaemonControlState::default();
+        assert!(arm_reservation_deadline(&mut state, "first".into(), 1, 0));
+        assert!(arm_reservation_deadline(&mut state, "second".into(), 2, 0));
+        assert!(mark_background_ready(&mut state, BackgroundWork::Deadline));
+        let item = state
+            .owner_ready
+            .pop_next()
+            .expect("the collector is ready");
+        let now = Instant::now();
+        let mut exhausted = crate::daemon::owner_turn::OwnerTurnBudget::new(now);
+        exhausted
+            .try_charge(
+                now,
+                crate::daemon::owner_turn::OwnerTurnCharge::inspection(
+                    crate::daemon::owner_turn::OWNER_TURN_INSPECTED_BYTE_LIMIT,
+                ),
+            )
+            .expect("consume the byte budget");
+
+        assert!(run_background_ready_item(
+            &mut daemon,
+            &mut state,
+            item,
+            &mut exhausted
+        ));
+        assert!(
+            state
+                .reservation_deadlines
+                .values()
+                .all(|entry| entry.ready_key.is_none())
+        );
+        enqueue_control_message(&mut state, ControlMessage::RejectedConnection)
+            .expect("queue control work");
+        loop {
+            let ready = state.owner_ready.pop_next().expect("control work is ready");
+            assert_ne!(
+                ready.key().class(),
+                crate::daemon::owner_schedule::ReadyClass::Deadline
+            );
+            if ready.key().class() == crate::daemon::owner_schedule::ReadyClass::ControlIngress {
+                break;
+            }
+        }
+        let item = loop {
+            let item = state
+                .owner_ready
+                .pop_next()
+                .expect("the collector remains ready");
+            if item.key().class() == crate::daemon::owner_schedule::ReadyClass::Deadline {
+                break item;
+            }
+        };
+        let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+        assert!(run_background_ready_item(
+            &mut daemon,
+            &mut state,
+            item,
+            &mut budget
+        ));
+        assert_eq!(
+            state
+                .reservation_deadlines
+                .values()
+                .filter(|entry| entry.ready_key.is_some())
+                .count(),
+            1
+        );
+        assert!(state.deadlines.has_due(Instant::now()));
+
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove the collector test directory");
     }
 
     #[test]
@@ -2958,6 +3087,10 @@ return botster.register({
         let _ = read_hello_ack(&mut client, &mut reader);
 
         let mut state = DaemonControlState::default();
+        daemon
+            .runtime()
+            .expect("the runtime is active")
+            .install_plugin_completion_notifier(state.plugin_result_budget.completion_notifier());
         let transport_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3092,10 +3225,7 @@ return botster.register({
         ));
         let sibling_deadline = Instant::now() + Duration::from_secs(2);
         while state.pending_requests.len() > botster_hub_client::MAX_OUTSTANDING_REQUESTS {
-            assert!(!crate::daemon::control::request::poll_deferred(
-                &mut daemon,
-                &mut state,
-            ));
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state,));
             assert!(
                 Instant::now() < sibling_deadline,
                 "the sibling Status request must complete while the plugin handler is held"
@@ -3119,26 +3249,7 @@ return botster.register({
         crate::lua_runtime::release_test_plugin_invocation_gate();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !state.pending_requests.is_empty() {
-            if let Some(runtime) = daemon.runtime() {
-                let DaemonControlState {
-                    maintenance,
-                    plugin_controls,
-                    plugin_entities,
-                    plugin_result_budget,
-                    ..
-                } = &mut state;
-                let _ = run_completion_drain_slice_for_owner(
-                    runtime,
-                    maintenance,
-                    plugin_controls,
-                    plugin_entities,
-                    plugin_result_budget,
-                );
-            }
-            assert!(!crate::daemon::control::request::poll_deferred(
-                &mut daemon,
-                &mut state,
-            ));
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state,));
             assert!(
                 Instant::now() < deadline,
                 "admitted plugin requests did not complete after gate release"

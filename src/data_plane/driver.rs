@@ -839,6 +839,10 @@ impl DataPlaneDriver {
         self.progress_latch.take()
     }
 
+    pub(crate) fn progress_pending(&self) -> bool {
+        self.progress_latch.bits.load(Ordering::Acquire) != 0
+    }
+
     pub(crate) fn stop_and_join(&mut self, release_for_restart: bool) -> Result<(), &'static str> {
         let _admission = self
             .core

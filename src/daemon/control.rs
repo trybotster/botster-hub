@@ -29,7 +29,6 @@ use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::control::pending::ControlStep;
 use crate::daemon::error::DaemonTransportError;
 use crate::daemon::owner_loop::{DaemonControlState, record_egress_write_failure};
-use crate::daemon::owner_turn::{OwnerTurnBudget, OwnerTurnCharge};
 pub(crate) use message::{ControlMessage, ControlSender};
 
 /// Owned snapshot of owner diagnostics and connection identity for one
@@ -91,12 +90,11 @@ pub(crate) fn control_request_operation_label(request: &DaemonRequest) -> &'stat
     }
 }
 
-pub(crate) fn handle_control_message_with_budget(
+pub(crate) fn dispatch_control_message(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     transport_handle: &tokio::runtime::Handle,
     control_tx: ControlSender,
-    owner_turn: &mut OwnerTurnBudget,
     message: ControlMessage,
 ) -> bool {
     match message {
@@ -143,25 +141,11 @@ pub(crate) fn handle_control_message_with_budget(
             );
             false
         }
-        ControlMessage::PluginResultCapacityReleased => {
-            absorb_plugin_progress(state, owner_turn);
-            false
-        }
-        ControlMessage::PluginCompletionPublished => {
-            absorb_plugin_progress(state, owner_turn);
-            false
-        }
-        ControlMessage::HostProgressPublished => {
-            crate::subscription::entity::absorb_session_type_catalog_completions(
-                daemon, state, owner_turn,
-            );
-            false
-        }
-        ControlMessage::ManagedSessionSpawnQueued => {
-            if let Some(runtime) = daemon.runtime() {
-                runtime.take_managed_spawn_notification();
-            }
-            managed_git::accept_one(daemon, state);
+        ControlMessage::PluginResultCapacityReleased
+        | ControlMessage::PluginCompletionPublished
+        | ControlMessage::HostProgressPublished
+        | ControlMessage::ManagedSessionSpawnQueued => {
+            crate::daemon::owner_loop::publish_completion_wakes(daemon, state);
             false
         }
     }
@@ -175,53 +159,8 @@ pub(crate) fn handle_control_message(
     control_tx: ControlSender,
     message: ControlMessage,
 ) -> bool {
-    let mut owner_turn = OwnerTurnBudget::new(std::time::Instant::now());
-    let shutdown = handle_control_message_with_budget(
-        daemon,
-        state,
-        transport_handle,
-        control_tx,
-        &mut owner_turn,
-        message,
-    );
-    if shutdown {
-        return true;
-    }
-    if let Some(runtime) = daemon.runtime()
-        && runtime.take_core_completion_notification()
-    {
-        let identities =
-            runtime.take_owner_core_completions(crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT);
-        let consumed = pending::absorb_core_completions(state, &identities, &mut owner_turn);
-        runtime.restore_owner_core_completions(&identities[consumed..]);
-    }
-    request::poll_deferred(daemon, state)
-}
-
-pub(crate) fn absorb_plugin_progress(
-    state: &mut DaemonControlState,
-    owner_turn: &mut OwnerTurnBudget,
-) {
-    if owner_turn
-        .try_charge(std::time::Instant::now(), OwnerTurnCharge::inspection(0))
-        .is_ok()
-        && state.plugin_result_budget.take_completion_notification()
-    {
-        state
-            .maintenance
-            .wakes
-            .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
-    }
-    if owner_turn
-        .try_charge(std::time::Instant::now(), OwnerTurnCharge::inspection(0))
-        .is_ok()
-        && state.plugin_result_budget.take_release_notification()
-    {
-        state
-            .maintenance
-            .wakes
-            .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
-    }
+    let shutdown = dispatch_control_message(daemon, state, transport_handle, control_tx, message);
+    shutdown || crate::daemon::owner_loop::drive_ready_test_turn(daemon, state)
 }
 
 pub(crate) fn record_data_plane_progress(

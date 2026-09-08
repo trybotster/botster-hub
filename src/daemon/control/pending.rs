@@ -394,40 +394,34 @@ pub(crate) fn mark_due_owner_deadlines(
     now: Instant,
     budget: &mut OwnerTurnBudget,
 ) {
-    while state.deadlines.has_due(now) {
-        if budget
-            .try_charge(Instant::now(), OwnerTurnCharge::opaque_move())
-            .is_err()
-        {
-            break;
-        }
-        let Some(key) = state.deadlines.pop_due(now, 1).into_iter().next() else {
-            break;
-        };
-        if let Some(entry) = state.pending_requests.get_mut(&key.waiter_id()) {
-            entry.deadline_key = None;
-            mark_owner_ready(state, key.waiter_id(), ReadyClass::Deadline, READY_DEADLINE);
-            continue;
-        }
-        if state.plugin_entities.clear_deadline(key.waiter_id()) {
-            crate::daemon::control::entities::mark_plugin_entity_ready(
-                state,
-                key.waiter_id(),
-                ReadyClass::Deadline,
-                READY_DEADLINE,
-            );
-            continue;
-        }
-        if state.budget.clear_obligation_deadline(key.waiter_id()) {
-            crate::daemon::owner_budget::mark_obligation_ready(
-                state,
-                key.waiter_id(),
-                READY_DEADLINE,
-            );
-            continue;
-        }
-        crate::daemon::owner_loop::mark_reservation_deadline_ready(state, key.waiter_id());
+    if budget
+        .try_charge(Instant::now(), OwnerTurnCharge::opaque_move())
+        .is_err()
+    {
+        return;
     }
+    let Some(key) = state.deadlines.pop_due(now, 1).into_iter().next() else {
+        return;
+    };
+    if let Some(entry) = state.pending_requests.get_mut(&key.waiter_id()) {
+        entry.deadline_key = None;
+        mark_owner_ready(state, key.waiter_id(), ReadyClass::Deadline, READY_DEADLINE);
+        return;
+    }
+    if state.plugin_entities.clear_deadline(key.waiter_id()) {
+        crate::daemon::control::entities::mark_plugin_entity_ready(
+            state,
+            key.waiter_id(),
+            ReadyClass::Deadline,
+            READY_DEADLINE,
+        );
+        return;
+    }
+    if state.budget.clear_obligation_deadline(key.waiter_id()) {
+        crate::daemon::owner_budget::mark_obligation_ready(state, key.waiter_id(), READY_DEADLINE);
+        return;
+    }
+    crate::daemon::owner_loop::mark_reservation_deadline_ready(state, key.waiter_id());
 }
 
 fn retire(
@@ -442,7 +436,6 @@ fn retire(
     state.deadlines.retire(entry.waiter_id);
     state.host_completions.remove(&entry.waiter_id);
     state.document_waiters.remove(&entry.waiter_id);
-    state.host_recovery_waiters.remove(&entry.waiter_id);
     state
         .blocked_session_type_roots
         .retain(|_, waiter_id| *waiter_id != entry.waiter_id);

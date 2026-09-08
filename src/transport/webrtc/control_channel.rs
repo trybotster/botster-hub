@@ -62,7 +62,7 @@ pub(crate) trait LocalWebrtcDataChannel: Send + Sync {
         Ok(0)
     }
     async fn local_send_text(&self, text: &str) -> Result<(), String>;
-    async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), String>;
+    async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), webrtc::error::Error>;
     async fn local_poll(&self) -> Option<DataChannelEvent>;
     async fn local_close(&self) -> Result<(), String>;
 }
@@ -96,10 +96,8 @@ where
             .map_err(|error| error.to_string())
     }
 
-    async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), String> {
-        self.send(BytesMut::from(bytes))
-            .await
-            .map_err(|error| error.to_string())
+    async fn local_send_binary(&self, bytes: &[u8]) -> Result<(), webrtc::error::Error> {
+        self.send(BytesMut::from(bytes)).await
     }
 
     async fn local_poll(&self) -> Option<DataChannelEvent> {
