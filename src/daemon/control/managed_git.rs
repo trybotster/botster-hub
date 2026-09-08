@@ -336,7 +336,7 @@ impl ManagedSpawnOperation {
                 let start = runtime.spawn_prepared_managed_session(
                     self.pending.as_ref().expect("managed request exists"),
                     self.prepared.as_ref().expect("managed worktree exists"),
-                    Some(self.waiter_id),
+                    self.waiter_id,
                 );
                 match start {
                     Ok(start) => {
