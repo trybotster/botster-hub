@@ -2,12 +2,12 @@
 
 use std::time::Instant;
 
-use botster_hub_client::{DaemonRequest, DaemonResponseKind};
+use botster_hub_client::DaemonResponseKind;
 
 use crate::HubDaemon;
 use crate::daemon::control::host_work::{DocumentAdmission, admit_document, release_document};
 use crate::daemon::control::pending::{
-    ControlPoll, PendingControlRequest, READY_DEADLINE, READY_INITIAL, mark_request_ready,
+    ControlPoll, PendingControlRequest, READY_DEADLINE, READY_INITIAL, mark_owner_ready,
 };
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::ReadyClass;
@@ -54,6 +54,13 @@ struct ManagedSpawnOperation {
     deadline: Instant,
 }
 
+pub(crate) struct ManagedGitRecoveryRequired {
+    pub(crate) code: String,
+    pub(crate) message: String,
+    _prepared: PreparedManagedWorktree,
+    _permit: HostWorkPermit,
+}
+
 pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let Some(runtime) = daemon.runtime() else {
         return;
@@ -61,6 +68,13 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     let Some(pending) = runtime.take_pending_managed_spawn() else {
         return;
     };
+    if let Some(recovery) = state.managed_git_recovery_required.as_ref() {
+        let _ = pending.response.send(Err(ManagedGitError::new(
+            "reconciliation_required",
+            format!("{}: {}", recovery.code, recovery.message),
+        )));
+        return;
+    }
     let request = match runtime.validate_managed_git_request(&pending) {
         Ok(request) => request,
         Err(error) => {
@@ -135,13 +149,12 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             deadline_key: None,
             last_core_phase: 0,
             last_host_phase: 0,
-            request: DaemonRequest::ListWorktrees,
+            completion: crate::daemon::control::pending::OwnerRequestCompletion::default(),
             reply_tx,
             response_delivery_rx: None,
             grant_id: None,
             client: None,
             permit: Some(owner_permit),
-            accepted_at,
             must_finish: true,
             past_deadline: false,
             continuation: Box::new(move |daemon, state| operation.poll(daemon, state)),
@@ -150,7 +163,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     );
     let deadline = accepted_at + MANAGED_GIT_OPERATION_TIMEOUT;
     let arm = state
-        .request_deadlines
+        .deadlines
         .arm(waiter_id, deadline, Instant::now())
         .expect("a new managed Git deadline must make progress");
     state
@@ -158,9 +171,9 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         .get_mut(&waiter_id)
         .expect("the managed Git waiter was inserted")
         .deadline_key = Some(arm.key());
-    mark_request_ready(state, waiter_id, ReadyClass::HostCompletion, READY_INITIAL);
+    mark_owner_ready(state, waiter_id, ReadyClass::HostCompletion, READY_INITIAL);
     if arm.is_due() {
-        mark_request_ready(state, waiter_id, ReadyClass::Deadline, READY_DEADLINE);
+        mark_owner_ready(state, waiter_id, ReadyClass::Deadline, READY_DEADLINE);
     }
 }
 
@@ -181,7 +194,7 @@ impl ManagedSpawnOperation {
             Phase::Create => self.created(daemon, state, result),
             Phase::PrepareRecord => self.record_prepared(daemon, state, result),
             Phase::CommitRecord => self.record_committed(daemon, state, result),
-            Phase::FinalizeCommit => self.finalized_commit(result),
+            Phase::FinalizeCommit => self.finalized_commit(state, result),
             Phase::FinalizeRollback => self.finalized_rollback(daemon, state, result),
             Phase::PrepareRemoval => self.removal_prepared(daemon, state, result),
             Phase::CommitRemoval => self.removal_committed(daemon, state, result),
@@ -212,8 +225,8 @@ impl ManagedSpawnOperation {
                 }
                 self.submit_record_prepare(daemon, state, None)
             }
-            HostResult::ManagedWorktreeRecoveryRequired { error, .. } => {
-                self.finish_reconciliation(&format!("{}: {}", error.code, error.message))
+            HostResult::ManagedWorktreeRecoveryRequired { prepared, error } => {
+                self.retain_recovery(state, prepared, error)
             }
             HostResult::ManagedWorktreeFailed(error) => self.finish_error(error),
             HostResult::Failed { error, .. } => self.finish_error(managed_host_failure(error)),
@@ -440,11 +453,15 @@ impl ManagedSpawnOperation {
         }
     }
 
-    fn finalized_commit(&mut self, result: HostResult) -> ControlPoll {
+    fn finalized_commit(
+        &mut self,
+        state: &mut DaemonControlState,
+        result: HostResult,
+    ) -> ControlPoll {
         match result {
             HostResult::ManagedWorktreeFinalized => self.finish_internal(),
-            HostResult::ManagedWorktreeRecoveryRequired { error, .. } => {
-                self.finish_reconciliation(&format!("{}: {}", error.code, error.message))
+            HostResult::ManagedWorktreeRecoveryRequired { prepared, error } => {
+                self.retain_recovery(state, prepared, error)
             }
             HostResult::Failed { error, .. } => self.finish_error(managed_host_failure(error)),
             _ => self
@@ -471,8 +488,8 @@ impl ManagedSpawnOperation {
                     self.finish_deferred_error()
                 }
             }
-            HostResult::ManagedWorktreeRecoveryRequired { error, .. } => {
-                self.finish_reconciliation(&format!("{}: {}", error.code, error.message))
+            HostResult::ManagedWorktreeRecoveryRequired { prepared, error } => {
+                self.retain_recovery(state, prepared, error)
             }
             HostResult::Failed { error, .. } => self.finish_error(managed_host_failure(error)),
             _ => {
@@ -732,6 +749,26 @@ impl ManagedSpawnOperation {
             "reconciliation_required",
             detail.to_string(),
         ))
+    }
+
+    fn retain_recovery(
+        &mut self,
+        state: &mut DaemonControlState,
+        prepared: PreparedManagedWorktree,
+        error: crate::host_executor::HostError,
+    ) -> ControlPoll {
+        let Some(permit) = self.permit.take() else {
+            return self
+                .finish_reconciliation("the managed Git recovery result lost its host permit");
+        };
+        let detail = format!("{}: {}", error.code, error.message);
+        state.managed_git_recovery_required = Some(ManagedGitRecoveryRequired {
+            code: error.code,
+            message: error.message,
+            _prepared: prepared,
+            _permit: permit,
+        });
+        self.finish_reconciliation(&detail)
     }
 
     fn finish_internal(&mut self) -> ControlPoll {

@@ -314,6 +314,7 @@ pub(crate) struct TestOfferPeer {
     pub(crate) accept_host_events: bool,
     pub(crate) pending_host_events: VecDeque<DaemonEvent>,
     pub(crate) reserved_channels: HashMap<String, ReservedTestChannel>,
+    pub(crate) next_request_id: u64,
 }
 
 pub(crate) struct ReservedTestChannel {
@@ -396,6 +397,7 @@ impl TestOfferPeer {
                 accept_host_events: false,
                 pending_host_events: VecDeque::new(),
                 reserved_channels: HashMap::new(),
+                next_request_id: 1,
             },
             serde_json::to_value(offer).expect("serialize offer"),
         )
@@ -430,7 +432,11 @@ impl TestOfferPeer {
         key: &AesGcmKey,
         request: &DaemonRequest,
     ) -> DaemonResponse {
-        let request_id = next_test_request_id();
+        let request_id = self.next_request_id.to_string();
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .expect("test request ids do not overflow");
         let frame = ClientFrame::Request {
             request_id: request_id.clone(),
             request: request.clone(),
@@ -783,6 +789,11 @@ impl PeerHarness {
         let mut daemon =
             start_test_daemon_with_event_queue(data_directory.clone(), consumer_queue_max_events);
         let (control_tx, control_rx) = tokio_mpsc::channel(256);
+        if let Some(runtime) = daemon.runtime() {
+            runtime.bind_data_plane_owner_wake(control_tx.clone());
+            runtime.bind_host_owner_wake(control_tx.clone());
+            runtime.bind_managed_spawn_owner_wake(control_tx.clone());
+        }
         let transport_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -793,6 +804,14 @@ impl PeerHarness {
         #[allow(clippy::field_reassign_with_default)]
         let mut state = DaemonControlState::default();
         state.event_plane = daemon.local_webrtc().event_plane();
+        state
+            .plugin_result_budget
+            .bind_owner_wake(control_tx.clone());
+        if let Some(runtime) = daemon.runtime() {
+            runtime.install_plugin_completion_notifier(
+                state.plugin_result_budget.completion_notifier(),
+            );
+        }
         Self {
             daemon,
             state,
@@ -808,7 +827,7 @@ impl PeerHarness {
     }
 
     pub(crate) fn control_request(&mut self, request: DaemonRequest) -> Option<DaemonResponse> {
-        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+        let (reply_tx, mut reply_rx) = crate::daemon::control::message::control_reply_channel();
         handle_control_message(
             &mut self.daemon,
             &mut self.state,
@@ -824,7 +843,32 @@ impl PeerHarness {
                 enqueued_at: Instant::now(),
             },
         );
-        reply_rx.blocking_recv().ok().and_then(|result| result.ok())
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match reply_rx.try_recv() {
+                Ok(reply) => return reply.into_parts().0.ok(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return None,
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            match self.control_rx.try_recv() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut self.daemon,
+                        &mut self.state,
+                        &self.transport_handle,
+                        self.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => return None,
+            }
+        }
     }
 
     pub(crate) fn list_session_lifecycle(&mut self, session_id: &str) -> Option<String> {
@@ -879,7 +923,10 @@ impl PeerHarness {
                 remove.kind
             ));
         }
-        if self.list_session_lifecycle(session_id).is_some() {
+        let removed = soft_wait_until(Instant::now() + Duration::from_secs(5), &mut || {
+            self.list_session_lifecycle(session_id).is_none()
+        });
+        if !removed {
             return Err(format!(
                 "session {session_id} still listed after successful RemoveSession"
             ));
@@ -1489,8 +1536,7 @@ impl PeerHarness {
         assert_eq!(
             spawn.kind,
             botster_hub_client::DaemonResponseKind::Spawned,
-            "spawn over local WebRTC must succeed for attach proof: {:?}",
-            spawn.error
+            "spawn over local WebRTC must succeed for attach proof: {spawn:?}",
         );
         // Arm panic-safe cleanup immediately after Spawn readiness.
         self.owned_sessions.push(session_id.to_string());

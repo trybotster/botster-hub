@@ -339,6 +339,7 @@ impl TerminalReservationRegistry {
         labels
     }
 
+    #[cfg(test)]
     pub(crate) fn retire_expired(&mut self, now_seconds: u64) -> Vec<TerminalReservation> {
         let mut expired = Vec::new();
         for reservation in self.by_key.values_mut() {
@@ -352,7 +353,7 @@ impl TerminalReservationRegistry {
         expired
     }
 
-    pub(crate) fn forget_route(&mut self, session_id: &str, subscription_id: &str) {
+    pub(crate) fn forget_route(&mut self, session_id: &str, subscription_id: &str) -> Vec<String> {
         let keys: Vec<_> = self
             .by_key
             .keys()
@@ -361,11 +362,14 @@ impl TerminalReservationRegistry {
             })
             .cloned()
             .collect();
+        let mut labels = Vec::new();
         for key in keys {
             if let Some(reservation) = self.by_key.remove(&key) {
                 self.by_label.remove(&reservation.label);
+                labels.push(reservation.label);
             }
         }
+        labels
     }
 
     pub(crate) fn forget_peer(&mut self, peer_generation: u64) -> Vec<String> {

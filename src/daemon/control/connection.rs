@@ -33,7 +33,9 @@ pub(crate) fn handle(
     message: ControlMessage,
 ) -> bool {
     match message {
-        ControlMessage::AcceptedConnection { .. } | ControlMessage::RejectedConnection => false,
+        ControlMessage::AcceptedConnection { .. }
+        | ControlMessage::ConnectionCleanup(_)
+        | ControlMessage::RejectedConnection => false,
         ControlMessage::RegisterUnixAdmission {
             client_id,
             admission,
@@ -175,7 +177,12 @@ fn register_webrtc_admission(
             .pending_runtime
             .admission
             .webrtc_admissions
-            .insert(grant_id, admission);
+            .insert(grant_id.clone(), admission);
+        state
+            .pending_runtime
+            .admission
+            .grant_by_peer_generation
+            .insert(generation, grant_id);
     }
     false
 }
@@ -343,11 +350,14 @@ fn bind_reserved_subscription(
                 let _ = reply_tx.send(Err(BindReservedError::Bound));
                 return false;
             };
-            let _ = state
+            let bound = state
                 .pending_runtime
                 .admission
                 .reservations
                 .mark_bound(&label, peer_generation);
+            if bound.is_some() {
+                crate::daemon::owner_loop::retire_reservation_deadline(state, &label);
+            }
             let _ = reply_tx.send(Ok(BoundSubscription::Entity { receiver, usage }));
             return false;
         }
@@ -358,11 +368,14 @@ fn bind_reserved_subscription(
                 return false;
             };
             let mailbox = Arc::clone(mailbox);
-            let _ = state
+            let bound = state
                 .pending_runtime
                 .admission
                 .reservations
                 .mark_bound(&label, peer_generation);
+            if bound.is_some() {
+                crate::daemon::owner_loop::retire_reservation_deadline(state, &label);
+            }
             let _ = reply_tx.send(Ok(BoundSubscription::Event { mailbox, usage }));
             return false;
         }
@@ -389,11 +402,11 @@ fn bind_reserved_subscription(
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
     };
-    let Some(runtime) = daemon.runtime() else {
+    if daemon.runtime().is_none() {
         retire_reserved_subscription(daemon, state, &grant_id, &label);
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
-    };
+    }
     // The attachment identity captured here fences the deferred completion:
     // a replacement stream on the same route has a different epoch.
     let Some(identity) = state
@@ -434,7 +447,7 @@ fn bind_reserved_subscription(
     let (adapter, handle) = mux.create_adapter_with_aggregate(aggregate);
     // The bind runs on the Core owner thread; the reply follows as owner work.
     let client_id = identity.client_id.clone();
-    let mut ticket = runtime.bind_route_adapter(BindRoutePlan {
+    let mut bind_plan = Some(BindRoutePlan {
         client_id: botster_core::ClientId(client_id.clone()),
         session_id: botster_core::SessionId(reservation.session_id.clone()),
         subscription_id: botster_core::SubscriptionId(reservation.subscription_id.clone()),
@@ -443,6 +456,7 @@ fn bind_reserved_subscription(
         now_seconds: bind_now,
         adapter: Box::new(adapter),
     });
+    let mut ticket = None;
     let session_id = reservation.session_id.clone();
     let subscription_id = reservation.subscription_id.clone();
     let mut reply_tx = Some(reply_tx);
@@ -450,38 +464,52 @@ fn bind_reserved_subscription(
     // Phase two of the obligation: release exactly the generation this bind
     // created when the bind turned out stale or undeliverable.
     let mut stale_generation: Option<botster_core::TerminalSubscriptionGeneration> = None;
-    let mut detach_slot: Option<
-        CoreTicket<
-            Result<
-                botster_core_daemon::DetachTerminalSubscriptionResult,
-                botster_core_daemon::CoreDaemonError,
-            >,
-        >,
-    > = None;
-    state
-        .budget
-        .retain(permit, "reserved_bind", move |daemon, state| {
+    let mut detach_slot: Option<CoreTicket<Result<(), botster_core_daemon::CoreDaemonError>>> =
+        None;
+    crate::daemon::owner_budget::allocate_and_retain_owner_obligation(
+        state,
+        permit,
+        "reserved_bind",
+        move |daemon, state, waiter_id| {
             if let Some(stale) = stale_generation {
-                return match drive_core_slot(&mut detach_slot, daemon, state, |runtime, state| {
-                    let now = tick(&mut state.logical_clock);
-                    runtime.detach_terminal_subscription(
-                        botster_core::ClientId(client_id.clone()),
-                        botster_core::SessionId(session_id.clone()),
-                        botster_core::SubscriptionId(subscription_id.clone()),
-                        stale,
-                        now,
-                    )
-                }) {
+                return match drive_core_slot(
+                    &mut detach_slot,
+                    daemon,
+                    state,
+                    waiter_id,
+                    |runtime, state, waiter_id| {
+                        let now = tick(&mut state.logical_clock);
+                        runtime.detach_route_exact_or_owned_for_owner(
+                            waiter_id,
+                            botster_core::ClientId(client_id.clone()),
+                            botster_core::SessionId(session_id.clone()),
+                            botster_core::SubscriptionId(subscription_id.clone()),
+                            Some(stale),
+                            now,
+                        )
+                    },
+                ) {
                     CoreWorkPoll::Pending => ObligationPoll::Pending,
+                    CoreWorkPoll::Retry => ObligationPoll::ReadyAgain,
                     CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
                 };
             }
-            let bound = match ticket.poll() {
-                CoreTicketPoll::Pending => return ObligationPoll::Pending,
-                // The adapter moved into the bind plan; a refused or lost
-                // admission created nothing in Core and cannot be resubmitted.
-                CoreTicketPoll::Lost | CoreTicketPoll::Refused => false,
-                CoreTicketPoll::Ready(result) => result.is_ok(),
+            let bound = match drive_core_slot(
+                &mut ticket,
+                daemon,
+                state,
+                waiter_id,
+                |runtime, _, waiter_id| {
+                    let plan = bind_plan.take().expect("a bind plan is submitted once");
+                    runtime.submit_core_for_owner(waiter_id, move |daemon| {
+                        crate::runtime::bind_route_on_core(daemon, plan)
+                    })
+                },
+            ) {
+                CoreWorkPoll::Pending => return ObligationPoll::Pending,
+                CoreWorkPoll::Retry => false,
+                CoreWorkPoll::Lost => false,
+                CoreWorkPoll::Ready(result) => result.is_ok(),
             };
             let (Some(reply_tx), Some(usage)) = (reply_tx.take(), usage.take()) else {
                 return ObligationPoll::Done;
@@ -506,12 +534,15 @@ fn bind_reserved_subscription(
                     .reservations
                     .mark_bound(&label, peer_generation)
                     .is_some();
+            if reservation_bound {
+                crate::daemon::owner_loop::retire_reservation_deadline(state, &label);
+            }
             if !reservation_bound {
                 handle.close();
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
                 let _ = reply_tx.send(Err(BindReservedError::BindFailed));
                 stale_generation = Some(generation);
-                return ObligationPoll::Pending;
+                return ObligationPoll::ReadyAgain;
             }
             let registered = state.pending_runtime.mark_adapter_bound_if(
                 &session_id,
@@ -543,10 +574,11 @@ fn bind_reserved_subscription(
                 );
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
                 stale_generation = Some(generation);
-                return ObligationPoll::Pending;
+                return ObligationPoll::ReadyAgain;
             }
             ObligationPoll::Done
-        });
+        },
+    );
     false
 }
 
@@ -556,6 +588,7 @@ fn retire_reserved_subscription(
     grant_id: &str,
     label: &str,
 ) {
+    crate::daemon::owner_loop::retire_reservation_deadline(state, label);
     let Some(peer_generation) = admitted_peer_generation(state, grant_id) else {
         return;
     };
@@ -700,7 +733,7 @@ fn admitted_peer_generation(state: &DaemonControlState, grant_id: &str) -> Optio
     }
 }
 
-fn emit_reservation_expired(
+pub(crate) fn emit_reservation_expired(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     grant_id: &str,
@@ -717,6 +750,7 @@ fn emit_reservation_expired(
     else {
         return;
     };
+    crate::daemon::owner_loop::retire_reservation_deadline(state, label);
     retire_route_owner(daemon, state, grant_id, &reservation);
     if let Some(budget) = state
         .pending_runtime

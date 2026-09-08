@@ -106,6 +106,7 @@ pub(crate) fn handle_control_message_with_budget(
         }
         ControlMessage::CoreCompletionPublished => false,
         message @ ControlMessage::AcceptedConnection { .. }
+        | message @ ControlMessage::ConnectionCleanup(_)
         | message @ ControlMessage::RejectedConnection
         | message @ ControlMessage::RegisterUnixAdmission { .. }
         | message @ ControlMessage::RegisterWebrtcAdmission { .. }
@@ -175,14 +176,26 @@ pub(crate) fn handle_control_message(
     message: ControlMessage,
 ) -> bool {
     let mut owner_turn = OwnerTurnBudget::new(std::time::Instant::now());
-    handle_control_message_with_budget(
+    let shutdown = handle_control_message_with_budget(
         daemon,
         state,
         transport_handle,
         control_tx,
         &mut owner_turn,
         message,
-    )
+    );
+    if shutdown {
+        return true;
+    }
+    if let Some(runtime) = daemon.runtime()
+        && runtime.take_core_completion_notification()
+    {
+        let identities =
+            runtime.take_owner_core_completions(crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT);
+        let consumed = pending::absorb_core_completions(state, &identities, &mut owner_turn);
+        runtime.restore_owner_core_completions(&identities[consumed..]);
+    }
+    request::poll_deferred(daemon, state)
 }
 
 pub(crate) fn absorb_plugin_progress(
@@ -194,14 +207,20 @@ pub(crate) fn absorb_plugin_progress(
         .is_ok()
         && state.plugin_result_budget.take_completion_notification()
     {
-        state.maintenance.scheduler.prefer_completion_drain();
+        state
+            .maintenance
+            .wakes
+            .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
     }
     if owner_turn
         .try_charge(std::time::Instant::now(), OwnerTurnCharge::inspection(0))
         .is_ok()
         && state.plugin_result_budget.take_release_notification()
     {
-        state.maintenance.scheduler.prefer_completion_drain();
+        state
+            .maintenance
+            .wakes
+            .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
     }
 }
 

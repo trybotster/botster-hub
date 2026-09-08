@@ -107,13 +107,7 @@ pub(crate) fn accept_connections(
     // startup deterministic, this closes the gap between binding the initial
     // listener and beginning to poll the accept loop.
     let socket_events = SocketPathEvents::new(&listener);
-    accept_connections_with_events(
-        listener,
-        control_tx,
-        shutdown_rx,
-        admission,
-        socket_events,
-    )
+    accept_connections_with_events(listener, control_tx, shutdown_rx, admission, socket_events)
 }
 
 fn accept_connections_with_events(
@@ -150,10 +144,15 @@ fn accept_connections_with_events(
                         Ok((stream, _)) => {
                             match admission.clone().try_acquire_owned() {
                                 Ok(admission_permit) => {
+                                    let cleanup_permit = match control_tx.clone().reserve_owned().await {
+                                        Ok(permit) => permit,
+                                        Err(_) => return,
+                                    };
                                     if control_tx
                                         .send(ControlMessage::AcceptedConnection {
                                             stream,
                                             admission_permit,
+                                            cleanup_permit,
                                         })
                                         .await
                                         .is_err()
@@ -553,7 +552,7 @@ mod tests {
         listener: TokioUnixListener,
         socket_events: Result<SocketPathEvents, String>,
     ) {
-        let (control_tx, mut control_rx) = tokio_mpsc::channel(1);
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(2);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let accept_task = tokio::spawn(accept_connections_with_events(
             listener,
@@ -573,12 +572,14 @@ mod tests {
         let ControlMessage::AcceptedConnection {
             stream,
             admission_permit,
+            cleanup_permit,
         } = message
         else {
             panic!("degraded listener returned an unexpected control message");
         };
         drop(stream);
         drop(admission_permit);
+        drop(cleanup_permit);
         drop(client);
 
         shutdown_tx.send(true).expect("signal shutdown");

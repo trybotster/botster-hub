@@ -74,7 +74,9 @@ pub(crate) enum ControlMessage {
     AcceptedConnection {
         stream: TokioUnixStream,
         admission_permit: OwnedSemaphorePermit,
+        cleanup_permit: tokio_mpsc::OwnedPermit<ControlMessage>,
     },
+    ConnectionCleanup(crate::transport::unix::connection::ConnectionCleanup),
     RejectedConnection,
     SubscribeEntities {
         entity_type: String,
