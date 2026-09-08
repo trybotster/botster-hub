@@ -320,13 +320,6 @@ pub struct FileHubStateStore {
 pub(crate) struct PreparedHubStateWrite {
     state: SharedView<HubState>,
     bytes: Vec<u8>,
-    package_registry_logical_bytes: usize,
-}
-
-impl PreparedHubStateWrite {
-    pub(crate) fn package_registry_logical_bytes(&self) -> usize {
-        self.package_registry_logical_bytes
-    }
 }
 
 impl FileHubStateStore {
@@ -435,22 +428,13 @@ impl FileHubStateStore {
         // The durable pretty JSON is larger than compact JSON. Its existing
         // byte length is therefore one conservative logical view charge.
         let bytes = serde_json::to_vec_pretty(&state).map_err(HubStateStoreError::Serialize)?;
-        let package_registry_logical_bytes = serde_json::from_slice::<HubStatePackageSpan>(&bytes)
-            .map_err(HubStateStoreError::Serialize)?
-            .package_registry
-            .get()
-            .len();
         let view = SharedView::try_new(budget, state, bytes.len()).map_err(|error| {
             HubStateStoreError::ViewCapacity {
                 requested: error.requested,
                 available: error.available,
             }
         })?;
-        Ok(PreparedHubStateWrite {
-            state: view,
-            bytes,
-            package_registry_logical_bytes,
-        })
+        Ok(PreparedHubStateWrite { state: view, bytes })
     }
 
     pub(crate) fn commit_shared(

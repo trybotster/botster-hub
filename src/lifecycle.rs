@@ -85,6 +85,7 @@ fn package_id_from_entity_owner_token(token: &str) -> Result<String, String> {
 pub struct HubPluginLifecycle {
     engine: PluginWorkerEngine,
     loaded: Arc<Mutex<BTreeSet<String>>>,
+    load_failures: Arc<Mutex<BTreeMap<String, HubPluginLoadFailure>>>,
     descriptors: Arc<Mutex<BTreeMap<String, Vec<PluginOwnedDescriptor>>>>,
     event_handlers: Arc<Mutex<BTreeMap<String, Vec<HubPluginEventHandler>>>>,
 }
@@ -96,6 +97,7 @@ impl HubPluginLifecycle {
         Self {
             engine: PluginWorkerEngine::with_config(config),
             loaded: Arc::new(Mutex::new(BTreeSet::new())),
+            load_failures: Arc::new(Mutex::new(BTreeMap::new())),
             descriptors: Arc::new(Mutex::new(BTreeMap::new())),
             event_handlers: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -133,6 +135,10 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle event handlers lock")
             .insert(plugin_key.0.clone(), event_handlers);
+        self.load_failures
+            .lock()
+            .expect("hub plugin lifecycle load failures lock")
+            .remove(&plugin_key.0);
 
         Ok(plugin_key)
     }
@@ -198,6 +204,10 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle event handlers lock")
             .insert(plugin_key.0.clone(), event_handlers);
+        self.load_failures
+            .lock()
+            .expect("hub plugin lifecycle load failures lock")
+            .remove(&plugin_key.0);
 
         Ok(cleanup)
     }
@@ -222,6 +232,10 @@ impl HubPluginLifecycle {
         self.event_handlers
             .lock()
             .expect("hub plugin lifecycle event handlers lock")
+            .remove(package_name);
+        self.load_failures
+            .lock()
+            .expect("hub plugin lifecycle load failures lock")
             .remove(package_name);
         cleanup
     }
@@ -402,6 +416,11 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle loaded set lock")
             .clone();
+        let load_failures = self
+            .load_failures
+            .lock()
+            .expect("hub plugin lifecycle load failures lock")
+            .clone();
 
         registry
             .packages()
@@ -411,9 +430,25 @@ impl HubPluginLifecycle {
                 package_name: record.manifest.name.clone(),
                 state: record.state,
                 loaded: loaded.contains(&record.manifest.name),
+                load_failure: load_failures.get(&record.manifest.name).cloned(),
             })
             .collect()
     }
+
+    /// Record one package-scoped startup load failure for operator inspection.
+    pub fn record_load_failure(&self, package_name: &str, failure: HubPluginLoadFailure) {
+        self.load_failures
+            .lock()
+            .expect("hub plugin lifecycle load failures lock")
+            .insert(package_name.to_string(), failure);
+    }
+}
+
+/// One package-scoped plugin load failure that startup isolated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubPluginLoadFailure {
+    pub code: String,
+    pub message: String,
 }
 
 /// Read-only plugin package lifecycle status visible to local clients.
@@ -425,6 +460,8 @@ pub struct HubPluginLifecycleStatus {
     pub state: PackageState,
     /// Whether this lifecycle adapter has loaded the package into a core worker.
     pub loaded: bool,
+    /// Package-scoped startup failure when the enabled package stayed unloaded.
+    pub load_failure: Option<HubPluginLoadFailure>,
 }
 
 /// Host-supplied executable runtime state for one package load.

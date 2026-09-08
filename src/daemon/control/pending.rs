@@ -224,6 +224,7 @@ pub(crate) fn absorb_core_completions(
             return index;
         }
         let Some(entry) = state.pending_requests.get_mut(&identity.waiter_id) else {
+            state.absorb_background_core_completion(identity);
             continue;
         };
         let Some(expected) = entry.last_core_phase.checked_add(1) else {

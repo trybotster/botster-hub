@@ -121,9 +121,9 @@ pub use botster_hub_client::{
     DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageNavigationEntry,
     DaemonPackageNavigationSource, DaemonPackagePin, DaemonPackageProcess,
     DaemonPackageRouteDescriptor, DaemonPackageRouteTarget, DaemonPackageRunnableEntrypoint,
-    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonPluginWorkerCounters,
-    DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionType, DaemonResponse,
-    DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
+    DaemonPackageWorkingDirectory, DaemonPluginLifecycle, DaemonPluginLoadFailure,
+    DaemonPluginWorkerCounters, DaemonRequest, DaemonResolvedAppLaunch, DaemonResolvedSessionType,
+    DaemonResponse, DaemonResponseKind, DaemonSession, DaemonSessionCleanup, DaemonSessionContext,
     DaemonSessionType, DaemonSessionTypeContextInput, DaemonSessionTypeDefinition,
     DaemonSessionTypeExecution, DaemonSessionTypeMutationSource, DaemonSessionTypeRequest,
     DaemonSessionTypeWorkingDirectory, DaemonSoftwareIdentity, DaemonSpawnTarget,
@@ -142,11 +142,11 @@ pub use client_api::{
     HubClientPackageNavigationEntry, HubClientPackageNavigationTarget, HubClientPackageProcess,
     HubClientPackageRunnableEntrypoint, HubClientPackageState, HubClientPackageWorkingDirectory,
     HubClientPending, HubClientPluginLifecycle, HubClientPluginLifecycleReport,
-    HubClientPluginResourceCounters, HubClientPluginSurface, HubClientPluginWorkerCounters,
-    HubClientReadScreen, HubClientRequest, HubClientResponse, HubClientResponseBody,
-    HubClientResult, HubClientRole, HubClientRoutedEnvelopeAck, HubClientRoutedEnvelopeDrain,
-    HubClientRoutedEnvelopePublish, HubClientRuntimeErrorKind, HubClientSession, HubClientSpawned,
-    HubClientStatus, HubClientStep,
+    HubClientPluginLoadFailure, HubClientPluginResourceCounters, HubClientPluginSurface,
+    HubClientPluginWorkerCounters, HubClientReadScreen, HubClientRequest, HubClientResponse,
+    HubClientResponseBody, HubClientResult, HubClientRole, HubClientRoutedEnvelopeAck,
+    HubClientRoutedEnvelopeDrain, HubClientRoutedEnvelopePublish, HubClientRuntimeErrorKind,
+    HubClientSession, HubClientSpawned, HubClientStatus, HubClientStep,
 };
 pub use config::{
     CoreEngineOptions, CoreQueueCapacity, DataDirectoryOption, DirectoryList, HostIdentity,
@@ -170,7 +170,7 @@ pub use entrypoint_supervisor::{
 };
 pub use lifecycle::{
     HubLifecycleError, HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus,
-    HubPluginRuntimeBundle,
+    HubPluginLoadFailure, HubPluginRuntimeBundle,
 };
 pub use lua_runtime::{
     LuaPluginHostApi, LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,

@@ -3151,6 +3151,14 @@ pub struct DaemonPluginLifecycle {
     pub package_name: String,
     pub state: String,
     pub loaded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_failure: Option<DaemonPluginLoadFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPluginLoadFailure {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

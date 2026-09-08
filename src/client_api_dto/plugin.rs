@@ -3,7 +3,7 @@ use botster_core_daemon::{GuardedWriteDecision, GuardedWriteDeliveryState};
 use botster_hub_client::{
     DaemonCoordination, DaemonEnvelope, DaemonEnvelopeAck, DaemonEnvelopeDelivery,
     DaemonEnvelopePublish, DaemonIdentity, DaemonNotify, DaemonPluginLifecycle,
-    DaemonPluginWorkerCounters,
+    DaemonPluginLoadFailure, DaemonPluginWorkerCounters,
 };
 
 use crate::client_api_dto::session::guarded_write_delivery_state_label;
@@ -137,6 +137,12 @@ pub(crate) fn daemon_plugin_lifecycle_from_client(
         package_name: lifecycle.package_name,
         state: package_state_label(lifecycle.state).to_string(),
         loaded: lifecycle.loaded,
+        load_failure: lifecycle
+            .load_failure
+            .map(|failure| DaemonPluginLoadFailure {
+                code: failure.code,
+                message: failure.message,
+            }),
     }
 }
 
