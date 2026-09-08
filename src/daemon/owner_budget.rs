@@ -211,7 +211,7 @@ pub(crate) fn poll_owner_obligations(
         return;
     }
     if let Some(runtime) = daemon.runtime() {
-        runtime.absorb_core_completions();
+        runtime.reap_detached_core_operations();
     }
     let obligations = std::mem::take(&mut state.budget.obligations);
     let mut retained = Vec::with_capacity(obligations.len());

@@ -68,6 +68,7 @@ pub mod lua_runtime;
 pub mod maintenance;
 pub mod managed_git_worktrees;
 pub mod mcp;
+pub(crate) mod owner_identity;
 pub mod package_entity_fanout;
 pub mod package_event_router;
 pub(crate) mod package_event_schema;
