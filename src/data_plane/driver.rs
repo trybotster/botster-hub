@@ -179,6 +179,14 @@ impl CoreCompletionWake {
         state.registered.remove(&identity)
     }
 
+    fn awaits_collection(&self, identity: OwnerWorkIdentity) -> bool {
+        self.identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .registered
+            .contains(&identity)
+    }
+
     fn retire_waiter(&self, waiter_id: WaiterId) -> usize {
         let mut state = self
             .identities
@@ -358,6 +366,7 @@ enum CoreTicketSlot<T> {
     Queued {
         identity: OwnerWorkIdentity,
         receiver: Receiver<CoreTicketResult<T>>,
+        owner_wake: Option<Arc<CoreCompletionWake>>,
     },
     /// Admission refused the operation; there is nothing to wait for.
     Refused,
@@ -372,7 +381,7 @@ struct CoreTicketResult<T> {
 #[derive(Debug)]
 struct CoreTicketPublisher<T> {
     identity: OwnerWorkIdentity,
-    sender: SyncSender<CoreTicketResult<T>>,
+    sender: Option<SyncSender<CoreTicketResult<T>>>,
     wake: Arc<CoreCompletionWake>,
     notify_owner: bool,
 }
@@ -383,14 +392,29 @@ impl<T> CoreTicketPublisher<T> {
             identity: self.identity,
             value,
         };
-        if self.sender.try_send(result).is_ok() {
+        if self
+            .sender
+            .as_ref()
+            .expect("live publisher owns its sender")
+            .try_send(result)
+            .is_ok()
+        {
             if self.notify_owner {
                 // The result is readable before its identity. The identity is
                 // readable before the independent bit and doorbell publish.
                 self.wake.publish(self.identity);
             }
-        } else if self.notify_owner {
-            self.wake.retire(self.identity);
+        }
+    }
+}
+
+impl<T> Drop for CoreTicketPublisher<T> {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if self.notify_owner {
+            // Close the channel before waking its waiter. If no result exists,
+            // the same completion collector makes the lost ticket observable.
+            self.wake.publish(self.identity);
         }
     }
 }
@@ -430,10 +454,16 @@ impl<T> CoreTicket<T> {
     ) -> (Self, CoreTicketPublisher<T>) {
         let (sender, receiver) = mpsc::sync_channel(1);
         (
-            Self::queued(identity, receiver),
+            Self {
+                slot: CoreTicketSlot::Queued {
+                    identity,
+                    receiver,
+                    owner_wake: notify_owner.then(|| Arc::clone(&wake)),
+                },
+            },
             CoreTicketPublisher {
                 identity,
-                sender,
+                sender: Some(sender),
                 wake,
                 notify_owner,
             },
@@ -442,7 +472,11 @@ impl<T> CoreTicket<T> {
 
     fn queued(identity: OwnerWorkIdentity, receiver: Receiver<CoreTicketResult<T>>) -> Self {
         Self {
-            slot: CoreTicketSlot::Queued { identity, receiver },
+            slot: CoreTicketSlot::Queued {
+                identity,
+                receiver,
+                owner_wake: None,
+            },
         }
     }
 
@@ -473,14 +507,32 @@ impl<T> CoreTicket<T> {
     pub(crate) fn poll(&mut self) -> CoreTicketPoll<T> {
         match &self.slot {
             CoreTicketSlot::Refused => CoreTicketPoll::Refused,
-            CoreTicketSlot::Queued { identity, receiver } => match receiver.try_recv() {
-                Ok(result) if result.identity == *identity => CoreTicketPoll::Ready(result.value),
-                // A stale phase cannot make this ticket ready. Dropping the
-                // rejected result also releases every value-owned charge.
-                Ok(_) => CoreTicketPoll::Pending,
-                Err(TryRecvError::Empty) => CoreTicketPoll::Pending,
-                Err(TryRecvError::Disconnected) => CoreTicketPoll::Lost,
-            },
+            CoreTicketSlot::Queued {
+                identity,
+                receiver,
+                owner_wake,
+            } => {
+                // The result can arrive before its completion identity. The
+                // owner must collect that identity before it starts a new phase.
+                // Owner registration precedes request submission. An absent
+                // identity therefore means collection or explicit retirement.
+                if owner_wake
+                    .as_ref()
+                    .is_some_and(|wake| wake.awaits_collection(*identity))
+                {
+                    return CoreTicketPoll::Pending;
+                }
+                match receiver.try_recv() {
+                    Ok(result) if result.identity == *identity => {
+                        CoreTicketPoll::Ready(result.value)
+                    }
+                    // A stale phase cannot make this ticket ready. Dropping the
+                    // rejected result also releases every value-owned charge.
+                    Ok(_) => CoreTicketPoll::Pending,
+                    Err(TryRecvError::Empty) => CoreTicketPoll::Pending,
+                    Err(TryRecvError::Disconnected) => CoreTicketPoll::Lost,
+                }
+            }
         }
     }
 
@@ -488,7 +540,9 @@ impl<T> CoreTicket<T> {
     pub fn wait(self, timeout: Duration) -> Result<T, CoreTicketError> {
         match self.slot {
             CoreTicketSlot::Refused => Err(CoreTicketError::Overloaded),
-            CoreTicketSlot::Queued { identity, receiver } => {
+            CoreTicketSlot::Queued {
+                identity, receiver, ..
+            } => {
                 let deadline = Instant::now() + timeout;
                 loop {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1095,6 +1149,57 @@ mod tests {
     }
 
     #[test]
+    fn owner_result_cannot_advance_before_its_identity_is_collected() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (mut ticket, publisher) = owner_channel(identity(81, 1), Arc::clone(&wake));
+        // Stop at the production ordering boundary between result and wake.
+        publisher
+            .sender
+            .as_ref()
+            .expect("sender")
+            .try_send(CoreTicketResult {
+                identity: identity(81, 1),
+                value: 42_u8,
+            })
+            .expect("publish result before identity");
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Pending));
+        assert!(wake.take_identities(1).is_empty());
+        wake.publish(identity(81, 1));
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Pending));
+        assert_eq!(wake.take_identities(1), vec![identity(81, 1)]);
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Ready(42)));
+        assert_eq!(
+            wake.register_phases(WaiterId(81), 2),
+            Some(vec![identity(81, 2), identity(81, 3)])
+        );
+        drop(publisher);
+        assert!(
+            wake.take_identities(2).is_empty(),
+            "late publisher drop cannot wake a new phase"
+        );
+    }
+
+    #[test]
+    fn dropped_owner_publisher_wakes_a_lost_ticket_after_channel_close() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        wake.bind(sender);
+        let (mut ticket, publisher) = owner_channel::<u8>(identity(82, 1), Arc::clone(&wake));
+        drop(publisher);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CoreCompletionPublished)
+        ));
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Pending));
+        assert_eq!(wake.take_identities(1), vec![identity(82, 1)]);
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Lost));
+        assert_eq!(
+            wake.register_phases(WaiterId(82), 1),
+            Some(vec![identity(82, 2)])
+        );
+    }
+
+    #[test]
     fn keyed_result_is_published_before_an_independent_owner_wake() {
         let wake = Arc::new(CoreCompletionWake::new());
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
@@ -1125,7 +1230,7 @@ mod tests {
         second_publisher.publish(22_u8);
 
         assert!(matches!(first.poll(), CoreTicketPoll::Pending));
-        assert!(matches!(second.poll(), CoreTicketPoll::Ready(22)));
+        assert!(matches!(second.poll(), CoreTicketPoll::Pending));
         assert!(matches!(
             receiver.try_recv(),
             Ok(ControlMessage::CoreCompletionPublished)
@@ -1140,6 +1245,7 @@ mod tests {
             vec![identity(8, 1), identity(9, 1)]
         );
         assert!(matches!(first.poll(), CoreTicketPoll::Ready(11)));
+        assert!(matches!(second.poll(), CoreTicketPoll::Ready(22)));
     }
 
     #[test]
@@ -1393,6 +1499,8 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         publisher
             .sender
+            .as_ref()
+            .expect("sender")
             .try_send(CoreTicketResult {
                 identity: sibling,
                 value: DropProbe(Arc::clone(&drops)),
@@ -1419,15 +1527,21 @@ mod tests {
 
         publisher
             .sender
+            .as_ref()
+            .expect("sender")
             .try_send(CoreTicketResult {
                 identity: expected,
                 value: DropProbe(Arc::clone(&drops)),
             })
             .expect("publish first result");
-        let duplicate = publisher.sender.try_send(CoreTicketResult {
-            identity: expected,
-            value: DropProbe(Arc::clone(&drops)),
-        });
+        let duplicate = publisher
+            .sender
+            .as_ref()
+            .expect("sender")
+            .try_send(CoreTicketResult {
+                identity: expected,
+                value: DropProbe(Arc::clone(&drops)),
+            });
         assert!(matches!(duplicate, Err(TrySendError::Full(_))));
         drop(duplicate);
 

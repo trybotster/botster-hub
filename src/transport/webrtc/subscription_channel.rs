@@ -1624,18 +1624,27 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
-        // The owner loop's inventory reconcile phase is the production registry cleanup.
+        // Drive the production dispatcher until its inventory wake removes the route.
         let reconcile_deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut reconcile_passes = 0usize;
-        while crate::daemon::owner_loop::run_inventory_reconcile_phase(
-            &harness.daemon,
-            &mut harness.state,
-        ) {
-            reconcile_passes += 1;
+        while harness
+            .state
+            .pending_runtime
+            .is_adapter_bound(session_id, subscription_id)
+        {
+            if let Ok(message) = harness.try_receive_owner_message() {
+                handle_control_message(
+                    &mut harness.daemon,
+                    &mut harness.state,
+                    &harness.transport_handle,
+                    harness.control_tx.clone(),
+                    message,
+                );
+            }
             assert!(
-                std::time::Instant::now() < reconcile_deadline && reconcile_passes < 1024,
-                "owner-loop inventory reconcile did not complete: passes={reconcile_passes}"
+                std::time::Instant::now() < reconcile_deadline,
+                "owner dispatcher must reconcile the retired adapter route"
             );
+            thread::sleep(Duration::from_millis(5));
         }
         assert!(
             !harness
