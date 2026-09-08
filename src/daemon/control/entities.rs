@@ -65,6 +65,7 @@ enum RoutedPluginEntityCompletion {
 /// Bounded owner-side state for asynchronous entity-provider calls.
 #[derive(Default)]
 pub(crate) struct PluginEntityState {
+    pub(crate) targets: BTreeMap<String, std::sync::Arc<crate::plugin_entity::Target>>,
     next_serial: u64,
     pending: BTreeMap<String, PendingPluginEntity>,
     by_waiter: BTreeMap<crate::owner_identity::WaiterId, String>,
@@ -1043,6 +1044,7 @@ fn unsubscribe(
 }
 
 pub(crate) fn remove_entity_subscription(state: &mut DaemonControlState, subscription_id: &str) {
+    state.plugin_entities.targets.remove(subscription_id);
     if state.entity_subscriptions.remove(subscription_id).is_some() {
         state.lifecycle_counters.live_entity_subscriptions = state
             .lifecycle_counters

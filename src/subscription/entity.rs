@@ -158,6 +158,7 @@ pub(crate) struct EntitySubscriptionState {
     package_last_applied_seq: Option<u64>,
     /// Package-entity subscriber is gated to targeted snapshots until caught up.
     package_catching_up: bool,
+    package_delivery: Option<PackageSubscriptionDelivery>,
     /// Resume key for one bounded session-delivery page.
     delivery_after: Option<String>,
     /// Removes first, then projection rows. Prevents a high remove id from
@@ -171,6 +172,223 @@ pub(crate) struct EntitySubscriptionState {
     assembled_item_bytes: usize,
     /// True until a delivery page reports no remaining work.
     needs_delivery: bool,
+}
+
+#[derive(Debug)]
+struct PackageSubscriptionDelivery {
+    target: std::sync::Arc<crate::plugin_entity::Target>,
+    publication: Option<PackagePublication>,
+}
+
+#[derive(Debug)]
+struct PackagePublication {
+    identity: HostJobIdentity,
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for PackagePublication {
+    fn drop(&mut self) {
+        self.live.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Install worker-prepared metadata before the first delivery starts.
+pub(crate) fn install_package_entity_subscription(
+    state: &mut DaemonControlState,
+    registration: crate::plugin_entity::Registration,
+    target: std::sync::Arc<crate::plugin_entity::Target>,
+    owner_grant_id: Option<String>,
+) -> Result<
+    crate::admission::reservations::PreparedSubscriptionIdentity,
+    crate::plugin_entity::Registration,
+> {
+    if state
+        .entity_subscriptions
+        .contains_key(&registration.subscription_id)
+    {
+        return Err(registration);
+    }
+    let crate::plugin_entity::Registration {
+        subscription_id,
+        target_key,
+        entity_type,
+        reservation,
+    } = registration;
+    state
+        .plugin_entities
+        .targets
+        .insert(target_key, std::sync::Arc::clone(&target));
+    state.entity_subscriptions.insert(
+        subscription_id,
+        EntitySubscriptionState {
+            sender: target.sender.clone(),
+            entity_type,
+            cursor: None,
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
+            resync_reason: None,
+            owner_grant_id,
+            package_last_applied_seq: None,
+            package_catching_up: true,
+            package_delivery: Some(PackageSubscriptionDelivery {
+                target,
+                publication: None,
+            }),
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Removes,
+            next_seq: 0,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: false,
+        },
+    );
+    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
+    state.lifecycle_counters.high_water_entity_subscriptions = state
+        .lifecycle_counters
+        .high_water_entity_subscriptions
+        .max(state.lifecycle_counters.live_entity_subscriptions);
+    Ok(reservation)
+}
+
+/// Inspect one subscription. The caller advances the cursor even when delivery is unnecessary.
+pub(crate) fn next_package_entity_target(
+    state: &DaemonControlState,
+    after: Option<&crate::plugin_entity::Target>,
+) -> Option<std::sync::Arc<crate::plugin_entity::Target>> {
+    let lower = after.map_or(Bound::Unbounded, |target| {
+        Bound::Excluded(target.subscription_id.as_str())
+    });
+    state
+        .plugin_entities
+        .targets
+        .range::<str, _>((lower, Bound::Unbounded))
+        .next()
+        .map(|(_, target)| std::sync::Arc::clone(target))
+}
+
+/// Arm one publication only when the current subscription needs the payload.
+pub(crate) fn arm_package_entity_delivery(
+    state: &mut DaemonControlState,
+    target: &std::sync::Arc<crate::plugin_entity::Target>,
+    identity: HostJobIdentity,
+    sequence: u64,
+    snapshot: bool,
+    family_floor: u64,
+) -> Option<(
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    Option<String>,
+)> {
+    let subscription = state
+        .entity_subscriptions
+        .get_mut(&target.subscription_id)?;
+    let delivery = subscription.package_delivery.as_mut()?;
+    if !std::sync::Arc::ptr_eq(target, &delivery.target) {
+        return None;
+    }
+    let applied = subscription.package_last_applied_seq;
+    if snapshot {
+        if applied.is_some_and(|applied| sequence < applied)
+            || !(subscription.package_catching_up
+                || subscription.resync_reason.is_some()
+                || applied.is_none_or(|applied| applied < family_floor))
+        {
+            return None;
+        }
+    } else if subscription.package_catching_up
+        || applied.and_then(|applied| applied.checked_add(1)) != Some(sequence)
+    {
+        if applied.is_none_or(|applied| sequence > applied) {
+            subscription.package_catching_up = true;
+        }
+        return None;
+    }
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    delivery.publication = Some(PackagePublication {
+        identity,
+        live: std::sync::Arc::clone(&live),
+    });
+    state.lifecycle_counters.entity_delivery_attempts = state
+        .lifecycle_counters
+        .entity_delivery_attempts
+        .saturating_add(1);
+    Some((live, subscription.resync_reason.clone()))
+}
+
+/// Apply a completion only to the exact subscription and publication that admitted it.
+pub(crate) fn complete_package_entity_delivery(
+    state: &mut DaemonControlState,
+    target: &std::sync::Arc<crate::plugin_entity::Target>,
+    identity: HostJobIdentity,
+    sequence: u64,
+    snapshot: bool,
+    family_floor: u64,
+    status: crate::plugin_entity::DeliveryStatus,
+) -> bool {
+    let Some(subscription) = state.entity_subscriptions.get_mut(&target.subscription_id) else {
+        return false;
+    };
+    let Some(delivery) = subscription.package_delivery.as_mut() else {
+        return false;
+    };
+    if !std::sync::Arc::ptr_eq(target, &delivery.target)
+        || !delivery
+            .publication
+            .as_ref()
+            .is_some_and(|publication| publication.identity == identity)
+    {
+        return false;
+    }
+    delivery.publication = None;
+    use crate::plugin_entity::DeliveryStatus;
+    match status {
+        DeliveryStatus::Sent => {
+            subscription.package_last_applied_seq = Some(
+                subscription
+                    .package_last_applied_seq
+                    .map_or(sequence, |applied| applied.max(sequence)),
+            );
+            if snapshot {
+                subscription.package_catching_up = sequence < family_floor;
+            }
+            subscription.resync_reason = None;
+            state.lifecycle_counters.entity_delivery_successes = state
+                .lifecycle_counters
+                .entity_delivery_successes
+                .saturating_add(1);
+        }
+        DeliveryStatus::Full | DeliveryStatus::Capacity | DeliveryStatus::Invalid => {
+            subscription.package_catching_up = true;
+            subscription.resync_reason = Some(
+                match status {
+                    DeliveryStatus::Invalid => "entity_provider_frame_too_large",
+                    _ => "subscriber_overflow",
+                }
+                .into(),
+            );
+            state.lifecycle_counters.entity_delivery_overflows = state
+                .lifecycle_counters
+                .entity_delivery_overflows
+                .saturating_add(1);
+        }
+        DeliveryStatus::Disconnected => {
+            state.entity_subscriptions.remove(&target.subscription_id);
+            state
+                .plugin_entities
+                .targets
+                .remove(&target.subscription_id);
+            state.lifecycle_counters.entity_delivery_failures = state
+                .lifecycle_counters
+                .entity_delivery_failures
+                .saturating_add(1);
+            state.lifecycle_counters.live_entity_subscriptions =
+                state.entity_subscriptions.len() as u64;
+            return false;
+        }
+        DeliveryStatus::Cancelled => {}
+    }
+    subscription.package_catching_up
 }
 
 #[cfg(test)]
@@ -573,6 +791,7 @@ pub(crate) fn register_builtin_entity_subscription(
                 owner_grant_id,
                 package_last_applied_seq: None,
                 package_catching_up: false,
+                package_delivery: None,
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Removes,
                 next_seq: snapshot_seq,
@@ -606,6 +825,7 @@ pub(crate) fn register_builtin_entity_subscription(
         owner_grant_id,
         package_last_applied_seq: None,
         package_catching_up: false,
+        package_delivery: None,
         delivery_after: None,
         delivery_phase: DeliveryPhase::Assembling {
             source_seq: snapshot_seq,
@@ -706,6 +926,7 @@ pub(crate) fn register_package_entity_subscription_snapshot(
             owner_grant_id,
             package_last_applied_seq: Some(snapshot_seq),
             package_catching_up: catching_up,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: snapshot_seq,
@@ -895,13 +1116,18 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
     }
     let Some(runtime) = daemon.runtime() else {
         state.entity_subscriptions.clear();
+        state.plugin_entities.targets.clear();
         state.lifecycle_counters.live_entity_subscriptions = 0;
         return;
     };
-    state.entity_subscriptions.retain(|_, subscription| {
-        subscription.entity_type == "session"
+    state.entity_subscriptions.retain(|id, subscription| {
+        let keep = subscription.entity_type == "session"
             || subscription.entity_type == "session_type"
-            || runtime.has_plugin_entity_provider_family(&subscription.entity_type)
+            || runtime.has_plugin_entity_provider_family(&subscription.entity_type);
+        if !keep {
+            state.plugin_entities.targets.remove(id);
+        }
+        keep
     });
     state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 
@@ -2330,6 +2556,62 @@ mod tests {
     use crate::daemon::owner_loop::DaemonControlState;
     use crate::owner_identity::WaiterIdSource;
 
+    #[test]
+    fn replacement_subscription_rejects_the_previous_publication() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        let mut state = DaemonControlState::default();
+        let install = |state: &mut DaemonControlState| {
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            let target = Arc::new(crate::plugin_entity::Target {
+                subscription_id: "sub".into(),
+                entity_type: "task".into(),
+                sender: EntityFrameSender::Async(sender),
+            });
+            install_package_entity_subscription(
+                state,
+                crate::plugin_entity::Registration {
+                    subscription_id: "sub".into(),
+                    target_key: "sub".into(),
+                    entity_type: "task".into(),
+                    reservation: crate::admission::reservations::PreparedSubscriptionIdentity::new(
+                        "sub".into(),
+                    ),
+                },
+                Arc::clone(&target),
+                None,
+            )
+            .unwrap();
+            target
+        };
+        let old_target = install(&mut state);
+        let identity =
+            crate::owner_identity::OwnerWorkIdentity::first(crate::owner_identity::WaiterId(904));
+        let (live, _) =
+            arm_package_entity_delivery(&mut state, &old_target, identity, 19, true, 19).unwrap();
+        crate::daemon::control::entities::remove_entity_subscription(&mut state, "sub");
+        assert!(!live.load(Ordering::Acquire));
+        let new_target = install(&mut state);
+        assert!(!complete_package_entity_delivery(
+            &mut state,
+            &old_target,
+            identity,
+            19,
+            true,
+            19,
+            crate::plugin_entity::DeliveryStatus::Sent
+        ));
+        assert_eq!(
+            state.entity_subscriptions["sub"].package_last_applied_seq,
+            None
+        );
+        assert!(Arc::ptr_eq(
+            &next_package_entity_target(&state, None).unwrap(),
+            &new_target
+        ));
+        assert!(next_package_entity_target(&state, Some(&new_target)).is_none());
+    }
+
     fn drive_all_maintenance(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
         for kind in crate::daemon_maintenance::MaintenanceSliceKind::ALL {
             if kind == crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery {
@@ -2879,6 +3161,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 0,
@@ -2950,6 +3233,7 @@ mod tests {
                 owner_grant_id: None,
                 package_last_applied_seq: None,
                 package_catching_up: false,
+                package_delivery: None,
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Removes,
                 next_seq: 0,
@@ -3001,6 +3285,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq,
@@ -3215,6 +3500,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 0,
@@ -3308,6 +3594,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 0,
@@ -3382,6 +3669,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Rows,
             next_seq: 0,
@@ -3451,6 +3739,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Rows,
             next_seq: 110,
@@ -3531,6 +3820,7 @@ mod tests {
                 owner_grant_id: None,
                 package_last_applied_seq: None,
                 package_catching_up: false,
+                package_delivery: None,
                 delivery_after: None,
                 delivery_phase: DeliveryPhase::Rows,
                 next_seq: 0,
@@ -3596,6 +3886,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
@@ -3693,6 +3984,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
@@ -3788,6 +4080,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
@@ -3865,6 +4158,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Removes,
             next_seq: 1,
@@ -3924,6 +4218,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
@@ -4021,6 +4316,7 @@ mod tests {
                     owner_grant_id: None,
                     package_last_applied_seq: None,
                     package_catching_up: false,
+                    package_delivery: None,
                     delivery_after: None,
                     delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
                     next_seq: 1,
@@ -4085,6 +4381,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq: 1 },
             next_seq: 1,
@@ -4167,6 +4464,7 @@ mod tests {
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
+            package_delivery: None,
             delivery_after: None,
             delivery_phase: DeliveryPhase::Assembling { source_seq },
             next_seq: source_seq,
