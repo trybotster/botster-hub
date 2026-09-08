@@ -2133,6 +2133,15 @@ impl HubRuntime {
     }
 
     /// Take one mutation. The caller must reserve Host capacity first.
+    pub(crate) fn has_package_entity_fanout(&self) -> bool {
+        !self
+            .package_entity_fanout
+            .lock()
+            .expect("package entity fanout lock")
+            .is_empty()
+    }
+
+    /// Take one mutation. The caller must reserve Host capacity first.
     #[must_use]
     pub fn take_one_package_entity_fanout(&self) -> Option<TakenPackageEntityMutation> {
         self.package_entity_fanout

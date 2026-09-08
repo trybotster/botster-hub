@@ -18,7 +18,8 @@ use crate::{HubRuntime, McpToolError};
 pub(crate) enum Command {
     Prepare {
         invocation: crate::runtime::PluginEntitySnapshotInvocation,
-        result: RetainedPluginResult<Result<PluginInvocationResult, String>>,
+        result: RetainedPluginResult<PluginInvocationResult>,
+        inconsistent: bool,
         target: Option<Arc<Target>>,
     },
     PrepareMutation(PackageEntityMutation),
@@ -30,8 +31,15 @@ pub(crate) enum Command {
         resync_reason: Option<String>,
     },
     Reclaim(Payload),
+    Discard {
+        payload: Option<Payload>,
+        registration: Option<Registration>,
+        reservation_identity: Option<crate::admission::reservations::PreparedSubscriptionIdentity>,
+    },
     Finish {
         payload: Option<Payload>,
+        registration: Option<Registration>,
+        reservation_identity: Option<crate::admission::reservations::PreparedSubscriptionIdentity>,
         target: Arc<Target>,
         reservation: Option<botster_hub_client::DaemonSubscriptionReservation>,
         error: Option<(&'static str, &'static str)>,
@@ -224,6 +232,7 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
         Command::Prepare {
             invocation,
             result,
+            inconsistent,
             target,
         } => {
             let family = Arc::new(invocation.expected_entity_kind().as_str().to_string());
@@ -236,14 +245,18 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
                 ),
             });
             let (result, charge) = result.into_parts();
-            let converted = result
-                .map_err(|message| McpToolError::new("plugin_completion_inconsistent", message))
-                .and_then(|result| {
-                    HubRuntime::convert_plugin_entity_snapshot(
-                        invocation.expected_entity_kind(),
-                        result,
-                    )
-                });
+            let converted = if inconsistent {
+                drop(result);
+                Err(McpToolError::new(
+                    "plugin_completion_inconsistent",
+                    "plugin completion identity did not match the admitted request",
+                ))
+            } else {
+                HubRuntime::convert_plugin_entity_snapshot(
+                    invocation.expected_entity_kind(),
+                    result,
+                )
+            };
             let body = match converted {
                 Ok((sequence, items)) => {
                     if crate::bounded_json::encode(
@@ -320,8 +333,20 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
             drop(payload);
             Completion::Reclaimed
         }
+        Command::Discard {
+            payload,
+            registration,
+            reservation_identity,
+        } => {
+            drop(payload);
+            drop(registration);
+            drop(reservation_identity);
+            Completion::Reclaimed
+        }
         Command::Finish {
             payload,
+            registration,
+            reservation_identity,
             target,
             reservation,
             error,
@@ -329,6 +354,8 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
             reply_tx,
             publication_live,
         } => {
+            drop(registration);
+            drop(reservation_identity);
             let provider_error = payload.and_then(|payload| match payload.body {
                 Body::Error(error) => Some(error),
                 _ => None,
@@ -414,6 +441,8 @@ mod tests {
             .submit(
                 OwnerWorkIdentity::first(WaiterId(903)),
                 HostCommand::PluginEntity(Command::Finish {
+                    registration: None,
+                    reservation_identity: None,
                     payload: Some(Payload {
                         body: Body::Error(McpToolError::new("provider_error", "provider detail")),
                     }),

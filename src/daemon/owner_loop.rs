@@ -3420,37 +3420,7 @@ return botster.register({
             );
             let deadline = Instant::now() + Duration::from_secs(5);
             let response = loop {
-                if let Some(runtime) = daemon.runtime() {
-                    let DaemonControlState {
-                        maintenance,
-                        plugin_controls,
-                        plugin_entities,
-                        plugin_result_budget,
-                        ..
-                    } = &mut state;
-                    let _ = run_completion_drain_slice_for_owner(
-                        runtime,
-                        maintenance,
-                        plugin_controls,
-                        plugin_entities,
-                        plugin_result_budget,
-                    );
-                }
-                for waiter_id in state.plugin_entities.take_ready_waiters(8) {
-                    crate::daemon::control::entities::mark_plugin_entity_ready(
-                        &mut state,
-                        waiter_id,
-                        crate::daemon::owner_schedule::ReadyClass::PluginCompletion,
-                        crate::daemon::control::pending::READY_PLUGIN_COMPLETION,
-                    );
-                }
-                if let Some(item) = state.owner_ready.pop_next() {
-                    let _ = crate::daemon::control::entities::drive_plugin_entity_ready_item(
-                        &mut daemon,
-                        &mut state,
-                        item,
-                    );
-                }
+                drive_ready_test_turn(&mut daemon, &mut state);
                 match reply_rx.try_recv() {
                     Ok(reply) => break reply.into_parts().0.expect("entity response"),
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
@@ -3676,15 +3646,25 @@ return botster.register({
                 );
             }
 
-            assert_eq!(state.budget.outstanding(), baseline);
+            assert_eq!(state.budget.outstanding(), baseline + 1);
             assert!(state.deadlines.is_empty());
             assert!(
                 crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::ZERO),
-                "Core execution must remain live after Hub releases entity reply capacity"
+                "Core execution must remain live while Hub retains entity cleanup capacity"
             );
 
             crate::lua_runtime::release_test_plugin_invocation_gate();
             drop(reply_rx);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while state.budget.outstanding() != baseline {
+                drive_ready_test_turn(&mut daemon, &mut state);
+                assert!(
+                    Instant::now() < deadline,
+                    "entity cancellation must finish worker cleanup"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(state.plugin_result_budget.retained_bytes(), 0);
             daemon.stop();
         }
     }

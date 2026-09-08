@@ -1,6 +1,8 @@
 //! Entity subscription control-message family.
 
-use std::collections::{BTreeMap, VecDeque};
+mod worker;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 use botster_core::{
@@ -17,8 +19,7 @@ use crate::daemon::owner_budget::{OwnerPermit, RETAINED_OPERATION_DEADLINE};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::runtime::PluginEntitySnapshotInvocation;
 use crate::subscription::entity::{
-    EntityFrameSender, apply_package_entity_resync_snapshot, entity_subscription_error,
-    register_builtin_entity_subscription,
+    EntityFrameSender, entity_subscription_error, register_builtin_entity_subscription,
 };
 use botster_hub_client::{DaemonRequest, DaemonResponse, DaemonResponseKind};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -45,21 +46,26 @@ enum PendingPluginEntityKind {
         entity_type: String,
         permit: OwnerPermit,
     },
+    Fanout {
+        permit: OwnerPermit,
+    },
 }
 
 struct PendingPluginEntity {
+    request_id: String,
     waiter_id: crate::owner_identity::WaiterId,
     ready_key: Option<crate::daemon::owner_schedule::ReadyKey>,
     deadline_key: Option<crate::daemon::owner_schedule::DeadlineKey>,
-    identity: PluginEntityIdentity,
-    invocation: PluginEntitySnapshotInvocation,
+    identity: Option<PluginEntityIdentity>,
+    invocation: Option<PluginEntitySnapshotInvocation>,
     kind: PendingPluginEntityKind,
     result: Option<RoutedPluginEntityCompletion>,
+    work: worker::EntityWork,
 }
 
 enum RoutedPluginEntityCompletion {
     Invocation(RetainedPluginResult<PluginInvocationResult>),
-    Inconsistent(RetainedPluginResult<String>),
+    Inconsistent(RetainedPluginResult<PluginInvocationResult>),
 }
 
 /// Bounded owner-side state for asynchronous entity-provider calls.
@@ -71,6 +77,9 @@ pub(crate) struct PluginEntityState {
     by_waiter: BTreeMap<crate::owner_identity::WaiterId, String>,
     ready: VecDeque<crate::owner_identity::WaiterId>,
     completion_inconsistencies: u64,
+    capacity_waiters: BTreeSet<crate::owner_identity::WaiterId>,
+    delivery_waiters: BTreeSet<crate::owner_identity::WaiterId>,
+    active_delivery: Option<crate::owner_identity::WaiterId>,
 }
 
 impl std::fmt::Debug for PluginEntityState {
@@ -99,7 +108,10 @@ impl PluginEntityState {
         self.pending
             .values()
             .filter(|entry| {
-                entry.identity.connection_generation == generation
+                entry
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.connection_generation == generation)
                     && matches!(entry.kind, PendingPluginEntityKind::Subscribe(_))
             })
             .count()
@@ -111,20 +123,32 @@ impl PluginEntityState {
         waiter_id: crate::owner_identity::WaiterId,
         invocation: PluginEntitySnapshotInvocation,
         identity: PluginEntityIdentity,
-        kind: PendingPluginEntityKind,
+        mut kind: PendingPluginEntityKind,
     ) {
         let request_id = invocation.request.request_id.0.clone();
+        let target = match &mut kind {
+            PendingPluginEntityKind::Subscribe(subscribe) => {
+                Some(std::sync::Arc::new(crate::plugin_entity::Target {
+                    subscription_id: std::mem::take(&mut subscribe.request.subscription_id),
+                    entity_type: std::mem::take(&mut subscribe.request.entity_type),
+                    sender: subscribe.request.frame_tx.clone(),
+                }))
+            }
+            _ => None,
+        };
         self.by_waiter.insert(waiter_id, request_id.clone());
         self.pending.insert(
-            request_id,
+            request_id.clone(),
             PendingPluginEntity {
+                request_id,
                 waiter_id,
                 ready_key: None,
                 deadline_key: None,
-                identity,
-                invocation,
+                identity: Some(identity),
+                invocation: Some(invocation),
                 kind,
                 result: None,
+                work: worker::EntityWork::new(target),
             },
         );
     }
@@ -144,19 +168,15 @@ impl PluginEntityState {
         };
         let mut became_ready = false;
         if completion.value().class != PluginInvocationClass::RequestResponse
-            || entry.identity.plugin_key != handler.plugin_key.0
-            || entry.identity.handler != handler
+            || !entry.identity.as_ref().is_some_and(|identity| {
+                identity.plugin_key == handler.plugin_key.0 && identity.handler == handler
+            })
         {
             self.completion_inconsistencies = self.completion_inconsistencies.saturating_add(1);
             if entry.result.is_none() {
-                entry.result = Some(RoutedPluginEntityCompletion::Inconsistent(completion.map(
-                    |_| {
-                        format!(
-                            "plugin completion identity did not match admitted request {}",
-                            request_id.0
-                        )
-                    },
-                )));
+                entry.result = Some(RoutedPluginEntityCompletion::Inconsistent(
+                    completion.map(|completion| completion.result),
+                ));
                 became_ready = true;
             }
         } else if entry.result.is_none() {
@@ -210,11 +230,49 @@ impl PluginEntityState {
         self.pending.get_mut(&request_id)
     }
 
+    fn restore(&mut self, entry: PendingPluginEntity) {
+        self.by_waiter
+            .insert(entry.waiter_id, entry.request_id.clone());
+        self.pending.insert(entry.request_id.clone(), entry);
+    }
+
+    pub(crate) fn accepts_host_completion(
+        &self,
+        identity: crate::host_executor::HostJobIdentity,
+    ) -> bool {
+        self.by_waiter
+            .get(&identity.waiter_id)
+            .and_then(|request| self.pending.get(request))
+            .is_some_and(|entry| entry.work.accepts(identity))
+    }
+
+    pub(crate) fn retain_host_completion(
+        &mut self,
+        completion: crate::host_executor::HostCompletion,
+    ) {
+        let entry = self
+            .entry_for_waiter_mut(completion.identity.waiter_id)
+            .expect("an accepted entity completion has a pending row");
+        entry
+            .work
+            .retain_completion(completion)
+            .expect("the entity completion matches its retained phase");
+    }
+
+    pub(crate) fn has_capacity_waiters(&self) -> bool {
+        !self.capacity_waiters.is_empty()
+    }
+
+    pub(crate) fn pop_capacity_waiter(&mut self) -> Option<crate::owner_identity::WaiterId> {
+        self.capacity_waiters.pop_first()
+    }
+
     pub(crate) fn clear_deadline(&mut self, waiter_id: crate::owner_identity::WaiterId) -> bool {
         let Some(entry) = self.entry_for_waiter_mut(waiter_id) else {
             return false;
         };
         entry.deadline_key = None;
+        entry.work.cancel();
         true
     }
 
@@ -227,14 +285,24 @@ impl PluginEntityState {
 
     fn take_matching_subscriptions(
         &mut self,
-        mut predicate: impl FnMut(&PendingEntitySubscribe, &PluginEntityIdentity) -> bool,
+        mut predicate: impl FnMut(
+            &PendingEntitySubscribe,
+            &PluginEntityIdentity,
+            &crate::plugin_entity::Target,
+        ) -> bool,
     ) -> Vec<PendingPluginEntity> {
         let request_ids: Vec<String> = self
             .pending
             .iter()
             .filter_map(|(request_id, entry)| match &entry.kind {
                 PendingPluginEntityKind::Subscribe(subscribe)
-                    if predicate(subscribe, &entry.identity) =>
+                    if entry
+                        .identity
+                        .as_ref()
+                        .zip(entry.work.target.as_deref())
+                        .is_some_and(|(identity, target)| {
+                            predicate(subscribe, identity, target)
+                        }) =>
                 {
                     Some(request_id.clone())
                 }
@@ -253,7 +321,7 @@ impl PluginEntityState {
             matches!(
                 &entry.kind,
                 PendingPluginEntityKind::Subscribe(subscribe)
-                    if subscribe.request.subscription_id == subscription_id
+                    if entry.work.target.as_ref().is_some_and(|target| target.subscription_id == subscription_id) && !entry.work.cancelled
             )
         })
     }
@@ -652,6 +720,48 @@ pub(crate) fn begin_plugin_entity_resync(
     }
 }
 
+pub(crate) fn begin_package_entity_fanout(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if state.plugin_entities.active_delivery.is_some()
+        || !daemon
+            .runtime()
+            .is_some_and(|runtime| runtime.has_package_entity_fanout())
+    {
+        return;
+    }
+    let Some(permit) = state.budget.reserve() else {
+        return;
+    };
+    let Some(waiter_id) = state.waiter_ids.next() else {
+        state.budget.release(permit);
+        return;
+    };
+    let Some(request_id) = state.plugin_entities.next_request_id() else {
+        state.budget.release(permit);
+        return;
+    };
+    let mut work = worker::EntityWork::new(None);
+    work.snapshot = false;
+    work.stage = worker::Stage::Begin;
+    state.plugin_entities.restore(PendingPluginEntity {
+        request_id: request_id.0,
+        waiter_id,
+        ready_key: None,
+        deadline_key: None,
+        identity: None,
+        invocation: None,
+        kind: PendingPluginEntityKind::Fanout { permit },
+        result: None,
+        work,
+    });
+    state.plugin_entities.active_delivery = Some(waiter_id);
+    mark_plugin_entity_ready(
+        state,
+        waiter_id,
+        crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+        crate::daemon::control::pending::READY_HOST_COMPLETION,
+    );
+}
+
 /// Apply one exact entity-provider completion or deadline.
 pub(crate) fn drive_plugin_entity_ready_item(
     daemon: &mut HubDaemon,
@@ -662,105 +772,43 @@ pub(crate) fn drive_plugin_entity_ready_item(
     let Some(mut entry) = state.plugin_entities.take_waiter(waiter_id) else {
         return false;
     };
-    state.deadlines.retire(waiter_id);
-    let Some(completion) = entry.result.take() else {
-        retire_plugin_entity_entries(daemon, state, vec![entry], true);
-        return true;
-    };
-    match entry.kind {
-        PendingPluginEntityKind::Subscribe(subscribe) => {
-            let PendingEntitySubscribe {
-                request, permit, ..
-            } = subscribe;
-            let EntitySubscribeRequest {
-                entity_type,
-                subscription_id,
-                frame_rx,
-                frame_tx,
-                reply_tx,
-                grant_id,
-                ..
-            } = request;
-            let (completion, plugin_result_charge) = match completion {
-                RoutedPluginEntityCompletion::Invocation(result) => {
-                    let (result, charge) = result.into_parts();
-                    (Ok(result), charge)
+    entry.ready_key = None;
+    let step = worker::step(daemon, state, &mut entry);
+    match step {
+        worker::Step::Done => {
+            state.deadlines.retire(waiter_id);
+            state.plugin_entities.capacity_waiters.remove(&waiter_id);
+            state.plugin_entities.delivery_waiters.remove(&waiter_id);
+            if state.plugin_entities.active_delivery == Some(waiter_id) {
+                state.plugin_entities.active_delivery = None;
+                if let Some(waiter) = state.plugin_entities.delivery_waiters.pop_first() {
+                    mark_plugin_entity_ready(
+                        state,
+                        waiter,
+                        crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                        crate::daemon::control::pending::READY_HOST_COMPLETION,
+                    );
                 }
-                RoutedPluginEntityCompletion::Inconsistent(message) => {
-                    let (message, charge) = message.into_parts();
-                    (Err(message), charge)
-                }
+                state
+                    .maintenance
+                    .wakes
+                    .mark(crate::daemon_maintenance::MaintenanceSliceKind::ProviderResync);
+            }
+            let permit = match entry.kind {
+                PendingPluginEntityKind::Subscribe(subscribe) => subscribe.permit,
+                PendingPluginEntityKind::Resync { permit, .. }
+                | PendingPluginEntityKind::Fanout { permit } => permit,
             };
-            let mut response = match daemon.runtime() {
-                    Some(runtime) => match completion {
-                        Ok(result) => match runtime
-                            .complete_plugin_entity_snapshot(entry.invocation, result)
-                        {
-                            Ok((snapshot_seq, items)) => {
-                                crate::subscription::entity::register_package_entity_subscription_snapshot(
-                                    daemon,
-                                    state,
-                                    entity_type,
-                                    subscription_id.clone(),
-                                    frame_tx,
-                                    grant_id.clone(),
-                                    snapshot_seq,
-                                    items,
-                                )
-                            }
-                            Err(error) => Ok(entity_subscription_error(
-                                &error.code,
-                                &subscription_id,
-                                &error.message,
-                            )),
-                        },
-                        Err(message) => {
-                            runtime.retire_plugin_entity_snapshot(&entry.invocation);
-                            Ok(entity_subscription_error(
-                                "plugin_completion_inconsistent",
-                                &subscription_id,
-                                &message,
-                            ))
-                        }
-                    },
-                    None => Err(DaemonTransportError::DaemonNotRunning),
-                };
             state.budget.release(permit);
-            finish_entity_subscribe_response(
-                state,
-                &subscription_id,
-                frame_rx,
-                grant_id,
-                reply_tx,
-                &mut response,
-                Some(plugin_result_charge),
-            );
         }
-        PendingPluginEntityKind::Resync {
-            entity_type,
-            permit,
-        } => {
-            let completed = daemon.runtime().and_then(|runtime| match completion {
-                RoutedPluginEntityCompletion::Invocation(result) => {
-                    let (result, _charge) = result.into_parts();
-                    runtime
-                        .complete_plugin_entity_snapshot(entry.invocation, result)
-                        .ok()
-                }
-                RoutedPluginEntityCompletion::Inconsistent(message) => {
-                    let (_message, _charge) = message.into_parts();
-                    runtime.retire_plugin_entity_snapshot(&entry.invocation);
-                    None
-                }
-            });
-            state.budget.release(permit);
-            if let Some((snapshot_seq, items)) = completed {
-                apply_package_entity_resync_snapshot(
-                    daemon,
+        step => {
+            state.plugin_entities.restore(entry);
+            if matches!(step, worker::Step::Again) {
+                mark_plugin_entity_ready(
                     state,
-                    &entity_type,
-                    snapshot_seq,
-                    items,
+                    waiter_id,
+                    crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                    crate::daemon::control::pending::READY_HOST_COMPLETION,
                 );
             }
         }
@@ -776,7 +824,7 @@ pub(crate) fn retire_plugin_entity_connection(
 ) {
     let retired = state
         .plugin_entities
-        .take_matching_subscriptions(|_, identity| identity.connection_id == connection_id);
+        .take_matching_subscriptions(|_, identity, _| identity.connection_id == connection_id);
     retire_plugin_entity_entries(daemon, state, retired, true);
 }
 
@@ -791,14 +839,15 @@ fn retire_plugin_entity_entries(
             state.owner_ready.remove(key);
         }
         state.deadlines.retire(entry.waiter_id);
-        if let Some(runtime) = daemon.runtime() {
-            runtime.retire_plugin_entity_snapshot(&entry.invocation);
-        }
-        let permit = match entry.kind {
-            PendingPluginEntityKind::Subscribe(subscribe) => subscribe.permit,
-            PendingPluginEntityKind::Resync { permit, .. } => permit,
-        };
-        state.budget.release(permit);
+        entry.work.cancel();
+        let waiter_id = entry.waiter_id;
+        state.plugin_entities.restore(entry);
+        mark_plugin_entity_ready(
+            state,
+            waiter_id,
+            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+            crate::daemon::control::pending::READY_HOST_COMPLETION,
+        );
         if count_abandoned {
             state.budget.counters.retired_abandoned =
                 state.budget.counters.retired_abandoned.saturating_add(1);
@@ -814,11 +863,127 @@ fn retire_plugin_entity_subscription(
 ) {
     let retired = state
         .plugin_entities
-        .take_matching_subscriptions(|subscribe, _| {
-            subscribe.request.subscription_id == subscription_id
+        .take_matching_subscriptions(|subscribe, _, target| {
+            target.subscription_id == subscription_id
                 && owner.is_none_or(|owner| subscribe.request.grant_id.as_deref() == Some(owner))
         });
     retire_plugin_entity_entries(daemon, state, retired, true);
+}
+
+fn prepare_package_entity_reservation(
+    state: &mut DaemonControlState,
+    subscription_id: &str,
+    frame_rx: Option<tokio_mpsc::Receiver<crate::entity_delivery::EntityDelivery>>,
+    grant_id: Option<&str>,
+    identity: &mut Option<crate::admission::reservations::PreparedSubscriptionIdentity>,
+    error: &mut Option<(&'static str, &'static str)>,
+) -> Option<botster_hub_client::DaemonSubscriptionReservation> {
+    let (Some(grant_id), Some(frame_rx)) = (grant_id, frame_rx) else {
+        return None;
+    };
+    let Some(peer_generation) = state
+        .pending_runtime
+        .admission
+        .webrtc_admissions
+        .get(grant_id)
+        .map(|admission| match admission {
+            crate::admission::unix_hello::WebrtcTerminalAdmission::Admitted {
+                peer_generation,
+                ..
+            }
+            | crate::admission::unix_hello::WebrtcTerminalAdmission::Rejected {
+                peer_generation,
+                ..
+            } => *peer_generation,
+        })
+    else {
+        *error = Some((
+            "local_webrtc_peer_gone",
+            "local WebRTC peer admission is no longer live",
+        ));
+        return None;
+    };
+    let Some(generation) = state
+        .pending_runtime
+        .admission
+        .next_subscription_generation
+        .checked_add(1)
+    else {
+        *error = Some((
+            "subscription_generation_exhausted",
+            "the daemon exhausted subscription generations",
+        ));
+        return None;
+    };
+    state.pending_runtime.admission.next_subscription_generation = generation;
+    let reserved = state
+        .pending_runtime
+        .admission
+        .reservations
+        .reserve_subscription_prepared(
+            crate::admission::connection_budget::ChannelClass::Entity,
+            identity
+                .take()
+                .expect("a registered package subscription retains its prepared identity"),
+            generation,
+            peer_generation,
+            crate::admission::reservations::now_seconds(),
+            crate::admission::reservations::ReservationBinding::Entity {
+                receiver: std::sync::Arc::new(std::sync::Mutex::new(Some(frame_rx))),
+            },
+        );
+    let reservation = match reserved {
+        Ok(reservation) => reservation,
+        Err(_) => {
+            *error = Some((
+                "reservation_label_conflict",
+                "a live entity reservation already exists for this route",
+            ));
+            return None;
+        }
+    };
+    let reserved_budget = state
+        .pending_runtime
+        .admission
+        .connection_budgets
+        .get_mut(&peer_generation)
+        .is_some_and(|budget| {
+            budget
+                .reserve(
+                    reservation.label.clone(),
+                    crate::admission::connection_budget::ChannelClass::Entity,
+                )
+                .is_ok()
+        });
+    if reserved_budget
+        && crate::daemon::owner_loop::arm_reservation_deadline(
+            state,
+            reservation.label.clone(),
+            peer_generation,
+            reservation.expires_in_seconds,
+        )
+    {
+        return Some(reservation);
+    }
+    if let Some(budget) = state
+        .pending_runtime
+        .admission
+        .connection_budgets
+        .get_mut(&peer_generation)
+    {
+        let _ = budget.release(&reservation.label);
+    }
+    let _ = state
+        .pending_runtime
+        .admission
+        .reservations
+        .forget_label(&reservation.label, peer_generation);
+    remove_entity_subscription(state, subscription_id);
+    *error = Some((
+        "connection_channel_limit",
+        "the WebRTC connection channel budget rejected the reservation",
+    ));
+    None
 }
 
 fn finish_entity_subscribe_response(
@@ -981,17 +1146,8 @@ fn unsubscribe(
                 Some(owner) => owner == grant_id,
             },
         };
-        if should_remove
-            && state
-                .entity_subscriptions
-                .remove(&subscription_id)
-                .is_some()
-        {
-            state.lifecycle_counters.live_entity_subscriptions = state
-                .lifecycle_counters
-                .live_entity_subscriptions
-                .saturating_sub(1);
-            state.released_entity_generations = state.released_entity_generations.saturating_add(1);
+        if should_remove {
+            remove_entity_subscription(state, &subscription_id);
         }
         if let Some(reply_tx) = reply_tx {
             // Idempotent unsubscribed reply for the stale client even when the row is
@@ -1002,17 +1158,7 @@ fn unsubscribe(
         }
         return false;
     }
-    if state
-        .entity_subscriptions
-        .remove(&subscription_id)
-        .is_some()
-    {
-        state.lifecycle_counters.live_entity_subscriptions = state
-            .lifecycle_counters
-            .live_entity_subscriptions
-            .saturating_sub(1);
-        state.released_entity_generations = state.released_entity_generations.saturating_add(1);
-    }
+    remove_entity_subscription(state, &subscription_id);
     if let Some(peer_generation) = peer_generation {
         let labels = state
             .pending_runtime
