@@ -5,14 +5,27 @@ use std::io;
 use std::mem;
 use std::path::PathBuf;
 
-use botster_core::PackageConfigurationValue;
-#[cfg(test)]
-use botster_hub_client::DaemonResponseKind;
-use botster_hub_client::{DaemonEvent, DaemonRequest, DaemonResponse, MAX_CONTROL_RESPONSE_BYTES};
+use botster_core::{
+    PackageConfigurationValue, PackageSource, RunnableEntrypointKind, RunnableEntrypointLaunchMode,
+};
+use botster_hub_client::{
+    DaemonAvailablePackage, DaemonCapability, DaemonEvent, DaemonPackageCompatibility,
+    DaemonPackageDiagnostic, DaemonPackageInstallEffect, DaemonPackageInstallPlan,
+    DaemonPackagePin, DaemonPackageUpdateStatus, DaemonRequest, DaemonResolvedAppLaunch,
+    DaemonResponse, DaemonResponseKind, MAX_CONTROL_RESPONSE_BYTES,
+};
+use botster_ui_contract::PackageSurfaceKind;
 
 use crate::client_api::HubClientPackage;
+use crate::client_api_dto::package::{
+    daemon_package_decision_from_policy, daemon_package_pin_from_policy,
+    package_classification_label, package_compatibility_label, package_pin_from_daemon,
+    registry_source_kind_label, update_status_actions,
+};
 use crate::client_api_dto::response::{
-    daemon_apps, daemon_packages, daemon_resolved_session_type, daemon_session_type_definition,
+    daemon_apps, daemon_available_packages, daemon_package_install_plan, daemon_package_navigation,
+    daemon_package_update_status, daemon_packages, daemon_resolved_app_launch,
+    daemon_resolved_package_route, daemon_resolved_session_type, daemon_session_type_definition,
     daemon_session_types, daemon_spawn_target_validation, daemon_spawn_targets, daemon_worktrees,
 };
 use crate::client_api_dto::session::{
@@ -26,10 +39,16 @@ use crate::daemon::control::session_types::{
     session_type_catalog_entities,
 };
 use crate::daemon::error::DaemonTransportError;
-use crate::daemon_projection::apps_from_registry;
+use crate::daemon::error::{daemon_app_launch_error, daemon_package_route_error};
+use crate::daemon_projection::{
+    apps_from_registry, package_route_descriptors, package_state_label,
+    runnable_entrypoint_kind_label, runnable_launch_mode_label,
+};
 use crate::entrypoint_supervisor::EntrypointProcessSnapshot;
 use crate::host_executor::HOST_PREPARED_BYTE_CAPACITY;
-use crate::packages::{PackageAction, PackageAdmissionReason, PackageRegistryError};
+use crate::packages::{
+    PackageAction, PackageAdmissionReason, PackageDecision, PackageRegistryError, PackageState,
+};
 use crate::persistence::{FileHubStateStore, HubState, PreparedHubStateWrite};
 use crate::session_types::{
     PackageSessionType, RepoSessionTypeFileSnapshot, SessionTypeMutation,
@@ -40,6 +59,7 @@ use crate::session_types::{
 use crate::shared_view::SharedView;
 use crate::{
     PackageRegistry, SpawnTargetCreate, SpawnTargetError, SpawnTargetUpdate, WorktreeCreate,
+    resolve_foreground_launch_contract,
 };
 
 /// Execute one owned host mutation command.
@@ -89,6 +109,7 @@ impl std::fmt::Debug for HostMutationCommand {
 pub(crate) enum HostRead {
     Package {
         request: DaemonRequest,
+        config: HubConfig,
         packages: SharedView<PackageRegistry>,
         entrypoint_processes: Vec<EntrypointProcessSnapshot>,
     },
@@ -231,6 +252,42 @@ pub(crate) struct PreparedStateChange {
     write: PreparedHubStateWrite,
     reply: HostReply,
     packages: Option<SharedView<PackageRegistry>>,
+    package_effect: Option<PackageRuntimeEffect>,
+}
+
+/// One live runtime effect that the owner must apply after a package commit.
+pub(crate) enum PackageRuntimeEffect {
+    Enable {
+        package_name: String,
+        previous_state: SharedView<HubState>,
+        previous_packages: SharedView<PackageRegistry>,
+    },
+    Disable {
+        package_name: String,
+    },
+    Remove {
+        package_name: String,
+    },
+    Reload {
+        package_name: String,
+        reload_plugin: bool,
+        previous_state: SharedView<HubState>,
+        previous_packages: SharedView<PackageRegistry>,
+        running_entrypoints: Vec<String>,
+    },
+    Refresh {
+        previous_state: SharedView<HubState>,
+        previous_packages: SharedView<PackageRegistry>,
+        running_entrypoints: BTreeMap<String, Vec<String>>,
+        packages: Vec<PackageRefreshEffect>,
+    },
+}
+
+/// Post-commit work for one refreshed local package.
+pub(crate) struct PackageRefreshEffect {
+    pub(crate) package_name: String,
+    pub(crate) reload_plugin: bool,
+    pub(crate) restart_entrypoints: Vec<String>,
 }
 
 /// A prepared session-type write across Hub state and an optional repository file.
@@ -267,6 +324,7 @@ pub(crate) struct CommittedView {
     pub(crate) committed_revision: u64,
     pub(crate) view: SharedView<HubState>,
     pub(crate) packages: Option<SharedView<PackageRegistry>>,
+    pub(crate) package_effect: Option<PackageRuntimeEffect>,
     pub(crate) reply: HostReply,
 }
 
@@ -328,9 +386,10 @@ fn execute_read(read: HostRead) -> Result<HostReply, HostMutationError> {
     let response = match read {
         HostRead::Package {
             request,
+            config,
             packages,
             entrypoint_processes,
-        } => package_read(request, &packages, entrypoint_processes)?,
+        } => package_read(request, &config, &packages, entrypoint_processes)?,
         HostRead::SpawnTarget { request, state } => spawn_target_read(request, &state)?,
         HostRead::SessionType {
             request,
@@ -391,6 +450,7 @@ fn session_type_read(
 
 fn package_read(
     request: DaemonRequest,
+    config: &HubConfig,
     packages: &PackageRegistry,
     entrypoint_processes: Vec<EntrypointProcessSnapshot>,
 ) -> Result<DaemonResponse, HostMutationError> {
@@ -423,8 +483,449 @@ fn package_read(
             packages,
             entrypoint_processes,
         ))),
+        DaemonRequest::ResolveAppLaunch {
+            package_name,
+            entrypoint_id,
+        } => resolve_app_launch(config, packages, &package_name, &entrypoint_id),
+        DaemonRequest::ResolvePackageRoute {
+            package_name,
+            route_id,
+        } => Ok(resolve_package_route(packages, &package_name, &route_id)),
+        DaemonRequest::ListPackageNavigation => {
+            let rows = packages
+                .packages()
+                .into_iter()
+                .map(|record| HubClientPackage::from_record(packages, record))
+                .collect::<Vec<_>>();
+            let navigation = rows.iter().flat_map(package_navigation_for_row).collect();
+            Ok(daemon_package_navigation(navigation, &rows))
+        }
+        DaemonRequest::ListAvailablePackages { registry_path } => packages
+            .available_packages(&registry_path)
+            .map(|rows| daemon_available_packages(rows, &registry_path))
+            .map_err(package_error),
+        DaemonRequest::InspectAvailablePackage {
+            registry_path,
+            entry_id,
+        } => packages
+            .inspect_available_package(&registry_path, &entry_id)
+            .map(|row| daemon_available_packages(vec![row], &registry_path))
+            .map_err(package_error),
+        DaemonRequest::PreviewPackageInstall {
+            registry_path,
+            entry_id,
+        } => packages
+            .preview_registry_install(registry_path, &entry_id)
+            .map(daemon_package_install_plan)
+            .map_err(package_error),
+        DaemonRequest::CheckPackageUpdate { package_name } => {
+            package_update_status(packages, &entrypoint_processes, &package_name, None)
+                .map(daemon_package_update_status)
+        }
+        DaemonRequest::PreviewPackageUpdate { package_name, pin } => {
+            let update_status = package_update_status(
+                packages,
+                &entrypoint_processes,
+                &package_name,
+                Some(pin.clone()),
+            )?;
+            let mut response = daemon_package_update_status(update_status.clone());
+            response.install_plan = Some(package_update_plan(
+                packages,
+                update_status,
+                &package_name,
+                pin,
+            )?);
+            Ok(response)
+        }
         request => Err(HostMutationError::unsupported(&request, "package read")),
     }
+}
+
+fn package_navigation_for_row(
+    package: &HubClientPackage,
+) -> Vec<crate::HubClientPackageNavigationEntry> {
+    if !package.navigation.is_empty() {
+        return package.navigation.clone();
+    }
+    package
+        .surfaces
+        .iter()
+        .filter(|surface| surface.kind == PackageSurfaceKind::App)
+        .map(|surface| crate::HubClientPackageNavigationEntry {
+            package_name: package.package_name.clone(),
+            item_id: surface.id.clone(),
+            label: surface.title.clone(),
+            icon: surface.icon.clone(),
+            description: surface.description.clone(),
+            target: crate::HubClientPackageNavigationTarget::Surface {
+                surface_id: surface.id.clone(),
+            },
+        })
+        .collect()
+}
+
+fn resolve_package_route(
+    packages: &PackageRegistry,
+    package_name: &str,
+    route_id: &str,
+) -> DaemonResponse {
+    let Some(record) = packages.package(package_name) else {
+        return daemon_package_route_error(
+            package_name,
+            route_id,
+            "package_not_installed",
+            "package is not installed",
+        );
+    };
+    let package = HubClientPackage::from_record(packages, record);
+    match package_route_descriptors(&package)
+        .into_iter()
+        .find(|route| route.route_id == route_id)
+    {
+        Some(route) => daemon_resolved_package_route(route),
+        None => daemon_package_route_error(
+            package_name,
+            route_id,
+            "route_not_found",
+            "package route is not declared",
+        ),
+    }
+}
+
+fn resolve_app_launch(
+    config: &HubConfig,
+    packages: &PackageRegistry,
+    package_name: &str,
+    entrypoint_id: &str,
+) -> Result<DaemonResponse, HostMutationError> {
+    let data_directory = runtime_path(config.data_directory.clone());
+    let socket =
+        runtime_path(crate::transport::unix::listener::socket_path(config).map_err(daemon_error)?);
+    let Some(record) = packages.package(package_name) else {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "package_not_installed",
+            "package is not installed",
+        ));
+    };
+    if !record.is_enabled() {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "package_not_enabled",
+            "package is not enabled",
+        ));
+    }
+    let Some(entrypoint) = record
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id)
+    else {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "entrypoint_not_found",
+            "entrypoint is not installed for package",
+        ));
+    };
+    if !matches!(entrypoint.kind, RunnableEntrypointKind::TerminalApp) {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "unsupported_app_kind",
+            "app is not a terminal_app",
+        ));
+    }
+    if !matches!(
+        entrypoint.launch_mode,
+        RunnableEntrypointLaunchMode::ForegroundStdio
+    ) {
+        return Ok(daemon_app_launch_error(
+            package_name,
+            entrypoint_id,
+            "unsupported_launch_mode",
+            "terminal app must use foreground_stdio launch mode",
+        ));
+    }
+    let launch =
+        match resolve_foreground_launch_contract(record, entrypoint, &data_directory, &socket) {
+            Ok(launch) => launch,
+            Err(message) => {
+                return Ok(daemon_app_launch_error(
+                    package_name,
+                    entrypoint_id,
+                    "launch_contract_unavailable",
+                    message,
+                ));
+            }
+        };
+    Ok(daemon_resolved_app_launch(DaemonResolvedAppLaunch {
+        package_name: record.manifest.name.clone(),
+        app_id: entrypoint.id.clone(),
+        entrypoint_id: entrypoint.id.clone(),
+        kind: runnable_entrypoint_kind_label(&entrypoint.kind).to_string(),
+        launch_mode: runnable_launch_mode_label(&entrypoint.launch_mode).to_string(),
+        command: launch.command,
+        args: launch.args,
+        working_directory: launch.working_directory.display().to_string(),
+        environment: launch.environment,
+    }))
+}
+
+fn runtime_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn package_update_status(
+    packages: &PackageRegistry,
+    entrypoint_processes: &[EntrypointProcessSnapshot],
+    package_name: &str,
+    proposed_pin: Option<DaemonPackagePin>,
+) -> Result<DaemonPackageUpdateStatus, HostMutationError> {
+    let record = packages.package(package_name).ok_or_else(|| {
+        package_error(PackageRegistryError::without_record(
+            package_name,
+            PackageAction::CheckUpdate,
+            PackageAdmissionReason::PackageNotInstalled,
+            "daemon socket check package update".to_string(),
+        ))
+    })?;
+    let source_metadata_present = record.source_metadata.is_some();
+    let local_path_source = matches!(record.manifest.source, Some(PackageSource::Path { .. }));
+    let existing_pin = record.pin.clone();
+    let enabled = package_state_label(record.state.into()) == "enabled";
+    let live_entrypoint = entrypoint_processes
+        .iter()
+        .any(|snapshot| snapshot.package_name == package_name && snapshot.state == "running");
+    let pin = proposed_pin.or_else(|| existing_pin.map(daemon_package_pin_from_policy));
+    let mut diagnostics = Vec::new();
+    if !source_metadata_present {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "update_unavailable".to_string(),
+            message:
+                "update resolution is unavailable for packages without registry source metadata"
+                    .to_string(),
+        });
+    }
+    if pin.is_none() {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "pin_required".to_string(),
+            message: "apply update requires explicit pinned source metadata".to_string(),
+        });
+    }
+    if enabled && !local_path_source {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "reload_unavailable".to_string(),
+            message: "enabled package changes require an operator disable/enable cycle".to_string(),
+        });
+    } else if enabled {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "reload_available".to_string(),
+            message: "enabled local path package changes can be reloaded with reload_package"
+                .to_string(),
+        });
+    }
+    if live_entrypoint {
+        diagnostics.push(DaemonPackageDiagnostic {
+            kind: "restart_required".to_string(),
+            message: "running package entrypoints must be restarted after update metadata changes"
+                .to_string(),
+        });
+    }
+    let has_pin = pin.is_some();
+    let actions = update_status_actions(
+        package_name,
+        pin.as_ref(),
+        has_pin,
+        source_metadata_present,
+        local_path_source,
+    );
+    Ok(DaemonPackageUpdateStatus {
+        package_name: package_name.to_string(),
+        update_available: has_pin && source_metadata_present,
+        reload_required: enabled,
+        restart_required: live_entrypoint,
+        pin,
+        diagnostics,
+        actions,
+    })
+}
+
+fn package_update_plan(
+    packages: &PackageRegistry,
+    update_status: DaemonPackageUpdateStatus,
+    package_name: &str,
+    pin: DaemonPackagePin,
+) -> Result<DaemonPackageInstallPlan, HostMutationError> {
+    let record = packages.package(package_name).ok_or_else(|| {
+        package_error(PackageRegistryError::without_record(
+            package_name,
+            PackageAction::PreviewUpdate,
+            PackageAdmissionReason::PackageNotInstalled,
+            "daemon socket preview package update".to_string(),
+        ))
+    })?;
+    let source = record.source_metadata.as_ref();
+    Ok(DaemonPackageInstallPlan {
+        entry: DaemonAvailablePackage {
+            entry_id: source
+                .map(|source| source.entry_id.clone())
+                .unwrap_or_else(|| package_name.to_string()),
+            package_name: record.manifest.name.clone(),
+            version: record.manifest.version.clone(),
+            classification: package_classification_label(record.classification.into()).to_string(),
+            source_kind: source
+                .map(|source| registry_source_kind_label(source.source_kind).to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            source_label: source
+                .map(|source| source.source_label.clone())
+                .unwrap_or_else(|| "installed package has no registry source metadata".to_string()),
+            first_party: record.trust.first_party,
+            state: package_state_label(record.state.into()).to_string(),
+            requested_capabilities: record
+                .manifest
+                .capabilities
+                .iter()
+                .cloned()
+                .map(|capability| DaemonCapability {
+                    surface: format!("{:?}", capability.surface),
+                    scope: capability.scope,
+                })
+                .collect(),
+            compatibility: DaemonPackageCompatibility {
+                botster_requirement: record.compatibility.botster_requirement.clone(),
+                result: package_compatibility_label(record.compatibility.result).to_string(),
+                diagnostics: record.compatibility.diagnostics.clone(),
+            },
+            pin: Some(pin),
+            actions: Vec::new(),
+        },
+        effects: vec![DaemonPackageInstallEffect {
+            kind: "update_pin_metadata".to_string(),
+            message: "would update pinned source metadata without fetching, enabling, or starting entrypoints"
+                .to_string(),
+        }],
+        diagnostics: update_status.diagnostics,
+        mutates_registry: false,
+        starts_entrypoints: false,
+    })
+}
+
+fn install_decision(record: &crate::PackageRecord) -> PackageDecision {
+    PackageDecision {
+        package_name: record.manifest.name.clone(),
+        action: PackageAction::Install,
+        state: record.state,
+        classification: record.classification,
+        admitted_host_profile: None,
+        audit_reason: record.last_audit_reason.clone(),
+    }
+}
+
+fn package_list_reply(
+    packages: &PackageRegistry,
+    entrypoint_processes: Vec<EntrypointProcessSnapshot>,
+) -> DaemonResponse {
+    let mut rows = packages
+        .packages()
+        .into_iter()
+        .map(|record| HubClientPackage::from_record(packages, record))
+        .collect::<Vec<_>>();
+    apply_entrypoint_processes(&mut rows, entrypoint_processes);
+    daemon_packages(rows)
+}
+
+fn package_decision_reply(
+    packages: &PackageRegistry,
+    entrypoint_processes: Vec<EntrypointProcessSnapshot>,
+    decision: PackageDecision,
+) -> DaemonResponse {
+    let mut response = package_list_reply(packages, entrypoint_processes);
+    response.kind = DaemonResponseKind::PackageDecision;
+    response.package_decision = Some(daemon_package_decision_from_policy(decision));
+    response
+}
+
+fn running_entrypoint_ids(
+    snapshots: &[EntrypointProcessSnapshot],
+    package_filter: Option<&str>,
+) -> BTreeMap<String, Vec<String>> {
+    snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot.state == "running"
+                && package_filter.is_none_or(|name| snapshot.package_name == name)
+        })
+        .fold(BTreeMap::new(), |mut running, snapshot| {
+            running
+                .entry(snapshot.package_name.clone())
+                .or_default()
+                .push(snapshot.entrypoint_id.clone());
+            running
+        })
+}
+
+fn refresh_effects(
+    previous: &PackageRegistry,
+    candidate: &PackageRegistry,
+    decisions: &[PackageDecision],
+    running_entrypoints: &BTreeMap<String, Vec<String>>,
+) -> Vec<PackageRefreshEffect> {
+    decisions
+        .iter()
+        .map(|decision| {
+            let restart_entrypoints = running_entrypoints
+                .get(&decision.package_name)
+                .into_iter()
+                .flatten()
+                .filter(|entrypoint_id| {
+                    runnable_entrypoint_definition_changed(
+                        previous,
+                        candidate,
+                        &decision.package_name,
+                        entrypoint_id,
+                    )
+                })
+                .cloned()
+                .collect();
+            PackageRefreshEffect {
+                package_name: decision.package_name.clone(),
+                reload_plugin: decision.state == PackageState::Enabled,
+                restart_entrypoints,
+            }
+        })
+        .collect()
+}
+
+fn runnable_entrypoint_definition_changed(
+    previous: &PackageRegistry,
+    candidate: &PackageRegistry,
+    package_name: &str,
+    entrypoint_id: &str,
+) -> bool {
+    let Some(previous) = previous.package(package_name) else {
+        return true;
+    };
+    let Some(candidate) = candidate.package(package_name) else {
+        return true;
+    };
+    let previous_entrypoint = previous
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id);
+    let candidate_entrypoint = candidate
+        .runnable_entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.id == entrypoint_id);
+    previous.manifest != candidate.manifest || previous_entrypoint != candidate_entrypoint
 }
 
 fn spawn_target_read(
@@ -587,26 +1088,192 @@ fn prepare_package(
     entrypoint_processes: Vec<EntrypointProcessSnapshot>,
     data_directory: PathBuf,
 ) -> Result<PreparedMutation, HostMutationError> {
-    let DaemonRequest::SetPackageConfiguration {
-        package_name,
-        values,
-    } = request
-    else {
-        return Err(HostMutationError::unsupported(&request, "package prepare"));
-    };
-    let values = decode_package_configuration(values)?;
+    let advances_generation = !matches!(&request, DaemonRequest::SetPackageConfiguration { .. });
+    let before = advances_generation
+        .then(|| session_type_catalog_entities(&packages, &state))
+        .transpose()
+        .map_err(daemon_error)?;
     let mut candidate_packages = (*packages).clone();
-    candidate_packages
-        .set_configuration(&package_name, values, "daemon socket configure package")
-        .map_err(package_error)?;
-    let mut row = candidate_packages
-        .package(&package_name)
-        .map(|record| HubClientPackage::from_record(&candidate_packages, record))
-        .expect("successful package configuration retains the package");
-    apply_entrypoint_processes(std::slice::from_mut(&mut row), entrypoint_processes);
-    let reply = HostReply::try_new(daemon_packages(vec![row]))?;
+    let (response, package_effect) = match request {
+        DaemonRequest::SetPackageConfiguration {
+            package_name,
+            values,
+        } => {
+            let values = decode_package_configuration(values)?;
+            candidate_packages
+                .set_configuration(&package_name, values, "daemon socket configure package")
+                .map_err(package_error)?;
+            let mut row = candidate_packages
+                .package(&package_name)
+                .map(|record| HubClientPackage::from_record(&candidate_packages, record))
+                .expect("successful package configuration retains the package");
+            apply_entrypoint_processes(
+                std::slice::from_mut(&mut row),
+                entrypoint_processes.clone(),
+            );
+            (daemon_packages(vec![row]), None)
+        }
+        DaemonRequest::InstallPackageRegistryEntry {
+            registry_path,
+            entry_id,
+        } => {
+            let record = candidate_packages
+                .install_registry_entry(
+                    registry_path,
+                    &entry_id,
+                    "daemon socket install registry package",
+                )
+                .map_err(package_error)?;
+            let decision = install_decision(record);
+            (
+                package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision),
+                None,
+            )
+        }
+        DaemonRequest::InstallPackageLocalPath { path } => {
+            let record = candidate_packages
+                .install_local_path(path, "daemon socket install local package")
+                .map_err(package_error)?;
+            let decision = install_decision(record);
+            (
+                package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision),
+                None,
+            )
+        }
+        DaemonRequest::ApplyPackageUpdate { package_name, pin } => {
+            let update_status = package_update_status(
+                &packages,
+                &entrypoint_processes,
+                &package_name,
+                Some(pin.clone()),
+            )?;
+            let pin = package_pin_from_daemon(pin).map_err(daemon_error)?;
+            let record = candidate_packages
+                .pin(&package_name, pin, "daemon socket apply package update")
+                .map_err(package_error)?;
+            let decision = PackageDecision {
+                package_name: record.manifest.name.clone(),
+                action: PackageAction::ApplyUpdate,
+                state: record.state,
+                classification: record.classification,
+                admitted_host_profile: record.admitted_host_profile.clone(),
+                audit_reason: record.last_audit_reason.clone(),
+            };
+            let mut response =
+                package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision);
+            response.update_status = Some(update_status);
+            (response, None)
+        }
+        DaemonRequest::ReloadPackage { package_name } => {
+            let running_entrypoints =
+                running_entrypoint_ids(&entrypoint_processes, Some(package_name.as_str()))
+                    .remove(&package_name)
+                    .unwrap_or_default();
+            let (candidate, decision) = packages
+                .refreshed_local_package(&package_name, "daemon socket reload local package")
+                .map_err(package_error)?;
+            candidate_packages = candidate;
+            let reload_plugin = decision.state == PackageState::Enabled;
+            let response =
+                package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision);
+            (
+                response,
+                Some(PackageRuntimeEffect::Reload {
+                    package_name,
+                    reload_plugin,
+                    previous_state: state.clone(),
+                    previous_packages: packages.clone(),
+                    running_entrypoints,
+                }),
+            )
+        }
+        DaemonRequest::RefreshLocalPackages => {
+            let (candidate, decisions) = packages
+                .refreshed_local_packages("daemon socket refresh local package registrations")
+                .map_err(package_error)?;
+            let running_entrypoints = running_entrypoint_ids(&entrypoint_processes, None);
+            let effects = refresh_effects(&packages, &candidate, &decisions, &running_entrypoints);
+            candidate_packages = candidate;
+            (
+                package_list_reply(&candidate_packages, entrypoint_processes.clone()),
+                Some(PackageRuntimeEffect::Refresh {
+                    previous_state: state.clone(),
+                    previous_packages: packages.clone(),
+                    running_entrypoints,
+                    packages: effects,
+                }),
+            )
+        }
+        DaemonRequest::EnablePackageLocalPath { path } => {
+            let package_name = candidate_packages
+                .install_local_path(path, "daemon socket enable local package")
+                .map_err(package_error)?
+                .manifest
+                .name
+                .clone();
+            let decision = candidate_packages
+                .enable(&package_name, "daemon socket enable local package")
+                .map_err(package_error)?;
+            let response =
+                package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision);
+            (
+                response,
+                Some(PackageRuntimeEffect::Enable {
+                    package_name,
+                    previous_state: state.clone(),
+                    previous_packages: packages.clone(),
+                }),
+            )
+        }
+        DaemonRequest::EnablePackage { package_name } => {
+            let decision = candidate_packages
+                .enable(&package_name, "daemon socket enable package")
+                .map_err(package_error)?;
+            let response =
+                package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision);
+            (
+                response,
+                Some(PackageRuntimeEffect::Enable {
+                    package_name,
+                    previous_state: state.clone(),
+                    previous_packages: packages.clone(),
+                }),
+            )
+        }
+        DaemonRequest::DisablePackage { package_name } => {
+            let decision = candidate_packages
+                .disable(&package_name, "daemon socket disable package")
+                .map_err(package_error)?;
+            let response =
+                package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision);
+            (
+                response,
+                Some(PackageRuntimeEffect::Disable { package_name }),
+            )
+        }
+        DaemonRequest::RemovePackage { package_name } => {
+            let decision = candidate_packages
+                .remove(&package_name, "daemon socket remove package")
+                .map_err(package_error)?;
+            let response =
+                package_decision_reply(&candidate_packages, entrypoint_processes.clone(), decision);
+            (
+                response,
+                Some(PackageRuntimeEffect::Remove { package_name }),
+            )
+        }
+        request => return Err(HostMutationError::unsupported(&request, "package prepare")),
+    };
     let mut candidate_state = (*state).clone();
     candidate_state.package_registry = candidate_packages.snapshot();
+    if let Some(before) = before {
+        advance_generation_after_spawn_target_change(
+            &candidate_packages,
+            &mut candidate_state,
+            Some(before),
+        )?;
+    }
+    let reply = HostReply::try_new(response)?;
     let package_logical_bytes = encoded_len(
         &candidate_state.package_registry,
         "host_prepared_package_registry_encode_failed",
@@ -631,6 +1298,7 @@ fn prepare_package(
         reply,
         MutationFamily::PackageConfiguration,
         Some(candidate_packages),
+        package_effect,
     )
 }
 
@@ -807,6 +1475,7 @@ fn prepare_spawn_target(
         HostReply::try_new(reply)?,
         family,
         None,
+        None,
     )
 }
 
@@ -911,6 +1580,7 @@ fn prepare_session_type(
                 write,
                 reply,
                 packages: None,
+                package_effect: None,
             },
             repo_write,
         }),
@@ -930,9 +1600,15 @@ fn prepare_state_change(
     reply: HostReply,
     family: MutationFamily,
     packages: Option<SharedView<PackageRegistry>>,
+    package_effect: Option<PackageRuntimeEffect>,
 ) -> Result<PreparedMutation, HostMutationError> {
     let state_bytes = pretty_encoded_len(&candidate, "host_prepared_state_encode_failed")?;
-    let logical_bytes = checked_total(&[state_bytes, rollback_descriptor_bytes()])?;
+    let effect_bytes = package_effect
+        .as_ref()
+        .map(package_effect_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let logical_bytes = checked_total(&[state_bytes, rollback_descriptor_bytes(), effect_bytes])?;
     if logical_bytes > HOST_PREPARED_BYTE_CAPACITY {
         return Err(HostMutationError::new(
             "host_prepared_too_large",
@@ -948,6 +1624,7 @@ fn prepare_state_change(
         write,
         reply,
         packages,
+        package_effect,
     };
     let (change, rollback) = match family {
         MutationFamily::PackageConfiguration => (
@@ -969,6 +1646,54 @@ fn prepare_state_change(
         rollback,
         logical_bytes,
     })
+}
+
+fn package_effect_bytes(effect: &PackageRuntimeEffect) -> Result<usize, HostMutationError> {
+    let initial = mem::size_of::<PackageRuntimeEffect>();
+    match effect {
+        PackageRuntimeEffect::Enable { package_name, .. }
+        | PackageRuntimeEffect::Disable { package_name }
+        | PackageRuntimeEffect::Remove { package_name } => {
+            checked_total(&[initial, package_name.len()])
+        }
+        PackageRuntimeEffect::Reload {
+            package_name,
+            running_entrypoints,
+            ..
+        } => running_entrypoints.iter().try_fold(
+            checked_total(&[initial, package_name.len()])?,
+            |total, entrypoint| checked_total(&[total, mem::size_of::<String>(), entrypoint.len()]),
+        ),
+        PackageRuntimeEffect::Refresh {
+            packages,
+            running_entrypoints,
+            ..
+        } => {
+            let total = running_entrypoints.iter().try_fold(
+                initial,
+                |total, (package_name, entrypoints)| {
+                    entrypoints.iter().try_fold(
+                        checked_total(&[total, mem::size_of::<String>(), package_name.len()])?,
+                        |total, entrypoint| {
+                            checked_total(&[total, mem::size_of::<String>(), entrypoint.len()])
+                        },
+                    )
+                },
+            )?;
+            packages.iter().try_fold(total, |total, package| {
+                package.restart_entrypoints.iter().try_fold(
+                    checked_total(&[
+                        total,
+                        mem::size_of::<PackageRefreshEffect>(),
+                        package.package_name.len(),
+                    ])?,
+                    |total, entrypoint| {
+                        checked_total(&[total, mem::size_of::<String>(), entrypoint.len()])
+                    },
+                )
+            })
+        }
+    }
 }
 
 fn execute_commit(commit: HostCommit) -> HostMutationResult {
@@ -998,12 +1723,14 @@ fn execute_commit(commit: HostCommit) -> HostMutationResult {
         write,
         reply,
         packages,
+        package_effect,
     } = into_state_change(change);
     match store.commit_shared(write) {
         Ok(view) => HostMutationResult::Committed(CommittedView {
             committed_revision,
             view,
             packages,
+            package_effect,
             reply,
         }),
         Err(error) => {
@@ -1024,8 +1751,10 @@ fn execute_session_type_commit(
         write,
         reply,
         packages,
+        package_effect,
     } = state;
     debug_assert!(packages.is_none());
+    debug_assert!(package_effect.is_none());
     if let Err(error) = commit_repo_session_type_mutation(repo_write) {
         return HostMutationResult::Recovered(execute_recovery(HostRecover {
             rollback,
@@ -1037,6 +1766,7 @@ fn execute_session_type_commit(
             committed_revision,
             view,
             packages: None,
+            package_effect: None,
             reply,
         }),
         Err(error) => HostMutationResult::Recovered(execute_recovery(HostRecover {
@@ -1369,6 +2099,26 @@ mod tests {
             .join(nanos.to_string())
     }
 
+    fn test_config(data_directory: PathBuf) -> HubConfig {
+        HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(data_directory),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .expect("build host mutation test config")
+    }
+
+    fn test_pin() -> DaemonPackagePin {
+        DaemonPackagePin {
+            revision: "revision-2".to_string(),
+            branch: None,
+            tag: None,
+            rev: Some("0123456789abcdef".to_string()),
+            checksum: None,
+            update_policy: "manual".to_string(),
+        }
+    }
+
     fn create_target_request(id: String) -> DaemonRequest {
         DaemonRequest::CreateSpawnTarget {
             target_id: Some(id),
@@ -1549,10 +2299,12 @@ mod tests {
 
     #[test]
     fn package_read_uses_the_owned_registry_view() {
-        let (_state, packages, _directory) = inputs("package-read");
+        let (_state, packages, directory) = inputs("package-read");
+        let config = test_config(directory);
         let HostMutationResult::ReadReady(reply) =
             execute(HostMutationCommand::Read(HostRead::Package {
                 request: DaemonRequest::ListPackages,
+                config,
                 packages,
                 entrypoint_processes: Vec::new(),
             }))
@@ -1561,6 +2313,177 @@ mod tests {
         };
         assert_eq!(reply.response.kind, DaemonResponseKind::Packages);
         assert!(reply.response.packages.is_empty());
+    }
+
+    #[test]
+    fn package_read_routes_each_immutable_package_request() {
+        let (_state, packages, data_directory) = package_inputs("package-read-routes");
+        let config = test_config(data_directory.clone());
+        let missing_registry = data_directory.join("missing-registry.json");
+        let requests = vec![
+            DaemonRequest::ResolveAppLaunch {
+                package_name: "missing.plugin".to_string(),
+                entrypoint_id: "terminal".to_string(),
+            },
+            DaemonRequest::ResolvePackageRoute {
+                package_name: "missing.plugin".to_string(),
+                route_id: "home".to_string(),
+            },
+            DaemonRequest::ListPackageNavigation,
+            DaemonRequest::ListAvailablePackages {
+                registry_path: missing_registry.clone(),
+            },
+            DaemonRequest::InspectAvailablePackage {
+                registry_path: missing_registry.clone(),
+                entry_id: "missing".to_string(),
+            },
+            DaemonRequest::PreviewPackageInstall {
+                registry_path: missing_registry,
+                entry_id: "missing".to_string(),
+            },
+            DaemonRequest::CheckPackageUpdate {
+                package_name: "configured.plugin".to_string(),
+            },
+            DaemonRequest::PreviewPackageUpdate {
+                package_name: "configured.plugin".to_string(),
+                pin: test_pin(),
+            },
+        ];
+        for request in requests {
+            let result = execute(HostMutationCommand::Read(HostRead::Package {
+                request,
+                config: config.clone(),
+                packages: packages.clone(),
+                entrypoint_processes: Vec::new(),
+            }));
+            if let HostMutationResult::Failed(error) = result {
+                assert_ne!(error.code, "unsupported_host_mutation");
+            }
+        }
+    }
+
+    #[test]
+    fn package_prepare_returns_typed_runtime_effects() {
+        let (state, packages, data_directory) = package_inputs("package-effects");
+        let requests = vec![
+            DaemonRequest::EnablePackage {
+                package_name: "configured.plugin".to_string(),
+            },
+            DaemonRequest::DisablePackage {
+                package_name: "configured.plugin".to_string(),
+            },
+            DaemonRequest::RemovePackage {
+                package_name: "configured.plugin".to_string(),
+            },
+            DaemonRequest::RefreshLocalPackages,
+        ];
+        for request in requests {
+            let HostMutationResult::Prepared(prepared) =
+                execute(HostMutationCommand::Prepare(HostPrepare::Package {
+                    request,
+                    base_revision: 3,
+                    state: state.clone(),
+                    packages: packages.clone(),
+                    entrypoint_processes: Vec::new(),
+                    data_directory: data_directory.clone(),
+                }))
+            else {
+                panic!("package preparation must succeed");
+            };
+            let PreparedChange::PackageConfiguration(change) = prepared.change else {
+                panic!("package preparation must keep its mutation family");
+            };
+            assert!(change.package_effect.is_some());
+        }
+        assert_eq!(
+            packages
+                .package("configured.plugin")
+                .expect("base package")
+                .state,
+            PackageState::Installed
+        );
+    }
+
+    #[test]
+    fn refresh_effect_retains_exact_compensation_inputs() {
+        let (state, packages, data_directory) = package_inputs("package-refresh-compensation");
+        let snapshot = EntrypointProcessSnapshot {
+            package_name: "configured.plugin".to_string(),
+            entrypoint_id: "worker".to_string(),
+            state: "running".to_string(),
+            pid: Some(42),
+            started_at: Some(1),
+            exited_at: None,
+            exit_status: None,
+            diagnostics: Vec::new(),
+            launch_result: None,
+        };
+        let HostMutationResult::Prepared(prepared) =
+            execute(HostMutationCommand::Prepare(HostPrepare::Package {
+                request: DaemonRequest::RefreshLocalPackages,
+                base_revision: 5,
+                state: state.clone(),
+                packages: packages.clone(),
+                entrypoint_processes: vec![snapshot],
+                data_directory,
+            }))
+        else {
+            panic!("package refresh preparation must succeed");
+        };
+        let PreparedChange::PackageConfiguration(change) = prepared.change else {
+            panic!("package refresh must keep its mutation family");
+        };
+        let Some(PackageRuntimeEffect::Refresh {
+            previous_state,
+            previous_packages,
+            running_entrypoints,
+            ..
+        }) = change.package_effect
+        else {
+            panic!("package refresh must return its runtime effect");
+        };
+        assert!(SharedView::ptr_eq(&previous_state, &state));
+        assert!(SharedView::ptr_eq(&previous_packages, &packages));
+        assert_eq!(
+            running_entrypoints,
+            BTreeMap::from([("configured.plugin".to_string(), vec!["worker".to_string()])])
+        );
+    }
+
+    #[test]
+    fn package_prepare_routes_each_filesystem_mutation() {
+        let (state, packages, data_directory) = package_inputs("package-prepare-routes");
+        let missing_path = data_directory.join("missing-package");
+        let requests = vec![
+            DaemonRequest::InstallPackageRegistryEntry {
+                registry_path: missing_path.clone(),
+                entry_id: "missing".to_string(),
+            },
+            DaemonRequest::InstallPackageLocalPath {
+                path: missing_path.clone(),
+            },
+            DaemonRequest::ApplyPackageUpdate {
+                package_name: "configured.plugin".to_string(),
+                pin: test_pin(),
+            },
+            DaemonRequest::ReloadPackage {
+                package_name: "configured.plugin".to_string(),
+            },
+            DaemonRequest::EnablePackageLocalPath { path: missing_path },
+        ];
+        for request in requests {
+            let result = execute(HostMutationCommand::Prepare(HostPrepare::Package {
+                request,
+                base_revision: 3,
+                state: state.clone(),
+                packages: packages.clone(),
+                entrypoint_processes: Vec::new(),
+                data_directory: data_directory.clone(),
+            }));
+            if let HostMutationResult::Failed(error) = result {
+                assert_ne!(error.code, "unsupported_host_mutation");
+            }
+        }
     }
 
     #[test]
