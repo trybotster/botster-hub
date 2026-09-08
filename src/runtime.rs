@@ -1697,6 +1697,12 @@ impl HubRuntime {
             .collect()
     }
 
+    /// Return a cheap handle to the shared plugin lifecycle state.
+    #[must_use]
+    pub(crate) fn plugin_lifecycle_handle(&self) -> HubPluginLifecycle {
+        self.plugin_lifecycle.clone()
+    }
+
     /// Invoke a loaded plugin MCP tool through the core worker path.
     pub fn call_plugin_mcp_tool(
         &self,
@@ -2742,12 +2748,7 @@ impl HubRuntime {
         package_name: &str,
         result: PluginInvocationResult,
     ) -> Result<UiNode, crate::McpToolError> {
-        let value = completed_plugin_payload(result, "plugin surface render")?;
-        let node: UiNode = serde_json::from_value(value).map_err(|error| {
-            crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
-        })?;
-        validate_plugin_surface_node(&node, &self.plugin_entity_provider_families(package_name))?;
-        Ok(node)
+        complete_plugin_surface_render_with_lifecycle(&self.plugin_lifecycle, package_name, result)
     }
 
     /// Dispatch a plugin-owned semantic UI action through the plugin worker path.
@@ -2830,19 +2831,12 @@ impl HubRuntime {
         request: &UiActionRequest,
         result: PluginInvocationResult,
     ) -> Result<UiActionResult, crate::McpToolError> {
-        let value = completed_plugin_payload(result, "plugin surface action")?;
-        let result: UiActionResult = serde_json::from_value(value).map_err(|error| {
-            crate::McpToolError::new(
-                "invalid_action_result",
-                format!("invalid plugin UiActionResult: {error}"),
-            )
-        })?;
-        validate_plugin_surface_action_result(
-            &result,
+        complete_plugin_surface_action_with_lifecycle(
+            &self.plugin_lifecycle,
+            package_name,
             request,
-            &self.plugin_entity_provider_families(package_name),
-        )?;
-        Ok(result)
+            result,
+        )
     }
 
     /// Return exact entity families currently provided by one loaded package.
@@ -4572,6 +4566,40 @@ fn completed_plugin_payload(
             format!("{operation} failed: {}", failure.reason),
         )),
     }
+}
+
+pub(crate) fn complete_plugin_surface_render_with_lifecycle(
+    lifecycle: &HubPluginLifecycle,
+    package_name: &str,
+    result: PluginInvocationResult,
+) -> Result<UiNode, crate::McpToolError> {
+    let value = completed_plugin_payload(result, "plugin surface render")?;
+    let node: UiNode = serde_json::from_value(value).map_err(|error| {
+        crate::McpToolError::new("invalid_surface", format!("invalid plugin UiNode: {error}"))
+    })?;
+    validate_plugin_surface_node(&node, &lifecycle.entity_provider_families_for(package_name))?;
+    Ok(node)
+}
+
+pub(crate) fn complete_plugin_surface_action_with_lifecycle(
+    lifecycle: &HubPluginLifecycle,
+    package_name: &str,
+    request: &UiActionRequest,
+    result: PluginInvocationResult,
+) -> Result<UiActionResult, crate::McpToolError> {
+    let value = completed_plugin_payload(result, "plugin surface action")?;
+    let result: UiActionResult = serde_json::from_value(value).map_err(|error| {
+        crate::McpToolError::new(
+            "invalid_action_result",
+            format!("invalid plugin UiActionResult: {error}"),
+        )
+    })?;
+    validate_plugin_surface_action_result(
+        &result,
+        request,
+        &lifecycle.entity_provider_families_for(package_name),
+    )?;
+    Ok(result)
 }
 
 fn is_stale_worker_control_socket_adoption_error(error: &CoreDaemonError) -> bool {
