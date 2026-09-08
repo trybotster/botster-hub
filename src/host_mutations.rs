@@ -212,6 +212,7 @@ pub(crate) struct PreparedStateChange {
     store: FileHubStateStore,
     write: PreparedHubStateWrite,
     reply: HostReply,
+    packages: Option<SharedView<PackageRegistry>>,
 }
 
 /// A prepared session-type write across Hub state and an optional repository file.
@@ -247,6 +248,7 @@ pub(crate) enum RollbackDescriptor {
 pub(crate) struct CommittedView {
     pub(crate) committed_revision: u64,
     pub(crate) view: SharedView<HubState>,
+    pub(crate) packages: Option<SharedView<PackageRegistry>>,
     pub(crate) reply: HostReply,
 }
 
@@ -506,6 +508,22 @@ fn prepare_package(
     let reply = HostReply::try_new(daemon_packages(vec![row]))?;
     let mut candidate_state = (*state).clone();
     candidate_state.package_registry = candidate_packages.snapshot();
+    let package_logical_bytes = encoded_len(
+        &candidate_state.package_registry,
+        "host_prepared_package_registry_encode_failed",
+    )?;
+    let candidate_packages =
+        SharedView::try_new(&state.budget(), candidate_packages, package_logical_bytes).map_err(
+            |error| {
+                HostMutationError::new(
+                    "shared_view_capacity_exhausted",
+                    format!(
+                        "package registry needs {} logical bytes but only {} remain",
+                        error.requested, error.available
+                    ),
+                )
+            },
+        )?;
     prepare_state_change(
         base_revision,
         state,
@@ -513,6 +531,7 @@ fn prepare_package(
         data_directory,
         reply,
         MutationFamily::PackageConfiguration,
+        Some(candidate_packages),
     )
 }
 
@@ -688,6 +707,7 @@ fn prepare_spawn_target(
         data_directory,
         HostReply::try_new(reply)?,
         family,
+        None,
     )
 }
 
@@ -791,6 +811,7 @@ fn prepare_session_type(
                 store,
                 write,
                 reply,
+                packages: None,
             },
             repo_write,
         }),
@@ -809,6 +830,7 @@ fn prepare_state_change(
     data_directory: PathBuf,
     reply: HostReply,
     family: MutationFamily,
+    packages: Option<SharedView<PackageRegistry>>,
 ) -> Result<PreparedMutation, HostMutationError> {
     let state_bytes = pretty_encoded_len(&candidate, "host_prepared_state_encode_failed")?;
     let logical_bytes = checked_total(&[state_bytes, rollback_descriptor_bytes()])?;
@@ -826,6 +848,7 @@ fn prepare_state_change(
         store,
         write,
         reply,
+        packages,
     };
     let (change, rollback) = match family {
         MutationFamily::PackageConfiguration => (
@@ -875,11 +898,13 @@ fn execute_commit(commit: HostCommit) -> HostMutationResult {
         store,
         write,
         reply,
+        packages,
     } = into_state_change(change);
     match store.commit_shared(write) {
         Ok(view) => HostMutationResult::Committed(CommittedView {
             committed_revision,
             view,
+            packages,
             reply,
         }),
         Err(error) => {
@@ -899,7 +924,9 @@ fn execute_session_type_commit(
         store,
         write,
         reply,
+        packages,
     } = state;
+    debug_assert!(packages.is_none());
     if let Err(error) = commit_repo_session_type_mutation(repo_write) {
         return HostMutationResult::Recovered(execute_recovery(HostRecover {
             rollback,
@@ -910,6 +937,7 @@ fn execute_session_type_commit(
         Ok(view) => HostMutationResult::Committed(CommittedView {
             committed_revision,
             view,
+            packages: None,
             reply,
         }),
         Err(error) => HostMutationResult::Recovered(execute_recovery(HostRecover {

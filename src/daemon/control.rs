@@ -4,6 +4,7 @@ pub(crate) mod connection;
 pub(crate) mod entities;
 pub(crate) mod events;
 pub(crate) mod host;
+pub(crate) mod host_work;
 pub(crate) mod message;
 pub(crate) mod messaging;
 pub(crate) mod packages;
@@ -98,8 +99,9 @@ pub(crate) fn handle_control_message(
     match message {
         ControlMessage::DataPlaneProgress => {
             record_data_plane_progress(daemon, state);
-            request::poll_deferred(daemon, state)
+            false
         }
+        ControlMessage::CoreCompletionPublished => false,
         message @ ControlMessage::AcceptedConnection { .. }
         | message @ ControlMessage::RejectedConnection
         | message @ ControlMessage::RegisterUnixAdmission { .. }
@@ -165,7 +167,7 @@ pub(crate) fn record_data_plane_progress(
     if !progress.progressed && !progress.journal_advanced && !progress.terminal_inventory_changed {
         return false;
     }
-    runtime.absorb_core_completions();
+    runtime.reap_detached_core_operations();
     if progress.journal_advanced {
         state.maintenance.note_journal_advanced();
         state.maintenance.note_authoritative_mutation();
@@ -186,6 +188,10 @@ pub(crate) fn handle_control_request(
     control_tx: ControlSender,
     request: DaemonRequest,
 ) -> ControlStep {
+    if host_work::handles(&request) {
+        return host_work::handle(daemon, state, request)
+            .expect("a classified host request has a running owner waiter");
+    }
     match request {
         DaemonRequest::ListApps
         | DaemonRequest::ResolveAppLaunch { .. }

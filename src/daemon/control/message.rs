@@ -69,6 +69,8 @@ pub(crate) enum ControlMessage {
     /// The data-plane thread recorded one or more coalesced progress facts.
     /// The shared latch owns the facts. This message is only a doorbell.
     DataPlaneProgress,
+    /// The data-plane thread published one or more keyed Core results.
+    CoreCompletionPublished,
     AcceptedConnection {
         stream: TokioUnixStream,
         admission_permit: OwnedSemaphorePermit,

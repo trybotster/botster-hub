@@ -11,6 +11,7 @@ use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::daemon::control::session_types::{
     SessionTypeCatalogBuild, bounded_session_type_catalog_entities,
 };
+use crate::owner_identity::OwnerWorkIdentity;
 use crate::packages::PackageRegistry;
 use crate::persistence::HubState;
 use crate::shared_view::SharedView;
@@ -21,26 +22,7 @@ pub(crate) const HOST_PREPARED_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
 pub(crate) const HOST_PREPARED_AGGREGATE_BYTE_CAPACITY: usize =
     HOST_OPERATION_CAPACITY * HOST_PREPARED_BYTE_CAPACITY;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct WaiterId(u64);
-
-#[derive(Debug, Default)]
-pub(crate) struct WaiterIdSequence {
-    next: u64,
-}
-
-impl WaiterIdSequence {
-    pub(crate) fn next(&mut self) -> Option<WaiterId> {
-        self.next = self.next.checked_add(1)?;
-        Some(WaiterId(self.next))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HostJobIdentity {
-    pub(crate) waiter_id: WaiterId,
-    pub(crate) phase: u64,
-}
+pub(crate) type HostJobIdentity = OwnerWorkIdentity;
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostError {
@@ -63,8 +45,11 @@ pub(crate) enum HostCommand {
         packages: SharedView<PackageRegistry>,
         state: SharedView<HubState>,
     },
+    Mutation(crate::host_mutations::HostMutationCommand),
     #[cfg(test)]
-    Panic { generation: u64 },
+    Panic {
+        generation: u64,
+    },
     #[cfg(test)]
     Wait {
         generation: u64,
@@ -76,6 +61,7 @@ impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
+            Self::Mutation(_) => 0,
             #[cfg(test)]
             Self::Panic { generation } => *generation,
             #[cfg(test)]
@@ -91,6 +77,7 @@ impl std::fmt::Debug for HostCommand {
                 .debug_struct("BuildSessionTypeCatalog")
                 .field("generation", generation)
                 .finish_non_exhaustive(),
+            Self::Mutation(command) => formatter.debug_tuple("Mutation").field(command).finish(),
             #[cfg(test)]
             Self::Panic { generation } => formatter
                 .debug_struct("Panic")
@@ -123,6 +110,7 @@ pub(crate) enum HostResult {
         generation: u64,
         error: HostError,
     },
+    Mutation(crate::host_mutations::HostMutationResult),
 }
 
 impl HostResult {
@@ -131,6 +119,7 @@ impl HostResult {
             Self::SessionTypeCatalogReady { generation, .. } | Self::Failed { generation, .. } => {
                 *generation
             }
+            Self::Mutation(_) => 0,
         }
     }
 }
@@ -150,6 +139,7 @@ impl HostCompletion {
         let logical_bytes = match &result {
             HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
             HostResult::Failed { .. } => 0,
+            HostResult::Mutation(_) => 0,
         };
         if logical_bytes > HOST_PREPARED_BYTE_CAPACITY {
             let generation = result.generation();
@@ -164,9 +154,14 @@ impl HostCompletion {
         let logical_bytes = match &result {
             HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
             HostResult::Failed { .. } => 0,
+            HostResult::Mutation(_) => 0,
         };
         let charge = permit.into_prepared_charge(logical_bytes);
         (result, charge)
+    }
+
+    pub(crate) fn into_parts(self) -> (HostJobIdentity, HostResult, HostWorkPermit) {
+        (self.identity, self.result, self.permit)
     }
 
     #[cfg(test)]
@@ -317,7 +312,7 @@ pub(crate) struct HostWorkPermit {
 }
 
 impl HostWorkPermit {
-    fn into_prepared_charge(mut self, logical_bytes: usize) -> HostPreparedCharge {
+    pub(crate) fn into_prepared_charge(mut self, logical_bytes: usize) -> HostPreparedCharge {
         let reservation = self
             .prepared
             .take()
@@ -592,6 +587,9 @@ fn execute(command: HostCommand) -> HostResult {
                 error: HostError::new("session_type_catalog_failed", error.to_string()),
             },
         },
+        HostCommand::Mutation(command) => {
+            HostResult::Mutation(crate::host_mutations::execute(command))
+        }
         #[cfg(test)]
         HostCommand::Panic { .. } => panic!("host executor panic test"),
         #[cfg(test)]
@@ -647,6 +645,7 @@ impl TestHostGate {
 mod tests {
     use super::*;
     use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
+    use crate::owner_identity::WaiterId;
     use crate::packages::PackageRegistry;
     use crate::persistence::HubState;
     use std::path::PathBuf;
@@ -907,13 +906,5 @@ mod tests {
             );
             std::thread::yield_now();
         }
-    }
-
-    #[test]
-    fn waiter_ids_stop_before_wrap() {
-        let mut sequence = WaiterIdSequence { next: u64::MAX - 1 };
-        assert_eq!(sequence.next(), Some(WaiterId(u64::MAX)));
-        assert_eq!(sequence.next(), None);
-        assert_eq!(sequence.next(), None);
     }
 }

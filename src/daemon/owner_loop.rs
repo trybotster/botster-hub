@@ -92,7 +92,7 @@ impl DaemonControlState {
 /// owner wakes to retire abandoned work even when no control traffic arrives.
 fn next_owner_deadline(state: &DaemonControlState) -> Option<Instant> {
     let obligation = state.budget.next_obligation_deadline();
-    let request = crate::daemon::control::pending::next_request_deadline(&state.pending_requests);
+    let request = crate::daemon::control::pending::next_request_deadline(state);
     [
         obligation,
         request,
@@ -333,9 +333,25 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         rebind_rx,
     ))];
     loop {
+        let mut owner_turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
         reap_finished_connection_tasks(&mut connection_tasks);
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
+        }
+        // Read the shared completion bit on every turn. If the bounded
+        // doorbell queue was full, another owner event still exposes results.
+        if let Some(runtime) = daemon.runtime()
+            && runtime.take_core_completion_notification()
+        {
+            let identities = runtime
+                .take_owner_core_completions(crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT);
+            let consumed = crate::daemon::control::pending::absorb_core_completions(
+                &mut control_state,
+                &identities,
+                &mut owner_turn,
+            );
+            runtime.restore_owner_core_completions(&identities[consumed..]);
+            runtime.reap_detached_core_operations();
         }
         crate::daemon::control::record_data_plane_progress(&daemon, &mut control_state);
         crate::subscription::entity::absorb_session_type_catalog_completions(
@@ -365,9 +381,15 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             Instant::now(),
         );
         mark_due_reconciliation(&mut control_state, Instant::now());
+        crate::daemon::control::pending::mark_due_request_deadlines(
+            &mut control_state,
+            Instant::now(),
+            &mut owner_turn,
+        );
         let slice_due = control_state
             .background
-            .has_pending(owner_maintenance_pending(&daemon, &control_state));
+            .has_pending(owner_maintenance_pending(&daemon, &control_state))
+            || !control_state.request_ready.is_empty();
         let event = match classify_owner_poll(control_rx.try_recv(), slice_due) {
             OwnerPollDecision::ServeControl(message) => Some(OwnerEvent::Control(message)),
             OwnerPollDecision::RunSlice => None,
@@ -476,6 +498,17 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         {
             run_one_owner_background_slice(&mut daemon, &mut control_state);
         }
+        for waiter_id in control_state
+            .plugin_controls
+            .take_ready_waiters(crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT)
+        {
+            crate::daemon::control::pending::mark_request_ready(
+                &mut control_state,
+                waiter_id,
+                crate::daemon::owner_schedule::ReadyClass::PluginCompletion,
+                crate::daemon::control::pending::READY_PLUGIN_COMPLETION,
+            );
+        }
         crate::daemon::control::entities::drive_plugin_entity_completions(
             &mut daemon,
             &mut control_state,
@@ -485,7 +518,11 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             &mut control_state,
             Instant::now(),
         );
-        if crate::daemon::control::request::poll_deferred(&mut daemon, &mut control_state) {
+        if crate::daemon::control::request::poll_deferred_with_budget(
+            &mut daemon,
+            &mut control_state,
+            &mut owner_turn,
+        ) {
             let _ = shutdown_tx.send(true);
             wait_for_connection_tasks(
                 &transport_runtime,
@@ -902,7 +939,21 @@ pub(crate) struct DaemonControlState {
     pub(crate) attach_close: crate::subscription::closed_events::AttachCloseBookkeeping,
     pub(crate) pending_hub_update_reply: Option<ControlReplySender>,
     /// Requests whose response waits on a Core owner-thread result.
-    pub(crate) pending_requests: Vec<crate::daemon::control::pending::PendingControlRequest>,
+    pub(crate) pending_requests: BTreeMap<
+        crate::owner_identity::WaiterId,
+        crate::daemon::control::pending::PendingControlRequest,
+    >,
+    pub(crate) waiter_ids: crate::owner_identity::WaiterIdSource,
+    pub(crate) current_waiter_id: Option<crate::owner_identity::WaiterId>,
+    pub(crate) request_ready: crate::daemon::owner_schedule::ReadyQueues,
+    pub(crate) request_deadlines: crate::daemon::owner_schedule::DeadlineIndex,
+    pub(crate) host_completions:
+        BTreeMap<crate::owner_identity::WaiterId, crate::host_executor::HostCompletion>,
+    pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
+    pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
+    pub(crate) host_recovery_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
+    pub(crate) blocked_session_type_roots:
+        BTreeMap<std::path::PathBuf, crate::owner_identity::WaiterId>,
     /// Correlation for non-blocking plugin request-response work.
     pub(crate) plugin_controls: crate::daemon::control::plugins::PluginControlState,
     /// Correlation and retained replies for asynchronous entity providers.
@@ -919,8 +970,6 @@ pub(crate) struct DaemonControlState {
     pub(crate) close_event_decisions: crate::subscription::closed_events::CloseEventDecisions,
     /// Session-type catalog built off the owner thread.
     pub(crate) session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache,
-    /// Checked identities shared by host jobs and later owner waiters.
-    pub(crate) waiter_ids: crate::host_executor::WaiterIdSequence,
     /// Inventory read in flight for the pump reconcile phase, with the
     /// attach epoch captured when it was submitted.
     reconcile_inventory: Option<InventoryRead>,
@@ -968,7 +1017,16 @@ impl Default for DaemonControlState {
             released_entity_generations: 0,
             attach_close: crate::subscription::closed_events::AttachCloseBookkeeping::default(),
             pending_hub_update_reply: None,
-            pending_requests: Vec::new(),
+            pending_requests: BTreeMap::new(),
+            waiter_ids: crate::owner_identity::WaiterIdSource::default(),
+            current_waiter_id: None,
+            request_ready: crate::daemon::owner_schedule::ReadyQueues::new(),
+            request_deadlines: crate::daemon::owner_schedule::DeadlineIndex::new(),
+            host_completions: BTreeMap::new(),
+            document_owner: None,
+            document_waiters: std::collections::BTreeSet::new(),
+            host_recovery_waiters: std::collections::BTreeSet::new(),
+            blocked_session_type_roots: BTreeMap::new(),
             plugin_controls: crate::daemon::control::plugins::PluginControlState::default(),
             plugin_entities: crate::daemon::control::entities::PluginEntityState::default(),
             plugin_result_budget:
@@ -978,7 +1036,6 @@ impl Default for DaemonControlState {
             close_event_decisions: crate::subscription::closed_events::CloseEventDecisions::default(
             ),
             session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache::default(),
-            waiter_ids: crate::host_executor::WaiterIdSequence::default(),
             reconcile_inventory: None,
             observe_resume: None,
             observe_read: None,
@@ -2327,6 +2384,9 @@ return botster.register({
                     );
                     return response.into_parts().0;
                 }
+                crate::daemon::control::pending::ControlPoll::ReadyHost(_, _) => {
+                    panic!("plugin response must not carry a host-result charge")
+                }
                 crate::daemon::control::pending::ControlPoll::Pending => {
                     assert!(Instant::now() < deadline, "plugin response timed out");
                     thread::sleep(Duration::from_millis(5));
@@ -2425,6 +2485,9 @@ return botster.register({
                 crate::daemon::control::pending::ControlPoll::ReadyRetained(_) => {
                     panic!("status must not carry a plugin-result charge")
                 }
+                crate::daemon::control::pending::ControlPoll::ReadyHost(_, _) => {
+                    panic!("status must not carry a host-result charge")
+                }
                 crate::daemon::control::pending::ControlPoll::Pending => {
                     assert!(
                         Instant::now() < status_deadline,
@@ -2467,6 +2530,9 @@ return botster.register({
                 crate::daemon::control::pending::ControlPoll::Ready(response) => break response,
                 crate::daemon::control::pending::ControlPoll::ReadyRetained(response) => {
                     break response.into_parts().0;
+                }
+                crate::daemon::control::pending::ControlPoll::ReadyHost(_, _) => {
+                    panic!("plugin response must not carry a host-result charge")
                 }
                 crate::daemon::control::pending::ControlPoll::Pending => {
                     assert!(
@@ -2992,6 +3058,8 @@ return botster.register({
 
             let (control_tx, _control_rx) = tokio_mpsc::channel(8);
             let mut state = DaemonControlState::default();
+            let waiter_id = crate::owner_identity::WaiterId(1);
+            state.current_waiter_id = Some(waiter_id);
             crate::lua_runtime::arm_test_plugin_invocation_gate();
             let request = DaemonRequest::PluginMcpCallTool {
                 name: "owner.controlled_gate".to_string(),
@@ -3013,6 +3081,7 @@ return botster.register({
             let crate::daemon::control::pending::ControlStep::Pending(step) = step else {
                 panic!("the controlled plugin request must wait for its worker");
             };
+            state.current_waiter_id = None;
             assert!(
                 crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::from_secs(2)),
                 "the controlled plugin worker must enter the gate"
@@ -3030,9 +3099,15 @@ return botster.register({
             if retire_reason == "reply_closed" {
                 drop(reply_rx.take());
             }
-            state
-                .pending_requests
-                .push(crate::daemon::control::pending::PendingControlRequest {
+            state.pending_requests.insert(
+                waiter_id,
+                crate::daemon::control::pending::PendingControlRequest {
+                    waiter_id,
+                    ready_class: step.ready_class,
+                    ready_key: None,
+                    deadline_key: None,
+                    last_core_phase: 0,
+                    last_host_phase: 0,
                     request,
                     reply_tx,
                     response_delivery_rx: None,
@@ -3044,7 +3119,8 @@ return botster.register({
                     past_deadline: false,
                     continuation: step.continuation,
                     retire: step.retire,
-                });
+                },
+            );
             assert_eq!(state.budget.outstanding(), 1);
 
             crate::daemon::control::pending::poll_pending_requests(
@@ -3773,7 +3849,7 @@ return botster.register({
         let deadline = Instant::now() + Duration::from_secs(10);
         let response = loop {
             if let Some(runtime) = daemon.runtime() {
-                runtime.absorb_core_completions();
+                runtime.reap_detached_core_operations();
             }
             match (pending.continuation)(daemon, state) {
                 crate::daemon::control::pending::ControlPoll::Ready(response) => {
@@ -3781,6 +3857,9 @@ return botster.register({
                 }
                 crate::daemon::control::pending::ControlPoll::ReadyRetained(_) => {
                     panic!("attach must not carry a plugin-result charge")
+                }
+                crate::daemon::control::pending::ControlPoll::ReadyHost(_, _) => {
+                    panic!("attach must not carry a host-result charge")
                 }
                 crate::daemon::control::pending::ControlPoll::Pending => {
                     assert!(Instant::now() < deadline, "attach continuation timed out");
