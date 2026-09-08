@@ -234,6 +234,13 @@ const REPO_SESSION_TYPES_FILE: &str = ".botster/session-types.json";
 const REPO_SESSION_TYPES_TEMP_FILE: &str = ".botster/session-types.json.tmp";
 const REPO_SESSION_TYPES_FILE_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
 
+/// Exact prior state for one repo session-type file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepoSessionTypeFileSnapshot {
+    Missing,
+    Present(Vec<u8>),
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RepoSessionTypesFile {
     #[serde(default)]
@@ -432,6 +439,153 @@ fn write_repo_session_types(
     })
 }
 
+/// Read the exact prior repo file with a hard logical-byte bound.
+pub(crate) fn snapshot_repo_session_type_file(
+    root: &Path,
+    logical_byte_limit: usize,
+) -> SessionTypeResult<RepoSessionTypeFileSnapshot> {
+    let path = root.join(REPO_SESSION_TYPES_FILE);
+    let canonical_root = root.canonicalize().map_err(|_| {
+        SessionTypeError::new("target_not_admitted", "admitted target is unavailable")
+    })?;
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RepoSessionTypeFileSnapshot::Missing);
+        }
+        Err(error) => {
+            return Err(SessionTypeError::new(
+                "repo_session_type_read_failed",
+                format!("repo session type file could not be read: {error}"),
+            ));
+        }
+    };
+    let canonical_path = path.canonicalize().map_err(|_| {
+        SessionTypeError::new(
+            "repo_session_type_read_failed",
+            "repo session type file could not be resolved",
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(SessionTypeError::new(
+            "target_not_admitted",
+            "repo session type file escapes the admitted target",
+        ));
+    }
+    let limit = logical_byte_limit.min(REPO_SESSION_TYPES_FILE_BYTE_CAPACITY);
+    if file
+        .metadata()
+        .map_err(|error| {
+            SessionTypeError::new(
+                "repo_session_type_read_failed",
+                format!("repo session type file metadata could not be read: {error}"),
+            )
+        })?
+        .len()
+        > limit as u64
+    {
+        return Err(SessionTypeError::new(
+            "repo_session_types_too_large",
+            "repo session type rollback exceeds the prepared-operation byte limit",
+        ));
+    }
+    let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            SessionTypeError::new(
+                "repo_session_type_read_failed",
+                format!("repo session type file could not be read: {error}"),
+            )
+        })?;
+    if bytes.len() > limit {
+        return Err(SessionTypeError::new(
+            "repo_session_types_too_large",
+            "repo session type rollback exceeds the prepared-operation byte limit",
+        ));
+    }
+    Ok(RepoSessionTypeFileSnapshot::Present(bytes))
+}
+
+/// Restore the exact prior repo file contents or absence through the atomic path.
+pub(crate) fn restore_repo_session_type_file(
+    root: &Path,
+    prior: &RepoSessionTypeFileSnapshot,
+) -> SessionTypeResult<()> {
+    let canonical_root = root.canonicalize().map_err(|_| {
+        SessionTypeError::new("target_not_admitted", "admitted target is unavailable")
+    })?;
+    let directory = root.join(".botster");
+    let path = root.join(REPO_SESSION_TYPES_FILE);
+    match prior {
+        RepoSessionTypeFileSnapshot::Missing => {
+            if !directory.exists() {
+                return Ok(());
+            }
+            let canonical_directory = directory.canonicalize().map_err(|_| {
+                SessionTypeError::new(
+                    "repo_session_type_restore_failed",
+                    "repo session type directory could not be resolved",
+                )
+            })?;
+            if !canonical_directory.starts_with(&canonical_root) {
+                return Err(SessionTypeError::new(
+                    "target_not_admitted",
+                    "repo session type directory escapes the admitted target",
+                ));
+            }
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(SessionTypeError::new(
+                    "repo_session_type_restore_failed",
+                    format!("repo session type file absence could not be restored: {error}"),
+                )),
+            }
+        }
+        RepoSessionTypeFileSnapshot::Present(bytes) => {
+            if bytes.len() > REPO_SESSION_TYPES_FILE_BYTE_CAPACITY {
+                return Err(SessionTypeError::new(
+                    "repo_session_types_too_large",
+                    "repo session type rollback exceeds the file byte limit",
+                ));
+            }
+            fs::create_dir_all(&directory).map_err(|error| {
+                SessionTypeError::new(
+                    "repo_session_type_restore_failed",
+                    format!("repo session type directory could not be created: {error}"),
+                )
+            })?;
+            let canonical_directory = directory.canonicalize().map_err(|_| {
+                SessionTypeError::new(
+                    "repo_session_type_restore_failed",
+                    "repo session type directory could not be resolved",
+                )
+            })?;
+            if !canonical_directory.starts_with(&canonical_root) {
+                return Err(SessionTypeError::new(
+                    "target_not_admitted",
+                    "repo session type directory escapes the admitted target",
+                ));
+            }
+            let temporary = root.join(REPO_SESSION_TYPES_TEMP_FILE);
+            fs::write(&temporary, bytes).map_err(|error| {
+                SessionTypeError::new(
+                    "repo_session_type_restore_failed",
+                    format!("repo session type rollback could not be written: {error}"),
+                )
+            })?;
+            fs::rename(&temporary, path).map_err(|error| {
+                SessionTypeError::new(
+                    "repo_session_type_restore_failed",
+                    format!("repo session type rollback could not be installed: {error}"),
+                )
+            })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionTypeSourceRank {
     Package = 0,
@@ -455,6 +609,18 @@ pub fn list_session_types(
     state: &HubState,
 ) -> SessionTypeResult<Vec<HubSessionType>> {
     let sources = source_session_types(records, state)?;
+    effective_session_type_rows(sources)
+}
+
+/// Project effective rows from staged repo definitions without reading that repo file.
+pub(crate) fn list_session_types_with_staged_repo(
+    records: &[&PackageRecord],
+    state: &HubState,
+    target_id: &str,
+    definitions: &[PackageSessionType],
+) -> SessionTypeResult<Vec<HubSessionType>> {
+    let sources =
+        source_session_types_with_staged_repo(records, state, Some((target_id, definitions)))?;
     effective_session_type_rows(sources)
 }
 
@@ -1248,6 +1414,14 @@ fn source_session_types(
     records: &[&PackageRecord],
     state: &HubState,
 ) -> SessionTypeResult<Vec<SourceSessionType>> {
+    source_session_types_with_staged_repo(records, state, None)
+}
+
+fn source_session_types_with_staged_repo(
+    records: &[&PackageRecord],
+    state: &HubState,
+    staged_repo: Option<(&str, &[PackageSessionType])>,
+) -> SessionTypeResult<Vec<SourceSessionType>> {
     let mut sources = Vec::new();
     for record in records {
         let root = package_root(record).ok();
@@ -1285,7 +1459,10 @@ fn source_session_types(
         if !target.enabled {
             continue;
         }
-        let repo_session_types = repo_session_types(&target.root)?;
+        let repo_session_types = match staged_repo {
+            Some((target_id, definitions)) if target.target_id == target_id => definitions.to_vec(),
+            _ => repo_session_types(&target.root)?,
+        };
         validate_session_types(&repo_session_types)
             .map_err(|message| SessionTypeError::new("invalid_repo_session_types", message))?;
         for session_type in repo_session_types {
@@ -1769,13 +1946,55 @@ mod bounded_catalog_tests {
     use super::*;
     use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
 
-    #[test]
-    fn oversized_repo_metadata_stops_at_the_bounded_reader() {
+    fn temporary_root(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("botster-session-type-bound-{unique}"));
+        std::env::temp_dir().join(format!("botster-session-type-{label}-{unique}"))
+    }
+
+    #[test]
+    fn repo_file_snapshot_restores_exact_bytes_and_absence() {
+        let root = temporary_root("rollback");
+        fs::create_dir_all(root.join(".botster")).expect("create repo metadata directory");
+        let path = root.join(REPO_SESSION_TYPES_FILE);
+        let original = br#"{"session_types":[]}"#;
+        fs::write(&path, original).expect("write original repo metadata");
+
+        let present = snapshot_repo_session_type_file(&root, original.len())
+            .expect("snapshot present repo metadata");
+        fs::write(&path, b"replacement").expect("replace repo metadata");
+        restore_repo_session_type_file(&root, &present).expect("restore repo metadata bytes");
+        assert_eq!(
+            fs::read(&path).expect("read restored repo metadata"),
+            original
+        );
+
+        fs::remove_file(&path).expect("remove repo metadata");
+        let missing = snapshot_repo_session_type_file(&root, 1).expect("snapshot absence");
+        fs::write(&path, b"new").expect("create repo metadata after snapshot");
+        restore_repo_session_type_file(&root, &missing).expect("restore repo metadata absence");
+        assert!(!path.exists());
+        fs::remove_dir_all(root).expect("remove rollback test directory");
+    }
+
+    #[test]
+    fn repo_file_snapshot_enforces_the_logical_byte_limit() {
+        let root = temporary_root("rollback-bound");
+        fs::create_dir_all(root.join(".botster")).expect("create repo metadata directory");
+        fs::write(root.join(REPO_SESSION_TYPES_FILE), b"1234")
+            .expect("write bounded repo metadata");
+
+        let error = snapshot_repo_session_type_file(&root, 3)
+            .expect_err("snapshot must reject bytes above its limit");
+        assert_eq!(error.kind, "repo_session_types_too_large");
+        fs::remove_dir_all(root).expect("remove rollback bound test directory");
+    }
+
+    #[test]
+    fn oversized_repo_metadata_stops_at_the_bounded_reader() {
+        let root = temporary_root("bound");
         fs::create_dir_all(root.join(".botster")).expect("create repo metadata directory");
         fs::write(root.join(REPO_SESSION_TYPES_FILE), vec![b' '; 33])
             .expect("write oversized repo metadata");
