@@ -114,13 +114,14 @@ pub(crate) fn handle_runtime(
                 },
                 now,
             );
-            let step = api.handle_request(
+            let step = api.handle_request_for_owner(
                 runtime,
                 &packages,
                 HubClientRequest::PublishRoutedEnvelope {
                     request_id: request_id("daemon-mcp-post-message"),
                     envelope,
                 },
+                state.current_waiter_id.expect("owner waiter is assigned"),
             );
             defer_client_step(step, |body| {
                 let HubClientResponseBody::RoutedEnvelopePublish(publish) = body else {
@@ -137,7 +138,7 @@ pub(crate) fn handle_runtime(
             after,
             limit,
         } => {
-            let step = api.handle_request(
+            let step = api.handle_request_for_owner(
                 runtime,
                 &packages,
                 HubClientRequest::DrainRoutedEnvelopes {
@@ -148,6 +149,7 @@ pub(crate) fn handle_runtime(
                     after: after.map(EnvelopeCursor),
                     limit: limit.clamp(1, 128),
                 },
+                state.current_waiter_id.expect("owner waiter is assigned"),
             );
             defer_client_step(step, |body| {
                 let HubClientResponseBody::RoutedEnvelopeDrain(drain) = body else {
@@ -163,7 +165,7 @@ pub(crate) fn handle_runtime(
             caller_session_id,
             envelope_id,
         } => {
-            let step = api.handle_request(
+            let step = api.handle_request_for_owner(
                 runtime,
                 &packages,
                 HubClientRequest::AcknowledgeRoutedEnvelope {
@@ -173,6 +175,7 @@ pub(crate) fn handle_runtime(
                     },
                     envelope_id: EnvelopeId(envelope_id),
                 },
+                state.current_waiter_id.expect("owner waiter is assigned"),
             );
             defer_client_step(step, |body| {
                 let HubClientResponseBody::RoutedEnvelopeAck(ack) = body else {
@@ -186,7 +189,7 @@ pub(crate) fn handle_runtime(
         }
         DaemonRequest::NotifySession { session_id, data } => {
             let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
-            let step = api.handle_request(
+            let step = api.handle_request_for_owner(
                 runtime,
                 &packages,
                 HubClientRequest::NotifySession {
@@ -196,6 +199,7 @@ pub(crate) fn handle_runtime(
                     readiness: ReadinessEvidence::default(),
                     now_seconds: now,
                 },
+                state.current_waiter_id.expect("owner waiter is assigned"),
             );
             defer_client_step(step, |body| {
                 let HubClientResponseBody::GuardedWrite(write) = body else {

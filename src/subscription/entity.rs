@@ -177,6 +177,10 @@ enum SessionTypeCatalogRefresh<'a> {
 }
 
 impl SessionTypeCatalogCache {
+    fn accepts(&self, identity: HostJobIdentity) -> bool {
+        self.pending
+            .is_some_and(|(expected, _)| expected == identity)
+    }
     /// Return the requested catalog or submit one bounded off-owner build.
     fn refresh(&mut self, daemon: &HubDaemon, generation: u64) -> SessionTypeCatalogRefresh<'_> {
         self.requested_generation = Some(generation);
@@ -283,6 +287,16 @@ impl SessionTypeCatalogCache {
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
+            HostResult::Mutation(_) => {
+                self.failure = Some((
+                    expected_generation,
+                    HostError::new(
+                        "host_completion_kind_mismatch",
+                        "a mutation completion used a catalog identity",
+                    ),
+                ));
+                return true;
+            }
         };
         if result_generation != expected_generation || result_generation != desired_generation {
             return true;
@@ -307,6 +321,7 @@ impl SessionTypeCatalogCache {
                 self.prepared_charge = None;
                 self.failure = Some((generation, error));
             }
+            HostResult::Mutation(_) => unreachable!("mutation result was handled above"),
         }
         true
     }
@@ -954,7 +969,11 @@ pub(crate) fn absorb_session_type_catalog_completions(
     loop {
         match executor.poll_completion() {
             HostCompletionPoll::Ready(completion) => {
-                catalog_changed |= state.session_type_catalog.absorb(completion);
+                if state.session_type_catalog.accepts(completion.identity) {
+                    catalog_changed |= state.session_type_catalog.absorb(completion);
+                } else {
+                    crate::daemon::control::pending::absorb_host_completion(state, completion);
+                }
             }
             HostCompletionPoll::Empty => break,
             HostCompletionPoll::Stopped => {
@@ -964,6 +983,21 @@ pub(crate) fn absorb_session_type_catalog_completions(
         }
     }
     let capacity_released = capacity_released || executor.take_capacity_notification();
+    if capacity_released {
+        let recovery_waiters = state
+            .host_recovery_waiters
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for waiter_id in recovery_waiters {
+            crate::daemon::control::pending::mark_request_ready(
+                state,
+                waiter_id,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            );
+        }
+    }
     if catalog_changed || (capacity_released && state.session_type_catalog.waiting_for_capacity()) {
         state.maintenance.scheduler.prefer_subscriber_delivery();
     }

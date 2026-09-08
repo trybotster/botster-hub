@@ -7,7 +7,7 @@
 //! data-plane thread publishes ticket results before an independent completion
 //! wake. Pump facts use `ControlMessage::DataPlaneProgress` instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,7 @@ use botster_core_daemon::{
 
 use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::data_plane::close_work::CloseWorkSource;
-use crate::owner_identity::{OwnerWorkIdentity, WaiterIdSource};
+use crate::owner_identity::{OwnerWorkIdentity, WaiterId, WaiterIdSource};
 use crate::subscription::closed_events::session_close_event_decision;
 
 pub(crate) const DATA_PLANE_WATCHDOG: Duration = Duration::from_secs(1);
@@ -34,6 +34,10 @@ pub(crate) const DATA_PLANE_MAX_CLOSE_KEYS: usize = 8;
 /// queue full is refused at once with a [`CoreTicketPoll::Refused`] ticket;
 /// admission never waits for the data-plane thread.
 pub(crate) const CORE_REQUEST_CAPACITY: usize = 64;
+/// Each admitted owner waiter can register one two-phase Core operation.
+/// The owner permit bound therefore also bounds every unconsumed identity.
+pub(crate) const CORE_OWNER_COMPLETION_CAPACITY: usize =
+    crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY * 2;
 const CORE_REQUESTS_PER_TURN: usize = CORE_REQUEST_CAPACITY;
 const STOP_ACTION_SHUTDOWN: u8 = 0;
 const STOP_ACTION_RELEASE_FOR_RESTART: u8 = 1;
@@ -106,6 +110,14 @@ type CoreRequest = Box<dyn FnOnce(&mut CoreDaemon, &mut PendingCoreOperations) +
 struct CoreCompletionWake {
     pending: AtomicBool,
     owner: Mutex<Option<ControlSender>>,
+    identities: Mutex<CoreCompletionIdentities>,
+}
+
+#[derive(Debug, Default)]
+struct CoreCompletionIdentities {
+    next_phase: BTreeMap<WaiterId, u64>,
+    registered: BTreeSet<OwnerWorkIdentity>,
+    ready: BTreeSet<OwnerWorkIdentity>,
 }
 
 impl CoreCompletionWake {
@@ -113,7 +125,84 @@ impl CoreCompletionWake {
         Self {
             pending: AtomicBool::new(false),
             owner: Mutex::new(None),
+            identities: Mutex::new(CoreCompletionIdentities::default()),
         }
+    }
+
+    fn register_phases(
+        &self,
+        waiter_id: WaiterId,
+        phase_count: usize,
+    ) -> Option<Vec<OwnerWorkIdentity>> {
+        let mut state = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state
+            .registered
+            .range(
+                OwnerWorkIdentity {
+                    waiter_id,
+                    phase: 0,
+                }..=OwnerWorkIdentity {
+                    waiter_id,
+                    phase: u64::MAX,
+                },
+            )
+            .next()
+            .is_some()
+        {
+            return None;
+        }
+        let next_len = state.registered.len().checked_add(phase_count)?;
+        if next_len > CORE_OWNER_COMPLETION_CAPACITY || phase_count == 0 {
+            return None;
+        };
+        let previous = state.next_phase.get(&waiter_id).copied().unwrap_or(0);
+        let mut identities = Vec::with_capacity(phase_count);
+        let mut phase = previous;
+        for _ in 0..phase_count {
+            phase = phase.checked_add(1)?;
+            identities.push(OwnerWorkIdentity { waiter_id, phase });
+        }
+        state.registered.extend(identities.iter().copied());
+        state.next_phase.insert(waiter_id, phase);
+        Some(identities)
+    }
+
+    fn retire(&self, identity: OwnerWorkIdentity) -> bool {
+        let mut state = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.ready.remove(&identity);
+        state.registered.remove(&identity)
+    }
+
+    fn retire_waiter(&self, waiter_id: WaiterId) -> usize {
+        let mut state = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let identities = state
+            .registered
+            .range(
+                OwnerWorkIdentity {
+                    waiter_id,
+                    phase: 0,
+                }..=OwnerWorkIdentity {
+                    waiter_id,
+                    phase: u64::MAX,
+                },
+            )
+            .copied()
+            .collect::<Vec<_>>();
+        for identity in &identities {
+            state.ready.remove(identity);
+            state.registered.remove(identity);
+        }
+        state.next_phase.remove(&waiter_id);
+        identities.len()
     }
 
     fn bind(&self, sender: ControlSender) {
@@ -126,10 +215,24 @@ impl CoreCompletionWake {
         }
     }
 
-    fn publish(&self) {
-        if self.pending.swap(true, Ordering::AcqRel) {
-            return;
+    fn publish(&self, identity: OwnerWorkIdentity) {
+        let should_wake = {
+            let mut state = self
+                .identities
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !state.registered.contains(&identity) {
+                false
+            } else {
+                state.ready.insert(identity) && !self.pending.swap(true, Ordering::AcqRel)
+            }
+        };
+        if should_wake {
+            self.notify_owner();
         }
+    }
+
+    fn notify_owner(&self) {
         if let Some(sender) = self
             .owner
             .lock()
@@ -142,6 +245,63 @@ impl CoreCompletionWake {
 
     fn take(&self) -> bool {
         self.pending.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_identities(&self, limit: usize) -> Vec<OwnerWorkIdentity> {
+        let mut state = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let identities = state.ready.iter().copied().take(limit).collect::<Vec<_>>();
+        for identity in &identities {
+            state.ready.remove(identity);
+            state.registered.remove(identity);
+        }
+        let has_remaining = !state.ready.is_empty();
+        let should_wake = if has_remaining {
+            !self.pending.swap(true, Ordering::AcqRel)
+        } else {
+            self.pending.store(false, Ordering::Release);
+            false
+        };
+        drop(state);
+        if should_wake {
+            self.notify_owner();
+        }
+        identities
+    }
+
+    fn restore_identities(&self, identities: &[OwnerWorkIdentity]) {
+        if identities.is_empty() {
+            return;
+        }
+        let should_wake = {
+            let mut state = self
+                .identities
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for identity in identities {
+                state.registered.insert(*identity);
+                state.ready.insert(*identity);
+            }
+            !self.pending.swap(true, Ordering::AcqRel)
+        };
+        if should_wake {
+            self.notify_owner();
+        }
+    }
+
+    #[cfg(test)]
+    fn live_identity_counts(&self) -> (usize, usize, usize) {
+        let state = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (
+            state.registered.len(),
+            state.ready.len(),
+            state.next_phase.len(),
+        )
     }
 }
 
@@ -214,17 +374,23 @@ struct CoreTicketPublisher<T> {
     identity: OwnerWorkIdentity,
     sender: SyncSender<CoreTicketResult<T>>,
     wake: Arc<CoreCompletionWake>,
+    notify_owner: bool,
 }
 
 impl<T> CoreTicketPublisher<T> {
-    fn publish(&self, value: T) {
+    fn publish(self, value: T) {
         let result = CoreTicketResult {
             identity: self.identity,
             value,
         };
         if self.sender.try_send(result).is_ok() {
-            // The result is readable before this independent bit and doorbell publish.
-            self.wake.publish();
+            if self.notify_owner {
+                // The result is readable before its identity. The identity is
+                // readable before the independent bit and doorbell publish.
+                self.wake.publish(self.identity);
+            }
+        } else if self.notify_owner {
+            self.wake.retire(self.identity);
         }
     }
 }
@@ -260,6 +426,7 @@ impl<T> CoreTicket<T> {
     fn channel(
         identity: OwnerWorkIdentity,
         wake: Arc<CoreCompletionWake>,
+        notify_owner: bool,
     ) -> (Self, CoreTicketPublisher<T>) {
         let (sender, receiver) = mpsc::sync_channel(1);
         (
@@ -268,6 +435,7 @@ impl<T> CoreTicket<T> {
                 identity,
                 sender,
                 wake,
+                notify_owner,
             },
         )
     }
@@ -398,15 +566,58 @@ impl CoreDaemonHandle {
             return CoreTicket::refused();
         };
         let identity = OwnerWorkIdentity::first(waiter_id);
-        let (ticket, publisher) = CoreTicket::channel(identity, Arc::clone(&self.completion_wake));
+        let (ticket, publisher) =
+            CoreTicket::channel(identity, Arc::clone(&self.completion_wake), false);
         let request: CoreRequest = Box::new(move |daemon, _| {
             publisher.publish(operation(daemon));
         });
         let _admission = self.admission.lock().expect("Core request admission mutex");
         match admit_request(&self.requests, &self.accepting, request) {
             CoreAdmission::Queued => {}
-            CoreAdmission::Refused => return CoreTicket::refused(),
-            CoreAdmission::Stopped => return CoreTicket::lost(identity),
+            CoreAdmission::Refused => {
+                self.completion_wake.retire(identity);
+                return CoreTicket::refused();
+            }
+            CoreAdmission::Stopped => {
+                self.completion_wake.retire(identity);
+                return CoreTicket::lost(identity);
+            }
+        }
+        self.request_pending.store(true, Ordering::Release);
+        if self.owner_waiting.swap(false, Ordering::AcqRel) {
+            self.control.interrupt();
+        }
+        drop(_admission);
+        ticket
+    }
+
+    /// Queue one Core request whose result must ready an owner waiter.
+    pub(crate) fn submit_for_owner<T, F>(&self, waiter_id: WaiterId, operation: F) -> CoreTicket<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut CoreDaemon) -> T + Send + 'static,
+    {
+        let Some(identity) = self
+            .completion_wake
+            .register_phases(waiter_id, 1)
+            .and_then(|identities| identities.into_iter().next())
+        else {
+            return CoreTicket::refused();
+        };
+        let (ticket, publisher) =
+            CoreTicket::channel(identity, Arc::clone(&self.completion_wake), true);
+        let request: CoreRequest = Box::new(move |daemon, _| publisher.publish(operation(daemon)));
+        let _admission = self.admission.lock().expect("Core request admission mutex");
+        match admit_request(&self.requests, &self.accepting, request) {
+            CoreAdmission::Queued => {}
+            CoreAdmission::Refused => {
+                self.completion_wake.retire(identity);
+                return CoreTicket::refused();
+            }
+            CoreAdmission::Stopped => {
+                self.completion_wake.retire(identity);
+                return CoreTicket::lost(identity);
+            }
         }
         self.request_pending.store(true, Ordering::Release);
         if self.owner_waiting.swap(false, Ordering::AcqRel) {
@@ -430,9 +641,12 @@ impl CoreDaemonHandle {
             .expect("the first Core phase always has a successor");
         // Both phases are registered before the request can start in Core.
         let (begin, begin_publisher) =
-            CoreTicket::channel(begin_identity, Arc::clone(&self.completion_wake));
-        let (completion, completion_publisher) =
-            CoreTicket::channel(completion_identity, Arc::clone(&self.completion_wake));
+            CoreTicket::channel(begin_identity, Arc::clone(&self.completion_wake), false);
+        let (completion, completion_publisher) = CoreTicket::channel(
+            completion_identity,
+            Arc::clone(&self.completion_wake),
+            false,
+        );
         let request: CoreRequest = Box::new(move |daemon, pending| {
             let result = daemon.begin(operation);
             if let Ok(id) = result {
@@ -464,12 +678,87 @@ impl CoreDaemonHandle {
         CoreOperationTicket { begin, completion }
     }
 
+    /// Start one two-phase Core operation for an admitted owner waiter.
+    pub(crate) fn begin_for_owner(
+        &self,
+        waiter_id: WaiterId,
+        operation: CoreOperation,
+    ) -> CoreOperationTicket {
+        let Some(identities) = self.completion_wake.register_phases(waiter_id, 2) else {
+            return CoreOperationTicket {
+                begin: CoreTicket::refused(),
+                completion: CoreTicket::refused(),
+            };
+        };
+        let [begin_identity, completion_identity] = identities.as_slice() else {
+            unreachable!("two Core phases were registered");
+        };
+        let begin_identity = *begin_identity;
+        let completion_identity = *completion_identity;
+        let (begin, begin_publisher) =
+            CoreTicket::channel(begin_identity, Arc::clone(&self.completion_wake), true);
+        let (completion, completion_publisher) =
+            CoreTicket::channel(completion_identity, Arc::clone(&self.completion_wake), true);
+        let completion_wake = Arc::clone(&self.completion_wake);
+        let request: CoreRequest = Box::new(move |daemon, pending| {
+            let result = daemon.begin(operation);
+            if let Ok(id) = result {
+                pending.insert(id, CoreResultPublisher(completion_publisher));
+            } else {
+                completion_wake.retire(completion_identity);
+            }
+            begin_publisher.publish(result);
+        });
+        let _admission = self.admission.lock().expect("Core request admission mutex");
+        match admit_request(&self.requests, &self.accepting, request) {
+            CoreAdmission::Queued => {}
+            CoreAdmission::Refused => {
+                self.completion_wake.retire(begin_identity);
+                self.completion_wake.retire(completion_identity);
+                return CoreOperationTicket {
+                    begin: CoreTicket::refused(),
+                    completion: CoreTicket::refused(),
+                };
+            }
+            CoreAdmission::Stopped => {
+                self.completion_wake.retire(begin_identity);
+                self.completion_wake.retire(completion_identity);
+                return CoreOperationTicket {
+                    begin: CoreTicket::lost(begin_identity),
+                    completion: CoreTicket::lost(completion_identity),
+                };
+            }
+        }
+        self.request_pending.store(true, Ordering::Release);
+        if self.owner_waiting.swap(false, Ordering::AcqRel) {
+            self.control.interrupt();
+        }
+        drop(_admission);
+        CoreOperationTicket { begin, completion }
+    }
+
     pub(crate) fn waiter_ids(&self) -> &WaiterIdSource {
         &self.waiter_ids
     }
 
     pub(crate) fn take_completion_notification(&self) -> bool {
         self.completion_wake.take()
+    }
+
+    pub(crate) fn take_owner_completion_identities(&self, limit: usize) -> Vec<OwnerWorkIdentity> {
+        self.completion_wake.take_identities(limit)
+    }
+
+    pub(crate) fn restore_owner_completion_identities(&self, identities: &[OwnerWorkIdentity]) {
+        self.completion_wake.restore_identities(identities);
+    }
+
+    pub(crate) fn retire_owner_completion(&self, identity: OwnerWorkIdentity) -> bool {
+        self.completion_wake.retire(identity)
+    }
+
+    pub(crate) fn retire_owner_waiter(&self, waiter_id: WaiterId) -> usize {
+        self.completion_wake.retire_waiter(waiter_id)
     }
 }
 
@@ -716,6 +1005,17 @@ mod tests {
         }
     }
 
+    fn owner_channel<T>(
+        identity: OwnerWorkIdentity,
+        wake: Arc<CoreCompletionWake>,
+    ) -> (CoreTicket<T>, CoreTicketPublisher<T>) {
+        assert_eq!(
+            wake.register_phases(identity.waiter_id, 1),
+            Some(vec![identity])
+        );
+        CoreTicket::channel(identity, wake, true)
+    }
+
     fn noop_request() -> CoreRequest {
         Box::new(|_, _| {})
     }
@@ -796,7 +1096,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         wake.bind(sender);
         let progress = DataPlaneProgressLatch::default();
-        let (mut ticket, publisher) = CoreTicket::channel(identity(7, 2), Arc::clone(&wake));
+        let (mut ticket, publisher) = owner_channel(identity(7, 1), Arc::clone(&wake));
 
         publisher.publish(41_u8);
 
@@ -806,6 +1106,7 @@ mod tests {
         ));
         assert_eq!(progress.take(), DataPlaneProgress::default());
         assert!(wake.take());
+        assert_eq!(wake.take_identities(1), vec![identity(7, 1)]);
         assert!(matches!(ticket.poll(), CoreTicketPoll::Ready(41)));
     }
 
@@ -814,8 +1115,8 @@ mod tests {
         let wake = Arc::new(CoreCompletionWake::new());
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         wake.bind(sender);
-        let (mut first, first_publisher) = CoreTicket::channel(identity(8, 1), Arc::clone(&wake));
-        let (mut second, second_publisher) = CoreTicket::channel(identity(9, 1), Arc::clone(&wake));
+        let (mut first, first_publisher) = owner_channel(identity(8, 1), Arc::clone(&wake));
+        let (mut second, second_publisher) = owner_channel(identity(9, 1), Arc::clone(&wake));
 
         second_publisher.publish(22_u8);
 
@@ -830,6 +1131,10 @@ mod tests {
         first_publisher.publish(11_u8);
         assert!(receiver.try_recv().is_err());
         assert!(wake.take());
+        assert_eq!(
+            wake.take_identities(2),
+            vec![identity(8, 1), identity(9, 1)]
+        );
         assert!(matches!(first.poll(), CoreTicketPoll::Ready(11)));
     }
 
@@ -841,7 +1146,7 @@ mod tests {
             .try_send(ControlMessage::RejectedConnection)
             .expect("fill owner doorbell queue");
         wake.bind(sender);
-        let (mut ticket, publisher) = CoreTicket::channel(identity(10, 1), Arc::clone(&wake));
+        let (mut ticket, publisher) = owner_channel(identity(10, 1), Arc::clone(&wake));
 
         publisher.publish(31_u8);
 
@@ -851,7 +1156,228 @@ mod tests {
         ));
         assert!(receiver.try_recv().is_err());
         assert!(wake.take());
+        assert_eq!(wake.take_identities(1), vec![identity(10, 1)]);
         assert!(matches!(ticket.poll(), CoreTicketPoll::Ready(31)));
+    }
+
+    #[test]
+    fn retired_identity_is_removed_before_owner_consumption() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let expected = identity(12, 1);
+        let (mut ticket, publisher) = owner_channel(expected, Arc::clone(&wake));
+
+        publisher.publish(7_u8);
+        assert!(wake.retire(expected));
+
+        assert!(wake.take_identities(1).is_empty());
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Ready(7)));
+    }
+
+    #[test]
+    fn blocking_consumer_results_do_not_enter_the_owner_mailbox() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let expected = identity(14, 1);
+        let (ticket, publisher) = CoreTicket::channel(expected, Arc::clone(&wake), false);
+
+        publisher.publish(9_u8);
+
+        assert_eq!(ticket.wait(Duration::ZERO), Ok(9));
+        assert!(!wake.take());
+        assert!(wake.take_identities(1).is_empty());
+    }
+
+    #[test]
+    fn consumed_identities_release_capacity_and_return_to_idle() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let first = identity(15, 1);
+        let second = identity(16, 1);
+        let (first_ticket, first_publisher) = owner_channel(first, Arc::clone(&wake));
+        let (second_ticket, second_publisher) = owner_channel(second, Arc::clone(&wake));
+
+        first_publisher.publish(1_u8);
+        second_publisher.publish(2_u8);
+        assert!(wake.take());
+        assert_eq!(wake.take_identities(1), vec![first]);
+        assert_eq!(wake.take_identities(1), vec![second]);
+        assert!(!wake.take());
+        assert!(wake.take_identities(1).is_empty());
+        drop((first_ticket, second_ticket));
+
+        let replacement = identity(17, 1);
+        assert_eq!(
+            wake.register_phases(replacement.waiter_id, 1),
+            Some(vec![replacement])
+        );
+        assert!(wake.retire(replacement));
+    }
+
+    #[test]
+    fn identity_capacity_covers_two_phases_for_each_owner_permit() {
+        assert_eq!(
+            CORE_OWNER_COMPLETION_CAPACITY,
+            crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY * 2
+        );
+        let wake = CoreCompletionWake::new();
+
+        for waiter in 1..=crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY {
+            assert_eq!(
+                wake.register_phases(WaiterId(waiter as u64), 2)
+                    .expect("each owner permit reserves two phases")
+                    .len(),
+                2
+            );
+        }
+        assert!(wake.register_phases(WaiterId(u64::MAX), 1).is_none());
+        for waiter in 1..=crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY {
+            assert_eq!(wake.retire_waiter(WaiterId(waiter as u64)), 2);
+        }
+    }
+
+    #[test]
+    fn wired_owner_identity_lifecycle_reuses_capacity_across_mixed_batches() {
+        const BATCH_SIZE: usize = 17;
+
+        let root = std::env::temp_dir().join(format!(
+            "botster-core-owner-capacity-{}-{}",
+            std::process::id(),
+            current_unix_seconds()
+        ));
+        std::fs::create_dir_all(&root).expect("create Core identity test directory");
+        let mut daemon = CoreDaemon::new(CoreDaemonConfig::new(&root));
+        let control = daemon.wake_pump_control();
+        let failed_root = root.join("stopped");
+        std::fs::create_dir_all(&failed_root).expect("create stopped Core test directory");
+        let mut failed_daemon = CoreDaemon::new(CoreDaemonConfig::new(&failed_root));
+        let failed_control = failed_daemon.wake_pump_control();
+        failed_control.request_stop();
+        assert!(matches!(
+            failed_daemon.wait_pump(Duration::ZERO),
+            WakePumpWait::Stopped
+        ));
+        failed_daemon
+            .shutdown(None, current_unix_seconds())
+            .expect("stop Core so each tested begin fails deterministically");
+        let (requests, request_rx) = mpsc::sync_channel::<CoreRequest>(CORE_REQUEST_CAPACITY);
+        let accepting = Arc::new(AtomicBool::new(true));
+        let completion_wake = Arc::new(CoreCompletionWake::new());
+        let handle = CoreDaemonHandle {
+            requests,
+            control,
+            accepting,
+            admission: Arc::new(Mutex::new(())),
+            request_pending: Arc::new(AtomicBool::new(false)),
+            owner_waiting: Arc::new(AtomicBool::new(false)),
+            waiter_ids: Arc::new(WaiterIdSource::default()),
+            completion_wake: Arc::clone(&completion_wake),
+        };
+        let mut pending = PendingCoreOperations::new();
+        let mut next_waiter = 1_u64;
+        let mut registered_phases = 0_usize;
+
+        while registered_phases <= CORE_OWNER_COMPLETION_CAPACITY {
+            let mut successes = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                let waiter_id = WaiterId(next_waiter);
+                next_waiter += 1;
+                successes.push((waiter_id, handle.submit_for_owner(waiter_id, |_| 7_u8)));
+                registered_phases += 1;
+            }
+            for _ in 0..BATCH_SIZE {
+                request_rx
+                    .try_recv()
+                    .expect("each successful submission queues one Core request")(
+                    &mut daemon,
+                    &mut pending,
+                );
+            }
+            assert_eq!(
+                handle.take_owner_completion_identities(BATCH_SIZE).len(),
+                BATCH_SIZE
+            );
+            for (waiter_id, mut ticket) in successes {
+                assert!(matches!(ticket.poll(), CoreTicketPoll::Ready(7)));
+                assert_eq!(handle.retire_owner_waiter(waiter_id), 0);
+            }
+            assert_eq!(completion_wake.live_identity_counts(), (0, 0, 0));
+
+            let completed_waiter = WaiterId(next_waiter);
+            next_waiter += 1;
+            let completed = handle.begin_for_owner(
+                completed_waiter,
+                CoreOperation::RemoveSession(botster_core::SessionId(format!(
+                    "completed-missing-{next_waiter}"
+                ))),
+            );
+            registered_phases += 2;
+            request_rx
+                .try_recv()
+                .expect("the successful begin queues one Core request")(
+                &mut daemon, &mut pending
+            );
+            publish_completions(&mut daemon, &mut pending);
+            assert_eq!(handle.take_owner_completion_identities(2).len(), 2);
+            let (mut begin, mut completion) = completed.into_parts();
+            assert!(matches!(begin.poll(), CoreTicketPoll::Ready(Ok(_))));
+            assert!(matches!(completion.poll(), CoreTicketPoll::Ready(_)));
+            assert_eq!(handle.retire_owner_waiter(completed_waiter), 0);
+            assert_eq!(completion_wake.live_identity_counts(), (0, 0, 0));
+
+            let failed_waiter = WaiterId(next_waiter);
+            next_waiter += 1;
+            let failed = handle.begin_for_owner(
+                failed_waiter,
+                CoreOperation::RemoveSession(botster_core::SessionId(format!(
+                    "missing-{next_waiter}"
+                ))),
+            );
+            registered_phases += 2;
+            request_rx
+                .try_recv()
+                .expect("the failed begin queues one Core request")(
+                &mut failed_daemon,
+                &mut pending,
+            );
+            assert_eq!(handle.take_owner_completion_identities(2).len(), 1);
+            let (mut begin, mut completion) = failed.into_parts();
+            assert!(matches!(begin.poll(), CoreTicketPoll::Ready(Err(_))));
+            assert!(matches!(completion.poll(), CoreTicketPoll::Lost));
+            assert_eq!(handle.retire_owner_waiter(failed_waiter), 0);
+            assert_eq!(completion_wake.live_identity_counts(), (0, 0, 0));
+
+            for _ in 0..CORE_REQUEST_CAPACITY {
+                handle
+                    .requests
+                    .try_send(noop_request())
+                    .expect("fill the bounded Core request queue");
+            }
+            let refused_waiter = WaiterId(next_waiter);
+            next_waiter += 1;
+            let mut refused = handle.submit_for_owner(refused_waiter, |_| 9_u8);
+            registered_phases += 1;
+            assert!(matches!(refused.poll(), CoreTicketPoll::Refused));
+            assert_eq!(request_rx.try_iter().count(), CORE_REQUEST_CAPACITY);
+            assert_eq!(handle.retire_owner_waiter(refused_waiter), 0);
+            assert_eq!(completion_wake.live_identity_counts(), (0, 0, 0));
+
+            let retired_waiter = WaiterId(next_waiter);
+            next_waiter += 1;
+            let mut retired = handle.submit_for_owner(retired_waiter, |_| 11_u8);
+            registered_phases += 1;
+            assert_eq!(handle.retire_owner_waiter(retired_waiter), 1);
+            request_rx
+                .try_recv()
+                .expect("the retired request remains accepted Core work")(
+                &mut daemon,
+                &mut pending,
+            );
+            assert!(matches!(retired.poll(), CoreTicketPoll::Ready(11)));
+            assert!(handle.take_owner_completion_identities(1).is_empty());
+            assert_eq!(completion_wake.live_identity_counts(), (0, 0, 0));
+        }
+
+        assert!(registered_phases > CORE_OWNER_COMPLETION_CAPACITY);
+        assert_eq!(completion_wake.live_identity_counts(), (0, 0, 0));
+        std::fs::remove_dir_all(root).expect("remove Core identity test directory");
     }
 
     #[test]
@@ -859,7 +1385,7 @@ mod tests {
         let wake = Arc::new(CoreCompletionWake::new());
         let expected = identity(11, 3);
         let sibling = identity(11, 2);
-        let (mut ticket, publisher) = CoreTicket::channel(expected, wake);
+        let (mut ticket, publisher) = CoreTicket::channel(expected, wake, false);
         let drops = Arc::new(AtomicUsize::new(0));
         publisher
             .sender
@@ -883,11 +1409,23 @@ mod tests {
     #[test]
     fn duplicate_result_is_rejected_and_releases_its_value() {
         let wake = Arc::new(CoreCompletionWake::new());
-        let (mut ticket, publisher) = CoreTicket::channel(identity(13, 1), wake);
+        let expected = identity(13, 1);
+        let (mut ticket, publisher) = CoreTicket::channel(expected, wake, false);
         let drops = Arc::new(AtomicUsize::new(0));
 
-        publisher.publish(DropProbe(Arc::clone(&drops)));
-        publisher.publish(DropProbe(Arc::clone(&drops)));
+        publisher
+            .sender
+            .try_send(CoreTicketResult {
+                identity: expected,
+                value: DropProbe(Arc::clone(&drops)),
+            })
+            .expect("publish first result");
+        let duplicate = publisher.sender.try_send(CoreTicketResult {
+            identity: expected,
+            value: DropProbe(Arc::clone(&drops)),
+        });
+        assert!(matches!(duplicate, Err(TrySendError::Full(_))));
+        drop(duplicate);
 
         assert_eq!(drops.load(Ordering::Acquire), 1);
         let CoreTicketPoll::Ready(result) = ticket.poll() else {
