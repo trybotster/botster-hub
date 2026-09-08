@@ -35,10 +35,9 @@ use crate::packages::{
 };
 use crate::runtime::{CoreOperationTracker, STARTUP_CORE_WAIT, core_bridge_error};
 use crate::session_types::{
-    HubSessionContext, HubSessionType, HubSessionTypeDefinition, PackageSessionType,
-    ResolvedSessionType, SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest,
-    list_session_types, list_session_types_for_target, materialize_session_type, show_session_type,
-    show_session_type_definition,
+    HubSessionContext, HubSessionType, HubSessionTypeDefinition, ResolvedSessionType,
+    SessionTypeRequest, list_session_types, list_session_types_for_target,
+    materialize_session_type, show_session_type, show_session_type_definition,
 };
 use crate::{HubRuntime, HubRuntimeError, daemon_session_to_core_session, host_profile};
 
@@ -856,82 +855,6 @@ impl HubClientApi {
                         })?;
                 HubClientResponseBody::SessionTypeDefinition(Box::new(definition))
             }
-            HubClientRequest::CreateSessionType {
-                source, definition, ..
-            } => {
-                runtime
-                    .mutate_session_type(source, SessionTypeMutation::Create(definition))
-                    .map_err(|error| HubClientError::SessionType {
-                        request_id: request_id.clone(),
-                        operation,
-                        kind: error.kind,
-                        message: error.message,
-                    })?;
-                let records = packages.packages();
-                HubClientResponseBody::SessionTypes(
-                    list_session_types(&records, &runtime.state()).map_err(|error| {
-                        HubClientError::SessionType {
-                            request_id: request_id.clone(),
-                            operation,
-                            kind: error.kind,
-                            message: error.message,
-                        }
-                    })?,
-                )
-            }
-            HubClientRequest::UpdateSessionType {
-                source, definition, ..
-            } => {
-                runtime
-                    .mutate_session_type(source, SessionTypeMutation::Update(definition))
-                    .map_err(|error| HubClientError::SessionType {
-                        request_id: request_id.clone(),
-                        operation,
-                        kind: error.kind,
-                        message: error.message,
-                    })?;
-                let records = packages.packages();
-                HubClientResponseBody::SessionTypes(
-                    list_session_types(&records, &runtime.state()).map_err(|error| {
-                        HubClientError::SessionType {
-                            request_id: request_id.clone(),
-                            operation,
-                            kind: error.kind,
-                            message: error.message,
-                        }
-                    })?,
-                )
-            }
-            HubClientRequest::DeleteSessionType {
-                source,
-                session_type_id,
-                ..
-            } => {
-                runtime
-                    .mutate_session_type(
-                        source,
-                        SessionTypeMutation::Delete {
-                            id: session_type_id,
-                        },
-                    )
-                    .map_err(|error| HubClientError::SessionType {
-                        request_id: request_id.clone(),
-                        operation,
-                        kind: error.kind,
-                        message: error.message,
-                    })?;
-                let records = packages.packages();
-                HubClientResponseBody::SessionTypes(
-                    list_session_types(&records, &runtime.state()).map_err(|error| {
-                        HubClientError::SessionType {
-                            request_id: request_id.clone(),
-                            operation,
-                            kind: error.kind,
-                            message: error.message,
-                        }
-                    })?,
-                )
-            }
             HubClientRequest::ResolveSessionType {
                 session_type_id,
                 session_type_request,
@@ -1199,12 +1122,9 @@ impl HubClientAdmission {
             | HubClientOperation::ShowSessionType
             | HubClientOperation::ResolveSessionType => self.allow_packages,
             // The authoring read carries the authored environment and
-            // working-directory path, so it is gated by the same editor authority
-            // as the mutations, not by the sanitized-read category.
+            // working-directory path, so the runtime category gates it instead
+            // of the sanitized-read category.
             HubClientOperation::ShowSessionTypeDefinition
-            | HubClientOperation::CreateSessionType
-            | HubClientOperation::UpdateSessionType
-            | HubClientOperation::DeleteSessionType
             | HubClientOperation::SpawnSessionType
             | HubClientOperation::ReadSessionContext => self.allow_runtime,
             HubClientOperation::PluginLifecycleStatus
@@ -1338,24 +1258,6 @@ pub enum HubClientRequest {
         request_id: RequestId,
         session_type_id: String,
     },
-    /// Create a session type in an editable authoritative source.
-    CreateSessionType {
-        request_id: RequestId,
-        source: SessionTypeMutationSource,
-        definition: PackageSessionType,
-    },
-    /// Replace a session type in an editable authoritative source.
-    UpdateSessionType {
-        request_id: RequestId,
-        source: SessionTypeMutationSource,
-        definition: PackageSessionType,
-    },
-    /// Delete a session type from an editable authoritative source.
-    DeleteSessionType {
-        request_id: RequestId,
-        source: SessionTypeMutationSource,
-        session_type_id: String,
-    },
     /// Resolve a session type without spawning it.
     ResolveSessionType {
         request_id: RequestId,
@@ -1419,9 +1321,6 @@ impl HubClientRequest {
             | Self::ListSessionTypesForTarget { request_id, .. }
             | Self::ShowSessionType { request_id, .. }
             | Self::ShowSessionTypeDefinition { request_id, .. }
-            | Self::CreateSessionType { request_id, .. }
-            | Self::UpdateSessionType { request_id, .. }
-            | Self::DeleteSessionType { request_id, .. }
             | Self::ResolveSessionType { request_id, .. }
             | Self::SpawnSessionType { request_id, .. }
             | Self::ReadSessionContext { request_id, .. }
@@ -1456,9 +1355,6 @@ impl HubClientRequest {
             Self::ListSessionTypesForTarget { .. } => HubClientOperation::ListSessionTypesForTarget,
             Self::ShowSessionType { .. } => HubClientOperation::ShowSessionType,
             Self::ShowSessionTypeDefinition { .. } => HubClientOperation::ShowSessionTypeDefinition,
-            Self::CreateSessionType { .. } => HubClientOperation::CreateSessionType,
-            Self::UpdateSessionType { .. } => HubClientOperation::UpdateSessionType,
-            Self::DeleteSessionType { .. } => HubClientOperation::DeleteSessionType,
             Self::ResolveSessionType { .. } => HubClientOperation::ResolveSessionType,
             Self::SpawnSessionType { .. } => HubClientOperation::SpawnSessionType,
             Self::ReadSessionContext { .. } => HubClientOperation::ReadSessionContext,
@@ -1495,9 +1391,6 @@ pub enum HubClientOperation {
     ListSessionTypesForTarget,
     ShowSessionType,
     ShowSessionTypeDefinition,
-    CreateSessionType,
-    UpdateSessionType,
-    DeleteSessionType,
     ResolveSessionType,
     SpawnSessionType,
     ReadSessionContext,
@@ -2631,8 +2524,6 @@ mod tests {
             !sanitized_reader_only.allows(HubClientOperation::ShowSessionTypeDefinition),
             "authored environments and paths must not ride the sanitized-read category"
         );
-        assert!(!sanitized_reader_only.allows(HubClientOperation::UpdateSessionType));
-
         let editor_only = HubClientAdmission {
             allow_status: true,
             allow_runtime: true,
@@ -2640,9 +2531,6 @@ mod tests {
             allow_lifecycle: false,
         };
         assert!(editor_only.allows(HubClientOperation::ShowSessionTypeDefinition));
-        assert!(editor_only.allows(HubClientOperation::CreateSessionType));
-        assert!(editor_only.allows(HubClientOperation::UpdateSessionType));
-        assert!(editor_only.allows(HubClientOperation::DeleteSessionType));
         assert!(!editor_only.allows(HubClientOperation::ShowSessionType));
     }
 }
