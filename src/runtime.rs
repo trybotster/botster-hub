@@ -232,6 +232,13 @@ pub(crate) struct PluginEntitySnapshotInvocation {
     scope_id: Option<u64>,
 }
 
+impl PluginEntitySnapshotInvocation {
+    #[must_use]
+    pub(crate) const fn expected_entity_kind(&self) -> &EntityKind {
+        &self.entity_kind
+    }
+}
+
 /// Hub-owned policy bridge for plugin-safe session-type spawns.
 pub struct HubSessionTypeSpawner {
     pending: Mutex<VecDeque<PendingSessionTypeSpawn>>,
@@ -2970,6 +2977,14 @@ impl HubRuntime {
             invocation.scope_id,
             &invocation.request.request_id,
         );
+        Self::convert_plugin_entity_snapshot(&invocation.entity_kind, result)
+    }
+
+    /// Convert and validate one entity-provider completion without runtime state access.
+    pub(crate) fn convert_plugin_entity_snapshot(
+        expected_entity_kind: &EntityKind,
+        result: PluginInvocationResult,
+    ) -> Result<(u64, Vec<serde_json::Value>), crate::McpToolError> {
         let value = completed_plugin_payload(result, "plugin entity provider")?;
         let value = coerce_entity_frame_empty_items(value);
         let frame: EntityFrame = serde_json::from_value(value).map_err(|error| {
@@ -2978,7 +2993,7 @@ impl HubRuntime {
                 format!("invalid entity provider frame: {error}"),
             )
         })?;
-        if frame.entity_type() != &invocation.entity_kind {
+        if frame.entity_type() != expected_entity_kind {
             return Err(crate::McpToolError::new(
                 "invalid_entity_provider",
                 format!(
@@ -3000,8 +3015,8 @@ impl HubRuntime {
         };
         let mut record_ids = BTreeSet::new();
         for item in &items {
-            let record_id = EntityContract::extract_record_id(&invocation.entity_kind, item)
-                .map_err(|error| {
+            let record_id =
+                EntityContract::extract_record_id(expected_entity_kind, item).map_err(|error| {
                     crate::McpToolError::new("invalid_entity_provider", error.to_string())
                 })?;
             if !record_ids.insert(record_id.0.clone()) {
@@ -5547,6 +5562,115 @@ mod tests {
         DataDirectoryOption, HostIdentityOptions, HubStartupOptions, RuntimeEnvironment,
         SessionDefaults, TransportBindings,
     };
+
+    fn completed_entity_snapshot(payload: serde_json::Value) -> PluginInvocationResult {
+        PluginInvocationResult::Completed(botster_core::PluginInvocationSuccess {
+            request_id: RequestId("entity-snapshot-test".to_string()),
+            handler: botster_core::PluginHandlerRef {
+                plugin_key: PluginKey("project-pipelines".to_string()),
+                kind: PluginHandlerKind::EntityProvider,
+                handler_id: "runs".to_string(),
+            },
+            payload: Some(BoundaryJson(payload)),
+        })
+    }
+
+    #[test]
+    fn convert_plugin_entity_snapshot_accepts_valid_snapshot() {
+        let expected = EntityKind("project-pipelines.run".to_string());
+        let (snapshot_seq, items) = HubRuntime::convert_plugin_entity_snapshot(
+            &expected,
+            completed_entity_snapshot(serde_json::json!({
+                "type": "entity_snapshot",
+                "entity_type": "project-pipelines.run",
+                "snapshot_seq": 7,
+                "items": [{ "id": "run-1", "status": "ready" }]
+            })),
+        )
+        .expect("valid provider snapshot");
+
+        assert_eq!(snapshot_seq, 7);
+        assert_eq!(
+            items,
+            vec![serde_json::json!({ "id": "run-1", "status": "ready" })]
+        );
+    }
+
+    #[test]
+    fn convert_plugin_entity_snapshot_rejects_wrong_family() {
+        let expected = EntityKind("project-pipelines.run".to_string());
+        let error = HubRuntime::convert_plugin_entity_snapshot(
+            &expected,
+            completed_entity_snapshot(serde_json::json!({
+                "type": "entity_snapshot",
+                "entity_type": "project-pipelines.ticket",
+                "snapshot_seq": 1,
+                "items": []
+            })),
+        )
+        .expect_err("wrong provider family must fail");
+
+        assert_eq!(error.code, "invalid_entity_provider");
+        assert!(error.message.contains("returned wrong family"));
+    }
+
+    #[test]
+    fn convert_plugin_entity_snapshot_rejects_duplicate_ids() {
+        let expected = EntityKind("project-pipelines.run".to_string());
+        let error = HubRuntime::convert_plugin_entity_snapshot(
+            &expected,
+            completed_entity_snapshot(serde_json::json!({
+                "type": "entity_snapshot",
+                "entity_type": "project-pipelines.run",
+                "snapshot_seq": 1,
+                "items": [{ "id": "run-1" }, { "id": "run-1" }]
+            })),
+        )
+        .expect_err("duplicate provider record ids must fail");
+
+        assert_eq!(error.code, "invalid_entity_provider");
+        assert!(error.message.contains("duplicate record id run-1"));
+    }
+
+    #[test]
+    fn convert_plugin_entity_snapshot_rejects_non_snapshot_frame() {
+        let expected = EntityKind("project-pipelines.run".to_string());
+        let error = HubRuntime::convert_plugin_entity_snapshot(
+            &expected,
+            completed_entity_snapshot(serde_json::json!({
+                "type": "entity_upsert",
+                "entity_type": "project-pipelines.run",
+                "snapshot_seq": 1,
+                "id": "run-1",
+                "entity": { "id": "run-1" }
+            })),
+        )
+        .expect_err("non-snapshot provider frame must fail");
+
+        assert_eq!(error.code, "invalid_entity_provider");
+        assert!(
+            error
+                .message
+                .contains("authoritative whole-family snapshot")
+        );
+    }
+
+    #[test]
+    fn convert_plugin_entity_snapshot_rejects_invalid_record() {
+        let expected = EntityKind("project-pipelines.run".to_string());
+        let error = HubRuntime::convert_plugin_entity_snapshot(
+            &expected,
+            completed_entity_snapshot(serde_json::json!({
+                "type": "entity_snapshot",
+                "entity_type": "project-pipelines.run",
+                "snapshot_seq": 1,
+                "items": [{ "status": "missing-id" }]
+            })),
+        )
+        .expect_err("provider record without its id must fail");
+
+        assert_eq!(error.code, "invalid_entity_provider");
+    }
 
     #[test]
     fn startup_plugin_failure_classification_is_fail_closed() {
