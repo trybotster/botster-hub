@@ -1041,6 +1041,7 @@ fn prepare_managed_worktree_removal(
         HostReply::try_new(daemon_worktrees(Vec::new()))?,
         MutationFamily::RegisteredWorktree,
         None,
+        None,
     )
 }
 
@@ -1076,6 +1077,7 @@ fn prepare_managed_worktree_record(
         data_directory,
         HostReply::try_new(daemon_worktrees(vec![worktree]))?,
         MutationFamily::RegisteredWorktree,
+        None,
         None,
     )
 }
