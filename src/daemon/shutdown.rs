@@ -22,11 +22,12 @@ pub(crate) enum ShutdownSessionClassification {
 /// Classify one session on the Core owner thread.
 pub(crate) fn begin_shutdown_classification(
     runtime: &crate::HubRuntime,
+    waiter_id: crate::owner_identity::WaiterId,
     session_id: &str,
     now_seconds: u64,
 ) -> CoreTicket<Result<ShutdownSessionClassification, CoreDaemonError>> {
     let session_id = session_id.to_string();
-    runtime.submit_core(move |daemon| {
+    runtime.submit_core_for_owner(waiter_id, move |daemon| {
         let lookup = daemon.observe_session_lifecycle(&SessionId(session_id.clone()), now_seconds);
         classify_lookup(&session_id, lookup)
     })
