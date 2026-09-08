@@ -13,6 +13,7 @@ pub(crate) mod shutdown;
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use botster_core::SessionId;
 
@@ -23,7 +24,7 @@ use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
 };
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
-use crate::runtime::{HubRuntime, HubRuntimeError};
+use crate::runtime::{HubRuntime, HubRuntimeError, SharedHubState};
 use crate::transport::webrtc::LocalWebrtcTransport;
 
 /// Local daemon lifecycle state.
@@ -80,7 +81,7 @@ pub struct HubDaemonStatus {
 /// Local daemon lifecycle around `HubRuntime` and durable hub state.
 pub struct HubDaemon {
     config: HubConfig,
-    state: HubState,
+    state: SharedHubState,
     state_source: HubStateLoadSource,
     package_registry: PackageRegistry,
     entrypoint_supervisor: EntrypointSupervisor,
@@ -101,19 +102,20 @@ impl HubDaemon {
             HubStateLoadSource::Initialized
         };
         let mut runtime = HubRuntime::load_from_store(config.clone(), &store)?;
-        let mut state = runtime.state().clone();
+        let mut state = runtime.state();
         let package_registry = PackageRegistry::from_snapshot(state.package_registry.clone())?;
         let (package_registry, decisions) = package_registry
             .refreshed_local_packages("daemon startup refresh local package registrations")?;
         if !decisions.is_empty() {
             let snapshot = package_registry.snapshot();
-            state = store.update(&config, |state| {
+            state = Arc::new(store.update(&config, |state| {
                 state.package_registry = snapshot;
-            })?;
-            runtime.replace_state(state.clone());
+            })?);
+            runtime.replace_state(Arc::clone(&state));
         }
         load_enabled_local_plugins(&mut runtime, &package_registry)?;
 
+        let state = runtime.state_publication();
         Ok(Self {
             config,
             state,
@@ -138,12 +140,23 @@ impl HubDaemon {
         self.runtime.as_mut()
     }
 
-    /// Replace durable hub state after an owner-thread mutation.
+    /// Publish durable hub state after an owner-thread mutation.
     pub fn replace_state(&mut self, state: HubState) {
+        self.publish_state(Arc::new(state));
+    }
+
+    /// Publish one shared state allocation to the daemon and runtime views.
+    pub(crate) fn publish_state(&mut self, state: Arc<HubState>) {
         if let Some(runtime) = self.runtime.as_mut() {
-            runtime.replace_state(state.clone());
+            runtime.replace_state(state);
+        } else {
+            self.state.publish(state);
         }
-        self.state = state;
+    }
+
+    /// Return the current shared state allocation and its owner revision.
+    pub(crate) fn state_view(&self) -> (u64, Arc<HubState>) {
+        self.state.snapshot()
     }
 
     /// Return the package registry restored for this daemon lifecycle.
@@ -203,7 +216,7 @@ impl HubDaemon {
             lifecycle_state: self.lifecycle_state,
             host_id: self.config.host.id.clone(),
             host_display_name: self.config.host.display_name.clone(),
-            schema_version: self.state.schema_version,
+            schema_version: self.state.snapshot().1.schema_version,
             data_dir_configured: true,
             core_initialized: self.runtime.is_some(),
             state_source: self.state_source,
@@ -355,6 +368,30 @@ pub type HubDaemonResult<T> = Result<T, HubDaemonError>;
 mod tests {
     use super::*;
 
+    fn shared_state_config() -> HubConfig {
+        let data_directory = std::path::PathBuf::from("target")
+            .join("botster-hub-test-data")
+            .join("shared-state-publication")
+            .join(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time after epoch")
+                    .as_nanos()
+                    .to_string(),
+            );
+        crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "shared-state-test".to_string(),
+                display_name: "Shared State Test".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build shared state config")
+    }
+
     #[test]
     fn plugin_result_capacity_accepts_exact_limit_and_rejects_larger_completion() {
         let capacity = crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY;
@@ -366,6 +403,79 @@ mod tests {
                 retained_result_capacity,
             }) if maximum_completion_bytes == capacity + 1
                 && retained_result_capacity == capacity
+        ));
+    }
+
+    #[test]
+    fn state_publication_shares_one_allocation_and_advances_the_owner_revision() {
+        let mut daemon = HubDaemon::start(shared_state_config()).expect("start daemon");
+        let (initial_revision, initial) = daemon.state_view();
+        let runtime_initial = daemon.runtime().expect("runtime").state();
+        assert_eq!(initial_revision, 0);
+        assert!(Arc::ptr_eq(&initial, &runtime_initial));
+
+        let mut next = initial.as_ref().clone();
+        next.session_type_generation = 1;
+        let next = Arc::new(next);
+        daemon.publish_state(Arc::clone(&next));
+
+        let (published_revision, published) = daemon.state_view();
+        let runtime = daemon.runtime().expect("runtime");
+        let runtime_published = runtime.state();
+        let spawn_targets = runtime.spawn_targets();
+        let worktrees = runtime.worktrees();
+        let plugin_published = spawn_targets.snapshot().1;
+        assert_eq!(published_revision, 1);
+        assert!(Arc::ptr_eq(&next, &published));
+        assert!(Arc::ptr_eq(&published, &runtime_published));
+        assert!(Arc::ptr_eq(&published, &plugin_published));
+        assert!(Arc::ptr_eq(&spawn_targets, &worktrees));
+        assert!(!Arc::ptr_eq(&initial, &published));
+
+        let mut final_state = published.as_ref().clone();
+        final_state.session_type_generation = 2;
+        daemon.publish_state(Arc::new(final_state));
+        let (final_revision, _) = daemon.state_view();
+        assert_eq!(final_revision, 2);
+    }
+
+    #[test]
+    fn runtime_mutation_updates_the_shared_state_and_revision() {
+        let daemon = HubDaemon::start(shared_state_config()).expect("start daemon");
+        let (_, before) = daemon.state_view();
+        daemon
+            .runtime()
+            .expect("runtime")
+            .mutate_session_type(
+                crate::SessionTypeMutationSource::Device,
+                crate::SessionTypeMutation::Create(crate::PackageSessionType {
+                    id: "shared-publication".to_string(),
+                    label: "Shared publication".to_string(),
+                    description: None,
+                    icon: None,
+                    role: "botster.agent".to_string(),
+                    interaction: "interactive".to_string(),
+                    traits: vec!["terminal".to_string()],
+                    lifecycle: "task".to_string(),
+                    execution: crate::PackageSessionTypeExecution::RelativeExecutable,
+                    command: "bin/agent".to_string(),
+                    args: Vec::new(),
+                    working_directory: crate::PackageSessionTypeWorkingDirectory::PackageRoot,
+                    environment: std::collections::BTreeMap::new(),
+                    allowed_environment_overrides: Vec::new(),
+                    context: Vec::new(),
+                    target_id: None,
+                }),
+            )
+            .expect("create device session type");
+
+        let (revision, after) = daemon.state_view();
+        assert_eq!(revision, 1);
+        assert_eq!(after.session_type_generation, 1);
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(Arc::ptr_eq(
+            &after,
+            &daemon.runtime().expect("runtime").state()
         ));
     }
 }

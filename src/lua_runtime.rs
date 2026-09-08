@@ -1231,10 +1231,12 @@ fn spawn_targets_table(lua: &Lua, spawn_targets: SharedSpawnTargets) -> Result<T
     table.set(
         "list",
         lua.create_function(move |lua, ()| {
-            let targets = list_targets.lock().map_err(|_| {
-                mlua::Error::RuntimeError("spawn target registry lock poisoned".to_string())
-            })?;
-            lua.to_value(&crate::spawn_targets::list_spawn_targets(&targets))
+            let (_, state) = list_targets
+                .try_snapshot()
+                .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
+            lua.to_value(&crate::spawn_targets::list_spawn_targets(
+                &state.spawn_targets,
+            ))
         })?,
     )?;
     table.set(
@@ -1250,11 +1252,12 @@ fn spawn_targets_table(lua: &Lua, spawn_targets: SharedSpawnTargets) -> Result<T
                         "spawn_targets.validate requires target_id".to_string(),
                     )
                 })?;
-            let targets = spawn_targets.lock().map_err(|_| {
-                mlua::Error::RuntimeError("spawn target registry lock poisoned".to_string())
-            })?;
+            let (_, state) = spawn_targets
+                .try_snapshot()
+                .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
             lua.to_value(&crate::spawn_targets::validate_spawn_target(
-                &targets, target_id,
+                &state.spawn_targets,
+                target_id,
             ))
         })?,
     )?;
@@ -1272,13 +1275,14 @@ fn worktrees_table(
     table.set(
         "list",
         lua.create_function(move |lua, ()| {
-            let targets = list_targets.lock().map_err(|_| {
-                mlua::Error::RuntimeError("spawn target registry lock poisoned".to_string())
-            })?;
-            let worktrees = list_worktrees.lock().map_err(|_| {
-                mlua::Error::RuntimeError("worktree registry lock poisoned".to_string())
-            })?;
-            lua.to_value(&crate::worktrees::list_worktrees(&worktrees, &targets))
+            let (_, state) = list_targets
+                .try_snapshot()
+                .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
+            debug_assert!(Arc::ptr_eq(&list_targets, &list_worktrees));
+            lua.to_value(&crate::worktrees::list_worktrees(
+                &state.worktrees,
+                &state.spawn_targets,
+            ))
         })?,
     )?;
     table.set(
@@ -1292,13 +1296,15 @@ fn worktrees_table(
                 .ok_or_else(|| {
                     mlua::Error::RuntimeError("worktrees.show requires worktree_id".to_string())
                 })?;
-            let targets = spawn_targets.lock().map_err(|_| {
-                mlua::Error::RuntimeError("spawn target registry lock poisoned".to_string())
-            })?;
-            let worktrees = worktrees.lock().map_err(|_| {
-                mlua::Error::RuntimeError("worktree registry lock poisoned".to_string())
-            })?;
-            match crate::worktrees::show_worktree(&worktrees, &targets, worktree_id) {
+            let (_, state) = spawn_targets
+                .try_snapshot()
+                .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
+            debug_assert!(Arc::ptr_eq(&spawn_targets, &worktrees));
+            match crate::worktrees::show_worktree(
+                &state.worktrees,
+                &state.spawn_targets,
+                worktree_id,
+            ) {
                 Ok(worktree) => lua.to_value(&json!({
                     "ok": true,
                     "status": worktree.status,
