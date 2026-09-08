@@ -22,7 +22,7 @@ use crate::daemon::control::session_types::{
 };
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, PackageRollbackFailure};
 use crate::entrypoint_supervisor::EntrypointSupervisorError;
-use crate::persistence::{FileHubStateStore, HubStateStore};
+use crate::persistence::FileHubStateStore;
 use crate::{
     PackageAction, PackageAdmissionReason, PackageDecision, PackageRegistry, PackageRegistryError,
     PackageState,
@@ -309,10 +309,15 @@ fn commit_package_registry(
     let config = runtime.config().clone();
     let snapshot = package_registry.snapshot();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
-    let state = store.update(&config, |state| {
-        state.package_registry = snapshot;
-    })?;
-    daemon.replace_package_registry(package_registry);
+    let mut state = store.load_for_update(&config)?;
+    state.package_registry = snapshot;
+    let prepared_state = store.prepare_shared(state, &runtime.shared_view_budget())?;
+    let package_registry = daemon.prepare_package_registry_with_charge(
+        package_registry,
+        prepared_state.package_registry_logical_bytes(),
+    )?;
+    let state = store.commit_shared(prepared_state)?;
+    daemon.publish_package_registry_view(package_registry);
     daemon.replace_state(state);
     Ok(())
 }

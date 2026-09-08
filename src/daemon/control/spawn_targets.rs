@@ -8,7 +8,7 @@ use crate::HubDaemon;
 use crate::client_api_dto::response::{daemon_spawn_targets, daemon_worktrees};
 use crate::client_api_dto::workspace::{worktree_failure_event, worktree_lifecycle_event};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, daemon_worktree_error};
-use crate::persistence::{FileHubStateStore, HubStateStore};
+use crate::persistence::FileHubStateStore;
 use crate::{
     SpawnTarget, SpawnTargetCreate, SpawnTargetError, SpawnTargetUpdate, Worktree, WorktreeCreate,
 };
@@ -103,7 +103,7 @@ fn persist_spawn_targets(
     let config = runtime.config().clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     let mut changed = None;
-    let state = store.update(&config, |state| {
+    let state = store.update_shared(&config, &runtime.shared_view_budget(), |state| {
         let target = update(&mut state.spawn_targets);
         changed = Some(target);
     })?;
@@ -124,7 +124,7 @@ fn persist_spawn_targets_with_worktrees(
     let config = runtime.config().clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     let mut changed = None;
-    let state = store.update(&config, |state| {
+    let state = store.update_shared(&config, &runtime.shared_view_budget(), |state| {
         let worktrees = state.worktrees.clone();
         changed = Some(update(&mut state.spawn_targets, &worktrees));
     })?;
@@ -145,7 +145,7 @@ fn persist_worktrees(
     let config = runtime.config().clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     let mut changed = None;
-    let state = store.update(&config, |state| {
+    let state = store.update_shared(&config, &runtime.shared_view_budget(), |state| {
         let targets = state.spawn_targets.clone();
         let worktree = update(&mut state.worktrees, &targets);
         changed = Some(worktree);

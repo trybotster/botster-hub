@@ -77,6 +77,7 @@ pub mod profile;
 pub mod runtime;
 mod session_projection;
 pub mod session_types;
+pub(crate) mod shared_view;
 #[doc(hidden)]
 pub mod source_update;
 pub mod spawn_targets;
