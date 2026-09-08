@@ -1240,8 +1240,13 @@ fn handle_shutdown_session(
 ) -> ControlStep {
     let runtime = daemon.runtime().expect("runtime checked by caller");
     let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
-    let mut stage =
-        ShutdownStage::Classify(begin_shutdown_classification(runtime, &session_id, now));
+    let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+    let mut stage = ShutdownStage::Classify(begin_shutdown_classification(
+        runtime,
+        waiter_id,
+        &session_id,
+        now,
+    ));
     let id = request_id("daemon-sessions-shutdown");
     ControlStep::pending(move |daemon, state| {
         loop {
@@ -1305,7 +1310,12 @@ fn handle_shutdown_session(
                             };
                             let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
                             stage = ShutdownStage::Recover {
-                                ticket: begin_shutdown_classification(runtime, &session_id, now),
+                                ticket: begin_shutdown_classification(
+                                    runtime,
+                                    waiter_id,
+                                    &session_id,
+                                    now,
+                                ),
                                 error,
                             };
                         }
