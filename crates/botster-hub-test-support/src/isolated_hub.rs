@@ -193,53 +193,25 @@ impl IsolatedHubBuilder {
             source,
         })?;
         let endpoint = DaemonEndpoint::new(data_dir.join(default_socket_name()));
-
-        let mut command = Command::new(&hub_bin);
-        command
-            .arg("start")
-            .arg("--data-dir")
-            .arg(&selected_data_dir)
-            .arg("--session-worker-bin")
-            .arg(&session_worker_bin)
-            .current_dir(&working_directory)
-            .env("BOTSTER_ENV", "test")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        prepend_worker_dir_to_path(&mut command, &session_worker_bin);
-
-        let mut child = command.spawn().map_err(|source| IsolatedHubError::Spawn {
-            path: hub_bin.clone(),
-            source,
-        })?;
-        let hub_pid = child.id();
-
-        if let Err(error) = wait_for_ready(&endpoint, &mut child, self.ready_timeout) {
-            let _ = cleanup_child(&mut child);
-            let _ = reap_owned_session_workers(
-                hub_pid,
-                None,
-                &TeardownBudget::new(),
-                &IsolatedHubSeams::default(),
-            );
-            remove_data_dir_path(&data_dir)?;
-            return Err(error);
-        }
+        let launch = IsolatedHubLaunch {
+            session_worker_bin,
+            ready_timeout: self.ready_timeout,
+            extra_env: self.extra_env,
+        };
+        let (child, hub_pid) = spawn_isolated_hub(
+            &hub_bin,
+            &selected_data_dir,
+            &data_dir,
+            &working_directory,
+            &endpoint,
+            &launch,
+        )?;
 
         Ok(IsolatedHub {
             hub_bin,
             data_dir,
             working_directory,
+            launch,
             endpoint,
             child: Some(child),
             hub_pid,
@@ -268,6 +240,74 @@ impl IsolatedHubBuilder {
             .join(sanitize_segment(&self.name))
             .join(now.to_string()))
     }
+}
+
+#[derive(Debug, Clone)]
+struct IsolatedHubLaunch {
+    session_worker_bin: PathBuf,
+    ready_timeout: Duration,
+    extra_env: Vec<(String, String)>,
+}
+
+fn spawn_isolated_hub(
+    hub_bin: &Path,
+    data_dir_argument: &Path,
+    data_dir: &Path,
+    working_directory: &Path,
+    endpoint: &DaemonEndpoint,
+    launch: &IsolatedHubLaunch,
+) -> Result<(Child, u32), IsolatedHubError> {
+    let mut command = Command::new(hub_bin);
+    command
+        .arg("start")
+        .arg("--data-dir")
+        .arg(data_dir_argument)
+        .arg("--session-worker-bin")
+        .arg(&launch.session_worker_bin)
+        .current_dir(working_directory)
+        .env("BOTSTER_ENV", "test")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in &launch.extra_env {
+        command.env(key, value);
+    }
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    prepend_worker_dir_to_path(&mut command, &launch.session_worker_bin);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(source) => {
+            remove_data_dir_path(data_dir)?;
+            return Err(IsolatedHubError::Spawn {
+                path: hub_bin.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let hub_pid = child.id();
+    #[cfg(test)]
+    LAST_ISOLATED_HUB_SPAWN_PID.with(|pid| pid.set(Some(hub_pid)));
+
+    if let Err(error) = wait_for_ready(endpoint, &mut child, launch.ready_timeout) {
+        let _ = cleanup_child(&mut child);
+        let _ = reap_owned_session_workers(
+            hub_pid,
+            None,
+            &TeardownBudget::new(),
+            &IsolatedHubSeams::default(),
+        );
+        remove_data_dir_path(data_dir)?;
+        return Err(error);
+    }
+
+    Ok((child, hub_pid))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +340,7 @@ pub struct IsolatedHub {
     pub(crate) hub_bin: PathBuf,
     pub(crate) data_dir: PathBuf,
     pub(crate) working_directory: PathBuf,
+    launch: IsolatedHubLaunch,
     pub(crate) endpoint: DaemonEndpoint,
     pub(crate) child: Option<Child>,
     pub(crate) hub_pid: u32,
@@ -431,6 +472,52 @@ impl IsolatedHub {
         self.shutdown_inner()
     }
 
+    /// Stop this daemon and start a fresh daemon at the same owned endpoint.
+    ///
+    /// Restart completes the bounded shutdown and worker reap before it removes
+    /// and recreates the same data directory. The new daemon therefore has no
+    /// sessions from the old daemon.
+    pub fn restart(self) -> Result<Self, IsolatedHubError> {
+        let _guard = isolated_hub_start_guard();
+        let mut this = self;
+        this.shutdown_inner()?;
+        if let Some(taint) = current_taint() {
+            return Err(IsolatedHubError::Tainted {
+                pgid: taint.pgid,
+                data_dir: taint.data_dir,
+            });
+        }
+        run_after_taint_check_hook();
+        ensure_file("botster-hub binary", &this.hub_bin)?;
+        ensure_file(
+            "botster-session-worker binary",
+            &this.launch.session_worker_bin,
+        )?;
+        fs::create_dir_all(&this.data_dir).map_err(|source| IsolatedHubError::CreateDataDir {
+            path: this.data_dir.clone(),
+            source,
+        })?;
+        let (child, hub_pid) = spawn_isolated_hub(
+            &this.hub_bin,
+            &this.data_dir,
+            &this.data_dir,
+            &this.working_directory,
+            &this.endpoint,
+            &this.launch,
+        )?;
+        this.child = Some(child);
+        this.hub_pid = hub_pid;
+        this.lifecycle = IsolatedHubLifecycle::Pending;
+        this.seams = IsolatedHubSeams::default();
+        this.drop_retry_used = false;
+        this.teardown_started = None;
+        this.unconfirmed_deadline = None;
+        this.stop_polls.set(0);
+        this.drop_retry_ran_cleanup.set(false);
+        this.drop_retry_used_fresh_budget.set(false);
+        Ok(this)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_running_child(
         hub_bin: PathBuf,
@@ -439,11 +526,17 @@ impl IsolatedHub {
         child: Child,
     ) -> Self {
         let hub_pid = child.id();
+        let launch = IsolatedHubLaunch {
+            session_worker_bin: data_dir.join("missing-session-worker-for-test-fixture"),
+            ready_timeout: READY_TIMEOUT,
+            extra_env: Vec::new(),
+        };
         Self {
             hub_bin,
-            endpoint: DaemonEndpoint::new(data_dir.join(default_socket_name())),
-            data_dir,
+            data_dir: data_dir.clone(),
             working_directory,
+            endpoint: DaemonEndpoint::new(data_dir.join(default_socket_name())),
+            launch,
             child: Some(child),
             hub_pid,
             lifecycle: IsolatedHubLifecycle::Pending,
@@ -1339,6 +1432,132 @@ mod candidate_manifest_tests {
     }
 }
 
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    struct FixtureRoot(PathBuf);
+
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn candidate_path(variable: &'static str) -> PathBuf {
+        env::var_os(variable)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{variable} must name a verified test candidate"))
+    }
+
+    fn wait_for_owned_workers(hub: &IsolatedHub) -> Vec<u32> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let workers = hub.owned_session_worker_pids();
+            if !workers.is_empty() {
+                return workers;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the spawned session did not create an owned worker")
+    }
+
+    fn assert_process_gone(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if process_pgid(pid).is_none() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("process {pid} still exists")
+    }
+
+    #[test]
+    #[ignore = "requires BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, and BOTSTER_CANDIDATE_MANIFEST from one verified candidate"]
+    fn restart_reuses_the_endpoint_and_starts_with_fresh_sessions() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "bh-restart-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _fixture_root = FixtureRoot(root.clone());
+        let mut hub = IsolatedHubBuilder::new()
+            .hub_bin(candidate_path("BOTSTER_HUB_BIN"))
+            .session_worker_bin(candidate_path("BOTSTER_SESSION_WORKER_BIN"))
+            .manifest(candidate_path(CANDIDATE_MANIFEST_ENV))
+            .root(&root)
+            .name("restart")
+            .start()
+            .expect("start isolated hub");
+        let data_dir = hub.data_dir().clone();
+        let endpoint = hub.endpoint().clone();
+        let old_hub_pid = hub.hub_child_pid();
+        let stale_marker = data_dir.join("old-run-marker");
+
+        fs::write(&stale_marker, b"old run").expect("write old-run marker");
+        let spawn = botster_hub_client::request(
+            hub.endpoint(),
+            DaemonRequest::Spawn {
+                session_id: "restart-old-session".to_string(),
+                command: "printf 'OLD-READY\\n'; sleep 60".to_string(),
+            },
+        )
+        .expect("spawn old session");
+        assert_eq!(spawn.kind, DaemonResponseKind::Spawned);
+        let old_worker_pids = wait_for_owned_workers(&hub);
+
+        hub = hub.restart().expect("restart isolated hub");
+
+        assert_eq!(hub.data_dir(), &data_dir);
+        assert_eq!(hub.endpoint(), &endpoint);
+        assert!(!stale_marker.exists());
+        assert_process_gone(old_hub_pid);
+        for pid in old_worker_pids {
+            assert_process_gone(pid);
+        }
+        assert_eq!(process_pgid(hub.hub_child_pid()), Some(hub.hub_child_pid()));
+        let sessions = botster_hub_client::request(hub.endpoint(), DaemonRequest::ListSessions)
+            .expect("list sessions after restart");
+        assert_eq!(sessions.kind, DaemonResponseKind::Sessions);
+        assert!(sessions.sessions.is_empty());
+        assert!(
+            sessions
+                .sessions
+                .iter()
+                .all(|session| session.session_id != "restart-old-session")
+        );
+
+        let report = crate::run_client_conformance(&hub)
+            .expect("spawn and attach a new session after restart");
+        assert_eq!(report.initial_session_count, 0);
+        assert!(report.stream_contains_ready);
+
+        let failed_restart_old_pid = hub.hub_child_pid();
+        hub.launch.ready_timeout = Duration::ZERO;
+        let error = match hub.restart() {
+            Ok(restarted) => {
+                restarted
+                    .shutdown()
+                    .expect("shutdown unexpected successful restart");
+                panic!("zero readiness budget unexpectedly succeeded")
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(error, IsolatedHubError::ReadyTimeout { .. }));
+        let failed_restart_pid = LAST_ISOLATED_HUB_SPAWN_PID
+            .with(Cell::get)
+            .expect("restart attempted a new daemon spawn");
+        assert_ne!(failed_restart_pid, failed_restart_old_pid);
+        assert_process_gone(failed_restart_old_pid);
+        assert_process_gone(failed_restart_pid);
+        assert!(!data_dir.exists());
+    }
+}
+
 pub(crate) fn explicit_path(
     explicit: Option<PathBuf>,
     variable: &'static str,
@@ -1545,6 +1764,8 @@ thread_local! {
     static START_GUARD_DEPTH: Cell<u32> = const { Cell::new(0) };
     static BYPASS_START_GUARD: Cell<bool> = const { Cell::new(false) };
     static START_TOKEN: Cell<Option<u64>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static LAST_ISOLATED_HUB_SPAWN_PID: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 fn isolated_hub_start_lock() -> &'static Mutex<()> {
