@@ -810,6 +810,9 @@ pub(crate) fn register_builtin_entity_subscription(
     }
     // The journal pull runs on the Core owner thread; the maintenance
     // scheduler pulls and applies it on the next owner slices.
+    // A new subscriber needs delivery even when the journal has no changes.
+    // Journal confirmation must retain that delivery wake until the snapshot is sent.
+    state.maintenance.projection_dirty = true;
     state.maintenance.note_authoritative_mutation();
     let cursor = state.maintenance.projection.cursor.clone();
     let snapshot_seq = cursor.as_ref().map(|cursor| cursor.sequence).unwrap_or(0);
