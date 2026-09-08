@@ -625,35 +625,77 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mutation_updates_the_shared_state_and_revision() {
-        let daemon = HubDaemon::start(shared_state_config()).expect("start daemon");
+    fn admitted_mutation_updates_the_shared_state_and_revision() {
+        let mut daemon = HubDaemon::start(shared_state_config()).expect("start daemon");
         let (_, before) = daemon.state_view();
-        daemon
-            .runtime()
-            .expect("runtime")
-            .mutate_session_type(
-                crate::SessionTypeMutationSource::Device,
-                crate::SessionTypeMutation::Create(crate::PackageSessionType {
-                    id: "shared-publication".to_string(),
-                    label: "Shared publication".to_string(),
-                    description: None,
-                    icon: None,
-                    role: "botster.agent".to_string(),
-                    interaction: "interactive".to_string(),
-                    traits: vec!["terminal".to_string()],
-                    lifecycle: "task".to_string(),
-                    execution: crate::PackageSessionTypeExecution::RelativeExecutable,
-                    command: "bin/agent".to_string(),
-                    args: Vec::new(),
-                    working_directory: crate::PackageSessionTypeWorkingDirectory::PackageRoot,
-                    environment: std::collections::BTreeMap::new(),
-                    allowed_environment_overrides: Vec::new(),
-                    context: Vec::new(),
-                    target_id: None,
-                }),
-            )
-            .expect("create device session type");
-
+        let definition = crate::PackageSessionType {
+            id: "shared-publication".to_string(),
+            label: "Shared publication".to_string(),
+            description: None,
+            icon: None,
+            role: "botster.agent".to_string(),
+            interaction: "interactive".to_string(),
+            traits: vec!["terminal".to_string()],
+            lifecycle: "task".to_string(),
+            execution: crate::PackageSessionTypeExecution::RelativeExecutable,
+            command: "bin/agent".to_string(),
+            args: Vec::new(),
+            working_directory: crate::PackageSessionTypeWorkingDirectory::PackageRoot,
+            environment: std::collections::BTreeMap::new(),
+            allowed_environment_overrides: Vec::new(),
+            context: Vec::new(),
+            target_id: None,
+        };
+        let request = botster_hub_client::DaemonRequest::CreateSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            definition: crate::client_api_dto::session::daemon_session_type_definition_from_client(
+                definition,
+            ),
+        };
+        let mut state = crate::daemon::owner_loop::DaemonControlState::default();
+        let transport = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("transport runtime");
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+        let (reply_tx, mut reply_rx) = crate::daemon::control::message::control_reply_channel();
+        assert!(!crate::daemon::control::request::handle(
+            &mut daemon,
+            &mut state,
+            transport.handle(),
+            control_tx,
+            crate::daemon::control::message::ControlMessage::Request {
+                request: Box::new(request),
+                transport_request_id: None,
+                reply_tx,
+                response_delivery_rx: None,
+                grant_id: None,
+                client_id: None,
+                enqueued_at: std::time::Instant::now(),
+            },
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let response = loop {
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            match reply_rx.try_recv() {
+                Ok(reply) => break reply.into_parts().0.expect("mutation response"),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    panic!("mutation reply closed")
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the owner must complete the mutation"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        };
+        assert!(
+            response.error.is_none(),
+            "mutation must succeed: {:?}",
+            response.error
+        );
         let (revision, after) = daemon.state_view();
         assert_eq!(revision, 1);
         assert_eq!(after.session_type_generation, 1);
@@ -662,5 +704,6 @@ mod tests {
             &after,
             &daemon.runtime().expect("runtime").state()
         ));
+        daemon.stop();
     }
 }
