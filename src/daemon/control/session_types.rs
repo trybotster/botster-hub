@@ -63,10 +63,10 @@ pub(crate) fn session_type_definition_map(
 ) -> DaemonTransportResult<BTreeMap<String, Value>> {
     let packages = daemon.package_registry().clone();
     let records = packages.packages().into_iter().cloned().collect::<Vec<_>>();
-    let runtime = daemon
-        .runtime_mut()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?;
-    let state = runtime.state().clone();
+    if daemon.runtime().is_none() {
+        return Err(DaemonTransportError::DaemonNotRunning);
+    }
+    let (_, state) = daemon.state_view();
     session_type_catalog_entities(&records, &state)
 }
 

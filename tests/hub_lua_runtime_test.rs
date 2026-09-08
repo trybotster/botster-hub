@@ -1778,7 +1778,7 @@ fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() 
         .join("lua-runtime")
         .join("spawn-target-reader-target");
     fs::create_dir_all(&target_root).expect("create target root");
-    let mut state = hub.state().clone();
+    let mut state = hub.state().as_ref().clone();
     state.spawn_targets = vec![
         SpawnTarget {
             target_id: "tgt_lua_enabled".to_string(),
@@ -1835,7 +1835,7 @@ fn real_lua_plugin_lists_and_shows_worktrees_without_mutation_surface() {
         .join("worktree-reader-target");
     let worktree_path = target_root.join("plain");
     fs::create_dir_all(&worktree_path).expect("create worktree path");
-    let mut state = hub.state().clone();
+    let mut state = hub.state().as_ref().clone();
     state.spawn_targets = vec![SpawnTarget {
         target_id: "tgt_lua_worktrees".to_string(),
         label: "Lua Worktrees".to_string(),
@@ -1891,7 +1891,7 @@ fn real_lua_plugin_observes_worktrees_added_after_plugin_load() {
         .join("worktree-live-refresh-target");
     let worktree_path = target_root.join("late");
     fs::create_dir_all(&worktree_path).expect("create late worktree path");
-    let mut state = hub.state().clone();
+    let mut state = hub.state().as_ref().clone();
     state.spawn_targets = vec![SpawnTarget {
         target_id: "tgt_lua_worktrees".to_string(),
         label: "Lua Worktrees".to_string(),
@@ -2015,7 +2015,7 @@ fn exercise_cross_package_managed_spawn(
         .expect("write cross-package repository fixture");
     run_git(Some(&repo_root), &["add", "-A"]);
     run_git(Some(&repo_root), &["commit", "-m", "cross-package fixture"]);
-    let mut state = hub.state().clone();
+    let mut state = hub.state().as_ref().clone();
     state.spawn_targets = vec![SpawnTarget {
         target_id: target_id.to_string(),
         label: "Cross-package managed target".to_string(),
@@ -2320,7 +2320,7 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
         &["commit", "-m", "branch-specific command"],
     );
     run_git(Some(&repo_root), &["switch", "main"]);
-    let mut state = hub.state().clone();
+    let mut state = hub.state().as_ref().clone();
     state.spawn_targets = vec![SpawnTarget {
         target_id: "tgt_managed".to_string(),
         label: "Managed".to_string(),

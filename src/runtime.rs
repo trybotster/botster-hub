@@ -77,8 +77,8 @@ use crate::session_types::{
     list_session_types_for_target, materialize_managed_session_type, materialize_session_type,
     mutate_session_type, show_session_type_for_target,
 };
+#[cfg(test)]
 use crate::spawn_targets::SpawnTarget;
-use crate::worktrees::Worktree;
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -88,10 +88,9 @@ use crate::worktrees::Worktree;
 /// admission and policy boundaries remain visible at the hub layer.
 pub struct HubRuntime {
     config: HubConfig,
-    // Managed-session fulfillment needs interior mutability while the plugin
-    // owner loop holds `&self`. This state remains owner-thread policy: never
-    // hold a read guard across `replace_state`, which takes the write guard.
-    state: RwLock<HubState>,
+    // Readers clone the current Arc under this short lock. Publication swaps
+    // one Arc, so the owner never clones a durable state collection.
+    state: SharedHubState,
     core_daemon: SharedCoreDaemon,
     core_completions: CoreCompletionReceiver,
     completed_operations: Mutex<BTreeMap<PendingOperationId, CoreCompletion>>,
@@ -102,8 +101,6 @@ pub struct HubRuntime {
     reconciliation: HubSessionReconciliation,
     plugin_lifecycle: HubPluginLifecycle,
     capability_runtime: SharedHubCapabilityRuntime,
-    spawn_targets: SharedSpawnTargets,
-    worktrees: SharedWorktrees,
     session_type_spawner: SharedSessionTypeSpawner,
     managed_git_coordinator: ManagedGitCoordinator,
     managed_git_operations: Mutex<Vec<PendingManagedGitOperation>>,
@@ -158,10 +155,50 @@ const SOURCE_HELD_MAX: usize = 2;
 
 /// Shared hub-owned session-type spawn bridge exposed to Lua plugin workers.
 pub type SharedSessionTypeSpawner = Arc<HubSessionTypeSpawner>;
-/// Shared hub-owned spawn-target projection exposed to Lua plugin workers.
-pub type SharedSpawnTargets = Arc<Mutex<Vec<SpawnTarget>>>;
-/// Shared hub-owned worktree projection exposed to Lua plugin workers.
-pub type SharedWorktrees = Arc<Mutex<Vec<Worktree>>>;
+struct PublishedHubState {
+    revision: u64,
+    state: Arc<HubState>,
+}
+
+/// One versioned durable state view shared by every runtime and daemon reader.
+pub struct HubStatePublication(RwLock<PublishedHubState>);
+
+impl HubStatePublication {
+    fn new(state: HubState) -> Self {
+        Self(RwLock::new(PublishedHubState {
+            revision: 0,
+            state: Arc::new(state),
+        }))
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, Arc<HubState>) {
+        let published = self.0.read().expect("hub state lock");
+        (published.revision, Arc::clone(&published.state))
+    }
+
+    pub(crate) fn try_snapshot(&self) -> Result<(u64, Arc<HubState>), ()> {
+        self.0
+            .read()
+            .map(|published| (published.revision, Arc::clone(&published.state)))
+            .map_err(|_| ())
+    }
+
+    pub(crate) fn publish(&self, state: Arc<HubState>) {
+        let mut published = self.0.write().expect("hub state lock");
+        published.revision = published
+            .revision
+            .checked_add(1)
+            .expect("hub state revision exhausted");
+        published.state = state;
+    }
+}
+
+/// Shared immutable durable state exposed to runtime and Lua readers.
+pub type SharedHubState = Arc<HubStatePublication>;
+/// Shared hub-owned spawn-target view exposed to Lua plugin workers.
+pub type SharedSpawnTargets = SharedHubState;
+/// Shared hub-owned worktree view exposed to Lua plugin workers.
+pub type SharedWorktrees = SharedHubState;
 
 /// Prepared package entity-provider work and its causal lease.
 pub(crate) struct PluginEntitySnapshotInvocation {
@@ -298,6 +335,7 @@ impl HubRuntime {
     /// Returns an error when the plugin database cannot be opened.
     pub fn new(config: HubConfig) -> HubRuntimeResult<Self> {
         let state = HubState::from_config(&config);
+        let state = Arc::new(HubStatePublication::new(state));
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let (close_work, data_plane, core_daemon, core_completions) = start_data_plane(core_config);
@@ -309,8 +347,6 @@ impl HubRuntime {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
-            spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
-            worktrees: Arc::new(Mutex::new(state.worktrees.clone())),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             managed_git_coordinator: ManagedGitCoordinator::new(),
             managed_git_operations: Mutex::new(Vec::new()),
@@ -319,7 +355,7 @@ impl HubRuntime {
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
             config,
-            state: RwLock::new(state),
+            state,
             core_daemon,
             core_completions,
             completed_operations: Mutex::new(BTreeMap::new()),
@@ -407,6 +443,7 @@ impl HubRuntime {
     }
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
+        let state = Arc::new(HubStatePublication::new(state));
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let (close_work, data_plane, core_daemon, core_completions) = start_data_plane(core_config);
@@ -418,8 +455,6 @@ impl HubRuntime {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
-            spawn_targets: Arc::new(Mutex::new(state.spawn_targets.clone())),
-            worktrees: Arc::new(Mutex::new(state.worktrees.clone())),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             managed_git_coordinator: ManagedGitCoordinator::new(),
             managed_git_operations: Mutex::new(Vec::new()),
@@ -428,7 +463,7 @@ impl HubRuntime {
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
             config,
-            state: RwLock::new(state),
+            state,
             core_daemon,
             core_completions,
             completed_operations: Mutex::new(BTreeMap::new()),
@@ -508,19 +543,19 @@ impl HubRuntime {
     }
 
     /// Return the durable hub state loaded for this runtime.
-    pub fn state(&self) -> std::sync::RwLockReadGuard<'_, HubState> {
-        self.state.read().expect("hub state lock")
+    pub fn state(&self) -> Arc<HubState> {
+        self.state.snapshot().1
     }
 
-    /// Replace durable hub state after an owner-thread mutation.
-    pub fn replace_state(&self, state: HubState) {
-        if let Ok(mut spawn_targets) = self.spawn_targets.lock() {
-            *spawn_targets = state.spawn_targets.clone();
-        }
-        if let Ok(mut worktrees) = self.worktrees.lock() {
-            *worktrees = state.worktrees.clone();
-        }
-        *self.state.write().expect("hub state lock") = state;
+    /// Return the shared state publication used by daemon and plugin readers.
+    pub(crate) fn state_publication(&self) -> SharedHubState {
+        Arc::clone(&self.state)
+    }
+
+    /// Publish durable hub state after an owner-thread mutation.
+    pub fn replace_state(&self, state: impl Into<Arc<HubState>>) {
+        let state = state.into();
+        self.state.publish(state);
     }
 
     /// Apply and persist one Hub-authorized session type mutation.
@@ -553,13 +588,13 @@ impl HubRuntime {
     /// Return the shared spawn-target projection used by Lua helpers.
     #[must_use]
     pub fn spawn_targets(&self) -> SharedSpawnTargets {
-        self.spawn_targets.clone()
+        Arc::clone(&self.state)
     }
 
     /// Return the shared worktree projection used by Lua helpers.
     #[must_use]
     pub fn worktrees(&self) -> SharedWorktrees {
-        self.worktrees.clone()
+        Arc::clone(&self.state)
     }
 
     fn lua_plugin_host_api(&self) -> LuaPluginHostApi {
@@ -568,8 +603,8 @@ impl HubRuntime {
             coordination: self.coordination_bridge(),
             entity_publish: self.entity_publish_bridge(),
             session_types: self.session_type_spawner.clone(),
-            spawn_targets: self.spawn_targets.clone(),
-            worktrees: self.worktrees.clone(),
+            spawn_targets: Arc::clone(&self.state),
+            worktrees: Arc::clone(&self.state),
             package_event_router: self.package_event_router.clone(),
             causal_scopes: self.causal_scopes.clone(),
         }
