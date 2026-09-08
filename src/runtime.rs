@@ -58,9 +58,9 @@ use crate::managed_git_worktrees::{
     adopt_unrecorded_managed_worktrees, managed_worktree_id,
 };
 use crate::package_entity_fanout::{
-    EntityMutationLease, PackageEntityFamilyState, PackageEntityMutation,
-    PackageEntityPublishResult, PackageEntityPublishStatus, coerce_entity_frame_empty_items,
-    parse_publish_mutation,
+    EntityMutationLease, PackageEntityFamilyProgress, PackageEntityFamilyState,
+    PackageEntityFamilyStep, PackageEntityMutation, PackageEntityPublishResult,
+    PackageEntityPublishStatus, coerce_entity_frame_empty_items, parse_publish_mutation,
 };
 use crate::package_event_router::{
     CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, EventPlaneStatus,
@@ -106,6 +106,7 @@ pub struct HubRuntime {
     entity_publish_bridge: HubEntityPublishBridge,
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
     package_entity_fanout: Arc<Mutex<VecDeque<LeasedFanoutMutation>>>,
+    package_entity_finishes: Arc<Mutex<VecDeque<CausalOp>>>,
     last_capability_cleanup: Option<PluginCleanupResult>,
     session_contexts: SharedSessionContexts,
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
@@ -346,6 +347,7 @@ impl HubRuntime {
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
+            package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
             config,
             state,
             core_daemon,
@@ -451,6 +453,7 @@ impl HubRuntime {
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
+            package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
             config,
             state,
             core_daemon,
@@ -1172,47 +1175,29 @@ impl HubRuntime {
     }
 
     fn has_finish_only_fanout(&self) -> bool {
-        self.package_entity_fanout
+        self.package_entity_finishes
             .lock()
-            .map(|pending| pending.iter().any(|item| item.finish_only))
+            .map(|pending| !pending.is_empty())
             .unwrap_or(false)
     }
 
     fn retry_finish_only_fanout(&self) {
-        let items: Vec<TakenPackageEntityMutation> = {
-            let Ok(mut fanout) = self.package_entity_fanout.lock() else {
-                return;
-            };
-            let mut kept = VecDeque::new();
-            let mut retry = Vec::new();
-            while let Some(item) = fanout.pop_front() {
-                if item.finish_only {
-                    retry.push(TakenPackageEntityMutation {
-                        mutation: item.mutation,
-                        lease: item.lease,
-                        finish_only: true,
-                        scheduled_resync: item.scheduled_resync,
-                    });
-                } else {
-                    kept.push_back(item);
-                }
-            }
-            *fanout = kept;
-            retry
-        };
-        for item in items {
-            self.finish_package_entity_mutation_fanout(&item, item.scheduled_resync);
+        let op = self
+            .package_entity_finishes
+            .lock()
+            .expect("package entity finish lock")
+            .pop_front();
+        if let Some(op) = op {
+            self.finish_package_entity_causal_op(op);
         }
     }
 
-    fn restore_fanout_finish(&self, item: &TakenPackageEntityMutation, scheduled_resync: bool) {
-        if let Ok(mut fanout) = self.package_entity_fanout.lock() {
-            fanout.push_back(LeasedFanoutMutation {
-                mutation: item.mutation.clone(),
-                lease: item.lease.clone(),
-                finish_only: true,
-                scheduled_resync,
-            });
+    fn finish_package_entity_causal_op(&self, op: CausalOp) {
+        if let CausalAdmitResult::Retry(op) = self.keep_owned(self.admit_causal_op(op)) {
+            self.package_entity_finishes
+                .lock()
+                .expect("package entity finish lock")
+                .push_back(op);
         }
     }
 
@@ -2112,8 +2097,6 @@ impl HubRuntime {
             leased_ready.push(LeasedFanoutMutation {
                 mutation: ready_mutation,
                 lease,
-                finish_only: false,
-                scheduled_resync: false,
             });
         }
         if let Some(scope_id) = scope_id {
@@ -2137,32 +2120,32 @@ impl HubRuntime {
         Ok(result)
     }
 
-    /// Drain admitted package entity mutations for control-path fanout.
+    /// Take admitted mutations for callers outside the owner delivery path.
     #[must_use]
     pub fn take_package_entity_fanout(&self) -> Vec<PackageEntityMutation> {
-        let items = self.take_leased_package_entity_fanout();
-        let mutations = items.iter().map(|item| item.mutation.clone()).collect();
-        for item in &items {
-            self.finish_package_entity_mutation_fanout(item, false);
+        let mut mutations = Vec::new();
+        while let Some(item) = self.take_one_package_entity_fanout() {
+            let (mutation, finish) = item.into_parts();
+            mutations.push(mutation);
+            self.finish_package_entity_fanout(finish);
         }
         mutations
     }
 
+    /// Take one mutation. The caller must reserve Host capacity first.
     #[must_use]
-    pub fn take_leased_package_entity_fanout(&self) -> Vec<TakenPackageEntityMutation> {
-        let mut fanout = self
-            .package_entity_fanout
+    pub fn take_one_package_entity_fanout(&self) -> Option<TakenPackageEntityMutation> {
+        self.package_entity_fanout
             .lock()
-            .expect("package entity fanout lock");
-        fanout
-            .drain(..)
+            .expect("package entity fanout lock")
+            .pop_front()
             .map(|item| TakenPackageEntityMutation {
                 mutation: item.mutation,
-                lease: item.lease,
-                finish_only: item.finish_only,
-                scheduled_resync: item.scheduled_resync,
+                finish: PackageEntityFanoutFinish {
+                    lease: item.lease,
+                    scheduled_resync: false,
+                },
             })
-            .collect()
     }
 
     fn settle_entity_publish_lease(
@@ -2222,18 +2205,12 @@ impl HubRuntime {
     }
 
     /// Release or convert the mutation lease after subscriber decisions finish.
-    pub fn finish_package_entity_mutation_fanout(
-        &self,
-        item: &TakenPackageEntityMutation,
-        scheduled_resync: bool,
-    ) {
-        let Some(lease) = item.lease.clone() else {
+    pub fn finish_package_entity_fanout(&self, finish: PackageEntityFanoutFinish) {
+        let Some(lease) = finish.lease.as_ref() else {
             return;
         };
-        let op = self.prepare_finish_op(&lease, scheduled_resync);
-        if let CausalAdmitResult::Retry(_) = self.keep_owned(self.admit_causal_op(op)) {
-            self.restore_fanout_finish(item, scheduled_resync);
-        }
+        let op = self.prepare_finish_op(lease, finish.scheduled_resync);
+        self.finish_package_entity_causal_op(op);
     }
 
     fn prepare_finish_op(&self, lease: &EntityMutationLease, scheduled_resync: bool) -> CausalOp {
@@ -2267,78 +2244,86 @@ impl HubRuntime {
         }
     }
 
-    /// Snapshot of package entity family admission state for one family.
+    /// Read scalar family progress without copying pending payloads.
     #[must_use]
-    pub fn package_entity_family_state(
+    pub fn package_entity_family_progress(
         &self,
         entity_type: &str,
-    ) -> Option<PackageEntityFamilyState> {
+    ) -> Option<PackageEntityFamilyProgress> {
         self.package_entity_families
             .lock()
             .expect("package entity family lock")
             .get(entity_type)
-            .cloned()
+            .map(PackageEntityFamilyState::provider_snapshot_progress)
     }
 
-    /// Apply a provider snapshot sequence to the shared family floor.
-    ///
-    /// Returns mutations that became ready after the floor advanced.
-    pub fn apply_package_entity_provider_snapshot(
+    /// Advance the provider floor without removing pending payloads.
+    pub fn begin_package_entity_provider_snapshot(
         &self,
         entity_type: &str,
         snapshot_seq: u64,
-    ) -> Vec<PackageEntityMutation> {
-        let now = Instant::now();
-        let mut families = self
+    ) -> PackageEntityFamilyProgress {
+        self.package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .entry(entity_type.to_string())
+            .or_default()
+            .begin_provider_snapshot_seq(snapshot_seq, Instant::now())
+    }
+
+    /// Take one family transition after the provider snapshot reaches its subscribers.
+    /// The caller must reserve Host capacity before a payload can leave the family.
+    pub fn step_package_entity_provider_snapshot(
+        &self,
+        entity_type: &str,
+    ) -> PackageEntitySnapshotStep {
+        let step = self
             .package_entity_families
             .lock()
-            .expect("package entity family lock");
-        let family = families.entry(entity_type.to_string()).or_default();
-        let ready = family.apply_provider_snapshot_seq(snapshot_seq, now);
-        let mut leased_ready = Vec::new();
-        for ready_mutation in ready {
-            let lease = family.take_pending_lease(ready_mutation.snapshot_seq());
-            leased_ready.push(LeasedFanoutMutation {
-                mutation: ready_mutation,
-                lease,
-                finish_only: false,
-                scheduled_resync: false,
-            });
-        }
-        for discarded in family.take_discarded_pending_leases() {
-            if let CausalAdmitResult::Retry(_) =
-                self.enqueue_retry(self.admit_causal_op(CausalOp::Release {
-                    scope_id: discarded.scope_id,
-                    identity: LeaseIdentity::AdmittedEntityMutation {
-                        family: discarded.family.clone(),
-                        seq: discarded.seq,
+            .expect("package entity family lock")
+            .entry(entity_type.to_string())
+            .or_default()
+            .step_provider_snapshot(Instant::now());
+        match step {
+            PackageEntityFamilyStep::Discarded { mutation, lease } => {
+                PackageEntitySnapshotStep::Discarded(TakenPackageEntityMutation {
+                    mutation,
+                    finish: PackageEntityFanoutFinish {
+                        lease,
+                        scheduled_resync: false,
                     },
-                }))
-            {
-                family.store_pending_lease(discarded);
+                })
+            }
+            PackageEntityFamilyStep::Ready { mutation, lease } => {
+                PackageEntitySnapshotStep::Ready(TakenPackageEntityMutation {
+                    mutation,
+                    finish: PackageEntityFanoutFinish {
+                        lease,
+                        scheduled_resync: false,
+                    },
+                })
+            }
+            PackageEntityFamilyStep::ReleaseResync { scope_id, family } => {
+                let op = CausalOp::Release {
+                    scope_id,
+                    identity: LeaseIdentity::ProviderResyncNeed {
+                        family: family.clone(),
+                    },
+                };
+                if let CausalAdmitResult::Retry(_) = self.enqueue_retry(self.admit_causal_op(op)) {
+                    self.package_entity_families
+                        .lock()
+                        .expect("package entity family lock")
+                        .entry(entity_type.to_string())
+                        .or_default()
+                        .remember_resync_lease(scope_id, family);
+                }
+                PackageEntitySnapshotStep::Pending
+            }
+            PackageEntityFamilyStep::Complete(progress) => {
+                PackageEntitySnapshotStep::Complete(progress)
             }
         }
-        if !family.resync.needed {
-            let started = Instant::now();
-            let mut applied = 0;
-            for (scope_id, family_name) in
-                self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
-            {
-                family.remember_resync_lease(scope_id, family_name);
-            }
-        }
-        let mutations: Vec<PackageEntityMutation> = leased_ready
-            .iter()
-            .map(|item| item.mutation.clone())
-            .collect();
-        if !leased_ready.is_empty() {
-            let mut fanout = self
-                .package_entity_fanout
-                .lock()
-                .expect("package entity fanout lock");
-            fanout.extend(leased_ready);
-        }
-        mutations
     }
 
     /// Mark family resync needed (e.g. overflow or residual gap).
@@ -2487,7 +2472,7 @@ impl HubRuntime {
         fanout.retain(|item| {
             if families.contains(item.mutation.entity_type()) {
                 if let Some(lease) = item.lease.clone()
-                    && let CausalAdmitResult::Retry(_) =
+                    && let CausalAdmitResult::Retry(op) =
                         self.keep_or_park(self.admit_causal_op(CausalOp::Release {
                             scope_id: lease.scope_id,
                             identity: LeaseIdentity::AdmittedEntityMutation {
@@ -2496,19 +2481,17 @@ impl HubRuntime {
                             },
                         }))
                 {
-                    restore.push_back(LeasedFanoutMutation {
-                        mutation: item.mutation.clone(),
-                        lease: item.lease.clone(),
-                        finish_only: true,
-                        scheduled_resync: item.scheduled_resync,
-                    });
+                    restore.push_back(op);
                 }
                 false
             } else {
                 true
             }
         });
-        fanout.append(&mut restore);
+        self.package_entity_finishes
+            .lock()
+            .expect("package entity finish lock")
+            .append(&mut restore);
     }
 
     /// Resync attempt counter for observability (attempts field across families).
@@ -2909,8 +2892,11 @@ impl HubRuntime {
             )
         })?;
         let scope_id = self
-            .package_entity_family_state(entity_type)
-            .and_then(|family| family.provider_scope_id());
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock")
+            .get(entity_type)
+            .and_then(PackageEntityFamilyState::provider_scope_id);
         if scope_id.is_some() && !self.leftover_slot_available() {
             return Err(crate::McpToolError::new(
                 "causal_scope_busy",
@@ -4763,8 +4749,6 @@ impl Error for HubLuaPluginLoadError {
 struct LeasedFanoutMutation {
     mutation: PackageEntityMutation,
     lease: Option<EntityMutationLease>,
-    finish_only: bool,
-    scheduled_resync: bool,
 }
 
 struct PendingEventPlaneReplace {
@@ -4772,11 +4756,29 @@ struct PendingEventPlaneReplace {
     subscriptions: Vec<EventSubscription>,
 }
 
-/// One drained mutation plus the lease that stays live until fanout finishes.
+/// One bounded transition from the provider floor to pending mutation delivery.
+pub enum PackageEntitySnapshotStep {
+    Discarded(TakenPackageEntityMutation),
+    Ready(TakenPackageEntityMutation),
+    Pending,
+    Complete(PackageEntityFamilyProgress),
+}
+
+/// One mutation and its separate completion lease.
 pub struct TakenPackageEntityMutation {
     pub mutation: PackageEntityMutation,
+    finish: PackageEntityFanoutFinish,
+}
+
+impl TakenPackageEntityMutation {
+    pub fn into_parts(self) -> (PackageEntityMutation, PackageEntityFanoutFinish) {
+        (self.mutation, self.finish)
+    }
+}
+
+/// The owner retains this lease while a Host worker owns the mutation.
+pub struct PackageEntityFanoutFinish {
     lease: Option<EntityMutationLease>,
-    pub finish_only: bool,
     pub scheduled_resync: bool,
 }
 

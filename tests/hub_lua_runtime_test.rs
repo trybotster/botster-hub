@@ -4030,13 +4030,18 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
             }
         ]))
     );
-    let taken = hub.take_leased_package_entity_fanout();
-    assert_eq!(taken.len(), 1);
+    let (mutation, mut finish) = hub
+        .take_one_package_entity_fanout()
+        .expect("one admitted mutation")
+        .into_parts();
+    assert!(hub.take_one_package_entity_fanout().is_none());
+    drop(mutation);
+    finish.scheduled_resync = true;
     assert!(
         scopes.is_live(success),
         "drain must keep the mutation lease until fanout finishes"
     );
-    hub.finish_package_entity_mutation_fanout(&taken[0], true);
+    hub.finish_package_entity_fanout(finish);
     assert!(
         scopes.is_live(success),
         "fanout-created resync must keep the mutation scope"
@@ -4132,8 +4137,13 @@ fn production_fanout_finish_returns_the_513th_op_without_spinning() {
         published.result,
         PluginInvocationResult::Completed(_)
     ));
-    let taken = hub.take_leased_package_entity_fanout();
-    assert_eq!(taken.len(), 1);
+    let (mutation, mut finish) = hub
+        .take_one_package_entity_fanout()
+        .expect("one admitted mutation")
+        .into_parts();
+    assert!(hub.take_one_package_entity_fanout().is_none());
+    drop(mutation);
+    finish.scheduled_resync = true;
 
     let capacity = CAUSAL_PENDING_MAX;
     let mut fillers = Vec::new();
@@ -4162,7 +4172,7 @@ fn production_fanout_finish_returns_the_513th_op_without_spinning() {
             );
         }
         let started = Instant::now();
-        hub.finish_package_entity_mutation_fanout(&taken[0], true);
+        hub.finish_package_entity_fanout(finish);
         assert!(
             started.elapsed() < Duration::from_millis(20),
             "production finish must return without spinning: {:?}",

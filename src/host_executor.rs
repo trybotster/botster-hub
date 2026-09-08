@@ -46,6 +46,7 @@ impl HostError {
 }
 
 pub(crate) enum HostCommand {
+    PluginEntity(crate::plugin_entity::Command),
     PreparePluginResponse {
         input: crate::plugin_response::PluginResponseInput,
         reply_tx: crate::daemon::control::message::ControlReplySender,
@@ -86,7 +87,7 @@ pub(crate) enum HostCommand {
 impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
-            Self::PreparePluginResponse { .. } | Self::StopEntrypoints => 0,
+            Self::PluginEntity(_) | Self::PreparePluginResponse { .. } | Self::StopEntrypoints => 0,
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
             Self::Mutation(_) => 0,
             Self::ReclaimSessionTypeCatalog(_) => 0,
@@ -102,6 +103,7 @@ impl HostCommand {
 impl std::fmt::Debug for HostCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PluginEntity(_) => formatter.write_str("PluginEntity"),
             Self::PreparePluginResponse { .. } => formatter.write_str("PreparePluginResponse"),
             Self::StopEntrypoints => formatter.write_str("StopEntrypoints"),
             Self::BuildSessionTypeCatalog { generation, .. } => formatter
@@ -146,6 +148,7 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
+    PluginEntity(crate::plugin_entity::Completion),
     PluginResponseAbandoned,
     PluginResponseDelivered {
         kind: botster_hub_client::DaemonResponseKind,
@@ -173,7 +176,8 @@ pub(crate) enum HostResult {
 impl HostResult {
     fn generation(&self) -> u64 {
         match self {
-            Self::PluginResponseAbandoned
+            Self::PluginEntity(_)
+            | Self::PluginResponseAbandoned
             | Self::PluginResponseDelivered { .. }
             | Self::EntrypointsStopped => 0,
             Self::SessionTypeCatalogReady { generation, .. } | Self::Failed { generation, .. } => {
@@ -254,6 +258,7 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
+        HostResult::PluginEntity(_) => HOST_PREPARED_BYTE_CAPACITY,
         HostResult::PluginResponseAbandoned
         | HostResult::PluginResponseDelivered { .. }
         | HostResult::EntrypointsStopped => 0,
@@ -701,6 +706,9 @@ fn execute(
     permit: &mut HostWorkPermit,
 ) -> HostResult {
     match command {
+        HostCommand::PluginEntity(command) => {
+            HostResult::PluginEntity(crate::plugin_entity::execute(command, permit))
+        }
         HostCommand::PreparePluginResponse {
             input,
             reply_tx,
