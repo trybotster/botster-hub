@@ -26,15 +26,45 @@ use crate::daemon::owner_loop::DaemonControlState;
 use crate::persistence::{FileHubStateStore, HubStateStore};
 use crate::{HubClientRequest, HubClientResponseBody};
 
+pub(crate) enum SessionTypeCatalogBuild {
+    Ready {
+        entities: BTreeMap<String, Value>,
+        logical_bytes: usize,
+    },
+    TooLarge,
+}
+
 /// Build the session-type entity catalog from owned inputs.
 ///
 /// Pure over its arguments so the owner can run it on a catalog worker
 /// thread and apply the result on a later turn.
 pub(crate) fn session_type_catalog_entities(
-    records: &[crate::packages::PackageRecord],
+    packages: &crate::packages::PackageRegistry,
     state: &crate::persistence::HubState,
 ) -> DaemonTransportResult<BTreeMap<String, Value>> {
-    let records = records.iter().collect::<Vec<_>>();
+    let SessionTypeCatalogBuild::Ready { entities, .. } =
+        build_session_type_catalog(packages, state, None)?
+    else {
+        unreachable!("an unbounded catalog build cannot exceed its limit");
+    };
+    Ok(entities)
+}
+
+/// Build a catalog without retaining more than `logical_byte_limit` bytes.
+pub(crate) fn bounded_session_type_catalog_entities(
+    packages: &crate::packages::PackageRegistry,
+    state: &crate::persistence::HubState,
+    logical_byte_limit: usize,
+) -> DaemonTransportResult<SessionTypeCatalogBuild> {
+    build_session_type_catalog(packages, state, Some(logical_byte_limit))
+}
+
+fn build_session_type_catalog(
+    packages: &crate::packages::PackageRegistry,
+    state: &crate::persistence::HubState,
+    logical_byte_limit: Option<usize>,
+) -> DaemonTransportResult<SessionTypeCatalogBuild> {
+    let records = packages.packages();
     let session_types =
         crate::session_types::list_session_types(&records, state).map_err(|error| {
             DaemonTransportError::Client(crate::HubClientError::SessionType {
@@ -44,16 +74,90 @@ pub(crate) fn session_type_catalog_entities(
                 message: error.message,
             })
         })?;
-    session_types
+    let mut entities = BTreeMap::new();
+    let mut logical_bytes = 0_usize;
+    for session_type in session_types
         .into_iter()
         .map(daemon_session_type_from_client)
-        .map(|session_type| {
-            let id = session_type.session_type_id.clone();
-            serde_json::to_value(session_type)
-                .map(|value| (id, value))
-                .map_err(DaemonTransportError::Json)
-        })
-        .collect::<DaemonTransportResult<BTreeMap<_, _>>>()
+    {
+        let id = session_type.session_type_id.clone();
+        let value = serde_json::to_value(session_type).map_err(DaemonTransportError::Json)?;
+        if !retain_catalog_entity(
+            &mut entities,
+            &mut logical_bytes,
+            id,
+            value,
+            logical_byte_limit,
+        )? {
+            return Ok(SessionTypeCatalogBuild::TooLarge);
+        }
+    }
+    Ok(SessionTypeCatalogBuild::Ready {
+        entities,
+        logical_bytes,
+    })
+}
+
+fn retain_catalog_entity(
+    entities: &mut BTreeMap<String, Value>,
+    logical_bytes: &mut usize,
+    id: String,
+    value: Value,
+    logical_byte_limit: Option<usize>,
+) -> DaemonTransportResult<bool> {
+    if let Some(limit) = logical_byte_limit {
+        let encoded_bytes = serde_json::to_vec(&value)
+            .map_err(DaemonTransportError::Json)?
+            .len();
+        let Some(next_bytes) = logical_bytes
+            .checked_add(id.len())
+            .and_then(|bytes| bytes.checked_add(encoded_bytes))
+        else {
+            return Ok(false);
+        };
+        if next_bytes > limit {
+            return Ok(false);
+        }
+        *logical_bytes = next_bytes;
+    }
+    entities.insert(id, value);
+    Ok(true)
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_catalog_construction_stops_before_retaining_an_oversized_row() {
+        let mut entities = BTreeMap::new();
+        let mut logical_bytes = 0;
+        assert!(
+            retain_catalog_entity(
+                &mut entities,
+                &mut logical_bytes,
+                "first".to_string(),
+                serde_json::json!({ "value": "small" }),
+                Some(64),
+            )
+            .expect("retain first row")
+        );
+        let retained_bytes = logical_bytes;
+        assert!(
+            !retain_catalog_entity(
+                &mut entities,
+                &mut logical_bytes,
+                "second".to_string(),
+                Value::String("x".repeat(64)),
+                Some(64),
+            )
+            .expect("reject second row")
+        );
+        assert_eq!(entities.len(), 1);
+        assert!(entities.contains_key("first"));
+        assert_eq!(logical_bytes, retained_bytes);
+        assert!(logical_bytes <= 64);
+    }
 }
 
 /// Session-type definitions keyed by id, built on the owner thread for
@@ -61,13 +165,11 @@ pub(crate) fn session_type_catalog_entities(
 pub(crate) fn session_type_definition_map(
     daemon: &mut HubDaemon,
 ) -> DaemonTransportResult<BTreeMap<String, Value>> {
-    let packages = daemon.package_registry().clone();
-    let records = packages.packages().into_iter().cloned().collect::<Vec<_>>();
     if daemon.runtime().is_none() {
         return Err(DaemonTransportError::DaemonNotRunning);
     }
     let (_, state) = daemon.state_view();
-    session_type_catalog_entities(&records, &state)
+    session_type_catalog_entities(daemon.package_registry(), &state)
 }
 
 pub(crate) fn is_invalid_repo_session_types_error(error: &DaemonTransportError) -> bool {

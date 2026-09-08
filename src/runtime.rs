@@ -102,6 +102,7 @@ pub struct HubRuntime {
     plugin_lifecycle: HubPluginLifecycle,
     capability_runtime: SharedHubCapabilityRuntime,
     session_type_spawner: SharedSessionTypeSpawner,
+    host_executor: crate::host_executor::HostExecutor,
     managed_git_coordinator: ManagedGitCoordinator,
     managed_git_operations: Mutex<Vec<PendingManagedGitOperation>>,
     coordination_bridge: HubCoordinationBridge,
@@ -348,6 +349,7 @@ impl HubRuntime {
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
+            host_executor: crate::host_executor::HostExecutor::new(),
             managed_git_coordinator: ManagedGitCoordinator::new(),
             managed_git_operations: Mutex::new(Vec::new()),
             coordination_bridge: HubCoordinationBridge::new(),
@@ -456,6 +458,7 @@ impl HubRuntime {
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
+            host_executor: crate::host_executor::HostExecutor::new(),
             managed_git_coordinator: ManagedGitCoordinator::new(),
             managed_git_operations: Mutex::new(Vec::new()),
             coordination_bridge: HubCoordinationBridge::new(),
@@ -3905,6 +3908,17 @@ impl HubRuntime {
         if let Some(driver) = self.data_plane.as_ref() {
             driver.bind_owner_wake(sender);
         }
+    }
+
+    pub(crate) fn bind_host_owner_wake(
+        &self,
+        sender: crate::daemon::control::message::ControlSender,
+    ) {
+        self.host_executor.bind_owner_wake(sender);
+    }
+
+    pub(crate) fn host_executor(&self) -> &crate::host_executor::HostExecutor {
+        &self.host_executor
     }
 
     pub(crate) fn take_data_plane_progress(&self) -> crate::data_plane::driver::DataPlaneProgress {

@@ -118,6 +118,8 @@ pub(crate) enum ControlMessage {
     PluginResultCapacityReleased,
     /// Core published one or more plugin completions for the owner to drain.
     PluginCompletionPublished,
+    /// A host job completed or released bounded executor capacity.
+    HostProgressPublished,
     LocalWebrtcPeerClosed {
         grant_id: String,
         attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,

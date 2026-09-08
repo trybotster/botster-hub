@@ -291,6 +291,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     let mut daemon = HubDaemon::start(config)?;
     if let Some(runtime) = daemon.runtime() {
         runtime.bind_data_plane_owner_wake(control_tx.clone());
+        runtime.bind_host_owner_wake(control_tx.clone());
     }
     let mut control_state = DaemonControlState {
         event_plane: daemon.local_webrtc().event_plane(),
@@ -337,6 +338,10 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
         crate::daemon::control::record_data_plane_progress(&daemon, &mut control_state);
+        crate::subscription::entity::absorb_session_type_catalog_completions(
+            &daemon,
+            &mut control_state,
+        );
         let completion_published = control_state
             .plugin_result_budget
             .take_completion_notification();
@@ -914,6 +919,8 @@ pub(crate) struct DaemonControlState {
     pub(crate) close_event_decisions: crate::subscription::closed_events::CloseEventDecisions,
     /// Session-type catalog built off the owner thread.
     pub(crate) session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache,
+    /// Checked identities shared by host jobs and later owner waiters.
+    pub(crate) waiter_ids: crate::host_executor::WaiterIdSequence,
     /// Inventory read in flight for the pump reconcile phase, with the
     /// attach epoch captured when it was submitted.
     reconcile_inventory: Option<InventoryRead>,
@@ -971,6 +978,7 @@ impl Default for DaemonControlState {
             close_event_decisions: crate::subscription::closed_events::CloseEventDecisions::default(
             ),
             session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache::default(),
+            waiter_ids: crate::host_executor::WaiterIdSequence::default(),
             reconcile_inventory: None,
             observe_resume: None,
             observe_read: None,

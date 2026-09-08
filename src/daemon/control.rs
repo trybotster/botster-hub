@@ -147,6 +147,10 @@ pub(crate) fn handle_control_message(
             state.maintenance.scheduler.prefer_completion_drain();
             false
         }
+        ControlMessage::HostProgressPublished => {
+            crate::subscription::entity::absorb_session_type_catalog_completions(daemon, state);
+            false
+        }
     }
 }
 

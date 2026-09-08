@@ -62,6 +62,7 @@ mod daemon_projection;
 pub(crate) mod data_plane;
 pub mod entrypoint_supervisor;
 pub(crate) mod event_plane_counters;
+pub(crate) mod host_executor;
 pub mod lifecycle;
 pub mod lua_runtime;
 pub mod maintenance;
