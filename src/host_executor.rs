@@ -426,6 +426,7 @@ impl HostWorkPermit {
         self.take_prepared_charge(logical_bytes)
     }
 
+    /// Consume the prepared-byte reservation. Call this only in a terminal phase.
     pub(crate) fn take_prepared_charge(&mut self, logical_bytes: usize) -> HostPreparedCharge {
         let reservation = self
             .prepared
