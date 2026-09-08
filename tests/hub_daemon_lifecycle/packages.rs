@@ -2404,7 +2404,7 @@ fn daemon_spawns_repo_local_session_type_after_state_reload() {
     let config = explicit_config(&data_dir);
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.spawn_targets = vec![SpawnTarget {
                 target_id: "repo:runtime".to_string(),
                 label: "Repo Runtime".to_string(),
@@ -2536,7 +2536,7 @@ fn daemon_list_session_types_for_target_includes_device_globals() {
     let config = explicit_config(&data_dir);
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.device_session_type_sources = vec![botster_hub::DeviceSessionTypeSource {
                 root: device_root.clone(),
                 session_types: vec![botster_hub::PackageSessionType {

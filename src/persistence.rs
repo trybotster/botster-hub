@@ -306,18 +306,19 @@ pub trait HubStateStore {
     /// Load existing state or create a v2 default from config when no file exists.
     fn load_or_initialize(&self, config: &HubConfig) -> HubStateStoreResult<HubState>;
 
-    /// Save a complete state snapshot.
-    fn save(&self, state: &HubState) -> HubStateStoreResult<()>;
+    /// Save state while startup has exclusive ownership and no shared view exists.
+    fn save_exclusive_startup_state(&self, state: &HubState) -> HubStateStoreResult<()>;
 
-    /// Load, mutate, save, and return the committed state.
-    fn update(
+    /// Update a test fixture without a live runtime or retained shared views.
+    #[doc(hidden)]
+    fn update_unreserved_test_fixture(
         &self,
         config: &HubConfig,
         update: impl FnOnce(&mut HubState),
     ) -> HubStateStoreResult<HubState> {
         let mut state = self.load_or_initialize(config)?;
         update(&mut state);
-        self.save(&state)?;
+        self.save_exclusive_startup_state(&state)?;
         Ok(state)
     }
 }
@@ -505,14 +506,14 @@ impl HubStateStore for FileHubStateStore {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let state = HubState::from_config(config);
-                self.save(&state)?;
+                self.save_exclusive_startup_state(&state)?;
                 Ok(state)
             }
             Err(error) => Err(HubStateStoreError::Io(error)),
         }
     }
 
-    fn save(&self, state: &HubState) -> HubStateStoreResult<()> {
+    fn save_exclusive_startup_state(&self, state: &HubState) -> HubStateStoreResult<()> {
         state
             .validate_version()
             .map_err(HubStateStoreError::State)?;
@@ -878,7 +879,7 @@ mod tests {
         );
 
         store
-            .update(&config, |state| {
+            .update_unreserved_test_fixture(&config, |state| {
                 state.credential_keys.push(CredentialKeyReference {
                     key_id: key_id.clone(),
                     provider: CredentialProviderKind::TestFile,
@@ -1067,7 +1068,7 @@ mod tests {
             .expect("enable package");
 
         store
-            .update(&config, |state| {
+            .update_unreserved_test_fixture(&config, |state| {
                 state.package_registry = registry.snapshot();
                 state.capability_grants.push(CapabilityGrantRecord {
                     subject: "workflow.plugin".to_string(),
@@ -1134,7 +1135,7 @@ mod tests {
             .expect("set package configuration");
 
         store
-            .update(&config, |state| {
+            .update_unreserved_test_fixture(&config, |state| {
                 state.package_registry = registry.snapshot();
             })
             .expect("persist state");
@@ -1188,7 +1189,7 @@ mod tests {
         }];
 
         store
-            .update(&config, |state| {
+            .update_unreserved_test_fixture(&config, |state| {
                 state.package_registry = snapshot;
             })
             .expect("persist runnable entrypoint state");
@@ -1275,7 +1276,9 @@ mod tests {
         let config = test_config("shared-view-capacity");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let initial = HubState::from_config(&config);
-        store.save(&initial).expect("save initial state");
+        store
+            .save_exclusive_startup_state(&initial)
+            .expect("save initial state");
         let committed = fs::read(store.path()).expect("read initial state");
         let budget = SharedViewBudget::with_capacity(1);
 

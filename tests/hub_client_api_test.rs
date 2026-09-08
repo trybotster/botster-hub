@@ -141,7 +141,7 @@ fn session_type_device_crud_is_authoritative_and_package_mutation_is_read_only()
     let config = runtime.config().clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.spawn_targets.push(SpawnTarget {
                 target_id: "repo:concurrent".to_string(),
                 label: "Concurrently persisted target".to_string(),
@@ -1456,7 +1456,7 @@ fn session_type_sources_apply_device_repo_precedence_and_reload_from_state() {
     let config = explicit_runtime("session-type-precedence").config().clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.device_session_type_sources = vec![DeviceSessionTypeSource {
                 root: device_root.clone(),
                 session_types: vec![session_type("bin/device.sh", "device")],
@@ -1659,7 +1659,7 @@ fn session_type_definition_round_trips_repo_sources_and_preserves_selection() {
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.device_session_type_sources = vec![DeviceSessionTypeSource {
                 root: device_root.clone(),
                 session_types: vec![device_authored.clone()],
@@ -1765,7 +1765,7 @@ fn session_type_definition_rejects_ambiguous_bare_ids() {
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.spawn_targets = vec![
                 SpawnTarget {
                     target_id: "repo:first".to_string(),
@@ -1869,7 +1869,7 @@ fn session_type_sources_apply_device_over_package_when_repo_disabled() {
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.device_session_type_sources = vec![DeviceSessionTypeSource {
                 root: device_root.clone(),
                 session_types: vec![session_type("bin/device.sh", "device")],
@@ -1923,7 +1923,7 @@ fn session_type_sources_reject_duplicate_ids_within_device_source() {
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.device_session_type_sources = vec![DeviceSessionTypeSource {
                 root: device_root.clone(),
                 session_types: vec![
@@ -1974,7 +1974,7 @@ fn session_type_sources_reject_duplicate_ids_within_repo_source() {
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.spawn_targets = vec![SpawnTarget {
                 target_id: "repo:duplicate".to_string(),
                 label: "repo:duplicate".to_string(),
@@ -2047,7 +2047,7 @@ fn session_type_sources_reject_ambiguous_same_rank_repo_ids() {
         .clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.spawn_targets = vec![
                 SpawnTarget {
                     target_id: "repo:first".to_string(),
@@ -2173,7 +2173,7 @@ fn device_global_session_types_eligible_at_admitted_spawn_point() {
     let config = explicit_runtime("device-global-eligible").config().clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.device_session_type_sources = vec![DeviceSessionTypeSource {
                 root: device_root.clone(),
                 session_types: vec![device_global, device_relative, device_zebra],

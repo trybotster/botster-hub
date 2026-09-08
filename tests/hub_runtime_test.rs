@@ -350,7 +350,7 @@ fn hub_runtime_reloads_trusted_browser_identity_when_credential_reference_resolv
         .expect("write explicit test credential");
 
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.credential_keys.push(CredentialKeyReference {
                 key_id: key_id.clone(),
                 provider: CredentialProviderKind::TestFile,
@@ -394,7 +394,7 @@ fn hub_runtime_fails_closed_when_required_credential_store_is_unavailable() {
     );
 
     store
-        .update(&config, |state| {
+        .update_unreserved_test_fixture(&config, |state| {
             state.credential_keys.push(CredentialKeyReference {
                 key_id: key_id.clone(),
                 provider: CredentialProviderKind::TestFile,

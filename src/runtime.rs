@@ -475,7 +475,7 @@ impl HubRuntime {
             &mut state.worktrees,
             &managed_worktree_root(&config),
         ) {
-            store.save(&state)?;
+            store.save_exclusive_startup_state(&state)?;
         }
         validate_hub_credentials(
             &state,
@@ -502,7 +502,7 @@ impl HubRuntime {
             &mut state.worktrees,
             &managed_worktree_root(&config),
         ) {
-            store.save(&state)?;
+            store.save_exclusive_startup_state(&state)?;
         }
         validate_hub_credentials(&state, provider_kind, credential_store)?;
         Self::from_validated_state(config, state)
