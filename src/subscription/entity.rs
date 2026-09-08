@@ -347,7 +347,8 @@ impl SessionTypeCatalogCache {
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
-            HostResult::EntrypointsStopped
+            HostResult::PluginEntity(_)
+            | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)
@@ -408,7 +409,8 @@ impl SessionTypeCatalogCache {
                 self.generation = None;
                 self.failure = Some((generation, error));
             }
-            HostResult::EntrypointsStopped
+            HostResult::PluginEntity(_)
+            | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)
@@ -662,10 +664,10 @@ pub(crate) fn register_package_entity_subscription_snapshot(
             .runtime_mut()
             .ok_or(DaemonTransportError::DaemonNotRunning)?;
         // Advance the monotonic family floor from the provider. Never lower it.
-        let _ = runtime.apply_package_entity_provider_snapshot(&entity_type, snapshot_seq);
+        let _ = runtime.begin_package_entity_provider_snapshot(&entity_type, snapshot_seq);
         let family_floor = runtime
-            .package_entity_family_state(&entity_type)
-            .map(|family| family.last_accepted_seq)
+            .package_entity_family_progress(&entity_type)
+            .map(|family| family.floor)
             .unwrap_or(snapshot_seq);
         let catching_up = snapshot_seq < family_floor;
         if catching_up {
@@ -1268,16 +1270,9 @@ pub(crate) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
     let Some(runtime) = daemon.runtime() else {
         return;
     };
-    let mutations = runtime.take_leased_package_entity_fanout();
-    if mutations.is_empty() {
-        return;
-    }
-    for item in mutations {
-        if item.finish_only {
-            runtime.finish_package_entity_mutation_fanout(&item, item.scheduled_resync);
-            continue;
-        }
-        let mutation = &item.mutation;
+    if let Some(item) = runtime.take_one_package_entity_fanout() {
+        let (mutation, mut finish) = item.into_parts();
+        let mutation = &mutation;
         state.lifecycle_counters.package_entity_publish_accepted = state
             .lifecycle_counters
             .package_entity_publish_accepted
@@ -1393,7 +1388,8 @@ pub(crate) fn drive_package_entity_fanout(daemon: &mut HubDaemon, state: &mut Da
                 }
             }
         }
-        runtime.finish_package_entity_mutation_fanout(&item, scheduled_resync);
+        finish.scheduled_resync = scheduled_resync;
+        runtime.finish_package_entity_fanout(finish);
         for subscription_id in dead {
             state.entity_subscriptions.remove(&subscription_id);
         }
@@ -1473,11 +1469,9 @@ pub(crate) fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut Da
         });
         let family_needs = daemon
             .runtime()
-            .and_then(|runtime| runtime.package_entity_family_state(&entity_type))
+            .and_then(|runtime| runtime.package_entity_family_progress(&entity_type))
             .is_some_and(|family| {
-                family.resync.needed
-                    || family.last_accepted_seq < family.high_water_seq
-                    || !family.pending_by_seq.is_empty()
+                family.needed || family.floor < family.high_water || family.has_live_pending
             });
         if !has_catching_up && !family_needs {
             continue;
@@ -1529,10 +1523,10 @@ pub(crate) fn apply_package_entity_resync_snapshot(
     let Some(runtime) = daemon.runtime() else {
         return;
     };
-    let _ready = runtime.apply_package_entity_provider_snapshot(entity_type, snapshot_seq);
+    let _ready = runtime.begin_package_entity_provider_snapshot(entity_type, snapshot_seq);
     let family_floor = runtime
-        .package_entity_family_state(entity_type)
-        .map(|family| family.last_accepted_seq)
+        .package_entity_family_progress(entity_type)
+        .map(|family| family.floor)
         .unwrap_or(snapshot_seq);
 
     let mut dead = Vec::new();
