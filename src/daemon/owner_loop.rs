@@ -2812,7 +2812,7 @@ return botster.register({
         .expect("write asynchronous response fixture");
     }
 
-    fn start_async_plugin_control(
+    fn start_async_control_request(
         daemon: &mut HubDaemon,
         state: &mut DaemonControlState,
         request: DaemonRequest,
@@ -2885,7 +2885,7 @@ return botster.register({
         request: DaemonRequest,
         transport_request_id: &str,
     ) -> DaemonTransportResult<DaemonResponse> {
-        let reply_rx = start_async_plugin_control(
+        let reply_rx = start_async_control_request(
             daemon,
             state,
             request,
@@ -2926,13 +2926,9 @@ return botster.register({
         )
         .expect("enable controlled gate plugin");
 
-        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
         let mut state = DaemonControlState::default();
         crate::lua_runtime::arm_test_plugin_invocation_gate();
-        state.current_waiter_id = daemon
-            .runtime()
-            .and_then(|runtime| runtime.next_waiter_id());
-        let held_reply_rx = start_async_plugin_control(
+        let held_reply_rx = start_async_control_request(
             &mut daemon,
             &mut state,
             DaemonRequest::PluginMcpCallTool {
@@ -2956,49 +2952,35 @@ return botster.register({
 
         // Two seconds is a test safety bound. It is not a Status latency requirement.
         let status_started = Instant::now();
-        state.current_waiter_id = daemon
-            .runtime()
-            .and_then(|runtime| runtime.next_waiter_id());
-        let status = handle_control_request(
+        let mut status_reply = start_async_control_request(
             &mut daemon,
             &mut state,
-            DaemonObservability {
-                egress: Vec::new(),
-                lifecycle: DaemonLifecycleCounters::default(),
-                client_id: Some("connection-status".to_string()),
-                grant_id: None,
-                transport_request_id: Some("7".to_string()),
-            },
-            control_tx,
             DaemonRequest::Status,
+            "connection-status",
+            "7",
         );
-        let crate::daemon::control::pending::ControlStep::Pending(mut status) = status else {
-            panic!("status must wait only for its independent Core read");
-        };
         let status_deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {
-            match (status.continuation)(&mut daemon, &mut state) {
-                crate::daemon::control::pending::ControlPoll::Ready(response) => break response,
-                crate::daemon::control::pending::ControlPoll::PreparePluginResponse(_, _)
-                | crate::daemon::control::pending::ControlPoll::SubmitPluginHost(_) => {
-                    panic!("status must not carry a plugin-result charge")
-                }
-                crate::daemon::control::pending::ControlPoll::ReadyHost(_, _) => {
-                    panic!("status must not carry a host-result charge")
-                }
-                crate::daemon::control::pending::ControlPoll::Pending => {
+            drive_ready_test_turn(&mut daemon, &mut state);
+            match status_reply.try_recv() {
+                Ok(reply) => break reply.expect("status response"),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     assert!(
                         Instant::now() < status_deadline,
                         "unrelated status exceeded the safety deadline"
                     );
                     thread::sleep(Duration::from_millis(5));
                 }
+                Err(error) => panic!("status reply channel failed: {error}"),
             }
         };
+        assert_eq!(status.kind, DaemonResponseKind::Status);
         assert_eq!(
-            status.expect("status response").kind,
-            DaemonResponseKind::Status
+            state.pending_requests.len(),
+            1,
+            "the blocked plugin row must remain"
         );
+        assert_eq!(state.budget.outstanding(), 1);
         assert!(
             status_started.elapsed() < Duration::from_secs(2),
             "unrelated owner control exceeded the safety deadline"
@@ -3527,7 +3509,7 @@ return botster.register({
                 .collect::<Vec<_>>();
             let mut state = DaemonControlState::default();
             crate::lua_runtime::arm_test_plugin_invocation_gate();
-            let reply_rx = start_async_plugin_control(
+            let reply_rx = start_async_control_request(
                 &mut daemon,
                 &mut state,
                 DaemonRequest::PluginMcpCallTool {
