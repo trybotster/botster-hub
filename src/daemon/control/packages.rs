@@ -7,9 +7,9 @@ use std::path::PathBuf;
 
 use botster_hub_client::{DaemonRequest, DaemonResponse};
 
-use crate::HubDaemon;
 use crate::client_api_dto::response::daemon_packages;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
+use crate::entrypoint_supervisor::EntrypointSupervisor;
 use crate::entrypoint_supervisor::EntrypointSupervisorError;
 use crate::packages::{PackageResolvedEntrypointLaunch, resolve_entrypoint_launch_contract};
 use crate::transport::unix::listener::socket_path;
@@ -18,35 +18,72 @@ use crate::{
     PackageRegistry, PackageRegistryError, PackageState,
 };
 
+/// Run one entrypoint operation on a host worker.
 pub(crate) fn handle_request(
-    daemon: &mut HubDaemon,
+    config: &HubConfig,
+    registry: &PackageRegistry,
+    supervisor: &mut EntrypointSupervisor,
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
-    match request {
+    let package_name = match request {
         DaemonRequest::StartPackageEntrypoint {
             package_name,
             entrypoint_id,
             environment_overrides,
-        } => start_package_entrypoint_response(
-            daemon,
-            package_name,
-            entrypoint_id,
-            environment_overrides,
-        ),
+        } => {
+            let launch = supervised_launch_contract(
+                config,
+                registry,
+                &package_name,
+                &entrypoint_id,
+                &environment_overrides,
+            )?;
+            supervisor.start(
+                registry,
+                &package_name,
+                &entrypoint_id,
+                &launch.args,
+                &launch.environment,
+            )?;
+            package_name
+        }
         DaemonRequest::StopPackageEntrypoint {
             package_name,
             entrypoint_id,
-        } => stop_package_entrypoint_response(daemon, package_name, entrypoint_id),
+        } => {
+            supervisor.stop(&package_name, &entrypoint_id);
+            package_name
+        }
         DaemonRequest::RestartPackageEntrypoint {
             package_name,
             entrypoint_id,
-        } => restart_package_entrypoint_response(daemon, package_name, entrypoint_id),
+        } => {
+            let launch = supervised_launch_contract(
+                config,
+                registry,
+                &package_name,
+                &entrypoint_id,
+                &BTreeMap::new(),
+            )?;
+            supervisor.restart(
+                registry,
+                &package_name,
+                &entrypoint_id,
+                &launch.args,
+                &launch.environment,
+            )?;
+            package_name
+        }
         DaemonRequest::PackageEntrypointStatus {
             package_name,
             entrypoint_id,
-        } => package_entrypoint_status_response(daemon, package_name, entrypoint_id),
-        _ => unreachable!("package family received a non-package request"),
-    }
+        } => {
+            supervisor.status(&package_name, &entrypoint_id);
+            package_name
+        }
+        _ => unreachable!("entrypoint execution received a different request family"),
+    };
+    show_package_response(registry, supervisor, &package_name)
 }
 
 fn supervised_launch_contract(
@@ -106,10 +143,10 @@ fn runtime_path(path: PathBuf) -> PathBuf {
 }
 
 fn show_package_response(
-    daemon: &mut HubDaemon,
+    registry: &PackageRegistry,
+    supervisor: &mut EntrypointSupervisor,
     package_name: &str,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let registry = daemon.package_registry();
     let mut package = registry
         .package(package_name)
         .map(|record| HubClientPackage::from_record(registry, record))
@@ -121,88 +158,8 @@ fn show_package_response(
                 "daemon socket show package".to_string(),
             )
         })?;
-    let snapshots = daemon.entrypoint_supervisor().snapshots();
-    apply_entrypoint_snapshots(std::slice::from_mut(&mut package), snapshots);
+    apply_entrypoint_snapshots(std::slice::from_mut(&mut package), supervisor.snapshots());
     Ok(daemon_packages(vec![package]))
-}
-
-fn start_package_entrypoint_response(
-    daemon: &mut HubDaemon,
-    package_name: String,
-    entrypoint_id: String,
-    environment_overrides: BTreeMap<String, String>,
-) -> DaemonTransportResult<DaemonResponse> {
-    let config = daemon
-        .runtime()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?
-        .config()
-        .clone();
-    let packages = daemon.package_registry().clone();
-    let launch = supervised_launch_contract(
-        &config,
-        &packages,
-        &package_name,
-        &entrypoint_id,
-        &environment_overrides,
-    )?;
-    daemon.entrypoint_supervisor().start(
-        &packages,
-        &package_name,
-        &entrypoint_id,
-        &launch.args,
-        &launch.environment,
-    )?;
-    show_package_response(daemon, &package_name)
-}
-
-fn stop_package_entrypoint_response(
-    daemon: &mut HubDaemon,
-    package_name: String,
-    entrypoint_id: String,
-) -> DaemonTransportResult<DaemonResponse> {
-    daemon
-        .entrypoint_supervisor()
-        .stop(&package_name, &entrypoint_id);
-    show_package_response(daemon, &package_name)
-}
-
-fn restart_package_entrypoint_response(
-    daemon: &mut HubDaemon,
-    package_name: String,
-    entrypoint_id: String,
-) -> DaemonTransportResult<DaemonResponse> {
-    let config = daemon
-        .runtime()
-        .ok_or(DaemonTransportError::DaemonNotRunning)?
-        .config()
-        .clone();
-    let packages = daemon.package_registry().clone();
-    let launch = supervised_launch_contract(
-        &config,
-        &packages,
-        &package_name,
-        &entrypoint_id,
-        &BTreeMap::new(),
-    )?;
-    daemon.entrypoint_supervisor().restart(
-        &packages,
-        &package_name,
-        &entrypoint_id,
-        &launch.args,
-        &launch.environment,
-    )?;
-    show_package_response(daemon, &package_name)
-}
-
-fn package_entrypoint_status_response(
-    daemon: &mut HubDaemon,
-    package_name: String,
-    entrypoint_id: String,
-) -> DaemonTransportResult<DaemonResponse> {
-    daemon
-        .entrypoint_supervisor()
-        .status(&package_name, &entrypoint_id);
-    show_package_response(daemon, &package_name)
 }
 
 fn apply_entrypoint_snapshots(

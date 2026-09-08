@@ -195,7 +195,7 @@ pub(crate) fn handle_control_request(
     control_tx: ControlSender,
     request: DaemonRequest,
 ) -> ControlStep {
-    if let Some(response) = host_work::package_recovery_response(state, &request) {
+    if let Some(response) = host_work::recovery_response(state, &request) {
         return ControlStep::ready(response);
     }
     if host_work::handles(&request) {
@@ -228,7 +228,7 @@ pub(crate) fn handle_control_request(
         | DaemonRequest::StopPackageEntrypoint { .. }
         | DaemonRequest::RestartPackageEntrypoint { .. }
         | DaemonRequest::PackageEntrypointStatus { .. } => {
-            packages::handle_request(daemon, request).into()
+            unreachable!("package requests use the host executor")
         }
         DaemonRequest::ListSpawnTargets
         | DaemonRequest::ShowSpawnTarget { .. }

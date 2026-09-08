@@ -56,6 +56,16 @@ pub(crate) fn handle(
     else {
         unreachable!("request owner received a non-request control message");
     };
+    if state.shutdown_waiter.is_some() {
+        return send_control_response(
+            reply_tx,
+            Ok(attach_bind_operator_error(
+                "daemon_shutting_down",
+                "the daemon is finishing accepted requests before shutdown",
+            )),
+            response_delivery_rx,
+        );
+    }
     if let Some(runtime) = daemon.runtime() {
         runtime.event_plane_counters().record_ready_operation_wait(
             u64::try_from(enqueued_at.elapsed().as_micros()).unwrap_or(u64::MAX),

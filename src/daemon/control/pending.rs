@@ -461,6 +461,18 @@ fn retire(
     // Dropping the continuation drops its Core ticket; the Core answer is
     // discarded. Dropping `reply_tx` closes the reply channel.
     drop(entry);
+    wake_shutdown_waiter(state);
+}
+
+pub(crate) fn wake_shutdown_waiter(state: &mut DaemonControlState) {
+    if let Some(waiter_id) = state.shutdown_waiter {
+        mark_owner_ready(
+            state,
+            waiter_id,
+            ReadyClass::HostCompletion,
+            READY_HOST_COMPLETION,
+        );
+    }
 }
 
 fn flag_past_deadline(state: &mut DaemonControlState, entry: &mut PendingControlRequest) {
@@ -545,7 +557,11 @@ pub(crate) fn poll_ready_request_item(
             if let Some(runtime) = daemon.runtime() {
                 runtime.retire_owner_core_waiter(waiter_id);
             }
-            return finish(daemon, state, entry, reply);
+            let shutdown = finish(daemon, state, entry, reply);
+            if !shutdown {
+                wake_shutdown_waiter(state);
+            }
+            return shutdown;
         }
     }
     if reasons.contains(READY_DEADLINE) {

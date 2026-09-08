@@ -210,42 +210,96 @@ pub(crate) fn handle_runtime(
     };
     match request {
         DaemonRequest::DaemonShutdown => {
+            let Some(permit) = runtime.host_executor().try_reserve() else {
+                return ControlStep::ready(crate::daemon::control::attach_bind_operator_error(
+                    "host_executor_full",
+                    "the host executor has no shutdown slot; retry after capacity is released",
+                ));
+            };
+            let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+            state.shutdown_waiter = Some(waiter_id);
             let policy = runtime.retention_policy();
-            let mut ticket = runtime.submit_core_for_owner(
-                state.current_waiter_id.expect("owner waiter is assigned"),
-                |daemon| daemon.retention_accounting(),
-            );
+            let mut ticket =
+                runtime.submit_core_for_owner(waiter_id, |daemon| daemon.retention_accounting());
             let session_count = state.maintenance.projection.rows.len();
             let lifecycle = observability.lifecycle.clone();
-            ControlStep::pending(move |daemon, _| {
-                let accounting = match ticket.poll() {
-                    CoreTicketPoll::Pending => return ControlPoll::Pending,
-                    CoreTicketPoll::Lost | CoreTicketPoll::Refused => None,
-                    CoreTicketPoll::Ready(accounting) => Some(accounting),
-                };
+            let mut response = None;
+            let mut permit = Some(permit);
+            let mut stop_submitted = false;
+            ControlStep::pending(move |daemon, state| {
                 let Some(runtime) = daemon.runtime() else {
+                    state.shutdown_waiter = None;
                     return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
                 };
-                let mut response = daemon_response_base(DaemonResponseKind::Shutdown);
-                response.status = Some(daemon_status_from_status(
-                    &status,
-                    session_count,
-                    Vec::new(),
-                    lifecycle.clone(),
-                    software_identity(),
-                    installation_identity(),
-                    runtime.event_plane_counters_snapshot(),
-                    accounting.map(|accounting| DaemonRetentionAccounting {
-                        max_object_bytes: policy.max_object_bytes as u64,
-                        max_total_bytes: policy.max_total_bytes as u64,
-                        max_sessions: u32::try_from(policy.max_sessions).unwrap_or(u32::MAX),
-                        total_bytes: accounting.total_bytes as u64,
-                        sessions: u32::try_from(accounting.sessions).unwrap_or(u32::MAX),
-                        evictions: accounting.evictions,
-                    }),
-                ));
-                response.diagnostics = vec![DaemonDiagnostic::connected("shutdown")];
-                ControlPoll::Ready(Ok(response))
+                if response.is_none() {
+                    let accounting = match ticket.poll() {
+                        CoreTicketPoll::Pending => return ControlPoll::Pending,
+                        CoreTicketPoll::Lost | CoreTicketPoll::Refused => None,
+                        CoreTicketPoll::Ready(accounting) => Some(accounting),
+                    };
+                    let mut prepared_response = daemon_response_base(DaemonResponseKind::Shutdown);
+                    prepared_response.status = Some(daemon_status_from_status(
+                        &status,
+                        session_count,
+                        Vec::new(),
+                        lifecycle.clone(),
+                        software_identity(),
+                        installation_identity(),
+                        runtime.event_plane_counters_snapshot(),
+                        accounting.map(|accounting| DaemonRetentionAccounting {
+                            max_object_bytes: policy.max_object_bytes as u64,
+                            max_total_bytes: policy.max_total_bytes as u64,
+                            max_sessions: u32::try_from(policy.max_sessions).unwrap_or(u32::MAX),
+                            total_bytes: accounting.total_bytes as u64,
+                            sessions: u32::try_from(accounting.sessions).unwrap_or(u32::MAX),
+                            evictions: accounting.evictions,
+                        }),
+                    ));
+                    prepared_response.diagnostics = vec![DaemonDiagnostic::connected("shutdown")];
+
+                    response = Some(prepared_response);
+                }
+                if !stop_submitted {
+                    // The dispatcher removes this waiter while it runs this continuation.
+                    if !state.pending_requests.is_empty() {
+                        return ControlPoll::Pending;
+                    }
+                    match runtime.host_executor().submit(
+                        crate::host_executor::HostJobIdentity {
+                            waiter_id,
+                            phase: 1,
+                        },
+                        crate::host_executor::HostCommand::StopEntrypoints,
+                        permit.take().expect("shutdown retains its host slot"),
+                    ) {
+                        Ok(()) => {
+                            stop_submitted = true;
+                            return ControlPoll::Pending;
+                        }
+                        Err(_) => {
+                            state.shutdown_waiter = None;
+                            return ControlPoll::Ready(Err(DaemonTransportError::Protocol(
+                                "host shutdown submission failed",
+                            )));
+                        }
+                    }
+                }
+                let Some(completion) = state.host_completions.remove(&waiter_id) else {
+                    return ControlPoll::Pending;
+                };
+                let (_, result, permit) = completion.into_parts();
+                drop(permit);
+                state.shutdown_waiter = None;
+                match result {
+                    crate::host_executor::HostResult::EntrypointsStopped => {
+                        ControlPoll::Ready(Ok(response
+                            .take()
+                            .expect("shutdown response was prepared")))
+                    }
+                    _ => ControlPoll::Ready(Err(DaemonTransportError::Protocol(
+                        "host entrypoint shutdown failed",
+                    ))),
+                }
             })
         }
         _ => unreachable!("host runtime family received a non-host request"),

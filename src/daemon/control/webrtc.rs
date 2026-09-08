@@ -8,9 +8,7 @@ use botster_hub_client::{
 use serde_json::Value;
 
 use crate::HubDaemon;
-use crate::client_api_dto::response::{
-    daemon_local_webrtc_answer, daemon_local_webrtc_bootstrap, daemon_response_base,
-};
+use crate::client_api_dto::response::{daemon_local_webrtc_answer, daemon_response_base};
 use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::daemon::control::pending::retire_abandoned_requests;
 use crate::daemon::control::runtime_client_id;
@@ -33,11 +31,9 @@ pub(crate) fn handle_request(
     request: DaemonRequest,
 ) -> DaemonTransportResult<DaemonResponse> {
     match request {
-        DaemonRequest::IssueLocalWebrtcBootstrap {
-            package_name,
-            entrypoint_id,
-            origin,
-        } => issue_local_webrtc_bootstrap_response(daemon, &package_name, &entrypoint_id, &origin),
+        DaemonRequest::IssueLocalWebrtcBootstrap { .. } => {
+            unreachable!("bootstrap validation uses the host executor")
+        }
         DaemonRequest::LocalWebrtcSignal {
             grant_id,
             grant_secret,
@@ -48,28 +44,28 @@ pub(crate) fn handle_request(
     }
 }
 
-fn issue_local_webrtc_bootstrap_response(
-    daemon: &mut HubDaemon,
+pub(crate) fn validate_local_webrtc_bootstrap(
+    packages: &crate::PackageRegistry,
+    entrypoints: &mut crate::entrypoint_supervisor::EntrypointSupervisor,
     package_name: &str,
     entrypoint_id: &str,
     origin: &str,
-) -> DaemonTransportResult<DaemonResponse> {
+) -> Result<String, DaemonResponse> {
     if package_name != "botster-web" || entrypoint_id != "web-client" {
-        return Ok(local_webrtc_bootstrap_issue_error(
+        return Err(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_unsupported_entrypoint",
             "local WebRTC page-load bootstrap is only supported for botster-web/web-client",
         ));
     }
 
-    let packages = daemon.package_registry().clone();
     let Some(record) = packages.package(package_name) else {
-        return Ok(local_webrtc_bootstrap_issue_error(
+        return Err(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_package_not_installed",
             format!("package {package_name} is not installed"),
         ));
     };
     if !record.is_enabled() {
-        return Ok(local_webrtc_bootstrap_issue_error(
+        return Err(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_package_disabled",
             format!("package {package_name} is not enabled"),
         ));
@@ -79,46 +75,40 @@ fn issue_local_webrtc_bootstrap_response(
         .iter()
         .find(|entrypoint| entrypoint.id == entrypoint_id)
     else {
-        return Ok(local_webrtc_bootstrap_issue_error(
+        return Err(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_entrypoint_not_found",
             format!("entrypoint {entrypoint_id} was not found for package {package_name}"),
         ));
     };
 
-    let snapshot = daemon
-        .entrypoint_supervisor()
-        .status(package_name, entrypoint_id);
+    let snapshot = entrypoints.status(package_name, entrypoint_id);
     if snapshot.state != "running" {
-        return Ok(local_webrtc_bootstrap_issue_error(
+        return Err(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_entrypoint_not_running",
             format!("entrypoint {package_name}/{entrypoint_id} is not running"),
         ));
     }
 
     let Some(local_url) = app_local_url(entrypoint, Some(&snapshot)) else {
-        return Ok(local_webrtc_bootstrap_issue_error(
+        return Err(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_local_url_unavailable",
             format!("entrypoint {package_name}/{entrypoint_id} has no structured local_url"),
         ));
     };
     let Some(expected_origin) = crate::admission::grants::origin_from_local_url(&local_url) else {
-        return Ok(local_webrtc_bootstrap_issue_error(
+        return Err(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_invalid_local_url",
             format!("entrypoint {package_name}/{entrypoint_id} local_url has no origin"),
         ));
     };
     if origin != expected_origin {
-        return Ok(local_webrtc_bootstrap_issue_error(
+        return Err(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_origin_mismatch",
             "requested origin does not match running entrypoint local_url origin",
         ));
     }
 
-    let bootstrap =
-        daemon
-            .local_webrtc()
-            .issue_bootstrap(package_name, entrypoint_id, &expected_origin)?;
-    Ok(daemon_local_webrtc_bootstrap(bootstrap))
+    Ok(expected_origin)
 }
 
 pub(crate) fn local_webrtc_peer_gone_request_error(operation: &str) -> DaemonResponse {
