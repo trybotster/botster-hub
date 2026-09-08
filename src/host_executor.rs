@@ -4,12 +4,17 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Instant;
 
 use serde_json::Value;
 
 use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::daemon::control::session_types::{
     SessionTypeCatalogBuild, bounded_session_type_catalog_entities,
+};
+use crate::managed_git_worktrees::{
+    ManagedGitRequest, ManagedWorktreeDecision, PreparedManagedWorktree,
+    create_managed_worktree_effect, finalize_managed_worktree,
 };
 use crate::owner_identity::OwnerWorkIdentity;
 use crate::packages::PackageRegistry;
@@ -46,6 +51,18 @@ pub(crate) enum HostCommand {
         state: SharedView<HubState>,
     },
     Mutation(crate::host_mutations::HostMutationCommand),
+    /// Run this external-effect phase before document admission. The owner must
+    /// not hold the shared document reservation while Git runs.
+    CreateManagedWorktree {
+        request: ManagedGitRequest,
+    },
+    /// Complete the external-effect phase with the same operation permit and a
+    /// later phase serial after the owner makes its document decision.
+    FinalizeManagedWorktree {
+        prepared: PreparedManagedWorktree,
+        decision: ManagedWorktreeDecision,
+        deadline: Instant,
+    },
     #[cfg(test)]
     Panic {
         generation: u64,
@@ -62,6 +79,7 @@ impl HostCommand {
         match self {
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
             Self::Mutation(_) => 0,
+            Self::CreateManagedWorktree { .. } | Self::FinalizeManagedWorktree { .. } => 0,
             #[cfg(test)]
             Self::Panic { generation } => *generation,
             #[cfg(test)]
@@ -78,6 +96,13 @@ impl std::fmt::Debug for HostCommand {
                 .field("generation", generation)
                 .finish_non_exhaustive(),
             Self::Mutation(command) => formatter.debug_tuple("Mutation").field(command).finish(),
+            Self::CreateManagedWorktree { .. } => formatter
+                .debug_struct("CreateManagedWorktree")
+                .finish_non_exhaustive(),
+            Self::FinalizeManagedWorktree { decision, .. } => formatter
+                .debug_struct("FinalizeManagedWorktree")
+                .field("decision", decision)
+                .finish_non_exhaustive(),
             #[cfg(test)]
             Self::Panic { generation } => formatter
                 .debug_struct("Panic")
@@ -111,6 +136,12 @@ pub(crate) enum HostResult {
         error: HostError,
     },
     Mutation(crate::host_mutations::HostMutationResult),
+    ManagedWorktreeCreated(PreparedManagedWorktree),
+    ManagedWorktreeFinalized,
+    ManagedWorktreeRecoveryRequired {
+        prepared: PreparedManagedWorktree,
+        error: HostError,
+    },
 }
 
 impl HostResult {
@@ -120,6 +151,9 @@ impl HostResult {
                 *generation
             }
             Self::Mutation(_) => 0,
+            Self::ManagedWorktreeCreated(_)
+            | Self::ManagedWorktreeFinalized
+            | Self::ManagedWorktreeRecoveryRequired { .. } => 0,
         }
     }
 }
@@ -140,6 +174,9 @@ impl HostCompletion {
             HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
             HostResult::Failed { .. } => 0,
             HostResult::Mutation(_) => 0,
+            HostResult::ManagedWorktreeCreated(_)
+            | HostResult::ManagedWorktreeFinalized
+            | HostResult::ManagedWorktreeRecoveryRequired { .. } => 0,
         };
         if logical_bytes > HOST_PREPARED_BYTE_CAPACITY {
             let generation = result.generation();
@@ -155,6 +192,9 @@ impl HostCompletion {
             HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
             HostResult::Failed { .. } => 0,
             HostResult::Mutation(_) => 0,
+            HostResult::ManagedWorktreeCreated(_)
+            | HostResult::ManagedWorktreeFinalized
+            | HostResult::ManagedWorktreeRecoveryRequired { .. } => 0,
         };
         let charge = permit.into_prepared_charge(logical_bytes);
         (result, charge)
@@ -543,6 +583,8 @@ fn run_worker(
             })
             .is_err()
         {
+            // An undelivered created worktree stays in its deterministic path.
+            // Startup adoption publishes the same preserved external effect.
             return;
         }
         // The completion is in the mailbox before this bit and doorbell publish.
@@ -590,6 +632,32 @@ fn execute(command: HostCommand) -> HostResult {
         HostCommand::Mutation(command) => {
             HostResult::Mutation(crate::host_mutations::execute(command))
         }
+        HostCommand::CreateManagedWorktree { request } => {
+            match create_managed_worktree_effect(&request) {
+                Ok(prepared) => HostResult::ManagedWorktreeCreated(prepared),
+                Err(mut error) => match error.take_recovery() {
+                    Some(prepared) => HostResult::ManagedWorktreeRecoveryRequired {
+                        prepared,
+                        error: HostError::new(error.kind, error.message),
+                    },
+                    None => HostResult::Failed {
+                        generation: 0,
+                        error: HostError::new(error.kind, error.message),
+                    },
+                },
+            }
+        }
+        HostCommand::FinalizeManagedWorktree {
+            prepared,
+            decision,
+            deadline,
+        } => match finalize_managed_worktree(&prepared, decision, deadline) {
+            Ok(()) => HostResult::ManagedWorktreeFinalized,
+            Err(error) => HostResult::ManagedWorktreeRecoveryRequired {
+                prepared,
+                error: HostError::new(error.kind, error.message),
+            },
+        },
         #[cfg(test)]
         HostCommand::Panic { .. } => panic!("host executor panic test"),
         #[cfg(test)]
@@ -645,10 +713,19 @@ impl TestHostGate {
 mod tests {
     use super::*;
     use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
+    use crate::managed_git_worktrees::{
+        MANAGED_GIT_OPERATION_TIMEOUT, adopt_unrecorded_managed_worktrees, managed_worktree_path,
+    };
     use crate::owner_identity::WaiterId;
     use crate::packages::PackageRegistry;
     use crate::persistence::HubState;
+    use crate::spawn_targets::SpawnTarget;
+    use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_MANAGED_REPOSITORY: AtomicU64 = AtomicU64::new(1);
 
     fn empty_catalog_inputs() -> (SharedView<PackageRegistry>, SharedView<HubState>) {
         let config = HubStartupOptions {
@@ -668,6 +745,105 @@ mod tests {
             SharedView::try_new(&budget, HubState::from_config(&config), 1)
                 .expect("state view fits"),
         )
+    }
+
+    struct ManagedGitFixture {
+        root: PathBuf,
+        repository: PathBuf,
+        managed_root: PathBuf,
+    }
+
+    impl ManagedGitFixture {
+        fn new() -> Self {
+            let id = NEXT_MANAGED_REPOSITORY.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "botster-host-managed-git-{}-{id}",
+                std::process::id()
+            ));
+            let repository = root.join("repository");
+            let managed_root = root.join("managed");
+            fs::create_dir_all(&repository).expect("create managed Git repository");
+            run_test_git(
+                None,
+                &[
+                    "init",
+                    "-b",
+                    "main",
+                    repository.to_str().expect("repository path"),
+                ],
+            );
+            run_test_git(
+                Some(&repository),
+                &["config", "user.email", "botster@example.invalid"],
+            );
+            run_test_git(Some(&repository), &["config", "user.name", "Botster Test"]);
+            fs::write(repository.join("README.md"), "fixture\n")
+                .expect("write managed Git fixture");
+            run_test_git(Some(&repository), &["add", "README.md"]);
+            run_test_git(Some(&repository), &["commit", "-m", "fixture"]);
+            Self {
+                root,
+                repository,
+                managed_root,
+            }
+        }
+
+        fn target(&self) -> SpawnTarget {
+            SpawnTarget {
+                target_id: "tgt_host_managed".to_string(),
+                label: "Managed".to_string(),
+                root: self.repository.clone(),
+                enabled: true,
+                kind: "git".to_string(),
+                base_ref: Some("main".to_string()),
+                metadata: BTreeMap::new(),
+            }
+        }
+
+        fn request(&self, branch: &str) -> ManagedGitRequest {
+            ManagedGitRequest {
+                target: self.target(),
+                branch: branch.to_string(),
+                managed_root: self.managed_root.clone(),
+                persisted_worktree: None,
+                accepted_at: Instant::now(),
+            }
+        }
+    }
+
+    impl Drop for ManagedGitFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn run_test_git(root: Option<&std::path::Path>, args: &[&str]) {
+        let mut command = Command::new("git");
+        if let Some(root) = root {
+            command.arg("-C").arg(root);
+        }
+        assert!(
+            command
+                .args(args)
+                .status()
+                .expect("run managed Git fixture command")
+                .success(),
+            "managed Git fixture command must succeed"
+        );
+    }
+
+    fn receive_host_completion(executor: &HostExecutor) -> HostCompletion {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match executor.poll_completion() {
+                HostCompletionPoll::Ready(completion) => return completion,
+                HostCompletionPoll::Stopped => panic!("host completion mailbox stopped"),
+                HostCompletionPoll::Empty => {
+                    assert!(Instant::now() < deadline, "host completion must arrive");
+                    std::thread::yield_now();
+                }
+            }
+        }
     }
 
     #[test]
@@ -906,5 +1082,137 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn managed_create_and_failed_finalize_keep_one_permit_and_recovery_identity() {
+        let fixture = ManagedGitFixture::new();
+        let executor = HostExecutor::new();
+        let permit = executor.try_reserve().expect("reserve managed operation");
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 1,
+                },
+                HostCommand::CreateManagedWorktree {
+                    request: fixture.request("feature/recovery"),
+                },
+                permit,
+            )
+            .expect("submit managed create phase");
+        let (created_identity, created_result, permit) =
+            receive_host_completion(&executor).into_parts();
+        assert_eq!(created_identity.phase, 1);
+        let HostResult::ManagedWorktreeCreated(prepared) = created_result else {
+            panic!("managed create phase must return its rollback descriptor");
+        };
+        fs::write(prepared.path.join("user-change"), "preserve\n")
+            .expect("change created worktree");
+
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 2,
+                },
+                HostCommand::FinalizeManagedWorktree {
+                    prepared,
+                    decision: ManagedWorktreeDecision::Rollback,
+                    deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
+                },
+                permit,
+            )
+            .expect("submit managed rollback phase");
+        let (failed_identity, failed_result, permit) =
+            receive_host_completion(&executor).into_parts();
+        assert_eq!(failed_identity.phase, 2);
+        let HostResult::ManagedWorktreeRecoveryRequired { prepared, error } = failed_result else {
+            panic!("failed rollback must retain recovery identity");
+        };
+        assert_eq!(error.code, "rollback_identity_mismatch");
+        assert!(prepared.path.exists());
+        assert_eq!(executor.outstanding(), 1, "one permit spans both phases");
+
+        fs::remove_file(prepared.path.join("user-change")).expect("remove test user change");
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 3,
+                },
+                HostCommand::FinalizeManagedWorktree {
+                    prepared,
+                    decision: ManagedWorktreeDecision::Rollback,
+                    deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
+                },
+                permit,
+            )
+            .expect("submit managed recovery phase");
+        let (recovered_identity, recovered_result, permit) =
+            receive_host_completion(&executor).into_parts();
+        assert_eq!(recovered_identity.phase, 3);
+        assert!(matches!(
+            recovered_result,
+            HostResult::ManagedWorktreeFinalized
+        ));
+        drop(permit);
+        assert_eq!(executor.outstanding(), 0);
+    }
+
+    #[test]
+    fn disconnected_create_delivery_preserves_an_adoptable_external_effect() {
+        let fixture = ManagedGitFixture::new();
+        let permit_executor = HostExecutor::new();
+        let permit = permit_executor
+            .try_reserve()
+            .expect("reserve disconnected managed operation");
+        let (jobs_tx, jobs_rx) = mpsc::sync_channel(1);
+        let (completions_tx, completions_rx) = mpsc::sync_channel(1);
+        drop(completions_rx);
+        let wake = Arc::new(HostWake::new());
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker = std::thread::spawn({
+            let wake = Arc::clone(&wake);
+            let stopping = Arc::clone(&stopping);
+            move || {
+                run_worker(
+                    Arc::new(Mutex::new(jobs_rx)),
+                    completions_tx,
+                    wake,
+                    stopping,
+                )
+            }
+        });
+        let branch = "feature/disconnected";
+        let path =
+            managed_worktree_path(&fixture.managed_root, &fixture.target().target_id, branch);
+        jobs_tx
+            .send(HostJob {
+                identity: HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 1,
+                },
+                command: HostCommand::CreateManagedWorktree {
+                    request: fixture.request(branch),
+                },
+                permit,
+            })
+            .expect("submit disconnected managed create");
+        drop(jobs_tx);
+        worker.join().expect("join disconnected host worker");
+        assert!(path.exists(), "undelivered create must preserve one policy");
+
+        let mut rows = Vec::new();
+        assert!(adopt_unrecorded_managed_worktrees(
+            &[fixture.target()],
+            &mut rows,
+            &fixture.managed_root,
+        ));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].path,
+            path.canonicalize().expect("canonical managed path")
+        );
     }
 }

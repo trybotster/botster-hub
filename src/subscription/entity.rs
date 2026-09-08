@@ -288,7 +288,10 @@ impl SessionTypeCatalogCache {
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
-            HostResult::Mutation(_) => {
+            HostResult::Mutation(_)
+            | HostResult::ManagedWorktreeCreated(_)
+            | HostResult::ManagedWorktreeFinalized
+            | HostResult::ManagedWorktreeRecoveryRequired { .. } => {
                 self.failure = Some((
                     expected_generation,
                     HostError::new(
@@ -322,7 +325,12 @@ impl SessionTypeCatalogCache {
                 self.prepared_charge = None;
                 self.failure = Some((generation, error));
             }
-            HostResult::Mutation(_) => unreachable!("mutation result was handled above"),
+            HostResult::Mutation(_)
+            | HostResult::ManagedWorktreeCreated(_)
+            | HostResult::ManagedWorktreeFinalized
+            | HostResult::ManagedWorktreeRecoveryRequired { .. } => {
+                unreachable!("non-catalog result was handled above")
+            }
         }
         true
     }
