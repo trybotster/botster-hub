@@ -276,12 +276,13 @@ pub(crate) fn arm_package_entity_resync_deadline(
         crate::subscription::entity_resync::note_package_entity_resync_change(state);
         return;
     }
-    let Some(waiter_id) = background_waiter_id(
+    // Production reaches this call through ProviderResync dispatch. That
+    // dispatch already allocated this waiter, which remains registered.
+    let waiter_id = background_waiter_id(
         state,
         BackgroundWork::Maintenance(MaintenanceSliceKind::ProviderResync),
-    ) else {
-        return;
-    };
+    )
+    .expect("resync dispatch retains its background waiter");
     let arm = state
         .deadlines
         .arm(waiter_id, deadline, now)

@@ -1861,7 +1861,7 @@ impl EventPlaneOwnerOps {
         self.pending.is_empty()
     }
 
-    /// Attempt one operation. Retain the owner cursor when an operation blocks.
+    /// Attempt one operation. Advance the cursor even when the operation blocks.
     pub fn apply_ready(&mut self, router: &PackageEventRouter) -> Vec<OwnerOp> {
         use std::ops::Bound::{Excluded, Unbounded};
 
