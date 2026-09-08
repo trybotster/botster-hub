@@ -26,6 +26,7 @@ use crate::admission::budgets::DAEMON_MAX_FRAME_BYTES;
 use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
+use crate::daemon::owner_turn::{OwnerTurnBudget, OwnerTurnCharge};
 use crate::host_executor::{
     HostCommand, HostCompletion, HostCompletionPoll, HostError, HostJobIdentity, HostResult,
     HostSubmitError,
@@ -958,15 +959,34 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
 pub(crate) fn absorb_session_type_catalog_completions(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
+    owner_turn: &mut OwnerTurnBudget,
 ) {
     let Some(runtime) = daemon.runtime() else {
         return;
     };
     let executor = runtime.host_executor();
-    executor.take_completion_notification();
-    let capacity_released = executor.take_capacity_notification();
+    if owner_turn
+        .try_charge(Instant::now(), OwnerTurnCharge::inspection(0))
+        .is_ok()
+        && executor.take_completion_notification()
+    {
+        state.host_completion_drain_pending = true;
+    }
+    if owner_turn
+        .try_charge(Instant::now(), OwnerTurnCharge::inspection(0))
+        .is_ok()
+        && executor.take_capacity_notification()
+    {
+        state.host_capacity_wake_pending = true;
+    }
     let mut catalog_changed = false;
-    loop {
+    while state.host_completion_drain_pending {
+        if owner_turn
+            .try_charge(Instant::now(), OwnerTurnCharge::inspection(0))
+            .is_err()
+        {
+            break;
+        }
         match executor.poll_completion() {
             HostCompletionPoll::Ready(completion) => {
                 if state.session_type_catalog.accepts(completion.identity) {
@@ -975,31 +995,64 @@ pub(crate) fn absorb_session_type_catalog_completions(
                     crate::daemon::control::pending::absorb_host_completion(state, completion);
                 }
             }
-            HostCompletionPoll::Empty => break,
+            HostCompletionPoll::Empty => {
+                state.host_completion_drain_pending = false;
+                break;
+            }
             HostCompletionPoll::Stopped => {
+                state.host_completion_drain_pending = false;
                 catalog_changed |= state.session_type_catalog.executor_stopped();
                 break;
             }
         }
     }
-    let capacity_released = capacity_released || executor.take_capacity_notification();
-    if capacity_released {
-        let recovery_waiters = state
-            .host_recovery_waiters
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        for waiter_id in recovery_waiters {
-            crate::daemon::control::pending::mark_request_ready(
-                state,
-                waiter_id,
-                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
-                crate::daemon::control::pending::READY_HOST_COMPLETION,
-            );
-        }
+    if owner_turn
+        .try_charge(Instant::now(), OwnerTurnCharge::inspection(0))
+        .is_ok()
+        && executor.take_capacity_notification()
+    {
+        state.host_capacity_wake_pending = true;
     }
-    if catalog_changed || (capacity_released && state.session_type_catalog.waiting_for_capacity()) {
+    drain_host_capacity_wakes(state, owner_turn);
+    if catalog_changed {
         state.maintenance.scheduler.prefer_subscriber_delivery();
+    }
+}
+
+fn drain_host_capacity_wakes(state: &mut DaemonControlState, owner_turn: &mut OwnerTurnBudget) {
+    while state.host_capacity_wake_pending {
+        let Some(waiter_id) = state.host_recovery_waiters.first().copied() else {
+            if state.session_type_catalog.waiting_for_capacity() {
+                if owner_turn
+                    .try_charge(Instant::now(), OwnerTurnCharge::inspection(0))
+                    .is_err()
+                {
+                    break;
+                }
+                state.maintenance.scheduler.prefer_subscriber_delivery();
+            }
+            state.host_capacity_wake_pending = false;
+            break;
+        };
+        if owner_turn
+            .try_charge(Instant::now(), OwnerTurnCharge::inspection(0))
+            .is_err()
+        {
+            break;
+        }
+        state.host_recovery_waiters.remove(&waiter_id);
+        if !state.pending_requests.contains_key(&waiter_id) {
+            continue;
+        }
+        if !crate::daemon::control::pending::mark_request_ready(
+            state,
+            waiter_id,
+            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+            crate::daemon::control::pending::READY_HOST_COMPLETION,
+        ) {
+            state.host_recovery_waiters.insert(waiter_id);
+            break;
+        }
     }
 }
 
@@ -4588,5 +4641,37 @@ mod tests {
         ));
         assert!(!state.needs_delivery);
         assert!(matches!(state.delivery_phase, DeliveryPhase::Removes));
+    }
+
+    #[test]
+    fn exhausted_budget_preserves_host_capacity_wake_progress() {
+        let now = Instant::now();
+        let mut budget = OwnerTurnBudget::new(now);
+        budget
+            .try_charge(
+                now,
+                OwnerTurnCharge::inspection(
+                    crate::daemon::owner_turn::OWNER_TURN_INSPECTED_BYTE_LIMIT,
+                ),
+            )
+            .expect("fill the exact inspected-byte budget");
+        let mut state = DaemonControlState::default();
+        let waiter_id = crate::owner_identity::WaiterId(7);
+        state.host_capacity_wake_pending = true;
+        state.host_recovery_waiters.insert(waiter_id);
+
+        drain_host_capacity_wakes(&mut state, &mut budget);
+
+        assert!(state.host_capacity_wake_pending);
+        assert_eq!(
+            state.host_recovery_waiters,
+            [waiter_id].into_iter().collect()
+        );
+
+        let mut fresh_budget = OwnerTurnBudget::new(Instant::now());
+        drain_host_capacity_wakes(&mut state, &mut fresh_budget);
+
+        assert!(!state.host_capacity_wake_pending);
+        assert!(state.host_recovery_waiters.is_empty());
     }
 }
