@@ -292,6 +292,35 @@ impl PackageEntityResyncState {
     }
 }
 
+/// Scalar progress for an incremental provider snapshot transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageEntityFamilyProgress {
+    pub floor: u64,
+    pub high_water: u64,
+    pub needed: bool,
+    pub degraded: bool,
+    pub has_live_pending: bool,
+    pub has_step_work: bool,
+}
+
+/// One bounded provider snapshot transition step.
+#[derive(Debug, PartialEq)]
+pub enum PackageEntityFamilyStep {
+    Discarded {
+        mutation: PackageEntityMutation,
+        lease: Option<EntityMutationLease>,
+    },
+    Ready {
+        mutation: PackageEntityMutation,
+        lease: Option<EntityMutationLease>,
+    },
+    ReleaseResync {
+        scope_id: u64,
+        family: String,
+    },
+    Complete(PackageEntityFamilyProgress),
+}
+
 /// Per-family runtime admission state.
 #[derive(Debug, Clone, Default)]
 pub struct PackageEntityFamilyState {
@@ -325,7 +354,7 @@ impl PackageEntityFamilyState {
         }
 
         let mut ready = Vec::new();
-        let status = if seq == self.last_accepted_seq + 1 {
+        let status = if self.last_accepted_seq.checked_add(1) == Some(seq) {
             self.high_water_seq = self.high_water_seq.max(seq);
             self.last_accepted_seq = seq;
             ready.push(mutation);
@@ -334,7 +363,11 @@ impl PackageEntityFamilyState {
             // clear degraded fully when the family converges.
             self.after_publish_progress(now);
             PackageEntityPublishStatus::Accepted
-        } else if seq <= self.last_accepted_seq + PACKAGE_ENTITY_PENDING_WINDOW {
+        } else if seq
+            <= self
+                .last_accepted_seq
+                .saturating_add(PACKAGE_ENTITY_PENDING_WINDOW)
+        {
             if self.pending_by_seq.contains_key(&seq) {
                 return (
                     self.result(PackageEntityPublishStatus::DuplicateSequence),
@@ -357,7 +390,7 @@ impl PackageEntityFamilyState {
 
     fn after_publish_progress(&mut self, now: Instant) {
         let gap_or_pending =
-            self.last_accepted_seq < self.high_water_seq || !self.pending_by_seq.is_empty();
+            self.last_accepted_seq < self.high_water_seq || self.has_live_pending();
         if gap_or_pending {
             self.resync.rearm(now);
         } else {
@@ -366,33 +399,63 @@ impl PackageEntityFamilyState {
         }
     }
 
-    /// Apply a provider snapshot sequence to the family floor.
-    ///
-    /// Returns mutations that became deliverable after the floor advanced.
-    pub fn apply_provider_snapshot_seq(
+    /// Begin an incremental provider snapshot transition with scalar updates only.
+    pub fn begin_provider_snapshot_seq(
         &mut self,
         snapshot_seq: u64,
         now: Instant,
-    ) -> Vec<PackageEntityMutation> {
+    ) -> PackageEntityFamilyProgress {
         self.high_water_seq = self.high_water_seq.max(snapshot_seq);
-        if snapshot_seq > self.last_accepted_seq {
-            self.last_accepted_seq = snapshot_seq;
-            // Drop pending at or below the new floor (provider is durable truth).
-            self.pending_by_seq
-                .retain(|seq, _| *seq > self.last_accepted_seq);
-            let ready = self.drain_consecutive_pending();
+        self.last_accepted_seq = self.last_accepted_seq.max(snapshot_seq);
+        self.recompute_resync_need(now);
+        self.provider_snapshot_progress()
+    }
+
+    /// Apply at most one provider snapshot transition step.
+    pub fn step_provider_snapshot(&mut self, now: Instant) -> PackageEntityFamilyStep {
+        let next_pending_seq = self.pending_by_seq.first_key_value().map(|(seq, _)| *seq);
+        if next_pending_seq.is_some_and(|seq| seq <= self.last_accepted_seq) {
+            let (seq, mutation) = self
+                .pending_by_seq
+                .pop_first()
+                .expect("the stale pending row was observed");
+            let lease = self.pending_leases.remove(&seq);
             self.recompute_resync_need(now);
-            ready
-        } else {
-            self.recompute_resync_need(now);
-            Vec::new()
+            return PackageEntityFamilyStep::Discarded { mutation, lease };
         }
+
+        if self
+            .last_accepted_seq
+            .checked_add(1)
+            .is_some_and(|next| next_pending_seq == Some(next))
+        {
+            let (seq, mutation) = self
+                .pending_by_seq
+                .pop_first()
+                .expect("the next ready pending row was observed");
+            let lease = self.pending_leases.remove(&seq);
+            self.last_accepted_seq = seq;
+            self.high_water_seq = self.high_water_seq.max(seq);
+            self.recompute_resync_need(now);
+            return PackageEntityFamilyStep::Ready { mutation, lease };
+        }
+
+        self.recompute_resync_need(now);
+        if self.converged()
+            && let Some((scope_id, family)) = self.resync.leases.pop_first()
+        {
+            return PackageEntityFamilyStep::ReleaseResync { scope_id, family };
+        }
+
+        PackageEntityFamilyStep::Complete(self.provider_snapshot_progress())
     }
 
     fn drain_consecutive_pending(&mut self) -> Vec<PackageEntityMutation> {
         let mut ready = Vec::new();
         loop {
-            let next = self.last_accepted_seq + 1;
+            let Some(next) = self.last_accepted_seq.checked_add(1) else {
+                break;
+            };
             let Some(mutation) = self.pending_by_seq.remove(&next) else {
                 break;
             };
@@ -404,14 +467,44 @@ impl PackageEntityFamilyState {
     }
 
     pub fn recompute_resync_need(&mut self, now: Instant) {
-        let gap_or_high_water =
-            self.last_accepted_seq < self.high_water_seq || !self.pending_by_seq.is_empty();
+        let gap_or_high_water = !self.converged();
         if gap_or_high_water {
             self.resync.mark_needed(now);
         } else {
             // Always clear degraded on convergence, even when needed was already false.
             self.resync.clear_needed();
             self.resync.clear_degraded_on_progress();
+        }
+    }
+
+    fn has_live_pending(&self) -> bool {
+        self.pending_by_seq
+            .last_key_value()
+            .is_some_and(|(seq, _)| *seq > self.last_accepted_seq)
+    }
+
+    fn converged(&self) -> bool {
+        self.last_accepted_seq >= self.high_water_seq && !self.has_live_pending()
+    }
+
+    /// Return scalar progress without cloning pending mutation payloads.
+    #[must_use]
+    pub fn provider_snapshot_progress(&self) -> PackageEntityFamilyProgress {
+        let first_pending_seq = self.pending_by_seq.first_key_value().map(|(seq, _)| *seq);
+        let has_stale = first_pending_seq.is_some_and(|seq| seq <= self.last_accepted_seq);
+        let has_exact_next = self
+            .last_accepted_seq
+            .checked_add(1)
+            .is_some_and(|next| first_pending_seq == Some(next));
+        let has_live_pending = self.has_live_pending();
+        let has_releasable_resync = self.converged() && !self.resync.leases.is_empty();
+        PackageEntityFamilyProgress {
+            floor: self.last_accepted_seq,
+            high_water: self.high_water_seq,
+            needed: self.resync.needed,
+            degraded: self.resync.degraded,
+            has_live_pending,
+            has_step_work: has_stale || has_exact_next || has_releasable_resync,
         }
     }
 
@@ -542,6 +635,285 @@ fn validate_mutation_record(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn pending_mutation(seq: u64, id: &str) -> PackageEntityMutation {
+        PackageEntityMutation::Upsert {
+            entity_type: "f".into(),
+            snapshot_seq: seq,
+            id: id.into(),
+            entity: json!({ "id": id }),
+        }
+    }
+
+    fn store_pending_with_lease(
+        state: &mut PackageEntityFamilyState,
+        seq: u64,
+        id: &str,
+        scope_id: u64,
+    ) {
+        state.pending_by_seq.insert(seq, pending_mutation(seq, id));
+        state.store_pending_lease(EntityMutationLease {
+            scope_id,
+            family: "f".into(),
+            seq,
+        });
+        state.high_water_seq = state.high_water_seq.max(seq);
+    }
+
+    #[test]
+    fn provider_snapshot_steps_discard_one_stale_payload_with_its_lease() {
+        let now = Instant::now();
+        let mut state = PackageEntityFamilyState::default();
+        store_pending_with_lease(&mut state, 1, "one", 101);
+        store_pending_with_lease(&mut state, 2, "two", 102);
+        store_pending_with_lease(&mut state, 4, "four", 104);
+
+        let progress = state.begin_provider_snapshot_seq(2, now);
+        assert_eq!(progress.floor, 2);
+        assert_eq!(progress.high_water, 4);
+        assert!(progress.has_live_pending);
+        assert!(progress.has_step_work);
+        assert_eq!(state.pending_by_seq.len(), 3);
+        assert_eq!(state.pending_leases.len(), 3);
+
+        let first = state.step_provider_snapshot(now);
+        assert!(matches!(
+            first,
+            PackageEntityFamilyStep::Discarded {
+                mutation: PackageEntityMutation::Upsert {
+                    snapshot_seq: 1,
+                    ..
+                },
+                lease: Some(EntityMutationLease {
+                    scope_id: 101,
+                    seq: 1,
+                    ..
+                })
+            }
+        ));
+        assert_eq!(state.pending_by_seq.len(), 2);
+        assert!(!state.pending_leases.contains_key(&1));
+
+        let second = state.step_provider_snapshot(now);
+        assert!(matches!(
+            second,
+            PackageEntityFamilyStep::Discarded {
+                mutation: PackageEntityMutation::Upsert {
+                    snapshot_seq: 2,
+                    ..
+                },
+                lease: Some(EntityMutationLease {
+                    scope_id: 102,
+                    seq: 2,
+                    ..
+                })
+            }
+        ));
+        assert_eq!(state.pending_by_seq.len(), 1);
+        assert!(!state.pending_leases.contains_key(&2));
+
+        let PackageEntityFamilyStep::Complete(progress) = state.step_provider_snapshot(now) else {
+            panic!("the gap must stop provider snapshot stepping");
+        };
+        assert_eq!(progress.floor, 2);
+        assert!(progress.needed);
+        assert!(progress.has_live_pending);
+        assert!(!progress.has_step_work);
+        assert!(state.pending_by_seq.contains_key(&4));
+        assert!(state.pending_leases.contains_key(&4));
+    }
+
+    #[test]
+    fn provider_snapshot_steps_move_consecutive_ready_rows_one_at_a_time() {
+        let now = Instant::now();
+        let mut state = PackageEntityFamilyState {
+            last_accepted_seq: 1,
+            high_water_seq: 1,
+            ..Default::default()
+        };
+        store_pending_with_lease(&mut state, 3, "three", 203);
+        store_pending_with_lease(&mut state, 4, "four", 204);
+
+        let progress = state.begin_provider_snapshot_seq(2, now);
+        assert_eq!(progress.floor, 2);
+        assert!(progress.has_step_work);
+
+        let first = state.step_provider_snapshot(now);
+        assert!(matches!(
+            first,
+            PackageEntityFamilyStep::Ready {
+                mutation: PackageEntityMutation::Upsert {
+                    snapshot_seq: 3,
+                    ..
+                },
+                lease: Some(EntityMutationLease {
+                    scope_id: 203,
+                    seq: 3,
+                    ..
+                })
+            }
+        ));
+        assert_eq!(state.last_accepted_seq, 3);
+        assert_eq!(state.pending_by_seq.len(), 1);
+
+        let second = state.step_provider_snapshot(now);
+        assert!(matches!(
+            second,
+            PackageEntityFamilyStep::Ready {
+                mutation: PackageEntityMutation::Upsert {
+                    snapshot_seq: 4,
+                    ..
+                },
+                lease: Some(EntityMutationLease {
+                    scope_id: 204,
+                    seq: 4,
+                    ..
+                })
+            }
+        ));
+        assert_eq!(state.last_accepted_seq, 4);
+        assert!(state.pending_by_seq.is_empty());
+
+        let PackageEntityFamilyStep::Complete(progress) = state.step_provider_snapshot(now) else {
+            panic!("consecutive rows must reach completion");
+        };
+        assert_eq!(progress.floor, 4);
+        assert!(!progress.needed);
+        assert!(!progress.has_live_pending);
+        assert!(!progress.has_step_work);
+    }
+
+    #[test]
+    fn provider_snapshot_begin_never_lowers_floor_during_cleanup() {
+        let now = Instant::now();
+        let mut state = PackageEntityFamilyState::default();
+        store_pending_with_lease(&mut state, 1, "one", 301);
+        store_pending_with_lease(&mut state, 2, "two", 302);
+        store_pending_with_lease(&mut state, 3, "three", 303);
+
+        assert_eq!(state.begin_provider_snapshot_seq(2, now).floor, 2);
+        assert_eq!(state.pending_by_seq.len(), 3);
+        assert_eq!(state.begin_provider_snapshot_seq(1, now).floor, 2);
+        assert_eq!(state.pending_by_seq.len(), 3);
+        assert_eq!(state.begin_provider_snapshot_seq(2, now).floor, 2);
+        assert_eq!(state.pending_by_seq.len(), 3);
+        assert!(matches!(
+            state.step_provider_snapshot(now),
+            PackageEntityFamilyStep::Discarded {
+                mutation: PackageEntityMutation::Upsert {
+                    snapshot_seq: 1,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let progress = state.begin_provider_snapshot_seq(3, now);
+        assert_eq!(progress.floor, 3);
+        assert_eq!(progress.high_water, 3);
+        for expected in [2, 3] {
+            assert!(matches!(
+                state.step_provider_snapshot(now),
+                PackageEntityFamilyStep::Discarded {
+                    mutation: PackageEntityMutation::Upsert { snapshot_seq, .. },
+                    ..
+                } if snapshot_seq == expected
+            ));
+        }
+        assert!(matches!(
+            state.step_provider_snapshot(now),
+            PackageEntityFamilyStep::Complete(PackageEntityFamilyProgress {
+                floor: 3,
+                has_step_work: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn converged_provider_snapshot_releases_one_resync_lease_per_step() {
+        let now = Instant::now();
+        let mut state = PackageEntityFamilyState {
+            last_accepted_seq: 5,
+            high_water_seq: 5,
+            ..Default::default()
+        };
+        state.resync.rearm(now);
+        assert!(state.remember_resync_lease(401, "f".into()));
+        assert!(state.remember_resync_lease(402, "f".into()));
+
+        let progress = state.begin_provider_snapshot_seq(5, now);
+        assert!(!progress.needed);
+        assert!(progress.has_step_work);
+        assert_eq!(
+            state.step_provider_snapshot(now),
+            PackageEntityFamilyStep::ReleaseResync {
+                scope_id: 401,
+                family: "f".into()
+            }
+        );
+        assert_eq!(state.resync.leases.len(), 1);
+        assert_eq!(
+            state.step_provider_snapshot(now),
+            PackageEntityFamilyStep::ReleaseResync {
+                scope_id: 402,
+                family: "f".into()
+            }
+        );
+        assert!(state.resync.leases.is_empty());
+        assert!(matches!(
+            state.step_provider_snapshot(now),
+            PackageEntityFamilyStep::Complete(PackageEntityFamilyProgress {
+                has_step_work: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_snapshot_sequence_arithmetic_handles_u64_boundary() {
+        let now = Instant::now();
+        let mut state = PackageEntityFamilyState {
+            last_accepted_seq: u64::MAX - 1,
+            high_water_seq: u64::MAX - 1,
+            ..Default::default()
+        };
+        store_pending_with_lease(&mut state, u64::MAX, "max", 501);
+
+        let progress = state.begin_provider_snapshot_seq(u64::MAX - 1, now);
+        assert!(progress.has_step_work);
+        assert!(matches!(
+            state.step_provider_snapshot(now),
+            PackageEntityFamilyStep::Ready {
+                mutation: PackageEntityMutation::Upsert {
+                    snapshot_seq: u64::MAX,
+                    ..
+                },
+                lease: Some(EntityMutationLease {
+                    scope_id: 501,
+                    seq: u64::MAX,
+                    ..
+                })
+            }
+        ));
+        assert_eq!(state.last_accepted_seq, u64::MAX);
+        assert!(matches!(
+            state.step_provider_snapshot(now),
+            PackageEntityFamilyStep::Complete(PackageEntityFamilyProgress {
+                floor: u64::MAX,
+                has_step_work: false,
+                ..
+            })
+        ));
+
+        let (duplicate, ready) = state.admit(pending_mutation(u64::MAX, "duplicate"), now);
+        assert_eq!(
+            duplicate.status,
+            PackageEntityPublishStatus::DuplicateSequence
+        );
+        assert!(ready.is_empty());
+        assert_eq!(state.begin_provider_snapshot_seq(0, now).floor, u64::MAX);
+    }
 
     #[test]
     fn coerce_empty_items_object_to_array_only() {
