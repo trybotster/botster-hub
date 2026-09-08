@@ -23,7 +23,7 @@ use crate::daemon::control::pending::ControlStep;
 use crate::daemon::control::{DaemonObservability, request_id};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
-use crate::persistence::{FileHubStateStore, HubStateStore};
+use crate::persistence::FileHubStateStore;
 use crate::{HubClientRequest, HubClientResponseBody};
 
 pub(crate) enum SessionTypeCatalogBuild {
@@ -65,8 +65,24 @@ fn build_session_type_catalog(
     logical_byte_limit: Option<usize>,
 ) -> DaemonTransportResult<SessionTypeCatalogBuild> {
     let records = packages.packages();
-    let session_types =
-        crate::session_types::list_session_types(&records, state).map_err(|error| {
+    let session_types = if let Some(limit) = logical_byte_limit {
+        let Some((rows, input_bytes)) = crate::session_types::list_session_types_bounded(
+            &records, state, limit,
+        )
+        .map_err(|error| {
+            DaemonTransportError::Client(crate::HubClientError::SessionType {
+                request_id: request_id("daemon-session-types-list"),
+                operation: crate::HubClientOperation::ListSessionTypes,
+                kind: error.kind,
+                message: error.message,
+            })
+        })?
+        else {
+            return Ok(SessionTypeCatalogBuild::TooLarge);
+        };
+        (rows, input_bytes)
+    } else {
+        let rows = crate::session_types::list_session_types(&records, state).map_err(|error| {
             DaemonTransportError::Client(crate::HubClientError::SessionType {
                 request_id: request_id("daemon-session-types-list"),
                 operation: crate::HubClientOperation::ListSessionTypes,
@@ -74,9 +90,13 @@ fn build_session_type_catalog(
                 message: error.message,
             })
         })?;
+        (rows, 0)
+    };
     let mut entities = BTreeMap::new();
     let mut logical_bytes = 0_usize;
+    let mut operation_bytes = session_types.1;
     for session_type in session_types
+        .0
         .into_iter()
         .map(daemon_session_type_from_client)
     {
@@ -85,6 +105,7 @@ fn build_session_type_catalog(
         if !retain_catalog_entity(
             &mut entities,
             &mut logical_bytes,
+            &mut operation_bytes,
             id,
             value,
             logical_byte_limit,
@@ -101,6 +122,7 @@ fn build_session_type_catalog(
 fn retain_catalog_entity(
     entities: &mut BTreeMap<String, Value>,
     logical_bytes: &mut usize,
+    operation_bytes: &mut usize,
     id: String,
     value: Value,
     logical_byte_limit: Option<usize>,
@@ -118,7 +140,17 @@ fn retain_catalog_entity(
         if next_bytes > limit {
             return Ok(false);
         }
+        let Some(next_operation_bytes) = operation_bytes
+            .checked_add(id.len())
+            .and_then(|bytes| bytes.checked_add(encoded_bytes))
+        else {
+            return Ok(false);
+        };
+        if next_operation_bytes > limit {
+            return Ok(false);
+        }
         *logical_bytes = next_bytes;
+        *operation_bytes = next_operation_bytes;
     }
     entities.insert(id, value);
     Ok(true)
@@ -132,10 +164,12 @@ mod catalog_tests {
     fn bounded_catalog_construction_stops_before_retaining_an_oversized_row() {
         let mut entities = BTreeMap::new();
         let mut logical_bytes = 0;
+        let mut operation_bytes = 0;
         assert!(
             retain_catalog_entity(
                 &mut entities,
                 &mut logical_bytes,
+                &mut operation_bytes,
                 "first".to_string(),
                 serde_json::json!({ "value": "small" }),
                 Some(64),
@@ -147,6 +181,7 @@ mod catalog_tests {
             !retain_catalog_entity(
                 &mut entities,
                 &mut logical_bytes,
+                &mut operation_bytes,
                 "second".to_string(),
                 Value::String("x".repeat(64)),
                 Some(64),
@@ -243,7 +278,7 @@ pub(crate) fn force_advance_session_type_generation(
         .ok_or(DaemonTransportError::DaemonNotRunning)?;
     let config = runtime.config().clone();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
-    let state = store.update(&config, |state| {
+    let state = store.update_shared(&config, &runtime.shared_view_budget(), |state| {
         state.session_type_generation = state.session_type_generation.saturating_add(1);
     })?;
     daemon.replace_state(state);

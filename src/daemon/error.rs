@@ -253,11 +253,24 @@ pub(crate) fn daemon_plugin_tool_error(error: crate::McpToolError) -> DaemonResp
 pub(crate) fn daemon_operator_error_from_state(
     error: crate::HubStateStoreError,
 ) -> DaemonOperatorError {
+    let (code, message) = match error {
+        crate::HubStateStoreError::ViewCapacity {
+            requested,
+            available,
+        } => (
+            "shared_view_capacity_exhausted",
+            format!("shared view needs {requested} logical bytes but only {available} remain"),
+        ),
+        error => (
+            "hub_state_error",
+            format!("failed to persist package registry: {error}"),
+        ),
+    };
     DaemonOperatorError {
-        code: "hub_state_error".to_string(),
+        code: code.to_string(),
         request_id: "daemon-package-mutation".to_string(),
         operation: "persist_package_registry".to_string(),
-        message: format!("failed to persist package registry: {error}"),
+        message,
         diagnostics: Vec::new(),
     }
 }

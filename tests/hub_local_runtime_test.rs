@@ -46,18 +46,20 @@ fn run_local_runtime() {
     assert!(startup_status.core_initialized);
     assert!(store.path().exists());
 
+    let mut package_registry = daemon.package_registry().clone();
     let installed_name = {
-        let record = daemon
-            .package_registry_mut()
+        let record = package_registry
             .install_local_path(&package_dir, "runtime install local synthetic package")
             .expect("install synthetic local package");
         record.manifest.name.clone()
     };
     assert_eq!(installed_name, RUNTIME_PACKAGE);
-    daemon
-        .package_registry_mut()
+    package_registry
         .enable(RUNTIME_PACKAGE, "runtime enable synthetic package")
         .expect("enable synthetic local package");
+    daemon
+        .replace_package_registry(package_registry)
+        .expect("replacement package registry fits");
     persist_package_registry(&daemon);
 
     let packages = daemon.package_registry().clone();

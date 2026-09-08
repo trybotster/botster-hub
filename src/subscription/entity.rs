@@ -163,6 +163,7 @@ pub(crate) struct SessionTypeCatalogCache {
     entities: BTreeMap<String, Value>,
     /// Logical encoded bytes retained by `entities` after its host permit releases.
     logical_bytes: usize,
+    prepared_charge: Option<crate::host_executor::HostPreparedCharge>,
     pending: Option<(HostJobIdentity, u64)>,
     requested_generation: Option<u64>,
     waiting_for_capacity: bool,
@@ -207,6 +208,7 @@ impl SessionTypeCatalogCache {
             self.generation = None;
             self.entities.clear();
             self.logical_bytes = 0;
+            self.prepared_charge = None;
             self.failure = Some((
                 generation,
                 HostError {
@@ -246,6 +248,7 @@ impl SessionTypeCatalogCache {
             self.generation = None;
             self.entities.clear();
             self.logical_bytes = 0;
+            self.prepared_charge = None;
             let (code, message) = match error {
                 HostSubmitError::Full => (
                     "host_executor_full",
@@ -280,7 +283,7 @@ impl SessionTypeCatalogCache {
             return false;
         }
         self.pending = None;
-        let result = completion.release();
+        let (result, prepared_charge) = completion.release();
         let desired_generation = self.requested_generation.unwrap_or(expected_generation);
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
@@ -298,6 +301,7 @@ impl SessionTypeCatalogCache {
                 self.generation = Some(generation);
                 self.entities = entities;
                 self.logical_bytes = logical_bytes;
+                self.prepared_charge = Some(prepared_charge);
                 self.failure = None;
             }
             HostResult::Failed { generation, error } => {
@@ -305,6 +309,7 @@ impl SessionTypeCatalogCache {
                 self.generation = None;
                 self.entities.clear();
                 self.logical_bytes = 0;
+                self.prepared_charge = None;
                 self.failure = Some((generation, error));
             }
         }
@@ -322,6 +327,7 @@ impl SessionTypeCatalogCache {
         self.generation = None;
         self.entities.clear();
         self.logical_bytes = 0;
+        self.prepared_charge = None;
         self.failure = Some((
             generation,
             HostError::new(

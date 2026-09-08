@@ -23,8 +23,9 @@ use crate::entrypoint_supervisor::EntrypointSupervisor;
 use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
 };
-use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
+use crate::persistence::{FileHubStateStore, HubState, HubStateStoreError};
 use crate::runtime::{HubRuntime, HubRuntimeError, SharedHubState};
+use crate::shared_view::SharedView;
 use crate::transport::webrtc::LocalWebrtcTransport;
 
 /// Local daemon lifecycle state.
@@ -83,7 +84,7 @@ pub struct HubDaemon {
     config: HubConfig,
     state: SharedHubState,
     state_source: HubStateLoadSource,
-    package_registry: Arc<PackageRegistry>,
+    package_registry: SharedView<PackageRegistry>,
     entrypoint_supervisor: EntrypointSupervisor,
     local_webrtc: LocalWebrtcTransport,
     runtime: Option<HubRuntime>,
@@ -106,12 +107,14 @@ impl HubDaemon {
         let package_registry = PackageRegistry::from_snapshot(state.package_registry.clone())?;
         let (package_registry, decisions) = package_registry
             .refreshed_local_packages("daemon startup refresh local package registrations")?;
+        let package_registry =
+            reserve_package_registry(&runtime.shared_view_budget(), package_registry)?;
         if !decisions.is_empty() {
             let snapshot = package_registry.snapshot();
-            state = Arc::new(store.update(&config, |state| {
+            state = store.update_shared(&config, &runtime.shared_view_budget(), |state| {
                 state.package_registry = snapshot;
-            })?);
-            runtime.replace_state(Arc::clone(&state));
+            })?;
+            runtime.publish_state_view(state.clone());
         }
         load_enabled_local_plugins(&mut runtime, &package_registry)?;
 
@@ -120,7 +123,7 @@ impl HubDaemon {
             config,
             state,
             state_source,
-            package_registry: Arc::new(package_registry),
+            package_registry,
             entrypoint_supervisor: EntrypointSupervisor::default(),
             local_webrtc: LocalWebrtcTransport::default(),
             runtime: Some(runtime),
@@ -141,21 +144,21 @@ impl HubDaemon {
     }
 
     /// Publish durable hub state after an owner-thread mutation.
-    pub fn replace_state(&mut self, state: HubState) {
-        self.publish_state(Arc::new(state));
-    }
-
     /// Publish one shared state allocation to the daemon and runtime views.
-    pub(crate) fn publish_state(&mut self, state: Arc<HubState>) {
+    pub(crate) fn publish_state(&mut self, state: SharedView<HubState>) {
         if let Some(runtime) = self.runtime.as_mut() {
-            runtime.replace_state(state);
+            runtime.publish_state_view(state);
         } else {
             self.state.publish(state);
         }
     }
 
+    pub(crate) fn replace_state(&mut self, state: SharedView<HubState>) {
+        self.publish_state(state);
+    }
+
     /// Return the current shared state allocation and its owner revision.
-    pub(crate) fn state_view(&self) -> (u64, Arc<HubState>) {
+    pub(crate) fn state_view(&self) -> (u64, SharedView<HubState>) {
         self.state.snapshot()
     }
 
@@ -165,19 +168,47 @@ impl HubDaemon {
         self.package_registry.as_ref()
     }
 
-    /// Return the mutable package registry restored for this daemon lifecycle.
-    pub fn package_registry_mut(&mut self) -> &mut PackageRegistry {
-        Arc::make_mut(&mut self.package_registry)
+    /// Replace the in-memory package registry after reserving its shared-view charge.
+    pub fn replace_package_registry(
+        &mut self,
+        package_registry: PackageRegistry,
+    ) -> Result<(), HubStateStoreError> {
+        let package_registry = self.prepare_package_registry(package_registry)?;
+        self.publish_package_registry_view(package_registry);
+        Ok(())
     }
 
-    /// Replace the daemon-owned package registry after a durable commit.
-    pub fn replace_package_registry(&mut self, package_registry: PackageRegistry) {
-        self.package_registry = Arc::new(package_registry);
+    /// Publish a package view that was reserved before its durable commit.
+    pub(crate) fn publish_package_registry_view(
+        &mut self,
+        package_registry: SharedView<PackageRegistry>,
+    ) {
+        self.package_registry = package_registry;
+    }
+
+    pub(crate) fn prepare_package_registry(
+        &self,
+        package_registry: PackageRegistry,
+    ) -> Result<SharedView<PackageRegistry>, HubStateStoreError> {
+        reserve_package_registry(&self.state.budget(), package_registry)
+    }
+
+    pub(crate) fn prepare_package_registry_with_charge(
+        &self,
+        package_registry: PackageRegistry,
+        logical_bytes: usize,
+    ) -> Result<SharedView<PackageRegistry>, HubStateStoreError> {
+        SharedView::try_new(&self.state.budget(), package_registry, logical_bytes).map_err(
+            |error| HubStateStoreError::ViewCapacity {
+                requested: error.requested,
+                available: error.available,
+            },
+        )
     }
 
     /// Return one shared package-registry input for off-owner reads.
-    pub(crate) fn package_registry_view(&self) -> Arc<PackageRegistry> {
-        Arc::clone(&self.package_registry)
+    pub(crate) fn package_registry_view(&self) -> SharedView<PackageRegistry> {
+        self.package_registry.clone()
     }
 
     /// Return the local package entrypoint supervisor.
@@ -271,6 +302,21 @@ pub(crate) fn load_enabled_local_plugins(
         }
     }
     Ok(())
+}
+
+fn reserve_package_registry(
+    budget: &Arc<crate::shared_view::SharedViewBudget>,
+    package_registry: PackageRegistry,
+) -> Result<SharedView<PackageRegistry>, HubStateStoreError> {
+    let logical_bytes = serde_json::to_vec_pretty(&package_registry.snapshot())
+        .map_err(HubStateStoreError::Serialize)?
+        .len();
+    SharedView::try_new(budget, package_registry, logical_bytes).map_err(|error| {
+        HubStateStoreError::ViewCapacity {
+            requested: error.requested,
+            available: error.available,
+        }
+    })
 }
 
 /// Typed daemon startup errors.
@@ -417,12 +463,16 @@ mod tests {
         let (initial_revision, initial) = daemon.state_view();
         let runtime_initial = daemon.runtime().expect("runtime").state();
         assert_eq!(initial_revision, 0);
-        assert!(Arc::ptr_eq(&initial, &runtime_initial));
+        assert!(SharedView::ptr_eq(&initial, &runtime_initial));
 
-        let mut next = initial.as_ref().clone();
+        let mut next = (*initial).clone();
         next.session_type_generation = 1;
-        let next = Arc::new(next);
-        daemon.publish_state(Arc::clone(&next));
+        let next = daemon
+            .runtime()
+            .expect("runtime")
+            .prepare_state(next)
+            .expect("next view fits");
+        daemon.publish_state(next.clone());
 
         let (published_revision, published) = daemon.state_view();
         let runtime = daemon.runtime().expect("runtime");
@@ -431,17 +481,42 @@ mod tests {
         let worktrees = runtime.worktrees();
         let plugin_published = spawn_targets.snapshot().1;
         assert_eq!(published_revision, 1);
-        assert!(Arc::ptr_eq(&next, &published));
-        assert!(Arc::ptr_eq(&published, &runtime_published));
-        assert!(Arc::ptr_eq(&published, &plugin_published));
+        assert!(SharedView::ptr_eq(&next, &published));
+        assert!(SharedView::ptr_eq(&published, &runtime_published));
+        assert!(SharedView::ptr_eq(&published, &plugin_published));
         assert!(Arc::ptr_eq(&spawn_targets, &worktrees));
-        assert!(!Arc::ptr_eq(&initial, &published));
+        assert!(!SharedView::ptr_eq(&initial, &published));
 
-        let mut final_state = published.as_ref().clone();
+        let mut final_state = (*published).clone();
         final_state.session_type_generation = 2;
-        daemon.publish_state(Arc::new(final_state));
+        let final_state = daemon
+            .runtime()
+            .expect("runtime")
+            .prepare_state(final_state)
+            .expect("final view fits");
+        daemon.publish_state(final_state);
         let (final_revision, _) = daemon.state_view();
         assert_eq!(final_revision, 2);
+    }
+
+    #[test]
+    fn state_and_package_registry_use_separate_charges_in_one_pool() {
+        let daemon = HubDaemon::start(shared_state_config()).expect("start daemon");
+        let runtime = daemon.runtime().expect("runtime");
+        let state = runtime.state();
+        let state_bytes = serde_json::to_vec_pretty(&*state)
+            .expect("serialize state")
+            .len();
+        let package_bytes = serde_json::to_vec_pretty(&daemon.package_registry().snapshot())
+            .expect("serialize package registry")
+            .len();
+        let budget = runtime.shared_view_budget();
+
+        assert_eq!(budget.used(), state_bytes + package_bytes);
+        let package_lease = daemon.package_registry_view();
+        assert_eq!(budget.used(), state_bytes + package_bytes);
+        drop(package_lease);
+        assert_eq!(budget.used(), state_bytes + package_bytes);
     }
 
     #[test]
@@ -477,8 +552,8 @@ mod tests {
         let (revision, after) = daemon.state_view();
         assert_eq!(revision, 1);
         assert_eq!(after.session_type_generation, 1);
-        assert!(!Arc::ptr_eq(&before, &after));
-        assert!(Arc::ptr_eq(
+        assert!(!SharedView::ptr_eq(&before, &after));
+        assert!(SharedView::ptr_eq(
             &after,
             &daemon.runtime().expect("runtime").state()
         ));

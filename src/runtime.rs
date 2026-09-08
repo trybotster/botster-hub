@@ -74,11 +74,48 @@ use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateSto
 use crate::session_types::{
     EnsuredManagedWorktree, HubSessionContext, HubSessionType, ManagedSessionTypeRequest,
     SessionTypeError, SessionTypeMutation, SessionTypeMutationSource, SessionTypeRequest,
-    list_session_types_for_target, materialize_managed_session_type, materialize_session_type,
-    mutate_session_type, show_session_type_for_target,
+    commit_repo_session_type_mutation, list_session_types_for_target,
+    materialize_managed_session_type, materialize_session_type, prepare_session_type_mutation,
+    show_session_type_for_target,
 };
+use crate::shared_view::{SharedView, SharedViewBudget};
 #[cfg(test)]
 use crate::spawn_targets::SpawnTarget;
+
+/// Allocation-owned immutable durable state view.
+pub type HubStateView = SharedView<HubState>;
+
+fn session_type_state_write_error(error: HubStateStoreError) -> SessionTypeError {
+    match error {
+        HubStateStoreError::ViewCapacity {
+            requested,
+            available,
+        } => SessionTypeError::new(
+            "shared_view_capacity_exhausted",
+            format!(
+                "session type state needs {requested} logical bytes but only {available} remain"
+            ),
+        ),
+        _ => SessionTypeError::new(
+            "session_type_state_write_failed",
+            "session type state could not be persisted",
+        ),
+    }
+}
+
+fn managed_git_state_write_error(
+    error: HubStateStoreError,
+    fallback_code: &'static str,
+    fallback: &str,
+) -> ManagedGitError {
+    match error {
+        HubStateStoreError::ViewCapacity { .. } => ManagedGitError::new(
+            "shared_view_capacity_exhausted",
+            "managed worktree state exceeds shared-view capacity",
+        ),
+        _ => ManagedGitError::new(fallback_code, fallback),
+    }
+}
 
 /// Hub-owned adapter and policy facade over the default local core engine.
 ///
@@ -158,39 +195,66 @@ const SOURCE_HELD_MAX: usize = 2;
 pub type SharedSessionTypeSpawner = Arc<HubSessionTypeSpawner>;
 struct PublishedHubState {
     revision: u64,
-    state: Arc<HubState>,
+    state: SharedView<HubState>,
 }
 
 /// One versioned durable state view shared by every runtime and daemon reader.
 pub struct HubStatePublication(RwLock<PublishedHubState>);
 
 impl HubStatePublication {
-    fn new(state: HubState) -> Self {
-        Self(RwLock::new(PublishedHubState {
-            revision: 0,
-            state: Arc::new(state),
-        }))
+    fn new(state: HubState) -> Result<Self, HubStateStoreError> {
+        let budget = SharedViewBudget::new();
+        let logical_bytes = serde_json::to_vec_pretty(&state)
+            .map_err(HubStateStoreError::Serialize)?
+            .len();
+        let state = SharedView::try_new(&budget, state, logical_bytes).map_err(|error| {
+            HubStateStoreError::ViewCapacity {
+                requested: error.requested,
+                available: error.available,
+            }
+        })?;
+        Ok(Self(RwLock::new(PublishedHubState { revision: 0, state })))
     }
 
-    pub(crate) fn snapshot(&self) -> (u64, Arc<HubState>) {
+    pub(crate) fn snapshot(&self) -> (u64, SharedView<HubState>) {
         let published = self.0.read().expect("hub state lock");
-        (published.revision, Arc::clone(&published.state))
+        (published.revision, published.state.clone())
     }
 
-    pub(crate) fn try_snapshot(&self) -> Result<(u64, Arc<HubState>), ()> {
+    pub(crate) fn try_snapshot(&self) -> Result<(u64, SharedView<HubState>), ()> {
         self.0
             .read()
-            .map(|published| (published.revision, Arc::clone(&published.state)))
+            .map(|published| (published.revision, published.state.clone()))
             .map_err(|_| ())
     }
 
-    pub(crate) fn publish(&self, state: Arc<HubState>) {
+    pub(crate) fn publish(&self, state: SharedView<HubState>) {
         let mut published = self.0.write().expect("hub state lock");
         published.revision = published
             .revision
             .checked_add(1)
             .expect("hub state revision exhausted");
         published.state = state;
+    }
+
+    pub(crate) fn budget(&self) -> Arc<SharedViewBudget> {
+        let published = self.0.read().expect("hub state lock");
+        published.state.budget()
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        state: HubState,
+    ) -> Result<SharedView<HubState>, HubStateStoreError> {
+        let logical_bytes = serde_json::to_vec_pretty(&state)
+            .map_err(HubStateStoreError::Serialize)?
+            .len();
+        SharedView::try_new(&self.budget(), state, logical_bytes).map_err(|error| {
+            HubStateStoreError::ViewCapacity {
+                requested: error.requested,
+                available: error.available,
+            }
+        })
     }
 }
 
@@ -336,7 +400,7 @@ impl HubRuntime {
     /// Returns an error when the plugin database cannot be opened.
     pub fn new(config: HubConfig) -> HubRuntimeResult<Self> {
         let state = HubState::from_config(&config);
-        let state = Arc::new(HubStatePublication::new(state));
+        let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let (close_work, data_plane, core_daemon, core_completions) = start_data_plane(core_config);
@@ -445,7 +509,7 @@ impl HubRuntime {
     }
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
-        let state = Arc::new(HubStatePublication::new(state));
+        let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let (close_work, data_plane, core_daemon, core_completions) = start_data_plane(core_config);
@@ -546,7 +610,7 @@ impl HubRuntime {
     }
 
     /// Return the durable hub state loaded for this runtime.
-    pub fn state(&self) -> Arc<HubState> {
+    pub fn state(&self) -> HubStateView {
         self.state.snapshot().1
     }
 
@@ -556,9 +620,26 @@ impl HubRuntime {
     }
 
     /// Publish durable hub state after an owner-thread mutation.
-    pub fn replace_state(&self, state: impl Into<Arc<HubState>>) {
-        let state = state.into();
+    pub(crate) fn publish_state_view(&self, state: SharedView<HubState>) {
         self.state.publish(state);
+    }
+
+    /// Replace the in-memory state after reserving its shared-view charge.
+    pub fn replace_state(&self, state: HubState) -> Result<(), HubStateStoreError> {
+        let state = self.prepare_state(state)?;
+        self.publish_state_view(state);
+        Ok(())
+    }
+
+    pub(crate) fn shared_view_budget(&self) -> Arc<SharedViewBudget> {
+        self.state.budget()
+    }
+
+    pub(crate) fn prepare_state(
+        &self,
+        state: HubState,
+    ) -> Result<SharedView<HubState>, HubStateStoreError> {
+        self.state.prepare(state)
     }
 
     /// Apply and persist one Hub-authorized session type mutation.
@@ -567,25 +648,21 @@ impl HubRuntime {
         source: SessionTypeMutationSource,
         mutation: SessionTypeMutation,
     ) -> Result<HubState, SessionTypeError> {
-        let mut mutation_result = None;
-        let next = FileHubStateStore::for_data_directory(&self.config.data_directory)
-            .update(&self.config, |state| {
-                let result =
-                    mutate_session_type(&self.config, state, source.clone(), mutation.clone());
-                if let Ok(next) = &result {
-                    *state = next.clone();
-                }
-                mutation_result = Some(result);
-            })
-            .map_err(|_| {
-                SessionTypeError::new(
-                    "session_type_state_write_failed",
-                    "session type state could not be persisted",
-                )
-            })?;
-        mutation_result.expect("state update closure always records a mutation result")?;
-        self.replace_state(next.clone());
-        Ok(next)
+        let store = FileHubStateStore::for_data_directory(&self.config.data_directory);
+        let current = store
+            .load_for_update(&self.config)
+            .map_err(session_type_state_write_error)?;
+        let prepared = prepare_session_type_mutation(&self.config, &current, source, mutation)?;
+        let (next, repo_write) = prepared.into_parts();
+        let prepared_state = store
+            .prepare_shared(next, &self.shared_view_budget())
+            .map_err(session_type_state_write_error)?;
+        commit_repo_session_type_mutation(repo_write)?;
+        let next = store
+            .commit_shared(prepared_state)
+            .map_err(session_type_state_write_error)?;
+        self.publish_state_view(next.clone());
+        Ok((*next).clone())
     }
 
     /// Return the shared spawn-target projection used by Lua helpers.
@@ -2233,7 +2310,7 @@ impl HubRuntime {
         let current_state = self.state().clone();
         let mut conflict = None;
         let state = store
-            .update(&config, |state| {
+            .update_shared(&config, &self.shared_view_budget(), |state| {
                 state.spawn_targets = current_state.spawn_targets.clone();
                 state.device_session_type_sources =
                     current_state.device_session_type_sources.clone();
@@ -2257,8 +2334,9 @@ impl HubRuntime {
                     state.worktrees.push(row.clone());
                 }
             })
-            .map_err(|_| {
-                ManagedGitError::new(
+            .map_err(|error| {
+                managed_git_state_write_error(
+                    error,
                     "persistence_failed",
                     "managed worktree state could not be persisted",
                 )
@@ -2266,7 +2344,7 @@ impl HubRuntime {
         if let Some(conflict) = conflict {
             return Err(conflict);
         }
-        self.replace_state(state);
+        self.publish_state_view(state);
         Ok(())
     }
 
@@ -2274,18 +2352,19 @@ impl HubRuntime {
         let config = self.config.clone();
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let state = store
-            .update(&config, |state| {
+            .update_shared(&config, &self.shared_view_budget(), |state| {
                 state.worktrees.retain(|worktree| {
                     worktree.worktree_id != worktree_id || worktree.management != "hub_managed_git"
                 });
             })
-            .map_err(|_| {
-                ManagedGitError::new(
+            .map_err(|error| {
+                managed_git_state_write_error(
+                    error,
                     "reconciliation_failed",
                     "managed worktree rollback state could not be persisted",
                 )
             })?;
-        self.replace_state(state);
+        self.publish_state_view(state);
         Ok(())
     }
 

@@ -13,10 +13,13 @@ use crate::daemon::control::session_types::{
 };
 use crate::packages::PackageRegistry;
 use crate::persistence::HubState;
+use crate::shared_view::SharedView;
 
 pub(crate) const HOST_WORKER_COUNT: usize = 2;
 pub(crate) const HOST_OPERATION_CAPACITY: usize = 8;
 pub(crate) const HOST_PREPARED_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
+pub(crate) const HOST_PREPARED_AGGREGATE_BYTE_CAPACITY: usize =
+    HOST_OPERATION_CAPACITY * HOST_PREPARED_BYTE_CAPACITY;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct WaiterId(u64);
@@ -57,8 +60,8 @@ impl HostError {
 pub(crate) enum HostCommand {
     BuildSessionTypeCatalog {
         generation: u64,
-        packages: Arc<PackageRegistry>,
-        state: Arc<HubState>,
+        packages: SharedView<PackageRegistry>,
+        state: SharedView<HubState>,
     },
     #[cfg(test)]
     Panic { generation: u64 },
@@ -122,6 +125,16 @@ pub(crate) enum HostResult {
     },
 }
 
+impl HostResult {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::SessionTypeCatalogReady { generation, .. } | Self::Failed { generation, .. } => {
+                *generation
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct HostCompletion {
     pub(crate) identity: HostJobIdentity,
@@ -130,10 +143,30 @@ pub(crate) struct HostCompletion {
 }
 
 impl HostCompletion {
-    pub(crate) fn release(self) -> HostResult {
-        let Self { result, permit, .. } = self;
-        drop(permit);
-        result
+    pub(crate) fn release(self) -> (HostResult, HostPreparedCharge) {
+        let Self {
+            mut result, permit, ..
+        } = self;
+        let logical_bytes = match &result {
+            HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
+            HostResult::Failed { .. } => 0,
+        };
+        if logical_bytes > HOST_PREPARED_BYTE_CAPACITY {
+            let generation = result.generation();
+            result = HostResult::Failed {
+                generation,
+                error: HostError::new(
+                    "host_result_too_large",
+                    "host result exceeds its prepared-byte reservation",
+                ),
+            };
+        }
+        let logical_bytes = match &result {
+            HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
+            HostResult::Failed { .. } => 0,
+        };
+        let charge = permit.into_prepared_charge(logical_bytes);
+        (result, charge)
     }
 
     #[cfg(test)]
@@ -223,8 +256,74 @@ struct HostPermitPool {
 }
 
 #[derive(Debug)]
+struct HostPreparedPool {
+    used: AtomicUsize,
+    wake: Arc<HostWake>,
+}
+
+#[derive(Debug)]
+struct HostPreparedReservation {
+    pool: Arc<HostPreparedPool>,
+    logical_bytes: usize,
+}
+
+impl HostPreparedReservation {
+    fn into_charge(mut self, logical_bytes: usize) -> HostPreparedCharge {
+        debug_assert!(logical_bytes <= self.logical_bytes);
+        let released = self.logical_bytes.saturating_sub(logical_bytes);
+        if released > 0 {
+            self.pool.used.fetch_sub(released, Ordering::AcqRel);
+        }
+        self.logical_bytes = 0;
+        HostPreparedCharge {
+            pool: Arc::clone(&self.pool),
+            logical_bytes,
+        }
+    }
+}
+
+impl Drop for HostPreparedReservation {
+    fn drop(&mut self) {
+        if self.logical_bytes > 0 {
+            self.pool
+                .used
+                .fetch_sub(self.logical_bytes, Ordering::AcqRel);
+            self.pool.wake.publish_capacity();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct HostPreparedCharge {
+    pool: Arc<HostPreparedPool>,
+    logical_bytes: usize,
+}
+
+impl Drop for HostPreparedCharge {
+    fn drop(&mut self) {
+        if self.logical_bytes > 0 {
+            self.pool
+                .used
+                .fetch_sub(self.logical_bytes, Ordering::AcqRel);
+            self.pool.wake.publish_capacity();
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct HostWorkPermit {
     pool: Arc<HostPermitPool>,
+    prepared: Option<HostPreparedReservation>,
+}
+
+impl HostWorkPermit {
+    fn into_prepared_charge(mut self, logical_bytes: usize) -> HostPreparedCharge {
+        let reservation = self
+            .prepared
+            .take()
+            .expect("host work permit owns a prepared-byte reservation");
+        reservation.into_charge(logical_bytes)
+    }
 }
 
 impl Drop for HostWorkPermit {
@@ -239,6 +338,7 @@ pub(crate) struct HostExecutor {
     jobs: Option<mpsc::SyncSender<HostJob>>,
     completions: Arc<Mutex<mpsc::Receiver<HostCompletion>>>,
     permits: Arc<HostPermitPool>,
+    prepared: Arc<HostPreparedPool>,
     wake: Arc<HostWake>,
     stopping: Arc<AtomicBool>,
     workers: Vec<thread::JoinHandle<()>>,
@@ -269,6 +369,10 @@ impl HostExecutor {
             outstanding: AtomicUsize::new(0),
             wake: Arc::clone(&wake),
         });
+        let prepared = Arc::new(HostPreparedPool {
+            used: AtomicUsize::new(0),
+            wake: Arc::clone(&wake),
+        });
         let stopping = Arc::new(AtomicBool::new(false));
         let workers = (0..HOST_WORKER_COUNT)
             .map(|index| {
@@ -286,6 +390,7 @@ impl HostExecutor {
             jobs: Some(jobs_tx),
             completions,
             permits,
+            prepared,
             wake,
             stopping,
             workers,
@@ -309,8 +414,33 @@ impl HostExecutor {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    let mut prepared_used = self.prepared.used.load(Ordering::Acquire);
+                    loop {
+                        let Some(next) = prepared_used.checked_add(HOST_PREPARED_BYTE_CAPACITY)
+                        else {
+                            self.permits.outstanding.fetch_sub(1, Ordering::AcqRel);
+                            return None;
+                        };
+                        if next > HOST_PREPARED_AGGREGATE_BYTE_CAPACITY {
+                            self.permits.outstanding.fetch_sub(1, Ordering::AcqRel);
+                            return None;
+                        }
+                        match self.prepared.used.compare_exchange_weak(
+                            prepared_used,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => break,
+                            Err(observed) => prepared_used = observed,
+                        }
+                    }
                     return Some(HostWorkPermit {
                         pool: Arc::clone(&self.permits),
+                        prepared: Some(HostPreparedReservation {
+                            pool: Arc::clone(&self.prepared),
+                            logical_bytes: HOST_PREPARED_BYTE_CAPACITY,
+                        }),
                     });
                 }
                 Err(observed) => outstanding = observed,
@@ -521,16 +651,23 @@ mod tests {
     use crate::persistence::HubState;
     use std::path::PathBuf;
 
-    fn empty_catalog_inputs() -> (Arc<PackageRegistry>, Arc<HubState>) {
+    fn empty_catalog_inputs() -> (SharedView<PackageRegistry>, SharedView<HubState>) {
         let config = HubStartupOptions {
             data_directory: DataDirectoryOption::Explicit(PathBuf::from("host-executor-test")),
             ..HubStartupOptions::default()
         }
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .expect("build host executor test config");
+        let budget = crate::shared_view::SharedViewBudget::new();
         (
-            Arc::new(PackageRegistry::new(botster_core::CapabilitySet::new())),
-            Arc::new(HubState::from_config(&config)),
+            SharedView::try_new(
+                &budget,
+                PackageRegistry::new(botster_core::CapabilitySet::new()),
+                1,
+            )
+            .expect("registry view fits"),
+            SharedView::try_new(&budget, HubState::from_config(&config), 1)
+                .expect("state view fits"),
         )
     }
 
@@ -545,6 +682,35 @@ mod tests {
         assert!(executor.try_reserve().is_none());
         drop(permits);
         assert_eq!(executor.outstanding(), 0);
+    }
+
+    #[test]
+    fn retained_result_bytes_reduce_new_operation_capacity() {
+        let executor = HostExecutor::new();
+        let permit = executor.try_reserve().expect("first operation fits");
+        let completion = HostCompletion::for_test(
+            HostJobIdentity {
+                waiter_id: WaiterId(1),
+                phase: 1,
+            },
+            HostResult::SessionTypeCatalogReady {
+                generation: 1,
+                entities: BTreeMap::new(),
+                logical_bytes: 1,
+            },
+            permit,
+        );
+        let (_result, retained) = completion.release();
+        let permits = (0..7)
+            .map(|_| executor.try_reserve().expect("seven operations fit"))
+            .collect::<Vec<_>>();
+        assert!(executor.try_reserve().is_none());
+        drop(retained);
+        let final_permit = executor
+            .try_reserve()
+            .expect("released retained bytes restore capacity");
+        drop(final_permit);
+        drop(permits);
     }
 
     #[test]

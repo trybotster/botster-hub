@@ -14,9 +14,11 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use botster_core::{Capability, CapabilitySurface};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 use crate::config::{
     CoreEngineOptions, HostIdentity, HubConfig, SessionDefaults, TransportBindings,
@@ -24,6 +26,7 @@ use crate::config::{
 use crate::credentials::{CredentialKeyPurpose, CredentialProviderKind};
 use crate::packages::PackageRegistrySnapshot;
 use crate::session_types::PackageSessionType;
+use crate::shared_view::{SharedView, SharedViewBudget};
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::Worktree;
 
@@ -326,6 +329,18 @@ pub struct FileHubStateStore {
     temporary_path: PathBuf,
 }
 
+pub(crate) struct PreparedHubStateWrite {
+    state: SharedView<HubState>,
+    bytes: Vec<u8>,
+    package_registry_logical_bytes: usize,
+}
+
+impl PreparedHubStateWrite {
+    pub(crate) fn package_registry_logical_bytes(&self) -> usize {
+        self.package_registry_logical_bytes
+    }
+}
+
 impl FileHubStateStore {
     /// Build a store at `<data_directory>/hub-state.json`.
     #[must_use]
@@ -344,31 +359,115 @@ impl FileHubStateStore {
     }
 
     fn write_atomically(&self, state: &HubState) -> HubStateStoreResult<()> {
-        self.write_temporary_file(state)?;
+        let bytes = serde_json::to_vec_pretty(state).map_err(HubStateStoreError::Serialize)?;
+        self.write_prepared_atomically(&bytes)?;
+        Ok(())
+    }
+
+    fn write_prepared_atomically(&self, bytes: &[u8]) -> HubStateStoreResult<()> {
+        self.write_temporary_file(bytes)?;
         fs::rename(&self.temporary_path, &self.path).map_err(HubStateStoreError::Io)?;
         Ok(())
     }
 
-    fn write_temporary_file(&self, state: &HubState) -> HubStateStoreResult<()> {
+    fn write_temporary_file(&self, bytes: &[u8]) -> HubStateStoreResult<()> {
         let parent = self
             .path
             .parent()
             .ok_or(HubStateStoreError::MissingParent)?;
         fs::create_dir_all(parent).map_err(HubStateStoreError::Io)?;
 
-        let bytes = serde_json::to_vec_pretty(state).map_err(HubStateStoreError::Serialize)?;
         let mut temporary = File::create(&self.temporary_path).map_err(HubStateStoreError::Io)?;
-        temporary
-            .write_all(&bytes)
-            .map_err(HubStateStoreError::Io)?;
+        temporary.write_all(bytes).map_err(HubStateStoreError::Io)?;
         temporary.sync_all().map_err(HubStateStoreError::Io)?;
         Ok(())
     }
 
     #[cfg(test)]
     fn save_with_injected_failure(&self, state: &HubState) -> HubStateStoreResult<()> {
-        self.write_temporary_file(state)?;
+        let bytes = serde_json::to_vec_pretty(state).map_err(HubStateStoreError::Serialize)?;
+        self.write_temporary_file(&bytes)?;
         Err(HubStateStoreError::InjectedWriteFailure)
+    }
+
+    /// Load the update base without creating a state file when it is absent.
+    pub(crate) fn load_for_update(&self, config: &HubConfig) -> HubStateStoreResult<HubState> {
+        match fs::read(&self.path) {
+            Ok(bytes) => {
+                let version: HubStateVersion =
+                    serde_json::from_slice(&bytes).map_err(HubStateStoreError::Corrupt)?;
+                if version.schema_version != HUB_STATE_SCHEMA_VERSION {
+                    return Err(HubStateStoreError::State(
+                        HubStateError::UnsupportedVersion(version.schema_version),
+                    ));
+                }
+                serde_json::from_slice(&bytes).map_err(HubStateStoreError::Corrupt)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(HubState::from_config(config))
+            }
+            Err(error) => Err(HubStateStoreError::Io(error)),
+        }
+    }
+
+    /// Reserve the candidate view before the durable write starts.
+    pub(crate) fn update_shared(
+        &self,
+        config: &HubConfig,
+        budget: &Arc<SharedViewBudget>,
+        update: impl FnOnce(&mut HubState),
+    ) -> HubStateStoreResult<SharedView<HubState>> {
+        let mut state = self.load_for_update(config)?;
+        update(&mut state);
+        let prepared = self.prepare_shared(state, budget)?;
+        self.commit_shared(prepared)
+    }
+
+    pub(crate) fn prepare_shared(
+        &self,
+        state: HubState,
+        budget: &Arc<SharedViewBudget>,
+    ) -> HubStateStoreResult<PreparedHubStateWrite> {
+        state
+            .validate_version()
+            .map_err(HubStateStoreError::State)?;
+        // The durable pretty JSON is larger than compact JSON. Its existing
+        // byte length is therefore one conservative logical view charge.
+        let bytes = serde_json::to_vec_pretty(&state).map_err(HubStateStoreError::Serialize)?;
+        let package_registry_logical_bytes = serde_json::from_slice::<HubStatePackageSpan>(&bytes)
+            .map_err(HubStateStoreError::Serialize)?
+            .package_registry
+            .get()
+            .len();
+        let view = SharedView::try_new(budget, state, bytes.len()).map_err(|error| {
+            HubStateStoreError::ViewCapacity {
+                requested: error.requested,
+                available: error.available,
+            }
+        })?;
+        Ok(PreparedHubStateWrite {
+            state: view,
+            bytes,
+            package_registry_logical_bytes,
+        })
+    }
+
+    pub(crate) fn commit_shared(
+        &self,
+        prepared: PreparedHubStateWrite,
+    ) -> HubStateStoreResult<SharedView<HubState>> {
+        let PreparedHubStateWrite { state, bytes, .. } = prepared;
+        #[cfg(test)]
+        if let Some(remaining) = SAVES_UNTIL_FAILURE.with(|cell| cell.get()) {
+            if remaining == 0 {
+                SAVES_UNTIL_FAILURE.with(|cell| cell.set(None));
+                self.write_temporary_file(&bytes)?;
+                return Err(HubStateStoreError::InjectedWriteFailure);
+            }
+            SAVES_UNTIL_FAILURE.with(|cell| cell.set(Some(remaining - 1)));
+        }
+        self.write_prepared_atomically(&bytes)?;
+        Ok(state)
     }
 
     /// Fail the next `save` after writing the temporary file, before rename.
@@ -434,6 +533,12 @@ struct HubStateVersion {
     schema_version: u16,
 }
 
+#[derive(Deserialize)]
+struct HubStatePackageSpan<'a> {
+    #[serde(borrow)]
+    package_registry: &'a RawValue,
+}
+
 /// Typed storage boundary errors.
 #[derive(Debug)]
 pub enum HubStateStoreError {
@@ -447,6 +552,8 @@ pub enum HubStateStoreError {
     Corrupt(serde_json::Error),
     /// Loaded or saved state failed model validation.
     State(HubStateError),
+    /// A candidate view cannot coexist with the retained shared views.
+    ViewCapacity { requested: usize, available: usize },
     /// Test-only injected failure between temp-file flush and rename.
     #[cfg(test)]
     InjectedWriteFailure,
@@ -460,6 +567,13 @@ impl fmt::Display for HubStateStoreError {
             Self::Serialize(error) => write!(formatter, "hub state serialization error: {error}"),
             Self::Corrupt(error) => write!(formatter, "hub state file is corrupt: {error}"),
             Self::State(error) => write!(formatter, "{error}"),
+            Self::ViewCapacity {
+                requested,
+                available,
+            } => write!(
+                formatter,
+                "shared view needs {requested} logical bytes but only {available} remain"
+            ),
             #[cfg(test)]
             Self::InjectedWriteFailure => {
                 write!(formatter, "injected hub state write failure before rename")
@@ -474,6 +588,7 @@ impl Error for HubStateStoreError {
             Self::Io(error) => Some(error),
             Self::Serialize(error) | Self::Corrupt(error) => Some(error),
             Self::State(error) => Some(error),
+            Self::ViewCapacity { .. } => None,
             #[cfg(test)]
             Self::MissingParent | Self::InjectedWriteFailure => None,
             #[cfg(not(test))]
@@ -503,6 +618,7 @@ mod tests {
         CredentialKeyPurpose, CredentialProviderKind, TestFileCredentialStore, credential_key_id,
         validate_hub_credentials,
     };
+    use crate::shared_view::SharedViewBudget;
     use crate::{
         DataDirectoryOption, HostIdentityOptions, HubPackageManifest, HubStartupOptions,
         PackageProvenance, PackageRegistry, PackageRunnableEntrypoint, PackageRunnableProcessState,
@@ -1152,6 +1268,46 @@ mod tests {
             error,
             HubStateStoreError::State(HubStateError::UnsupportedVersion(99))
         ));
+    }
+
+    #[test]
+    fn shared_view_capacity_failure_preserves_the_committed_file() {
+        let config = test_config("shared-view-capacity");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let initial = HubState::from_config(&config);
+        store.save(&initial).expect("save initial state");
+        let committed = fs::read(store.path()).expect("read initial state");
+        let budget = SharedViewBudget::with_capacity(1);
+
+        let error = store
+            .update_shared(&config, &budget, |state| {
+                state.session_type_generation = 1;
+            })
+            .expect_err("candidate view must exceed one byte");
+
+        assert!(matches!(error, HubStateStoreError::ViewCapacity { .. }));
+        assert_eq!(
+            fs::read(store.path()).expect("read preserved state"),
+            committed
+        );
+    }
+
+    #[test]
+    fn prepared_state_reuses_the_package_registry_span_for_its_charge() {
+        let config = test_config("package-registry-span");
+        let state = HubState::from_config(&config);
+        let bytes = serde_json::to_vec_pretty(&state).expect("serialize state");
+        let registry_bytes = serde_json::from_slice::<HubStatePackageSpan>(&bytes)
+            .expect("find registry value")
+            .package_registry
+            .get()
+            .len();
+        let compact_registry_bytes = serde_json::to_vec(&state.package_registry)
+            .expect("serialize registry")
+            .len();
+
+        assert!(registry_bytes >= compact_registry_bytes);
+        assert!(registry_bytes < bytes.len());
     }
 
     #[test]

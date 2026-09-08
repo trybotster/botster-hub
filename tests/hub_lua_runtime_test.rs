@@ -1799,7 +1799,7 @@ fn real_lua_plugin_lists_and_validates_spawn_targets_without_mutation_surface() 
             metadata: BTreeMap::new(),
         },
     ];
-    hub.replace_state(state);
+    hub.replace_state(state).expect("replacement state fits");
     hub.load_lua_plugin_package(&registry, "spawn-target-reader.plugin")
         .expect("load spawn target reader plugin");
 
@@ -1855,7 +1855,7 @@ fn real_lua_plugin_lists_and_shows_worktrees_without_mutation_surface() {
         git: None,
         metadata: BTreeMap::new(),
     }];
-    hub.replace_state(state);
+    hub.replace_state(state).expect("replacement state fits");
     hub.load_lua_plugin_package(&registry, "worktree-reader.plugin")
         .expect("load worktree reader plugin");
 
@@ -1901,7 +1901,8 @@ fn real_lua_plugin_observes_worktrees_added_after_plugin_load() {
         base_ref: None,
         metadata: BTreeMap::new(),
     }];
-    hub.replace_state(state.clone());
+    hub.replace_state(state.clone())
+        .expect("replacement state fits");
     hub.load_lua_plugin_package(&registry, "worktree-reader.plugin")
         .expect("load worktree reader plugin");
 
@@ -1915,7 +1916,7 @@ fn real_lua_plugin_observes_worktrees_added_after_plugin_load() {
         git: None,
         metadata: BTreeMap::new(),
     }];
-    hub.replace_state(state);
+    hub.replace_state(state).expect("replacement state fits");
 
     let result = hub
         .call_plugin_mcp_tool(botster_hub::McpCallRequest {
@@ -2025,7 +2026,7 @@ fn exercise_cross_package_managed_spawn(
         base_ref: Some("main".to_string()),
         metadata: BTreeMap::new(),
     }];
-    hub.replace_state(state);
+    hub.replace_state(state).expect("replacement state fits");
     hub.load_lua_plugin_package(registry, "managed-session-caller.plugin")
         .expect("load cross-package caller");
 
@@ -2330,7 +2331,7 @@ fn real_lua_plugin_atomically_ensures_managed_worktree_and_spawns_session() {
         base_ref: Some("main".to_string()),
         metadata: BTreeMap::new(),
     }];
-    hub.replace_state(state);
+    hub.replace_state(state).expect("replacement state fits");
     hub.load_lua_plugin_package(&registry, "session-type-spawner.plugin")
         .expect("load managed session-type plugin");
 
