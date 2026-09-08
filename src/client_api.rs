@@ -1836,11 +1836,10 @@ impl HubClientPackage {
         }
     }
 
-    fn navigation_entries(self) -> Vec<HubClientPackageNavigationEntry> {
+    pub(crate) fn navigation_entries(self) -> Vec<HubClientPackageNavigationEntry> {
         if !self.navigation.is_empty() {
             return self.navigation;
         }
-
         self.surfaces
             .into_iter()
             .filter(|surface| surface.kind == PackageSurfaceKind::App)
@@ -2272,6 +2271,14 @@ pub struct HubClientPluginLifecycle {
     pub package_name: String,
     pub state: HubClientPackageState,
     pub loaded: bool,
+    pub load_failure: Option<HubClientPluginLoadFailure>,
+}
+
+/// One package-scoped plugin load failure that startup isolated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubClientPluginLoadFailure {
+    pub code: String,
+    pub message: String,
 }
 
 /// Sanitized plugin lifecycle report for local clients.
@@ -2305,6 +2312,12 @@ impl From<HubPluginLifecycleStatus> for HubClientPluginLifecycle {
             package_name: status.package_name,
             state: status.state.into(),
             loaded: status.loaded,
+            load_failure: status
+                .load_failure
+                .map(|failure| HubClientPluginLoadFailure {
+                    code: failure.code,
+                    message: failure.message,
+                }),
         }
     }
 }

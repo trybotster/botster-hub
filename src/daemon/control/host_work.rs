@@ -23,6 +23,15 @@ pub(crate) enum DocumentAdmission {
     Stale,
 }
 
+/// One package rollback that keeps one host slot until the daemon restarts.
+/// The retained row leaves seven host slots available during degraded operation.
+pub(crate) struct PackageRecoveryRequired {
+    pub(crate) original: String,
+    pub(crate) compensation: String,
+    _effect: PackageRuntimeEffect,
+    _permit: HostWorkPermit,
+}
+
 /// Route one supported host request. A `None` result leaves the request with its existing family.
 pub(crate) fn handle(
     daemon: &mut HubDaemon,
@@ -122,7 +131,6 @@ pub(crate) fn handle(
     let mut retained_prepare: Option<(PreparedMutation, HostWorkPermit)> = None;
     let mut prior_compensation_failure: Option<HostMutationError> = None;
     let mut failed_package_effect: Option<(PackageRuntimeEffect, DaemonTransportError)> = None;
-    let mut prior_package_compensation_failure: Option<PackageRollbackFailure> = None;
     let mut finalizing_package = false;
     let mut next_phase = 2;
     Some(ControlStep::pending_in(
@@ -208,6 +216,10 @@ pub(crate) fn handle(
                                 .restore_command(runtime.config().data_directory.clone())
                                 .expect("a fallible package effect retains its restore views");
                             failed_package_effect = Some((effect, error));
+                            debug_assert_eq!(state.document_owner, Some(waiter_id));
+                            // Keep the document reservation through this first whole-state
+                            // restore. No code can replay this snapshot after the reservation
+                            // is released.
                             return submit_phase(
                                 daemon,
                                 state,
@@ -240,16 +252,11 @@ pub(crate) fn handle(
                     let (effect, original) = failed_package_effect
                         .take()
                         .expect("a package restore follows one failed runtime effect");
-                    let mut rollbacks = prior_package_compensation_failure
-                        .take()
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                    rollbacks.extend(
+                    let rollbacks =
                         crate::daemon::control::packages::mutations::restore_runtime_after_failed_effect(
                             daemon,
                             &effect,
-                        ),
-                    );
+                        );
                     release_document(state, waiter_id);
                     let error = if rollbacks.is_empty() {
                         original
@@ -262,42 +269,27 @@ pub(crate) fn handle(
                     finish_transport_error(permit, error)
                 }
                 HostMutationResult::PackageRestoreFailed(error) => {
-                    let (effect, _) = failed_package_effect
-                        .as_ref()
-                        .expect("a package restore failure follows one failed runtime effect");
-                    let Some(runtime) = daemon.runtime() else {
-                        release_document(state, waiter_id);
-                        let (_effect, original) = failed_package_effect
-                            .take()
-                            .expect("the failed package effect remains retained");
-                        return finish_transport_error(
-                            permit,
-                            DaemonTransportError::PackageCompensation {
-                                original: Box::new(original),
-                                rollbacks: vec![PackageRollbackFailure {
-                                    step: "persist",
-                                    package_name: None,
-                                    error: Box::new(DaemonTransportError::State(error)),
-                                }],
-                            },
-                        );
-                    };
-                    let restore = effect
-                        .restore_command(runtime.config().data_directory.clone())
-                        .expect("a fallible package effect retains its restore views");
-                    prior_package_compensation_failure = Some(PackageRollbackFailure {
+                    let failure = PackageRollbackFailure {
                         step: "persist",
                         package_name: None,
                         error: Box::new(DaemonTransportError::State(error)),
+                    };
+                    let (effect, original) = failed_package_effect
+                        .take()
+                        .expect("a package restore failure follows one failed runtime effect");
+                    let original_message = original.to_string();
+                    let compensation_message = failure.error.to_string();
+                    state.package_recovery_required = Some(PackageRecoveryRequired {
+                        original: original_message,
+                        compensation: compensation_message,
+                        _effect: effect,
+                        _permit: permit,
                     });
-                    submit_phase(
-                        daemon,
-                        state,
-                        waiter_id,
-                        HostMutationCommand::RestorePackage(restore),
-                        permit,
-                        &mut next_phase,
-                    )
+                    release_document(state, waiter_id);
+                    ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
+                        original: Box::new(original),
+                        rollbacks: vec![failure],
+                    }))
                 }
                 HostMutationResult::Recovered(outcome) => match outcome {
                     RecoveryOutcome::PackageConfiguration { failure, .. }
@@ -538,6 +530,31 @@ fn error_response(code: &str, operation: &str, message: &str) -> DaemonResponse 
     });
     response.diagnostics = vec![diagnostic];
     response
+}
+
+/// Reject package operations that cannot use a possibly inconsistent registry.
+pub(crate) fn package_recovery_response(
+    state: &DaemonControlState,
+    request: &DaemonRequest,
+) -> Option<DaemonResponse> {
+    let recovery = state.package_recovery_required.as_ref()?;
+    let blocked = is_package_read(request)
+        || is_package_prepare(request)
+        || matches!(
+            request,
+            DaemonRequest::StartPackageEntrypoint { .. }
+                | DaemonRequest::RestartPackageEntrypoint { .. }
+        );
+    blocked.then(|| {
+        error_response(
+            "package_recovery_required",
+            "host_execution",
+            &format!(
+                "package recovery is required; original: {}; compensation: {}",
+                recovery.original, recovery.compensation
+            ),
+        )
+    })
 }
 
 fn with_compensation_failure(

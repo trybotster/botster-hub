@@ -216,6 +216,7 @@ impl ManagedSpawnOperation {
                 self.finish_reconciliation(&format!("{}: {}", error.code, error.message))
             }
             HostResult::ManagedWorktreeFailed(error) => self.finish_error(error),
+            HostResult::Failed { error, .. } => self.finish_error(managed_host_failure(error)),
             _ => self.finish_reconciliation("the host executor returned an invalid create result"),
         }
     }
@@ -445,6 +446,7 @@ impl ManagedSpawnOperation {
             HostResult::ManagedWorktreeRecoveryRequired { error, .. } => {
                 self.finish_reconciliation(&format!("{}: {}", error.code, error.message))
             }
+            HostResult::Failed { error, .. } => self.finish_error(managed_host_failure(error)),
             _ => self
                 .finish_reconciliation("the host executor returned an invalid finalization result"),
         }
@@ -472,6 +474,7 @@ impl ManagedSpawnOperation {
             HostResult::ManagedWorktreeRecoveryRequired { error, .. } => {
                 self.finish_reconciliation(&format!("{}: {}", error.code, error.message))
             }
+            HostResult::Failed { error, .. } => self.finish_error(managed_host_failure(error)),
             _ => {
                 self.finish_reconciliation("the host executor returned an invalid rollback result")
             }
@@ -738,6 +741,15 @@ impl ManagedSpawnOperation {
             crate::client_api_dto::response::daemon_response_base(DaemonResponseKind::Worktrees);
         ControlPoll::Ready(Ok(response))
     }
+}
+
+fn managed_host_failure(error: crate::host_executor::HostError) -> ManagedGitError {
+    let kind = if error.code == "host_worker_panicked" {
+        "host_worker_panicked"
+    } else {
+        "host_execution_failed"
+    };
+    ManagedGitError::new(kind, format!("{}: {}", error.code, error.message))
 }
 
 fn timeout_error() -> ManagedGitError {

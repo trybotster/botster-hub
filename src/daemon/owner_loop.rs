@@ -35,7 +35,7 @@ use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon_maintenance::{
     BackgroundClass, BackgroundClassScheduler, BackgroundTurnDecision, MaintenanceSliceKind,
     MaintenanceState, OBSERVE_SLICE_BUDGET, PUMP_MAX_ROUTES_VALIDATED, PumpPhase, PumpScheduler,
-    decide_background_slice, run_completion_drain_slice_for_owner, run_maintenance_kind,
+    decide_background_slice, run_completion_drain_slice_for_owner, run_maintenance_kind_for_owner,
 };
 use crate::subscription::attach_routes::{
     AttachStreamRegistry, AttachedSubscription, AttachedSubscriptionChange,
@@ -55,6 +55,49 @@ use crate::transport::unix::listener::{
 };
 
 const ENTITY_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BackgroundCoreKind {
+    MaintenanceObserve,
+    JournalPull,
+    Baseline,
+    PumpObserve,
+    InventoryReconcile,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackgroundCoreWaiter {
+    kind: BackgroundCoreKind,
+    last_phase: u64,
+}
+
+fn background_waiter_id(
+    state: &mut DaemonControlState,
+    kind: BackgroundCoreKind,
+) -> Option<crate::owner_identity::WaiterId> {
+    if let Some(waiter_id) = state.background_waiter_ids.get(&kind) {
+        return Some(*waiter_id);
+    }
+    let waiter_id = state.waiter_ids.next()?;
+    state.background_waiter_ids.insert(kind, waiter_id);
+    state.background_core_waiters.insert(
+        waiter_id,
+        BackgroundCoreWaiter {
+            kind,
+            last_phase: 0,
+        },
+    );
+    Some(waiter_id)
+}
+
+fn maintenance_core_kind(kind: MaintenanceSliceKind) -> Option<BackgroundCoreKind> {
+    match kind {
+        MaintenanceSliceKind::Observe => Some(BackgroundCoreKind::MaintenanceObserve),
+        MaintenanceSliceKind::JournalPull => Some(BackgroundCoreKind::JournalPull),
+        MaintenanceSliceKind::Baseline => Some(BackgroundCoreKind::Baseline),
+        _ => None,
+    }
+}
 
 /// One Core inventory read for the reconcile phase. `read_epoch` is the
 /// registry attach epoch at submission: the read's rows cover every attach
@@ -104,6 +147,23 @@ impl DaemonControlState {
         self.pump
             .note_inventory_change_during_reconcile(reconcile_active);
         self.background.mark_pump();
+    }
+
+    pub(crate) fn absorb_background_core_completion(
+        &mut self,
+        identity: crate::owner_identity::OwnerWorkIdentity,
+    ) -> bool {
+        let Some(waiter) = self.background_core_waiters.get_mut(&identity.waiter_id) else {
+            return false;
+        };
+        let Some(expected) = waiter.last_phase.checked_add(1) else {
+            return true;
+        };
+        if identity.phase == expected {
+            waiter.last_phase = identity.phase;
+            self.background_core_ready.insert(waiter.kind);
+        }
+        true
     }
 }
 
@@ -208,6 +268,30 @@ fn mark_due_reconciliation(
 }
 
 fn run_one_owner_background_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    if let Some(kind) = state.background_core_ready.pop_first() {
+        match kind {
+            BackgroundCoreKind::MaintenanceObserve => {
+                run_owner_maintenance_kind(daemon, state, MaintenanceSliceKind::Observe)
+            }
+            BackgroundCoreKind::JournalPull => {
+                run_owner_maintenance_kind(daemon, state, MaintenanceSliceKind::JournalPull)
+            }
+            BackgroundCoreKind::Baseline => {
+                run_owner_maintenance_kind(daemon, state, MaintenanceSliceKind::Baseline)
+            }
+            BackgroundCoreKind::PumpObserve => {
+                if run_pump_observe_phase(daemon, state) {
+                    state.background.mark_pump();
+                }
+            }
+            BackgroundCoreKind::InventoryReconcile => {
+                if run_inventory_reconcile_phase(daemon, state) {
+                    state.background.mark_pump();
+                }
+            }
+        }
+        return;
+    }
     let maintenance_pending = owner_maintenance_pending(daemon, state);
     let BackgroundTurnDecision::OneSlice(class) =
         decide_background_slice(&mut state.background, maintenance_pending)
@@ -226,6 +310,29 @@ fn run_one_owner_background_slice(daemon: &mut HubDaemon, state: &mut DaemonCont
     }
 }
 
+fn run_owner_maintenance_kind(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    kind: MaintenanceSliceKind,
+) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let Some(core_kind) = maintenance_core_kind(kind) else {
+        return;
+    };
+    let Some(waiter_id) = background_waiter_id(state, core_kind) else {
+        return;
+    };
+    run_maintenance_kind_for_owner(
+        runtime,
+        &mut state.maintenance,
+        &mut state.maintenance_reads,
+        kind,
+        waiter_id,
+    );
+}
+
 fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     retry_client_event_cleanups(daemon, state);
     let started = Instant::now();
@@ -240,7 +347,7 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
         }
         MaintenanceSliceKind::PackageEventDelivery => {
             if let Some(runtime) = daemon.runtime() {
-                run_maintenance_kind(
+                crate::daemon_maintenance::run_maintenance_kind(
                     runtime,
                     &mut state.maintenance,
                     &mut state.maintenance_reads,
@@ -278,12 +385,24 @@ fn run_one_owner_maintenance_slice(daemon: &mut HubDaemon, state: &mut DaemonCon
                 {
                     state.maintenance.try_wake();
                 }
-                run_maintenance_kind(
-                    runtime,
-                    &mut state.maintenance,
-                    &mut state.maintenance_reads,
-                    other,
-                );
+                if let Some(core_kind) = maintenance_core_kind(other) {
+                    if let Some(waiter_id) = background_waiter_id(state, core_kind) {
+                        run_maintenance_kind_for_owner(
+                            runtime,
+                            &mut state.maintenance,
+                            &mut state.maintenance_reads,
+                            other,
+                            waiter_id,
+                        );
+                    }
+                } else {
+                    crate::daemon_maintenance::run_maintenance_kind(
+                        runtime,
+                        &mut state.maintenance,
+                        &mut state.maintenance_reads,
+                        other,
+                    );
+                }
             }
         }
     }
@@ -429,6 +548,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         let slice_due = control_state
             .background
             .has_pending(owner_maintenance_pending(&daemon, &control_state))
+            || !control_state.background_core_ready.is_empty()
             || !control_state.request_ready.is_empty()
             || control_state.host_completion_drain_pending
             || control_state.host_capacity_wake_pending;
@@ -857,9 +977,13 @@ pub(crate) fn run_inventory_reconcile_phase(
             state.pump.reconcile_after.as_ref(),
             PUMP_MAX_ROUTES_VALIDATED,
         );
+        let Some(waiter_id) = background_waiter_id(state, BackgroundCoreKind::InventoryReconcile)
+        else {
+            return false;
+        };
         state.reconcile_inventory = Some(InventoryRead {
             read_epoch,
-            ticket: runtime.terminal_subscription_generations(routes),
+            ticket: runtime.terminal_subscription_generations_for_owner(waiter_id, routes),
         });
         return true;
     };
@@ -880,6 +1004,8 @@ pub(crate) fn run_inventory_reconcile_phase(
         CoreTicketPoll::Ready(inventory) => inventory,
     };
     state.reconcile_inventory = None;
+    // Core keeps one live owner per (session, subscription). A takeover gets
+    // a fresh monotonic generation, so the generation identifies that owner.
     let lookup = |_client_id: &str, session_id: &str, subscription_id: &str| {
         inventory
             .iter()
@@ -928,7 +1054,11 @@ fn run_pump_observe_phase(daemon: &HubDaemon, state: &mut DaemonControlState) ->
     };
     let Some(ticket) = state.observe_read.as_mut() else {
         let now = tick(&mut state.logical_clock);
-        state.observe_read = Some(runtime.observe_lifecycle_slice(
+        let Some(waiter_id) = background_waiter_id(state, BackgroundCoreKind::PumpObserve) else {
+            return false;
+        };
+        state.observe_read = Some(runtime.observe_lifecycle_slice_for_owner(
+            waiter_id,
             now,
             state.observe_resume.as_ref(),
             OBSERVE_SLICE_BUDGET,
@@ -997,11 +1127,16 @@ pub(crate) struct DaemonControlState {
     pub(crate) current_waiter_id: Option<crate::owner_identity::WaiterId>,
     pub(crate) request_ready: crate::daemon::owner_schedule::ReadyQueues,
     pub(crate) request_deadlines: crate::daemon::owner_schedule::DeadlineIndex,
+    background_waiter_ids: BTreeMap<BackgroundCoreKind, crate::owner_identity::WaiterId>,
+    background_core_waiters: BTreeMap<crate::owner_identity::WaiterId, BackgroundCoreWaiter>,
+    background_core_ready: std::collections::BTreeSet<BackgroundCoreKind>,
     pub(crate) host_completions:
         BTreeMap<crate::owner_identity::WaiterId, crate::host_executor::HostCompletion>,
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
     pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
     pub(crate) host_recovery_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
+    pub(crate) package_recovery_required:
+        Option<crate::daemon::control::host_work::PackageRecoveryRequired>,
     pub(crate) host_completion_drain_pending: bool,
     pub(crate) host_capacity_wake_pending: bool,
     pub(crate) blocked_session_type_roots:
@@ -1074,10 +1209,14 @@ impl Default for DaemonControlState {
             current_waiter_id: None,
             request_ready: crate::daemon::owner_schedule::ReadyQueues::new(),
             request_deadlines: crate::daemon::owner_schedule::DeadlineIndex::new(),
+            background_waiter_ids: BTreeMap::new(),
+            background_core_waiters: BTreeMap::new(),
+            background_core_ready: std::collections::BTreeSet::new(),
             host_completions: BTreeMap::new(),
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
             host_recovery_waiters: std::collections::BTreeSet::new(),
+            package_recovery_required: None,
             host_completion_drain_pending: false,
             host_capacity_wake_pending: false,
             blocked_session_type_roots: BTreeMap::new(),
@@ -2157,6 +2296,15 @@ mod tests {
         daemon: &mut HubDaemon,
         request: DaemonRequest,
     ) -> DaemonTransportResult<DaemonResponse> {
+        let mut state = DaemonControlState::default();
+        drive_package_request_with_state(daemon, &mut state, request)
+    }
+
+    fn drive_package_request_with_state(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        request: DaemonRequest,
+    ) -> DaemonTransportResult<DaemonResponse> {
         let (control_tx, _control_rx) = tokio_mpsc::channel(8);
         let observability = DaemonObservability {
             egress: Vec::new(),
@@ -2165,16 +2313,13 @@ mod tests {
             grant_id: None,
             transport_request_id: None,
         };
-        let mut state = DaemonControlState {
-            current_waiter_id: daemon
-                .runtime()
-                .and_then(|runtime| runtime.next_waiter_id()),
-            ..DaemonControlState::default()
-        };
-        match handle_control_request(daemon, &mut state, observability, control_tx, request) {
+        state.current_waiter_id = daemon
+            .runtime()
+            .and_then(|runtime| runtime.next_waiter_id());
+        match handle_control_request(daemon, state, observability, control_tx, request) {
             crate::daemon::control::pending::ControlStep::Ready(response) => response,
             crate::daemon::control::pending::ControlStep::Pending(mut step) => loop {
-                match (step.continuation)(daemon, &mut state) {
+                match (step.continuation)(daemon, state) {
                     crate::daemon::control::pending::ControlPoll::Pending => {}
                     crate::daemon::control::pending::ControlPoll::Ready(response) => {
                         break response;
@@ -3703,8 +3848,10 @@ return botster.register({
         std::fs::write(package_dir.join("plugin.lua"), "-- placeholder").expect("write lua");
         let config = package_control_config(data_directory);
         let mut daemon = HubDaemon::start(config.clone()).expect("start rollback persist daemon");
-        drive_package_request(
+        let mut state = DaemonControlState::default();
+        drive_package_request_with_state(
             &mut daemon,
+            &mut state,
             DaemonRequest::InstallPackageLocalPath {
                 path: package_dir.clone(),
             },
@@ -3712,8 +3859,9 @@ return botster.register({
         .expect("install");
         std::fs::remove_file(package_dir.join("plugin.lua")).expect("remove lua");
         FileHubStateStore::inject_save_failure_after(&config.data_directory, 1);
-        let error = drive_package_request(
+        let error = drive_package_request_with_state(
             &mut daemon,
+            &mut state,
             DaemonRequest::EnablePackage {
                 package_name: "broken.plugin".to_string(),
             },
@@ -3732,6 +3880,70 @@ return botster.register({
                 &*rollback.error,
                 DaemonTransportError::State(crate::HubStateStoreError::InjectedWriteFailure)
             )));
+        assert!(
+            state.package_recovery_required.is_some(),
+            "the failed restore must retain one bounded recovery row"
+        );
+        let entrypoint_cases = [
+            (
+                "start",
+                DaemonRequest::StartPackageEntrypoint {
+                    package_name: "broken.plugin".to_string(),
+                    entrypoint_id: "missing".to_string(),
+                    environment_overrides: BTreeMap::new(),
+                },
+                true,
+            ),
+            (
+                "restart",
+                DaemonRequest::RestartPackageEntrypoint {
+                    package_name: "broken.plugin".to_string(),
+                    entrypoint_id: "missing".to_string(),
+                },
+                true,
+            ),
+            (
+                "stop",
+                DaemonRequest::StopPackageEntrypoint {
+                    package_name: "broken.plugin".to_string(),
+                    entrypoint_id: "missing".to_string(),
+                },
+                false,
+            ),
+            (
+                "status",
+                DaemonRequest::PackageEntrypointStatus {
+                    package_name: "broken.plugin".to_string(),
+                    entrypoint_id: "missing".to_string(),
+                },
+                false,
+            ),
+        ];
+        for (operation, request, blocked) in entrypoint_cases {
+            let response = drive_package_request_with_state(&mut daemon, &mut state, request)
+                .unwrap_or_else(|error| panic!("{operation} returned {error:?}"));
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code.as_str())
+                    == Some("package_recovery_required"),
+                blocked,
+                "unexpected recovery gate result for {operation}"
+            );
+        }
+        let rejected =
+            drive_package_request_with_state(&mut daemon, &mut state, DaemonRequest::ListPackages)
+                .expect("recovery-required package work returns a typed operator response");
+        assert_eq!(rejected.kind, DaemonResponseKind::OperatorError);
+        assert_eq!(
+            rejected.error.as_ref().map(|error| error.code.as_str()),
+            Some("package_recovery_required")
+        );
+        let spawn_targets = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ListSpawnTargets,
+        )
+        .expect("unrelated control work must progress during package recovery");
+        assert_eq!(spawn_targets.kind, DaemonResponseKind::SpawnTargets);
         daemon.stop();
     }
 

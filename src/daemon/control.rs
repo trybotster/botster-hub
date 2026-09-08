@@ -237,6 +237,9 @@ pub(crate) fn handle_control_request(
     control_tx: ControlSender,
     request: DaemonRequest,
 ) -> ControlStep {
+    if let Some(response) = host_work::package_recovery_response(state, &request) {
+        return ControlStep::ready(response);
+    }
     if host_work::handles(&request) {
         return host_work::handle(daemon, state, request)
             .expect("a classified host request has a running owner waiter");

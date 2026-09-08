@@ -195,19 +195,6 @@ impl HubDaemon {
         reserve_package_registry(&self.state.budget(), package_registry)
     }
 
-    pub(crate) fn prepare_package_registry_with_charge(
-        &self,
-        package_registry: PackageRegistry,
-        logical_bytes: usize,
-    ) -> Result<SharedView<PackageRegistry>, HubStateStoreError> {
-        SharedView::try_new(&self.state.budget(), package_registry, logical_bytes).map_err(
-            |error| HubStateStoreError::ViewCapacity {
-                requested: error.requested,
-                available: error.available,
-            },
-        )
-    }
-
     /// Return one shared package-registry input for off-owner reads.
     pub(crate) fn package_registry_view(&self) -> SharedView<PackageRegistry> {
         self.package_registry.clone()
@@ -300,7 +287,16 @@ pub(crate) fn load_enabled_local_plugins(
         .prepare_enabled_local_packages("daemon startup load enabled local plugin packages")?;
     for package in prepared {
         if package.selected_lua_entrypoint().is_some() {
-            runtime.load_lua_plugin_package(package_registry, &package.package_name)?;
+            if let Err(error) =
+                runtime.load_lua_plugin_package(package_registry, &package.package_name)
+            {
+                if !error.is_package_scoped_startup_failure() {
+                    return Err(error.into());
+                }
+                // The failed package stays unloaded. Startup records the exact
+                // package failure and continues with healthy siblings.
+                runtime.record_startup_plugin_load_failure(&package.package_name, &error);
+            }
         }
     }
     Ok(())
@@ -457,6 +453,122 @@ mod tests {
             }) if maximum_completion_bytes == capacity + 1
                 && retained_result_capacity == capacity
         ));
+    }
+
+    #[test]
+    fn startup_isolates_one_package_load_failure_and_loads_a_healthy_sibling() {
+        let config = shared_state_config();
+        let broken_dir = config.data_directory.join("broken.plugin");
+        std::fs::create_dir_all(&broken_dir).expect("create broken package directory");
+        std::fs::write(
+            broken_dir.join("botster-package.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "broken.plugin",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": "." },
+                "capabilities": [{ "surface": "mcp" }],
+                "entrypoints": [
+                    { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+                ]
+            }))
+            .expect("serialize broken package manifest"),
+        )
+        .expect("write broken package manifest");
+        std::fs::write(
+            broken_dir.join("plugin.lua"),
+            "error('deterministic startup load failure')\n",
+        )
+        .expect("write broken Lua plugin");
+
+        let mut daemon = HubDaemon::start(config.clone()).expect("initialize daemon state");
+        let mut registry = daemon.package_registry().clone();
+        registry
+            .install_local_path(&broken_dir, "install broken startup package")
+            .expect("install broken startup package");
+        registry
+            .enable("broken.plugin", "enable broken startup package")
+            .expect("enable broken startup package");
+        registry
+            .install_local_path(
+                std::path::Path::new("examples/synthetic-plugin"),
+                "install healthy startup package",
+            )
+            .expect("install healthy startup package");
+        registry
+            .enable("runtime.synthetic-plugin", "enable healthy startup package")
+            .expect("enable healthy startup package");
+        daemon
+            .replace_package_registry(registry)
+            .expect("publish startup package registry");
+        let snapshot = daemon.package_registry().snapshot();
+        let runtime = daemon.runtime().expect("initial runtime");
+        FileHubStateStore::for_data_directory(&config.data_directory)
+            .update_shared(&config, &runtime.shared_view_budget(), |state| {
+                state.package_registry = snapshot;
+            })
+            .expect("persist startup package registry");
+        daemon.stop();
+
+        let mut restarted = HubDaemon::start(config).expect("start with isolated package failure");
+        let packages = restarted.package_registry().clone();
+        let api = crate::HubClientApi::local_operator("startup-package-isolation");
+        let response = api
+            .handle_request(
+                restarted.runtime_mut().expect("restarted runtime"),
+                &packages,
+                crate::HubClientRequest::PluginLifecycleStatus {
+                    request_id: botster_core::RequestId(
+                        "startup-package-isolation-status".to_string(),
+                    ),
+                },
+            )
+            .wait(restarted.runtime().expect("restarted runtime"))
+            .expect("read startup package failures");
+        let crate::HubClientResponseBody::PluginLifecycle(report) = response.body else {
+            panic!("plugin lifecycle response expected");
+        };
+        let broken = report
+            .lifecycle
+            .iter()
+            .find(|row| row.package_name == "broken.plugin")
+            .expect("broken package lifecycle row");
+        assert!(!broken.loaded);
+        let failure = broken
+            .load_failure
+            .as_ref()
+            .expect("broken package has a typed load failure");
+        assert_eq!(failure.code, "lua_load_failed");
+        assert!(
+            failure
+                .message
+                .contains("deterministic startup load failure")
+        );
+        let healthy = report
+            .lifecycle
+            .iter()
+            .find(|row| row.package_name == "runtime.synthetic-plugin")
+            .expect("healthy package lifecycle row");
+        assert!(healthy.loaded);
+        assert!(healthy.load_failure.is_none());
+
+        let runtime = restarted.runtime().expect("restarted runtime");
+        let healthy_result = runtime
+            .call_plugin_mcp_tool(crate::McpCallRequest {
+                name: "runtime.synthetic.echo".to_string(),
+                arguments: serde_json::json!({ "message": "healthy" }),
+            })
+            .expect("healthy sibling tool remains functional");
+        assert_eq!(healthy_result["message"], "healthy");
+        let denied = runtime
+            .call_plugin_mcp_tool(crate::McpCallRequest {
+                name: "broken.never".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .expect_err("the isolated package cannot invoke a capability-gated tool");
+        assert_eq!(denied.code, "unknown_tool");
+        restarted.stop();
     }
 
     #[test]

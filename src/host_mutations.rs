@@ -14,7 +14,6 @@ use botster_hub_client::{
     DaemonPackagePin, DaemonPackageUpdateStatus, DaemonRequest, DaemonResolvedAppLaunch,
     DaemonResponse, DaemonResponseKind, MAX_CONTROL_RESPONSE_BYTES,
 };
-use botster_ui_contract::PackageSurfaceKind;
 
 use crate::client_api::HubClientPackage;
 use crate::client_api_dto::package::{
@@ -588,7 +587,11 @@ fn package_read(
                 .into_iter()
                 .map(|record| HubClientPackage::from_record(packages, record))
                 .collect::<Vec<_>>();
-            let navigation = rows.iter().flat_map(package_navigation_for_row).collect();
+            let navigation = rows
+                .iter()
+                .cloned()
+                .flat_map(HubClientPackage::navigation_entries)
+                .collect();
             Ok(daemon_package_navigation(navigation, &rows))
         }
         DaemonRequest::ListAvailablePackages { registry_path } => packages
@@ -631,29 +634,6 @@ fn package_read(
         }
         request => Err(HostMutationError::unsupported(&request, "package read")),
     }
-}
-
-fn package_navigation_for_row(
-    package: &HubClientPackage,
-) -> Vec<crate::HubClientPackageNavigationEntry> {
-    if !package.navigation.is_empty() {
-        return package.navigation.clone();
-    }
-    package
-        .surfaces
-        .iter()
-        .filter(|surface| surface.kind == PackageSurfaceKind::App)
-        .map(|surface| crate::HubClientPackageNavigationEntry {
-            package_name: package.package_name.clone(),
-            item_id: surface.id.clone(),
-            label: surface.title.clone(),
-            icon: surface.icon.clone(),
-            description: surface.description.clone(),
-            target: crate::HubClientPackageNavigationTarget::Surface {
-                surface_id: surface.id.clone(),
-            },
-        })
-        .collect()
 }
 
 fn resolve_package_route(

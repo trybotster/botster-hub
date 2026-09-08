@@ -46,8 +46,8 @@ use crate::credentials::{
 };
 use crate::data_plane::driver::{CoreOperationTicket, CoreTicket, CoreTicketError, CoreTicketPoll};
 use crate::lifecycle::{
-    HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
-    package_entity_owner_token,
+    HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginLoadFailure,
+    HubPluginRuntimeBundle, package_entity_owner_token,
 };
 use crate::lua_runtime::{
     HubCoordinationBridge, HubCoordinationResponse, HubEntityPublishBridge, LuaPluginHostApi,
@@ -3178,6 +3178,21 @@ impl HubRuntime {
         self.plugin_lifecycle.status(registry)
     }
 
+    /// Record one package-scoped startup load failure without loading the package.
+    pub(crate) fn record_startup_plugin_load_failure(
+        &self,
+        package_name: &str,
+        error: &HubLuaPluginLoadError,
+    ) {
+        self.plugin_lifecycle.record_load_failure(
+            package_name,
+            HubPluginLoadFailure {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            },
+        );
+    }
+
     /// Return Core's authoritative read-only plugin worker snapshot.
     #[must_use]
     pub fn plugin_worker_debug_snapshot(&self) -> PluginWorkerDebugSnapshot {
@@ -3215,6 +3230,20 @@ impl HubRuntime {
         })
     }
 
+    /// Return one bounded observe slice and publish its owner identity.
+    pub(crate) fn observe_lifecycle_slice_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        now_seconds: u64,
+        resume: Option<&ObserveLifecycleCursor>,
+        budget: ObserveLifecycleBudget,
+    ) -> CoreTicket<Result<ObserveLifecycleSlice, SessionLifecyclePageError>> {
+        let resume = resume.cloned();
+        self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
+            daemon.observe_lifecycle_slice(now_seconds, resume.as_ref(), budget)
+        })
+    }
+
     /// Return one bounded lifecycle baseline page.
     pub fn lifecycle_baseline_page(
         &self,
@@ -3229,6 +3258,21 @@ impl HubRuntime {
         })
     }
 
+    /// Return one bounded baseline page and publish its owner identity.
+    pub(crate) fn lifecycle_baseline_page_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        snapshot: Option<&SessionLifecycleCursor>,
+        after: Option<&SessionId>,
+        budget: LifecycleBaselineBudget,
+    ) -> CoreTicket<Result<SessionLifecycleBaselinePage, SessionLifecyclePageError>> {
+        let snapshot = snapshot.cloned();
+        let after = after.cloned();
+        self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
+            daemon.lifecycle_baseline_page(snapshot.as_ref(), after.as_ref(), budget)
+        })
+    }
+
     /// Return one bounded lifecycle journal page after a cursor.
     pub fn lifecycle_changes_page(
         &self,
@@ -3239,6 +3283,20 @@ impl HubRuntime {
         let after = after.clone();
         self.core_daemon
             .submit(move |daemon| daemon.lifecycle_changes_page(&after, max_changes, max_bytes))
+    }
+
+    /// Return one bounded journal page and publish its owner identity.
+    pub(crate) fn lifecycle_changes_page_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        after: &SessionLifecycleCursor,
+        max_changes: usize,
+        max_bytes: usize,
+    ) -> CoreTicket<Result<SessionLifecyclePage, SessionLifecyclePageError>> {
+        let after = after.clone();
+        self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
+            daemon.lifecycle_changes_page(&after, max_changes, max_bytes)
+        })
     }
 
     /// Admit ready package-event deliveries and wait for completions.
@@ -3782,12 +3840,13 @@ impl HubRuntime {
             .submit(|daemon| daemon.list_terminal_subscriptions())
     }
 
-    /// Return the exact live generation for each requested terminal route.
-    pub(crate) fn terminal_subscription_generations(
+    /// Return exact terminal generations and publish the owner identity.
+    pub(crate) fn terminal_subscription_generations_for_owner(
         &self,
+        waiter_id: crate::owner_identity::WaiterId,
         routes: Vec<(String, String)>,
     ) -> CoreTicket<Vec<(String, String, Option<TerminalSubscriptionGeneration>)>> {
-        self.core_daemon.submit(move |daemon| {
+        self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
             routes
                 .into_iter()
                 .map(|(session_id, subscription_id)| {
@@ -4730,6 +4789,35 @@ pub enum HubLuaPluginLoadError {
     EventPlane(EventPlaneStatus),
 }
 
+impl HubLuaPluginLoadError {
+    pub(crate) const fn is_package_scoped_startup_failure(&self) -> bool {
+        match self {
+            Self::Package(_) | Self::Lua(_) | Self::Lifecycle(_) => true,
+            // List package failures explicitly. A new event-plane status must
+            // stop startup until code classifies it as package-scoped.
+            Self::EventPlane(status) => matches!(
+                status,
+                EventPlaneStatus::RejectedUndeclared
+                    | EventPlaneStatus::RejectedForeign
+                    | EventPlaneStatus::RejectedInvalid
+                    | EventPlaneStatus::RejectedOversize
+                    | EventPlaneStatus::RejectedWildcard
+                    | EventPlaneStatus::RejectedCausalScope
+                    | EventPlaneStatus::RejectedAudience
+            ),
+        }
+    }
+
+    pub(crate) const fn code(&self) -> &'static str {
+        match self {
+            Self::Package(_) => "package_policy_rejected",
+            Self::Lua(_) => "lua_load_failed",
+            Self::Lifecycle(_) => "plugin_lifecycle_rejected",
+            Self::EventPlane(status) => status.as_str(),
+        }
+    }
+}
+
 impl fmt::Display for HubLuaPluginLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -5554,6 +5642,60 @@ mod tests {
         DataDirectoryOption, HostIdentityOptions, HubStartupOptions, RuntimeEnvironment,
         SessionDefaults, TransportBindings,
     };
+
+    #[test]
+    fn startup_plugin_failure_classification_is_fail_closed() {
+        let package_failures = [
+            EventPlaneStatus::RejectedUndeclared,
+            EventPlaneStatus::RejectedForeign,
+            EventPlaneStatus::RejectedInvalid,
+            EventPlaneStatus::RejectedOversize,
+            EventPlaneStatus::RejectedWildcard,
+            EventPlaneStatus::RejectedCausalScope,
+            EventPlaneStatus::RejectedAudience,
+        ];
+        for status in package_failures {
+            assert!(
+                HubLuaPluginLoadError::EventPlane(status).is_package_scoped_startup_failure(),
+                "{status:?} must isolate only the failing package"
+            );
+        }
+        let infrastructure_failures = [
+            EventPlaneStatus::ShedFull,
+            EventPlaneStatus::ShedBusy,
+            EventPlaneStatus::RejectedOverRate,
+            EventPlaneStatus::RejectedOverFanout,
+        ];
+        for status in infrastructure_failures {
+            assert!(
+                !HubLuaPluginLoadError::EventPlane(status).is_package_scoped_startup_failure(),
+                "{status:?} must stop startup"
+            );
+        }
+        assert!(
+            !HubLuaPluginLoadError::EventPlane(EventPlaneStatus::Accepted)
+                .is_package_scoped_startup_failure()
+        );
+        assert!(
+            HubLuaPluginLoadError::Package(PackageRegistryError::without_record(
+                "broken.plugin",
+                crate::PackageAction::Show,
+                crate::PackageAdmissionReason::PackageNotInstalled,
+                "classification test".to_string(),
+            ))
+            .is_package_scoped_startup_failure()
+        );
+        assert!(
+            HubLuaPluginLoadError::Lua(LuaPluginRuntimeError::Load("broken".to_string()))
+                .is_package_scoped_startup_failure()
+        );
+        assert!(
+            HubLuaPluginLoadError::Lifecycle(crate::HubLifecycleError::MissingEntrypoint {
+                package_name: "broken.plugin".to_string(),
+            })
+            .is_package_scoped_startup_failure()
+        );
+    }
 
     fn binding_test_node(child: serde_json::Value) -> UiNode {
         serde_json::from_value(serde_json::json!({

@@ -937,11 +937,34 @@ pub fn run_maintenance_kind(
     reads: &mut MaintenanceCoreReads,
     kind: MaintenanceSliceKind,
 ) {
+    run_maintenance_kind_with_owner(runtime, state, reads, kind, None);
+}
+
+/// Run one maintenance slice whose Core read publishes to the Hub owner.
+pub(crate) fn run_maintenance_kind_for_owner(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    reads: &mut MaintenanceCoreReads,
+    kind: MaintenanceSliceKind,
+    waiter_id: crate::owner_identity::WaiterId,
+) {
+    run_maintenance_kind_with_owner(runtime, state, reads, kind, Some(waiter_id));
+}
+
+fn run_maintenance_kind_with_owner(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    reads: &mut MaintenanceCoreReads,
+    kind: MaintenanceSliceKind,
+    waiter_id: Option<crate::owner_identity::WaiterId>,
+) {
     match kind {
-        MaintenanceSliceKind::Observe => run_observe_slice(runtime, state, reads),
-        MaintenanceSliceKind::JournalPull => run_journal_pull_slice(runtime, state, reads),
+        MaintenanceSliceKind::Observe => run_observe_slice(runtime, state, reads, waiter_id),
+        MaintenanceSliceKind::JournalPull => {
+            run_journal_pull_slice(runtime, state, reads, waiter_id)
+        }
         MaintenanceSliceKind::ProjectionApply => run_projection_apply_slice(Some(runtime), state),
-        MaintenanceSliceKind::Baseline => run_baseline_slice(runtime, state, reads),
+        MaintenanceSliceKind::Baseline => run_baseline_slice(runtime, state, reads, waiter_id),
         MaintenanceSliceKind::HostBridge => run_host_bridge_slice(runtime, state),
         MaintenanceSliceKind::CompletionDrain => run_completion_drain_slice(runtime, state),
         MaintenanceSliceKind::PackageEventDelivery => {
@@ -1017,14 +1040,23 @@ fn run_observe_slice(
     runtime: &HubRuntime,
     state: &mut MaintenanceState,
     reads: &mut MaintenanceCoreReads,
+    waiter_id: Option<crate::owner_identity::WaiterId>,
 ) {
     let Some(ticket) = reads.observe.as_mut() else {
         let resume = state.observe_resume.clone();
-        reads.observe = Some(runtime.observe_lifecycle_slice(
-            now_seconds(),
-            resume.as_ref(),
-            OBSERVE_SLICE_BUDGET,
-        ));
+        reads.observe = Some(match waiter_id {
+            Some(waiter_id) => runtime.observe_lifecycle_slice_for_owner(
+                waiter_id,
+                now_seconds(),
+                resume.as_ref(),
+                OBSERVE_SLICE_BUDGET,
+            ),
+            None => runtime.observe_lifecycle_slice(
+                now_seconds(),
+                resume.as_ref(),
+                OBSERVE_SLICE_BUDGET,
+            ),
+        });
         return;
     };
     let result = match ticket.poll() {
@@ -1074,6 +1106,7 @@ fn run_journal_pull_slice(
     runtime: &HubRuntime,
     state: &mut MaintenanceState,
     reads: &mut MaintenanceCoreReads,
+    waiter_id: Option<crate::owner_identity::WaiterId>,
 ) {
     let (result, woke) = match reads.journal.as_mut() {
         Some((ticket, woke)) => match ticket.poll() {
@@ -1102,14 +1135,20 @@ fn run_journal_pull_slice(
                 }
                 return;
             };
-            reads.journal = Some((
-                runtime.lifecycle_changes_page(
+            let ticket = match waiter_id {
+                Some(waiter_id) => runtime.lifecycle_changes_page_for_owner(
+                    waiter_id,
                     &cursor,
                     JOURNAL_PAGE_MAX_CHANGES,
                     JOURNAL_PAGE_MAX_BYTES,
                 ),
-                woke,
-            ));
+                None => runtime.lifecycle_changes_page(
+                    &cursor,
+                    JOURNAL_PAGE_MAX_CHANGES,
+                    JOURNAL_PAGE_MAX_BYTES,
+                ),
+            };
+            reads.journal = Some((ticket, woke));
             return;
         }
     };
@@ -1174,6 +1213,7 @@ fn run_baseline_slice(
     runtime: &HubRuntime,
     state: &mut MaintenanceState,
     reads: &mut MaintenanceCoreReads,
+    waiter_id: Option<crate::owner_identity::WaiterId>,
 ) {
     let result = match reads.baseline.as_mut() {
         Some(ticket) => match ticket.poll() {
@@ -1193,11 +1233,19 @@ fn run_baseline_slice(
             };
             let snapshot_ref = recovery.snapshot.clone();
             let after_ref = recovery.after.clone();
-            reads.baseline = Some(runtime.lifecycle_baseline_page(
-                snapshot_ref.as_ref(),
-                after_ref.as_ref(),
-                BASELINE_PAGE_BUDGET,
-            ));
+            reads.baseline = Some(match waiter_id {
+                Some(waiter_id) => runtime.lifecycle_baseline_page_for_owner(
+                    waiter_id,
+                    snapshot_ref.as_ref(),
+                    after_ref.as_ref(),
+                    BASELINE_PAGE_BUDGET,
+                ),
+                None => runtime.lifecycle_baseline_page(
+                    snapshot_ref.as_ref(),
+                    after_ref.as_ref(),
+                    BASELINE_PAGE_BUDGET,
+                ),
+            });
             return;
         }
     };
