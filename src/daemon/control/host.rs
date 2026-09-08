@@ -211,7 +211,10 @@ pub(crate) fn handle_runtime(
     match request {
         DaemonRequest::DaemonShutdown => {
             let policy = runtime.retention_policy();
-            let mut ticket = runtime.retention_accounting();
+            let mut ticket = runtime.submit_core_for_owner(
+                state.current_waiter_id.expect("owner waiter is assigned"),
+                |daemon| daemon.retention_accounting(),
+            );
             let session_count = state.maintenance.projection.rows.len();
             let lifecycle = observability.lifecycle.clone();
             ControlStep::pending(move |daemon, _| {

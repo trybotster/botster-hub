@@ -309,7 +309,7 @@ pub(crate) fn handle_runtime(
     } = request
     {
         let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
-        let step = api.handle_request(
+        let step = api.handle_request_for_owner(
             runtime,
             &packages,
             HubClientRequest::SpawnSessionType {
@@ -321,6 +321,7 @@ pub(crate) fn handle_runtime(
                 ),
                 now_seconds: now,
             },
+            state.current_waiter_id.expect("owner waiter is assigned"),
         );
         return defer_client_step(step, move |body| {
             let HubClientResponseBody::Spawned(spawned) = body else {

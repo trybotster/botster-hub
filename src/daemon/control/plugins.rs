@@ -1,6 +1,6 @@
 //! Plugin MCP and surface request family.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use botster_core::{
     PluginAdmissionResult, PluginHandlerRef, PluginInvocationClass, PluginInvocationResult,
@@ -20,6 +20,8 @@ use crate::daemon::control::reply::RetainedPluginResult;
 use crate::daemon::control::{DaemonObservability, request_id};
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult, daemon_plugin_tool_error};
 use crate::daemon::owner_loop::DaemonControlState;
+use crate::daemon::owner_schedule::ReadyClass;
+use crate::owner_identity::WaiterId;
 use crate::{HubClientRequest, HubClientResponseBody, McpToolError};
 
 const OWNER_PLUGIN_REQUEST_PREFIX: &str = "daemon-owner-plugin-";
@@ -46,6 +48,7 @@ enum PendingPluginControlKind {
 }
 
 struct PendingPluginControl {
+    waiter_id: WaiterId,
     identity: PluginInvocationIdentity,
     kind: PendingPluginControlKind,
     result: Option<RoutedPluginControlCompletion>,
@@ -62,6 +65,7 @@ pub(crate) struct PluginControlState {
     next_serial: u64,
     pending: BTreeMap<String, PendingPluginControl>,
     completion_inconsistencies: u64,
+    ready_waiters: BTreeSet<WaiterId>,
 }
 
 impl std::fmt::Debug for PluginControlState {
@@ -114,12 +118,14 @@ impl PluginControlState {
     fn insert(
         &mut self,
         request_id: &RequestId,
+        waiter_id: WaiterId,
         identity: PluginInvocationIdentity,
         kind: PendingPluginControlKind,
     ) {
         self.pending.insert(
             request_id.0.clone(),
             PendingPluginControl {
+                waiter_id,
                 identity,
                 kind,
                 result: None,
@@ -154,6 +160,7 @@ impl PluginControlState {
                         )
                     },
                 )));
+                self.ready_waiters.insert(entry.waiter_id);
             }
             return None;
         }
@@ -161,6 +168,7 @@ impl PluginControlState {
             entry.result = Some(RoutedPluginControlCompletion::Invocation(
                 completion.map(|completion| completion.result),
             ));
+            self.ready_waiters.insert(entry.waiter_id);
         }
         None
     }
@@ -178,6 +186,7 @@ impl PluginControlState {
             return None;
         }
         let mut entry = self.pending.remove(&request_id.0)?;
+        self.ready_waiters.remove(&entry.waiter_id);
         Some((entry.kind, entry.result.take()?))
     }
 
@@ -187,8 +196,23 @@ impl PluginControlState {
             .get(&request_id.0)
             .is_some_and(|entry| entry.identity == *identity)
         {
-            self.pending.remove(&request_id.0);
+            if let Some(entry) = self.pending.remove(&request_id.0) {
+                self.ready_waiters.remove(&entry.waiter_id);
+            }
         }
+    }
+
+    pub(crate) fn take_ready_waiters(&mut self, limit: usize) -> Vec<WaiterId> {
+        let waiters = self
+            .ready_waiters
+            .iter()
+            .copied()
+            .take(limit)
+            .collect::<Vec<_>>();
+        for waiter_id in &waiters {
+            self.ready_waiters.remove(waiter_id);
+        }
+        waiters
     }
 }
 
@@ -441,9 +465,12 @@ fn start_plugin_control(
     };
     match runtime.try_admit_plugin(PluginInvocationClass::RequestResponse, request) {
         PluginAdmissionResult::Queued { .. } => {
-            state
-                .plugin_controls
-                .insert(&request_id, identity.clone(), kind);
+            state.plugin_controls.insert(
+                &request_id,
+                state.current_waiter_id.expect("owner waiter is assigned"),
+                identity.clone(),
+                kind,
+            );
             state.maintenance.try_wake();
             pending_plugin_control(request_id, identity)
         }
@@ -470,7 +497,8 @@ fn pending_plugin_control(
 ) -> ControlStep {
     let retire_request_id = request_id.clone();
     let retire_identity = identity.clone();
-    ControlStep::pending_retirable(
+    ControlStep::pending_retirable_in(
+        ReadyClass::PluginCompletion,
         move |daemon, state| {
             let Some((kind, result)) = state.plugin_controls.take_ready(&request_id, &identity)
             else {
@@ -672,6 +700,7 @@ mod tests {
         let identity = identity("generation-1", "transport-1", &handler);
         state.insert(
             &request_id,
+            WaiterId(1),
             identity.clone(),
             PendingPluginControlKind::McpTool,
         );
@@ -713,6 +742,7 @@ mod tests {
         let identity = identity("generation-1", "transport-1", &expected_handler);
         state.insert(
             &request_id,
+            WaiterId(1),
             identity.clone(),
             PendingPluginControlKind::McpTool,
         );
@@ -743,6 +773,7 @@ mod tests {
             let request_id = state.next_request_id().expect("request id");
             state.insert(
                 &request_id,
+                WaiterId(u64::try_from(serial).expect("test waiter id") + 1),
                 identity("generation-1", &format!("transport-{serial}"), &handler),
                 PendingPluginControlKind::McpTool,
             );

@@ -45,8 +45,11 @@ pub(crate) enum HostCommand {
         packages: SharedView<PackageRegistry>,
         state: SharedView<HubState>,
     },
+    Mutation(crate::host_mutations::HostMutationCommand),
     #[cfg(test)]
-    Panic { generation: u64 },
+    Panic {
+        generation: u64,
+    },
     #[cfg(test)]
     Wait {
         generation: u64,
@@ -58,6 +61,7 @@ impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
+            Self::Mutation(_) => 0,
             #[cfg(test)]
             Self::Panic { generation } => *generation,
             #[cfg(test)]
@@ -73,6 +77,7 @@ impl std::fmt::Debug for HostCommand {
                 .debug_struct("BuildSessionTypeCatalog")
                 .field("generation", generation)
                 .finish_non_exhaustive(),
+            Self::Mutation(command) => formatter.debug_tuple("Mutation").field(command).finish(),
             #[cfg(test)]
             Self::Panic { generation } => formatter
                 .debug_struct("Panic")
@@ -105,6 +110,7 @@ pub(crate) enum HostResult {
         generation: u64,
         error: HostError,
     },
+    Mutation(crate::host_mutations::HostMutationResult),
 }
 
 impl HostResult {
@@ -113,6 +119,7 @@ impl HostResult {
             Self::SessionTypeCatalogReady { generation, .. } | Self::Failed { generation, .. } => {
                 *generation
             }
+            Self::Mutation(_) => 0,
         }
     }
 }
@@ -132,6 +139,7 @@ impl HostCompletion {
         let logical_bytes = match &result {
             HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
             HostResult::Failed { .. } => 0,
+            HostResult::Mutation(_) => 0,
         };
         if logical_bytes > HOST_PREPARED_BYTE_CAPACITY {
             let generation = result.generation();
@@ -146,9 +154,14 @@ impl HostCompletion {
         let logical_bytes = match &result {
             HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
             HostResult::Failed { .. } => 0,
+            HostResult::Mutation(_) => 0,
         };
         let charge = permit.into_prepared_charge(logical_bytes);
         (result, charge)
+    }
+
+    pub(crate) fn into_parts(self) -> (HostJobIdentity, HostResult, HostWorkPermit) {
+        (self.identity, self.result, self.permit)
     }
 
     #[cfg(test)]
@@ -299,7 +312,7 @@ pub(crate) struct HostWorkPermit {
 }
 
 impl HostWorkPermit {
-    fn into_prepared_charge(mut self, logical_bytes: usize) -> HostPreparedCharge {
+    pub(crate) fn into_prepared_charge(mut self, logical_bytes: usize) -> HostPreparedCharge {
         let reservation = self
             .prepared
             .take()
@@ -574,6 +587,9 @@ fn execute(command: HostCommand) -> HostResult {
                 error: HostError::new("session_type_catalog_failed", error.to_string()),
             },
         },
+        HostCommand::Mutation(command) => {
+            HostResult::Mutation(crate::host_mutations::execute(command))
+        }
         #[cfg(test)]
         HostCommand::Panic { .. } => panic!("host executor panic test"),
         #[cfg(test)]

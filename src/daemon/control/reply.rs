@@ -183,7 +183,13 @@ pub(crate) struct RetainedPluginResult<T> {
 #[derive(Debug)]
 pub(crate) struct ControlReply {
     response: DaemonTransportResult<DaemonResponse>,
-    charge: Option<RetainedPluginResultCharge>,
+    charge: Option<RetainedControlCharge>,
+}
+
+#[derive(Debug)]
+pub(crate) enum RetainedControlCharge {
+    Plugin(RetainedPluginResultCharge),
+    Host(crate::host_executor::HostPreparedCharge),
 }
 
 impl ControlReply {
@@ -200,7 +206,17 @@ impl ControlReply {
         let (response, charge) = response.into_parts();
         Self {
             response,
-            charge: Some(charge),
+            charge: Some(RetainedControlCharge::Plugin(charge)),
+        }
+    }
+
+    pub(crate) fn host(
+        response: DaemonTransportResult<DaemonResponse>,
+        charge: crate::host_executor::HostPreparedCharge,
+    ) -> Self {
+        Self {
+            response,
+            charge: Some(RetainedControlCharge::Host(charge)),
         }
     }
 
@@ -208,14 +224,14 @@ impl ControlReply {
         self,
     ) -> (
         DaemonTransportResult<DaemonResponse>,
-        Option<RetainedPluginResultCharge>,
+        Option<RetainedControlCharge>,
     ) {
         (self.response, self.charge)
     }
 
     pub(crate) fn from_parts(
         response: DaemonTransportResult<DaemonResponse>,
-        charge: Option<RetainedPluginResultCharge>,
+        charge: Option<RetainedControlCharge>,
     ) -> Self {
         Self { response, charge }
     }

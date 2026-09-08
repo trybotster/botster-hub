@@ -275,7 +275,20 @@ impl HubClientApi {
         packages: &PackageRegistry,
         request: HubClientRequest,
     ) -> HubClientStep {
-        match self.start_request(runtime, packages, request) {
+        match self.start_request(runtime, packages, request, None) {
+            Ok(step) => step,
+            Err(error) => HubClientStep::Ready(Err(error)),
+        }
+    }
+
+    pub(crate) fn handle_request_for_owner(
+        &self,
+        runtime: &mut HubRuntime,
+        packages: &PackageRegistry,
+        request: HubClientRequest,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> HubClientStep {
+        match self.start_request(runtime, packages, request, Some(waiter_id)) {
             Ok(step) => step,
             Err(error) => HubClientStep::Ready(Err(error)),
         }
@@ -286,6 +299,7 @@ impl HubClientApi {
         runtime: &mut HubRuntime,
         packages: &PackageRegistry,
         request: HubClientRequest,
+        owner_waiter_id: Option<crate::owner_identity::WaiterId>,
     ) -> HubClientResult<HubClientStep> {
         let operation = request.operation();
         let request_id = request.request_id().clone();
@@ -318,7 +332,7 @@ impl HubClientApi {
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
-                    runtime.submit_core(move |daemon| {
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         daemon
                             .list()
                             .map(|sessions| {
@@ -339,7 +353,7 @@ impl HubClientApi {
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
-                    runtime.submit_core(move |daemon| {
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         daemon
                             .list()
                             .map(|sessions| {
@@ -368,7 +382,7 @@ impl HubClientApi {
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
-                    runtime.submit_core(move |daemon| {
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         daemon
                             .lifecycle_baseline_page(
                                 None,
@@ -390,7 +404,12 @@ impl HubClientApi {
                 HubClientResponseBody::Events(Vec::new())
             }
             HubClientRequest::RemoveSession { session_id, .. } => {
-                let tracker = runtime.begin_remove_session(&session_id);
+                let tracker = match owner_waiter_id {
+                    Some(waiter_id) => {
+                        runtime.begin_remove_session_for_owner(waiter_id, &session_id)
+                    }
+                    None => runtime.begin_remove_session(&session_id),
+                };
                 let respond = respond.clone();
                 let core_error = core_error.clone();
                 return Ok(HubClientStep::Pending(HubClientPending::operation(
@@ -411,7 +430,12 @@ impl HubClientApi {
                 ..
             } => {
                 let request = spawn_request(runtime, request_id.clone(), session_id, command);
-                let tracker = runtime.begin_spawn(request, client_session_metadata());
+                let tracker = match owner_waiter_id {
+                    Some(waiter_id) => {
+                        runtime.begin_spawn_for_owner(waiter_id, request, client_session_metadata())
+                    }
+                    None => runtime.begin_spawn(request, client_session_metadata()),
+                };
                 let respond = respond.clone();
                 let core_error = core_error.clone();
                 return Ok(HubClientStep::Pending(HubClientPending::operation(
@@ -451,7 +475,7 @@ impl HubClientApi {
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
-                    runtime.submit_core(move |daemon| {
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         daemon
                             .detach(client_id, session_id, subscription_id, now_seconds)
                             .map(|()| respond(HubClientResponseBody::Events(Vec::new())))
@@ -460,7 +484,12 @@ impl HubClientApi {
                 )));
             }
             HubClientRequest::Shutdown { session_id, .. } => {
-                let tracker = runtime.begin_shutdown_session(session_id);
+                let tracker = match owner_waiter_id {
+                    Some(waiter_id) => {
+                        runtime.begin_shutdown_session_for_owner(waiter_id, session_id)
+                    }
+                    None => runtime.begin_shutdown_session(session_id),
+                };
                 let respond = respond.clone();
                 let core_error = core_error.clone();
                 return Ok(HubClientStep::Pending(HubClientPending::operation(
@@ -502,7 +531,7 @@ impl HubClientApi {
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
-                    runtime.submit_core(move |daemon| {
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         daemon
                             .guarded_write(request)
                             .map(|result| {
@@ -533,7 +562,7 @@ impl HubClientApi {
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
-                    runtime.submit_core(move |daemon| {
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         daemon
                             .guarded_write(request)
                             .map(|result| {
@@ -551,7 +580,7 @@ impl HubClientApi {
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
-                    runtime.submit_core(move |daemon| {
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         daemon
                             .publish_routed_envelope(
                                 botster_core_daemon::PublishRoutedEnvelopeRequest { envelope },
@@ -576,7 +605,7 @@ impl HubClientApi {
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
-                    runtime.submit_core(move |daemon| {
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         daemon
                             .drain_routed_envelopes(
                                 botster_core_daemon::DrainRoutedEnvelopesRequest {
@@ -604,7 +633,7 @@ impl HubClientApi {
                 return Ok(HubClientStep::Pending(HubClientPending::ticket(
                     request_id,
                     operation,
-                    runtime.submit_core(move |daemon| {
+                    runtime.submit_core_for_optional_owner(owner_waiter_id, move |daemon| {
                         daemon
                             .acknowledge_routed_envelope(
                                 botster_core_daemon::AcknowledgeRoutedEnvelopeRequest {
@@ -628,8 +657,17 @@ impl HubClientApi {
                 session_id,
                 now_seconds,
             } => {
-                let tracker =
-                    runtime.begin_read_screen(read_request_id, session_id.clone(), now_seconds);
+                let tracker = match owner_waiter_id {
+                    Some(waiter_id) => runtime.begin_read_screen_for_owner(
+                        waiter_id,
+                        read_request_id,
+                        session_id.clone(),
+                        now_seconds,
+                    ),
+                    None => {
+                        runtime.begin_read_screen(read_request_id, session_id.clone(), now_seconds)
+                    }
+                };
                 let respond = respond.clone();
                 let core_error = core_error.clone();
                 return Ok(HubClientStep::Pending(HubClientPending::operation(
@@ -655,8 +693,19 @@ impl HubClientApi {
                 session_id,
                 now_seconds,
             } => {
-                let tracker =
-                    runtime.begin_read_mode_flags(read_request_id, session_id.clone(), now_seconds);
+                let tracker = match owner_waiter_id {
+                    Some(waiter_id) => runtime.begin_read_mode_flags_for_owner(
+                        waiter_id,
+                        read_request_id,
+                        session_id.clone(),
+                        now_seconds,
+                    ),
+                    None => runtime.begin_read_mode_flags(
+                        read_request_id,
+                        session_id.clone(),
+                        now_seconds,
+                    ),
+                };
                 let respond = respond.clone();
                 let core_error = core_error.clone();
                 return Ok(HubClientStep::Pending(HubClientPending::operation(
@@ -691,15 +740,25 @@ impl HubClientApi {
                 session_id,
                 now_seconds,
             } => {
-                let tracker = runtime.begin_capture_snapshot(
-                    snapshot_request_id,
-                    session_id.clone(),
-                    now_seconds,
-                    botster_core_daemon::CaptureOwner(format!(
-                        "client:{}",
-                        self.identity.client_id.0
-                    )),
-                );
+                let owner = botster_core_daemon::CaptureOwner(format!(
+                    "client:{}",
+                    self.identity.client_id.0
+                ));
+                let tracker = match owner_waiter_id {
+                    Some(waiter_id) => runtime.begin_capture_snapshot_for_owner(
+                        waiter_id,
+                        snapshot_request_id,
+                        session_id.clone(),
+                        now_seconds,
+                        owner,
+                    ),
+                    None => runtime.begin_capture_snapshot(
+                        snapshot_request_id,
+                        session_id.clone(),
+                        now_seconds,
+                        owner,
+                    ),
+                };
                 let respond = respond.clone();
                 let core_error = core_error.clone();
                 return Ok(HubClientStep::Pending(HubClientPending::operation(
@@ -918,7 +977,14 @@ impl HubClientApi {
                 let metadata = session_type_client_metadata(materialized.metadata);
                 runtime.record_session_context(context.clone());
                 let _ = now_seconds;
-                let tracker = runtime.begin_spawn(materialized.spawn_request, metadata);
+                let tracker = match owner_waiter_id {
+                    Some(waiter_id) => runtime.begin_spawn_for_owner(
+                        waiter_id,
+                        materialized.spawn_request,
+                        metadata,
+                    ),
+                    None => runtime.begin_spawn(materialized.spawn_request, metadata),
+                };
                 let respond = respond.clone();
                 let core_error = core_error.clone();
                 let contexts = runtime.session_contexts_handle();

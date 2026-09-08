@@ -3844,6 +3844,17 @@ impl HubRuntime {
         )
     }
 
+    pub(crate) fn begin_remove_session_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        session_id: &SessionId,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin_for_owner(waiter_id, CoreOperation::RemoveSession(session_id.clone())),
+        )
+    }
+
     /// Start one daemon-owned session spawn. Core answers with
     /// `CoreCompletion::Spawn`; the caller records the acknowledged spawn id
     /// once it returns the response.
@@ -3855,6 +3866,18 @@ impl HubRuntime {
         CoreOperationTracker::new(self.core_daemon.begin(CoreOperation::Spawn(
             SpawnSessionRequest { request, metadata },
         )))
+    }
+
+    pub(crate) fn begin_spawn_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        request: SessionSpawnRequest,
+        metadata: CoreSessionMetadata,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::Spawn(SpawnSessionRequest { request, metadata }),
+        ))
     }
 
     /// Record one session id this process already returned from a successful Spawn.
@@ -3931,6 +3954,16 @@ impl HubRuntime {
             .submit(move |daemon| attach_and_bind_on_core(daemon, plan))
     }
 
+    pub(crate) fn attach_and_bind_terminal_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        plan: AttachBindPlan,
+    ) -> CoreTicket<Result<TerminalSubscriptionGeneration, AttachBindFailure>> {
+        self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
+            attach_and_bind_on_core(daemon, plan)
+        })
+    }
+
     /// Attach one route without an adapter. Core holds the route's frames
     /// until [`Self::bind_route_adapter`] binds one (WebRTC reserved channel).
     pub(crate) fn attach_route(
@@ -3941,6 +3974,19 @@ impl HubRuntime {
         now_seconds: u64,
     ) -> CoreTicket<Result<TerminalSubscriptionGeneration, AttachBindFailure>> {
         self.core_daemon.submit(move |daemon| {
+            attach_route_on_core(daemon, client_id, session_id, subscription_id, now_seconds)
+        })
+    }
+
+    pub(crate) fn attach_route_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        client_id: ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+        now_seconds: u64,
+    ) -> CoreTicket<Result<TerminalSubscriptionGeneration, AttachBindFailure>> {
+        self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
             attach_route_on_core(daemon, client_id, session_id, subscription_id, now_seconds)
         })
     }
@@ -4000,6 +4046,35 @@ impl HubRuntime {
         self.core_daemon.take_completion_notification()
     }
 
+    pub(crate) fn take_owner_core_completions(
+        &self,
+        limit: usize,
+    ) -> Vec<crate::owner_identity::OwnerWorkIdentity> {
+        self.core_daemon.take_owner_completion_identities(limit)
+    }
+
+    pub(crate) fn restore_owner_core_completions(
+        &self,
+        identities: &[crate::owner_identity::OwnerWorkIdentity],
+    ) {
+        self.core_daemon
+            .restore_owner_completion_identities(identities);
+    }
+
+    pub(crate) fn retire_owner_core_completion(
+        &self,
+        identity: crate::owner_identity::OwnerWorkIdentity,
+    ) -> bool {
+        self.core_daemon.retire_owner_completion(identity)
+    }
+
+    pub(crate) fn retire_owner_core_waiter(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> usize {
+        self.core_daemon.retire_owner_waiter(waiter_id)
+    }
+
     pub(crate) fn take_data_plane_progress(&self) -> crate::data_plane::driver::DataPlaneProgress {
         self.data_plane
             .as_ref()
@@ -4036,6 +4111,30 @@ impl HubRuntime {
                 .map(|_| ()),
             None => daemon.detach(client_id, session_id, subscription_id, now_seconds),
         })
+    }
+
+    pub(crate) fn detach_route_exact_or_owned_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        client_id: ClientId,
+        session_id: SessionId,
+        subscription_id: SubscriptionId,
+        generation: Option<TerminalSubscriptionGeneration>,
+        now_seconds: u64,
+    ) -> CoreTicket<Result<(), CoreDaemonError>> {
+        self.core_daemon
+            .submit_for_owner(waiter_id, move |daemon| match generation {
+                Some(generation) => daemon
+                    .detach_terminal_subscription(
+                        client_id,
+                        session_id,
+                        subscription_id,
+                        generation,
+                        now_seconds,
+                    )
+                    .map(|_| ()),
+                None => daemon.detach(client_id, session_id, subscription_id, now_seconds),
+            })
     }
 
     /// Detach one subscription generation without deleting a newer owner.
@@ -4088,6 +4187,23 @@ impl HubRuntime {
         )))
     }
 
+    pub(crate) fn begin_read_screen_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::ReadScreen(ReadScreenRequest {
+                request_id,
+                session_id,
+                now_seconds,
+            }),
+        ))
+    }
+
     /// Start a mode-flags read. Core answers with `CoreCompletion::ReadModeFlags`.
     pub fn begin_read_mode_flags(
         &self,
@@ -4102,6 +4218,23 @@ impl HubRuntime {
                 now_seconds,
             },
         )))
+    }
+
+    pub(crate) fn begin_read_mode_flags_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::ReadModeFlags(ReadModeFlagsRequest {
+                request_id,
+                session_id,
+                now_seconds,
+            }),
+        ))
     }
 
     /// Start a GHOSTSNP capture for paging. Core answers with
@@ -4123,6 +4256,27 @@ impl HubRuntime {
         }))
     }
 
+    pub(crate) fn begin_capture_snapshot_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        request_id: RequestId,
+        session_id: SessionId,
+        now_seconds: u64,
+        owner: CaptureOwner,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::CaptureSnapshot {
+                request: CaptureSnapshotRequest {
+                    request_id,
+                    session_id,
+                    now_seconds,
+                },
+                owner,
+            },
+        ))
+    }
+
     /// Cancel one pending Core operation. `true` when it was still pending.
     pub(crate) fn cancel_core_operation(&self, id: PendingOperationId) -> CoreTicket<bool> {
         self.core_daemon.submit(move |daemon| daemon.cancel(id))
@@ -4142,6 +4296,17 @@ impl HubRuntime {
     ) -> CoreTicket<Result<SnapshotPage, CoreDaemonError>> {
         self.core_daemon
             .submit(move |daemon| daemon.read_snapshot_page(&capture, page))
+    }
+
+    pub(crate) fn read_snapshot_page_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        capture: CaptureId,
+        page: u32,
+    ) -> CoreTicket<Result<SnapshotPage, CoreDaemonError>> {
+        self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
+            daemon.read_snapshot_page(&capture, page)
+        })
     }
 
     /// Evaluate guarded-write readiness and inject only through the core daemon.
@@ -4254,6 +4419,17 @@ impl HubRuntime {
         CoreOperationTracker::new(
             self.core_daemon
                 .begin(CoreOperation::ShutdownSession(session_id)),
+        )
+    }
+
+    pub(crate) fn begin_shutdown_session_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        session_id: SessionId,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin_for_owner(waiter_id, CoreOperation::ShutdownSession(session_id)),
         )
     }
 
@@ -5320,6 +5496,43 @@ impl HubRuntime {
         F: FnOnce(&mut botster_core_daemon::CoreDaemon) -> T + Send + 'static,
     {
         self.core_daemon.submit(operation)
+    }
+
+    /// Run one Core closure for an explicitly registered owner phase.
+    pub(crate) fn submit_core_for_owner<T, F>(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        operation: F,
+    ) -> CoreTicket<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut botster_core_daemon::CoreDaemon) -> T + Send + 'static,
+    {
+        self.core_daemon.submit_for_owner(waiter_id, operation)
+    }
+
+    pub(crate) fn submit_core_for_optional_owner<T, F>(
+        &self,
+        waiter_id: Option<crate::owner_identity::WaiterId>,
+        operation: F,
+    ) -> CoreTicket<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut botster_core_daemon::CoreDaemon) -> T + Send + 'static,
+    {
+        match waiter_id {
+            Some(waiter_id) => self.core_daemon.submit_for_owner(waiter_id, operation),
+            None => self.core_daemon.submit(operation),
+        }
+    }
+
+    /// Start one two-phase Core operation for an admitted owner waiter.
+    pub(crate) fn begin_core_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        operation: CoreOperation,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(waiter_id, operation))
     }
 
     /// Current retention accounting, read on the Core owner thread.

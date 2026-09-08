@@ -13,7 +13,8 @@ use crate::client_api_dto::response::daemon_hub_update;
 use crate::daemon::control::attach_bind_operator_error;
 use crate::daemon::control::message::{ControlMessage, ControlReplySender, ControlSender};
 use crate::daemon::control::pending::{
-    ControlStep, PendingControlRequest, poll_pending_requests, request_must_finish,
+    ControlStep, PendingControlRequest, READY_DEADLINE, READY_INITIAL, mark_request_ready,
+    poll_ready_requests, request_must_finish,
 };
 use crate::daemon::control::reply::ControlReply;
 use crate::daemon::control::{
@@ -31,6 +32,8 @@ use crate::daemon::owner_loop::{
     DaemonControlState, request_succeeded, send_control_reply, send_control_response,
     should_mark_pump_after_control,
 };
+use crate::daemon::owner_schedule::ReadyClass;
+use crate::daemon::owner_turn::OwnerTurnBudget;
 use crate::maintenance::software_identity;
 use crate::subscription::attach_routes::{
     AttachedSubscriptionChange, attached_subscription_change_for_response,
@@ -122,6 +125,17 @@ pub(crate) fn handle(
             response_delivery_rx,
         );
     };
+    let Some(waiter_id) = state.waiter_ids.next() else {
+        state.budget.release(permit);
+        return send_control_response(
+            reply_tx,
+            Ok(attach_bind_operator_error(
+                OWNER_BUDGET_EXHAUSTED,
+                "the daemon exhausted unique owner waiter identifiers",
+            )),
+            response_delivery_rx,
+        );
+    };
     let observability = DaemonObservability {
         egress: state.egress_diagnostics.diagnostics(),
         lifecycle: state.lifecycle_counters.clone(),
@@ -129,8 +143,16 @@ pub(crate) fn handle(
         grant_id: grant_id.clone(),
         transport_request_id,
     };
+    state.current_waiter_id = Some(waiter_id);
     let step = handle_control_request(daemon, state, observability, control_tx, request.clone());
+    state.current_waiter_id = None;
     let entry = PendingControlRequest {
+        waiter_id,
+        ready_class: ReadyClass::CoreCompletion,
+        ready_key: None,
+        deadline_key: None,
+        last_core_phase: 0,
+        last_host_phase: 0,
         must_finish: request_must_finish(&request),
         request,
         reply_tx,
@@ -146,19 +168,54 @@ pub(crate) fn handle(
     match step {
         ControlStep::Ready(response) => finish(daemon, state, entry, ControlReply::plain(response)),
         ControlStep::Pending(pending) => {
-            state.pending_requests.push(PendingControlRequest {
-                continuation: pending.continuation,
-                retire: pending.retire,
-                ..entry
-            });
+            let ready_class = pending.ready_class;
+            state.pending_requests.insert(
+                waiter_id,
+                PendingControlRequest {
+                    continuation: pending.continuation,
+                    retire: pending.retire,
+                    ready_class,
+                    ..entry
+                },
+            );
+            let now = Instant::now();
+            let deadline = now + crate::daemon::owner_budget::RETAINED_OPERATION_DEADLINE;
+            let arm = state
+                .request_deadlines
+                .arm(waiter_id, deadline, now)
+                .expect("an initial owner deadline always makes progress");
+            state
+                .pending_requests
+                .get_mut(&waiter_id)
+                .expect("the pending waiter was inserted")
+                .deadline_key = Some(arm.key());
+            mark_request_ready(state, waiter_id, ready_class, READY_INITIAL);
+            if arm.is_due() {
+                mark_request_ready(state, waiter_id, ReadyClass::Deadline, READY_DEADLINE);
+            }
             false
         }
     }
 }
 
 /// Poll deferred requests and answer the finished ones.
+pub(crate) fn poll_deferred_with_budget(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    budget: &mut OwnerTurnBudget,
+) -> bool {
+    poll_ready_requests(daemon, state, Instant::now(), budget, finish)
+}
+
+#[cfg(test)]
 pub(crate) fn poll_deferred(daemon: &mut HubDaemon, state: &mut DaemonControlState) -> bool {
-    poll_pending_requests(daemon, state, Instant::now(), finish)
+    let waiter_ids = state.pending_requests.keys().copied().collect::<Vec<_>>();
+    for waiter_id in waiter_ids {
+        let class = state.pending_requests[&waiter_id].ready_class;
+        mark_request_ready(state, waiter_id, class, READY_INITIAL);
+    }
+    let mut budget = OwnerTurnBudget::new(Instant::now());
+    poll_ready_requests(daemon, state, Instant::now(), &mut budget, finish)
 }
 
 /// Post-process one complete response and send it. Returns `true` after a
