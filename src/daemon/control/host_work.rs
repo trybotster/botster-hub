@@ -28,6 +28,15 @@ pub(crate) fn handle(
     request: DaemonRequest,
 ) -> Option<ControlStep> {
     let waiter_id = state.current_waiter_id?;
+    // Only must-finish requests can produce prepared state and park on the
+    // document reservation. Transport closure cannot retire their handoff.
+    debug_assert!(
+        !(is_package_prepare(&request)
+            || is_spawn_target_prepare(&request)
+            || is_session_type_prepare(&request))
+            || crate::daemon::control::pending::request_must_finish(&request),
+        "a parkable host mutation must finish"
+    );
     let (base_revision, state_view) = daemon.state_view();
     let packages = daemon.package_registry_view();
     let entrypoint_processes = (is_package_read(&request) || is_package_prepare(&request))
