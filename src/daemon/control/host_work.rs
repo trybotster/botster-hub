@@ -12,8 +12,8 @@ use crate::host_executor::{
 };
 use crate::host_mutations::{
     HostCommit, HostMutationCommand, HostMutationError, HostMutationResult, HostPackageFinalize,
-    HostPrepare, HostRead, HostRecover, PackageRuntimeEffect, PreparedMutation, RecoveryOutcome,
-    SessionTypeRecovery,
+    HostPackageRestore, HostPrepare, HostRead, HostRecover, PackageRuntimeEffect, PreparedMutation,
+    RecoveryOutcome, SessionTypeRecovery,
 };
 use crate::owner_identity::WaiterId;
 
@@ -215,18 +215,16 @@ pub(crate) fn handle(
                             let restore = effect
                                 .restore_command(runtime.config().data_directory.clone())
                                 .expect("a fallible package effect retains its restore views");
-                            failed_package_effect = Some((effect, error));
-                            debug_assert_eq!(state.document_owner, Some(waiter_id));
-                            // Keep the document reservation through this first whole-state
-                            // restore. No code can replay this snapshot after the reservation
-                            // is released.
-                            return submit_phase(
+                            return submit_package_restore(
                                 daemon,
                                 state,
                                 waiter_id,
-                                HostMutationCommand::RestorePackage(restore),
+                                restore,
+                                effect,
+                                error,
                                 permit,
                                 &mut next_phase,
+                                &mut failed_package_effect,
                             );
                         }
                         finalizing_package = true;
@@ -277,19 +275,8 @@ pub(crate) fn handle(
                     let (effect, original) = failed_package_effect
                         .take()
                         .expect("a package restore failure follows one failed runtime effect");
-                    let original_message = original.to_string();
-                    let compensation_message = failure.error.to_string();
-                    state.package_recovery_required = Some(PackageRecoveryRequired {
-                        original: original_message,
-                        compensation: compensation_message,
-                        _effect: effect,
-                        _permit: permit,
-                    });
                     release_document(state, waiter_id);
-                    ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
-                        original: Box::new(original),
-                        rollbacks: vec![failure],
-                    }))
+                    retain_package_recovery(state, effect, original, failure, permit)
                 }
                 HostMutationResult::Recovered(outcome) => match outcome {
                     RecoveryOutcome::PackageConfiguration { failure, .. }
@@ -347,6 +334,60 @@ pub(crate) fn handle(
             }
         },
     ))
+}
+
+fn submit_package_restore(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    restore: HostPackageRestore,
+    effect: PackageRuntimeEffect,
+    original: DaemonTransportError,
+    permit: HostWorkPermit,
+    next_phase: &mut u64,
+    failed_package_effect: &mut Option<(PackageRuntimeEffect, DaemonTransportError)>,
+) -> ControlPoll {
+    if state.document_owner != Some(waiter_id) {
+        let failure = PackageRollbackFailure {
+            step: "restore_admission",
+            package_name: None,
+            error: Box::new(DaemonTransportError::Protocol(
+                "package restore requires the original document reservation",
+            )),
+        };
+        return retain_package_recovery(state, effect, original, failure, permit);
+    }
+
+    // The document reservation remains held through the first whole-state
+    // restore. No code can replay this snapshot after reservation release.
+    *failed_package_effect = Some((effect, original));
+    submit_phase(
+        daemon,
+        state,
+        waiter_id,
+        HostMutationCommand::RestorePackage(restore),
+        permit,
+        next_phase,
+    )
+}
+
+fn retain_package_recovery(
+    state: &mut DaemonControlState,
+    effect: PackageRuntimeEffect,
+    original: DaemonTransportError,
+    failure: PackageRollbackFailure,
+    permit: HostWorkPermit,
+) -> ControlPoll {
+    state.package_recovery_required = Some(PackageRecoveryRequired {
+        original: original.to_string(),
+        compensation: failure.error.to_string(),
+        _effect: effect,
+        _permit: permit,
+    });
+    ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
+        original: Box::new(original),
+        rollbacks: vec![failure],
+    }))
 }
 
 pub(crate) fn handles(request: &DaemonRequest) -> bool {
@@ -670,6 +711,92 @@ fn is_session_type_prepare(request: &DaemonRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn recovery_test_daemon() -> (HubDaemon, std::path::PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let directory = std::path::PathBuf::from("target")
+            .join("botster-hub-test-data")
+            .join(format!("package-restore-ownership-{unique}"));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "package-restore-ownership".to_string(),
+                display_name: "Package Restore Ownership".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build package restore test config");
+        (
+            HubDaemon::start(config).expect("start test daemon"),
+            directory,
+        )
+    }
+
+    #[test]
+    fn package_restore_without_document_ownership_retains_recovery_and_submits_nothing() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let previous_state = daemon.state_view().1;
+        let previous_packages = daemon.package_registry_view();
+        let effect = PackageRuntimeEffect::Enable {
+            package_name: "broken.plugin".to_string(),
+            previous_state: previous_state.clone(),
+            previous_packages: previous_packages.clone(),
+        };
+        let restore = HostPackageRestore {
+            previous_state,
+            previous_packages,
+            data_directory: directory.clone(),
+        };
+        let permit = daemon
+            .runtime()
+            .expect("runtime")
+            .host_executor()
+            .try_reserve()
+            .expect("reserve host work");
+        let mut state = DaemonControlState::default();
+        let mut next_phase = 7;
+        let mut failed_package_effect = None;
+
+        let poll = submit_package_restore(
+            &daemon,
+            &mut state,
+            WaiterId(41),
+            restore,
+            effect,
+            DaemonTransportError::DaemonNotRunning,
+            permit,
+            &mut next_phase,
+            &mut failed_package_effect,
+        );
+
+        assert!(matches!(
+            poll,
+            ControlPoll::Ready(Err(DaemonTransportError::PackageCompensation {
+                ref rollbacks,
+                ..
+            })) if rollbacks.len() == 1 && rollbacks[0].step == "restore_admission"
+        ));
+        assert!(state.package_recovery_required.is_some());
+        assert!(failed_package_effect.is_none());
+        assert_eq!(next_phase, 7);
+        assert!(matches!(
+            daemon
+                .runtime()
+                .expect("runtime")
+                .host_executor()
+                .poll_completion(),
+            crate::host_executor::HostCompletionPoll::Empty
+        ));
+
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove package restore test directory");
+    }
 
     #[test]
     fn document_release_and_stale_handoff_wake_one_waiter_each() {

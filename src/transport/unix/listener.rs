@@ -19,6 +19,7 @@ use botster_hub_client::{
     DaemonDiagnostic, DaemonEndpoint, DaemonTransportError as ClientDaemonTransportError,
     ServerFrame,
 };
+use notify::{RecursiveMode, Watcher};
 use tokio::io::BufReader as AsyncBufReader;
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStream};
 use tokio::sync::{Semaphore, mpsc as tokio_mpsc, watch};
@@ -96,86 +97,144 @@ pub(crate) fn acquire_socket_owner_lock(
     Ok(SocketOwnerLock { file })
 }
 
-pub(crate) async fn accept_connections(
+pub(crate) fn accept_connections(
     mut listener: TokioUnixListener,
     control_tx: tokio_mpsc::Sender<ControlMessage>,
     mut shutdown_rx: watch::Receiver<bool>,
     admission: Arc<Semaphore>,
-    mut rebind_rx: tokio_mpsc::Receiver<PathBuf>,
-) {
-    let rejection_admission = Arc::new(Semaphore::new(DAEMON_MAX_REJECTION_TASKS));
-    let mut rejection_tasks = tokio::task::JoinSet::new();
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, _)) => {
-                        match admission.clone().try_acquire_owned() {
-                            Ok(admission_permit) => {
-                                if control_tx
-                                    .send(ControlMessage::AcceptedConnection {
-                                        stream,
-                                        admission_permit,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Err(_) => {
-                                let permit = tokio::select! {
-                                    permit = rejection_admission.clone().acquire_owned() => {
-                                        permit.expect("rejection semaphore remains owned by accept loop")
-                                    }
-                                    changed = shutdown_rx.changed() => {
-                                        let _ = changed;
-                                        return;
-                                    }
-                                };
-                                let rejection_tx = control_tx.clone();
-                                rejection_tasks.spawn(async move {
-                                    let _permit = permit;
-                                    reject_connection_async(stream).await;
-                                    let _ = rejection_tx
-                                        .send(ControlMessage::RejectedConnection)
-                                        .await;
-                                });
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("botster-hub daemon accept error: {error}");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-            rebind = rebind_rx.recv() => {
-                let Some(path) = rebind else {
-                    return;
-                };
-                if path.exists() {
-                    continue;
-                }
-                match TokioUnixListener::bind(&path) {
-                    Ok(rebound) => {
-                        listener = rebound;
-                    }
-                    Err(error) => {
-                        eprintln!("botster-hub daemon socket rebind error: {error}");
-                    }
-                }
-            }
-            changed = shutdown_rx.changed() => {
-                let _ = changed;
+) -> impl Future<Output = ()> + Send {
+    // Register the directory watch before returning the future. Besides making
+    // startup deterministic, this closes the gap between binding the initial
+    // listener and beginning to poll the accept loop.
+    let socket_events = SocketPathEvents::new(&listener);
+    async move {
+        let mut socket_events = match socket_events {
+            Ok(events) => events,
+            Err(error) => {
+                eprintln!("botster-hub daemon socket watch error: {error}");
                 return;
             }
-            result = rejection_tasks.join_next(), if !rejection_tasks.is_empty() => {
-                if let Some(Err(error)) = result {
-                    eprintln!("botster-hub daemon rejection task error: {error}");
+        };
+        if socket_events.missing_at_start {
+            rebind_listener(&mut listener, &socket_events.path);
+        }
+
+        let rejection_admission = Arc::new(Semaphore::new(DAEMON_MAX_REJECTION_TASKS));
+        let mut rejection_tasks = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => {
+                            match admission.clone().try_acquire_owned() {
+                                Ok(admission_permit) => {
+                                    if control_tx
+                                        .send(ControlMessage::AcceptedConnection {
+                                            stream,
+                                            admission_permit,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(_) => {
+                                    let permit = tokio::select! {
+                                        permit = rejection_admission.clone().acquire_owned() => {
+                                            permit.expect("rejection semaphore remains owned by accept loop")
+                                        }
+                                        changed = shutdown_rx.changed() => {
+                                            let _ = changed;
+                                            return;
+                                        }
+                                    };
+                                    let rejection_tx = control_tx.clone();
+                                    rejection_tasks.spawn(async move {
+                                        let _permit = permit;
+                                        reject_connection_async(stream).await;
+                                        let _ = rejection_tx
+                                            .send(ControlMessage::RejectedConnection)
+                                            .await;
+                                    });
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("botster-hub daemon accept error: {error}");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+                event = socket_events.events.recv() => {
+                    let Some(event) = event else {
+                        return;
+                    };
+                    if let Err(error) = event {
+                        eprintln!("botster-hub daemon socket watch error: {error}");
+                    }
+                    rebind_listener(&mut listener, &socket_events.path);
+                }
+                changed = shutdown_rx.changed() => {
+                    let _ = changed;
+                    return;
+                }
+                result = rejection_tasks.join_next(), if !rejection_tasks.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        eprintln!("botster-hub daemon rejection task error: {error}");
+                    }
                 }
             }
         }
+    }
+}
+
+struct SocketPathEvents {
+    // The watcher must remain alive for its callback to keep receiving events.
+    _watcher: notify::RecommendedWatcher,
+    events: tokio_mpsc::Receiver<notify::Result<notify::Event>>,
+    path: PathBuf,
+    missing_at_start: bool,
+}
+
+impl SocketPathEvents {
+    fn new(listener: &TokioUnixListener) -> Result<Self, String> {
+        let path = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .as_pathname()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "Unix listener has no public socket path".to_string())?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "socket path has no parent directory".to_string())?;
+        let (events_tx, events) = tokio_mpsc::channel(1);
+        let mut watcher = notify::recommended_watcher(move |event| {
+            // Coalesce bursts: one queued wake is enough because the accept
+            // loop checks the path's current state rather than event history.
+            let _ = events_tx.try_send(event);
+        })
+        .map_err(|error| error.to_string())?;
+        watcher
+            .watch(parent, RecursiveMode::NonRecursive)
+            .map_err(|error| error.to_string())?;
+        let missing_at_start = !path.exists();
+        Ok(Self {
+            _watcher: watcher,
+            events,
+            path,
+            missing_at_start,
+        })
+    }
+}
+
+fn rebind_listener(listener: &mut TokioUnixListener, path: &Path) {
+    if path.exists() {
+        return;
+    }
+    match TokioUnixListener::bind(path) {
+        Ok(rebound) => *listener = rebound,
+        Err(error) => eprintln!("botster-hub daemon socket rebind error: {error}"),
     }
 }
 
@@ -256,11 +315,6 @@ pub(crate) fn prepare_socket_path(
     }
 }
 
-/// Ask the accept loop to recreate a listener when the public path is gone.
-pub(crate) fn rebind_missing_socket_path(rebind_tx: &tokio_mpsc::Sender<PathBuf>, path: &Path) {
-    let _ = rebind_tx.try_send(path.to_path_buf());
-}
-
 pub(crate) fn cleanup_socket_path(path: &Path, owner: SocketOwnerLock) {
     let _ = fs::remove_file(path);
     drop(owner);
@@ -291,8 +345,9 @@ mod tests {
     use super::*;
 
     fn temp_socket_path(tag: &str) -> PathBuf {
+        let tag = tag.chars().next().unwrap_or('x');
         std::env::temp_dir().join(format!(
-            "botster-hub-listener-{tag}-{}-{}.sock",
+            "bhl-{tag}-{}-{}.sock",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -391,5 +446,54 @@ mod tests {
         assert!(socket.exists(), "an unrelated path is never unlinked");
         let _ = fs::remove_file(&socket);
         drop(owner);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unlinking_live_socket_rebinds_without_transport_traffic() {
+        let socket = temp_socket_path("event-rebind");
+        let owner = acquire_socket_owner_lock(&socket).expect("lock");
+        prepare_socket_path(&socket, &owner).expect("prepare");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TokioUnixListener::from_std(listener).expect("Tokio listener");
+        let (control_tx, _control_rx) = tokio_mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Creating the future synchronously registers the filesystem watcher,
+        // so no control message, connection, or terminal frame is needed to
+        // prompt the rebind after this unlink.
+        let accept_loop = accept_connections(
+            listener,
+            control_tx,
+            shutdown_rx,
+            Arc::new(Semaphore::new(1)),
+        );
+        fs::remove_file(&socket).expect("unlink live socket");
+        let accept_task = tokio::spawn(accept_loop);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fs::symlink_metadata(&socket)
+                    .is_ok_and(|metadata| metadata.file_type().is_socket())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("filesystem event should cause the listener to rebind");
+        assert!(matches!(
+            acquire_socket_owner_lock(&socket),
+            Err(DaemonTransportError::AlreadyRunning)
+        ));
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(1), accept_task)
+            .await
+            .expect("accept loop should stop")
+            .expect("accept task should not panic");
+        cleanup_socket_path(&socket, owner);
+        let _ = fs::remove_file(SocketOwnerLock::lock_path(&socket));
     }
 }
