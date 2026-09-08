@@ -7526,6 +7526,7 @@ mod tests {
                 package_name: "workflow.plugin".to_string(),
                 state: "loaded".to_string(),
                 loaded: true,
+                load_failure: None,
             }],
             plugin_worker_counters: Some(DaemonPluginWorkerCounters {
                 configured_queue_capacity: 64,
