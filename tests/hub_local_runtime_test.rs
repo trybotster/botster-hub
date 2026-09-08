@@ -455,7 +455,7 @@ fn persist_package_registry(daemon: &HubDaemon) {
     let snapshot = daemon.package_registry().snapshot();
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update_unreserved_test_fixture(&config, |state| {
+        .update_test_fixture(&config, |state| {
             state.package_registry = snapshot;
         })
         .expect("persist runtime package registry");

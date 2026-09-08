@@ -19,7 +19,7 @@ use crate::{FileHubStateStore, HubConfig, HubState, HubStateStoreResult};
 
 /// Test-only durable state fixture writes through the reserved production path.
 pub trait TestHubStateStoreExt {
-    fn update_unreserved_test_fixture(
+    fn update_test_fixture(
         &self,
         config: &HubConfig,
         update: impl FnOnce(&mut HubState),
@@ -27,7 +27,7 @@ pub trait TestHubStateStoreExt {
 }
 
 impl TestHubStateStoreExt for FileHubStateStore {
-    fn update_unreserved_test_fixture(
+    fn update_test_fixture(
         &self,
         config: &HubConfig,
         update: impl FnOnce(&mut HubState),

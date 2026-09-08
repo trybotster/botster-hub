@@ -693,32 +693,22 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_session_arm_installs_exact_suppression_before_core_request() {
+    fn shutdown_handler_installs_exact_suppression_before_core_request() {
         const TRANSPORT: &str = include_str!("../daemon/control/sessions.rs");
-        let shutdown_needle = format!(
-            "{}{}{}",
-            "DaemonRequest::ShutdownSession ",
-            "{ session_id } => ",
-            char::from_u32(0x7b).expect("left brace"),
-        );
-        let read_screen_needle = "DaemonRequest::ReadScreen { session_id } =>";
-        let arm = TRANSPORT
-            .split(&shutdown_needle)
+        let handler = TRANSPORT
+            .split("fn handle_shutdown_session(")
             .nth(1)
-            .expect("ShutdownSession arm")
-            .split(read_screen_needle)
-            .next()
-            .expect("ShutdownSession arm end");
-        let unix_suppress = arm
+            .expect("shutdown handler");
+        let unix_suppress = handler
             .find("suppress_unix_session_close_events")
             .expect("unix suppression");
-        let webrtc_suppress = arm
+        let webrtc_suppress = handler
             .find("suppress_webrtc_session_close_events")
             .expect("webrtc suppression");
-        let core = arm
-            .find("HubClientRequest::Shutdown")
+        let core = handler
+            .find("begin_shutdown_session")
             .expect("Core Shutdown request");
-        let stopping = arm
+        let stopping = handler
             .find("ShutdownSessionClassification::Stopping")
             .expect("Stopping classification");
         assert!(
@@ -729,7 +719,7 @@ mod tests {
             unix_suppress < core && webrtc_suppress < core,
             "ShutdownSession must install exact-key suppression before the Core request"
         );
-        let after_core = &arm[core..];
+        let after_core = &handler[core..];
         assert!(
             !after_core.contains("suppress_unix_session_close_events")
                 && !after_core.contains("suppress_webrtc_session_close_events"),
@@ -737,7 +727,7 @@ mod tests {
         );
         const CLOSED: &str = include_str!("closed_events.rs");
         assert!(
-            arm.contains("suppress_unix_session_close_events")
+            handler.contains("suppress_unix_session_close_events")
                 && CLOSED.contains("suppress_session_route_generations"),
             "helpers must snapshot exact route generations, not session-wide keys"
         );

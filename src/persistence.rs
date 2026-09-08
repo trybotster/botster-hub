@@ -348,7 +348,7 @@ impl FileHubStateStore {
 
     /// Update a unit-test fixture without a live runtime or retained shared views.
     #[cfg(test)]
-    pub(crate) fn update_unreserved_test_fixture(
+    pub(crate) fn update_test_fixture(
         &self,
         config: &HubConfig,
         update: impl FnOnce(&mut HubState),
@@ -879,7 +879,7 @@ mod tests {
         );
 
         store
-            .update_unreserved_test_fixture(&config, |state| {
+            .update_test_fixture(&config, |state| {
                 state.credential_keys.push(CredentialKeyReference {
                     key_id: key_id.clone(),
                     provider: CredentialProviderKind::TestFile,
@@ -1068,7 +1068,7 @@ mod tests {
             .expect("enable package");
 
         store
-            .update_unreserved_test_fixture(&config, |state| {
+            .update_test_fixture(&config, |state| {
                 state.package_registry = registry.snapshot();
                 state.capability_grants.push(CapabilityGrantRecord {
                     subject: "workflow.plugin".to_string(),
@@ -1135,7 +1135,7 @@ mod tests {
             .expect("set package configuration");
 
         store
-            .update_unreserved_test_fixture(&config, |state| {
+            .update_test_fixture(&config, |state| {
                 state.package_registry = registry.snapshot();
             })
             .expect("persist state");
@@ -1189,7 +1189,7 @@ mod tests {
         }];
 
         store
-            .update_unreserved_test_fixture(&config, |state| {
+            .update_test_fixture(&config, |state| {
                 state.package_registry = snapshot;
             })
             .expect("persist runnable entrypoint state");
