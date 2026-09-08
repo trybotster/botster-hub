@@ -3782,6 +3782,25 @@ impl HubRuntime {
             .submit(|daemon| daemon.list_terminal_subscriptions())
     }
 
+    /// Return the exact live generation for each requested terminal route.
+    pub(crate) fn terminal_subscription_generations(
+        &self,
+        routes: Vec<(String, String)>,
+    ) -> CoreTicket<Vec<(String, String, Option<TerminalSubscriptionGeneration>)>> {
+        self.core_daemon.submit(move |daemon| {
+            routes
+                .into_iter()
+                .map(|(session_id, subscription_id)| {
+                    let generation = daemon.terminal_subscription_generation(
+                        &SessionId(session_id.clone()),
+                        &SubscriptionId(subscription_id.clone()),
+                    );
+                    (session_id, subscription_id, generation)
+                })
+                .collect()
+        })
+    }
+
     /// Detach one route for a client: the exact generation when the owner
     /// recorded one, otherwise whatever generation the client owns now.
     pub(crate) fn detach_route_exact_or_owned(

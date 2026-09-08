@@ -602,6 +602,25 @@ impl AttachStreamRegistry {
         }
     }
 
+    /// Return exact bound routes for one bounded reconciliation slice.
+    pub(crate) fn inventory_reconcile_routes(
+        &self,
+        read_epoch: u64,
+        after: Option<&(String, String)>,
+        max_entries: usize,
+    ) -> Vec<(String, String)> {
+        let start = match after {
+            Some(after_key) => Bound::Excluded(after_key.clone()),
+            None => Bound::Unbounded,
+        };
+        self.streams
+            .range((start, Bound::Unbounded))
+            .take(max_entries)
+            .filter(|(_, stream)| stream.adapter_bound && stream.identity().epoch <= read_epoch)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// Visit at most `max_entries` stream-map rows after `after`, exclusive.
     /// Unbound rows count toward the visit budget and advance the cursor.
     ///

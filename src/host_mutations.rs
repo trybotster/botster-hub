@@ -73,6 +73,10 @@ pub(crate) fn execute(command: HostMutationCommand) -> HostMutationResult {
         HostMutationCommand::Recover(recover) => {
             Ok(HostMutationResult::Recovered(execute_recovery(recover)))
         }
+        HostMutationCommand::RestorePackage(restore) => return execute_package_restore(restore),
+        HostMutationCommand::FinalizePackage(finalize) => {
+            finalize_package_reply(finalize).map(HostMutationResult::ReadReady)
+        }
     };
     result.unwrap_or_else(HostMutationResult::Failed)
 }
@@ -83,6 +87,8 @@ pub(crate) enum HostMutationCommand {
     Prepare(HostPrepare),
     Commit(HostCommit),
     Recover(HostRecover),
+    RestorePackage(HostPackageRestore),
+    FinalizePackage(HostPackageFinalize),
 }
 
 impl std::fmt::Debug for HostMutationCommand {
@@ -100,6 +106,8 @@ impl std::fmt::Debug for HostMutationCommand {
             }
             Self::Commit(_) => "Commit",
             Self::Recover(_) => "Recover",
+            Self::RestorePackage(_) => "RestorePackage",
+            Self::FinalizePackage(_) => "FinalizePackage",
         };
         formatter.write_str(name)
     }
@@ -177,12 +185,33 @@ pub(crate) struct HostRecover {
     pub(crate) failure: HostMutationError,
 }
 
+/// A durable package rollback after an owner-only runtime effect failed.
+pub(crate) struct HostPackageRestore {
+    pub(crate) previous_state: SharedView<HubState>,
+    pub(crate) previous_packages: SharedView<PackageRegistry>,
+    pub(crate) data_directory: PathBuf,
+}
+
+/// The views restored by one durable package rollback.
+pub(crate) struct RestoredPackageView {
+    pub(crate) view: SharedView<HubState>,
+    pub(crate) packages: SharedView<PackageRegistry>,
+}
+
+/// A committed package response that needs current entrypoint snapshots.
+pub(crate) struct HostPackageFinalize {
+    pub(crate) reply: HostReply,
+    pub(crate) entrypoint_processes: Vec<EntrypointProcessSnapshot>,
+}
+
 /// One typed host result.
 pub(crate) enum HostMutationResult {
     ReadReady(HostReply),
     Prepared(PreparedMutation),
     Committed(CommittedView),
     Recovered(RecoveryOutcome),
+    PackageRestored(RestoredPackageView),
+    PackageRestoreFailed(crate::HubStateStoreError),
     Failed(HostMutationError),
 }
 
@@ -203,9 +232,43 @@ impl std::fmt::Debug for HostMutationResult {
                 .field("committed_revision", &committed.committed_revision)
                 .finish_non_exhaustive(),
             Self::Recovered(_) => formatter.write_str("Recovered(..)"),
+            Self::PackageRestored(_) => formatter.write_str("PackageRestored(..)"),
+            Self::PackageRestoreFailed(error) => formatter
+                .debug_tuple("PackageRestoreFailed")
+                .field(error)
+                .finish(),
             Self::Failed(error) => formatter.debug_tuple("Failed").field(error).finish(),
         }
     }
+}
+
+fn execute_package_restore(restore: HostPackageRestore) -> HostMutationResult {
+    let HostPackageRestore {
+        previous_state,
+        previous_packages,
+        data_directory,
+    } = restore;
+    let store = FileHubStateStore::for_data_directory(data_directory);
+    let write = match store.prepare_shared((*previous_state).clone(), &previous_state.budget()) {
+        Ok(write) => write,
+        Err(error) => return HostMutationResult::PackageRestoreFailed(error),
+    };
+    match store.commit_shared(write) {
+        Ok(view) => HostMutationResult::PackageRestored(RestoredPackageView {
+            view,
+            packages: previous_packages,
+        }),
+        Err(error) => HostMutationResult::PackageRestoreFailed(error),
+    }
+}
+
+fn finalize_package_reply(finalize: HostPackageFinalize) -> Result<HostReply, HostMutationError> {
+    let HostPackageFinalize {
+        mut reply,
+        entrypoint_processes,
+    } = finalize;
+    apply_daemon_entrypoint_processes(&mut reply.response, entrypoint_processes);
+    HostReply::try_new(reply.response)
 }
 
 /// A response and its checked logical encoded-byte count.
@@ -281,6 +344,34 @@ pub(crate) enum PackageRuntimeEffect {
         running_entrypoints: BTreeMap<String, Vec<String>>,
         packages: Vec<PackageRefreshEffect>,
     },
+}
+
+impl PackageRuntimeEffect {
+    pub(crate) fn restore_command(&self, data_directory: PathBuf) -> Option<HostPackageRestore> {
+        let (previous_state, previous_packages) = match self {
+            Self::Enable {
+                previous_state,
+                previous_packages,
+                ..
+            }
+            | Self::Reload {
+                previous_state,
+                previous_packages,
+                ..
+            }
+            | Self::Refresh {
+                previous_state,
+                previous_packages,
+                ..
+            } => (previous_state.clone(), previous_packages.clone()),
+            Self::Disable { .. } | Self::Remove { .. } => return None,
+        };
+        Some(HostPackageRestore {
+            previous_state,
+            previous_packages,
+            data_directory,
+        })
+    }
 }
 
 /// Post-commit work for one refreshed local package.
@@ -1951,6 +2042,41 @@ fn apply_entrypoint_processes(
     }
 }
 
+fn apply_daemon_entrypoint_processes(
+    response: &mut DaemonResponse,
+    snapshots: Vec<EntrypointProcessSnapshot>,
+) {
+    for snapshot in snapshots {
+        let Some(package) = response
+            .packages
+            .iter_mut()
+            .find(|package| package.package_name == snapshot.package_name)
+        else {
+            continue;
+        };
+        let Some(entrypoint) = package
+            .runnable_entrypoints
+            .iter_mut()
+            .find(|entrypoint| entrypoint.id == snapshot.entrypoint_id)
+        else {
+            continue;
+        };
+        entrypoint.process.state = snapshot.state;
+        entrypoint.process.pid = snapshot.pid;
+        entrypoint.process.started_at = snapshot.started_at;
+        entrypoint.process.exited_at = snapshot.exited_at;
+        entrypoint.process.exit_status = snapshot.exit_status;
+        entrypoint.process.diagnostics = snapshot
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| DaemonPackageDiagnostic {
+                kind: diagnostic.kind,
+                message: diagnostic.message,
+            })
+            .collect();
+    }
+}
+
 fn daemon_error(error: DaemonTransportError) -> HostMutationError {
     match error {
         DaemonTransportError::Client(crate::HubClientError::SessionType {
@@ -2618,7 +2744,7 @@ mod tests {
         else {
             panic!("spawn-target prepare must succeed");
         };
-        FileHubStateStore::inject_next_save_failure();
+        FileHubStateStore::inject_next_save_failure(&data_directory);
         let HostMutationResult::Recovered(RecoveryOutcome::SpawnTarget { view, failure }) =
             execute(HostMutationCommand::Commit(HostCommit { prepared }))
         else {
@@ -2681,7 +2807,7 @@ mod tests {
         else {
             panic!("session-type prepare must succeed");
         };
-        FileHubStateStore::inject_next_save_failure();
+        FileHubStateStore::inject_next_save_failure(&data_directory);
         let HostMutationResult::Recovered(RecoveryOutcome::SessionType {
             view,
             failure,

@@ -51,6 +51,7 @@ pub(crate) enum HostCommand {
         state: SharedView<HubState>,
     },
     Mutation(crate::host_mutations::HostMutationCommand),
+    ReclaimSessionTypeCatalog(SessionTypeCatalogReclamation),
     /// Run this external-effect phase before document admission. The owner must
     /// not hold the shared document reservation while Git runs.
     CreateManagedWorktree {
@@ -80,6 +81,7 @@ impl HostCommand {
         match self {
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
             Self::Mutation(_) => 0,
+            Self::ReclaimSessionTypeCatalog(_) => 0,
             Self::CreateManagedWorktree { .. } | Self::FinalizeManagedWorktree { .. } => 0,
             #[cfg(test)]
             Self::Panic { generation } => *generation,
@@ -97,6 +99,7 @@ impl std::fmt::Debug for HostCommand {
                 .field("generation", generation)
                 .finish_non_exhaustive(),
             Self::Mutation(command) => formatter.debug_tuple("Mutation").field(command).finish(),
+            Self::ReclaimSessionTypeCatalog(_) => formatter.write_str("ReclaimSessionTypeCatalog"),
             Self::CreateManagedWorktree { .. } => formatter
                 .debug_struct("CreateManagedWorktree")
                 .finish_non_exhaustive(),
@@ -116,6 +119,12 @@ impl std::fmt::Debug for HostCommand {
                 .finish_non_exhaustive(),
         }
     }
+}
+
+/// One superseded catalog allocation and its retained byte charge.
+pub(crate) struct SessionTypeCatalogReclamation {
+    pub(crate) entities: BTreeMap<String, Value>,
+    pub(crate) prepared_charge: Option<HostPreparedCharge>,
 }
 
 #[derive(Debug)]
@@ -173,36 +182,25 @@ impl HostCompletion {
         let Self {
             mut result, permit, ..
         } = self;
-        let logical_bytes = match &result {
-            HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
-            HostResult::Failed { .. } => 0,
-            HostResult::Mutation(_) => 0,
-            HostResult::ManagedWorktreeCreated(_)
-            | HostResult::ManagedWorktreeFailed(_)
-            | HostResult::ManagedWorktreeFinalized
-            | HostResult::ManagedWorktreeRecoveryRequired { .. } => 0,
-        };
-        if logical_bytes > HOST_PREPARED_BYTE_CAPACITY {
-            let generation = result.generation();
-            result = HostResult::Failed {
-                generation,
-                error: HostError::new(
-                    "host_result_too_large",
-                    "host result exceeds its prepared-byte reservation",
-                ),
-            };
-        }
-        let logical_bytes = match &result {
-            HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
-            HostResult::Failed { .. } => 0,
-            HostResult::Mutation(_) => 0,
-            HostResult::ManagedWorktreeCreated(_)
-            | HostResult::ManagedWorktreeFailed(_)
-            | HostResult::ManagedWorktreeFinalized
-            | HostResult::ManagedWorktreeRecoveryRequired { .. } => 0,
-        };
+        normalize_result_size(&mut result);
+        let logical_bytes = result_logical_bytes(&result);
         let charge = permit.into_prepared_charge(logical_bytes);
         (result, charge)
+    }
+
+    /// Retain this operation slot for an off-owner reclamation job.
+    pub(crate) fn release_for_reclamation(
+        self,
+    ) -> (HostResult, HostPreparedCharge, HostWorkPermit) {
+        let Self {
+            mut result,
+            mut permit,
+            ..
+        } = self;
+        normalize_result_size(&mut result);
+        let logical_bytes = result_logical_bytes(&result);
+        let charge = permit.take_prepared_charge(logical_bytes);
+        (result, charge, permit)
     }
 
     pub(crate) fn into_parts(self) -> (HostJobIdentity, HostResult, HostWorkPermit) {
@@ -220,6 +218,30 @@ impl HostCompletion {
             result,
             permit,
         }
+    }
+}
+
+fn normalize_result_size(result: &mut HostResult) {
+    if result_logical_bytes(result) > HOST_PREPARED_BYTE_CAPACITY {
+        let generation = result.generation();
+        *result = HostResult::Failed {
+            generation,
+            error: HostError::new(
+                "host_result_too_large",
+                "host result exceeds its prepared-byte reservation",
+            ),
+        };
+    }
+}
+
+fn result_logical_bytes(result: &HostResult) -> usize {
+    match result {
+        HostResult::SessionTypeCatalogReady { logical_bytes, .. } => *logical_bytes,
+        HostResult::Failed { .. } | HostResult::Mutation(_) => 0,
+        HostResult::ManagedWorktreeCreated(_)
+        | HostResult::ManagedWorktreeFailed(_)
+        | HostResult::ManagedWorktreeFinalized
+        | HostResult::ManagedWorktreeRecoveryRequired { .. } => 0,
     }
 }
 
@@ -358,6 +380,10 @@ pub(crate) struct HostWorkPermit {
 
 impl HostWorkPermit {
     pub(crate) fn into_prepared_charge(mut self, logical_bytes: usize) -> HostPreparedCharge {
+        self.take_prepared_charge(logical_bytes)
+    }
+
+    fn take_prepared_charge(&mut self, logical_bytes: usize) -> HostPreparedCharge {
         let reservation = self
             .prepared
             .take()
@@ -509,6 +535,52 @@ impl HostExecutor {
             })
     }
 
+    pub(crate) fn submit_catalog_reclamation(
+        &self,
+        identity: HostJobIdentity,
+        reclamation: SessionTypeCatalogReclamation,
+        permit: HostWorkPermit,
+    ) -> Result<
+        (),
+        (
+            HostSubmitError,
+            SessionTypeCatalogReclamation,
+            HostWorkPermit,
+        ),
+    > {
+        let job = HostJob {
+            identity,
+            command: HostCommand::ReclaimSessionTypeCatalog(reclamation),
+            permit,
+        };
+        let Some(jobs) = self.jobs.as_ref() else {
+            let HostJob {
+                command: HostCommand::ReclaimSessionTypeCatalog(reclamation),
+                permit,
+                ..
+            } = job
+            else {
+                unreachable!()
+            };
+            return Err((HostSubmitError::Stopped, reclamation, permit));
+        };
+        jobs.try_send(job).map_err(|error| {
+            let (kind, job) = match error {
+                mpsc::TrySendError::Full(job) => (HostSubmitError::Full, job),
+                mpsc::TrySendError::Disconnected(job) => (HostSubmitError::Stopped, job),
+            };
+            let HostJob {
+                command: HostCommand::ReclaimSessionTypeCatalog(reclamation),
+                permit,
+                ..
+            } = job
+            else {
+                unreachable!()
+            };
+            (kind, reclamation, permit)
+        })
+    }
+
     pub(crate) fn poll_completion(&self) -> HostCompletionPoll {
         poll_completion_mailbox(&self.completions)
     }
@@ -574,6 +646,19 @@ fn run_worker(
             command,
             permit,
         } = job;
+        let command = match command {
+            HostCommand::ReclaimSessionTypeCatalog(reclamation) => {
+                let SessionTypeCatalogReclamation {
+                    entities,
+                    prepared_charge,
+                } = reclamation;
+                drop(entities);
+                drop(prepared_charge);
+                drop(permit);
+                continue;
+            }
+            command => command,
+        };
         let generation = command.generation();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(command)))
             .unwrap_or_else(|_| HostResult::Failed {
@@ -636,6 +721,9 @@ fn execute(command: HostCommand) -> HostResult {
         },
         HostCommand::Mutation(command) => {
             HostResult::Mutation(crate::host_mutations::execute(command))
+        }
+        HostCommand::ReclaimSessionTypeCatalog(_) => {
+            unreachable!("catalog reclamation completes without a result")
         }
         HostCommand::CreateManagedWorktree { request } => {
             match create_managed_worktree_effect(&request) {

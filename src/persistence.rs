@@ -7,14 +7,14 @@
 //! when a write fails before rename, but concurrent hub processes can still
 //! produce last-writer-wins updates.
 
-#[cfg(test)]
-use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use botster_core::{Capability, CapabilitySurface};
 use serde::{Deserialize, Serialize};
@@ -459,13 +459,9 @@ impl FileHubStateStore {
     ) -> HubStateStoreResult<SharedView<HubState>> {
         let PreparedHubStateWrite { state, bytes, .. } = prepared;
         #[cfg(test)]
-        if let Some(remaining) = SAVES_UNTIL_FAILURE.with(|cell| cell.get()) {
-            if remaining == 0 {
-                SAVES_UNTIL_FAILURE.with(|cell| cell.set(None));
-                self.write_temporary_file(&bytes)?;
-                return Err(HubStateStoreError::InjectedWriteFailure);
-            }
-            SAVES_UNTIL_FAILURE.with(|cell| cell.set(Some(remaining - 1)));
+        if save_failure_is_due(&self.path) {
+            self.write_temporary_file(&bytes)?;
+            return Err(HubStateStoreError::InjectedWriteFailure);
         }
         self.write_prepared_atomically(&bytes)?;
         Ok(state)
@@ -473,20 +469,44 @@ impl FileHubStateStore {
 
     /// Fail the next `save` after writing the temporary file, before rename.
     #[cfg(test)]
-    pub fn inject_next_save_failure() {
-        Self::inject_save_failure_after(0);
+    pub fn inject_next_save_failure(data_directory: impl AsRef<Path>) {
+        Self::inject_save_failure_after(data_directory, 0);
     }
 
     /// Allow `successful_saves` durable writes, then fail the next `save`.
     #[cfg(test)]
-    pub fn inject_save_failure_after(successful_saves: u32) {
-        SAVES_UNTIL_FAILURE.with(|remaining| remaining.set(Some(successful_saves)));
+    pub fn inject_save_failure_after(data_directory: impl AsRef<Path>, successful_saves: u32) {
+        save_failures()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                data_directory.as_ref().join(HUB_STATE_FILE_NAME),
+                successful_saves,
+            );
     }
 }
 
 #[cfg(test)]
-thread_local! {
-    static SAVES_UNTIL_FAILURE: Cell<Option<u32>> = const { Cell::new(None) };
+fn save_failures() -> &'static Mutex<std::collections::BTreeMap<PathBuf, u32>> {
+    static FAILURES: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, u32>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn save_failure_is_due(path: &Path) -> bool {
+    let mut failures = save_failures()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(remaining) = failures.get_mut(path) else {
+        return false;
+    };
+    if *remaining == 0 {
+        failures.remove(path);
+        true
+    } else {
+        *remaining -= 1;
+        false
+    }
 }
 
 impl HubStateStore for FileHubStateStore {
@@ -518,12 +538,8 @@ impl HubStateStore for FileHubStateStore {
             .validate_version()
             .map_err(HubStateStoreError::State)?;
         #[cfg(test)]
-        if let Some(remaining) = SAVES_UNTIL_FAILURE.with(|cell| cell.get()) {
-            if remaining == 0 {
-                SAVES_UNTIL_FAILURE.with(|cell| cell.set(None));
-                return self.save_with_injected_failure(state);
-            }
-            SAVES_UNTIL_FAILURE.with(|cell| cell.set(Some(remaining - 1)));
+        if save_failure_is_due(&self.path) {
+            return self.save_with_injected_failure(state);
         }
         self.write_atomically(state)
     }

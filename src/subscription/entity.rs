@@ -28,8 +28,8 @@ use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_turn::{OwnerTurnBudget, OwnerTurnCharge};
 use crate::host_executor::{
-    HostCommand, HostCompletion, HostCompletionPoll, HostError, HostJobIdentity, HostResult,
-    HostSubmitError,
+    HostCommand, HostCompletion, HostCompletionPoll, HostError, HostExecutor, HostJobIdentity,
+    HostResult, HostSubmitError, HostWorkPermit, SessionTypeCatalogReclamation,
 };
 
 const SESSION_DELIVERY_MAX_ITEMS: usize = 16;
@@ -168,6 +168,11 @@ pub(crate) struct SessionTypeCatalogCache {
     pending: Option<(HostJobIdentity, u64)>,
     requested_generation: Option<u64>,
     waiting_for_capacity: bool,
+    retained_reclamation: Option<(
+        HostJobIdentity,
+        SessionTypeCatalogReclamation,
+        HostWorkPermit,
+    )>,
     failure: Option<(u64, HostError)>,
 }
 
@@ -185,6 +190,14 @@ impl SessionTypeCatalogCache {
     /// Return the requested catalog or submit one bounded off-owner build.
     fn refresh(&mut self, daemon: &HubDaemon, generation: u64) -> SessionTypeCatalogRefresh<'_> {
         self.requested_generation = Some(generation);
+        let Some(runtime) = daemon.runtime() else {
+            return SessionTypeCatalogRefresh::Pending;
+        };
+        self.retry_reclamation(runtime.host_executor());
+        if self.retained_reclamation.is_some() {
+            self.waiting_for_capacity = true;
+            return SessionTypeCatalogRefresh::Pending;
+        }
         if self.generation == Some(generation) {
             return SessionTypeCatalogRefresh::Ready(generation, &self.entities);
         }
@@ -196,9 +209,6 @@ impl SessionTypeCatalogCache {
         if self.pending.is_some() {
             return SessionTypeCatalogRefresh::Pending;
         }
-        let Some(runtime) = daemon.runtime() else {
-            return SessionTypeCatalogRefresh::Pending;
-        };
         let Some(permit) = runtime.host_executor().try_reserve() else {
             self.waiting_for_capacity = true;
             return SessionTypeCatalogRefresh::Pending;
@@ -206,9 +216,6 @@ impl SessionTypeCatalogCache {
         let Some(waiter_id) = runtime.next_waiter_id() else {
             drop(permit);
             self.generation = None;
-            self.entities.clear();
-            self.logical_bytes = 0;
-            self.prepared_charge = None;
             self.failure = Some((
                 generation,
                 HostError {
@@ -246,9 +253,6 @@ impl SessionTypeCatalogCache {
         if let Err(error) = submitted {
             self.pending = None;
             self.generation = None;
-            self.entities.clear();
-            self.logical_bytes = 0;
-            self.prepared_charge = None;
             let (code, message) = match error {
                 HostSubmitError::Full => (
                     "host_executor_full",
@@ -273,17 +277,23 @@ impl SessionTypeCatalogCache {
     }
 
     /// Apply one matching completion. Superseded and duplicate results are discarded.
-    fn absorb(&mut self, completion: HostCompletion) -> bool {
-        let Some((expected_identity, expected_generation)) = self.pending else {
-            drop(completion);
-            return false;
+    fn absorb(&mut self, completion: HostCompletion, executor: &HostExecutor) -> bool {
+        let (expected_identity, expected_generation) = self
+            .pending
+            .expect("a matching catalog completion must have a pending build");
+        debug_assert_eq!(completion.identity, expected_identity);
+        let (result, prepared_charge, reclamation) = if matches!(
+            &completion.result,
+            HostResult::SessionTypeCatalogReady { .. }
+        ) {
+            let (result, prepared_charge, permit) = completion.release_for_reclamation();
+            (result, prepared_charge, Some(permit))
+        } else {
+            let (result, prepared_charge) = completion.release();
+            (result, prepared_charge, None)
         };
-        if completion.identity != expected_identity {
-            drop(completion);
-            return false;
-        }
+        self.waiting_for_capacity = false;
         self.pending = None;
-        let (result, prepared_charge) = completion.release();
         let desired_generation = self.requested_generation.unwrap_or(expected_generation);
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
@@ -293,6 +303,7 @@ impl SessionTypeCatalogCache {
             | HostResult::ManagedWorktreeFailed(_)
             | HostResult::ManagedWorktreeFinalized
             | HostResult::ManagedWorktreeRecoveryRequired { .. } => {
+                drop(reclamation);
                 self.failure = Some((
                     expected_generation,
                     HostError::new(
@@ -304,6 +315,18 @@ impl SessionTypeCatalogCache {
             }
         };
         if result_generation != expected_generation || result_generation != desired_generation {
+            if let HostResult::SessionTypeCatalogReady { entities, .. } = result {
+                let permit = reclamation.expect("catalog result retained its operation slot");
+                self.submit_reclamation(
+                    executor,
+                    expected_identity.next_phase().unwrap_or(expected_identity),
+                    SessionTypeCatalogReclamation {
+                        entities,
+                        prepared_charge: Some(prepared_charge),
+                    },
+                    permit,
+                );
+            }
             return true;
         }
         match result {
@@ -312,18 +335,25 @@ impl SessionTypeCatalogCache {
                 entities,
                 logical_bytes,
             } => {
+                let permit = reclamation.expect("catalog result retained its operation slot");
+                let superseded = SessionTypeCatalogReclamation {
+                    entities: std::mem::replace(&mut self.entities, entities),
+                    prepared_charge: self.prepared_charge.replace(prepared_charge),
+                };
                 self.generation = Some(generation);
-                self.entities = entities;
                 self.logical_bytes = logical_bytes;
-                self.prepared_charge = Some(prepared_charge);
                 self.failure = None;
+                self.submit_reclamation(
+                    executor,
+                    expected_identity.next_phase().unwrap_or(expected_identity),
+                    superseded,
+                    permit,
+                );
             }
             HostResult::Failed { generation, error } => {
+                drop(prepared_charge);
                 eprintln!("session type catalog build failed: {}", error.message);
                 self.generation = None;
-                self.entities.clear();
-                self.logical_bytes = 0;
-                self.prepared_charge = None;
                 self.failure = Some((generation, error));
             }
             HostResult::Mutation(_)
@@ -337,6 +367,29 @@ impl SessionTypeCatalogCache {
         true
     }
 
+    fn submit_reclamation(
+        &mut self,
+        executor: &HostExecutor,
+        identity: HostJobIdentity,
+        reclamation: SessionTypeCatalogReclamation,
+        permit: HostWorkPermit,
+    ) {
+        match executor.submit_catalog_reclamation(identity, reclamation, permit) {
+            Ok(()) => self.waiting_for_capacity = false,
+            Err((_error, reclamation, permit)) => {
+                self.retained_reclamation = Some((identity, reclamation, permit));
+                self.waiting_for_capacity = true;
+            }
+        }
+    }
+
+    fn retry_reclamation(&mut self, executor: &HostExecutor) {
+        let Some((identity, reclamation, permit)) = self.retained_reclamation.take() else {
+            return;
+        };
+        self.submit_reclamation(executor, identity, reclamation, permit);
+    }
+
     fn waiting_for_capacity(&self) -> bool {
         self.waiting_for_capacity
     }
@@ -346,9 +399,6 @@ impl SessionTypeCatalogCache {
             return false;
         };
         self.generation = None;
-        self.entities.clear();
-        self.logical_bytes = 0;
-        self.prepared_charge = None;
         self.failure = Some((
             generation,
             HostError::new(
@@ -1000,7 +1050,7 @@ pub(crate) fn absorb_session_type_catalog_completions(
         match executor.poll_completion() {
             HostCompletionPoll::Ready(completion) => {
                 if state.session_type_catalog.accepts(completion.identity) {
-                    catalog_changed |= state.session_type_catalog.absorb(completion);
+                    catalog_changed |= state.session_type_catalog.absorb(completion, executor);
                 } else {
                     crate::daemon::control::pending::absorb_host_completion(state, completion);
                 }
@@ -2207,14 +2257,22 @@ mod tests {
             },
             permit,
         );
+        let held_permits = (1..crate::host_executor::HOST_OPERATION_CAPACITY)
+            .map(|_| {
+                executor
+                    .try_reserve()
+                    .expect("fill host operation capacity")
+            })
+            .collect::<Vec<_>>();
+        assert!(executor.try_reserve().is_none());
 
-        assert!(cache.absorb(completion));
+        assert!(cache.absorb(completion, &executor));
         assert!(cache.pending.is_none());
         assert_eq!(cache.generation, Some(0));
         assert!(cache.entities.contains_key("current"));
         assert_eq!(cache.logical_bytes, 9);
-        assert!(executor.take_capacity_notification());
-        assert!(executor.try_reserve().is_some());
+        assert!(cache.retained_reclamation.is_none());
+        drop(held_permits);
     }
 
     #[test]
@@ -2243,7 +2301,7 @@ mod tests {
             executor.try_reserve().expect("reserve replacement"),
         );
 
-        assert!(cache.absorb(replacement));
+        assert!(cache.absorb(replacement, &executor));
         assert_eq!(cache.generation, Some(2));
         assert!(cache.entities.contains_key("new"));
         assert!(!cache.entities.contains_key("old"));
@@ -2264,10 +2322,10 @@ mod tests {
             executor.try_reserve().expect("reserve failed replacement"),
         );
 
-        assert!(cache.absorb(failure));
+        assert!(cache.absorb(failure, &executor));
         assert!(cache.generation.is_none());
-        assert!(cache.entities.is_empty());
-        assert_eq!(cache.logical_bytes, 0);
+        assert!(cache.entities.contains_key("new"));
+        assert_eq!(cache.logical_bytes, 7);
         assert!(cache.failure.is_some());
     }
 
