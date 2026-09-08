@@ -280,13 +280,17 @@ fn admit_or_park_commit(
             *retained = Some((prepared, permit));
             ControlPoll::Pending
         }
-        DocumentAdmission::Stale => finish_error(
-            permit,
-            HostMutationError {
-                code: "host_prepared_revision_stale".to_string(),
-                message: "the Hub state changed while the host mutation was prepared".to_string(),
-            },
-        ),
+        DocumentAdmission::Stale => {
+            wake_document_waiters(state);
+            finish_error(
+                permit,
+                HostMutationError {
+                    code: "host_prepared_revision_stale".to_string(),
+                    message: "the Hub state changed while the host mutation was prepared"
+                        .to_string(),
+                },
+            )
+        }
     }
 }
 
@@ -355,7 +359,12 @@ fn release_document(state: &mut DaemonControlState, waiter_id: WaiterId) {
     state
         .blocked_session_type_roots
         .retain(|_, blocked_waiter| *blocked_waiter != waiter_id);
-    if let Some(next) = state.document_waiters.pop_first() {
+    wake_document_waiters(state);
+}
+
+fn wake_document_waiters(state: &mut DaemonControlState) {
+    let waiters = std::mem::take(&mut state.document_waiters);
+    for next in waiters {
         crate::daemon::control::pending::mark_request_ready(
             state,
             next,
@@ -496,4 +505,22 @@ fn is_session_type_prepare(request: &DaemonRequest) -> bool {
             | DaemonRequest::UpdateSessionType { .. }
             | DaemonRequest::DeleteSessionType { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_release_wakes_every_parked_waiter() {
+        let owner = WaiterId(1);
+        let mut state = DaemonControlState::default();
+        state.document_owner = Some(owner);
+        state.document_waiters = [WaiterId(2), WaiterId(3)].into_iter().collect();
+
+        release_document(&mut state, owner);
+
+        assert_eq!(state.document_owner, None);
+        assert!(state.document_waiters.is_empty());
+    }
 }
