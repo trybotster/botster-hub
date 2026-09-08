@@ -44,7 +44,7 @@ pub(crate) enum ReservationBinding {
     Terminal,
     Entity {
         receiver: std::sync::Arc<
-            std::sync::Mutex<Option<mpsc::Receiver<botster_hub_client::DaemonEntityFrame>>>,
+            std::sync::Mutex<Option<mpsc::Receiver<crate::entity_delivery::EntityDelivery>>>,
         >,
     },
     Event {

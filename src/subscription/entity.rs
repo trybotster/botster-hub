@@ -59,11 +59,11 @@ struct SnapshotItemPage {
     cut: SnapshotPageCut,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum EntityFrameSender {
     #[cfg(test)]
     Blocking(SyncSender<DaemonEntityFrame>),
-    Async(tokio::sync::mpsc::Sender<DaemonEntityFrame>),
+    Async(tokio::sync::mpsc::Sender<crate::entity_delivery::EntityDelivery>),
 }
 
 #[derive(Debug)]
@@ -73,6 +73,35 @@ enum EntityFrameTrySendError {
 }
 
 impl EntityFrameSender {
+    /// Call only on a host worker, which drops any rejected frame.
+    pub(crate) fn send_prepared_from_worker(
+        &self,
+        delivery: crate::entity_delivery::PreparedEntityDelivery,
+    ) -> Result<(), crate::entity_delivery::EntitySendError> {
+        use crate::entity_delivery::{EntityDelivery, EntitySendError};
+        match self {
+            #[cfg(test)]
+            Self::Blocking(sender) => {
+                sender
+                    .try_send(delivery.into_typed())
+                    .map_err(|error| match error {
+                        mpsc::TrySendError::Full(_) => EntitySendError::Full,
+                        mpsc::TrySendError::Disconnected(_) => EntitySendError::Disconnected,
+                    })
+            }
+            Self::Async(sender) => {
+                sender
+                    .try_send(EntityDelivery::Encoded(delivery))
+                    .map_err(|error| match error {
+                        tokio::sync::mpsc::error::TrySendError::Full(_) => EntitySendError::Full,
+                        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                            EntitySendError::Disconnected
+                        }
+                    })
+            }
+        }
+    }
+
     fn try_send_kind(&self, frame: DaemonEntityFrame) -> Result<(), EntityFrameTrySendError> {
         match self {
             #[cfg(test)]
@@ -80,9 +109,14 @@ impl EntityFrameSender {
                 mpsc::TrySendError::Full(frame) => EntityFrameTrySendError::Full(frame),
                 mpsc::TrySendError::Disconnected(_) => EntityFrameTrySendError::Disconnected,
             }),
-            Self::Async(sender) => sender.try_send(frame).map_err(|error| match error {
+            Self::Async(sender) => sender.try_send(frame.into()).map_err(|error| match error {
                 tokio::sync::mpsc::error::TrySendError::Full(frame) => {
-                    EntityFrameTrySendError::Full(frame)
+                    EntityFrameTrySendError::Full(match frame {
+                        crate::entity_delivery::EntityDelivery::Typed(frame) => frame,
+                        crate::entity_delivery::EntityDelivery::Encoded(_) => {
+                            unreachable!("typed send returns its typed frame")
+                        }
+                    })
                 }
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                     EntityFrameTrySendError::Disconnected
@@ -3161,13 +3195,16 @@ mod tests {
         };
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         sender
-            .try_send(DaemonEntityFrame::Snapshot {
-                subscription_id: "async-subscription".to_string(),
-                entity_type: "session".to_string(),
-                snapshot_seq: 8,
-                items: Vec::new(),
-                resync_reason: None,
-            })
+            .try_send(
+                DaemonEntityFrame::Snapshot {
+                    subscription_id: "async-subscription".to_string(),
+                    entity_type: "session".to_string(),
+                    snapshot_seq: 8,
+                    items: Vec::new(),
+                    resync_reason: None,
+                }
+                .into(),
+            )
             .expect("fill bounded async subscriber queue");
         let mut state = EntitySubscriptionState {
             sender: EntityFrameSender::Async(sender),
@@ -3216,12 +3253,12 @@ mod tests {
         assert!(state.resync_reason.is_none());
         assert!(matches!(
             receiver.try_recv().expect("receive async resync snapshot"),
-            DaemonEntityFrame::Snapshot {
+            crate::entity_delivery::EntityDelivery::Typed(DaemonEntityFrame::Snapshot {
                 snapshot_seq: 9,
                 ref items,
                 resync_reason: Some(ref reason),
                 ..
-            } if items.is_empty() && reason == &overflow_reason
+            }) if items.is_empty() && reason == &overflow_reason
         ));
 
         drop(receiver);

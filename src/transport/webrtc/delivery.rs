@@ -226,6 +226,20 @@ pub(crate) fn framed_daemon_response(
     frame_correlated_response(key, request_id, encrypted)
 }
 
+pub(crate) fn framed_encoded_entity(
+    key: &AesGcmKey,
+    encoded_frame: &[u8],
+) -> LocalWebrtcResult<Vec<String>> {
+    let encrypted = encrypt_encoded_server_frame(key, encoded_frame)?;
+    if encrypted.len() > LOCAL_WEBRTC_MAX_DELIVERY_BYTES {
+        return Err(LocalWebrtcError::Webrtc(format!(
+            "encrypted daemon entity frame exceeded {LOCAL_WEBRTC_MAX_DELIVERY_BYTES} byte limit"
+        )));
+    }
+    let message_id = random_token("entity")?;
+    frame_encrypted_daemon_delivery(&message_id, &encrypted)
+}
+
 pub(crate) fn framed_encoded_daemon_response(
     key: &AesGcmKey,
     request_id: &str,

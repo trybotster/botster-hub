@@ -94,7 +94,7 @@ pub(crate) enum ControlMessage {
         /// Stable identity for one transport connection generation.
         client_id: Option<String>,
         frame_tx: EntityFrameSender,
-        frame_rx: Option<tokio_mpsc::Receiver<botster_hub_client::DaemonEntityFrame>>,
+        frame_rx: Option<tokio_mpsc::Receiver<crate::entity_delivery::EntityDelivery>>,
         reply_tx: ControlReplySender,
         /// When set, admission requires a still-live local WebRTC peer for this grant.
         /// Socket-path subscriptions leave this `None`.
@@ -186,7 +186,7 @@ pub(crate) enum BoundSubscription {
         usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     },
     Entity {
-        receiver: tokio_mpsc::Receiver<botster_hub_client::DaemonEntityFrame>,
+        receiver: tokio_mpsc::Receiver<crate::entity_delivery::EntityDelivery>,
         usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     },
     Event {

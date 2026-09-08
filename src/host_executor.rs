@@ -410,6 +410,12 @@ pub(crate) struct HostWorkPermit {
 }
 
 impl HostWorkPermit {
+    pub(crate) fn reserved_prepared_bytes(&self) -> usize {
+        self.prepared
+            .as_ref()
+            .map_or(0, |reservation| reservation.logical_bytes)
+    }
+
     pub(crate) fn into_prepared_charge(mut self, logical_bytes: usize) -> HostPreparedCharge {
         self.take_prepared_charge(logical_bytes)
     }

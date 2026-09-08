@@ -1,7 +1,5 @@
 //! Bounded shaping and encoding for plugin control responses.
 
-use std::io;
-
 use botster_core::{PluginInvocationResult, RequestId};
 use botster_hub_client::{
     DaemonOperatorError, DaemonResponse, DaemonResponseKind, MAX_CONTROL_RESPONSE_BYTES,
@@ -10,6 +8,7 @@ use botster_hub_client::{
 use botster_ui_contract::UiActionRequest;
 use serde::Serialize;
 
+use crate::bounded_json::EncodeError as EncodeResponseError;
 use crate::client_api::{HubClientOperation, HubClientPluginSurface};
 use crate::client_api_dto::response::{
     daemon_plugin_action_result, daemon_plugin_surface, daemon_plugin_tool_result,
@@ -248,7 +247,7 @@ fn encode_response(
         request_id: transport_request_id,
         response: &response,
     };
-    let encoded_frame = capped_json(&frame)?;
+    let encoded_frame = crate::bounded_json::encode(&frame, MAX_CONTROL_RESPONSE_BYTES)?;
     let kind = response.kind;
     drop(response);
     let logical_bytes = encoded_frame.len();
@@ -278,55 +277,6 @@ fn encode_protocol_bounded_error(
         Err(EncodeResponseError::Serialize) => {
             panic!("plugin {error_kind} fallback protocol serialization failed")
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EncodeResponseError {
-    TooLarge,
-    Serialize,
-}
-
-fn capped_json(value: &impl Serialize) -> Result<Vec<u8>, EncodeResponseError> {
-    let mut writer = CappedVecWriter::new(MAX_CONTROL_RESPONSE_BYTES);
-    if serde_json::to_writer(&mut writer, value).is_err() {
-        return Err(if writer.exceeded {
-            EncodeResponseError::TooLarge
-        } else {
-            EncodeResponseError::Serialize
-        });
-    }
-    Ok(writer.bytes)
-}
-
-struct CappedVecWriter {
-    bytes: Vec<u8>,
-    limit: usize,
-    exceeded: bool,
-}
-
-impl CappedVecWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(limit.min(8 * 1024)),
-            limit,
-            exceeded: false,
-        }
-    }
-}
-
-impl io::Write for CappedVecWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
-            self.exceeded = true;
-            return Err(io::Error::other("JSON byte limit exceeded"));
-        }
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 

@@ -51,6 +51,7 @@
 
 pub(crate) mod admission;
 pub mod auth;
+pub(crate) mod bounded_json;
 pub mod capabilities;
 pub mod client_api;
 pub(crate) mod client_api_dto;
@@ -60,6 +61,7 @@ pub mod daemon;
 mod daemon_maintenance;
 mod daemon_projection;
 pub(crate) mod data_plane;
+pub(crate) mod entity_delivery;
 pub mod entrypoint_supervisor;
 pub(crate) mod event_plane_counters;
 pub(crate) mod host_executor;
