@@ -43,9 +43,7 @@ use crate::credentials::{
     CredentialPolicyError, CredentialProviderKind, OsKeychainCredentialStore,
     validate_hub_credentials,
 };
-use crate::data_plane::driver::{
-    CoreCompletionReceiver, CoreTicket, CoreTicketError, CoreTicketPoll,
-};
+use crate::data_plane::driver::{CoreOperationTicket, CoreTicket, CoreTicketError, CoreTicketPoll};
 use crate::lifecycle::{
     HubLifecycleResult, HubPluginLifecycle, HubPluginLifecycleStatus, HubPluginRuntimeBundle,
     package_entity_owner_token,
@@ -129,8 +127,6 @@ pub struct HubRuntime {
     // one Arc, so the owner never clones a durable state collection.
     state: SharedHubState,
     core_daemon: SharedCoreDaemon,
-    core_completions: CoreCompletionReceiver,
-    completed_operations: Mutex<BTreeMap<PendingOperationId, CoreCompletion>>,
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
     inflight_plugin_core: Mutex<Vec<InflightPluginCore>>,
     close_work: crate::data_plane::CloseWorkSource,
@@ -403,7 +399,7 @@ impl HubRuntime {
         let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
-        let (close_work, data_plane, core_daemon, core_completions) = start_data_plane(core_config);
+        let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
@@ -423,8 +419,6 @@ impl HubRuntime {
             config,
             state,
             core_daemon,
-            core_completions,
-            completed_operations: Mutex::new(BTreeMap::new()),
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(Vec::new()),
             close_work,
@@ -512,7 +506,7 @@ impl HubRuntime {
         let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
-        let (close_work, data_plane, core_daemon, core_completions) = start_data_plane(core_config);
+        let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
         ));
@@ -532,8 +526,6 @@ impl HubRuntime {
             config,
             state,
             core_daemon,
-            core_completions,
-            completed_operations: Mutex::new(BTreeMap::new()),
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(Vec::new()),
             close_work,
@@ -4000,6 +3992,14 @@ impl HubRuntime {
         &self.host_executor
     }
 
+    pub(crate) fn next_waiter_id(&self) -> Option<crate::owner_identity::WaiterId> {
+        self.core_daemon.waiter_ids().next()
+    }
+
+    pub(crate) fn take_core_completion_notification(&self) -> bool {
+        self.core_daemon.take_completion_notification()
+    }
+
     pub(crate) fn take_data_plane_progress(&self) -> crate::data_plane::driver::DataPlaneProgress {
         self.data_plane
             .as_ref()
@@ -4970,6 +4970,9 @@ fn settle_entity_publish_op(
 
 /// Bound on Core waits that run before the owner loop exists (startup
 /// reconciliation) or on threads that never serve it (in-process CLI).
+/// The production `CoreTicket::wait` callers are startup reconciliation and
+/// its stale-record repair. `CoreOperationTracker::wait` remains for the CLI
+/// and test threads. The daemon owner uses only nonblocking `poll` calls.
 pub(crate) const STARTUP_CORE_WAIT: Duration = Duration::from_secs(30);
 
 /// Map a lost or timed-out bridge wait onto the Core error surface.
@@ -4989,8 +4992,7 @@ pub(crate) fn core_bridge_error(error: CoreTicketError) -> CoreDaemonError {
 /// One Core operation from `begin` to its completion.
 ///
 /// Stage one waits for the pending id on the begin ticket; stage two waits
-/// for the matching [`CoreCompletion`] the owner absorbed. Neither stage
-/// blocks.
+/// for the matching keyed [`CoreCompletion`]. Neither stage blocks.
 #[derive(Debug)]
 pub struct CoreOperationTracker {
     stage: CoreOperationStage,
@@ -4998,15 +5000,22 @@ pub struct CoreOperationTracker {
 
 #[derive(Debug)]
 enum CoreOperationStage {
-    Begin(CoreTicket<Result<PendingOperationId, CoreDaemonError>>),
-    Pending(PendingOperationId),
+    Begin {
+        ticket: CoreTicket<Result<PendingOperationId, CoreDaemonError>>,
+        completion: CoreTicket<CoreCompletion>,
+    },
+    Pending {
+        id: PendingOperationId,
+        completion: CoreTicket<CoreCompletion>,
+    },
     Done,
 }
 
 impl CoreOperationTracker {
-    pub(crate) fn new(ticket: CoreTicket<Result<PendingOperationId, CoreDaemonError>>) -> Self {
+    pub(crate) fn new(ticket: CoreOperationTicket) -> Self {
+        let (ticket, completion) = ticket.into_parts();
         Self {
-            stage: CoreOperationStage::Begin(ticket),
+            stage: CoreOperationStage::Begin { ticket, completion },
         }
     }
 
@@ -5014,7 +5023,7 @@ impl CoreOperationTracker {
     #[must_use]
     pub fn pending_id(&self) -> Option<PendingOperationId> {
         match self.stage {
-            CoreOperationStage::Pending(id) => Some(id),
+            CoreOperationStage::Pending { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -5023,10 +5032,13 @@ impl CoreOperationTracker {
     /// completion error; `Ready(Ok)` carries the completion.
     pub fn poll(
         &mut self,
-        runtime: &HubRuntime,
+        _runtime: &HubRuntime,
     ) -> CoreTicketPoll<Result<CoreCompletion, CoreDaemonError>> {
-        runtime.absorb_core_completions();
-        if let CoreOperationStage::Begin(ticket) = &mut self.stage {
+        self.poll_without_reaping()
+    }
+
+    fn poll_without_reaping(&mut self) -> CoreTicketPoll<Result<CoreCompletion, CoreDaemonError>> {
+        if let CoreOperationStage::Begin { ticket, .. } = &mut self.stage {
             match ticket.poll() {
                 CoreTicketPoll::Pending => return CoreTicketPoll::Pending,
                 CoreTicketPoll::Lost => {
@@ -5042,20 +5054,32 @@ impl CoreOperationTracker {
                     return CoreTicketPoll::Ready(Err(error));
                 }
                 CoreTicketPoll::Ready(Ok(id)) => {
-                    self.stage = CoreOperationStage::Pending(id);
+                    let previous = std::mem::replace(&mut self.stage, CoreOperationStage::Done);
+                    let CoreOperationStage::Begin { completion, .. } = previous else {
+                        unreachable!("the Core operation is in its begin phase");
+                    };
+                    self.stage = CoreOperationStage::Pending { id, completion };
                 }
             }
         }
-        match self.stage {
-            CoreOperationStage::Pending(id) => match runtime.take_completed_operation(id) {
-                Some(completion) => {
+        match &mut self.stage {
+            CoreOperationStage::Pending { completion, .. } => match completion.poll() {
+                CoreTicketPoll::Ready(completion) => {
                     self.stage = CoreOperationStage::Done;
                     CoreTicketPoll::Ready(Ok(completion))
                 }
-                None => CoreTicketPoll::Pending,
+                CoreTicketPoll::Pending => CoreTicketPoll::Pending,
+                CoreTicketPoll::Lost => {
+                    self.stage = CoreOperationStage::Done;
+                    CoreTicketPoll::Lost
+                }
+                CoreTicketPoll::Refused => {
+                    self.stage = CoreOperationStage::Done;
+                    CoreTicketPoll::Refused
+                }
             },
             CoreOperationStage::Done => CoreTicketPoll::Lost,
-            CoreOperationStage::Begin(_) => CoreTicketPoll::Pending,
+            CoreOperationStage::Begin { .. } => CoreTicketPoll::Pending,
         }
     }
 
@@ -5271,18 +5295,8 @@ pub(crate) fn bind_route_on_core(
 }
 
 impl HubRuntime {
-    /// Move every completion the data plane published into the owner map and
-    /// drop the ones no caller waits for.
-    pub(crate) fn absorb_core_completions(&self) {
-        let completions = self.core_completions.take();
-        if completions.is_empty() {
-            return;
-        }
-        if let Ok(mut map) = self.completed_operations.lock() {
-            for completion in completions {
-                map.insert(completion.id(), completion);
-            }
-        }
+    /// Retire detached Core operations whose keyed completion arrived.
+    pub(crate) fn reap_detached_core_operations(&self) {
         self.reap_detached_operations();
     }
 
@@ -5290,47 +5304,13 @@ impl HubRuntime {
         let Ok(mut detached) = self.detached_operations.lock() else {
             return;
         };
-        let mut ids = Vec::new();
         for tracker in detached.iter_mut() {
-            if let CoreOperationStage::Begin(ticket) = &mut tracker.stage {
-                match ticket.poll() {
-                    CoreTicketPoll::Ready(Ok(id)) => {
-                        tracker.stage = CoreOperationStage::Pending(id)
-                    }
-                    CoreTicketPoll::Ready(Err(_))
-                    | CoreTicketPoll::Lost
-                    | CoreTicketPoll::Refused => {
-                        tracker.stage = CoreOperationStage::Done;
-                    }
-                    CoreTicketPoll::Pending => {}
-                }
-            }
-            if let CoreOperationStage::Pending(id) = tracker.stage {
-                ids.push(id);
-            }
-        }
-        if let Ok(mut map) = self.completed_operations.lock() {
-            for tracker in detached.iter_mut() {
-                if let CoreOperationStage::Pending(id) = tracker.stage
-                    && map.remove(&id).is_some()
-                {
-                    tracker.stage = CoreOperationStage::Done;
-                }
+            match tracker.poll_without_reaping() {
+                CoreTicketPoll::Pending => {}
+                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {}
             }
         }
         detached.retain(|tracker| !matches!(tracker.stage, CoreOperationStage::Done));
-        let _ = ids;
-    }
-
-    /// Take the completion for one pending id, when it has arrived.
-    pub(crate) fn take_completed_operation(
-        &self,
-        id: PendingOperationId,
-    ) -> Option<CoreCompletion> {
-        self.completed_operations
-            .lock()
-            .ok()
-            .and_then(|mut map| map.remove(&id))
     }
 
     /// Run one closure on the Core owner thread and read its result later.
@@ -5457,12 +5437,11 @@ fn start_data_plane(
     crate::data_plane::CloseWorkSource,
     crate::data_plane::DataPlaneDriver,
     SharedCoreDaemon,
-    CoreCompletionReceiver,
 ) {
     let close_work = crate::data_plane::CloseWorkSource::new();
-    let (driver, core_daemon, completions) =
+    let (driver, core_daemon) =
         crate::data_plane::DataPlaneDriver::start(core_config, close_work.clone());
-    (close_work, driver, core_daemon, completions)
+    (close_work, driver, core_daemon)
 }
 
 fn core_daemon_config(config: &HubConfig) -> CoreDaemonConfig {

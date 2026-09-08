@@ -100,6 +100,13 @@ pub(crate) fn handle_control_message(
             record_data_plane_progress(daemon, state);
             request::poll_deferred(daemon, state)
         }
+        ControlMessage::CoreCompletionPublished => {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.take_core_completion_notification();
+                runtime.reap_detached_core_operations();
+            }
+            request::poll_deferred(daemon, state)
+        }
         message @ ControlMessage::AcceptedConnection { .. }
         | message @ ControlMessage::RejectedConnection
         | message @ ControlMessage::RegisterUnixAdmission { .. }
@@ -165,7 +172,7 @@ pub(crate) fn record_data_plane_progress(
     if !progress.progressed && !progress.journal_advanced && !progress.terminal_inventory_changed {
         return false;
     }
-    runtime.absorb_core_completions();
+    runtime.reap_detached_core_operations();
     if progress.journal_advanced {
         state.maintenance.note_journal_advanced();
         state.maintenance.note_authoritative_mutation();

@@ -207,7 +207,7 @@ pub(crate) fn poll_pending_requests(
         return false;
     }
     if let Some(runtime) = daemon.runtime() {
-        runtime.absorb_core_completions();
+        runtime.reap_detached_core_operations();
     }
     let mut pending = std::mem::take(&mut state.pending_requests);
     let mut retained = Vec::with_capacity(pending.len());

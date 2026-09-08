@@ -3,16 +3,16 @@
 //!
 //! The Hub owner thread never blocks on Core. It submits work through
 //! [`CoreDaemonHandle::submit`] or [`CoreDaemonHandle::begin`] and reads the
-//! outcome later from a [`CoreTicket`] or from the [`CoreCompletionReceiver`],
-//! both polled from its own turn. The data-plane thread wakes the owner with
-//! `ControlMessage::DataPlaneProgress` whenever a pump moved data, a ticket
-//! result was published, or Core finished a pending operation.
+//! outcome later from a keyed [`CoreTicket`] polled from its own turn. The
+//! data-plane thread publishes ticket results before an independent completion
+//! wake. Pump facts use `ControlMessage::DataPlaneProgress` instead.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core_daemon::{
     CoreCompletion, CoreDaemon, CoreDaemonConfig, CoreDaemonError, CoreOperation,
@@ -21,6 +21,7 @@ use botster_core_daemon::{
 
 use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::data_plane::close_work::CloseWorkSource;
+use crate::owner_identity::{OwnerWorkIdentity, WaiterIdSource};
 use crate::subscription::closed_events::session_close_event_decision;
 
 pub(crate) const DATA_PLANE_WATCHDOG: Duration = Duration::from_secs(1);
@@ -98,7 +99,51 @@ impl DataPlaneProgressLatch {
     }
 }
 
-type CoreRequest = Box<dyn FnOnce(&mut CoreDaemon) + Send + 'static>;
+type PendingCoreOperations = BTreeMap<PendingOperationId, CoreResultPublisher>;
+type CoreRequest = Box<dyn FnOnce(&mut CoreDaemon, &mut PendingCoreOperations) + Send + 'static>;
+
+#[derive(Debug)]
+struct CoreCompletionWake {
+    pending: AtomicBool,
+    owner: Mutex<Option<ControlSender>>,
+}
+
+impl CoreCompletionWake {
+    fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            owner: Mutex::new(None),
+        }
+    }
+
+    fn bind(&self, sender: ControlSender) {
+        let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        *owner = Some(sender.clone());
+        let should_wake = self.pending.load(Ordering::Acquire);
+        drop(owner);
+        if should_wake {
+            let _ = sender.try_send(ControlMessage::CoreCompletionPublished);
+        }
+    }
+
+    fn publish(&self) {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(sender) = self
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            let _ = sender.try_send(ControlMessage::CoreCompletionPublished);
+        }
+    }
+
+    fn take(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+}
 
 /// Outcome of one non-blocking [`CoreTicket::poll`].
 #[derive(Debug)]
@@ -149,22 +194,93 @@ pub struct CoreTicket<T> {
 
 #[derive(Debug)]
 enum CoreTicketSlot<T> {
-    /// The operation was queued; its result arrives on this channel.
-    Queued(Receiver<T>),
+    /// The operation was queued; its keyed result arrives on this channel.
+    Queued {
+        identity: OwnerWorkIdentity,
+        receiver: Receiver<CoreTicketResult<T>>,
+    },
     /// Admission refused the operation; there is nothing to wait for.
     Refused,
 }
 
+#[derive(Debug)]
+struct CoreTicketResult<T> {
+    identity: OwnerWorkIdentity,
+    value: T,
+}
+
+#[derive(Debug)]
+struct CoreTicketPublisher<T> {
+    identity: OwnerWorkIdentity,
+    sender: SyncSender<CoreTicketResult<T>>,
+    wake: Arc<CoreCompletionWake>,
+}
+
+impl<T> CoreTicketPublisher<T> {
+    fn publish(&self, value: T) {
+        let result = CoreTicketResult {
+            identity: self.identity,
+            value,
+        };
+        if self.sender.try_send(result).is_ok() {
+            // The result is readable before this independent bit and doorbell publish.
+            self.wake.publish();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CoreResultPublisher(CoreTicketPublisher<CoreCompletion>);
+
+impl CoreResultPublisher {
+    fn publish(self, completion: CoreCompletion) {
+        self.0.publish(completion);
+    }
+}
+
+/// Both keyed phases of one long-running Core operation.
+#[derive(Debug)]
+pub(crate) struct CoreOperationTicket {
+    begin: CoreTicket<Result<PendingOperationId, CoreDaemonError>>,
+    completion: CoreTicket<CoreCompletion>,
+}
+
+impl CoreOperationTicket {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CoreTicket<Result<PendingOperationId, CoreDaemonError>>,
+        CoreTicket<CoreCompletion>,
+    ) {
+        (self.begin, self.completion)
+    }
+}
+
 impl<T> CoreTicket<T> {
-    fn queued(receiver: Receiver<T>) -> Self {
+    fn channel(
+        identity: OwnerWorkIdentity,
+        wake: Arc<CoreCompletionWake>,
+    ) -> (Self, CoreTicketPublisher<T>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        (
+            Self::queued(identity, receiver),
+            CoreTicketPublisher {
+                identity,
+                sender,
+                wake,
+            },
+        )
+    }
+
+    fn queued(identity: OwnerWorkIdentity, receiver: Receiver<CoreTicketResult<T>>) -> Self {
         Self {
-            slot: CoreTicketSlot::Queued(receiver),
+            slot: CoreTicketSlot::Queued { identity, receiver },
         }
     }
 
-    fn lost() -> Self {
+    fn lost(identity: OwnerWorkIdentity) -> Self {
         let (_sender, receiver) = mpsc::sync_channel(1);
-        Self::queued(receiver)
+        Self::queued(identity, receiver)
     }
 
     fn refused() -> Self {
@@ -177,19 +293,23 @@ impl<T> CoreTicket<T> {
     /// result with it so an owner phase applies exactly that result.
     #[cfg(test)]
     pub(crate) fn resolved(value: T) -> Self {
+        let identity = OwnerWorkIdentity::first(crate::owner_identity::WaiterId(1));
         let (sender, receiver) = mpsc::sync_channel(1);
         sender
-            .send(value)
+            .send(CoreTicketResult { identity, value })
             .expect("a resolved ticket holds exactly one value");
-        Self::queued(receiver)
+        Self::queued(identity, receiver)
     }
 
     /// Non-blocking read; owner-thread use.
     pub(crate) fn poll(&mut self) -> CoreTicketPoll<T> {
         match &self.slot {
             CoreTicketSlot::Refused => CoreTicketPoll::Refused,
-            CoreTicketSlot::Queued(receiver) => match receiver.try_recv() {
-                Ok(value) => CoreTicketPoll::Ready(value),
+            CoreTicketSlot::Queued { identity, receiver } => match receiver.try_recv() {
+                Ok(result) if result.identity == *identity => CoreTicketPoll::Ready(result.value),
+                // A stale phase cannot make this ticket ready. Dropping the
+                // rejected result also releases every value-owned charge.
+                Ok(_) => CoreTicketPoll::Pending,
                 Err(TryRecvError::Empty) => CoreTicketPoll::Pending,
                 Err(TryRecvError::Disconnected) => CoreTicketPoll::Lost,
             },
@@ -200,11 +320,23 @@ impl<T> CoreTicket<T> {
     pub fn wait(self, timeout: Duration) -> Result<T, CoreTicketError> {
         match self.slot {
             CoreTicketSlot::Refused => Err(CoreTicketError::Overloaded),
-            CoreTicketSlot::Queued(receiver) => match receiver.recv_timeout(timeout) {
-                Ok(value) => Ok(value),
-                Err(RecvTimeoutError::Timeout) => Err(CoreTicketError::Timeout),
-                Err(RecvTimeoutError::Disconnected) => Err(CoreTicketError::DriverStopped),
-            },
+            CoreTicketSlot::Queued { identity, receiver } => {
+                let deadline = Instant::now() + timeout;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match receiver.recv_timeout(remaining) {
+                        Ok(result) if result.identity == identity => return Ok(result.value),
+                        // A stale phase is dropped with its value-owned charge.
+                        Ok(_) if !remaining.is_zero() => {}
+                        Ok(_) | Err(RecvTimeoutError::Timeout) => {
+                            return Err(CoreTicketError::Timeout);
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err(CoreTicketError::DriverStopped);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -237,23 +369,6 @@ fn admit_request(
     }
 }
 
-/// Owner-side receiver of Core completions published by the data-plane thread.
-#[derive(Debug)]
-pub(crate) struct CoreCompletionReceiver {
-    receiver: Receiver<CoreCompletion>,
-}
-
-impl CoreCompletionReceiver {
-    /// Drain every completion published so far. Never blocks.
-    pub(crate) fn take(&self) -> Vec<CoreCompletion> {
-        let mut completions = Vec::new();
-        while let Ok(completion) = self.receiver.try_recv() {
-            completions.push(completion);
-        }
-        completions
-    }
-}
-
 /// Hub-owned bounded operation bridge to the single Core owner thread.
 #[derive(Clone)]
 pub(crate) struct CoreDaemonHandle {
@@ -263,6 +378,8 @@ pub(crate) struct CoreDaemonHandle {
     admission: Arc<Mutex<()>>,
     request_pending: Arc<AtomicBool>,
     owner_waiting: Arc<AtomicBool>,
+    waiter_ids: Arc<WaiterIdSource>,
+    completion_wake: Arc<CoreCompletionWake>,
 }
 
 impl CoreDaemonHandle {
@@ -277,31 +394,82 @@ impl CoreDaemonHandle {
         T: Send + 'static,
         F: FnOnce(&mut CoreDaemon) -> T + Send + 'static,
     {
-        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
-        let request: CoreRequest = Box::new(move |daemon| {
-            let _ = completed_tx.send(operation(daemon));
+        let Some(waiter_id) = self.waiter_ids.next() else {
+            return CoreTicket::refused();
+        };
+        let identity = OwnerWorkIdentity::first(waiter_id);
+        let (ticket, publisher) = CoreTicket::channel(identity, Arc::clone(&self.completion_wake));
+        let request: CoreRequest = Box::new(move |daemon, _| {
+            publisher.publish(operation(daemon));
         });
         let _admission = self.admission.lock().expect("Core request admission mutex");
         match admit_request(&self.requests, &self.accepting, request) {
             CoreAdmission::Queued => {}
             CoreAdmission::Refused => return CoreTicket::refused(),
-            CoreAdmission::Stopped => return CoreTicket::lost(),
+            CoreAdmission::Stopped => return CoreTicket::lost(identity),
         }
         self.request_pending.store(true, Ordering::Release);
         if self.owner_waiting.swap(false, Ordering::AcqRel) {
             self.control.interrupt();
         }
         drop(_admission);
-        CoreTicket::queued(completed_rx)
+        ticket
     }
 
-    /// Start one Core operation. The ticket carries the pending id; the
-    /// result arrives later on the [`CoreCompletionReceiver`].
-    pub(crate) fn begin(
-        &self,
-        operation: CoreOperation,
-    ) -> CoreTicket<Result<PendingOperationId, CoreDaemonError>> {
-        self.submit(move |daemon| daemon.begin(operation))
+    /// Start one Core operation with registered begin and completion phases.
+    pub(crate) fn begin(&self, operation: CoreOperation) -> CoreOperationTicket {
+        let Some(waiter_id) = self.waiter_ids.next() else {
+            return CoreOperationTicket {
+                begin: CoreTicket::refused(),
+                completion: CoreTicket::refused(),
+            };
+        };
+        let begin_identity = OwnerWorkIdentity::first(waiter_id);
+        let completion_identity = begin_identity
+            .next_phase()
+            .expect("the first Core phase always has a successor");
+        // Both phases are registered before the request can start in Core.
+        let (begin, begin_publisher) =
+            CoreTicket::channel(begin_identity, Arc::clone(&self.completion_wake));
+        let (completion, completion_publisher) =
+            CoreTicket::channel(completion_identity, Arc::clone(&self.completion_wake));
+        let request: CoreRequest = Box::new(move |daemon, pending| {
+            let result = daemon.begin(operation);
+            if let Ok(id) = result {
+                pending.insert(id, CoreResultPublisher(completion_publisher));
+            }
+            begin_publisher.publish(result);
+        });
+        let _admission = self.admission.lock().expect("Core request admission mutex");
+        match admit_request(&self.requests, &self.accepting, request) {
+            CoreAdmission::Queued => {}
+            CoreAdmission::Refused => {
+                return CoreOperationTicket {
+                    begin: CoreTicket::refused(),
+                    completion,
+                };
+            }
+            CoreAdmission::Stopped => {
+                return CoreOperationTicket {
+                    begin: CoreTicket::lost(begin_identity),
+                    completion,
+                };
+            }
+        }
+        self.request_pending.store(true, Ordering::Release);
+        if self.owner_waiting.swap(false, Ordering::AcqRel) {
+            self.control.interrupt();
+        }
+        drop(_admission);
+        CoreOperationTicket { begin, completion }
+    }
+
+    pub(crate) fn waiter_ids(&self) -> &WaiterIdSource {
+        &self.waiter_ids
+    }
+
+    pub(crate) fn take_completion_notification(&self) -> bool {
+        self.completion_wake.take()
     }
 }
 
@@ -309,15 +477,16 @@ impl DataPlaneDriver {
     pub(crate) fn start(
         core_config: CoreDaemonConfig,
         close_work: CloseWorkSource,
-    ) -> (Self, CoreDaemonHandle, CoreCompletionReceiver) {
+    ) -> (Self, CoreDaemonHandle) {
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let (request_tx, request_rx) = mpsc::sync_channel(CORE_REQUEST_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let (completion_tx, completion_rx) = mpsc::channel();
         let accepting = Arc::new(AtomicBool::new(true));
         let admission = Arc::new(Mutex::new(()));
         let request_pending = Arc::new(AtomicBool::new(false));
         let owner_waiting = Arc::new(AtomicBool::new(false));
+        let waiter_ids = Arc::new(WaiterIdSource::default());
+        let completion_wake = Arc::new(CoreCompletionWake::new());
         let thread_request_pending = Arc::clone(&request_pending);
         let thread_owner_waiting = Arc::clone(&owner_waiting);
         let stop_action = Arc::new(AtomicU8::new(STOP_ACTION_SHUTDOWN));
@@ -335,7 +504,6 @@ impl DataPlaneDriver {
                 run_loop(
                     &mut daemon,
                     request_rx,
-                    completion_tx,
                     close_work,
                     thread_owner_wake,
                     thread_progress_latch,
@@ -357,6 +525,8 @@ impl DataPlaneDriver {
             admission,
             request_pending,
             owner_waiting,
+            waiter_ids,
+            completion_wake,
         };
         let driver = Self {
             core: core.clone(),
@@ -366,16 +536,11 @@ impl DataPlaneDriver {
             owner_wake,
             progress_latch,
         };
-        (
-            driver,
-            core,
-            CoreCompletionReceiver {
-                receiver: completion_rx,
-            },
-        )
+        (driver, core)
     }
 
     pub(crate) fn bind_owner_wake(&self, sender: ControlSender) {
+        self.core.completion_wake.bind(sender.clone());
         if let Ok(mut slot) = self.owner_wake.lock() {
             *slot = Some(sender);
         }
@@ -431,13 +596,13 @@ impl Drop for DataPlaneDriver {
 fn run_loop(
     core_daemon: &mut CoreDaemon,
     requests: Receiver<CoreRequest>,
-    completions: mpsc::Sender<CoreCompletion>,
     close_work: CloseWorkSource,
     owner_wake: Arc<Mutex<Option<ControlSender>>>,
     progress_latch: Arc<DataPlaneProgressLatch>,
     request_pending: Arc<AtomicBool>,
     owner_waiting: Arc<AtomicBool>,
 ) {
+    let mut pending_operations = PendingCoreOperations::new();
     loop {
         owner_waiting.store(true, Ordering::Release);
         let wait_timeout = if request_pending.swap(false, Ordering::AcqRel) {
@@ -468,8 +633,8 @@ fn run_loop(
             progress |= outcome.pumped_routes > 0 || !batch.ingress_sessions.is_empty();
             terminal_inventory_changed |= outcome.terminal_inventory_changed;
         }
-        progress |= run_core_requests(core_daemon, &requests) > 0;
-        progress |= publish_completions(core_daemon, &completions);
+        run_core_requests(core_daemon, &requests, &mut pending_operations);
+        publish_completions(core_daemon, &mut pending_operations);
         {
             let close_batch = close_work.take_batch(DATA_PLANE_MAX_CLOSE_KEYS);
             for state in close_batch {
@@ -496,33 +661,31 @@ fn run_loop(
         );
     }
     for request in requests.try_iter().take(CORE_REQUEST_CAPACITY) {
-        request(core_daemon);
+        request(core_daemon, &mut pending_operations);
     }
-    let _ = publish_completions(core_daemon, &completions);
+    publish_completions(core_daemon, &mut pending_operations);
 }
 
-fn run_core_requests(core_daemon: &mut CoreDaemon, requests: &Receiver<CoreRequest>) -> usize {
-    let mut ran = 0;
+fn run_core_requests(
+    core_daemon: &mut CoreDaemon,
+    requests: &Receiver<CoreRequest>,
+    pending_operations: &mut PendingCoreOperations,
+) {
     for request in requests.try_iter().take(CORE_REQUESTS_PER_TURN) {
-        request(core_daemon);
-        ran += 1;
+        request(core_daemon, pending_operations);
     }
-    ran
 }
 
-/// Move finished Core operations to the owner. Returns whether any moved.
+/// Publish each finished Core operation to its exact registered phase.
 fn publish_completions(
     core_daemon: &mut CoreDaemon,
-    completions: &mpsc::Sender<CoreCompletion>,
-) -> bool {
-    let finished = core_daemon.take_completions();
-    let published = !finished.is_empty();
-    for completion in finished {
-        if completions.send(completion).is_err() {
-            break;
+    pending_operations: &mut PendingCoreOperations,
+) {
+    for completion in core_daemon.take_completions() {
+        if let Some(publisher) = pending_operations.remove(&completion.id()) {
+            publisher.publish(completion);
         }
     }
-    published
 }
 
 fn current_unix_seconds() -> u64 {
@@ -535,10 +698,26 @@ fn current_unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Debug)]
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn identity(waiter_id: u64, phase: u64) -> OwnerWorkIdentity {
+        OwnerWorkIdentity {
+            waiter_id: crate::owner_identity::WaiterId(waiter_id),
+            phase,
+        }
+    }
 
     fn noop_request() -> CoreRequest {
-        Box::new(|_| {})
+        Box::new(|_, _| {})
     }
 
     #[test]
@@ -609,6 +788,113 @@ mod tests {
                 terminal_inventory_changed: true,
             }
         );
+    }
+
+    #[test]
+    fn keyed_result_is_published_before_an_independent_owner_wake() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        wake.bind(sender);
+        let progress = DataPlaneProgressLatch::default();
+        let (mut ticket, publisher) = CoreTicket::channel(identity(7, 2), Arc::clone(&wake));
+
+        publisher.publish(41_u8);
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CoreCompletionPublished)
+        ));
+        assert_eq!(progress.take(), DataPlaneProgress::default());
+        assert!(wake.take());
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Ready(41)));
+    }
+
+    #[test]
+    fn coalesced_wake_readies_only_the_matching_tickets() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        wake.bind(sender);
+        let (mut first, first_publisher) = CoreTicket::channel(identity(8, 1), Arc::clone(&wake));
+        let (mut second, second_publisher) = CoreTicket::channel(identity(9, 1), Arc::clone(&wake));
+
+        second_publisher.publish(22_u8);
+
+        assert!(matches!(first.poll(), CoreTicketPoll::Pending));
+        assert!(matches!(second.poll(), CoreTicketPoll::Ready(22)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CoreCompletionPublished)
+        ));
+        assert!(receiver.try_recv().is_err());
+
+        first_publisher.publish(11_u8);
+        assert!(receiver.try_recv().is_err());
+        assert!(wake.take());
+        assert!(matches!(first.poll(), CoreTicketPoll::Ready(11)));
+    }
+
+    #[test]
+    fn completion_bit_survives_a_full_owner_doorbell_queue() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(ControlMessage::RejectedConnection)
+            .expect("fill owner doorbell queue");
+        wake.bind(sender);
+        let (mut ticket, publisher) = CoreTicket::channel(identity(10, 1), Arc::clone(&wake));
+
+        publisher.publish(31_u8);
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::RejectedConnection)
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert!(wake.take());
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Ready(31)));
+    }
+
+    #[test]
+    fn stale_phase_cannot_ready_a_sibling_and_releases_its_value() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let expected = identity(11, 3);
+        let sibling = identity(11, 2);
+        let (mut ticket, publisher) = CoreTicket::channel(expected, wake);
+        let drops = Arc::new(AtomicUsize::new(0));
+        publisher
+            .sender
+            .try_send(CoreTicketResult {
+                identity: sibling,
+                value: DropProbe(Arc::clone(&drops)),
+            })
+            .expect("inject stale phase");
+
+        assert!(matches!(ticket.poll(), CoreTicketPoll::Pending));
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+
+        publisher.publish(DropProbe(Arc::clone(&drops)));
+        let CoreTicketPoll::Ready(result) = ticket.poll() else {
+            panic!("the matching phase must be ready");
+        };
+        drop(result);
+        assert_eq!(drops.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn duplicate_result_is_rejected_and_releases_its_value() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (mut ticket, publisher) = CoreTicket::channel(identity(13, 1), wake);
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        publisher.publish(DropProbe(Arc::clone(&drops)));
+        publisher.publish(DropProbe(Arc::clone(&drops)));
+
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        let CoreTicketPoll::Ready(result) = ticket.poll() else {
+            panic!("the first matching result must remain ready");
+        };
+        drop(result);
+        assert_eq!(drops.load(Ordering::Acquire), 2);
     }
 
     #[test]
@@ -688,7 +974,8 @@ mod tests {
             ticket.wait(Duration::from_millis(1)),
             Err(CoreTicketError::Overloaded)
         );
-        let mut lost: CoreTicket<u8> = CoreTicket::lost();
+        let mut lost: CoreTicket<u8> =
+            CoreTicket::lost(OwnerWorkIdentity::first(crate::owner_identity::WaiterId(1)));
         assert!(matches!(lost.poll(), CoreTicketPoll::Lost));
     }
 }

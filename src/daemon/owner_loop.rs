@@ -337,6 +337,13 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         while let Ok(cleanup) = cleanup_rx.try_recv() {
             handle_connection_cleanup(&mut daemon, &mut control_state, control_tx.clone(), cleanup);
         }
+        // Read the shared completion bit on every turn. If the bounded
+        // doorbell queue was full, another owner event still exposes results.
+        if let Some(runtime) = daemon.runtime()
+            && runtime.take_core_completion_notification()
+        {
+            runtime.reap_detached_core_operations();
+        }
         crate::daemon::control::record_data_plane_progress(&daemon, &mut control_state);
         crate::subscription::entity::absorb_session_type_catalog_completions(
             &daemon,
@@ -919,8 +926,6 @@ pub(crate) struct DaemonControlState {
     pub(crate) close_event_decisions: crate::subscription::closed_events::CloseEventDecisions,
     /// Session-type catalog built off the owner thread.
     pub(crate) session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache,
-    /// Checked identities shared by host jobs and later owner waiters.
-    pub(crate) waiter_ids: crate::host_executor::WaiterIdSequence,
     /// Inventory read in flight for the pump reconcile phase, with the
     /// attach epoch captured when it was submitted.
     reconcile_inventory: Option<InventoryRead>,
@@ -978,7 +983,6 @@ impl Default for DaemonControlState {
             close_event_decisions: crate::subscription::closed_events::CloseEventDecisions::default(
             ),
             session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache::default(),
-            waiter_ids: crate::host_executor::WaiterIdSequence::default(),
             reconcile_inventory: None,
             observe_resume: None,
             observe_read: None,
@@ -3773,7 +3777,7 @@ return botster.register({
         let deadline = Instant::now() + Duration::from_secs(10);
         let response = loop {
             if let Some(runtime) = daemon.runtime() {
-                runtime.absorb_core_completions();
+                runtime.reap_detached_core_operations();
             }
             match (pending.continuation)(daemon, state) {
                 crate::daemon::control::pending::ControlPoll::Ready(response) => {
