@@ -142,6 +142,7 @@ pub(crate) fn dispatch_control_message(
         }
         ControlMessage::PluginResultCapacityReleased
         | ControlMessage::PluginCompletionPublished
+        | ControlMessage::EntityPublishProgress
         | ControlMessage::CausalProgressPublished
         | ControlMessage::HostProgressPublished
         | ControlMessage::ManagedSessionSpawnQueued => {

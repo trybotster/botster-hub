@@ -134,6 +134,8 @@ pub(crate) enum ControlMessage {
     HostProgressPublished,
     /// The causal table published queue capacity or a mutex release.
     CausalProgressPublished,
+    /// A Lua publication or bridge unlock requires owner attention.
+    EntityPublishProgress,
     /// A Lua worker queued one managed worktree and session spawn operation.
     ManagedSessionSpawnQueued,
     LocalWebrtcPeerClosed {

@@ -754,41 +754,80 @@ The broader audit of legacy retry callers and fault visibility remains open.
 These tests do not close the remaining owner scheduling, notification, or idle-progress proof requirements outside this family cleanup path.
 
 
-## 14. Causal owner phases, 2026-09-09
+## 14. Ordered causal ownership and publication service, 2026-09-09
 
-Causal draining now has one ready item in the existing `HostBridge` class.
-Each dispatch attempts one table operation or advances one of 13 persistent local phases.
-When the table has ready work, table draining alternates with local phases.
-This gives different local queues access to freed table capacity. An empty table does not consume a separate activation.
-Each phase moves or applies at most one operation. Maintenance no longer drains causal operations or wakes itself for causal readiness.
-The obsolete 32-operation flush limit is removed. Synchronous runtime callers step the same cursor outside the daemon owner.
+This local implementation replaces the earlier 13-phase cursor and all causal fallback stores.
+One owner-only FIFO holds at most 256 operations, including immediate reservations.
+A reservation exists before its source changes. Its destructor returns an unused slot, including during unwinding.
+The owner applies only the FIFO head. A table wait or fault retains that exact head.
+The causal table has no operation queue or admission bypass.
 
-One owner-only FIFO now replaces the three finish segments. The total capacity remains 768 operations.
-New operations append to that FIFO. Each drain releases its borrow before it attempts admission.
-The general finish FIFO and the separate fanout finish queue use `RefCell`.
-Integration fixtures wait for logical causal ownership to clear, including operations retained outside the causal table.
+Each daemon dispatch applies one causal operation in the existing `HostBridge` class.
+Family resync releases use a separate source step in that class.
+A full FIFO retains each source: a publication request, fanout finish, provider invocation, event flight, or cleanup cursor.
+Entity completion waits preserve the original Host permit and owner permit.
+Admission refusal uses an explicit retirement stage before it sends the refusal.
+A required transition that encounters a table fault enters retained recovery.
+Cancellation does not release that retained state. Restart remains the table recovery boundary.
 
-Two regression tests exposed defects before the local corrections.
-A full causal table gave each freed slot to the same early local phase and starved later phases.
-The alternating cursor passes the regression with continuous early-phase refill and later finish or bridge work.
-The finish segments also let a release overtake an earlier transfer at a segment boundary.
-The single finish FIFO passes the ordered transfer-and-release regression.
+Table unlock notifications and FIFO capacity notifications wake indexed domain waiters.
+Each wake pass captures an upper bound and retains its cursor across new notifications.
+The owner keeps a live waiter indexed if ready admission fails.
+Tests pass for reinsertion during a wake pass and retention after ready-queue serial exhaustion.
 
-A source audit corrected the bridge ownership premise used during this work.
-Production workers access the bridge's publication queue. Only owner runtime paths access its five release stores.
-The removed release-store notifier and its synthetic worker tests did not establish a first-party production contention requirement.
-The genuinely shared causal table retains its mutex-release and capacity notifier.
+The publication audit found no daemon consumer for the previous Lua bridge queue.
+The new bridge has a daemon ready item and shares its one-request transition with synchronous runtime pumping.
+The bridge admits at most 256 queued requests and 8 MiB of logical bytes.
+Each request has a 1 MiB limit. The metric counts encoded JSON bytes and both retained plugin-key strings.
+The bridge measures bytes without allocating a second encoded frame.
+One removed request can coexist with a refilled queue during owner processing.
+These limits do not claim exact allocator memory usage.
 
-After that removal, all 16 selected causal tests and all 33 runtime tests passed.
-The four production package cleanup cases also passed. The Rust 1.97.0 check with tests passed.
-Matched integration checks remain pending.
+Workers use nonblocking enqueue and exact-token retraction.
+The owner uses a nonblocking try/arm/retry lock protocol before it reserves causal capacity and acquires the pending lease.
+The owner removes the exact head only after those prerequisites succeed.
+Capacity waits and table-lock waits have separate wake sources.
+A fault latches under the bridge guard. After that boundary, timeout cannot retract the retained source.
+Before that boundary, timeout can retract an unacquired request.
 
-The local corrections do not close global causal ordering.
-Direct table admission can still bypass an older transfer retained outside the table.
-Both admitted fanout retirement and provider-resync retirement can follow that path.
-The complete ordered-retention contract remains under review.
+Each pending publication lease includes its unique checked token.
+Two publications from the same plugin and scope therefore keep separate pending identities before their transfers apply.
+Lease acquisition borrows the request identity and clones it only after it acquires the table lock.
+A missing scope produces a terminal rejection without acquiring a lease.
 
-This checkpoint bounds operation count. It does not close identity byte accounting.
-Causal table updates compare and clone identity strings, but their owner dispatch currently uses an opaque movement charge.
-The producer byte bounds and the required charge remain under review.
-The shared publication queue and the broader legacy fault-reporting contract also remain outside this checkpoint.
+The earlier production regression failed because a retained publication transfer could follow its release.
+The new FIFO passes that production admission-and-finish regression.
+The earlier event regression lost a release after admission backpressure.
+The event path now reserves release capacity before it mints the scope or attempts admission.
+When the FIFO is full, the event retains its original source and does not mint a scope.
+
+Current local evidence:
+
+- The first owner migration passed 36 selected library tests and 11 selected integration tests.
+- Two worker tests passed with retained completions, Host permits, owner permits, and cancellation after table fault.
+- The publication and table selection passed 28 library tests, including limits, unlock races, distinct waits, and fault retention.
+- An asynchronous Lua tool published twice through daemon owner work. Its test passed without synchronous runtime pumping.
+- All four cases in the production package cleanup test passed with the new FIFO capacity fixture.
+- Formatting and the Rust 1.97.0 check with tests passed.
+- The actual admission-refusal test passed with a full causal FIFO and no available Host slots.
+- Two wake tests passed for a retained scan cursor, a captured upper bound, and a live waiter after ready-queue exhaustion.
+- The configured full Lua integration run passed 43 tests and failed five.
+- The rerun outside the sandbox passed 46 tests and failed one cross-package managed-spawn test.
+
+The first integration run found an oversize error-text mismatch, an obsolete directory-recovery fixture, a spawn timeout, and two socket-permission failures.
+The bridge now preserves the existing oversize error code.
+The obsolete fixture tested directory transactions, but the baseline already uses `plugin-db.redb`.
+The existing database transaction and restart test remains and passes.
+The socket-dependent spawn tests pass outside the sandbox.
+The remaining cross-package test calls the synchronous runtime helper, while the managed-spawn queue has only a daemon consumer.
+That timeout remains open. Source inspection shows the consumer gap predates this publication change; no baseline execution has verified that conclusion.
+Two earlier integration attempts stopped before execution because candidate environment paths were incomplete.
+
+The integration runs use the existing `e34f3c0` candidate worker and the current linked Hub library.
+They do not establish a matching final Hub binary or complete foundation acceptance.
+
+Identity byte accounting for the causal FIFO remains open.
+Causal table updates compare and clone identity strings, but dispatch still uses an opaque movement charge.
+The daemon publication path also exposes parsing, validation, and rejected-payload destruction on the owner.
+The next implementation step must move that proportional work off the owner or provide a valid bounded charge.
+The broader owner scheduling, memory, final Core pin, and matched client requirements remain open.

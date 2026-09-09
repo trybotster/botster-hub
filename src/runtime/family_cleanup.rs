@@ -35,17 +35,15 @@ impl HubRuntime {
             "wait for the exact worker completion"
         );
         if let Some(release) = cursor.release.take() {
-            return match self.causal_scopes.try_admit_or_wait(release) {
-                crate::package_event_router::CausalWaitResult::Applied => {
-                    FamilyCleanupStep::Pending
-                }
-                crate::package_event_router::CausalWaitResult::Waiting(release) => {
+            return match self.admit_causal_op(release) {
+                CausalAdmitResult::Applied => FamilyCleanupStep::Pending,
+                CausalAdmitResult::Retry(release) => {
                     cursor.release = Some(release);
-                    FamilyCleanupStep::Waiting
-                }
-                crate::package_event_router::CausalWaitResult::Fault(release) => {
-                    cursor.release = Some(release);
-                    FamilyCleanupStep::Fault
+                    if self.causal_faulted() {
+                        FamilyCleanupStep::Fault
+                    } else {
+                        FamilyCleanupStep::Waiting
+                    }
                 }
             };
         }
@@ -167,24 +165,19 @@ impl HubRuntime {
         cleanup.family_cursor.awaiting_worker = false;
     }
 
-    pub(super) fn drain_direct_package_entity_cleanup(&self, cleanup: &mut HostPackageCleanup) {
+    pub(super) fn drain_direct_package_entity_cleanup(
+        &self,
+        cleanup: &mut HostPackageCleanup,
+    ) -> bool {
         loop {
             match self.step_host_package_entity_cleanup(cleanup) {
                 FamilyCleanupStep::Pending => {}
-                FamilyCleanupStep::Waiting | FamilyCleanupStep::Fault => {
-                    // Synchronous callers have no retained Host operation.
-                    let release = cleanup
-                        .family_cursor
-                        .release
-                        .take()
-                        .expect("the cursor retains its release");
-                    self.finish_package_entity_causal_op(release);
-                }
+                FamilyCleanupStep::Waiting | FamilyCleanupStep::Fault => return false,
                 FamilyCleanupStep::Payload(payload) => {
                     drop(payload);
                     self.complete_host_package_entity_cleanup_item(cleanup);
                 }
-                FamilyCleanupStep::Complete => return,
+                FamilyCleanupStep::Complete => return true,
             }
         }
     }

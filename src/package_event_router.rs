@@ -6,7 +6,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -2720,6 +2720,17 @@ pub(crate) enum CausalWaitResult {
     Fault(CausalOp),
 }
 
+/// The owner retains the publication request until acquisition succeeds or fails permanently.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum CausalAcquireResult {
+    Acquired,
+    Waiting,
+    /// The scope no longer exists. The owner must reject this unacquired request.
+    MissingScope,
+    Fault,
+}
+
 /// Owner-thread-only keyed operations. No mutex. Workers never read this map.
 #[derive(Debug, Default)]
 pub struct EventPlaneOwnerOps {
@@ -2854,47 +2865,18 @@ impl EventPlaneOwnerOps {
     }
 }
 
-/// Worker undo: admit, or retract the identity the worker still owns.
-pub fn release_or_retract(
-    scopes: &CausalScopeTable,
-    scope_id: u64,
-    identity: LeaseIdentity,
-) -> CausalAdmitResult {
-    match scopes.try_admit(CausalOp::Release {
-        scope_id,
-        identity: identity.clone(),
-    }) {
-        CausalAdmitResult::Applied => CausalAdmitResult::Applied,
-        CausalAdmitResult::Retry(op) => {
-            if scopes.try_retract(scope_id, identity) {
-                CausalAdmitResult::Applied
-            } else {
-                CausalAdmitResult::Retry(op)
-            }
-        }
-    }
-}
-
-pub const CAUSAL_PENDING_MAX: usize = 256;
-
 /// Causal-scope lease table. Send + Sync. Lives beside the router.
 pub struct CausalScopeTable {
     inner: Mutex<CausalInner>,
-    pending: Mutex<VecDeque<CausalOp>>,
-    pending_len: AtomicUsize,
     next_id: AtomicU64,
     owner_wake: OnceLock<ControlSender>,
     progress_pending: AtomicBool,
-    interests: AtomicUsize,
-    drain_blocked: AtomicUsize,
+    unlock_interest: AtomicBool,
+    apply_blocked: AtomicBool,
     faulted: AtomicBool,
     #[cfg(test)]
     progress_test_probe: Mutex<Option<Arc<dyn Fn(CausalTestPoint) + Send + Sync>>>,
 }
-
-const CAUSAL_PENDING_UNLOCK: usize = 1;
-const CAUSAL_INNER_UNLOCK: usize = 2;
-const CAUSAL_CAPACITY: usize = 4;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CausalLockError {
@@ -2905,9 +2887,7 @@ enum CausalLockError {
 /// Declare this notice before every causal guard so notification follows all unlocks.
 struct CausalUnlockNotice<'a> {
     table: &'a CausalScopeTable,
-    acquired: Cell<usize>,
-    capacity: Cell<bool>,
-    queued: Cell<bool>,
+    acquired: Cell<bool>,
     poisoned: Cell<bool>,
 }
 
@@ -2915,9 +2895,7 @@ impl<'a> CausalUnlockNotice<'a> {
     fn new(table: &'a CausalScopeTable) -> Self {
         Self {
             table,
-            acquired: Cell::new(0),
-            capacity: Cell::new(false),
-            queued: Cell::new(false),
+            acquired: Cell::new(false),
             poisoned: Cell::new(false),
         }
     }
@@ -2926,21 +2904,15 @@ impl<'a> CausalUnlockNotice<'a> {
 impl Drop for CausalUnlockNotice<'_> {
     fn drop(&mut self) {
         let acquired = self.acquired.get();
-        let poisoned = self.poisoned.get()
-            || (acquired & CAUSAL_PENDING_UNLOCK != 0 && self.table.pending.is_poisoned())
-            || (acquired & CAUSAL_INNER_UNLOCK != 0 && self.table.inner.is_poisoned());
+        let poisoned = self.poisoned.get() || (acquired && self.table.inner.is_poisoned());
         let new_fault = poisoned && !self.table.faulted.swap(true, Ordering::SeqCst);
-        self.table
-            .drain_blocked
-            .fetch_and(!acquired, Ordering::SeqCst);
-        let completed = acquired
-            | if self.capacity.get() {
-                CAUSAL_CAPACITY
-            } else {
-                0
-            };
-        let interested = self.table.interests.fetch_and(!completed, Ordering::SeqCst) & completed;
-        if interested != 0 || self.queued.get() || new_fault {
+        let interested = if acquired {
+            self.table.apply_blocked.store(false, Ordering::SeqCst);
+            self.table.unlock_interest.swap(false, Ordering::SeqCst)
+        } else {
+            false
+        };
+        if interested || new_fault {
             #[cfg(test)]
             self.table
                 .run_progress_test_probe(CausalTestPoint::BeforeNotify);
@@ -2952,8 +2924,6 @@ impl Drop for CausalUnlockNotice<'_> {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CausalTestPoint {
-    BeforePendingArm,
-    BeforePendingRetry,
     BeforeInnerArm,
     BeforeInnerRetry,
     BeforeNotify,
@@ -2962,6 +2932,18 @@ enum CausalTestPoint {
 #[derive(Debug, Default)]
 struct CausalInner {
     scopes: HashMap<u64, CausalScope>,
+}
+
+impl CausalInner {
+    fn acquire(&mut self, scope_id: u64, identity: LeaseIdentity) -> bool {
+        let Some(scope) = self.scopes.get_mut(&scope_id) else {
+            return false;
+        };
+        if scope.identities.insert(identity) {
+            scope.leases = scope.leases.saturating_add(1);
+        }
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -2977,6 +2959,7 @@ pub enum LeaseIdentity {
     },
     PendingEntityPublish {
         plugin_key: String,
+        publication_token: u64,
     },
     AdmittedEntityMutation {
         family: String,
@@ -3003,13 +2986,11 @@ impl CausalScopeTable {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(CausalInner::default()),
-            pending: Mutex::new(VecDeque::new()),
-            pending_len: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
             owner_wake: OnceLock::new(),
             progress_pending: AtomicBool::new(false),
-            interests: AtomicUsize::new(0),
-            drain_blocked: AtomicUsize::new(0),
+            unlock_interest: AtomicBool::new(false),
+            apply_blocked: AtomicBool::new(false),
             faulted: AtomicBool::new(false),
             #[cfg(test)]
             progress_test_probe: Mutex::new(None),
@@ -3049,37 +3030,24 @@ impl CausalScopeTable {
         }
     }
 
-    fn causal_lock<'a, T>(
-        &'a self,
-        mutex: &'a Mutex<T>,
+    fn causal_lock(
+        &self,
         notice: &CausalUnlockNotice<'_>,
-        kind: usize,
         wait: bool,
-        drain: bool,
-    ) -> Result<MutexGuard<'a, T>, CausalLockError> {
-        let first = self.try_causal_guard(mutex, notice, kind);
+    ) -> Result<MutexGuard<'_, CausalInner>, CausalLockError> {
+        let first = self.try_causal_guard(notice);
         match first {
             Err(CausalLockError::Busy) if wait => {
                 #[cfg(test)]
-                self.run_progress_test_probe(if kind == CAUSAL_PENDING_UNLOCK {
-                    CausalTestPoint::BeforePendingArm
-                } else {
-                    CausalTestPoint::BeforeInnerArm
-                });
-                if drain {
-                    self.drain_blocked.fetch_or(kind, Ordering::SeqCst);
-                }
-                self.interests.fetch_or(kind, Ordering::SeqCst);
+                self.run_progress_test_probe(CausalTestPoint::BeforeInnerArm);
+                self.apply_blocked.store(true, Ordering::SeqCst);
+                self.unlock_interest.store(true, Ordering::SeqCst);
                 #[cfg(test)]
-                self.run_progress_test_probe(if kind == CAUSAL_PENDING_UNLOCK {
-                    CausalTestPoint::BeforePendingRetry
-                } else {
-                    CausalTestPoint::BeforeInnerRetry
-                });
+                self.run_progress_test_probe(CausalTestPoint::BeforeInnerRetry);
                 // The second attempt closes an unlock before interest registration.
-                let result = self.try_causal_guard(mutex, notice, kind);
-                if result.is_ok() && drain {
-                    self.drain_blocked.fetch_and(!kind, Ordering::SeqCst);
+                let result = self.try_causal_guard(notice);
+                if result.is_ok() {
+                    self.apply_blocked.store(false, Ordering::SeqCst);
                 }
                 result
             }
@@ -3087,20 +3055,18 @@ impl CausalScopeTable {
         }
     }
 
-    fn try_causal_guard<'a, T>(
-        &'a self,
-        mutex: &'a Mutex<T>,
+    fn try_causal_guard(
+        &self,
         notice: &CausalUnlockNotice<'_>,
-        kind: usize,
-    ) -> Result<MutexGuard<'a, T>, CausalLockError> {
-        match mutex.try_lock() {
+    ) -> Result<MutexGuard<'_, CausalInner>, CausalLockError> {
+        match self.inner.try_lock() {
             Ok(guard) => {
-                notice.acquired.set(notice.acquired.get() | kind);
+                notice.acquired.set(true);
                 Ok(guard)
             }
             Err(TryLockError::WouldBlock) => Err(CausalLockError::Busy),
             Err(TryLockError::Poisoned(poisoned)) => {
-                notice.acquired.set(notice.acquired.get() | kind);
+                notice.acquired.set(true);
                 notice.poisoned.set(true);
                 drop(poisoned.into_inner());
                 Err(CausalLockError::Poisoned)
@@ -3109,9 +3075,7 @@ impl CausalScopeTable {
     }
 
     fn causal_fault(&self, notice: &CausalUnlockNotice<'_>) -> bool {
-        let faulted = self.faulted.load(Ordering::SeqCst)
-            || self.pending.is_poisoned()
-            || self.inner.is_poisoned();
+        let faulted = self.is_faulted();
         notice.poisoned.set(faulted);
         faulted
     }
@@ -3137,9 +3101,7 @@ impl CausalScopeTable {
     pub fn mint_with_lease(&self, identity: Option<LeaseIdentity>) -> Option<u64> {
         let notice = CausalUnlockNotice::new(self);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut inner = self
-            .causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
-            .ok()?;
+        let mut inner = self.causal_lock(&notice, false).ok()?;
         let mut identities = BTreeSet::new();
         let mut leases = 0;
         if let Some(identity) = identity {
@@ -3152,147 +3114,75 @@ impl CausalScopeTable {
 
     pub fn acquire(&self, scope_id: u64, identity: LeaseIdentity) -> bool {
         let notice = CausalUnlockNotice::new(self);
-        let Ok(mut inner) =
-            self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
-        else {
+        let Ok(mut inner) = self.causal_lock(&notice, false) else {
             return false;
         };
-        let Some(scope) = inner.scopes.get_mut(&scope_id) else {
-            return false;
-        };
-        if scope.identities.insert(identity) {
-            scope.leases = scope.leases.saturating_add(1);
-        }
-        true
+        inner.acquire(scope_id, identity)
     }
 
-    /// Replace one identity with zero or more identities under a single lock so
-    /// the scope row cannot disappear between release and acquire.
-    pub fn transfer(
+    /// Acquire for the retained publication head without queuing or waiting on a lock.
+    /// Waiting registers an unlock notification. The owner must retain its request.
+    pub(crate) fn try_acquire_or_wait(
         &self,
         scope_id: u64,
-        from: LeaseIdentity,
-        to: impl IntoIterator<Item = LeaseIdentity>,
-    ) -> CausalAdmitResult {
-        self.try_admit(CausalOp::Transfer {
-            scope_id,
-            from,
-            to: to.into_iter().collect(),
-        })
-    }
-
-    pub fn release(&self, scope_id: u64, identity: LeaseIdentity) -> CausalAdmitResult {
-        self.try_admit(CausalOp::Release { scope_id, identity })
-    }
-
-    /// Undo one identity immediately when the caller still owns it.
-    pub fn try_retract(&self, scope_id: u64, identity: LeaseIdentity) -> bool {
+        identity: &LeaseIdentity,
+    ) -> CausalAcquireResult {
         let notice = CausalUnlockNotice::new(self);
-        let Ok(mut inner) =
-            self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
-        else {
-            return false;
-        };
-        apply_causal_locked(&mut inner, &CausalOp::Release { scope_id, identity });
-        true
-    }
-
-    /// Admit one causal op or return it. Never waits or spins.
-    ///
-    /// Later operations always append behind already-queued operations.
-    pub fn try_admit(&self, op: CausalOp) -> CausalAdmitResult {
-        match self.admit_causal(op, false) {
-            CausalWaitResult::Applied => CausalAdmitResult::Applied,
-            CausalWaitResult::Waiting(op) | CausalWaitResult::Fault(op) => {
-                CausalAdmitResult::Retry(op)
+        if self.causal_fault(&notice) {
+            return CausalAcquireResult::Fault;
+        }
+        if self.apply_blocked.load(Ordering::SeqCst) {
+            return CausalAcquireResult::Waiting;
+        }
+        match self.causal_lock(&notice, true) {
+            Ok(mut inner) => {
+                if inner.acquire(scope_id, identity.clone()) {
+                    CausalAcquireResult::Acquired
+                } else {
+                    CausalAcquireResult::MissingScope
+                }
             }
+            Err(CausalLockError::Busy) => CausalAcquireResult::Waiting,
+            Err(CausalLockError::Poisoned) => CausalAcquireResult::Fault,
         }
     }
 
-    /// Register the owner waiter before calling. Waiting never transfers operation ownership.
-    pub(crate) fn try_admit_or_wait(&self, op: CausalOp) -> CausalWaitResult {
-        self.admit_causal(op, true)
-    }
-
-    fn admit_causal(&self, op: CausalOp, wait: bool) -> CausalWaitResult {
+    /// Apply only the owner FIFO head. This method never queues an operation.
+    /// Waiting and Fault return the operation without changing its ownership.
+    pub(crate) fn try_apply_or_wait(&self, op: CausalOp) -> CausalWaitResult {
         let notice = CausalUnlockNotice::new(self);
         if self.causal_fault(&notice) {
             return CausalWaitResult::Fault(op);
         }
-        let mut pending =
-            match self.causal_lock(&self.pending, &notice, CAUSAL_PENDING_UNLOCK, wait, false) {
-                Ok(pending) => pending,
-                Err(CausalLockError::Busy) => return CausalWaitResult::Waiting(op),
-                Err(CausalLockError::Poisoned) => return CausalWaitResult::Fault(op),
-            };
-        if pending.is_empty() {
-            match self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false) {
-                Ok(mut inner) => {
-                    apply_causal_locked(&mut inner, &op);
-                    return CausalWaitResult::Applied;
-                }
-                Err(CausalLockError::Poisoned) => return CausalWaitResult::Fault(op),
-                Err(CausalLockError::Busy) => {}
+        if self.apply_blocked.load(Ordering::SeqCst) {
+            return CausalWaitResult::Waiting(op);
+        }
+        match self.causal_lock(&notice, true) {
+            Ok(mut inner) => {
+                apply_causal_locked(&mut inner, &op);
+                CausalWaitResult::Applied
             }
+            Err(CausalLockError::Busy) => CausalWaitResult::Waiting(op),
+            Err(CausalLockError::Poisoned) => CausalWaitResult::Fault(op),
         }
-        if pending.len() < CAUSAL_PENDING_MAX {
-            notice.queued.set(pending.is_empty());
-            pending.push_back(op);
-            self.pending_len.fetch_add(1, Ordering::SeqCst);
-            return CausalWaitResult::Applied;
-        }
-        if wait {
-            self.interests.fetch_or(CAUSAL_CAPACITY, Ordering::SeqCst);
-        }
-        CausalWaitResult::Waiting(op)
     }
 
-    /// Attempt at most one queued operation without waiting for either lock.
-    pub fn flush_pending(&self) -> usize {
-        let notice = CausalUnlockNotice::new(self);
-        if self.causal_fault(&notice) || !self.pending_ops() {
-            return 0;
-        }
-        let Ok(mut pending) =
-            self.causal_lock(&self.pending, &notice, CAUSAL_PENDING_UNLOCK, true, true)
-        else {
-            return 0;
-        };
-        let Ok(mut inner) = self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, true, true)
-        else {
-            return 0;
-        };
-        let Some(op) = pending.pop_front() else {
-            return 0;
-        };
-        self.pending_len.fetch_sub(1, Ordering::SeqCst);
-        notice.capacity.set(true);
-        apply_causal_locked(&mut inner, &op);
-        1
-    }
-
+    /// The owner can try its FIFO head unless an inner unlock or fault blocks it.
+    /// This query does not indicate whether the owner FIFO contains an operation.
     #[must_use]
-    pub fn pending_ops(&self) -> bool {
-        self.pending_len.load(Ordering::SeqCst) > 0
-    }
-
-    /// A mutex unlock re-enables draining after contention. Poison requires owner recovery.
-    #[must_use]
-    pub(crate) fn pending_ready(&self) -> bool {
-        self.pending_ops() && self.drain_blocked.load(Ordering::SeqCst) == 0 && !self.is_faulted()
+    pub(crate) fn apply_ready(&self) -> bool {
+        !self.apply_blocked.load(Ordering::SeqCst) && !self.is_faulted()
     }
 
     pub(crate) fn is_faulted(&self) -> bool {
-        self.faulted.load(Ordering::SeqCst)
-            || self.pending.is_poisoned()
-            || self.inner.is_poisoned()
+        self.faulted.load(Ordering::SeqCst) || self.inner.is_poisoned()
     }
 
     #[doc(hidden)]
     pub fn test_with_inner_held<R>(&self, body: impl FnOnce() -> R) -> R {
         let notice = CausalUnlockNotice::new(self);
         let _guard = self
-            .causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
+            .causal_lock(&notice, false)
             .expect("test hold must acquire causal inner");
         body()
     }
@@ -3300,7 +3190,7 @@ impl CausalScopeTable {
     #[must_use]
     pub fn is_live(&self, scope_id: u64) -> bool {
         let notice = CausalUnlockNotice::new(self);
-        match self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false) {
+        match self.causal_lock(&notice, false) {
             Ok(inner) => inner
                 .scopes
                 .get(&scope_id)
@@ -3312,7 +3202,7 @@ impl CausalScopeTable {
     #[must_use]
     pub fn lease_count(&self, scope_id: u64) -> Option<u32> {
         let notice = CausalUnlockNotice::new(self);
-        self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
+        self.causal_lock(&notice, false)
             .ok()
             .and_then(|inner| inner.scopes.get(&scope_id).map(|scope| scope.leases))
     }
@@ -3320,8 +3210,7 @@ impl CausalScopeTable {
     #[must_use]
     pub fn pending_publish_leases(&self) -> Vec<(u64, LeaseIdentity)> {
         let notice = CausalUnlockNotice::new(self);
-        let Ok(inner) = self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
-        else {
+        let Ok(inner) = self.causal_lock(&notice, false) else {
             return Vec::new();
         };
         inner
@@ -3340,14 +3229,12 @@ impl CausalScopeTable {
     #[must_use]
     pub fn identities(&self, scope_id: u64) -> Option<BTreeSet<LeaseIdentity>> {
         let notice = CausalUnlockNotice::new(self);
-        self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
-            .ok()
-            .and_then(|inner| {
-                inner
-                    .scopes
-                    .get(&scope_id)
-                    .map(|scope| scope.identities.clone())
-            })
+        self.causal_lock(&notice, false).ok().and_then(|inner| {
+            inner
+                .scopes
+                .get(&scope_id)
+                .map(|scope| scope.identities.clone())
+        })
     }
 }
 
@@ -3386,6 +3273,7 @@ mod tests {
     use super::*;
     use crate::config::PackageEventPlaneOptions;
     use crate::subscription::package_events::ClientEventMailbox;
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration as StdDuration;
 
@@ -3400,11 +3288,7 @@ mod tests {
         }
     }
 
-    fn assert_causal_locks_free(table: &CausalScopeTable) {
-        let _pending = table
-            .pending
-            .try_lock()
-            .expect("pending is unlocked before notification");
+    fn assert_causal_inner_free(table: &CausalScopeTable) {
         let _inner = table
             .inner
             .try_lock()
@@ -3412,263 +3296,311 @@ mod tests {
     }
 
     #[test]
-    fn causal_progress_survives_binding_and_a_full_control_channel() {
+    fn causal_owner_apply_changes_only_the_supplied_operation() {
         let table = CausalScopeTable::new();
-        table.test_with_inner_held(|| {
-            assert_eq!(
-                table.try_admit(causal_test_op(1)),
-                CausalAdmitResult::Applied
-            );
-        });
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        sender
-            .try_send(ControlMessage::CausalProgressPublished)
-            .expect("fill channel");
-        table.bind_owner_wake(sender.clone());
-        table.bind_owner_wake(sender);
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(ControlMessage::CausalProgressPublished)
-        ));
-        assert!(
-            receiver.try_recv().is_err(),
-            "the doorbell never exceeds channel capacity"
+        let pending_identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+            publication_token: 0,
+        };
+        let scope_id = table
+            .mint_with_lease(Some(pending_identity.clone()))
+            .unwrap();
+        let mutation = LeaseIdentity::AdmittedEntityMutation {
+            family: "producer.item".into(),
+            generation: 4,
+            seq: 1,
+        };
+        let resync = LeaseIdentity::ProviderResyncNeed {
+            family: "producer.item".into(),
+            generation: 4,
+        };
+        assert!(table.apply_ready());
+        assert_eq!(
+            table.try_apply_or_wait(CausalOp::Transfer {
+                scope_id,
+                from: pending_identity,
+                to: vec![mutation.clone(), resync.clone()],
+            }),
+            CausalWaitResult::Applied
         );
-        assert!(
-            table.take_progress_notification(),
-            "the bit survives a refused doorbell"
+        assert_eq!(
+            table.identities(scope_id),
+            Some(BTreeSet::from([mutation.clone(), resync.clone()]))
         );
-        assert!(!table.take_progress_notification());
-        assert!(table.pending_ready());
-        assert_eq!(table.flush_pending(), 1);
-        table.test_with_inner_held(|| {
-            assert_eq!(
-                table.try_admit(causal_test_op(2)),
-                CausalAdmitResult::Applied
-            );
-            assert_eq!(
-                table.try_admit(causal_test_op(3)),
-                CausalAdmitResult::Applied
-            );
-        });
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(ControlMessage::CausalProgressPublished)
-        ));
-        assert!(receiver.try_recv().is_err(), "progress coalesces");
-        assert!(table.take_progress_notification());
+        assert_eq!(
+            table.try_apply_or_wait(CausalOp::Release {
+                scope_id,
+                identity: mutation
+            }),
+            CausalWaitResult::Applied
+        );
+        assert_eq!(
+            table.identities(scope_id),
+            Some(BTreeSet::from([resync.clone()]))
+        );
+        assert_eq!(
+            table.try_apply_or_wait(CausalOp::Release {
+                scope_id,
+                identity: resync
+            }),
+            CausalWaitResult::Applied
+        );
+        assert_eq!(table.identities(scope_id), None);
+        assert!(table.apply_ready());
+        assert!(
+            !table.take_progress_notification(),
+            "uncontended application does not wake itself"
+        );
     }
 
     #[test]
-    fn causal_pending_unlock_before_registration_or_retry_cannot_lose_progress() {
-        for release_point in [
-            CausalTestPoint::BeforePendingArm,
-            CausalTestPoint::BeforePendingRetry,
+    fn causal_owner_operations_close_inner_unlock_races_before_arm_and_retry() {
+        for (release_point, acquire) in [
+            (CausalTestPoint::BeforeInnerArm, false),
+            (CausalTestPoint::BeforeInnerRetry, false),
+            (CausalTestPoint::BeforeInnerArm, true),
+            (CausalTestPoint::BeforeInnerRetry, true),
         ] {
             let table = Arc::new(CausalScopeTable::new());
+            let identity = LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+                publication_token: 0,
+            };
+            let scope_id = table
+                .mint_with_lease((!acquire).then(|| identity.clone()))
+                .unwrap();
             let (held_tx, held_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let worker_table = Arc::clone(&table);
             let worker = thread::spawn(move || {
-                {
-                    let notice = CausalUnlockNotice::new(&worker_table);
-                    let _pending = worker_table
-                        .causal_lock(
-                            &worker_table.pending,
-                            &notice,
-                            CAUSAL_PENDING_UNLOCK,
-                            false,
-                            false,
-                        )
-                        .expect("hold pending");
-                    held_tx.send(()).expect("holder started");
-                    release_rx.recv().expect("release holder");
-                }
-                done_tx.send(()).expect("holder unlocked");
+                worker_table.test_with_inner_held(|| {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                done_tx.send(()).unwrap();
             });
-            held_rx.recv().expect("pending held");
+            held_rx.recv().unwrap();
             let done_rx = Mutex::new(done_rx);
             let weak = Arc::downgrade(&table);
             *table.progress_test_probe.try_lock().unwrap() = Some(Arc::new(move |point| {
                 if point == release_point {
-                    release_tx.send(()).expect("release at the race boundary");
-                    done_rx.lock().unwrap().recv().expect("unlock before retry");
+                    release_tx.send(()).unwrap();
+                    done_rx.lock().unwrap().recv().unwrap();
                 }
                 if point == CausalTestPoint::BeforeNotify {
-                    assert_causal_locks_free(&weak.upgrade().expect("table lives"));
+                    assert_causal_inner_free(&weak.upgrade().unwrap());
                 }
             }));
+            if acquire {
+                assert_eq!(
+                    table.try_acquire_or_wait(scope_id, &identity),
+                    CausalAcquireResult::Acquired
+                );
+            } else {
+                assert_eq!(
+                    table.try_apply_or_wait(CausalOp::Release {
+                        scope_id,
+                        identity: identity.clone()
+                    }),
+                    CausalWaitResult::Applied
+                );
+            }
+            worker.join().unwrap();
             assert_eq!(
-                table.try_admit_or_wait(causal_test_op(1)),
-                CausalWaitResult::Applied
+                table.identities(scope_id),
+                acquire.then(|| BTreeSet::from([identity]))
             );
-            worker.join().expect("holder joins");
-            assert_eq!(table.pending_len.load(Ordering::SeqCst), 0);
-            assert_eq!(table.interests.load(Ordering::SeqCst), 0);
+            assert!(table.apply_ready());
+            assert!(!table.unlock_interest.load(Ordering::SeqCst));
+            assert!(!table.apply_blocked.load(Ordering::SeqCst));
             assert!(table.take_progress_notification());
         }
     }
 
     #[test]
-    fn causal_pending_unlock_wakes_an_owned_waiter_after_both_attempts_fail() {
+    fn causal_owner_apply_parks_without_polling_and_retains_a_full_channel_wake() {
         let table = Arc::new(CausalScopeTable::new());
+        let identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+            publication_token: 0,
+        };
+        let scope_id = table.mint_with_lease(Some(identity.clone())).unwrap();
+        let op = CausalOp::Release { scope_id, identity };
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(ControlMessage::CausalProgressPublished)
+            .unwrap();
         table.bind_owner_wake(sender);
+        let arms = Arc::new(AtomicUsize::new(0));
+        let retries = Arc::new(AtomicUsize::new(0));
+        let observed_arms = Arc::clone(&arms);
+        let observed_retries = Arc::clone(&retries);
+        let weak = Arc::downgrade(&table);
+        *table.progress_test_probe.try_lock().unwrap() = Some(Arc::new(move |point| match point {
+            CausalTestPoint::BeforeInnerArm => {
+                observed_arms.fetch_add(1, Ordering::SeqCst);
+            }
+            CausalTestPoint::BeforeInnerRetry => {
+                observed_retries.fetch_add(1, Ordering::SeqCst);
+            }
+            CausalTestPoint::BeforeNotify => assert_causal_inner_free(&weak.upgrade().unwrap()),
+        }));
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let worker_table = Arc::clone(&table);
         let worker = thread::spawn(move || {
-            let notice = CausalUnlockNotice::new(&worker_table);
-            let _pending = worker_table
-                .causal_lock(
-                    &worker_table.pending,
-                    &notice,
-                    CAUSAL_PENDING_UNLOCK,
-                    false,
-                    false,
-                )
-                .expect("hold pending");
-            held_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            worker_table.test_with_inner_held(|| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
         });
         held_rx.recv().unwrap();
-        let op = causal_test_op(9);
-        assert_eq!(
-            table.try_admit_or_wait(op.clone()),
-            CausalWaitResult::Waiting(op.clone())
-        );
-        assert!(!table.take_progress_notification());
-        assert!(receiver.try_recv().is_err());
+        for _ in 0..4 {
+            assert_eq!(
+                table.try_apply_or_wait(op.clone()),
+                CausalWaitResult::Waiting(op.clone())
+            );
+            assert!(!table.apply_ready());
+            assert!(!table.take_progress_notification());
+        }
+        assert_eq!(arms.load(Ordering::SeqCst), 1);
+        assert_eq!(retries.load(Ordering::SeqCst), 1);
         release_tx.send(()).unwrap();
         worker.join().unwrap();
+        assert!(table.apply_ready());
+        assert!(
+            table.take_progress_notification(),
+            "the bit survives a full channel"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CausalProgressPublished)
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(table.try_apply_or_wait(op), CausalWaitResult::Applied);
+        assert_eq!(table.identities(scope_id), None);
+        assert!(!table.take_progress_notification());
+    }
+
+    #[test]
+    fn causal_owner_apply_fault_retains_the_operation_and_prebind_notification() {
+        let table = CausalScopeTable::new();
+        let identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+            publication_token: 0,
+        };
+        let scope_id = table.mint_with_lease(Some(identity.clone())).unwrap();
+        let op = CausalOp::Release {
+            scope_id,
+            identity: identity.clone(),
+        };
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.test_with_inner_held(|| {
+                assert_eq!(
+                    table.try_apply_or_wait(op.clone()),
+                    CausalWaitResult::Waiting(op.clone())
+                );
+                panic!("poison the inner lock while the owner waits");
+            });
+        }));
+        assert!(fault.is_err());
+        assert!(table.is_faulted());
+        assert!(!table.apply_ready());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        table.bind_owner_wake(sender);
         assert!(matches!(
             receiver.try_recv(),
             Ok(ControlMessage::CausalProgressPublished)
         ));
         assert!(table.take_progress_notification());
-        assert_eq!(table.try_admit_or_wait(op), CausalWaitResult::Applied);
-        assert!(!table.take_progress_notification());
-    }
-
-    #[test]
-    fn causal_full_queue_waits_for_capacity_and_rearms_after_a_competing_insert() {
-        let table = Arc::new(CausalScopeTable::new());
-        table.test_with_inner_held(|| {
-            for sequence in 0..CAUSAL_PENDING_MAX {
-                assert_eq!(
-                    table.try_admit(causal_test_op(sequence as u64)),
-                    CausalAdmitResult::Applied
-                );
-            }
-        });
-        assert!(table.take_progress_notification());
-        let weak = Arc::downgrade(&table);
-        *table.progress_test_probe.try_lock().unwrap() = Some(Arc::new(move |point| {
-            if point == CausalTestPoint::BeforeNotify {
-                assert_causal_locks_free(&weak.upgrade().expect("table lives"));
-            }
-        }));
-        let waiting = causal_test_op(900);
         for _ in 0..3 {
             assert_eq!(
-                table.try_admit_or_wait(waiting.clone()),
-                CausalWaitResult::Waiting(waiting.clone())
+                table.try_apply_or_wait(op.clone()),
+                CausalWaitResult::Fault(op.clone())
             );
             assert!(
                 !table.take_progress_notification(),
-                "full refusal must not wake itself"
+                "a persistent fault does not poll"
             );
         }
-        assert_eq!(table.flush_pending(), 1);
-        assert!(table.take_progress_notification());
+        let inner = match table.inner.try_lock() {
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            _ => panic!("the oracle must observe a poisoned lock"),
+        };
         assert_eq!(
-            table.try_admit(causal_test_op(901)),
-            CausalAdmitResult::Applied
+            inner.scopes.get(&scope_id).unwrap().identities,
+            BTreeSet::from([identity])
         );
+    }
+
+    #[test]
+    fn causal_owner_acquire_distinguishes_a_missing_scope_and_keeps_identity_counts_exact() {
+        let table = CausalScopeTable::new();
+        let scope_id = table.mint().unwrap();
+        let identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+            publication_token: 0,
+        };
         assert_eq!(
-            table.try_admit_or_wait(waiting.clone()),
-            CausalWaitResult::Waiting(waiting.clone())
+            table.try_acquire_or_wait(u64::MAX, &identity),
+            CausalAcquireResult::MissingScope
         );
+        assert_eq!(table.identities(u64::MAX), None);
+        for _ in 0..2 {
+            assert_eq!(
+                table.try_acquire_or_wait(scope_id, &identity),
+                CausalAcquireResult::Acquired
+            );
+            assert_eq!(table.lease_count(scope_id), Some(1));
+            assert_eq!(
+                table.identities(scope_id),
+                Some(BTreeSet::from([identity.clone()]))
+            );
+        }
         assert!(!table.take_progress_notification());
-        assert_eq!(table.flush_pending(), 1);
-        assert!(
-            table.take_progress_notification(),
-            "the next free slot wakes the re-armed waiter"
-        );
-        assert_eq!(
-            table.try_admit_or_wait(waiting.clone()),
-            CausalWaitResult::Applied
-        );
-        let pending = table.pending.try_lock().unwrap();
-        assert_eq!(
-            pending.back(),
-            Some(&waiting),
-            "the admitted release keeps FIFO order"
-        );
-        assert_eq!(pending.len(), CAUSAL_PENDING_MAX);
     }
 
     #[test]
-    fn causal_inner_unlock_resumes_blocked_flush_before_capacity_admission() {
+    fn causal_owner_acquire_waits_for_unlock_and_distinguishes_a_fault() {
         let table = CausalScopeTable::new();
-        let waiting = causal_test_op(900);
+        let scope_id = table.mint().unwrap();
+        let identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+            publication_token: 0,
+        };
         table.test_with_inner_held(|| {
-            for sequence in 0..CAUSAL_PENDING_MAX {
+            for _ in 0..3 {
                 assert_eq!(
-                    table.try_admit(causal_test_op(sequence as u64)),
-                    CausalAdmitResult::Applied
+                    table.try_acquire_or_wait(scope_id, &identity),
+                    CausalAcquireResult::Waiting
                 );
+                assert!(!table.apply_ready());
+                assert!(!table.take_progress_notification());
             }
-            assert!(table.take_progress_notification());
-            assert_eq!(
-                table.try_admit_or_wait(waiting.clone()),
-                CausalWaitResult::Waiting(waiting.clone())
-            );
-            assert_eq!(table.flush_pending(), 0);
-            assert!(table.pending_ops());
-            assert!(!table.pending_ready(), "the owner parks until inner unlock");
-            assert!(
-                !table.take_progress_notification(),
-                "a failed flush must not poll itself"
-            );
         });
-        assert!(
-            table.take_progress_notification(),
-            "inner unlock wakes flushing"
-        );
-        assert!(table.pending_ready());
-        assert_eq!(table.flush_pending(), 1);
-        assert!(
-            table.take_progress_notification(),
-            "the pop wakes the capacity waiter"
-        );
-        assert_eq!(table.try_admit_or_wait(waiting), CausalWaitResult::Applied);
-    }
-
-    #[test]
-    fn causal_pending_unlock_resumes_blocked_flush() {
-        let table = CausalScopeTable::new();
-        table.test_with_inner_held(|| {
-            assert_eq!(
-                table.try_admit(causal_test_op(1)),
-                CausalAdmitResult::Applied
-            );
-        });
+        assert!(table.apply_ready());
         assert!(table.take_progress_notification());
-        {
-            let notice = CausalUnlockNotice::new(&table);
-            let _pending = table
-                .causal_lock(&table.pending, &notice, CAUSAL_PENDING_UNLOCK, false, false)
-                .unwrap();
-            assert_eq!(table.flush_pending(), 0);
-            assert!(!table.pending_ready());
+        assert_eq!(table.lease_count(scope_id), Some(0));
+        assert_eq!(
+            table.try_acquire_or_wait(scope_id, &identity),
+            CausalAcquireResult::Acquired
+        );
+        assert_eq!(table.lease_count(scope_id), Some(1));
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.test_with_inner_held(|| panic!("poison the acquisition lock"));
+        }));
+        assert!(fault.is_err());
+        assert!(table.take_progress_notification());
+        for _ in 0..3 {
+            assert_eq!(
+                table.try_acquire_or_wait(u64::MAX, &identity),
+                CausalAcquireResult::Fault,
+                "poison must not look like a missing scope"
+            );
+            assert!(!table.apply_ready());
             assert!(!table.take_progress_notification());
         }
-        assert!(table.take_progress_notification());
-        assert!(table.pending_ready());
-        assert_eq!(table.flush_pending(), 1);
-        assert!(!table.pending_ready());
     }
 
     #[test]
@@ -3677,7 +3609,7 @@ mod tests {
         let weak = Arc::downgrade(&table);
         *table.progress_test_probe.try_lock().unwrap() = Some(Arc::new(move |point| {
             if point == CausalTestPoint::BeforeNotify {
-                assert_causal_locks_free(&weak.upgrade().unwrap());
+                assert_causal_inner_free(&weak.upgrade().unwrap());
             }
         }));
         let actions: &[fn(&CausalScopeTable)] = &[
@@ -3691,14 +3623,6 @@ mod tests {
                         request_id: "absent".into()
                     }
                 ));
-            },
-            |table| {
-                let _ = table.try_retract(
-                    1,
-                    LeaseIdentity::EventInFlight {
-                        request_id: "absent".into(),
-                    },
-                );
             },
             |table| {
                 let _ = table.is_live(1);
@@ -3717,65 +3641,34 @@ mod tests {
             },
         ];
         for action in actions {
-            table.interests.store(CAUSAL_INNER_UNLOCK, Ordering::SeqCst);
-            table
-                .drain_blocked
-                .store(CAUSAL_INNER_UNLOCK, Ordering::SeqCst);
+            table.unlock_interest.store(true, Ordering::SeqCst);
+            table.apply_blocked.store(true, Ordering::SeqCst);
             action(&table);
             assert!(table.take_progress_notification());
-            assert_eq!(table.drain_blocked.load(Ordering::SeqCst), 0);
-            assert_eq!(table.interests.load(Ordering::SeqCst), 0);
+            assert!(table.apply_ready());
+            assert!(!table.unlock_interest.load(Ordering::SeqCst));
         }
-    }
-
-    #[test]
-    fn causal_poison_returns_the_owned_operation_and_publishes_one_fault() {
-        for kind in [CAUSAL_PENDING_UNLOCK, CAUSAL_INNER_UNLOCK] {
-            let table = CausalScopeTable::new();
-            table.test_with_inner_held(|| {
-                assert_eq!(
-                    table.try_admit(causal_test_op(1)),
-                    CausalAdmitResult::Applied
-                );
-            });
-            assert!(table.take_progress_notification());
-            let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let notice = CausalUnlockNotice::new(&table);
-                if kind == CAUSAL_PENDING_UNLOCK {
-                    let _pending = table
-                        .causal_lock(&table.pending, &notice, kind, false, false)
-                        .unwrap();
-                    panic!("poison pending");
-                } else {
-                    let _inner = table
-                        .causal_lock(&table.inner, &notice, kind, false, false)
-                        .unwrap();
-                    panic!("poison inner");
+        // A successful apply also consumes an existing unlock interest.
+        table.unlock_interest.store(true, Ordering::SeqCst);
+        assert_eq!(
+            table.try_apply_or_wait(causal_test_op(1)),
+            CausalWaitResult::Applied
+        );
+        assert!(table.take_progress_notification());
+        assert!(!table.unlock_interest.load(Ordering::SeqCst));
+        table.unlock_interest.store(true, Ordering::SeqCst);
+        assert_eq!(
+            table.try_acquire_or_wait(
+                u64::MAX,
+                &LeaseIdentity::PendingEntityPublish {
+                    plugin_key: "absent".into(),
+                    publication_token: 0
                 }
-            }));
-            assert!(fault.is_err());
-            assert!(
-                table.take_progress_notification(),
-                "poison wakes retained owner work"
-            );
-            let op = causal_test_op(2);
-            assert_eq!(
-                table.try_admit_or_wait(op.clone()),
-                CausalWaitResult::Fault(op.clone())
-            );
-            assert_eq!(table.try_admit(op.clone()), CausalAdmitResult::Retry(op));
-            assert!(!table.pending_ready());
-            assert_eq!(table.flush_pending(), 0);
-            assert_eq!(
-                table.pending_len.load(Ordering::SeqCst),
-                1,
-                "fault preserves admitted backlog"
-            );
-            assert!(
-                !table.take_progress_notification(),
-                "a persistent fault does not poll"
-            );
-        }
+            ),
+            CausalAcquireResult::MissingScope
+        );
+        assert!(table.take_progress_notification());
+        assert!(!table.unlock_interest.load(Ordering::SeqCst));
     }
 
     fn router() -> PackageEventRouter {
@@ -6329,21 +6222,23 @@ mod tests {
         let scope = table
             .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
                 plugin_key: "producer".into(),
+                publication_token: 0,
             }))
             .expect("mint");
         assert_eq!(
-            table.transfer(
-                scope,
-                LeaseIdentity::PendingEntityPublish {
+            table.try_apply_or_wait(CausalOp::Transfer {
+                scope_id: scope,
+                from: LeaseIdentity::PendingEntityPublish {
                     plugin_key: "producer".into(),
+                    publication_token: 0
                 },
-                [LeaseIdentity::AdmittedEntityMutation {
+                to: vec![LeaseIdentity::AdmittedEntityMutation {
                     generation: 0,
                     family: "producer.item".into(),
                     seq: 32,
                 }],
-            ),
-            CausalAdmitResult::Applied
+            }),
+            CausalWaitResult::Applied
         );
         assert!(table.is_live(scope));
         assert_eq!(table.lease_count(scope), Some(1));
@@ -6525,299 +6420,6 @@ mod tests {
                 .expect("unchanged"),
             generation
         );
-    }
-
-    #[test]
-    fn held_causal_table_queues_transfer_and_release_until_flush() {
-        let table = CausalScopeTable::new();
-        let scope = table
-            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
-            }))
-            .expect("mint");
-        table.test_with_inner_held(|| {
-            assert_eq!(
-                table.transfer(
-                    scope,
-                    LeaseIdentity::PendingEntityPublish {
-                        plugin_key: "producer".into(),
-                    },
-                    [LeaseIdentity::AdmittedEntityMutation {
-                        generation: 0,
-                        family: "f".into(),
-                        seq: 1,
-                    }],
-                ),
-                CausalAdmitResult::Applied
-            );
-            assert_eq!(
-                table.release(
-                    scope,
-                    LeaseIdentity::AdmittedEntityMutation {
-                        generation: 0,
-                        family: "f".into(),
-                        seq: 1,
-                    },
-                ),
-                CausalAdmitResult::Applied
-            );
-            assert!(table.pending_ops());
-        });
-        assert_eq!(
-            table.identities(scope),
-            Some(BTreeSet::from([LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
-            }]))
-        );
-        assert_eq!(table.flush_pending(), 1);
-        assert!(table.pending_ops());
-        assert_eq!(table.lease_count(scope), Some(1));
-        assert_eq!(table.flush_pending(), 1);
-        assert!(!table.pending_ops());
-        assert!(!table.is_live(scope));
-    }
-
-    #[test]
-    fn causal_flush_contention_retains_the_next_exact_lease_operation() {
-        let table = CausalScopeTable::new();
-        let identity = LeaseIdentity::EventInFlight {
-            request_id: "request".into(),
-        };
-        let scope = table
-            .mint_with_lease(Some(identity.clone()))
-            .expect("scope");
-        table.test_with_inner_held(|| {
-            assert_eq!(
-                table.release(scope, identity.clone()),
-                CausalAdmitResult::Applied
-            );
-            assert_eq!(table.flush_pending(), 0);
-            assert_eq!(table.pending_len.load(Ordering::SeqCst), 1);
-        });
-        {
-            let _pending = table.pending.try_lock().expect("hold pending queue");
-            assert_eq!(table.flush_pending(), 0);
-            assert!(table.pending_ops());
-            assert_eq!(table.identities(scope), Some(BTreeSet::from([identity])));
-        }
-        assert_eq!(table.flush_pending(), 1);
-        assert_eq!(table.pending_len.load(Ordering::SeqCst), 0);
-        assert!(!table.pending_ops());
-        assert!(!table.is_live(scope));
-        assert_eq!(table.flush_pending(), 0);
-    }
-
-    #[test]
-    fn ordered_pending_path_keeps_fifo_and_returns_the_257th() {
-        let table = CausalScopeTable::new();
-        let mut scopes = Vec::new();
-        for index in 0..=CAUSAL_PENDING_MAX {
-            let scope = table
-                .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                    plugin_key: format!("p{index}"),
-                }))
-                .expect("mint");
-            scopes.push(scope);
-        }
-        let overflow = table.test_with_inner_held(|| {
-            for (index, scope) in scopes.iter().take(CAUSAL_PENDING_MAX).enumerate() {
-                assert_eq!(
-                    table.transfer(
-                        *scope,
-                        LeaseIdentity::PendingEntityPublish {
-                            plugin_key: format!("p{index}"),
-                        },
-                        [LeaseIdentity::AdmittedEntityMutation {
-                            generation: 0,
-                            family: "f".into(),
-                            seq: index as u64,
-                        }],
-                    ),
-                    CausalAdmitResult::Applied
-                );
-            }
-            table.transfer(
-                scopes[CAUSAL_PENDING_MAX],
-                LeaseIdentity::PendingEntityPublish {
-                    plugin_key: format!("p{}", CAUSAL_PENDING_MAX),
-                },
-                [LeaseIdentity::AdmittedEntityMutation {
-                    generation: 0,
-                    family: "f".into(),
-                    seq: CAUSAL_PENDING_MAX as u64,
-                }],
-            )
-        });
-        let CausalAdmitResult::Retry(overflow) = overflow else {
-            panic!("the 257th transfer must return to the caller: {overflow:?}");
-        };
-        let first = table.flush_pending();
-        assert!(first > 0);
-        assert!(
-            first == 1,
-            "one owner turn must not drain without a bound: {first}"
-        );
-        assert_eq!(
-            table.identities(scopes[0]),
-            Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
-                generation: 0,
-                family: "f".into(),
-                seq: 0,
-            }]))
-        );
-        while table.pending_ops() {
-            let _ = table.flush_pending();
-        }
-        assert_eq!(table.try_admit(overflow), CausalAdmitResult::Applied);
-        while table.pending_ops() {
-            let _ = table.flush_pending();
-        }
-        for (index, scope) in scopes.iter().enumerate() {
-            assert_eq!(
-                table.identities(*scope),
-                Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
-                    generation: 0,
-                    family: "f".into(),
-                    seq: index as u64,
-                }]))
-            );
-        }
-    }
-
-    #[test]
-    fn same_scope_release_cannot_bypass_a_parked_transfer() {
-        let table = CausalScopeTable::new();
-        let live = table
-            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
-            }))
-            .expect("live");
-        let mut fillers = Vec::new();
-        for index in 0..(CAUSAL_PENDING_MAX - 1) {
-            fillers.push(
-                table
-                    .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                        plugin_key: format!("p{index}"),
-                    }))
-                    .expect("mint"),
-            );
-        }
-        table.test_with_inner_held(|| {
-            for (index, scope) in fillers.iter().enumerate() {
-                assert_eq!(
-                    table.transfer(
-                        *scope,
-                        LeaseIdentity::PendingEntityPublish {
-                            plugin_key: format!("p{index}"),
-                        },
-                        [LeaseIdentity::AdmittedEntityMutation {
-                            generation: 0,
-                            family: "f".into(),
-                            seq: index as u64,
-                        }],
-                    ),
-                    CausalAdmitResult::Applied
-                );
-            }
-            assert_eq!(
-                table.transfer(
-                    live,
-                    LeaseIdentity::PendingEntityPublish {
-                        plugin_key: "producer".into(),
-                    },
-                    [LeaseIdentity::AdmittedEntityMutation {
-                        generation: 0,
-                        family: "producer.item".into(),
-                        seq: 1,
-                    }],
-                ),
-                CausalAdmitResult::Applied
-            );
-        });
-        let first = table.flush_pending();
-        assert!(first > 0);
-        assert!(first == 1);
-        assert!(table.pending_ops());
-        assert_eq!(
-            table.release(
-                live,
-                LeaseIdentity::AdmittedEntityMutation {
-                    generation: 0,
-                    family: "producer.item".into(),
-                    seq: 1,
-                },
-            ),
-            CausalAdmitResult::Applied
-        );
-        while table.pending_ops() {
-            let _ = table.flush_pending();
-        }
-        assert!(
-            !table.is_live(live),
-            "parked transfer must apply before the later release"
-        );
-    }
-
-    #[test]
-    fn never_queued_release_closes_after_full_table_and_held_inner() {
-        let table = CausalScopeTable::new();
-        let live = table
-            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
-            }))
-            .expect("live");
-        let mut fillers = Vec::new();
-        for index in 0..CAUSAL_PENDING_MAX {
-            fillers.push(
-                table
-                    .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                        plugin_key: format!("p{index}"),
-                    }))
-                    .expect("mint"),
-            );
-        }
-        let overflow = table.test_with_inner_held(|| {
-            for (index, scope) in fillers.iter().enumerate() {
-                assert_eq!(
-                    table.transfer(
-                        *scope,
-                        LeaseIdentity::PendingEntityPublish {
-                            plugin_key: format!("p{index}"),
-                        },
-                        [LeaseIdentity::AdmittedEntityMutation {
-                            generation: 0,
-                            family: "f".into(),
-                            seq: index as u64,
-                        }],
-                    ),
-                    CausalAdmitResult::Applied
-                );
-            }
-            release_or_retract(
-                &table,
-                live,
-                LeaseIdentity::PendingEntityPublish {
-                    plugin_key: "producer".into(),
-                },
-            )
-        });
-        let CausalAdmitResult::Retry(overflow) = overflow else {
-            panic!("held full path must return the release: {overflow:?}");
-        };
-        assert_eq!(
-            table.identities(live),
-            Some(BTreeSet::from([LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
-            }]))
-        );
-        while table.pending_ops() {
-            let _ = table.flush_pending();
-        }
-        assert_eq!(table.try_admit(overflow), CausalAdmitResult::Applied);
-        while table.pending_ops() {
-            let _ = table.flush_pending();
-        }
-        assert!(!table.is_live(live));
     }
 
     #[test]

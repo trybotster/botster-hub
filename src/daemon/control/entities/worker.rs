@@ -30,12 +30,15 @@ pub(super) struct EntityWork {
     pub(super) registered: bool,
     pub(super) error: Option<(&'static str, &'static str)>,
     pub(super) finish: Option<crate::runtime::PackageEntityFanoutFinish>,
+    pub(super) admission_refusal: Option<(&'static str, String)>,
     pub(super) stage: Stage,
     phase: Phase,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Stage {
+    AdmissionRetirement,
+    CausalRecovery,
     Provider,
     Begin,
     Deliver,
@@ -87,6 +90,7 @@ impl EntityWork {
             registered: false,
             error: None,
             finish: None,
+            admission_refusal: None,
             stage: Stage::Provider,
             phase: Phase::Unreserved,
         }
@@ -361,6 +365,183 @@ mod tests {
         ));
         assert_reserved_slots(&executor, 1);
     }
+
+    fn causal_daemon() -> crate::HubDaemon {
+        let directory = std::env::temp_dir().join(format!(
+            "entity-causal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: "entity-causal-test".into(),
+                display_name: "Entity causal test".into(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(directory),
+            session_defaults: crate::SessionDefaults {
+                shell: "/bin/sh".into(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        crate::HubDaemon::start(config).unwrap()
+    }
+
+    fn retained_fanout(
+        runtime: &crate::HubRuntime,
+        state: &mut crate::daemon::owner_loop::DaemonControlState,
+    ) -> (super::super::PendingPluginEntity, u64) {
+        use crate::package_event_router::LeaseIdentity;
+        let family = "producer.item";
+        runtime.test_store_family_payload(PackageEntityMutation::Upsert {
+            entity_type: family.into(),
+            snapshot_seq: 1,
+            id: "item".into(),
+            entity: serde_json::json!({"id":"item"}),
+        });
+        let scope = runtime
+            .causal_scopes()
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family: family.into(),
+                generation: runtime.package_entity_family_generation(family).unwrap(),
+                seq: 1,
+            }))
+            .unwrap();
+        runtime.test_store_pending_lease(scope, family, 1);
+        runtime.begin_package_entity_provider_snapshot(family, 0);
+        let crate::runtime::PackageEntitySnapshotStep::Ready(item) =
+            runtime.step_package_entity_provider_snapshot(family)
+        else {
+            panic!("the family must return the leased mutation");
+        };
+        let (payload, finish) = item.into_parts();
+        drop(payload);
+        let waiter_id = WaiterId(705);
+        let mut work = EntityWork::new(None);
+        work.stage = Stage::Release;
+        work.finish = Some(finish);
+        work.phase = Phase::Completed(HostCompletion::for_test(
+            HostJobIdentity::first(waiter_id),
+            HostResult::PluginEntity(Completion::Reclaimed),
+            runtime.host_executor().try_reserve().unwrap(),
+        ));
+        (
+            super::super::PendingPluginEntity {
+                request_id: "retained-fanout".into(),
+                waiter_id,
+                ready_key: None,
+                deadline_key: None,
+                identity: None,
+                invocation: None,
+                result: None,
+                work,
+                kind: super::super::PendingPluginEntityKind::Fanout {
+                    permit: state.budget.reserve().unwrap(),
+                },
+            },
+            scope,
+        )
+    }
+
+    #[test]
+    fn reclaimed_fanout_keeps_completion_and_permits_until_causal_capacity_returns() {
+        use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
+        let daemon = causal_daemon();
+        let runtime = daemon.runtime().unwrap();
+        let mut state = crate::daemon::owner_loop::DaemonControlState::default();
+        let (mut entry, scope) = retained_fanout(runtime, &mut state);
+        for index in 0..crate::runtime::CAUSAL_OWNER_CAPACITY {
+            assert!(matches!(
+                runtime.admit_causal_op(CausalOp::Release {
+                    scope_id: u64::MAX,
+                    identity: LeaseIdentity::EventInFlight {
+                        request_id: format!("filler-{index}")
+                    },
+                }),
+                CausalAdmitResult::Applied
+            ));
+        }
+        assert!(matches!(
+            step(&daemon, &mut state, &mut entry),
+            Step::Waiting
+        ));
+        assert!(matches!(entry.work.phase, Phase::Completed(_)));
+        assert!(entry.work.finish.is_some());
+        assert!(
+            state
+                .plugin_entities
+                .causal_waiters
+                .contains(&entry.waiter_id)
+        );
+        assert_eq!(state.budget.outstanding(), 1);
+        assert_reserved_slots(&runtime.host_executor(), 1);
+        assert!(runtime.causal_scopes().is_live(scope));
+        runtime.apply_causal_owner_ops();
+        assert!(matches!(step(&daemon, &mut state, &mut entry), Step::Done));
+        assert!(entry.work.finish.is_none());
+        assert!(
+            !state
+                .plugin_entities
+                .causal_waiters
+                .contains(&entry.waiter_id)
+        );
+        assert_reserved_slots(&runtime.host_executor(), 0);
+        assert!(
+            runtime.causal_scopes().is_live(scope),
+            "the FIFO owns the release before table application"
+        );
+        while runtime.causal_operation_count() > 0 {
+            runtime.apply_causal_owner_ops();
+        }
+        assert!(!runtime.causal_scopes().is_live(scope));
+        let super::super::PendingPluginEntityKind::Fanout { permit } = entry.kind else {
+            unreachable!()
+        };
+        state.budget.release(permit);
+        assert_eq!(state.budget.outstanding(), 0);
+    }
+
+    #[test]
+    fn causal_fault_keeps_reclaimed_fanout_and_permits_after_cancellation() {
+        let daemon = causal_daemon();
+        let runtime = daemon.runtime().unwrap();
+        let mut state = crate::daemon::owner_loop::DaemonControlState::default();
+        let (mut entry, _scope) = retained_fanout(runtime, &mut state);
+        let table = runtime.causal_scopes();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.test_with_inner_held(|| panic!("inject causal table fault"));
+        }));
+        assert!(matches!(
+            step(&daemon, &mut state, &mut entry),
+            Step::Waiting
+        ));
+        assert_eq!(entry.work.stage, Stage::CausalRecovery);
+        assert!(
+            state
+                .plugin_entities
+                .causal_faults
+                .contains(&entry.waiter_id)
+        );
+        entry.work.cancel();
+        for _ in 0..3 {
+            assert!(matches!(
+                step(&daemon, &mut state, &mut entry),
+                Step::Waiting
+            ));
+            assert!(matches!(entry.work.phase, Phase::Completed(_)));
+            assert!(entry.work.finish.is_some());
+            assert_eq!(state.budget.outstanding(), 1);
+            assert_reserved_slots(&runtime.host_executor(), 1);
+        }
+    }
 }
 
 pub(super) enum Step {
@@ -396,6 +577,54 @@ fn remove_exact_subscription(
 }
 
 /// Perform one owner transition. The scheduler charges the transition before this call.
+fn retain_causal_transition(
+    state: &mut crate::daemon::owner_loop::DaemonControlState,
+    entry: &mut super::PendingPluginEntity,
+    status: crate::runtime::CausalTransitionStatus,
+) -> Option<Step> {
+    use crate::runtime::CausalTransitionStatus;
+    match status {
+        CausalTransitionStatus::Applied => {
+            state
+                .plugin_entities
+                .causal_waiters
+                .remove(&entry.waiter_id);
+            None
+        }
+        CausalTransitionStatus::Waiting => {
+            state.plugin_entities.causal_waiters.insert(entry.waiter_id);
+            Some(Step::Waiting)
+        }
+        CausalTransitionStatus::Fault => {
+            state
+                .plugin_entities
+                .causal_waiters
+                .remove(&entry.waiter_id);
+            state.plugin_entities.causal_faults.insert(entry.waiter_id);
+            entry.work.stage = Stage::CausalRecovery;
+            entry.work.error = Some((
+                "causal_recovery_required",
+                "causal transition storage requires daemon restart",
+            ));
+            if let super::PendingPluginEntityKind::Subscribe(subscribe) = &mut entry.kind {
+                let target = entry
+                    .work
+                    .target
+                    .as_ref()
+                    .expect("subscribe retains its target");
+                let _ = subscribe.request.reply_tx.take().send(Ok(
+                    crate::subscription::entity::entity_subscription_error(
+                        "causal_recovery_required",
+                        &target.subscription_id,
+                        "causal transition storage requires daemon restart",
+                    ),
+                ));
+            }
+            Some(Step::Waiting)
+        }
+    }
+}
+
 pub(super) fn step(
     daemon: &crate::HubDaemon,
     state: &mut crate::daemon::owner_loop::DaemonControlState,
@@ -411,6 +640,46 @@ pub(super) fn step(
     };
     let executor = runtime.host_executor();
     let waiter = entry.waiter_id;
+    if entry.work.stage == Stage::CausalRecovery {
+        return Step::Waiting;
+    }
+    if entry.work.stage == Stage::AdmissionRetirement {
+        let invocation = entry
+            .invocation
+            .as_ref()
+            .expect("refused admission retains its invocation");
+        let status = runtime.retire_plugin_entity_snapshot(invocation);
+        if let Some(step) = retain_causal_transition(state, entry, status) {
+            return step;
+        }
+        entry.invocation = None;
+        if let Some((code, message)) = entry.work.admission_refusal.take()
+            && let super::PendingPluginEntityKind::Subscribe(subscribe) = &mut entry.kind
+        {
+            let target = entry
+                .work
+                .target
+                .as_ref()
+                .expect("subscribe retains its target");
+            let _ = subscribe.request.reply_tx.take().send(Ok(
+                crate::subscription::entity::entity_subscription_error(
+                    code,
+                    &target.subscription_id,
+                    &message,
+                ),
+            ));
+        }
+        return Step::Done;
+    }
+    if matches!(&entry.work.phase, Phase::Completed(completion) if matches!(&completion.result, HostResult::PluginEntity(Completion::Reclaimed)))
+        && let Some(finish) = entry.work.finish.as_ref()
+    {
+        let status = runtime.finish_package_entity_fanout(finish);
+        if let Some(step) = retain_causal_transition(state, entry, status) {
+            return step;
+        }
+        entry.work.finish = None;
+    }
     let generation_is_current = match (&entry.work.family, entry.work.family_generation) {
         (Some(family), Some(generation)) => {
             runtime.package_entity_family_generation(family) == Some(generation)
@@ -478,9 +747,6 @@ pub(super) fn step(
                 entry.work.payload = Some(payload);
             }
             Completion::Reclaimed => {
-                if let Some(finish) = entry.work.finish.take() {
-                    runtime.finish_package_entity_fanout(finish);
-                }
                 if entry.work.stage == Stage::Release {
                     remove_exact_subscription(state, &entry.work);
                     return Step::Done;
@@ -529,7 +795,18 @@ pub(super) fn step(
         return submission_step(state, waiter, entry.work.submit(executor, command));
     }
     match entry.work.stage {
+        Stage::AdmissionRetirement | Stage::CausalRecovery => {
+            unreachable!("retirement states return before Host work")
+        }
         Stage::Provider => {
+            let invocation = entry
+                .invocation
+                .as_ref()
+                .expect("the provider invocation is retained");
+            let status = runtime.retire_plugin_entity_snapshot(invocation);
+            if let Some(step) = retain_causal_transition(state, entry, status) {
+                return step;
+            }
             let result = entry
                 .result
                 .take()
@@ -542,7 +819,6 @@ pub(super) fn step(
                 .invocation
                 .take()
                 .expect("the provider invocation is retained");
-            runtime.retire_plugin_entity_snapshot(&invocation);
             let command = Command::Prepare {
                 invocation,
                 result,
@@ -739,6 +1015,18 @@ pub(super) fn step(
                             .submit(executor, Command::PrepareMutation(mutation)),
                     )
                 }
+                crate::runtime::PackageEntitySnapshotStep::Waiting => retain_causal_transition(
+                    state,
+                    entry,
+                    crate::runtime::CausalTransitionStatus::Waiting,
+                )
+                .expect("capacity wait retains the entry"),
+                crate::runtime::PackageEntitySnapshotStep::Fault => retain_causal_transition(
+                    state,
+                    entry,
+                    crate::runtime::CausalTransitionStatus::Fault,
+                )
+                .expect("fault retains the entry"),
                 crate::runtime::PackageEntitySnapshotStep::Pending => Step::Again,
                 crate::runtime::PackageEntitySnapshotStep::Complete(_) => {
                     entry.work.stage = Stage::Finish;
