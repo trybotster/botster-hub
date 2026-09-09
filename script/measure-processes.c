@@ -41,8 +41,10 @@ typedef struct {
     size_t tracked_count;
     mach_timebase_info_data_t timebase;
     uint64_t sample, interval_ns;
-    bool invalid, turnover, footprint;
+    bool invalid, turnover, footprint, discovery_incomplete;
 } Sampler;
+
+static bool same_process(const Row *a, const Row *b);
 
 static void json_string(const char *text) {
     putchar('"');
@@ -128,41 +130,158 @@ static void *resize(Sampler *s, void *old, size_t count, size_t size) {
     return result;
 }
 
-static bool collect(Sampler *s, Row **rows, size_t *count) {
-    int estimate = proc_listallpids(NULL, 0);
-    if (estimate <= 0) {
-        error_event(s, 0, "list_size", errno);
+static void identity_error(Sampler *s, const Row *expected, const Row *observed) {
+    s->invalid = s->turnover = true;
+    event(s, "sampling_error");
+    printf(",\"pid\":%d,\"operation\":\"process_identity_changed\","
+           "\"expected_start_ticks\":%" PRIu64 ",\"observed_start_ticks\":%" PRIu64 "}\n",
+           expected->pid, expected->usage.ri_proc_start_abstime,
+           observed->usage.ri_proc_start_abstime);
+}
+
+static bool append_row(Sampler *s, Row **rows, size_t *count, Row row) {
+    for (size_t i = 0; i < *count; ++i) {
+        if ((*rows)[i].pid != row.pid) continue;
+        if (!same_process(&(*rows)[i], &row)) identity_error(s, &(*rows)[i], &row);
+        return true;
+    }
+    Row *next = resize(s, *rows, *count + 1, sizeof(**rows));
+    *rows = next;
+    if (!next) { *count = 0; return false; }
+    row.selected = true;
+    next[(*count)++] = row;
+    return true;
+}
+
+/* libproc returns a PID count. A zero result can also carry errno. */
+static bool list_children(Sampler *s, pid_t parent, pid_t **pids, size_t *count) {
+    *pids = NULL;
+    *count = 0;
+    errno = 0;
+    int estimate = proc_listchildpids(parent, NULL, 0);
+    if (estimate < 0 || (estimate == 0 && errno)) {
+        s->discovery_incomplete = true;
+        error_event(s, parent, "child_list_size", errno);
         return false;
     }
-    size_t capacity = (size_t)estimate + 128;
-    pid_t *pids = NULL;
-    int found;
+    if (!estimate) return true;
+    size_t capacity = (size_t)estimate + 1;
     for (;;) {
-        if (capacity > INT_MAX / sizeof(*pids)) {
-            error_event(s, 0, "list_size_overflow", EOVERFLOW);
-            free(pids);
+        if (capacity > INT_MAX / sizeof(**pids)) {
+            s->discovery_incomplete = true;
+            error_event(s, parent, "child_list_size_overflow", EOVERFLOW);
+            free(*pids);
+            *pids = NULL;
             return false;
         }
-        pids = resize(s, pids, capacity, sizeof(*pids));
-        if (!pids) return false;
-        found = proc_listallpids(pids, (int)(capacity * sizeof(*pids)));
-        if (found <= 0) {
-            error_event(s, 0, "list_pids", errno);
-            free(pids);
+        *pids = resize(s, *pids, capacity, sizeof(**pids));
+        if (!*pids) return false;
+        errno = 0;
+        int found = proc_listchildpids(parent, *pids, (int)(capacity * sizeof(**pids)));
+        if (found < 0 || (found == 0 && errno)) {
+            s->discovery_incomplete = true;
+            error_event(s, parent, "child_list", errno);
+            free(*pids);
+            *pids = NULL;
             return false;
         }
-        if ((size_t)found < capacity) break;
+        if ((size_t)found < capacity) {
+            *count = (size_t)found;
+            return true;
+        }
         capacity *= 2;
     }
-    *rows = resize(s, NULL, (size_t)found, sizeof(**rows));
-    if (!*rows) { free(pids); return false; }
-    *count = 0;
-    for (int i = 0; i < found; ++i) {
-        if (pids[i] <= 0) continue;
-        Row row = {0};
-        if (read_row(s, pids[i], &row)) (*rows)[(*count)++] = row;
+}
+
+static bool collect_children(Sampler *s, Row **rows, size_t *count, size_t index) {
+    Row parent = (*rows)[index], before = {0}, after = {0};
+    if (!read_row(s, parent.pid, &before)) {
+        s->discovery_incomplete = true;
+        return true;
+    }
+    if (!same_process(&parent, &before)) {
+        identity_error(s, &parent, &before);
+        s->discovery_incomplete = true;
+        return true;
+    }
+    pid_t *pids = NULL;
+    size_t child_count = 0;
+    if (!list_children(s, parent.pid, &pids, &child_count)) return true;
+    Row *children = NULL;
+    if (child_count) {
+        children = resize(s, NULL, child_count, sizeof(*children));
+        if (!children) { free(pids); return false; }
+    }
+    size_t accepted = 0;
+    for (size_t i = 0; i < child_count; ++i) {
+        Row child = {0};
+        if (pids[i] <= 0 || !read_row(s, pids[i], &child)) {
+            s->discovery_incomplete = true;
+            continue;
+        }
+        if (child.bsd.pbi_ppid != (uint32_t)parent.pid ||
+            child.usage.ri_proc_start_abstime < before.usage.ri_proc_start_abstime) {
+            s->discovery_incomplete = s->turnover = true;
+            error_event(s, child.pid, "candidate_ancestry_changed", 0);
+            continue;
+        }
+        child.root = parent.root;
+        children[accepted++] = child;
     }
     free(pids);
+    /* Publish child candidates only after the parent survives all child reads. */
+    if (!read_row(s, parent.pid, &after)) {
+        s->discovery_incomplete = true;
+        free(children);
+        return true;
+    }
+    if (!same_process(&parent, &after)) {
+        identity_error(s, &parent, &after);
+        s->discovery_incomplete = true;
+        free(children);
+        return true;
+    }
+    after.root = parent.root;
+    after.selected = true;
+    (*rows)[index] = after;
+    for (size_t i = 0; i < accepted; ++i) {
+        if (!append_row(s, rows, count, children[i])) { free(children); return false; }
+    }
+    free(children);
+    return true;
+}
+
+static bool collect(Sampler *s, Row **rows, size_t *count) {
+    *rows = NULL;
+    *count = 0;
+    for (size_t root = 0; root < s->root_count; ++root) {
+        Row row = {0};
+        if (!read_row(s, s->roots[root].pid, &row)) continue;
+        if (s->sample != 0 && row.usage.ri_proc_start_abstime != s->roots[root].start) {
+            Row expected = {.pid = row.pid,
+                            .usage = {.ri_proc_start_abstime = s->roots[root].start}};
+            identity_error(s, &expected, &row);
+            continue;
+        }
+        row.root = root;
+        if (!append_row(s, rows, count, row)) return false;
+    }
+    for (size_t i = 0; i < s->tracked_count; ++i) {
+        const Tracked *tracked = &s->tracked[i];
+        if (tracked->missing && tracked->exit_observed) continue;
+        bool already_read = false;
+        for (size_t j = 0; j < *count; ++j)
+            if ((*rows)[j].pid == tracked->row.pid) already_read = true;
+        if (already_read) continue;
+        Row row = {0};
+        if (!read_row(s, tracked->row.pid, &row)) continue;
+        if (!same_process(&tracked->row, &row)) continue;
+        row.root = tracked->row.root;
+        if (!append_row(s, rows, count, row)) return false;
+    }
+    /* Appending children extends this traversal without a global process census. */
+    for (size_t i = 0; i < *count; ++i)
+        if (!collect_children(s, rows, count, i)) return false;
     return true;
 }
 
@@ -259,6 +378,7 @@ static bool observe(Sampler *s, Row *rows, size_t count) {
             if (!next) { s->tracked_count = 0; return false; }
             s->tracked_count++;
             s->tracked[j] = (Tracked){.row = *row};
+            if (s->sample != 0) s->turnover = s->invalid = true;
             event(s, "observed_birth");
             identity_fields(row);
             printf(",\"first_sample\":%s}\n", s->sample == 0 ? "true" : "false");
@@ -284,6 +404,7 @@ static bool observe(Sampler *s, Row *rows, size_t count) {
             }
         }
         if (row->usage.ri_proc_exit_abstime && !s->tracked[j].exit_observed) {
+            s->turnover = s->invalid = true;
             event(s, "observed_exit");
             identity_fields(row);
             printf(",\"exit_ticks\":%" PRIu64 "}\n", row->usage.ri_proc_exit_abstime);
@@ -371,9 +492,10 @@ int main(int argc, char **argv) {
         free(rows);
         event(&s, "sample_end");
         printf(",\"begin_ticks\":%" PRIu64 ",\"end_ticks\":%" PRIu64
-               ",\"observations_valid\":%s,\"unresolved_turnover\":%s}\n",
+               ",\"observations_valid\":%s,\"unresolved_turnover\":%s,"
+               "\"ancestry_discovery_complete\":%s}\n",
                begin, mach_absolute_time(), s.invalid ? "false" : "true",
-               s.turnover ? "true" : "false");
+               s.turnover ? "true" : "false", s.discovery_incomplete ? "false" : "true");
         if (fflush(stdout) || ferror(stdout)) { s.invalid = true; break; }
         if (!ok || s.sample == samples - 1) break;
         struct timespec delay = {(time_t)(s.interval_ns / 1000000000),
@@ -384,8 +506,10 @@ int main(int argc, char **argv) {
     }
     event(&s, "summary");
     printf(",\"observations_valid\":%s,\"unresolved_turnover\":%s,"
+           "\"ancestry_discovery_complete\":%s,"
            "\"lifecycle_accounting_valid\":false,\"polling_can_miss_processes\":true}\n",
-           s.invalid ? "false" : "true", s.turnover ? "true" : "false");
+           s.invalid ? "false" : "true", s.turnover ? "true" : "false",
+           s.discovery_incomplete ? "false" : "true");
     free(s.tracked);
     free(s.roots);
     return (s.invalid || fflush(stdout) || ferror(stdout)) ? 2 : 0;

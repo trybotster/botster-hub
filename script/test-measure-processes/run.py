@@ -33,8 +33,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="measure-processes-test-") as directory:
         binary = str(pathlib.Path(directory) / "measure-processes")
         unit = str(pathlib.Path(directory) / "unit")
+        native = str(pathlib.Path(directory) / "native")
         flags = ["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1", "-lproc"]
-        for source, output in [(ROOT / "measure-processes.c", binary), (HERE / "unit.c", unit)]:
+        for source, output in [(ROOT / "measure-processes.c", binary),
+                               (HERE / "unit.c", unit), (HERE / "native.c", native)]:
             compiled = subprocess.run([*flags, str(source), "-o", output],
                                       capture_output=True, text=True, timeout=30)
             (evidence / f"{source.stem}-compile.log").write_text(compiled.stdout + compiled.stderr)
@@ -51,6 +53,11 @@ def main():
                 "sampling_error"} <= events
         assert any(row.get("operation") == "identity_changed_during_read" for row in synthetic)
         assert any(row.get("operation") == "owned_root_not_live" for row in synthetic)
+        native_result = subprocess.run([native], capture_output=True, text=True, timeout=10)
+        (evidence / "native-cpu.jsonl").write_text(native_result.stdout)
+        (evidence / "native-cpu.stderr").write_text(native_result.stderr)
+        native_result.check_returncode()
+        assert records(native_result)[0]["event"] == "native_cpu_units"
         for arguments in [[], ["--owned-root", "0:bad"],
                           ["--owned-root", "1:bad", "--interval-ms", "-1", "--samples", "1"]]:
             invalid = subprocess.run([binary, *arguments], capture_output=True, timeout=10)
@@ -78,7 +85,7 @@ child.wait(timeout=10)
                 "root_pid": root_pid, "child_pid": child_pid,
                 "sampler_exit_code": sampled.returncode,
             }) + "\n")
-            assert sampled.returncode in (0, 2), sampled.stderr
+            assert sampled.returncode == 0, (sampled.stderr, sampled.stdout)
             live = records(sampled)
             check_wire(live)
             config = live[0]
@@ -97,10 +104,10 @@ child.wait(timeout=10)
                         assert row[f"{name}_ns"] == row[f"{name}_ticks"] * config["timebase_numer"] // config["timebase_denom"]
             assert owned.poll() is None
             assert live[-1]["lifecycle_accounting_valid"] is False
-            if sampled.returncode == 2:
-                assert any(row["event"] == "sampling_error" for row in live)
-                assert live[-1]["observations_valid"] is False
-            print(f"Owned-tree check: {len(samples)} samples; {sum(row['event'] == 'sampling_error' for row in live)} census errors.")
+            assert live[-1]["observations_valid"] is True
+            assert live[-1]["unresolved_turnover"] is False
+            assert not any(row["event"] == "sampling_error" for row in live)
+            print(f"Owned-tree check: {len(samples)} valid scoped samples; ancestry discovery complete: {live[-1]['ancestry_discovery_complete']}.")
         finally:
             owned.stdin.close()
             owned.wait(timeout=15)
