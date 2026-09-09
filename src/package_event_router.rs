@@ -1961,6 +1961,8 @@ fn retire_producer_age(
             );
         }
     }
+    // Unload closes the cell before the worker destroys payloads. Final retirement
+    // must remove the empty list even when no replacement generation exists.
     if live == 0 && (age_ref.generation != current_generation || writes_closed) {
         if let Some(list) = inner.producer_age_lists.remove(&key) {
             list.cell().close_writes();
