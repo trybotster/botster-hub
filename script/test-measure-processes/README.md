@@ -110,3 +110,8 @@ The native measurement fell within that bracket without additional tolerance.
 The wrapper log is `/private/tmp/measure-processes-check-2.log`.
 The compiler version is recorded in `/private/tmp/measure-processes-compiler-2.log`.
 Raw evidence is in `/var/folders/2k/r_31n4yj0xv5wjvzq_yjrjkm0000gn/T/measure-processes-evidence-bh2fu2ca`.
+
+The stricter process-set assertion was replayed against that saved JSONL after review.
+Each sample contained exactly two process rows with PID set `{98643, 98645}`.
+The replay passed without another compiler or live test run.
+Its log is `/private/tmp/measure-processes-replay-1.log`.
