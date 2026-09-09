@@ -4045,6 +4045,228 @@ return botster.register({
         .expect("write controlled entity gate lua plugin");
     }
 
+    #[test]
+    fn prepared_snapshots_and_fanout_progress_when_host_capacity_is_full() {
+        let root = unique_package_control_dir("entity-delivery-capacity-order");
+        let package_dir = root.join("owner-entity-gate");
+        write_package_control_manifest(
+            &package_dir,
+            "owner-entity-gate",
+            serde_json::json!({
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        write_controlled_entity_gate_lua_plugin(&package_dir);
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner-entity-gate".into(),
+            },
+        )
+        .unwrap();
+        let mut state = DaemonControlState::default();
+        daemon
+            .runtime()
+            .unwrap()
+            .install_plugin_completion_notifier(state.plugin_result_budget.completion_notifier());
+        let mut replies = Vec::new();
+        let mut frames = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for index in 0..crate::host_executor::HOST_OPERATION_CAPACITY {
+            let (reply, frame) = 'request: loop {
+                let (frame_tx, frame_rx) = tokio_mpsc::channel(8);
+                let (reply_tx, mut reply_rx) =
+                    crate::daemon::control::message::control_reply_channel();
+                crate::daemon::control::entities::handle(
+                    &mut daemon,
+                    &mut state,
+                    ControlMessage::SubscribeEntities {
+                        entity_type: "owner-entity-gate.entity".into(),
+                        subscription_id: format!("capacity-{index}"),
+                        transport_request_id: Some(format!("request-{index}")),
+                        client_id: Some("capacity-client".into()),
+                        frame_tx: crate::subscription::entity::EntityFrameSender::Async(frame_tx),
+                        frame_rx: None,
+                        reply_tx,
+                        grant_id: None,
+                    },
+                );
+                loop {
+                    let completed = run_completion_drain_slice_for_owner(
+                        daemon.runtime().unwrap(),
+                        &mut state.maintenance,
+                        &mut state.plugin_controls,
+                        &mut state.plugin_entities,
+                        &state.plugin_result_budget,
+                    )
+                    .item_count;
+                    if completed > 0 {
+                        assert_eq!(completed, 1);
+                        break 'request (reply_rx, frame_rx);
+                    }
+                    if let Ok(reply) = reply_rx.try_recv() {
+                        let response = reply.into_parts().0.unwrap();
+                        assert_eq!(
+                            response.error.unwrap().code,
+                            "plugin_invocation_backpressured"
+                        );
+                        break;
+                    }
+                    // Core can refuse transient admission contention. Retire that refusal before retrying.
+                    // Host preparation results remain in their mailbox until all eight providers are ready.
+                    if let Some(item) = state.owner_ready.pop_next() {
+                        let mut budget =
+                            crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                        assert!(!dispatch_owner_ready_item(
+                            &mut daemon,
+                            &mut state,
+                            item,
+                            &mut budget
+                        ));
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "Lua snapshot {index} must complete"
+                    );
+                    thread::yield_now();
+                }
+                assert!(Instant::now() < deadline, "Core admission must recover");
+            };
+            replies.push(reply);
+            frames.push(frame);
+        }
+        // Route all real Core results before the next owner dispatch batch.
+        let waiters = state
+            .plugin_entities
+            .take_ready_waiters(crate::host_executor::HOST_OPERATION_CAPACITY);
+        for waiter in waiters {
+            crate::daemon::control::entities::mark_plugin_entity_ready(
+                &mut state,
+                waiter,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            );
+        }
+        // One dispatch batch can submit every preparation before collecting Host results.
+        while daemon.runtime().unwrap().host_executor().outstanding()
+            < crate::host_executor::HOST_OPERATION_CAPACITY
+        {
+            let item = state
+                .owner_ready
+                .pop_next()
+                .expect("provider preparation is ready");
+            let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+            assert!(!dispatch_owner_ready_item(
+                &mut daemon,
+                &mut state,
+                item,
+                &mut budget
+            ));
+            assert!(
+                Instant::now() < deadline,
+                "all preparations must reserve capacity"
+            );
+        }
+        daemon.runtime().unwrap().test_admit_publish("owner-entity-gate",
+            serde_json::json!({"type": "entity_remove", "entity_type": "owner-entity-gate.entity",
+                "snapshot_seq": 1, "id": "entity-1"}), None,
+        ).unwrap();
+        crate::daemon::control::entities::begin_package_entity_fanout(&daemon, &mut state);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::daemon::control::entities::plugin_entity_cleanup_pending(&state)
+            || daemon.runtime().unwrap().has_package_entity_fanout()
+        {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "snapshots and fanout must complete without a cancellation deadline: {:?}",
+                state.plugin_entities
+            );
+            thread::yield_now();
+        }
+        for mut reply in replies {
+            assert!(
+                reply
+                    .try_recv()
+                    .unwrap()
+                    .into_parts()
+                    .0
+                    .unwrap()
+                    .error
+                    .is_none()
+            );
+        }
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+        let decode = |delivery| match delivery {
+            crate::entity_delivery::EntityDelivery::Typed(frame) => frame,
+            crate::entity_delivery::EntityDelivery::Encoded(frame) => frame.into_typed(),
+        };
+        for receiver in &mut frames {
+            assert!(matches!(
+                decode(receiver.try_recv().unwrap()),
+                botster_hub_client::DaemonEntityFrame::Snapshot {
+                    snapshot_seq: 1,
+                    ..
+                }
+            ));
+            assert!(
+                receiver.try_recv().is_err(),
+                "the sequence-1 mutation is superseded"
+            );
+        }
+        let bridge = daemon.runtime().unwrap().entity_publish_bridge();
+        let publication = bridge.test_queue_publish(
+            botster_core::PluginKey("owner-entity-gate".into()),
+            serde_json::json!({"type": "entity_remove", "entity_type": "owner-entity-gate.entity",
+                "snapshot_seq": 2, "id": "entity-1"}),
+            None,
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            if bridge.pending_publish_count() == 0
+                && !daemon
+                    .runtime()
+                    .unwrap()
+                    .entity_publish_retirement_pending()
+                && !daemon.runtime().unwrap().has_package_entity_fanout()
+                && !crate::daemon::control::entities::plugin_entity_cleanup_pending(&state)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the next mutation must reach every subscriber"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            publication.try_recv().unwrap().unwrap().last_accepted_seq,
+            2
+        );
+        for receiver in &mut frames {
+            assert!(matches!(
+                decode(receiver.try_recv().unwrap()),
+                botster_hub_client::DaemonEntityFrame::Remove {
+                    snapshot_seq: 2,
+                    ..
+                }
+            ));
+            assert!(receiver.try_recv().is_err());
+        }
+        assert_eq!(bridge.retained_counts(), (0, 0));
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+        drop(frames);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn write_async_plugin_response_fixture(package_dir: &Path) {
         std::fs::write(
             package_dir.join("plugin.lua"),

@@ -624,6 +624,23 @@ fn retain_causal_transition(
     }
 }
 
+/// A delivery owner already holds Host capacity for all of its remaining phases.
+fn claim_delivery(
+    state: &mut crate::daemon::owner_loop::DaemonControlState,
+    waiter: WaiterId,
+) -> bool {
+    if state
+        .plugin_entities
+        .active_delivery
+        .is_some_and(|active| active != waiter)
+    {
+        state.plugin_entities.delivery_waiters.insert(waiter);
+        return false;
+    }
+    state.plugin_entities.active_delivery = Some(waiter);
+    true
+}
+
 pub(super) fn step(
     daemon: &crate::HubDaemon,
     state: &mut crate::daemon::owner_loop::DaemonControlState,
@@ -828,6 +845,9 @@ pub(super) fn step(
         }
         Stage::Begin => {
             if matches!(entry.kind, super::PendingPluginEntityKind::Fanout { .. }) {
+                if !claim_delivery(state, waiter) {
+                    return Step::Waiting;
+                }
                 let Some(item) = runtime.take_one_package_entity_fanout() else {
                     return Step::Done;
                 };
@@ -851,15 +871,9 @@ pub(super) fn step(
                 entry.work.stage = Stage::Finish;
                 return Step::Again;
             };
-            if state
-                .plugin_entities
-                .active_delivery
-                .is_some_and(|active| active != waiter)
-            {
-                state.plugin_entities.delivery_waiters.insert(waiter);
+            if !claim_delivery(state, waiter) {
                 return Step::Waiting;
             }
-            state.plugin_entities.active_delivery = Some(waiter);
             let family = entry
                 .work
                 .family

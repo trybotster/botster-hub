@@ -640,7 +640,7 @@ impl HostExecutor {
     }
 
     #[cfg(test)]
-    fn outstanding(&self) -> usize {
+    pub(crate) fn outstanding(&self) -> usize {
         self.permits.outstanding.load(Ordering::Acquire)
     }
 }

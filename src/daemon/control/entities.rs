@@ -82,6 +82,7 @@ pub(crate) struct PluginEntityState {
     causal_faults: BTreeSet<crate::owner_identity::WaiterId>,
     delivery_waiters: BTreeSet<crate::owner_identity::WaiterId>,
     active_delivery: Option<crate::owner_identity::WaiterId>,
+    pending_fanout: Option<crate::owner_identity::WaiterId>,
 }
 
 impl std::fmt::Debug for PluginEntityState {
@@ -89,6 +90,9 @@ impl std::fmt::Debug for PluginEntityState {
         formatter
             .debug_struct("PluginEntityState")
             .field("pending", &self.pending.len())
+            .field("capacity_waiters", &self.capacity_waiters.len())
+            .field("delivery_waiters", &self.delivery_waiters.len())
+            .field("active_delivery", &self.active_delivery)
             .field("causal_faults", &self.causal_faults.len())
             .field(
                 "completion_inconsistencies",
@@ -784,6 +788,7 @@ pub(crate) fn begin_plugin_entity_resync(
 pub(crate) fn begin_package_entity_fanout(daemon: &HubDaemon, state: &mut DaemonControlState) {
     if state.shutdown_waiter.is_some()
         || state.plugin_entities.active_delivery.is_some()
+        || state.plugin_entities.pending_fanout.is_some()
         || !daemon
             .runtime()
             .is_some_and(|runtime| runtime.has_package_entity_fanout())
@@ -815,7 +820,7 @@ pub(crate) fn begin_package_entity_fanout(daemon: &HubDaemon, state: &mut Daemon
         result: None,
         work,
     });
-    state.plugin_entities.active_delivery = Some(waiter_id);
+    state.plugin_entities.pending_fanout = Some(waiter_id);
     mark_plugin_entity_ready(
         state,
         waiter_id,
@@ -848,6 +853,9 @@ pub(crate) fn drive_plugin_entity_ready_item(
             state.plugin_entities.causal_waiters.remove(&waiter_id);
             state.plugin_entities.causal_faults.remove(&waiter_id);
             state.plugin_entities.delivery_waiters.remove(&waiter_id);
+            if state.plugin_entities.pending_fanout == Some(waiter_id) {
+                state.plugin_entities.pending_fanout = None;
+            }
             if state.plugin_entities.active_delivery == Some(waiter_id) {
                 state.plugin_entities.active_delivery = None;
                 if let Some(waiter) = state.plugin_entities.delivery_waiters.pop_first() {
