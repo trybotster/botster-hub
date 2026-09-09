@@ -8,12 +8,16 @@ it attaches the shipped Web and TUI harnesses to that session.
 Required environment:
   BOTSTER_HUB_BIN
   BOTSTER_SESSION_WORKER_BIN
+  BOTSTER_HUB_CLIENT_ADAPTER_BIN  executable built from the matched Hub client
   BOTSTER_WEB_CHECKOUT
   BOTSTER_TUI_CHECKOUT
   BOTSTER_SHARED_SESSION_ID
 
 Optional:
   BOTSTER_LIVE_DATA_DIR  reuse this data dir and leave it in place
+
+Build the adapter with:
+  cargo build -p botster-hub-client --example harness_control
 """
 
 from __future__ import annotations
@@ -31,7 +35,6 @@ import time
 from pathlib import Path
 from typing import Any, IO
 
-PROTOCOL = "botster-hub-daemon-v1"
 SESSION_TYPE_ID = "north-star-shared"
 SPAWN_TARGET_ID = "tgt_north_star"
 CLIENT_TIMEOUT_S = 900
@@ -43,6 +46,7 @@ LIFECYCLE_TIMEOUT_S = 30
 REQUIRED_ENV = (
     "BOTSTER_HUB_BIN",
     "BOTSTER_SESSION_WORKER_BIN",
+    "BOTSTER_HUB_CLIENT_ADAPTER_BIN",
     "BOTSTER_WEB_CHECKOUT",
     "BOTSTER_TUI_CHECKOUT",
     "BOTSTER_SHARED_SESSION_ID",
@@ -128,28 +132,36 @@ def wait_for_socket(path: Path, process: subprocess.Popen[str], timeout_s: float
     fail(f"timed out waiting for Hub socket {path}")
 
 
-def read_line(client: socket.socket) -> str:
-    buffer = bytearray()
-    while True:
-        chunk = client.recv(4096)
-        if not chunk:
-            fail("daemon socket closed before a complete line")
-        buffer.extend(chunk)
-        newline = buffer.find(b"\n")
-        if newline >= 0:
-            return buffer[:newline].decode("utf-8")
+def adapter_binary() -> Path:
+    path = required_path("BOTSTER_HUB_CLIENT_ADAPTER_BIN")
+    if not path.is_file() or not os.access(path, os.X_OK):
+        fail("BOTSTER_HUB_CLIENT_ADAPTER_BIN must be an executable file")
+    return path
 
 
 def send_daemon_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(30)
-        client.connect(str(socket_path))
-        client.sendall(json.dumps({"protocol": PROTOCOL}).encode("utf-8") + b"\n")
-        hello = json.loads(read_line(client))
-        if hello.get("protocol") != PROTOCOL:
-            fail(f"daemon protocol mismatch: {hello!r}")
-        client.sendall(json.dumps(request).encode("utf-8") + b"\n")
-        return json.loads(read_line(client))
+    try:
+        completed = subprocess.run(
+            [str(adapter_binary()), "request", "--socket", str(socket_path)],
+            input=json.dumps(request) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        fail(f"control adapter timed out after 30s for {request['type']}")
+    except OSError as error:
+        fail(f"could not run control adapter: {error}")
+    if completed.returncode != 0:
+        fail(f"control adapter failed (code={completed.returncode}): {completed.stderr[-4000:]}")
+    try:
+        response = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"control adapter returned invalid response JSON: {error}")
+    if not isinstance(response, dict) or not isinstance(response.get("kind"), str):
+        fail("control adapter returned a response without a kind")
+    return response
 
 
 def wait_for_session_lifecycle(
@@ -602,6 +614,7 @@ def main() -> None:
         else:
             required_path(name)
     hub_bin = required_path("BOTSTER_HUB_BIN")
+    adapter_binary()
     worker_bin = required_path("BOTSTER_SESSION_WORKER_BIN")
     web_checkout = required_path("BOTSTER_WEB_CHECKOUT")
     tui_checkout = required_path("BOTSTER_TUI_CHECKOUT")
