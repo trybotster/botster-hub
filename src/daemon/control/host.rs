@@ -226,6 +226,7 @@ pub(crate) fn handle_runtime(
             let mut response = None;
             let mut permit = Some(permit);
             let mut stop_submitted = false;
+            let mut entity_cancel_after = None;
             ControlStep::pending(move |daemon, state| {
                 let Some(runtime) = daemon.runtime() else {
                     state.shutdown_waiter = None;
@@ -260,6 +261,15 @@ pub(crate) fn handle_runtime(
                     response = Some(prepared_response);
                 }
                 if !stop_submitted {
+                    if crate::daemon::control::entities::cancel_next_plugin_entity_for_shutdown(
+                        state,
+                        &mut entity_cancel_after,
+                    ) {
+                        return ControlPoll::Again;
+                    }
+                    if crate::daemon::control::entities::plugin_entity_cleanup_pending(state) {
+                        return ControlPoll::Pending;
+                    }
                     // The dispatcher removes this waiter while it runs this continuation.
                     if !state.pending_requests.is_empty() {
                         return ControlPoll::Pending;

@@ -869,7 +869,7 @@ impl TestHostGate {
         }
     }
 
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         *self
             .released
             .lock()
@@ -877,7 +877,7 @@ impl TestHostGate {
         self.ready.notify_all();
     }
 
-    fn has_started(&self) -> bool {
+    pub(crate) fn has_started(&self) -> bool {
         self.started.load(Ordering::Acquire)
     }
 }
