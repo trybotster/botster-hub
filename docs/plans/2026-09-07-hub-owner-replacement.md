@@ -665,6 +665,9 @@ The focused same-generation consumer rebind test also passed.
 Mutation and resync causal identities now include the family generation. New family state captures the current owner-held epoch.
 An accepted package cleanup reserves its next epoch before family removal. A retained cleanup reserves that epoch only once.
 Epoch exhaustion retains the exact package result, fault, Host permit, and Owner permit through terminal recovery.
+That recovery rejects new Host requests before admission. Daemon status and shutdown requests remain available.
+Direct Lua load and unload check epoch capacity before host execution. Direct unload now returns a typed cleanup error.
+Direct cleanup consumes the checked epoch only when execution records a family unload.
 
 Provider preparation captures the family generation before asynchronous admission. Owner delivery phases compare that generation with live family state.
 A late fanout finish releases its old lease without recreating an absent family or marking a newer family for resync.
@@ -676,4 +679,7 @@ The retained-old-state and new-admission test remains required.
 Rust 1.97.0 `check --tests` passed. Nine family-focused library tests passed.
 The package recovery test passed both event failure and family epoch exhaustion with two previously accepted requests.
 The first lease integration run stopped during setup because the candidate environment was absent. It did not execute the test bodies.
-A clean candidate build and integration rerun are required after this checkpoint.
+The matched e233753 candidate then passed six lease tests and failed three. That candidate did not pass integration validation.
+Two failed tests used event readiness to drain causal cleanup. Their progress checks now use causal readiness and retain eventual-release assertions.
+The third fixture now drains its earlier successful resync before it tests a separate degraded scope.
+These test changes require validation against a new matched candidate.

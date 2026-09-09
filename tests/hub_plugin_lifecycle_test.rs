@@ -770,8 +770,9 @@ fn reload_and_unload_return_core_cleanup_and_stop_runtimes() {
     ));
     assert_eq!(new_runtime.invocations().len(), 1);
 
-    let unload_cleanup =
-        hub.unload_plugin_package(RequestId("unload-plugin".to_string()), package_name);
+    let unload_cleanup = hub
+        .unload_plugin_package(RequestId("unload-plugin".to_string()), package_name)
+        .expect("unload plugin");
     assert_eq!(new_runtime.stopped(), vec![plugin_key(package_name)]);
     assert_eq!(unload_cleanup.removed_descriptors.len(), 1);
     assert_eq!(unload_cleanup.removed_resources.len(), 1);

@@ -977,6 +977,18 @@ pub(crate) fn recovery_response(
         && state
             .host_recovery
             .values()
+            .any(|recovery| matches!(recovery, HostRecoveryRequired::PackageFamilies { .. }))
+    {
+        return Some(error_response(
+            "entity_family_generation_exhausted",
+            "packages",
+            "entity family cleanup exhausted generation identifiers",
+        ));
+    }
+    if handles(request)
+        && state
+            .host_recovery
+            .values()
             .any(|recovery| matches!(recovery, HostRecoveryRequired::PackageEvents { .. }))
     {
         return Some(error_response(

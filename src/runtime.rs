@@ -649,7 +649,8 @@ impl HubRuntime {
         !self.event_plane_owner_ops.borrow().is_empty()
     }
 
-    pub(crate) fn causal_owner_ops_pending(&self) -> bool {
+    #[doc(hidden)]
+    pub fn causal_owner_ops_pending(&self) -> bool {
         self.causal_scopes.pending_ops()
             || self.entity_publish_bridge.has_pending_releases()
             || self
@@ -1313,12 +1314,15 @@ impl HubRuntime {
         }
     }
 
-    fn advance_package_entity_epoch(&self) -> Result<u64, PackageEntityCleanupError> {
-        let next = self
-            .package_entity_epoch
+    fn next_package_entity_epoch(&self) -> Result<u64, PackageEntityCleanupError> {
+        self.package_entity_epoch
             .get()
             .checked_add(1)
-            .ok_or(PackageEntityCleanupError::GenerationExhausted)?;
+            .ok_or(PackageEntityCleanupError::GenerationExhausted)
+    }
+
+    fn advance_package_entity_epoch(&self) -> Result<u64, PackageEntityCleanupError> {
+        let next = self.next_package_entity_epoch()?;
         self.package_entity_epoch.set(next);
         Ok(next)
     }
@@ -1629,6 +1633,16 @@ impl HubRuntime {
         Ok(())
     }
 
+    /// Apply a boundary checked before synchronous host execution.
+    fn apply_direct_package_cleanup(&mut self, mut cleanup: HostPackageCleanup, next_epoch: u64) {
+        // The caller holds exclusive runtime access from preflight through cleanup.
+        if !cleanup.unloaded_families.is_empty() {
+            self.package_entity_epoch.set(next_epoch);
+            cleanup.family_epoch = Some(next_epoch);
+        }
+        self.apply_host_package_cleanup(cleanup);
+    }
+
     /// Load an enabled package through core plugin worker mechanics.
     pub fn load_plugin_package(
         &mut self,
@@ -1648,9 +1662,12 @@ impl HubRuntime {
         registry: &PackageRegistry,
         package_name: &str,
     ) -> Result<PluginKey, HubLuaPluginLoadError> {
+        let next_epoch = self
+            .next_package_entity_epoch()
+            .map_err(HubLuaPluginLoadError::EntityFamilyCleanup)?;
         let mut context = self.host_package_runtime();
         let result = context.load_lua_plugin_package(registry, package_name);
-        self.apply_host_package_cleanup(context.into_cleanup());
+        self.apply_direct_package_cleanup(context.into_cleanup(), next_epoch);
         result
     }
 
@@ -1741,11 +1758,12 @@ impl HubRuntime {
         &mut self,
         request_id: RequestId,
         package_name: &str,
-    ) -> PluginCleanupResult {
+    ) -> Result<PluginCleanupResult, PackageEntityCleanupError> {
+        let next_epoch = self.next_package_entity_epoch()?;
         let mut context = self.host_package_runtime();
         let result = context.unload_plugin_package(request_id, package_name);
-        self.apply_host_package_cleanup(context.into_cleanup());
-        result
+        self.apply_direct_package_cleanup(context.into_cleanup(), next_epoch);
+        Ok(result)
     }
 
     /// Submit a plugin capability request through the hub-owned concrete runtime.
@@ -4940,13 +4958,14 @@ pub enum HubLuaPluginLoadError {
     Lifecycle(crate::HubLifecycleError),
     EventPlane(EventPlaneStatus),
     EventPlaneCleanup,
+    EntityFamilyCleanup(PackageEntityCleanupError),
 }
 
 impl HubLuaPluginLoadError {
     pub(crate) const fn is_package_scoped_startup_failure(&self) -> bool {
         match self {
             Self::Package(_) | Self::Lua(_) | Self::Lifecycle(_) => true,
-            Self::EventPlaneCleanup => false,
+            Self::EventPlaneCleanup | Self::EntityFamilyCleanup(_) => false,
             // List package failures explicitly. A new event-plane status must
             // stop startup until code classifies it as package-scoped.
             Self::EventPlane(status) => matches!(
@@ -4969,6 +4988,9 @@ impl HubLuaPluginLoadError {
             Self::Lifecycle(_) => "plugin_lifecycle_rejected",
             Self::EventPlane(status) => status.as_str(),
             Self::EventPlaneCleanup => "event_plane_cleanup_failed",
+            Self::EntityFamilyCleanup(PackageEntityCleanupError::GenerationExhausted) => {
+                "entity_family_generation_exhausted"
+            }
         }
     }
 }
@@ -4983,6 +5005,9 @@ impl fmt::Display for HubLuaPluginLoadError {
             Self::EventPlaneCleanup => {
                 formatter.write_str("event router cleanup requires recovery")
             }
+            Self::EntityFamilyCleanup(PackageEntityCleanupError::GenerationExhausted) => {
+                formatter.write_str("entity family cleanup exhausted generation identifiers")
+            }
         }
     }
 }
@@ -4994,7 +5019,7 @@ impl Error for HubLuaPluginLoadError {
             Self::Lua(error) => Some(error),
             Self::Lifecycle(_) => None,
             Self::EventPlane(_) => None,
-            Self::EventPlaneCleanup => None,
+            Self::EventPlaneCleanup | Self::EntityFamilyCleanup(_) => None,
         }
     }
 }
@@ -5844,6 +5869,51 @@ mod tests {
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .unwrap();
         HubRuntime::new(config).unwrap()
+    }
+
+    #[test]
+    fn direct_family_cleanup_checks_exhaustion_before_effects() {
+        let mut runtime = family_runtime("direct-family-cleanup");
+        let registry = PackageRegistry::new(Default::default());
+        assert!(
+            runtime
+                .load_lua_plugin_package(&registry, "absent")
+                .is_err()
+        );
+        assert_eq!(runtime.package_entity_epoch.get(), 0);
+        runtime.test_set_family_seq("producer.item", 1);
+        runtime
+            .unload_plugin_package(RequestId("direct-unload".into()), "producer")
+            .expect("direct unload reserves its boundary");
+        assert_eq!(runtime.package_entity_epoch.get(), 1);
+        assert_eq!(
+            runtime.package_entity_family_generation("producer.item"),
+            None
+        );
+
+        runtime.test_set_family_seq("producer.item", 2);
+        let generation = runtime.package_entity_family_generation("producer.item");
+        runtime.test_exhaust_package_entity_epochs();
+        assert!(matches!(
+            runtime.unload_plugin_package(RequestId("refused-unload".into()), "producer"),
+            Err(PackageEntityCleanupError::GenerationExhausted)
+        ));
+        assert_eq!(
+            runtime.package_entity_family_generation("producer.item"),
+            generation
+        );
+        assert_eq!(runtime.package_entity_epoch.get(), u64::MAX);
+        let error = runtime
+            .load_lua_plugin_package(&registry, "absent")
+            .expect_err("load must reserve capacity for rollback before execution");
+        assert!(matches!(
+            error,
+            HubLuaPluginLoadError::EntityFamilyCleanup(
+                PackageEntityCleanupError::GenerationExhausted
+            )
+        ));
+        assert!(!error.is_package_scoped_startup_failure());
+        assert_eq!(error.code(), "entity_family_generation_exhausted");
     }
 
     #[test]
