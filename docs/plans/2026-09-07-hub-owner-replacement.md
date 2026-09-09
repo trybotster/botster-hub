@@ -1230,5 +1230,64 @@ Those tests cover retained capacity, actual table contention, commit order, chec
 Rust 1.97.0 `check --tests`, formatting, and the patch whitespace check pass.
 
 No production model phase consumes these receipts yet.
-The model review handoff remains blocked by automatic approval review.
-This prerequisite does not establish independent acceptance of the model design or complete owner accounting.
+Independent review confirmed the causal prerequisite after the user approved the model review handoff.
+Production integration must still preserve model ordering, extracted values, exact completions, and reader consistency.
+This prerequisite does not establish acceptance of that integration or complete owner accounting.
+
+
+### Host execution for the entity model
+
+The daemon now uses retained Host phases for publication, provider selection, family progress, fanout, snapshots, package cleanup, and resync inspection.
+The Host locks the shared `PackageEntities` model during each live phase.
+The Owner grants one model reservation after it reserves Host capacity.
+The Owner keeps that reservation until the exact completion and its causal receipt apply.
+Causal draining does not require the model reservation.
+Provider execution and subscriber delivery do not hold the model reservation.
+Later family phases revalidate the retained generation or token.
+
+Each shared work record retains its original input and extracted values before later operations can fail.
+Submission refusal, unexpected completion, phase exhaustion, and Host failure preserve the record and its capacity.
+The Owner does not consume output before the exact completion and table receipt.
+The Host clears variable inputs before normal record destruction on the Owner.
+Publication disposal precedes causal release and response retirement.
+A bridge fault after reservation retains the queued request and faults the model work.
+
+Package cleanup transfers the whole cursor between live and detached phases.
+A live phase advances the epoch before it selects an old family.
+A detached phase does not lock or reserve the live model.
+The detached cursor retains payloads and leases through disposal and causal application.
+The existing package recovery record retains the whole cleanup after a fault.
+Owner-only control continuations no longer require `Send`; transport tasks still send control messages.
+The old disposal-only `FamilyCleanup` command and result are removed.
+
+The existing resync scan now owns family queries, attempt updates, and indexed releases.
+It retains one Host permit and its preparation reservation through an active pass.
+The scan does not wait for provider admission or provider completion.
+A completed pass clears its metadata on Host before it returns capacity.
+Indexed releases can run while the family scan is idle or Owner capacity is full.
+The scan uses its existing single background record; new provider requests still require Owner admission.
+A pass that only releases leases preserves the existing provider retry deadline.
+Real changes behind the cursor request another family pass.
+Queries and empty release checks do not create another pass.
+
+Host phases compute fanout, resync, release, and publication readiness.
+Successful model release publishes those scalars after causal application.
+A retained fault preserves the previous scalars and emits no model change notification.
+Daemon readiness queries no longer lock or scan the model.
+Synchronous runtime wrappers call the same model operations and refresh their scalar state.
+
+The final boundary regression passed 69 library tests with no failures.
+Rust 1.97.0 `check --tests`, formatting for changed Rust files, and the patch whitespace check pass.
+The run includes runtime, publication, resync, cleanup, provider cancellation, and provider/fanout saturation checks.
+The resync checks include full Owner capacity, the last Host slot, multiple leases under table contention, and retry deadline preservation.
+Actual dispatcher fault cases cover Host failure after lease extraction, phase exhaustion, and stopped submission.
+The scalar receipt test covers both release and transfer, including blocked table application and one-shot change notification.
+An earlier run passed 66 tests and failed two immediate capacity assertions while the new asynchronous scan still held its slot.
+Those tests now wait for scan retirement before checking total capacity release.
+Independent review closed the publication, cleanup, and resync findings.
+The scalar audit found no production blocker and requested the strengthened receipt assertions above.
+
+This boundary does not establish complete Owner work or memory accounting.
+Pending-provider scans, subscriber lookup, and resync request metadata still require the separate accounting review.
+`Readiness::read` scans family resync state on Host; it is not a constant-work Host query.
+Final Core allowance integration, canonical pins, and matched client evidence remain open.

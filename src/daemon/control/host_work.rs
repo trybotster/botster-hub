@@ -28,16 +28,12 @@ pub(crate) enum DocumentAdmission {
 pub(crate) enum HostRecoveryRequired {
     PackageFamilyWork {
         owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
-        _result: Box<HostMutationResult>,
-        _unexpected: Option<(HostJobIdentity, HostResult)>,
-        _submission: Option<HostSubmissionFailure>,
-        _permit: Option<HostWorkPermit>,
+        _work: Box<super::host_family::FamilyWork>,
     },
     PackageFamilies {
         owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
-        _result: Box<HostMutationResult>,
+        _work: Box<super::host_family::FamilyWork>,
         _fault: crate::runtime::PackageEntityCleanupError,
-        _permit: HostWorkPermit,
     },
     PackageEvents {
         owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
@@ -211,8 +207,7 @@ pub(crate) fn handle(
     let mut prior_compensation_failure: Option<HostMutationError> = None;
     let mut failed_package_effect: Option<(PackageRuntimeEffect, DaemonTransportError)> = None;
     let mut next_phase = 2;
-    let mut family_ready: Option<(HostMutationResult, HostWorkPermit)> = None;
-    let mut family_work: Option<(HostMutationResult, HostJobIdentity)> = None;
+    let mut family_work: Option<super::host_family::FamilyWork> = None;
     let mut event_cleanup: Option<(
         HostMutationResult,
         crate::package_event_router::EventOwnerWorkId,
@@ -232,34 +227,28 @@ pub(crate) fn handle(
                     &mut next_phase,
                 );
             }
-            let (result, permit) = if let Some(ready) = family_ready.take() {
-                ready
+            let (result, permit) = if let Some(work) = family_work.as_mut() {
+                match work.poll(daemon, state, waiter_id, &mut next_phase) {
+                    super::host_family::Poll::Pending => return ControlPoll::Pending,
+                    super::host_family::Poll::Again => return ControlPoll::Again,
+                    super::host_family::Poll::Fault => {
+                        return retain_family_cleanup(
+                            state,
+                            waiter_id,
+                            family_work.take().unwrap(),
+                        );
+                    }
+                    super::host_family::Poll::Complete(result, permit) => {
+                        family_work = None;
+                        (result, permit)
+                    }
+                }
             } else {
                 let Some(completion) = state.host_completions.remove(&waiter_id) else {
                     return ControlPoll::Pending;
                 };
                 let (identity, result, permit) = completion.into_parts();
-                let result = if let Some((mut saved, expected)) = family_work.take() {
-                    if identity != expected
-                        || !matches!(result, HostResult::FamilyCleanupComplete { .. })
-                    {
-                        return retain_family_cleanup(
-                            state,
-                            waiter_id,
-                            saved,
-                            None,
-                            Some(permit),
-                            Some((identity, result)),
-                        );
-                    }
-                    daemon
-                        .runtime()
-                        .expect("cleanup retains its runtime")
-                        .complete_host_package_entity_cleanup_item(
-                            package_event_cleanup(&mut saved).expect("family work retains cleanup"),
-                        );
-                    saved
-                } else if let Some((saved, expected)) = event_cleanup.take() {
+                let result = if let Some((saved, expected)) = event_cleanup.take() {
                     match result {
                         HostResult::EventOwner(Ok(completed))
                             if completed.identity() == &expected =>
@@ -359,101 +348,9 @@ pub(crate) fn handle(
                         &mut event_cleanup,
                     );
                 }
-                if let Err(fault) = daemon
-                    .runtime()
-                    .expect("family cleanup retains its runtime")
-                    .begin_host_package_entity_cleanup(cleanup)
-                {
-                    state.host_recovery.insert(
-                        waiter_id,
-                        HostRecoveryRequired::PackageFamilies {
-                            owner_permit: None,
-                            _result: Box::new(result),
-                            _fault: fault,
-                            _permit: permit,
-                        },
-                    );
-                    return ControlPoll::Ready(Ok(error_response(
-                        "entity_family_generation_exhausted",
-                        "packages",
-                        "entity family cleanup exhausted generation identifiers",
-                    )));
-                }
-                state.family_cleanup_waiters.insert(waiter_id, next_phase);
-                let step = daemon
-                    .runtime()
-                    .expect("cleanup retains its runtime")
-                    .step_host_package_entity_cleanup(cleanup);
-                if !matches!(
-                    step,
-                    crate::runtime::family_cleanup::FamilyCleanupStep::Waiting
-                ) {
-                    state.family_cleanup_waiters.remove(&waiter_id);
-                }
-                match step {
-                    crate::runtime::family_cleanup::FamilyCleanupStep::Waiting => {
-                        family_ready = Some((result, permit));
-                        return ControlPoll::Pending;
-                    }
-                    crate::runtime::family_cleanup::FamilyCleanupStep::Fault => {
-                        return retain_family_cleanup(
-                            state,
-                            waiter_id,
-                            result,
-                            None,
-                            Some(permit),
-                            None,
-                        );
-                    }
-                    crate::runtime::family_cleanup::FamilyCleanupStep::Pending => {
-                        family_ready = Some((result, permit));
-                        return ControlPoll::Again;
-                    }
-                    crate::runtime::family_cleanup::FamilyCleanupStep::Payload(payload) => {
-                        let identity = HostJobIdentity {
-                            waiter_id,
-                            phase: next_phase,
-                        };
-                        let command = HostCommand::FamilyCleanup(payload);
-                        let Some(later_phase) = next_phase.checked_add(1) else {
-                            return retain_family_cleanup(
-                                state,
-                                waiter_id,
-                                result,
-                                Some(HostSubmissionFailure {
-                                    error: HostSubmitError::PhaseExhausted,
-                                    identity,
-                                    command,
-                                    permit,
-                                }),
-                                None,
-                                None,
-                            );
-                        };
-                        match daemon
-                            .runtime()
-                            .expect("cleanup retains its runtime")
-                            .host_executor()
-                            .submit(identity, command, permit)
-                        {
-                            Ok(()) => {
-                                next_phase = later_phase;
-                                family_work = Some((result, identity));
-                                return ControlPoll::Pending;
-                            }
-                            Err(failure) => {
-                                return retain_family_cleanup(
-                                    state,
-                                    waiter_id,
-                                    result,
-                                    Some(failure),
-                                    None,
-                                    None,
-                                );
-                            }
-                        }
-                    }
-                    crate::runtime::family_cleanup::FamilyCleanupStep::Complete => {}
+                if !cleanup.unloaded_families.is_empty() {
+                    family_work = Some(super::host_family::FamilyWork::new(result, permit));
+                    return ControlPoll::Again;
                 }
             }
             match result {
@@ -856,7 +753,7 @@ fn admit_or_park_commit(
     }
 }
 
-fn package_event_cleanup(
+pub(super) fn package_event_cleanup(
     result: &mut HostMutationResult,
 ) -> Option<&mut crate::runtime::package_effect::HostPackageCleanup> {
     match result {
@@ -870,19 +767,29 @@ fn package_event_cleanup(
 fn retain_family_cleanup(
     state: &mut DaemonControlState,
     waiter_id: WaiterId,
-    result: HostMutationResult,
-    submission: Option<HostSubmissionFailure>,
-    permit: Option<HostWorkPermit>,
-    unexpected: Option<(HostJobIdentity, HostResult)>,
+    work: super::host_family::FamilyWork,
 ) -> ControlPoll {
+    state.family_cleanup_waiters.remove(&waiter_id);
+    if let Some(fault) = work.generation_fault {
+        state.host_recovery.insert(
+            waiter_id,
+            HostRecoveryRequired::PackageFamilies {
+                owner_permit: None,
+                _work: Box::new(work),
+                _fault: fault,
+            },
+        );
+        return ControlPoll::Ready(Ok(error_response(
+            "entity_family_generation_exhausted",
+            "packages",
+            "entity family cleanup exhausted generation identifiers",
+        )));
+    }
     state.host_recovery.insert(
         waiter_id,
         HostRecoveryRequired::PackageFamilyWork {
             owner_permit: None,
-            _result: Box::new(result),
-            _unexpected: unexpected,
-            _submission: submission,
-            _permit: permit,
+            _work: Box::new(work),
         },
     );
     ControlPoll::Ready(Ok(error_response(

@@ -81,7 +81,10 @@ pub use causal::{CAUSAL_OWNER_CAPACITY, CAUSAL_OWNER_PAYLOAD_BYTES, CausalTransi
 use causal::{CausalOwnerQueue, CausalReservation};
 mod entities;
 use entities::PackageEntities;
+pub(crate) mod entity_model;
 pub(crate) mod provider;
+pub(crate) mod publication;
+pub(crate) mod resync;
 use provider::{ProviderExpectation, ProviderRequestPlan};
 pub(crate) mod family_cleanup;
 pub(crate) mod package_effect;
@@ -114,8 +117,8 @@ pub struct HubRuntime {
     coordination_bridge: HubCoordinationBridge,
     entity_publish_bridge: HubEntityPublishBridge,
     entity_publish_wait: Cell<PublicationWait>,
-    entity_publish_retirement: std::cell::RefCell<Option<PublicationRetirement>>,
     package_entities: Arc<Mutex<PackageEntities>>,
+    entity_model_owner: entity_model::Owner,
     next_provider_token: Cell<u64>,
     package_entity_resync_changed: std::cell::Cell<bool>,
     last_capability_cleanup: Option<PluginCleanupResult>,
@@ -364,8 +367,8 @@ impl HubRuntime {
                 plugin_lifecycle.entity_provider_registrations(),
             ),
             entity_publish_wait: Cell::new(PublicationWait::Ready),
-            entity_publish_retirement: std::cell::RefCell::new(None),
             package_entities: Arc::new(Mutex::new(PackageEntities::default())),
+            entity_model_owner: entity_model::Owner::default(),
             next_provider_token: Cell::new(1),
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
@@ -467,8 +470,8 @@ impl HubRuntime {
                 plugin_lifecycle.entity_provider_registrations(),
             ),
             entity_publish_wait: Cell::new(PublicationWait::Ready),
-            entity_publish_retirement: std::cell::RefCell::new(None),
             package_entities: Arc::new(Mutex::new(PackageEntities::default())),
+            entity_model_owner: entity_model::Owner::default(),
             next_provider_token: Cell::new(1),
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
@@ -740,12 +743,7 @@ impl HubRuntime {
     }
 
     fn has_family_resync_releases(&self) -> bool {
-        !self
-            .package_entities
-            .lock()
-            .expect("package entity model lock")
-            .resync_releases
-            .is_empty()
+        self.entity_model_readiness().releases
     }
 
     pub(crate) fn causal_family_release_ready(&self) -> bool {
@@ -758,22 +756,13 @@ impl HubRuntime {
         let Ok(reservation) = self.reserve_causal_transition() else {
             return;
         };
-        let mut model = self
-            .package_entities
-            .lock()
-            .expect("package entity model lock");
-        let Some((name, generation)) = model.resync_releases.pop_first() else {
-            return;
-        };
-        if !model
-            .families
-            .get(&name)
-            .is_some_and(|family| family.generation == generation)
-        {
-            return;
-        }
-        if let Some(op) = model.take_resync_release(&name, false) {
-            reservation.commit(op);
+        let mut cursor = resync::Cursor::default();
+        let mut operation = None;
+        self.with_direct_entity_model(|model| {
+            model.step_resync(resync::Action::Release, &mut cursor, &mut operation)
+        });
+        if let Some(operation) = operation {
+            reservation.commit(operation);
         }
     }
 
@@ -806,6 +795,7 @@ impl HubRuntime {
             generation: state.generation,
             seq,
         });
+        self.entity_model_owner.update_readiness(&model);
     }
 
     #[cfg(test)]
@@ -889,8 +879,17 @@ impl HubRuntime {
             self.admit_package_entity_publish(registration, mutation, scope_id, 0, reservation);
         drop(discarded);
         let (response, receiver) = std::sync::mpsc::channel();
-        assert!(self.entity_publish_retirement.borrow().is_none());
-        *self.entity_publish_retirement.borrow_mut() = Some(PublicationRetirement {
+        assert!(
+            self.package_entities
+                .lock()
+                .expect("package entity model lock")
+                .publication
+                .is_none()
+        );
+        self.package_entities
+            .lock()
+            .expect("package entity model lock")
+            .publication = Some(PublicationRetirement {
             disposed: false,
             drain,
             daemon_owned: false,
@@ -932,6 +931,7 @@ impl HubRuntime {
             reservation,
         );
         model.index_resync_releases(family);
+        self.entity_model_owner.update_readiness(&model);
     }
 
     #[doc(hidden)]
@@ -942,6 +942,7 @@ impl HubRuntime {
             .expect("test family token capacity");
         model.family(name).remember_resync_lease(scope_id);
         model.index_resync_releases(name);
+        self.entity_model_owner.update_readiness(&model);
     }
 
     #[must_use]
@@ -987,6 +988,7 @@ impl HubRuntime {
         let entry = model.family(family);
         entry.last_accepted_seq = seq;
         entry.high_water_seq = seq;
+        self.entity_model_owner.update_readiness(&model);
     }
 
     #[must_use]
@@ -1034,7 +1036,7 @@ impl HubRuntime {
         }
     }
 
-    pub(crate) fn begin_host_package_entity_cleanup(
+    pub(crate) fn begin_direct_package_entity_cleanup(
         &self,
         cleanup: &mut HostPackageCleanup,
     ) -> Result<(), PackageEntityCleanupError> {
@@ -1057,10 +1059,10 @@ impl HubRuntime {
         let Some(mut cleanup) = self.direct_family_cleanup.borrow_mut().take() else {
             return;
         };
-        match self.step_host_package_entity_cleanup(&mut cleanup) {
+        match self.step_direct_package_entity_cleanup(&mut cleanup) {
             family_cleanup::FamilyCleanupStep::Payload(payload) => {
                 drop(payload);
-                self.complete_host_package_entity_cleanup_item(&mut cleanup);
+                self.complete_direct_package_entity_cleanup_item(&mut cleanup);
             }
             family_cleanup::FamilyCleanupStep::Complete => return,
             _ => {}
@@ -1609,7 +1611,7 @@ impl HubRuntime {
 
     pub(crate) fn entity_publish_ready(&self) -> bool {
         self.entity_publish_wait.get() == PublicationWait::Ready
-            && self.entity_publish_retirement.borrow().is_none()
+            && self.entity_model_readiness().publication == publication::Next::Idle
             && self.entity_publish_bridge.ready()
     }
 
@@ -1633,15 +1635,26 @@ impl HubRuntime {
 
     /// Synchronous runtime pumping uses the same admission and retirement transitions.
     pub(crate) fn step_entity_publish(&self) {
+        if self.entity_model_in_flight() {
+            return;
+        }
         if self
-            .entity_publish_retirement
-            .borrow()
+            .package_entities
+            .lock()
+            .expect("package entity model lock")
+            .publication
             .as_ref()
             .is_some_and(|pending| pending.daemon_owned)
         {
             return;
         }
-        if self.entity_publish_retirement.borrow().is_none() {
+        if self
+            .package_entities
+            .lock()
+            .expect("package entity model lock")
+            .publication
+            .is_none()
+        {
             if let Some(payload) = self.begin_entity_publish() {
                 drop(payload);
                 self.complete_entity_publish_disposal();
@@ -1669,18 +1682,22 @@ impl HubRuntime {
 
     /// Advance one mutation in the exact family generation retained by this publication.
     pub(crate) fn advance_entity_publish(&self) -> PublicationAdvance {
-        let mut retirement = self.entity_publish_retirement.borrow_mut();
-        let Some(pending) = retirement.as_mut() else {
-            return PublicationAdvance::Complete;
-        };
-        let Some((name, generation)) = pending.drain.as_ref() else {
-            return PublicationAdvance::Complete;
-        };
-        let (status, result) = self
+        let mut model = self
             .package_entities
             .lock()
-            .expect("package entity model lock")
-            .advance_publish(name, *generation);
+            .expect("package entity model lock");
+        let Some((name, generation)) = model
+            .publication
+            .as_ref()
+            .and_then(|pending| pending.drain.clone())
+        else {
+            return PublicationAdvance::Complete;
+        };
+        let (status, result) = model.advance_publish(&name, generation);
+        let pending = model
+            .publication
+            .as_mut()
+            .expect("the publication remains retained");
         if let Some(result) = result {
             pending.result = Ok(result);
         }
@@ -1690,32 +1707,43 @@ impl HubRuntime {
         if status != PublicationAdvance::Fault {
             self.note_package_entity_resync_changed();
         }
+        self.entity_model_owner.update_readiness(&model);
         status
     }
 
     pub(crate) fn entity_publish_retirement_pending(&self) -> bool {
-        self.entity_publish_retirement.borrow().is_some()
+        self.entity_model_readiness().publication != publication::Next::Idle
     }
 
     pub(crate) fn mark_entity_publish_daemon_owned(&self) {
-        self.entity_publish_retirement
-            .borrow_mut()
+        self.package_entities
+            .lock()
+            .expect("package entity model lock")
+            .publication
             .as_mut()
             .expect("daemon retains its publication")
             .daemon_owned = true;
     }
 
     pub(crate) fn complete_entity_publish_disposal(&self) {
-        self.entity_publish_retirement
-            .borrow_mut()
+        let mut model = self
+            .package_entities
+            .lock()
+            .expect("package entity model lock");
+        model
+            .publication
             .as_mut()
             .expect("disposal retains its publication")
             .disposed = true;
+        self.entity_model_owner.update_readiness(&model);
     }
 
     pub(crate) fn finish_entity_publish_retirement(&self) -> CausalTransitionStatus {
-        let mut retirement = self.entity_publish_retirement.borrow_mut();
-        let Some(pending) = retirement.as_mut() else {
+        let mut model = self
+            .package_entities
+            .lock()
+            .expect("package entity model lock");
+        let Some(pending) = model.publication.as_mut() else {
             return CausalTransitionStatus::Applied;
         };
         if !pending.disposed || pending.drain.is_some() {
@@ -1728,8 +1756,9 @@ impl HubRuntime {
             };
             reservation.commit(pending.release.take().unwrap());
         }
-        let pending = retirement.take().unwrap();
+        let pending = model.publication.take().unwrap();
         let _ = pending.response.send(pending.result);
+        self.entity_model_owner.update_readiness(&model);
         CausalTransitionStatus::Applied
     }
 
@@ -1795,7 +1824,10 @@ impl HubRuntime {
             )
         };
         if discarded.is_some() || drain.is_some() {
-            *self.entity_publish_retirement.borrow_mut() = Some(PublicationRetirement {
+            self.package_entities
+                .lock()
+                .expect("package entity model lock")
+                .publication = Some(PublicationRetirement {
                 disposed: discarded.is_none(),
                 drain,
                 daemon_owned: false,
@@ -1807,6 +1839,12 @@ impl HubRuntime {
             assert!(release.is_none());
             let _ = pending.response.send(result);
         }
+        self.entity_model_owner.update_readiness(
+            &self
+                .package_entities
+                .lock()
+                .expect("package entity model lock"),
+        );
         discarded
     }
 
@@ -1859,11 +1897,9 @@ impl HubRuntime {
         ),
         (String, PackageEntityMutation),
     > {
-        let transition = self
-            .package_entities
-            .lock()
-            .expect("package entity model lock")
-            .admit(registration, mutation, scope_id, publication_token)?;
+        let transition = self.with_direct_entity_model(|model| {
+            model.admit(registration, mutation, scope_id, publication_token)
+        })?;
         if let Some(op) = transition.causal {
             reservation
                 .take()
@@ -1893,22 +1929,13 @@ impl HubRuntime {
 
     /// Take one mutation. The caller must reserve Host capacity first.
     pub(crate) fn has_package_entity_fanout(&self) -> bool {
-        !self
-            .package_entities
-            .lock()
-            .expect("package entity model lock")
-            .fanout
-            .is_empty()
+        self.entity_model_readiness().fanout
     }
 
     /// Take one mutation. The caller must reserve Host capacity first.
     #[must_use]
     pub fn take_one_package_entity_fanout(&self) -> Option<TakenPackageEntityMutation> {
-        self.package_entities
-            .lock()
-            .expect("package entity model lock")
-            .fanout
-            .pop_first()
+        self.with_direct_entity_model(|model| model.fanout.pop_first())
             .map(|item| TakenPackageEntityMutation {
                 mutation: item.mutation,
                 finish: PackageEntityFanoutFinish {
@@ -1955,11 +1982,8 @@ impl HubRuntime {
     }
 
     fn prepare_finish_op(&self, lease: &EntityMutationLease, scheduled_resync: bool) -> CausalOp {
-        let (op, changed) = self
-            .package_entities
-            .lock()
-            .expect("package entity model lock")
-            .finish(lease, scheduled_resync);
+        let (op, changed) =
+            self.with_direct_entity_model(|model| model.finish(lease, scheduled_resync));
         if changed {
             self.note_package_entity_resync_changed();
         }
@@ -1987,10 +2011,7 @@ impl HubRuntime {
         snapshot_seq: u64,
     ) -> PackageEntityFamilyProgress {
         self.note_package_entity_resync_changed();
-        self.package_entities
-            .lock()
-            .expect("package entity model lock")
-            .begin_snapshot(entity_type, snapshot_seq)
+        self.with_direct_entity_model(|model| model.begin_snapshot(entity_type, snapshot_seq))
     }
 
     /// Take one family transition after the provider snapshot reaches its subscribers.
@@ -2004,11 +2025,8 @@ impl HubRuntime {
             Err(CausalTransitionStatus::Waiting) => return PackageEntitySnapshotStep::Waiting,
             Err(_) => return PackageEntitySnapshotStep::Fault,
         };
-        let (generation, step) = self
-            .package_entities
-            .lock()
-            .expect("package entity model lock")
-            .step_snapshot(entity_type);
+        let (generation, step) =
+            self.with_direct_entity_model(|model| model.step_snapshot(entity_type));
         match step {
             PackageEntityFamilyStep::Discarded { mutation, lease } => {
                 PackageEntitySnapshotStep::Discarded(TakenPackageEntityMutation {
@@ -2052,20 +2070,14 @@ impl HubRuntime {
     /// or a new publish admission restarts a need cycle after degradation.
     pub fn mark_package_entity_resync_needed(&self, entity_type: &str) {
         self.note_package_entity_resync_changed();
-        self.package_entities
-            .lock()
-            .expect("package entity model lock")
-            .mark_resync(entity_type);
+        self.with_direct_entity_model(|model| model.mark_resync(entity_type));
     }
 
     /// Explicitly re-arm resync after a new catching-up subscription (or other
     /// progress event that must clear degradation).
     pub fn rearm_package_entity_resync(&self, entity_type: &str) {
         self.note_package_entity_resync_changed();
-        self.package_entities
-            .lock()
-            .expect("package entity model lock")
-            .rearm_resync(entity_type);
+        self.with_direct_entity_model(|model| model.rearm_resync(entity_type));
     }
 
     /// Retain a resync change until the owner records the scheduling work.
@@ -2077,67 +2089,18 @@ impl HubRuntime {
         self.package_entity_resync_changed.replace(false)
     }
 
-    /// Inspect one family after the retained cursor, including inactive families.
-    pub(crate) fn next_package_entity_resync_family(
-        &self,
-        after: Option<&str>,
-    ) -> Option<(String, Option<Instant>, bool)> {
+    pub(crate) fn package_entity_resync_next_attempt(&self, entity_type: &str) -> Option<Instant> {
         let model = self
             .package_entities
             .lock()
             .expect("package entity model lock");
-        let families = &model.families;
-        let next = match after {
-            Some(after) => families
-                .range::<str, _>((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
-                .next(),
-            None => families.first_key_value(),
-        };
-        next.map(|(name, family)| {
-            (
-                name.clone(),
-                if self.publication_drains_family(name, family.generation) {
-                    None
-                } else {
-                    family.resync.next_attempt_at()
-                },
-                family.resync.degraded && !family.resync.leases.is_empty(),
-            )
-        })
-    }
-
-    fn publication_drains_family(&self, name: &str, generation: u64) -> bool {
-        self.entity_publish_retirement
-            .borrow()
-            .as_ref()
-            .and_then(|pending| pending.drain.as_ref())
-            .is_some_and(|(active, active_generation)| {
-                active == name && *active_generation == generation
-            })
-    }
-
-    pub(crate) fn package_entity_resync_next_attempt(&self, entity_type: &str) -> Option<Instant> {
-        self.package_entities
-            .lock()
-            .expect("package entity model lock")
-            .families
-            .get(entity_type)
-            .and_then(|family| {
-                if self.publication_drains_family(entity_type, family.generation) {
-                    None
-                } else {
-                    family.resync.next_attempt_at()
-                }
-            })
+        model.resync_observation(entity_type).deadline
     }
 
     /// Record a resync attempt; returns whether the family entered degraded.
     pub fn record_package_entity_resync_attempt(&self, entity_type: &str) -> bool {
-        let degraded = self
-            .package_entities
-            .lock()
-            .expect("package entity model lock")
-            .record_resync_attempt(entity_type);
+        let degraded =
+            self.with_direct_entity_model(|model| model.record_resync_attempt(entity_type));
         if degraded {
             self.release_one_degraded_package_entity_resync_lease(entity_type);
         }
@@ -2152,11 +2115,8 @@ impl HubRuntime {
         let Ok(reservation) = self.reserve_causal_transition() else {
             return false;
         };
-        let op = self
-            .package_entities
-            .lock()
-            .expect("package entity model lock")
-            .take_resync_release(entity_type, true);
+        let op =
+            self.with_direct_entity_model(|model| model.take_resync_release(entity_type, true));
         let Some(op) = op else {
             return false;
         };
@@ -2208,29 +2168,15 @@ impl HubRuntime {
     /// True when admitted fanout or a non-degraded resync is waiting.
     #[must_use]
     pub fn package_entity_work_pending(&self) -> bool {
-        if self.package_entity_resync_still_needed() {
-            return true;
-        }
-        if self.causal_owner_ops_pending() {
-            return true;
-        }
-        !self
-            .package_entities
-            .lock()
-            .expect("package entity model lock")
-            .fanout
-            .is_empty()
+        self.package_entity_resync_still_needed()
+            || self.causal_owner_ops_pending()
+            || self.has_package_entity_fanout()
     }
 
     /// True when a family still needs resync and has not degraded.
     #[must_use]
     pub fn package_entity_resync_still_needed(&self) -> bool {
-        self.package_entities
-            .lock()
-            .expect("package entity model lock")
-            .families
-            .values()
-            .any(|family| family.resync.needed && !family.resync.degraded)
+        self.entity_model_readiness().resync
     }
 
     /// Whether the family is currently marked resync_degraded.
@@ -2616,7 +2562,16 @@ impl HubRuntime {
             let family = model.family(expected.entity_kind.as_str());
             (family.provider_obligation(), family.generation)
         };
-        let scope_id = obligation.as_ref().map(|(scope_id, _)| *scope_id);
+        self.selected_plugin_entity_snapshot(expected, family_generation, obligation.as_ref())
+    }
+
+    pub(crate) fn selected_plugin_entity_snapshot(
+        &self,
+        expected: &SharedView<ProviderExpectation>,
+        family_generation: u64,
+        obligation: Option<&(u64, Option<crate::lua_runtime::EntityPublishPermit>)>,
+    ) -> Result<PluginEntitySnapshotInvocation, crate::McpToolError> {
+        let scope_id = obligation.map(|(scope_id, _)| *scope_id);
         if scope_id.is_some() && self.causal_faulted() {
             return Err(crate::McpToolError::new(
                 "causal_scope_busy",
@@ -2642,7 +2597,7 @@ impl HubRuntime {
             family_generation,
             causal_lease,
             lease_acquired: false,
-            admission: obligation.and_then(|(_, admission)| admission),
+            admission: obligation.and_then(|(_, admission)| admission.clone()),
         })
     }
 
@@ -3117,12 +3072,18 @@ impl HubRuntime {
         invocation: &mut PluginEntitySnapshotInvocation,
     ) -> crate::package_event_router::CausalAcquireResult {
         use crate::package_event_router::CausalAcquireResult;
-        if invocation.lease_acquired || invocation.causal_lease.is_none() {
-            invocation.lease_acquired = true;
+        if invocation.lease_acquired {
             return CausalAcquireResult::Acquired;
         }
-        if self.causal_faulted() {
+        if invocation.causal_lease.is_some() && self.causal_faulted() {
             return CausalAcquireResult::Fault;
+        }
+        if !self.causal_queue.is_empty() {
+            return CausalAcquireResult::Waiting;
+        }
+        if invocation.causal_lease.is_none() {
+            invocation.lease_acquired = true;
+            return CausalAcquireResult::Acquired;
         }
         let (scope_id, invocation_token) = invocation.causal_lease.unwrap();
         let result = self.causal_scopes.try_acquire_with_admission_or_wait(
@@ -5285,7 +5246,7 @@ pub(crate) mod tests {
         SessionDefaults, TransportBindings,
     };
 
-    fn family_runtime(name: &str) -> HubRuntime {
+    pub(super) fn family_runtime(name: &str) -> HubRuntime {
         let config = HubStartupOptions {
             host: HostIdentityOptions {
                 id: name.to_string(),
@@ -6121,12 +6082,12 @@ pub(crate) mod tests {
             ..HostPackageCleanup::default()
         };
         runtime
-            .begin_host_package_entity_cleanup(&mut cleanup)
+            .begin_direct_package_entity_cleanup(&mut cleanup)
             .unwrap();
         assert_eq!(bridge.retained_counts().0, 2);
         let mut disposed = 0;
         loop {
-            match runtime.step_host_package_entity_cleanup(&mut cleanup) {
+            match runtime.step_direct_package_entity_cleanup(&mut cleanup) {
                 FamilyCleanupStep::Pending => {}
                 FamilyCleanupStep::Payload(payload) => {
                     assert_eq!(bridge.retained_counts().0, 2);
@@ -6136,7 +6097,7 @@ pub(crate) mod tests {
                         bridge.retained_counts().0,
                         if disposed == 1 { 2 } else { 1 }
                     );
-                    runtime.complete_host_package_entity_cleanup_item(&mut cleanup);
+                    runtime.complete_direct_package_entity_cleanup_item(&mut cleanup);
                 }
                 FamilyCleanupStep::Complete => break,
                 FamilyCleanupStep::Waiting | FamilyCleanupStep::Fault => {
@@ -6786,20 +6747,20 @@ pub(crate) mod tests {
             ..HostPackageCleanup::default()
         };
         runtime
-            .begin_host_package_entity_cleanup(&mut cleanup)
+            .begin_direct_package_entity_cleanup(&mut cleanup)
             .unwrap();
         assert!(matches!(
-            runtime.step_host_package_entity_cleanup(&mut cleanup),
+            runtime.step_direct_package_entity_cleanup(&mut cleanup),
             FamilyCleanupStep::Pending
         ));
         let FamilyCleanupStep::Payload(payload) =
-            runtime.step_host_package_entity_cleanup(&mut cleanup)
+            runtime.step_direct_package_entity_cleanup(&mut cleanup)
         else {
             panic!("select first payload");
         };
         assert_eq!(payload.snapshot_seq(), 1);
         drop(payload);
-        runtime.complete_host_package_entity_cleanup_item(&mut cleanup);
+        runtime.complete_direct_package_entity_cleanup_item(&mut cleanup);
         runtime.causal_scopes.test_with_inner_held(|| {
             for _ in 0..CAUSAL_OWNER_CAPACITY {
                 assert_eq!(
@@ -6813,7 +6774,7 @@ pub(crate) mod tests {
             runtime.causal_scopes.take_progress_notification();
             for _ in 0..2 {
                 assert!(matches!(
-                    runtime.step_host_package_entity_cleanup(&mut cleanup),
+                    runtime.step_direct_package_entity_cleanup(&mut cleanup),
                     FamilyCleanupStep::Waiting
                 ));
                 assert_eq!(
@@ -6835,20 +6796,20 @@ pub(crate) mod tests {
         }
         assert!(runtime.take_causal_capacity_notification());
         assert!(matches!(
-            runtime.step_host_package_entity_cleanup(&mut cleanup),
+            runtime.step_direct_package_entity_cleanup(&mut cleanup),
             FamilyCleanupStep::Pending
         ));
         assert!(cleanup.family_cursor.release.is_none());
         runtime.apply_causal_owner_ops();
         assert!(!runtime.causal_scopes.is_live(scope));
         let FamilyCleanupStep::Payload(payload) =
-            runtime.step_host_package_entity_cleanup(&mut cleanup)
+            runtime.step_direct_package_entity_cleanup(&mut cleanup)
         else {
             panic!("select second payload only after release admission");
         };
         assert_eq!(payload.snapshot_seq(), 2);
         drop(payload);
-        runtime.complete_host_package_entity_cleanup_item(&mut cleanup);
+        runtime.complete_direct_package_entity_cleanup_item(&mut cleanup);
         runtime.drain_direct_package_entity_cleanup(&mut cleanup);
     }
 
@@ -6888,10 +6849,10 @@ pub(crate) mod tests {
             ..HostPackageCleanup::default()
         };
         runtime
-            .begin_host_package_entity_cleanup(&mut cleanup)
+            .begin_direct_package_entity_cleanup(&mut cleanup)
             .unwrap();
         assert!(matches!(
-            runtime.step_host_package_entity_cleanup(&mut cleanup),
+            runtime.step_direct_package_entity_cleanup(&mut cleanup),
             FamilyCleanupStep::Pending
         ));
         assert!(!runtime.test_family_exists(family));
@@ -6907,7 +6868,7 @@ pub(crate) mod tests {
         );
         runtime.test_store_resync_lease(scope, family);
         let FamilyCleanupStep::Payload(old_payload) =
-            runtime.step_host_package_entity_cleanup(&mut cleanup)
+            runtime.step_direct_package_entity_cleanup(&mut cleanup)
         else {
             panic!("select the old detached payload");
         };
@@ -6929,9 +6890,9 @@ pub(crate) mod tests {
             1
         );
         drop(old_payload);
-        runtime.complete_host_package_entity_cleanup_item(&mut cleanup);
+        runtime.complete_direct_package_entity_cleanup_item(&mut cleanup);
         for _ in 0..20 {
-            match runtime.step_host_package_entity_cleanup(&mut cleanup) {
+            match runtime.step_direct_package_entity_cleanup(&mut cleanup) {
                 FamilyCleanupStep::Complete => break,
                 FamilyCleanupStep::Pending => {}
                 FamilyCleanupStep::Waiting | FamilyCleanupStep::Fault => {
@@ -6969,11 +6930,11 @@ pub(crate) mod tests {
             .unloaded_families
             .push(("producer".into(), BTreeSet::from(["producer.item".into()])));
         runtime
-            .begin_host_package_entity_cleanup(&mut cleanup)
+            .begin_direct_package_entity_cleanup(&mut cleanup)
             .unwrap();
         let epoch = runtime.package_entities.lock().unwrap().epoch;
         runtime
-            .begin_host_package_entity_cleanup(&mut cleanup)
+            .begin_direct_package_entity_cleanup(&mut cleanup)
             .unwrap();
         assert_eq!(runtime.package_entities.lock().unwrap().epoch, epoch);
         assert_eq!(cleanup.family_epoch, Some(epoch));
@@ -6987,7 +6948,7 @@ pub(crate) mod tests {
             .unloaded_families
             .push(("producer".into(), BTreeSet::from(["producer.item".into()])));
         assert_eq!(
-            runtime.begin_host_package_entity_cleanup(&mut refused),
+            runtime.begin_direct_package_entity_cleanup(&mut refused),
             Err(PackageEntityCleanupError::GenerationExhausted)
         );
         assert_eq!(refused.family_epoch, None);

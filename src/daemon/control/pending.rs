@@ -53,7 +53,7 @@ pub(crate) enum ControlPoll {
 
 /// One owner-thread continuation for a request that waits on Core.
 pub(crate) type ControlContinuation =
-    Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>;
+    Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll>;
 
 /// Retirement for a request that owns deferred work. The hook receives the
 /// entry permit. It must cancel, release, or transfer the work to another
@@ -82,9 +82,7 @@ impl ControlStep {
     }
 
     pub(crate) fn pending(
-        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
-        + Send
-        + 'static,
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + 'static,
     ) -> Self {
         Self::Pending(PendingStep {
             continuation: Box::new(continuation),
@@ -95,9 +93,7 @@ impl ControlStep {
 
     pub(crate) fn pending_in(
         ready_class: ReadyClass,
-        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
-        + Send
-        + 'static,
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + 'static,
     ) -> Self {
         Self::Pending(PendingStep {
             continuation: Box::new(continuation),
@@ -109,9 +105,7 @@ impl ControlStep {
     /// A deferred request whose Core work must be cancelled or released
     /// when the request is retired.
     pub(crate) fn pending_retirable(
-        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
-        + Send
-        + 'static,
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + 'static,
         retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit)
         + Send
         + 'static,
@@ -125,9 +119,7 @@ impl ControlStep {
 
     pub(crate) fn pending_retirable_in(
         ready_class: ReadyClass,
-        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
-        + Send
-        + 'static,
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + 'static,
         retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit)
         + Send
         + 'static,

@@ -565,8 +565,8 @@ impl SessionTypeCatalogCache {
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
-            HostResult::PluginEntity(_)
-            | HostResult::FamilyCleanupComplete { .. }
+            HostResult::EntityModelComplete(_)
+            | HostResult::PluginEntity(_)
             | HostResult::EventOwner(_)
             | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned
@@ -629,8 +629,8 @@ impl SessionTypeCatalogCache {
                 self.generation = None;
                 self.failure = Some((generation, error));
             }
-            HostResult::PluginEntity(_)
-            | HostResult::FamilyCleanupComplete { .. }
+            HostResult::EntityModelComplete(_)
+            | HostResult::PluginEntity(_)
             | HostResult::EventOwner(_)
             | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned
@@ -1270,6 +1270,14 @@ pub(crate) fn absorb_session_type_catalog_completions(
                 if state.publication_owner.accepts(completion.identity) {
                     state.publication_owner.retain_completion(completion);
                     crate::daemon::owner_loop::mark_publication_owner_ready(state);
+                } else if state
+                    .package_entity_resync_scan
+                    .accepts(completion.identity)
+                {
+                    state
+                        .package_entity_resync_scan
+                        .retain_completion(completion);
+                    crate::subscription::entity_resync::mark_ready(state);
                 } else if state.event_owner.accepts(completion.identity) {
                     state.event_owner.retain_completion(completion);
                     crate::daemon::owner_loop::mark_event_owner_ready(state);
@@ -1371,6 +1379,10 @@ fn publish_catalog_capacity_wake(state: &mut DaemonControlState, owner_turn: &mu
             .maintenance
             .wakes
             .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
+    }
+    if state.package_entity_resync_scan.waiting_for_host {
+        state.package_entity_resync_scan.waiting_for_host = false;
+        crate::subscription::entity_resync::mark_ready(state);
     }
     if state.publication_owner.waiting_for_host {
         state.publication_owner.waiting_for_host = false;
