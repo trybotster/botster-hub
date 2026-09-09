@@ -81,6 +81,8 @@ pub use causal::{CAUSAL_OWNER_CAPACITY, CAUSAL_OWNER_PAYLOAD_BYTES, CausalTransi
 use causal::{CausalOwnerQueue, CausalReservation};
 mod entities;
 use entities::PackageEntities;
+pub(crate) mod provider;
+use provider::{ProviderExpectation, ProviderRequestPlan};
 pub(crate) mod family_cleanup;
 pub(crate) mod package_effect;
 use package_effect::{HostPackageCleanup, HostPackageRuntime};
@@ -132,7 +134,7 @@ pub struct HubRuntime {
         )>,
     >,
     acknowledged_spawn_ids: Mutex<BTreeSet<String>>,
-    force_plugin_admit_backpressure: std::sync::atomic::AtomicBool,
+    force_plugin_admit_backpressure: Arc<std::sync::atomic::AtomicBool>,
     pending_test_event_settlements: Mutex<Vec<PendingTestEvent>>,
     force_park_test_events: std::sync::atomic::AtomicBool,
 }
@@ -238,18 +240,18 @@ pub enum PackageEntityCleanupError {
 
 /// Prepared package entity-provider work and its causal lease.
 pub(crate) struct PluginEntitySnapshotInvocation {
-    pub(crate) request: PluginInvocationRequest,
-    entity_kind: EntityKind,
+    pub(crate) expected: SharedView<ProviderExpectation>,
     pub(crate) family_generation: u64,
     // The retained scope ID and invocation token identify this exact lease.
-    causal_lease: Option<(u64, u64)>,
+    pub(crate) causal_lease: Option<(u64, u64)>,
+    pub(crate) lease_acquired: bool,
     pub(crate) admission: Option<crate::lua_runtime::EntityPublishPermit>,
 }
 
 impl PluginEntitySnapshotInvocation {
     #[must_use]
-    pub(crate) const fn expected_entity_kind(&self) -> &EntityKind {
-        &self.entity_kind
+    pub(crate) fn expected_entity_kind(&self) -> &EntityKind {
+        &self.expected.entity_kind
     }
 }
 
@@ -388,7 +390,7 @@ impl HubRuntime {
             event_plane_owner_ops_changed: std::cell::Cell::new(false),
             event_plane_cleanup_faults: std::cell::RefCell::new(Vec::new()),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
-            force_plugin_admit_backpressure: std::sync::atomic::AtomicBool::new(false),
+            force_plugin_admit_backpressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_test_event_settlements: Mutex::new(Vec::new()),
             force_park_test_events: std::sync::atomic::AtomicBool::new(false),
         })
@@ -491,7 +493,7 @@ impl HubRuntime {
             event_plane_owner_ops_changed: std::cell::Cell::new(false),
             event_plane_cleanup_faults: std::cell::RefCell::new(Vec::new()),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
-            force_plugin_admit_backpressure: std::sync::atomic::AtomicBool::new(false),
+            force_plugin_admit_backpressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_test_event_settlements: Mutex::new(Vec::new()),
             force_park_test_events: std::sync::atomic::AtomicBool::new(false),
         };
@@ -2550,13 +2552,13 @@ impl HubRuntime {
                 "causal transition capacity unavailable",
             )
         })?;
-        let invocation = self.prepare_plugin_entity_snapshot(
+        let (request, invocation) = self.prepare_plugin_entity_snapshot(
             entity_type,
             subscription_id,
             RequestId(format!("plugin-entity-provider-{subscription_id}")),
             None,
         )?;
-        let result = self.invoke_plugin(invocation.request.clone()).result;
+        let result = self.invoke_plugin(request).result;
         if let Some((scope_id, invocation_token)) = invocation.causal_lease {
             reservation.commit(CausalOp::Release {
                 scope_id,
@@ -2566,44 +2568,54 @@ impl HubRuntime {
         self.complete_plugin_entity_snapshot(invocation, result)
     }
 
-    /// Prepare one entity-provider snapshot for non-blocking worker admission.
+    /// Prepare a provider for synchronous callers outside the daemon owner.
     pub(crate) fn prepare_plugin_entity_snapshot(
         &self,
         entity_type: &str,
         subscription_id: &str,
         request_id: RequestId,
         client_id: Option<ClientId>,
-    ) -> Result<PluginEntitySnapshotInvocation, crate::McpToolError> {
-        let entity_kind = EntityKind(entity_type.to_string());
-        EntityContract::validate_entity_type(&entity_kind, None).map_err(|error| {
-            crate::McpToolError::new("invalid_entity_provider", error.to_string())
-        })?;
-        let descriptor = self
-            .plugin_lifecycle
-            .entity_provider_descriptor(entity_type)
-            .ok_or_else(|| {
-                crate::McpToolError::new(
-                    "entity_provider_unavailable",
-                    format!("no enabled package provides entity family {entity_type}"),
-                )
-            })?;
-        let package_name = descriptor.descriptor.plugin_key.0.clone();
-        let owner_token = package_entity_owner_token(&package_name);
-        EntityContract::validate_entity_type(&entity_kind, Some(&owner_token)).map_err(
-            |error| crate::McpToolError::new("invalid_entity_provider", error.to_string()),
+    ) -> Result<(PluginInvocationRequest, PluginEntitySnapshotInvocation), crate::McpToolError>
+    {
+        let mut plan = ProviderRequestPlan::prepare(
+            &self.plugin_lifecycle,
+            &self.shared_view_budget(),
+            entity_type,
+            subscription_id,
+            request_id,
+            client_id,
         )?;
-        let handler = descriptor.handler.ok_or_else(|| {
-            crate::McpToolError::new(
-                "entity_provider_unavailable",
-                format!("entity provider {entity_type} has no handler"),
-            )
-        })?;
+        let mut invocation = self.select_plugin_entity_snapshot(&plan.expected)?;
+        if let Some((scope_id, invocation_token)) = invocation.causal_lease {
+            if !self.causal_scopes.acquire_with_admission(
+                scope_id,
+                LeaseIdentity::ProviderInFlight { invocation_token },
+                invocation.admission.clone(),
+            ) {
+                return Err(crate::McpToolError::new(
+                    "causal_scope_busy",
+                    "could not acquire provider causal lease",
+                ));
+            }
+        }
+        invocation.lease_acquired = true;
+        plan.request.context.metadata = invocation
+            .causal_lease
+            .map(|(scope_id, _)| BoundaryJson(serde_json::json!({ "causal_scope_id": scope_id })));
+        Ok((plan.request, invocation))
+    }
+
+    /// Retain the selected family obligation before causal acquisition.
+    pub(crate) fn select_plugin_entity_snapshot(
+        &self,
+        expected: &SharedView<ProviderExpectation>,
+    ) -> Result<PluginEntitySnapshotInvocation, crate::McpToolError> {
         let (obligation, family_generation) = {
             let mut model = self
                 .package_entities
                 .lock()
                 .expect("package entity model lock");
-            let family = model.family(entity_type);
+            let family = model.family(expected.entity_kind.as_str());
             (family.provider_obligation(), family.generation)
         };
         let scope_id = obligation.as_ref().map(|(scope_id, _)| *scope_id);
@@ -2623,46 +2635,15 @@ impl HubRuntime {
             }
             self.next_provider_token
                 .set(invocation_token.checked_add(1).unwrap_or(0));
-            if !self.causal_scopes.acquire_with_admission(
-                scope_id,
-                LeaseIdentity::ProviderInFlight { invocation_token },
-                obligation
-                    .as_ref()
-                    .and_then(|(_, admission)| admission.clone()),
-            ) {
-                return Err(crate::McpToolError::new(
-                    "causal_scope_busy",
-                    "could not acquire provider causal lease",
-                ));
-            }
             Some((scope_id, invocation_token))
         } else {
             None
         };
-        let metadata = scope_id
-            .map(|scope_id| BoundaryJson(serde_json::json!({ "causal_scope_id": scope_id })));
-        let request = PluginInvocationRequest {
-            request_id: request_id.clone(),
-            handler,
-            timeout_ms: PLUGIN_EVENT_TIMEOUT_MS,
-            context: botster_core::PluginInvocationContext {
-                client_id,
-                session_id: None,
-                subscription_id: Some(SubscriptionId(subscription_id.to_string())),
-                surface_id: None,
-                origin: Some("local-client-api".to_string()),
-                metadata,
-            },
-            payload: BoundaryJson(serde_json::json!({
-                "entity_type": entity_type,
-                "subscription_id": subscription_id,
-            })),
-        };
         Ok(PluginEntitySnapshotInvocation {
-            request,
-            entity_kind,
+            expected: expected.clone(),
             family_generation,
             causal_lease,
+            lease_acquired: false,
             admission: obligation.and_then(|(_, admission)| admission),
         })
     }
@@ -2672,7 +2653,11 @@ impl HubRuntime {
         &self,
         invocation: &PluginEntitySnapshotInvocation,
     ) -> CausalTransitionStatus {
-        self.release_plugin_entity_snapshot_lease(invocation.causal_lease)
+        if invocation.lease_acquired {
+            self.release_plugin_entity_snapshot_lease(invocation.causal_lease)
+        } else {
+            CausalTransitionStatus::Applied
+        }
     }
 
     /// Convert one entity-provider completion and release its causal lease.
@@ -2681,7 +2666,7 @@ impl HubRuntime {
         invocation: PluginEntitySnapshotInvocation,
         result: PluginInvocationResult,
     ) -> Result<(u64, Vec<serde_json::Value>), crate::McpToolError> {
-        if self.package_entity_family_generation(invocation.entity_kind.as_str())
+        if self.package_entity_family_generation(invocation.expected_entity_kind().as_str())
             != Some(invocation.family_generation)
         {
             return Err(crate::McpToolError::new(
@@ -2689,7 +2674,7 @@ impl HubRuntime {
                 "the entity family changed during the provider request",
             ));
         }
-        Self::convert_plugin_entity_snapshot(&invocation.entity_kind, result)
+        Self::convert_plugin_entity_snapshot(invocation.expected_entity_kind(), result)
     }
 
     /// Convert and validate one entity-provider completion without runtime state access.
@@ -3120,6 +3105,34 @@ impl HubRuntime {
             };
         }
         self.plugin_lifecycle.try_admit(class, request)
+    }
+
+    pub(crate) fn plugin_provider_admission(&self) -> (HubPluginLifecycle, Arc<AtomicBool>) {
+        (
+            self.plugin_lifecycle.clone(),
+            Arc::clone(&self.force_plugin_admit_backpressure),
+        )
+    }
+
+    pub(crate) fn try_acquire_plugin_entity_snapshot(
+        &self,
+        invocation: &mut PluginEntitySnapshotInvocation,
+    ) -> crate::package_event_router::CausalAcquireResult {
+        use crate::package_event_router::CausalAcquireResult;
+        if invocation.lease_acquired || invocation.causal_lease.is_none() {
+            invocation.lease_acquired = true;
+            return CausalAcquireResult::Acquired;
+        }
+        let (scope_id, invocation_token) = invocation.causal_lease.unwrap();
+        let result = self.causal_scopes.try_acquire_with_admission_or_wait(
+            scope_id,
+            &LeaseIdentity::ProviderInFlight { invocation_token },
+            invocation.admission.as_ref(),
+        );
+        if matches!(result, CausalAcquireResult::Acquired) {
+            invocation.lease_acquired = true;
+        }
+        result
     }
 
     /// Drain previously published plugin completions without waiting.
@@ -5795,9 +5808,9 @@ pub(crate) mod tests {
                 None,
             )
         };
-        let first = prepare().unwrap();
+        let (_, first) = prepare().unwrap();
         runtime.next_provider_token.set(u64::MAX);
-        let last = prepare().unwrap();
+        let (_, last) = prepare().unwrap();
         assert_eq!(first.causal_lease, Some((scope_id, 1)));
         assert_eq!(last.causal_lease, Some((scope_id, u64::MAX)));
         assert!(prepare().is_err());
@@ -5930,6 +5943,75 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn provider_expectation_capacity_precedes_selection_and_returns_after_host_disposal() {
+        let (runtime, root) = publication_provider_runtime("provider-expectation-capacity");
+        let budget = SharedViewBudget::with_capacity(4096);
+        let full = budget.reserve(4096).unwrap();
+        let prepare = || {
+            ProviderRequestPlan::prepare(
+                &runtime.plugin_lifecycle,
+                &budget,
+                "producer.item",
+                "sub",
+                RequestId("metadata-test".into()),
+                None,
+            )
+        };
+        let error = prepare().unwrap_err();
+        assert_eq!(error.code, "entity_provider_metadata_capacity");
+        assert_eq!(budget.used(), 4096);
+        drop(full);
+        let plan = prepare().unwrap();
+        let charged = budget.used();
+        assert!(charged > 0);
+        let invocation = runtime
+            .select_plugin_entity_snapshot(&plan.expected)
+            .unwrap();
+        assert_eq!(
+            budget.used(),
+            charged,
+            "selection shares the expectation charge"
+        );
+        let executor = runtime.host_executor();
+        let identity =
+            crate::host_executor::HostJobIdentity::first(crate::owner_identity::WaiterId(707));
+        executor
+            .submit(
+                identity,
+                crate::host_executor::HostCommand::PluginEntity(
+                    crate::plugin_entity::Command::DiscardProvider {
+                        plan: Some(plan),
+                        invocation: Some(invocation),
+                        input: None,
+                        refusal: None,
+                    },
+                ),
+                executor.try_reserve().unwrap(),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match executor.poll_completion() {
+                crate::host_executor::HostCompletionPoll::Ready(completion) => {
+                    assert_eq!(completion.identity, identity);
+                    assert_eq!(
+                        budget.used(),
+                        0,
+                        "Host disposal returns the final expectation charge"
+                    );
+                    break;
+                }
+                crate::host_executor::HostCompletionPoll::Empty => std::thread::yield_now(),
+                crate::host_executor::HostCompletionPoll::Stopped => panic!("Host stopped"),
+            }
+            assert!(std::time::Instant::now() < deadline);
+        }
+        assert!(prepare().is_ok(), "released metadata capacity is reusable");
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn lifetime_budget_follows_provider_snapshot_after_causal_retirement() {
         use crate::daemon::control::reply::{RetainedPluginResult, RetainedPluginResultBudget};
         use crate::plugin_entity::{Command, Completion};
@@ -5944,7 +6026,7 @@ pub(crate) mod tests {
         );
         runtime.step_entity_publish();
         assert!(reply.try_recv().unwrap().unwrap().ok);
-        let invocation = runtime
+        let (request, invocation) = runtime
             .prepare_plugin_entity_snapshot(
                 "producer.item",
                 "sub",
@@ -5952,7 +6034,7 @@ pub(crate) mod tests {
                 None,
             )
             .unwrap();
-        let result = runtime.invoke_plugin(invocation.request.clone()).result;
+        let result = runtime.invoke_plugin(request).result;
         runtime
             .package_entities
             .lock()
@@ -6118,7 +6200,7 @@ pub(crate) mod tests {
                 .contains("capacity exhausted")
         );
         assert_eq!(runtime.test_resync_scope_ids("producer.item").len(), 256);
-        let invocation = runtime
+        let (request, invocation) = runtime
             .prepare_plugin_entity_snapshot(
                 "producer.item",
                 "sub",
@@ -6126,7 +6208,7 @@ pub(crate) mod tests {
                 None,
             )
             .unwrap();
-        let result = runtime.invoke_plugin(invocation.request.clone()).result;
+        let result = runtime.invoke_plugin(request).result;
         assert_eq!(
             runtime.retire_plugin_entity_snapshot(&invocation),
             CausalTransitionStatus::Applied
@@ -6189,7 +6271,7 @@ pub(crate) mod tests {
             .unwrap();
         publish(101);
         assert_eq!(bridge.retained_counts().0, 2);
-        let invocation = runtime
+        let (_, invocation) = runtime
             .prepare_plugin_entity_snapshot(
                 "producer.item",
                 "sub",
@@ -6221,7 +6303,7 @@ pub(crate) mod tests {
             ));
         }
         publish(102);
-        let replacement = runtime
+        let (_, replacement) = runtime
             .prepare_plugin_entity_snapshot(
                 "producer.item",
                 "sub",

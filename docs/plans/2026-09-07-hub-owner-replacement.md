@@ -1144,3 +1144,58 @@ They use the existing candidate worker and the current linked Hub library.
 These results do not establish final matched artifacts or owner work-budget closure.
 Rust 1.97.0 `check --tests`, formatting, and the patch whitespace check pass.
 Independent review found no remaining extraction defect after the notification correction.
+
+### Finite provider admission and retained expectations
+
+Provider request construction and Core admission encoding now execute on Host workers.
+The daemon retains separate preparation, causal acquisition, and admission phases.
+The owner installs the selected expectation and causal token before Host submits the request to Core.
+Causal acquisition uses the existing nonblocking table operation and retains the selected token across contention.
+Synchronous callers use the same preparation algorithm outside the daemon path.
+
+A `SharedView` charge covers the retained expectation before Host copies its fields.
+The charge includes the expectation record, entity family, plugin key, and handler identifier.
+It counts logical bytes; it does not measure allocator overhead or string capacity.
+The request stays under the existing Host preparation reservation through Core admission.
+Preparation checks the request with the largest scalar scope metadata before admission.
+No new numeric limit or Core contract was added.
+
+Confirmed admission releases the Host slot and its full prepared-byte reservation.
+The expectation keeps its separate shared-view charge while Core executes Lua.
+A later result preparation reserves Host capacity again and preserves the next phase identity.
+Known refusal retains its original Host slot through causal retirement and error preparation.
+Host destroys retained request metadata and refusal strings during disposal.
+
+The owner checks each completion variant against the retained stage before consuming the completion.
+An unexpected result retains the exact completion and permit in a faulted phase.
+An early Core result remains retained until Host confirms admission.
+Cancellation does not release a possibly admitted invocation after an ambiguous Host failure.
+These fault checks retain ownership; they do not add recovery from partial Core admission.
+
+The focused regression run passed 57 library tests.
+Two additional boundary tests passed after independent review corrected the exact-lease assertions.
+The early-result test then passed its expanded preparation, acquisition-contention, admitted-cancellation, delivery, and fault cases.
+Rust 1.97.0 `check --tests`, formatting, and the patch whitespace check pass.
+The checks establish:
+
+- Eight admitted providers retain their expectations while all eight Host slots remain available.
+  Their real Lua publications and snapshots then complete through the owner dispatcher.
+- An actual Core result can arrive before Hub consumes the Host admission completion.
+  The owner delays delivery and preserves the accepted scope and token.
+- An injected generic Host failure retains the exact lease, metadata charge, Core result bytes, and Host and owner permits after cancellation.
+  This injects the failure result; it does not cause a panic inside Core admission.
+- Metadata capacity refusal precedes provider selection.
+  Actual Host disposal returns the charge, and a later preparation reuses the capacity.
+- Cancellation before admission and during causal acquisition contention disposes of metadata on Host.
+  Cancellation after admission retires the exact acquired lease.
+- The updated causal saturation fixture retains its Host slot through refusal retirement.
+  The full-capacity snapshot and fanout fixture preserves its original delivery assertions.
+
+The first regression run exposed three fixtures that assumed synchronous admission.
+The revised fixtures drive Host admission and preserve their causal, cancellation, and capacity checks.
+Review also found wrong-stage completion acceptance and owner destruction of retained refusal strings.
+Both defects were corrected before the final boundary checks.
+
+Family model execution, provider family selection, descriptor readiness checks, and variable-length completion routing still touch the owner.
+The next phase must move those operations under the shared model reservation described above.
+Complete owner work and memory accounting, final Core allowance integration, canonical pins, and matched client evidence remain open.

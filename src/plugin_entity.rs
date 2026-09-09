@@ -11,11 +11,61 @@ use crate::daemon::control::reply::RetainedPluginResult;
 use crate::entity_delivery::{EntitySendError, PrepareEntityError, PreparedEntityDelivery};
 use crate::host_executor::HostWorkPermit;
 use crate::package_entity_fanout::PackageEntityMutation;
+use crate::runtime::provider::ProviderRequestPlan;
 use crate::shared_view::SharedViewBudget;
 use crate::subscription::entity::EntityFrameSender;
 use crate::{HubRuntime, McpToolError};
 
+pub(crate) enum ProviderInput {
+    Subscribe(Arc<Target>),
+    Resync {
+        family: Arc<String>,
+        subscription_id: String,
+    },
+}
+
+impl ProviderInput {
+    fn family(&self) -> &str {
+        match self {
+            Self::Subscribe(target) => &target.entity_type,
+            Self::Resync { family, .. } => family,
+        }
+    }
+
+    fn subscription_id(&self) -> &str {
+        match self {
+            Self::Subscribe(target) => &target.subscription_id,
+            Self::Resync {
+                subscription_id, ..
+            } => subscription_id,
+        }
+    }
+}
+
 pub(crate) enum Command {
+    PrepareProvider {
+        lifecycle: crate::lifecycle::HubPluginLifecycle,
+        budget: Arc<SharedViewBudget>,
+        input: ProviderInput,
+        request_id: botster_core::RequestId,
+    },
+    AdmitProvider {
+        lifecycle: crate::lifecycle::HubPluginLifecycle,
+        plan: ProviderRequestPlan,
+        scope_id: Option<u64>,
+        force_backpressure: Arc<AtomicBool>,
+    },
+    RefuseProvider {
+        plan: Option<ProviderRequestPlan>,
+        invocation: Option<crate::runtime::PluginEntitySnapshotInvocation>,
+        error: McpToolError,
+    },
+    DiscardProvider {
+        plan: Option<ProviderRequestPlan>,
+        invocation: Option<crate::runtime::PluginEntitySnapshotInvocation>,
+        input: Option<ProviderInput>,
+        refusal: Option<McpToolError>,
+    },
     Prepare {
         invocation: crate::runtime::PluginEntitySnapshotInvocation,
         result: RetainedPluginResult<PluginInvocationResult>,
@@ -67,6 +117,8 @@ pub(crate) struct Target {
 
 #[derive(Debug)]
 pub(crate) enum Completion {
+    ProviderPrepared(ProviderRequestPlan),
+    ProviderAdmitted(Option<McpToolError>),
     Prepared {
         payload: Payload,
         family: Arc<String>,
@@ -234,10 +286,115 @@ impl Payload {
     }
 }
 
+fn provider_error(mut error: McpToolError, family: &str) -> Completion {
+    if family
+        .len()
+        .saturating_add(error.code.len())
+        .saturating_add(error.message.len())
+        > crate::host_executor::HOST_PREPARED_BYTE_CAPACITY
+    {
+        error = McpToolError::new(
+            "entity_provider_error_capacity",
+            "provider error exceeds Host preparation capacity",
+        );
+    }
+    Completion::Prepared {
+        payload: Payload {
+            body: Body::Error(error),
+            admission: None,
+        },
+        family: Arc::new(family.to_string()),
+        registration: None,
+    }
+}
+
 pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completion {
     // Every phase retains the full reservation until the terminal reply consumes it.
     assert!(permit.reserved_prepared_bytes() >= crate::host_executor::HOST_PREPARED_BYTE_CAPACITY);
     match command {
+        Command::PrepareProvider {
+            lifecycle,
+            budget,
+            input,
+            request_id,
+        } => {
+            match ProviderRequestPlan::prepare(
+                &lifecycle,
+                &budget,
+                input.family(),
+                input.subscription_id(),
+                request_id,
+                None,
+            ) {
+                Ok(plan) => Completion::ProviderPrepared(plan),
+                Err(error) => provider_error(error, input.family()),
+            }
+        }
+        Command::AdmitProvider {
+            lifecycle,
+            mut plan,
+            scope_id,
+            force_backpressure,
+        } => {
+            plan.set_scope(scope_id);
+            let admission = if force_backpressure.load(Ordering::SeqCst)
+                && std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
+            {
+                botster_core::PluginAdmissionResult::Backpressured {
+                    request_id: plan.request.request_id,
+                    class: botster_core::PluginInvocationClass::RequestResponse,
+                    reason: "test-forced plugin admission backpressure".into(),
+                    backpressure: None,
+                }
+            } else {
+                lifecycle.try_admit(
+                    botster_core::PluginInvocationClass::RequestResponse,
+                    plan.request,
+                )
+            };
+            use botster_core::PluginAdmissionResult;
+            let refusal = match admission {
+                PluginAdmissionResult::Queued { .. } => None,
+                PluginAdmissionResult::Backpressured { reason, .. } => {
+                    Some(McpToolError::new("plugin_invocation_backpressured", reason))
+                }
+                PluginAdmissionResult::RejectedBudget { reason, .. } => {
+                    Some(McpToolError::new("plugin_invocation_rejected", reason))
+                }
+                PluginAdmissionResult::WorkerStopped { reason, .. } => {
+                    Some(McpToolError::new("plugin_worker_stopped", reason))
+                }
+                _ => Some(McpToolError::new(
+                    "plugin_invocation_rejected",
+                    "the plugin worker refused the invocation",
+                )),
+            };
+            Completion::ProviderAdmitted(refusal)
+        }
+        Command::RefuseProvider {
+            plan,
+            invocation,
+            error,
+        } => {
+            let family = invocation
+                .as_ref()
+                .map(|invocation| invocation.expected_entity_kind().as_str())
+                .or_else(|| plan.as_ref().map(|plan| plan.expected.entity_kind.as_str()))
+                .expect("a refused provider retains its expectation");
+            provider_error(error, family)
+        }
+        Command::DiscardProvider {
+            plan,
+            invocation,
+            input,
+            refusal,
+        } => {
+            drop(plan);
+            drop(invocation);
+            drop(input);
+            drop(refusal);
+            Completion::Reclaimed
+        }
         Command::Prepare {
             invocation,
             result,
