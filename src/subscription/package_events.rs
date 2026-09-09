@@ -245,7 +245,8 @@ impl ClientEventMailbox {
         self.age_cell.store(count, oldest, 0, false, bytes);
     }
 
-    pub(crate) fn retire_from_registry(&self) {
+    // The caller holds the mailbox lock or exclusive ownership during Drop.
+    fn retire_from_registry(&self) {
         if let Some(counters) = &self.counters {
             counters.retire_cell(&self.mailbox_identity(), &self.age_cell);
         }
@@ -508,6 +509,9 @@ impl ClientEventMailbox {
                 residency.subscriptions.remove(subscription_id);
             }
         }
+        if slots.is_empty() {
+            self.retire_from_registry();
+        }
         true
     }
 
@@ -697,8 +701,11 @@ impl ClientEventPlane {
         if state.subscriptions.is_empty()
             && let Some(removed) = connections.remove(connection_id)
         {
-            for mailbox in removed.mailboxes.values() {
-                mailbox.retire_from_registry();
+            for (subscription_id, mailbox) in removed.mailboxes {
+                mailbox.retire();
+                if !mailbox.try_drop_subscription(&subscription_id) {
+                    self.queue_residency_cleanup(&subscription_id, mailbox);
+                }
             }
         }
         Ok(())
@@ -821,7 +828,6 @@ impl ClientEventPlane {
                             if !mailbox.try_drop_subscription(subscription_id) {
                                 self.queue_residency_cleanup(subscription_id, Arc::clone(mailbox));
                             }
-                            mailbox.retire_from_registry();
                         }
                     }
                 }
@@ -1107,6 +1113,58 @@ mod tests {
         assert!(mailbox.take_ready_event().is_none());
         plane.retry_residency_cleanups();
         assert_pool_empty(&pool, 0);
+    }
+
+    #[test]
+    fn connection_cleanup_retires_diagnostics_only_after_mailbox_lock_release() {
+        let router = admitted_router(EventAudience::Clients);
+        let plane = ClientEventPlane::default();
+        plane
+            .try_subscribe(
+                "connection",
+                "sub",
+                "owner",
+                "ready",
+                Vec::new(),
+                PackageEventPlanePolicy::default(),
+                &router,
+            )
+            .unwrap();
+        let mailbox = plane.subscription_mailbox("connection", "sub").unwrap();
+        mailbox
+            .try_push("sub", "owner", "ready", json!({"value": 1}), 23)
+            .unwrap();
+        mailbox.test_with_inner_held(|| {
+            plane.cleanup_connection("connection", &router);
+            assert!(plane.has_pending_cleanup());
+            assert!(mailbox.is_retired());
+            assert!(
+                !mailbox.age_cell.is_write_closed(),
+                "retirement must wait for the current metric writer"
+            );
+            assert!(
+                router
+                    .counters()
+                    .snapshot()
+                    .queue_ages
+                    .iter()
+                    .any(|row| row.identity == "connection/sub")
+            );
+        });
+        assert!(!plane.apply_pending_cleanups(&router));
+        assert!(mailbox.age_cell.is_write_closed());
+        assert_eq!(
+            mailbox.age_cell.sample(),
+            crate::event_plane_counters::AgeSample::Empty { count: 0, bytes: 0 }
+        );
+        assert!(
+            !router
+                .counters()
+                .snapshot()
+                .queue_ages
+                .iter()
+                .any(|row| row.identity == "connection/sub")
+        );
     }
 
     #[test]
@@ -1705,9 +1763,14 @@ mod tests {
             .try_unsubscribe("conn", "sub", &router)
             .expect("unsubscribe");
         assert!(plane.mailbox("conn").is_none());
-        let row = mailbox_row(counters, "conn/sub");
-        assert_eq!(row.state, botster_hub_client::DaemonQueueAgeState::Empty);
-        assert_eq!(row.queue_count, Some(0));
+        assert!(!counters.snapshot().queue_ages.iter().any(|row| {
+            row.kind == DaemonQueueKind::ClientMailbox && row.identity == "conn/sub"
+        }));
+        assert!(mailbox.age_cell.is_write_closed());
+        assert_eq!(
+            mailbox.age_cell.sample(),
+            crate::event_plane_counters::AgeSample::Empty { count: 0, bytes: 0 }
+        );
     }
 
     #[test]
@@ -1782,10 +1845,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(
-            mailbox_rows(counters)
-                .iter()
-                .all(|row| row.state == botster_hub_client::DaemonQueueAgeState::Empty),
-            "retired mailboxes must not stay usable: {:?}",
+            mailbox_rows(counters).is_empty(),
+            "completed cleanup must remove retired mailbox rows: {:?}",
             mailbox_rows(counters)
         );
         plane
@@ -1803,7 +1864,7 @@ mod tests {
         assert_eq!(
             live_mailboxes.len(),
             1,
-            "next admission must prune retired mailbox rows: {live_mailboxes:?}"
+            "only the live mailbox must remain registered: {live_mailboxes:?}"
         );
         assert_eq!(live_mailboxes[0].identity, "conn-live/sub");
     }

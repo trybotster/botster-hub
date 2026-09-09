@@ -2544,11 +2544,14 @@ fn bind_consumer_cell(inner: &mut RouterInner, counters: &EventPlaneCounters, pl
     let queue = inner.consumers.entry(plugin_key.to_string()).or_default();
     if let Some(old) = queue.age_cell.replace(Arc::clone(&consumer_cell)) {
         old.close_writes();
-        counters.retire_identity(&AgeIdentity {
-            kind: DaemonQueueKind::Consumer,
-            identity: plugin_key.to_string(),
-            generation: Some(queue.generation),
-        });
+        counters.retire_cell(
+            &AgeIdentity {
+                kind: DaemonQueueKind::Consumer,
+                identity: plugin_key.to_string(),
+                generation: Some(queue.generation),
+            },
+            &old,
+        );
     }
     queue.generation = generation;
     consumer_cell.store(queue.events as u64, u64::MAX, 0, false, queue.bytes as u64);
@@ -4304,6 +4307,35 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn same_generation_consumer_rebind_keeps_the_new_diagnostic_cell() {
+        let router = router();
+        let mut inner = router.inner.lock().unwrap();
+        bind_consumer_cell(&mut inner, router.counters(), "consumer");
+        let old = inner.consumers["consumer"]
+            .age_cell
+            .as_ref()
+            .unwrap()
+            .clone();
+        old.close_writes();
+        bind_consumer_cell(&mut inner, router.counters(), "consumer");
+        let new = inner.consumers["consumer"].age_cell.as_ref().unwrap();
+        assert!(!Arc::ptr_eq(&old, new));
+        assert!(!new.is_write_closed());
+        let rows: Vec<_> = router
+            .counters()
+            .snapshot()
+            .queue_ages
+            .into_iter()
+            .filter(|row| row.kind == DaemonQueueKind::Consumer && row.identity == "consumer")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            botster_hub_client::DaemonQueueAgeState::Empty
+        );
     }
 
     #[test]
