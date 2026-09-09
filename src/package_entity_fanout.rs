@@ -171,6 +171,7 @@ pub struct PackageEntityPublishResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityMutationLease {
     pub scope_id: u64,
+    pub family_token: u64,
     pub family: String,
     pub generation: u64,
     pub seq: u64,
@@ -316,7 +317,7 @@ pub struct PackageEntityResyncState {
     pub last_attempt_at: Option<Instant>,
     attempt_times: VecDeque<Instant>,
     pub degraded: bool,
-    pub leases: BTreeSet<(u64, String)>,
+    pub leases: BTreeSet<u64>,
 }
 
 impl Default for PackageEntityResyncState {
@@ -466,15 +467,17 @@ pub enum PackageEntityFamilyStep {
     },
     ReleaseResync {
         scope_id: u64,
-        family: String,
+        family_token: u64,
     },
     Complete(PackageEntityFamilyProgress),
 }
 
 /// Per-family runtime admission state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct PackageEntityFamilyState {
     pub generation: u64,
+    /// Allocated before this incarnation first admits a causal publication.
+    pub causal_token: Option<u64>,
     pub last_accepted_seq: u64,
     pub high_water_seq: u64,
     pub pending_by_seq: BTreeMap<u64, PackageEntityMutation>,
@@ -600,9 +603,12 @@ impl PackageEntityFamilyState {
 
         self.recompute_resync_need(now);
         if self.converged()
-            && let Some((scope_id, family)) = self.resync.leases.pop_first()
+            && let Some(scope_id) = self.resync.leases.pop_first()
         {
-            return PackageEntityFamilyStep::ReleaseResync { scope_id, family };
+            return PackageEntityFamilyStep::ReleaseResync {
+                scope_id,
+                family_token: self.causal_token.expect("resync lease has a family token"),
+            };
         }
 
         PackageEntityFamilyStep::Complete(self.provider_snapshot_progress())
@@ -704,12 +710,16 @@ impl PackageEntityFamilyState {
             .collect()
     }
 
-    pub fn remember_resync_lease(&mut self, scope_id: u64, family: String) -> bool {
-        self.resync.leases.insert((scope_id, family))
+    pub fn remember_resync_lease(&mut self, scope_id: u64) -> bool {
+        assert!(
+            self.causal_token.is_some(),
+            "resync lease has a family token"
+        );
+        self.resync.leases.insert(scope_id)
     }
 
-    pub fn forget_resync_lease(&mut self, scope_id: u64, family: &str) {
-        self.resync.leases.remove(&(scope_id, family.to_string()));
+    pub fn forget_resync_lease(&mut self, scope_id: u64) {
+        self.resync.leases.remove(&scope_id);
     }
 
     #[must_use]
@@ -719,23 +729,18 @@ impl PackageEntityFamilyState {
             .values()
             .map(|lease| lease.scope_id)
             .collect();
-        ids.extend(self.resync.leases.iter().map(|(scope_id, _)| *scope_id));
+        ids.extend(self.resync.leases.iter().copied());
         ids
     }
 
     #[must_use]
     pub fn provider_scope_id(&self) -> Option<u64> {
-        self.resync
-            .leases
-            .iter()
-            .map(|(scope_id, _)| *scope_id)
-            .next()
-            .or_else(|| {
-                self.pending_leases
-                    .values()
-                    .map(|lease| lease.scope_id)
-                    .next()
-            })
+        self.resync.leases.iter().copied().next().or_else(|| {
+            self.pending_leases
+                .values()
+                .map(|lease| lease.scope_id)
+                .next()
+        })
     }
 }
 
@@ -851,6 +856,7 @@ mod tests {
                 entity: json!({"payload": format!("payload-{family}-{generation}-{seq}")}),
             },
             lease: leased.then(|| EntityMutationLease {
+                family_token: 1,
                 scope_id: 17,
                 family: family.into(),
                 generation,
@@ -1061,6 +1067,7 @@ mod tests {
     ) {
         state.pending_by_seq.insert(seq, pending_mutation(seq, id));
         state.store_pending_lease(EntityMutationLease {
+            family_token: 1,
             generation: 0,
             scope_id,
             family: "f".into(),
@@ -1094,6 +1101,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    family_token: 1,
                     generation: 0,
                     scope_id: 101,
                     seq: 1,
@@ -1113,6 +1121,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    family_token: 1,
                     generation: 0,
                     scope_id: 102,
                     seq: 2,
@@ -1158,6 +1167,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    family_token: 1,
                     generation: 0,
                     scope_id: 203,
                     seq: 3,
@@ -1177,6 +1187,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    family_token: 1,
                     generation: 0,
                     scope_id: 204,
                     seq: 4,
@@ -1247,13 +1258,14 @@ mod tests {
     fn converged_provider_snapshot_releases_one_resync_lease_per_step() {
         let now = Instant::now();
         let mut state = PackageEntityFamilyState {
+            causal_token: Some(1),
             last_accepted_seq: 5,
             high_water_seq: 5,
             ..Default::default()
         };
         state.resync.rearm(now);
-        assert!(state.remember_resync_lease(401, "f".into()));
-        assert!(state.remember_resync_lease(402, "f".into()));
+        assert!(state.remember_resync_lease(401));
+        assert!(state.remember_resync_lease(402));
 
         let progress = state.begin_provider_snapshot_seq(5, now);
         assert!(!progress.needed);
@@ -1262,7 +1274,7 @@ mod tests {
             state.step_provider_snapshot(now),
             PackageEntityFamilyStep::ReleaseResync {
                 scope_id: 401,
-                family: "f".into()
+                family_token: 1
             }
         );
         assert_eq!(state.resync.leases.len(), 1);
@@ -1270,7 +1282,7 @@ mod tests {
             state.step_provider_snapshot(now),
             PackageEntityFamilyStep::ReleaseResync {
                 scope_id: 402,
-                family: "f".into()
+                family_token: 1
             }
         );
         assert!(state.resync.leases.is_empty());
@@ -1303,6 +1315,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    family_token: 1,
                     generation: 0,
                     scope_id: 501,
                     seq: u64::MAX,
@@ -1406,7 +1419,10 @@ mod tests {
 
     #[test]
     fn pending_and_resync_rows_keep_distinct_scope_identities() {
-        let mut state = PackageEntityFamilyState::default();
+        let mut state = PackageEntityFamilyState {
+            causal_token: Some(1),
+            ..Default::default()
+        };
         let now = Instant::now();
         let (gap, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
@@ -1420,12 +1436,13 @@ mod tests {
         assert_eq!(gap.status, PackageEntityPublishStatus::PendingGap);
         assert!(ready.is_none());
         state.store_pending_lease(EntityMutationLease {
+            family_token: 1,
             generation: 0,
             scope_id: 7,
             family: "f".into(),
             seq: 3,
         });
-        assert!(state.remember_resync_lease(7, "f".into()));
+        assert!(state.remember_resync_lease(7));
         let (later, _, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
@@ -1437,12 +1454,13 @@ mod tests {
         );
         assert_eq!(later.status, PackageEntityPublishStatus::PendingGap);
         state.store_pending_lease(EntityMutationLease {
+            family_token: 1,
             generation: 0,
             scope_id: 8,
             family: "f".into(),
             seq: 4,
         });
-        assert!(state.remember_resync_lease(8, "f".into()));
+        assert!(state.remember_resync_lease(8));
         assert_eq!(state.active_scope_ids(), BTreeSet::from([7, 8]));
         assert_eq!(state.pending_leases.get(&3).map(|lease| lease.seq), Some(3));
         assert_eq!(state.provider_scope_id(), Some(7));

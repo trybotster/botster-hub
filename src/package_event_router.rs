@@ -2953,7 +2953,7 @@ struct CausalScope {
     identities: BTreeSet<LeaseIdentity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LeaseIdentity {
     /// Each event owns the root lease in a newly minted scope.
     EventInFlight,
@@ -2961,13 +2961,11 @@ pub enum LeaseIdentity {
         publication_token: u64,
     },
     AdmittedEntityMutation {
-        family: String,
-        generation: u64,
+        family_token: u64,
         seq: u64,
     },
     ProviderResyncNeed {
-        family: String,
-        generation: u64,
+        family_token: u64,
     },
     ProviderInFlight {
         invocation_token: u64,
@@ -3311,8 +3309,7 @@ mod tests {
         CausalOp::Release {
             scope_id: sequence,
             identity: LeaseIdentity::AdmittedEntityMutation {
-                family: "producer.item".into(),
-                generation: 4,
+                family_token: 5,
                 seq: sequence,
             },
         }
@@ -3335,14 +3332,10 @@ mod tests {
             .mint_with_lease(Some(pending_identity.clone()))
             .unwrap();
         let mutation = LeaseIdentity::AdmittedEntityMutation {
-            family: "producer.item".into(),
-            generation: 4,
+            family_token: 5,
             seq: 1,
         };
-        let resync = LeaseIdentity::ProviderResyncNeed {
-            family: "producer.item".into(),
-            generation: 4,
-        };
+        let resync = LeaseIdentity::ProviderResyncNeed { family_token: 5 };
         assert!(table.apply_ready());
         assert_eq!(
             table.try_apply_or_wait(CausalOp::Transfer {
@@ -6248,8 +6241,7 @@ mod tests {
                 },
                 to: [
                     Some(LeaseIdentity::AdmittedEntityMutation {
-                        generation: 0,
-                        family: "producer.item".into(),
+                        family_token: 1,
                         seq: 32,
                     }),
                     None,
@@ -6263,8 +6255,7 @@ mod tests {
         assert_eq!(
             table.identities(scope),
             Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
-                generation: 0,
-                family: "producer.item".into(),
+                family_token: 1,
                 seq: 32,
             }]))
         );

@@ -822,8 +822,24 @@ Before that boundary, timeout can retract an unacquired request.
 
 Each pending publication lease includes its unique checked token.
 Two publications from the same plugin and scope therefore keep separate pending identities before their transfers apply.
-Lease acquisition borrows the request identity and clones it only after it acquires the table lock.
+Lease acquisition borrows the request identity and copies it only after it acquires the table lock.
 A missing scope produces a terminal rejection without acquiring a lease.
+
+Each event root uses a newly minted scope as its identity.
+Provider invocations retain separate checked tokens through retries and retirement.
+The scope allocator permits its final token once, then rejects further allocation without replacing existing scopes.
+
+Each family receives a causal token before its first scoped publication changes family state.
+Unscoped family state can remain tokenless.
+Mutation and resync leases retain the family token through fanout, snapshot processing, and cleanup.
+A recreated family receives a new causal token, even if its name and cleanup generation match the retired family.
+The cleanup generation still identifies routing work outside the causal table.
+Token exhaustion preserves the original publication for disposal and does not prevent retirement of existing leases.
+
+Causal identities contain only fixed-size values.
+A transfer has three inline target slots for mutation, resync, and publication disposal obligations.
+The causal FIFO therefore retains a fixed payload size per occupied slot.
+This does not establish a bound for all causal table storage or table update time.
 
 The earlier production regression failed because a retained publication transfer could follow its release.
 The new FIFO passes that production admission-and-finish regression.
@@ -860,11 +876,24 @@ Two earlier integration attempts stopped before execution because candidate envi
 The integration runs use the existing `e34f3c0` candidate worker and the current linked Hub library.
 They do not establish a matching final Hub binary or complete foundation acceptance.
 
-Identity byte accounting for the causal FIFO remains open.
-Causal table updates compare and clone identity strings, but dispatch still uses an opaque movement charge.
+Family admission now exposes one ready mutation per step.
+The publication continuation retains the response until it finishes the consecutive pending run.
+Each continuation activation moves at most one mutation.
+
+The family token tests pass for shared scopes, same-generation recreation, allocator exhaustion, and a 300,000-character family suffix.
+The long-name test establishes runtime admission behavior. It does not measure owner execution time or exercise bridge byte accounting.
+The lifecycle selection passed 119 library tests.
+Four additional selected tests initially failed during socket setup in the sandbox; all four passed with local socket access.
+The exhaustion test retains the original bridge payload through manual disposal; earlier Host tests cover worker disposal.
+Eleven Lua integration tests pass for lease retirement, resync, cleanup, causal capacity, and distinct publications.
+Six focused tests pass after the final cleanup fixture and settlement signature changes.
+These integration results use the existing candidate worker and the current linked Hub library.
+
+The owner inspection budget remains open.
+Causal table updates now compare and copy fixed-size identities, but dispatch still uses an opaque movement charge.
 Publication parsing and mutation size validation now run on the Lua worker.
 The daemon now disposes of rejected payloads on a Host worker.
 The owner still checks current family ownership and clones the provider-family set.
-Family admission can also release a complete consecutive pending run in one owner step.
-The next implementation step must make family admission incremental and bound the remaining owner inspection work.
+Routing leases still contain family strings outside the causal table.
+The next implementation step must account for causal operations and bound the remaining table and routing work.
 The broader owner scheduling, memory, final Core pin, and matched client requirements remain open.
