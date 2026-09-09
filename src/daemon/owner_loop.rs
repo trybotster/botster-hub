@@ -58,6 +58,7 @@ enum BackgroundWork {
     DataPlaneProgress,
     CoreCompletion,
     HostCompletion,
+    CausalProgress,
     EventOwner,
     ManagedSpawn,
     PluginReady,
@@ -218,7 +219,9 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
         BackgroundWork::CoreCompletion | BackgroundWork::DataPlaneProgress => {
             ReadyClass::CoreCompletion
         }
-        BackgroundWork::HostCompletion | BackgroundWork::ManagedSpawn => ReadyClass::HostCompletion,
+        BackgroundWork::HostCompletion
+        | BackgroundWork::CausalProgress
+        | BackgroundWork::ManagedSpawn => ReadyClass::HostCompletion,
         BackgroundWork::EventOwner => ReadyClass::HostBridge,
         BackgroundWork::PluginReady | BackgroundWork::PluginEntityReady => {
             ReadyClass::PluginCompletion
@@ -340,6 +343,18 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         }
         if runtime.take_core_completion_notification() {
             mark_background_ready(state, BackgroundWork::CoreCompletion);
+        }
+        if runtime.causal_scopes().take_progress_notification() {
+            if state.family_cleanup_wake_active {
+                state.family_cleanup_wake_again = true;
+            } else {
+                state.family_cleanup_wake_active = true;
+                state.family_cleanup_wake_after = None;
+            }
+            mark_background_ready(state, BackgroundWork::CausalProgress);
+            if runtime.causal_owner_ops_ready() {
+                state.maintenance.try_wake();
+            }
         }
         let executor = runtime.host_executor();
         state.host_completion_drain_pending |= executor.take_completion_notification();
@@ -493,9 +508,9 @@ fn control_ready_class(message: &ControlMessage) -> crate::daemon::owner_schedul
         ControlMessage::CoreCompletionPublished | ControlMessage::DataPlaneProgress => {
             ReadyClass::CoreCompletion
         }
-        ControlMessage::HostProgressPublished | ControlMessage::ManagedSessionSpawnQueued => {
-            ReadyClass::HostCompletion
-        }
+        ControlMessage::HostProgressPublished
+        | ControlMessage::CausalProgressPublished
+        | ControlMessage::ManagedSessionSpawnQueued => ReadyClass::HostCompletion,
         ControlMessage::PluginCompletionPublished
         | ControlMessage::PluginResultCapacityReleased => ReadyClass::PluginCompletion,
         _ => ReadyClass::ControlIngress,
@@ -594,7 +609,7 @@ fn run_owner_maintenance_slice(
             if let Some(runtime) = daemon.runtime() {
                 runtime.apply_causal_owner_ops();
                 if runtime.package_event_router().peek_delivery_wake()
-                    || runtime.causal_owner_ops_pending()
+                    || runtime.causal_owner_ops_ready()
                 {
                     state.maintenance.try_wake();
                 }
@@ -674,6 +689,35 @@ pub(crate) fn run_background_ready_item(
             );
             if state.host_completion_drain_pending || state.host_capacity_wake_pending {
                 mark_background_ready(state, BackgroundWork::HostCompletion);
+            }
+        }
+        BackgroundWork::CausalProgress => {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let next = match state.family_cleanup_wake_after {
+                Some(after) => state
+                    .family_cleanup_waiters
+                    .range((Excluded(after), Unbounded))
+                    .next(),
+                None => state.family_cleanup_waiters.first_key_value(),
+            }
+            .map(|(waiter, phase)| (*waiter, *phase));
+            if let Some((waiter, _phase)) = next {
+                state.family_cleanup_wake_after = Some(waiter);
+                if !crate::daemon::control::pending::mark_owner_ready(
+                    state,
+                    waiter,
+                    crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                    crate::daemon::control::pending::READY_HOST_COMPLETION,
+                ) {
+                    state.family_cleanup_waiters.remove(&waiter);
+                }
+                mark_background_ready(state, BackgroundWork::CausalProgress);
+            } else if state.family_cleanup_wake_again {
+                state.family_cleanup_wake_again = false;
+                state.family_cleanup_wake_after = None;
+                mark_background_ready(state, BackgroundWork::CausalProgress);
+            } else {
+                state.family_cleanup_wake_active = false;
             }
         }
         BackgroundWork::EventOwner => {
@@ -1376,6 +1420,10 @@ pub(crate) struct DaemonControlState {
         crate::owner_identity::WaiterId,
         crate::daemon::control::host_work::HostRecoveryRequired,
     >,
+    pub(crate) family_cleanup_waiters: BTreeMap<crate::owner_identity::WaiterId, u64>,
+    family_cleanup_wake_after: Option<crate::owner_identity::WaiterId>,
+    family_cleanup_wake_active: bool,
+    family_cleanup_wake_again: bool,
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
     pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
     pub(crate) host_completion_drain_pending: bool,
@@ -1458,6 +1506,10 @@ impl Default for DaemonControlState {
             background_waiter_ids: BTreeMap::new(),
             background_core_waiters: BTreeMap::new(),
             host_completions: BTreeMap::new(),
+            family_cleanup_waiters: BTreeMap::new(),
+            family_cleanup_wake_after: None,
+            family_cleanup_wake_active: false,
+            family_cleanup_wake_again: false,
             host_recovery: BTreeMap::new(),
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
@@ -1632,8 +1684,15 @@ mod tests {
 
     #[test]
     fn package_event_cleanup_reuses_its_slot_at_full_host_capacity() {
-        for disconnected in [false, true] {
-            let root = unique_package_control_dir(&format!("event-cleanup-full-{disconnected}"));
+        for (disconnected, contended, stale) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let root = unique_package_control_dir(&format!(
+                "event-cleanup-full-{disconnected}-{contended}-{stale}"
+            ));
             let package_dir = root.join("cleanup.plugin");
             write_package_control_manifest(&package_dir, "cleanup.plugin", serde_json::json!({}));
             let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
@@ -1650,6 +1709,37 @@ mod tests {
                 },
             )
             .expect("enable cleanup package");
+            let scopes = daemon.runtime().unwrap().causal_scopes().clone();
+            let scope = scopes.mint().unwrap();
+            for seq in [1, 2] {
+                daemon.runtime().unwrap().test_store_family_payload(
+                    crate::package_entity_fanout::PackageEntityMutation::Upsert {
+                        entity_type: "cleanup.plugin.item".into(),
+                        snapshot_seq: seq,
+                        id: "item".into(),
+                        entity: serde_json::json!({"id": "item"}),
+                    },
+                );
+                assert!(
+                    scopes.acquire(
+                        scope,
+                        crate::package_event_router::LeaseIdentity::AdmittedEntityMutation {
+                            family: "cleanup.plugin.item".into(),
+                            generation: daemon
+                                .runtime()
+                                .unwrap()
+                                .package_entity_family_generation("cleanup.plugin.item")
+                                .unwrap(),
+                            seq,
+                        }
+                    )
+                );
+                daemon.runtime().unwrap().test_store_pending_lease(
+                    scope,
+                    "cleanup.plugin.item",
+                    seq,
+                );
+            }
             let mut state = DaemonControlState::default();
             let reply = start_async_control_request(
                 &mut daemon,
@@ -1720,6 +1810,84 @@ mod tests {
                     "cleanup-client",
                 );
             }
+            if stale {
+                loop {
+                    if let Some(completion) = state.host_completions.get_mut(&waiter)
+                        && matches!(
+                            completion.result,
+                            crate::host_executor::HostResult::FamilyCleanupComplete { .. }
+                        )
+                    {
+                        completion.identity = completion.identity.next_phase().unwrap();
+                        break;
+                    }
+                    publish_completion_wakes(&daemon, &mut state);
+                    publish_maintenance_wakes(&mut state);
+                    if let Some(item) = state.owner_ready.pop_next() {
+                        let mut budget =
+                            crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                        assert!(!dispatch_owner_ready_item(
+                            &mut daemon,
+                            &mut state,
+                            item,
+                            &mut budget
+                        ));
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "family completion must reach its waiter"
+                    );
+                    thread::yield_now();
+                }
+            }
+            if contended {
+                scopes.test_with_inner_held(|| {
+                    for _ in 0..crate::package_event_router::CAUSAL_PENDING_MAX {
+                        assert_eq!(
+                            scopes.try_admit(crate::package_event_router::CausalOp::Release {
+                                scope_id: u64::MAX,
+                                identity:
+                                    crate::package_event_router::LeaseIdentity::EventInFlight {
+                                        request_id: "absent".into()
+                                    },
+                            }),
+                            crate::package_event_router::CausalAdmitResult::Applied
+                        );
+                    }
+                    while !state.family_cleanup_waiters.contains_key(&waiter) {
+                        assert!(
+                            Instant::now() < deadline,
+                            "cleanup must park on rejected release"
+                        );
+                        assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                        thread::yield_now();
+                    }
+                    for _ in 0..20 {
+                        assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                    }
+                    let unexpected = state.owner_ready.pop_next();
+                    assert!(
+                        unexpected.is_none(),
+                        "lock contention must not poll the cleanup: {:?}",
+                        unexpected.map(|item| (
+                            item,
+                            state.background_core_waiters.get(&item.key().waiter_id())
+                        ))
+                    );
+                    assert!(state.pending_requests.contains_key(&waiter));
+                    assert!(state.family_cleanup_waiters.contains_key(&waiter));
+                    assert!(state.host_recovery.is_empty());
+                    assert_eq!(state.budget.outstanding(), 1);
+                    assert!(
+                        daemon
+                            .runtime()
+                            .unwrap()
+                            .host_executor()
+                            .try_reserve()
+                            .is_none()
+                    );
+                });
+            }
             while state.pending_requests.contains_key(&waiter) {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
                 assert!(
@@ -1728,7 +1896,56 @@ mod tests {
                 );
                 thread::yield_now();
             }
+            if stale {
+                let Some(
+                    crate::daemon::control::host_work::HostRecoveryRequired::PackageFamilyWork {
+                        owner_permit: Some(_),
+                        _result,
+                        _unexpected: Some(_),
+                        _permit: Some(_),
+                        ..
+                    },
+                ) = state.host_recovery.get(&waiter)
+                else {
+                    panic!("stale completion must retain cleanup and both permits");
+                };
+                let crate::host_mutations::HostMutationResult::PackageEffectApplied {
+                    cleanup, ..
+                } = _result.as_ref()
+                else {
+                    panic!("retain the original package result");
+                };
+                assert!(cleanup.family_cursor.release.is_some());
+                assert!(scopes.is_live(scope));
+                assert_eq!(state.budget.outstanding(), 1);
+                assert!(
+                    daemon
+                        .runtime()
+                        .unwrap()
+                        .host_executor()
+                        .try_reserve()
+                        .is_none()
+                );
+                let response = receive_test_control_reply(reply.take().unwrap()).unwrap();
+                assert!(response.error.is_some());
+                drop(reserved);
+                daemon.stop();
+                std::fs::remove_dir_all(root).unwrap();
+                continue;
+            }
+            assert!(
+                !daemon
+                    .runtime()
+                    .unwrap()
+                    .test_family_exists("cleanup.plugin.item")
+            );
             assert!(state.host_recovery.is_empty());
+            assert!(state.family_cleanup_waiters.is_empty());
+            while scopes.pending_ops() {
+                assert!(Instant::now() < deadline, "admitted releases must drain");
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            }
+            assert!(!scopes.is_live(scope));
             assert!(state.document_owner.is_none());
             assert_eq!(state.budget.outstanding(), 0);
             if let Some(reply) = reply {

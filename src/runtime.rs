@@ -76,6 +76,7 @@ use crate::session_types::{
 };
 use crate::shared_view::{SharedView, SharedViewBudget};
 
+pub(crate) mod family_cleanup;
 pub(crate) mod package_effect;
 use package_effect::{HostPackageCleanup, HostPackageRuntime};
 
@@ -107,6 +108,7 @@ pub struct HubRuntime {
     entity_publish_bridge: HubEntityPublishBridge,
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
     package_entity_epoch: std::cell::Cell<u64>,
+    package_entity_resync_releases: std::cell::RefCell<BTreeSet<(String, u64)>>,
     package_entity_resync_changed: std::cell::Cell<bool>,
     package_entity_fanout: Arc<Mutex<PackageEntityFanoutQueue>>,
     package_entity_finishes: Arc<Mutex<VecDeque<CausalOp>>>,
@@ -363,6 +365,7 @@ impl HubRuntime {
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_epoch: std::cell::Cell::new(0),
+            package_entity_resync_releases: std::cell::RefCell::new(BTreeSet::new()),
             package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(PackageEntityFanoutQueue::default())),
             package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
@@ -473,6 +476,7 @@ impl HubRuntime {
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_epoch: std::cell::Cell::new(0),
+            package_entity_resync_releases: std::cell::RefCell::new(BTreeSet::new()),
             package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(PackageEntityFanoutQueue::default())),
             package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
@@ -679,7 +683,17 @@ impl HubRuntime {
             || !self.source_ops.borrow().is_empty()
             || !self.source_held.borrow().is_empty()
             || self.unsettled_op.borrow().is_some()
-            || self.has_family_leftovers()
+            || self.has_family_resync_releases()
+    }
+
+    pub(crate) fn causal_owner_ops_ready(&self) -> bool {
+        if self.causal_scopes.is_faulted() {
+            return false;
+        }
+        if self.causal_scopes.pending_ops() && !self.causal_scopes.pending_ready() {
+            return false;
+        }
+        self.causal_owner_ops_pending()
     }
 
     /// Complete one operation for synchronous runtime callers outside the daemon owner loop.
@@ -736,7 +750,7 @@ impl HubRuntime {
         self.retry_in_hand();
         self.retry_owner_ops();
         self.retry_family_causal();
-        self.retry_unloading_families();
+        self.retry_family_resync_release();
         self.harvest_publish_releases();
         self.retry_unfinished_finishes();
         self.retry_finish_only_fanout();
@@ -923,15 +937,18 @@ impl HubRuntime {
         self.retry_ops.borrow_mut().append(&mut leftover);
     }
 
-    fn family_has_retry_work(family: &PackageEntityFamilyState) -> bool {
-        family.unloading || (!family.resync.needed && !family.resync.leases.is_empty())
+    fn index_family_resync_releases(&self, name: &str, family: &PackageEntityFamilyState) {
+        let key = (name.to_string(), family.generation);
+        let mut ready = self.package_entity_resync_releases.borrow_mut();
+        if !family.resync.needed && !family.resync.leases.is_empty() {
+            ready.insert(key);
+        } else {
+            ready.remove(&key);
+        }
     }
 
-    fn has_family_leftovers(&self) -> bool {
-        self.package_entity_families
-            .lock()
-            .map(|families| families.values().any(Self::family_has_retry_work))
-            .unwrap_or(false)
+    fn has_family_resync_releases(&self) -> bool {
+        !self.package_entity_resync_releases.borrow().is_empty()
     }
 
     fn keep_source_op(&self, op: CausalOp) -> CausalAdmitResult {
@@ -1177,80 +1194,33 @@ impl HubRuntime {
         self.source_ops.borrow_mut().append(&mut leftover);
     }
 
-    fn retry_unloading_families(&self) {
-        let started = Instant::now();
-        let mut applied = 0;
-        let Ok(mut state) = self.package_entity_families.lock() else {
+    fn retry_family_resync_release(&self) {
+        let key = self.package_entity_resync_releases.borrow_mut().pop_first();
+        let Some((name, generation)) = key else {
             return;
         };
-        let mut names = Vec::new();
-        for (name, family) in state.iter() {
-            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-                break;
-            }
-            if !Self::family_has_retry_work(family) {
-                continue;
-            }
-            names.push(name.clone());
-            if names.len() >= CAUSAL_FLUSH_MAX {
-                break;
-            }
-        }
-        let mut remove = Vec::new();
-        for name in names {
-            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-                break;
-            }
-            let Some(family) = state.get_mut(&name) else {
-                continue;
-            };
-            if family.unloading {
-                let mut pending_leases = std::mem::take(&mut family.pending_leases);
-                let mut leftover = BTreeMap::new();
-                loop {
-                    if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8)
-                    {
-                        leftover.append(&mut pending_leases);
-                        break;
-                    }
-                    let Some((seq, lease)) = pending_leases.pop_first() else {
-                        break;
-                    };
-                    applied += 1;
-                    if let CausalAdmitResult::Retry(_) =
-                        self.enqueue_retry(self.admit_causal_op(CausalOp::Release {
-                            scope_id: lease.scope_id,
-                            identity: LeaseIdentity::AdmittedEntityMutation {
-                                family: lease.family.clone(),
-                                generation: lease.generation,
-                                seq: lease.seq,
-                            },
-                        }))
-                    {
-                        leftover.insert(seq, lease);
-                    }
-                }
-                family.pending_leases = leftover;
-            }
-            if family.unloading || !family.resync.needed {
-                for (scope_id, family_name) in self.release_resync_leases(
-                    family.generation,
-                    family.take_resync_leases(),
-                    &mut applied,
-                    started,
-                ) {
-                    family.remember_resync_lease(scope_id, family_name);
-                }
-            }
-            if family.unloading
-                && family.pending_leases.is_empty()
-                && family.resync.leases.is_empty()
-            {
-                remove.push(name);
-            }
-        }
-        for name in remove {
-            state.remove(&name);
+        let mut families = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        let Some(family) = families
+            .get_mut(&name)
+            .filter(|family| family.generation == generation)
+        else {
+            return;
+        };
+        let lease = if !family.resync.needed {
+            family.resync.leases.pop_first()
+        } else {
+            None
+        };
+        self.index_family_resync_releases(&name, family);
+        drop(families);
+        if let Some((scope_id, family)) = lease {
+            self.finish_package_entity_causal_op(CausalOp::Release {
+                scope_id,
+                identity: LeaseIdentity::ProviderResyncNeed { family, generation },
+            });
         }
     }
 
@@ -1308,6 +1278,16 @@ impl HubRuntime {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_store_family_payload(&self, mutation: PackageEntityMutation) {
+        let mut families = self.package_entity_families.lock().unwrap();
+        families
+            .entry(mutation.entity_type().to_string())
+            .or_insert_with(|| self.new_package_entity_family())
+            .pending_by_seq
+            .insert(mutation.snapshot_seq(), mutation);
+    }
+
     fn new_package_entity_family(&self) -> PackageEntityFamilyState {
         PackageEntityFamilyState {
             generation: self.package_entity_epoch.get(),
@@ -1339,25 +1319,6 @@ impl HubRuntime {
             .expect("package entity family lock")
             .get(family)
             .map(|state| state.generation)
-    }
-
-    #[doc(hidden)]
-    pub fn test_family_unloading(&self, family: &str) -> bool {
-        self.package_entity_families
-            .lock()
-            .expect("package entity family lock")
-            .get(family)
-            .is_some_and(|state| state.unloading)
-    }
-
-    #[doc(hidden)]
-    pub fn test_unloading_lease_count(&self, family: &str) -> usize {
-        self.package_entity_families
-            .lock()
-            .expect("package entity family lock")
-            .get(family)
-            .map(|state| state.pending_leases.len())
-            .unwrap_or(0)
     }
 
     #[doc(hidden)]
@@ -1448,6 +1409,7 @@ impl HubRuntime {
             .entry(family.to_string())
             .or_insert_with(|| self.new_package_entity_family());
         self.settle_entity_publish_lease(entry, scope_id, plugin_key, family, seq, &result);
+        self.index_family_resync_releases(family, entry);
     }
 
     #[doc(hidden)]
@@ -1490,13 +1452,16 @@ impl HubRuntime {
     }
 
     #[doc(hidden)]
-    pub fn test_store_resync_lease(&self, scope_id: u64, family: &str) {
-        self.package_entity_families
+    pub fn test_store_resync_lease(&self, scope_id: u64, name: &str) {
+        let mut families = self
+            .package_entity_families
             .lock()
-            .expect("package entity family lock")
-            .entry(family.to_string())
-            .or_insert_with(|| self.new_package_entity_family())
-            .remember_resync_lease(scope_id, family.to_string());
+            .expect("package entity family lock");
+        let family = families
+            .entry(name.to_string())
+            .or_insert_with(|| self.new_package_entity_family());
+        family.remember_resync_lease(scope_id, name.to_string());
+        self.index_family_resync_releases(name, family);
     }
 
     #[must_use]
@@ -1541,33 +1506,6 @@ impl HubRuntime {
             .lock()
             .expect("package entity family lock")
             .contains_key(family)
-    }
-
-    #[doc(hidden)]
-    pub fn test_mark_unloading(&self, family: &str) {
-        if let Some(family) = self
-            .package_entity_families
-            .lock()
-            .expect("package entity family lock")
-            .get_mut(family)
-        {
-            if !family.unloading {
-                self.advance_package_entity_epoch()
-                    .expect("test family epoch is available");
-            }
-            family.unloading = true;
-        }
-    }
-
-    #[must_use]
-    #[doc(hidden)]
-    pub fn test_unloading_family_count(&self) -> usize {
-        self.package_entity_families
-            .lock()
-            .expect("package entity family lock")
-            .values()
-            .filter(|family| family.unloading)
-            .count()
     }
 
     #[must_use]
@@ -1616,9 +1554,10 @@ impl HubRuntime {
         for operation in cleanup.event_plane_unloads {
             self.record_event_plane_owner_op(operation);
         }
-        for (package_name, families) in cleanup.unloaded_families {
-            self.drop_package_entity_families(&package_name, families);
-        }
+        assert!(
+            cleanup.unloaded_families.is_empty(),
+            "finish family cleanup before applying the result"
+        );
         if let Some(cleanup) = cleanup.last_capability_cleanup {
             self.last_capability_cleanup = Some(cleanup);
         }
@@ -1641,6 +1580,7 @@ impl HubRuntime {
             self.package_entity_epoch.set(next_epoch);
             cleanup.family_epoch = Some(next_epoch);
         }
+        self.drain_direct_package_entity_cleanup(&mut cleanup);
         self.apply_host_package_cleanup(cleanup);
     }
 
@@ -2284,6 +2224,7 @@ impl HubRuntime {
                 &result,
             );
         }
+        self.index_family_resync_releases(&entity_type, family);
         drop(families);
         for item in leased_ready {
             fanout
@@ -2358,39 +2299,6 @@ impl HubRuntime {
         }
     }
 
-    fn release_resync_leases(
-        &self,
-        generation: u64,
-        leases: BTreeSet<(u64, String)>,
-        applied: &mut usize,
-        started: Instant,
-    ) -> BTreeSet<(u64, String)> {
-        let mut leftover = BTreeSet::new();
-        let mut pending = leases;
-        loop {
-            if *applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-                leftover.extend(pending);
-                break;
-            }
-            let Some((scope_id, family)) = pending.pop_first() else {
-                break;
-            };
-            *applied += 1;
-            if let CausalAdmitResult::Retry(_) =
-                self.enqueue_retry(self.admit_causal_op(CausalOp::Release {
-                    scope_id,
-                    identity: LeaseIdentity::ProviderResyncNeed {
-                        family: family.clone(),
-                        generation,
-                    },
-                }))
-            {
-                leftover.insert((scope_id, family));
-            }
-        }
-        leftover
-    }
-
     /// Release or convert the mutation lease after subscriber decisions finish.
     pub fn finish_package_entity_fanout(&self, finish: PackageEntityFanoutFinish) {
         let Some(lease) = finish.lease.as_ref() else {
@@ -2423,6 +2331,7 @@ impl HubRuntime {
             };
             family.resync.mark_needed(now);
             let added = family.remember_resync_lease(lease.scope_id, lease.family.clone());
+            self.index_family_resync_releases(&lease.family, family);
             drop(families);
             self.note_package_entity_resync_changed();
             if added {
@@ -2462,12 +2371,16 @@ impl HubRuntime {
         snapshot_seq: u64,
     ) -> PackageEntityFamilyProgress {
         self.note_package_entity_resync_changed();
-        self.package_entity_families
+        let mut families = self
+            .package_entity_families
             .lock()
-            .expect("package entity family lock")
+            .expect("package entity family lock");
+        let family = families
             .entry(entity_type.to_string())
-            .or_insert_with(|| self.new_package_entity_family())
-            .begin_provider_snapshot_seq(snapshot_seq, Instant::now())
+            .or_insert_with(|| self.new_package_entity_family());
+        let progress = family.begin_provider_snapshot_seq(snapshot_seq, Instant::now());
+        self.index_family_resync_releases(entity_type, family);
+        progress
     }
 
     /// Take one family transition after the provider snapshot reaches its subscribers.
@@ -2484,10 +2397,9 @@ impl HubRuntime {
             let family = families
                 .entry(entity_type.to_string())
                 .or_insert_with(|| self.new_package_entity_family());
-            (
-                family.generation,
-                family.step_provider_snapshot(Instant::now()),
-            )
+            let step = family.step_provider_snapshot(Instant::now());
+            self.index_family_resync_releases(entity_type, family);
+            (family.generation, step)
         };
         match step {
             PackageEntityFamilyStep::Discarded { mutation, lease } => {
@@ -2511,30 +2423,10 @@ impl HubRuntime {
                 })
             }
             PackageEntityFamilyStep::ReleaseResync { scope_id, family } => {
-                let op = CausalOp::Release {
+                self.finish_package_entity_causal_op(CausalOp::Release {
                     scope_id,
-                    identity: LeaseIdentity::ProviderResyncNeed {
-                        family: family.clone(),
-                        generation,
-                    },
-                };
-                if let CausalAdmitResult::Retry(_) = self.enqueue_retry(self.admit_causal_op(op)) {
-                    let mut families = self
-                        .package_entity_families
-                        .lock()
-                        .expect("package entity family lock");
-                    if let Some(state) = families
-                        .get_mut(entity_type)
-                        .filter(|state| state.generation == generation)
-                    {
-                        state.remember_resync_lease(scope_id, family);
-                    } else {
-                        self.finish_package_entity_causal_op(CausalOp::Release {
-                            scope_id,
-                            identity: LeaseIdentity::ProviderResyncNeed { family, generation },
-                        });
-                    }
-                }
+                    identity: LeaseIdentity::ProviderResyncNeed { family, generation },
+                });
                 PackageEntitySnapshotStep::Pending
             }
             PackageEntityFamilyStep::Complete(progress) => {
@@ -2554,11 +2446,11 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        families
+        let family = families
             .entry(entity_type.to_string())
-            .or_insert_with(|| self.new_package_entity_family())
-            .resync
-            .mark_needed(now);
+            .or_insert_with(|| self.new_package_entity_family());
+        family.resync.mark_needed(now);
+        self.index_family_resync_releases(entity_type, family);
     }
 
     /// Explicitly re-arm resync after a new catching-up subscription (or other
@@ -2570,11 +2462,11 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        families
+        let family = families
             .entry(entity_type.to_string())
-            .or_insert_with(|| self.new_package_entity_family())
-            .resync
-            .rearm(now);
+            .or_insert_with(|| self.new_package_entity_family());
+        family.resync.rearm(now);
+        self.index_family_resync_releases(entity_type, family);
     }
 
     /// Retain a resync change until the owner records the scheduling work.
@@ -2629,6 +2521,7 @@ impl HubRuntime {
             .entry(entity_type.to_string())
             .or_insert_with(|| self.new_package_entity_family());
         let degraded = family.resync.record_attempt(now);
+        self.index_family_resync_releases(entity_type, family);
         drop(families);
         if degraded {
             self.release_one_degraded_package_entity_resync_lease(entity_type);
@@ -2647,7 +2540,7 @@ impl HubRuntime {
                 .lock()
                 .expect("package entity family lock");
             families.get_mut(entity_type).and_then(|family| {
-                if family.resync.degraded {
+                let lease = if family.resync.degraded {
                     family
                         .resync
                         .leases
@@ -2655,7 +2548,9 @@ impl HubRuntime {
                         .map(|(scope_id, name)| (scope_id, name, family.generation))
                 } else {
                     None
-                }
+                };
+                self.index_family_resync_releases(entity_type, family);
+                lease
             })
         };
         let Some((scope_id, family, generation)) = lease else {
@@ -2679,86 +2574,13 @@ impl HubRuntime {
         Ok(())
     }
 
-    fn drop_package_entity_families(&self, package_name: &str, mut families: BTreeSet<String>) {
-        let cleanup_epoch = self.package_entity_epoch.get();
-        self.note_package_entity_resync_changed();
-        let mut state = self
-            .package_entity_families
-            .lock()
-            .expect("package entity family lock");
-        let prefix = format!("{package_name}.");
-        families.extend(
-            state
-                .keys()
-                .filter(|name| *name == package_name || name.starts_with(&prefix))
-                .cloned(),
-        );
-        for family_name in &families {
-            if let Some(mut family) = state.remove(family_name) {
-                let pending_leases = std::mem::take(&mut family.pending_leases);
-                let mut leftover = BTreeMap::new();
-                for lease in pending_leases.into_values() {
-                    if let CausalAdmitResult::Retry(_) =
-                        self.enqueue_retry(self.admit_causal_op(CausalOp::Release {
-                            scope_id: lease.scope_id,
-                            identity: LeaseIdentity::AdmittedEntityMutation {
-                                family: lease.family.clone(),
-                                generation: lease.generation,
-                                seq: lease.seq,
-                            },
-                        }))
-                    {
-                        leftover.insert(lease.seq, lease);
-                    }
-                }
-                family.pending_leases = leftover;
-                let started = Instant::now();
-                let mut applied = 0;
-                for (scope_id, name) in self.release_resync_leases(
-                    family.generation,
-                    family.take_resync_leases(),
-                    &mut applied,
-                    started,
-                ) {
-                    family.remember_resync_lease(scope_id, name);
-                }
-                if !family.pending_leases.is_empty() || !family.resync.leases.is_empty() {
-                    family.unloading = true;
-                    state.insert(family_name.clone(), family);
-                }
-            }
-        }
-        let mut fanout = self
-            .package_entity_fanout
-            .lock()
-            .expect("package entity fanout lock");
-        let mut restore = VecDeque::new();
-        for family_name in families {
-            while let Some(generation) =
-                fanout.next_family_generation_before(&family_name, cleanup_epoch)
-            {
-                let item = fanout
-                    .take_one_family(&family_name, generation)
-                    .expect("the indexed generation contains a queued mutation");
-                if let Some(lease) = item.lease.clone()
-                    && let CausalAdmitResult::Retry(op) =
-                        self.keep_or_park(self.admit_causal_op(CausalOp::Release {
-                            scope_id: lease.scope_id,
-                            identity: LeaseIdentity::AdmittedEntityMutation {
-                                family: lease.family,
-                                generation: lease.generation,
-                                seq: lease.seq,
-                            },
-                        }))
-                {
-                    restore.push_back(op);
-                }
-            }
-        }
-        self.package_entity_finishes
-            .lock()
-            .expect("package entity finish lock")
-            .append(&mut restore);
+    fn drop_package_entity_families(&self, package_name: &str, families: BTreeSet<String>) {
+        let mut cleanup = HostPackageCleanup {
+            family_epoch: Some(self.package_entity_epoch.get()),
+            unloaded_families: vec![(package_name.to_string(), families)],
+            ..HostPackageCleanup::default()
+        };
+        self.drain_direct_package_entity_cleanup(&mut cleanup);
     }
 
     /// Resync attempt counter for observability (attempts field across families).
@@ -2778,7 +2600,7 @@ impl HubRuntime {
         if self.package_entity_resync_still_needed() {
             return true;
         }
-        if self.has_family_leftovers()
+        if self.has_family_resync_releases()
             || !self.family_causal.borrow().is_empty()
             || self.family_held.borrow().is_some()
             || self.family_source.borrow().is_some()
@@ -3911,6 +3733,7 @@ impl HubRuntime {
         &self,
         sender: crate::daemon::control::message::ControlSender,
     ) {
+        self.causal_scopes.bind_owner_wake(sender.clone());
         self.host_executor.bind_owner_wake(sender);
     }
 
@@ -5924,7 +5747,7 @@ mod tests {
         }
         assert!(!runtime.test_family_exists(family));
         runtime.advance_package_entity_epoch().unwrap();
-        runtime.drop_package_entity_families("producer", BTreeSet::from([family.into()]));
+        runtime.drop_package_entity_families("producer", BTreeSet::new());
         let identities = runtime.causal_scopes.identities(scope).unwrap();
         assert!(
             !identities.contains(&LeaseIdentity::AdmittedEntityMutation {
@@ -6164,6 +5987,247 @@ return botster.register({ handlers = {{
         let families = runtime.package_entity_families.lock().unwrap();
         assert_eq!(families[family].generation, new_generation);
         assert!(!families[family].resync.needed);
+    }
+
+    #[test]
+    fn poisoned_causal_table_keeps_retry_ownership_without_ready_polling() {
+        let runtime = family_runtime("causal-poison-readiness");
+        let op = CausalOp::Release {
+            scope_id: 1,
+            identity: LeaseIdentity::EventInFlight {
+                request_id: "retained".into(),
+            },
+        };
+        runtime.retry_ops.borrow_mut().push_back(op.clone());
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime
+                .causal_scopes
+                .test_with_inner_held(|| panic!("poison causal inner"));
+        }));
+        assert!(poisoned.is_err());
+        assert!(!runtime.causal_scopes.pending_ops());
+        assert!(runtime.causal_owner_ops_pending());
+        assert!(!runtime.causal_owner_ops_ready());
+        assert_eq!(runtime.retry_ops.borrow().front(), Some(&op));
+    }
+
+    #[test]
+    fn family_resync_release_index_matches_live_state_after_each_transition() {
+        let runtime = family_runtime("family-release-index");
+        let assert_index = || {
+            let families = runtime.package_entity_families.lock().unwrap();
+            let expected = families
+                .iter()
+                .filter(|(_, family)| !family.resync.needed && !family.resync.leases.is_empty())
+                .map(|(name, family)| (name.clone(), family.generation))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(*runtime.package_entity_resync_releases.borrow(), expected);
+        };
+        assert_index();
+        for family in ["producer.a", "producer.b", "other.item"] {
+            runtime.test_store_resync_lease(1, family);
+            assert_index();
+            runtime.mark_package_entity_resync_needed(family);
+            assert_index();
+            runtime.rearm_package_entity_resync(family);
+            assert_index();
+            runtime.begin_package_entity_provider_snapshot(family, 1);
+            assert_index();
+        }
+        runtime.step_package_entity_provider_snapshot("producer.a");
+        assert_index();
+        runtime.retry_family_resync_release();
+        assert_index();
+        runtime
+            .drop_package_entity_families_for("producer")
+            .unwrap();
+        assert_index();
+        runtime.test_store_resync_lease(2, "producer.a");
+        assert_index();
+        assert_eq!(
+            runtime.package_entity_family_generation("producer.a"),
+            Some(1)
+        );
+        runtime.retry_family_resync_release();
+        assert_index();
+        runtime.retry_family_resync_release();
+        assert_index();
+        assert!(runtime.package_entity_resync_releases.borrow().is_empty());
+    }
+
+    #[test]
+    fn rejected_family_release_stays_in_cursor_before_next_payload() {
+        use super::family_cleanup::FamilyCleanupStep;
+        let runtime = family_runtime("retained-family-release");
+        let family = "producer.item";
+        let identity = LeaseIdentity::AdmittedEntityMutation {
+            family: family.into(),
+            generation: 0,
+            seq: 1,
+        };
+        let scope = runtime
+            .causal_scopes
+            .mint_with_lease(Some(identity.clone()))
+            .unwrap();
+        for seq in [1, 2] {
+            runtime.test_store_family_payload(PackageEntityMutation::Upsert {
+                entity_type: family.into(),
+                snapshot_seq: seq,
+                id: "item".into(),
+                entity: serde_json::json!({"id": "item"}),
+            });
+        }
+        runtime.test_store_pending_lease(scope, family, 1);
+        let mut cleanup = HostPackageCleanup {
+            unloaded_families: vec![("producer".into(), BTreeSet::from([family.into()]))],
+            ..HostPackageCleanup::default()
+        };
+        runtime
+            .begin_host_package_entity_cleanup(&mut cleanup)
+            .unwrap();
+        assert!(matches!(
+            runtime.step_host_package_entity_cleanup(&mut cleanup),
+            FamilyCleanupStep::Pending
+        ));
+        let FamilyCleanupStep::Payload(payload) =
+            runtime.step_host_package_entity_cleanup(&mut cleanup)
+        else {
+            panic!("select first payload");
+        };
+        assert_eq!(payload.snapshot_seq(), 1);
+        drop(payload);
+        runtime.complete_host_package_entity_cleanup_item(&mut cleanup);
+        runtime.causal_scopes.test_with_inner_held(|| {
+            for _ in 0..CAUSAL_PENDING_MAX {
+                assert_eq!(
+                    runtime.admit_causal_op(CausalOp::Release {
+                        scope_id: u64::MAX,
+                        identity: LeaseIdentity::EventInFlight {
+                            request_id: "absent".into()
+                        },
+                    }),
+                    CausalAdmitResult::Applied
+                );
+            }
+            runtime.causal_scopes.take_progress_notification();
+            for _ in 0..2 {
+                assert!(matches!(
+                    runtime.step_host_package_entity_cleanup(&mut cleanup),
+                    FamilyCleanupStep::Waiting
+                ));
+                assert_eq!(
+                    cleanup.family_cursor.release,
+                    Some(CausalOp::Release {
+                        scope_id: scope,
+                        identity: identity.clone()
+                    })
+                );
+                assert!(runtime.package_entity_finishes.lock().unwrap().is_empty());
+                assert!(
+                    !runtime.causal_scopes.take_progress_notification(),
+                    "a full refusal must not wake itself"
+                );
+            }
+        });
+        while runtime.causal_scopes.pending_ops() {
+            runtime.causal_scopes.flush_pending();
+        }
+        assert!(runtime.causal_scopes.take_progress_notification());
+        assert!(matches!(
+            runtime.step_host_package_entity_cleanup(&mut cleanup),
+            FamilyCleanupStep::Pending
+        ));
+        assert!(cleanup.family_cursor.release.is_none());
+        assert!(!runtime.causal_scopes.is_live(scope));
+        let FamilyCleanupStep::Payload(payload) =
+            runtime.step_host_package_entity_cleanup(&mut cleanup)
+        else {
+            panic!("select second payload only after release admission");
+        };
+        assert_eq!(payload.snapshot_seq(), 2);
+        drop(payload);
+        runtime.complete_host_package_entity_cleanup_item(&mut cleanup);
+        runtime.drain_direct_package_entity_cleanup(&mut cleanup);
+    }
+
+    #[test]
+    fn retained_family_cleanup_preserves_recreation_and_holds_payload_lease() {
+        use super::family_cleanup::FamilyCleanupStep;
+        let runtime = family_runtime("retained-family-cleanup");
+        let family = "producer.item";
+        let payload = || PackageEntityMutation::Upsert {
+            entity_type: family.into(),
+            snapshot_seq: 1,
+            id: "item".into(),
+            entity: serde_json::json!({"id": "item"}),
+        };
+        runtime.test_store_family_payload(payload());
+        let scope = runtime
+            .causal_scopes
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight {
+                request_id: "root".into(),
+            }))
+            .unwrap();
+        let identity = |generation| LeaseIdentity::AdmittedEntityMutation {
+            family: family.into(),
+            generation,
+            seq: 1,
+        };
+        assert!(runtime.causal_scopes.acquire(scope, identity(0)));
+        runtime.test_store_pending_lease(scope, family, 1);
+        let mut cleanup = HostPackageCleanup {
+            unloaded_families: vec![("producer".into(), BTreeSet::from([family.into()]))],
+            ..HostPackageCleanup::default()
+        };
+        runtime
+            .begin_host_package_entity_cleanup(&mut cleanup)
+            .unwrap();
+        assert!(matches!(
+            runtime.step_host_package_entity_cleanup(&mut cleanup),
+            FamilyCleanupStep::Pending
+        ));
+        assert!(!runtime.test_family_exists(family));
+        runtime.test_store_family_payload(payload());
+        runtime.test_store_pending_lease(scope, family, 1);
+        assert!(runtime.causal_scopes.acquire(scope, identity(1)));
+        let FamilyCleanupStep::Payload(old_payload) =
+            runtime.step_host_package_entity_cleanup(&mut cleanup)
+        else {
+            panic!("select the old detached payload");
+        };
+        assert!(
+            runtime
+                .causal_scopes
+                .identities(scope)
+                .unwrap()
+                .contains(&identity(0))
+        );
+        assert_eq!(
+            runtime.package_entity_families.lock().unwrap()[family]
+                .pending_by_seq
+                .len(),
+            1
+        );
+        drop(old_payload);
+        runtime.complete_host_package_entity_cleanup_item(&mut cleanup);
+        for _ in 0..20 {
+            match runtime.step_host_package_entity_cleanup(&mut cleanup) {
+                FamilyCleanupStep::Complete => break,
+                FamilyCleanupStep::Pending => {}
+                FamilyCleanupStep::Waiting | FamilyCleanupStep::Fault => {
+                    panic!("the causal table is available")
+                }
+                FamilyCleanupStep::Payload(_) => panic!("new payload must remain live"),
+            }
+        }
+        assert!(cleanup.unloaded_families.is_empty());
+        let live = runtime.causal_scopes.identities(scope).unwrap();
+        assert!(!live.contains(&identity(0)));
+        assert!(live.contains(&identity(1)));
+        let families = runtime.package_entity_families.lock().unwrap();
+        assert_eq!(families[family].generation, 1);
+        assert_eq!(families[family].pending_by_seq.len(), 1);
+        assert_eq!(families[family].pending_leases.len(), 1);
     }
 
     #[test]

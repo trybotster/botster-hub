@@ -142,6 +142,7 @@ pub(crate) fn dispatch_control_message(
         }
         ControlMessage::PluginResultCapacityReleased
         | ControlMessage::PluginCompletionPublished
+        | ControlMessage::CausalProgressPublished
         | ControlMessage::HostProgressPublished
         | ControlMessage::ManagedSessionSpawnQueued => {
             crate::daemon::owner_loop::publish_completion_wakes(daemon, state);

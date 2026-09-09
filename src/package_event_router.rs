@@ -3280,11 +3280,13 @@ impl CausalScopeTable {
     /// A mutex unlock re-enables draining after contention. Poison requires owner recovery.
     #[must_use]
     pub(crate) fn pending_ready(&self) -> bool {
-        self.pending_ops()
-            && self.drain_blocked.load(Ordering::SeqCst) == 0
-            && !self.faulted.load(Ordering::SeqCst)
-            && !self.pending.is_poisoned()
-            && !self.inner.is_poisoned()
+        self.pending_ops() && self.drain_blocked.load(Ordering::SeqCst) == 0 && !self.is_faulted()
+    }
+
+    pub(crate) fn is_faulted(&self) -> bool {
+        self.faulted.load(Ordering::SeqCst)
+            || self.pending.is_poisoned()
+            || self.inner.is_poisoned()
     }
 
     #[doc(hidden)]

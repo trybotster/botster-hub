@@ -240,6 +240,21 @@ impl PackageEntityFanoutQueue {
             .map(|((_, generation), _)| *generation)
     }
 
+    /// Find one package family without inspecting payloads or other packages.
+    pub(crate) fn next_package_family(&self, package: &str, after: Option<&str>) -> Option<String> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let prefix = format!("{package}.");
+        let lower = after.map_or_else(
+            || Included((prefix.clone(), 0)),
+            |after| Excluded((after.to_string(), u64::MAX)),
+        );
+        self.sequences_by_family
+            .range((lower, Unbounded))
+            .next()
+            .filter(|((family, _), _)| family.starts_with(&prefix))
+            .map(|((family, _), _)| family.clone())
+    }
+
     pub(crate) fn take_one_family(
         &mut self,
         family: &str,
@@ -469,7 +484,6 @@ pub struct PackageEntityFamilyState {
     pub pending_by_seq: BTreeMap<u64, PackageEntityMutation>,
     pub pending_leases: BTreeMap<u64, EntityMutationLease>,
     pub resync: PackageEntityResyncState,
-    pub unloading: bool,
 }
 
 impl PackageEntityFamilyState {
@@ -687,10 +701,6 @@ impl PackageEntityFamilyState {
 
     pub fn forget_resync_lease(&mut self, scope_id: u64, family: &str) {
         self.resync.leases.remove(&(scope_id, family.to_string()));
-    }
-
-    pub fn take_resync_leases(&mut self) -> BTreeSet<(u64, String)> {
-        std::mem::take(&mut self.resync.leases)
     }
 
     #[must_use]

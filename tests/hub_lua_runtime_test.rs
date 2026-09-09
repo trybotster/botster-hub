@@ -4867,24 +4867,19 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
         );
         hub.drop_package_entity_families_for("lease-probe")
             .expect("family cleanup boundary");
-        assert!(hub.test_family_unloading("lease-probe.item"));
+        assert!(!hub.test_family_exists("lease-probe.item"));
     });
-    assert!(hub.test_family_unloading("lease-probe.item"));
-    assert_eq!(
-        hub.test_unloading_lease_count("lease-probe.item"),
-        CAUSAL_FLUSH_MAX + 8
-    );
-    let _ = hub.apply_event_plane_owner_ops();
-    let remaining = hub.test_unloading_lease_count("lease-probe.item");
-    assert!(
-        remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
-        "one owner turn must slice unloading leases: {remaining}"
-    );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+    assert!(!hub.test_family_exists("lease-probe.item"));
+    assert!(hub.causal_owner_ops_pending());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while hub.causal_owner_ops_pending() || hub.event_plane_owner_ops_pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached releases must finish"
+        );
         let _ = hub.apply_event_plane_owner_ops();
         let _ = scopes.flush_pending();
     }
-    assert!(!hub.test_family_unloading("lease-probe.item"));
     for scope in lives {
         assert!(!scopes.is_live(scope));
     }
@@ -5148,12 +5143,12 @@ fn family_causal_is_one_global_fifo_and_258th_stays_at_source() {
 }
 
 #[test]
-fn unloading_family_scan_stops_after_the_slice() {
-    let hub = explicit_runtime("lease-family-scan");
+fn package_cleanup_detaches_all_old_families() {
+    let hub = explicit_runtime("lease-family-detach");
     let scopes = hub.causal_scopes().clone();
     let mut lives = Vec::new();
     for index in 0..(CAUSAL_FLUSH_MAX + 8) {
-        let family = format!("unload{index}");
+        let family = format!("unload.item{index}");
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
                 generation: 0,
@@ -5162,22 +5157,20 @@ fn unloading_family_scan_stops_after_the_slice() {
             }))
             .expect("mint");
         hub.test_store_pending_lease(scope, &family, index as u64);
-        hub.test_mark_unloading(&family);
-        lives.push(scope);
+        lives.push((family, scope));
     }
-    assert_eq!(hub.test_unloading_family_count(), CAUSAL_FLUSH_MAX + 8);
-    let _ = hub.apply_event_plane_owner_ops();
-    let remaining = hub.test_unloading_family_count();
-    assert!(
-        remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
-        "one owner turn must stop the unloading-family scan: {remaining}"
-    );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+    hub.drop_package_entity_families_for("unload")
+        .expect("family cleanup boundary");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while hub.causal_owner_ops_pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached releases must finish"
+        );
         let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
     }
-    assert_eq!(hub.test_unloading_family_count(), 0);
-    for scope in lives {
+    for (family, scope) in lives {
+        assert!(!hub.test_family_exists(&family));
         assert!(!scopes.is_live(scope));
     }
 }
@@ -6020,19 +6013,24 @@ fn active_resync_leftovers_retry_after_convergence() {
         hub.test_store_resync_lease(scope, "active.item");
         lives.push(scope);
     }
-    assert!(!hub.test_family_unloading("active.item"));
+    assert!(hub.test_family_exists("active.item"));
     assert_eq!(
         hub.test_resync_lease_count("active.item"),
         CAUSAL_FLUSH_MAX + 8
     );
-    assert!(hub.event_plane_owner_ops_pending());
+    assert!(hub.causal_owner_ops_pending());
     let _ = hub.apply_event_plane_owner_ops();
     let remaining = hub.test_resync_lease_count("active.item");
     assert!(
         remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
         "one owner turn must retry active resync leftovers: {remaining}"
     );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while hub.causal_owner_ops_pending() || hub.event_plane_owner_ops_pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "active resync releases must finish"
+        );
         let _ = hub.apply_event_plane_owner_ops();
         let _ = scopes.flush_pending();
     }
@@ -6045,7 +6043,7 @@ fn active_resync_leftovers_retry_after_convergence() {
 }
 
 #[test]
-fn unloading_resync_leases_stop_after_the_slice() {
+fn package_cleanup_releases_detached_resync_leases() {
     let hub = explicit_runtime("lease-resync-slice");
     let scopes = hub.causal_scopes().clone();
     let mut lives = Vec::new();
@@ -6059,18 +6057,9 @@ fn unloading_resync_leases_stop_after_the_slice() {
         hub.test_store_resync_lease(scope, "resync.item");
         lives.push(scope);
     }
-    hub.test_mark_unloading("resync.item");
-    assert_eq!(
-        hub.test_resync_lease_count("resync.item"),
-        CAUSAL_FLUSH_MAX + 8
-    );
-    let _ = hub.apply_event_plane_owner_ops();
-    let remaining = hub.test_resync_lease_count("resync.item");
-    assert!(
-        remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
-        "one owner turn must stop resync-lease release: {remaining}"
-    );
-    assert!(hub.causal_owner_ops_pending());
+    hub.drop_package_entity_families_for("resync")
+        .expect("family cleanup boundary");
+    assert!(!hub.test_family_exists("resync.item"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while hub.causal_owner_ops_pending() || hub.event_plane_owner_ops_pending() {
         assert!(
