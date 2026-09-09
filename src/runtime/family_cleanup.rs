@@ -77,10 +77,11 @@ impl HubRuntime {
                 *retired = None;
                 return FamilyCleanupStep::Pending;
             }
-            let mut fanout = self
-                .package_entity_fanout
+            let mut model = self
+                .package_entities
                 .lock()
-                .expect("package entity fanout lock");
+                .expect("package entity model lock");
+            let fanout = &mut model.fanout;
             if let Some(generation) = fanout.next_family_generation_before(name, epoch) {
                 let item = fanout
                     .take_one_family(name, generation)
@@ -95,10 +96,16 @@ impl HubRuntime {
         let Some((package, provided)) = cleanup.unloaded_families.last_mut() else {
             return FamilyCleanupStep::Complete;
         };
-        let mut families = self
-            .package_entity_families
+        let mut model = self
+            .package_entities
             .lock()
-            .expect("package entity family lock");
+            .expect("package entity model lock");
+        let PackageEntities {
+            families,
+            fanout,
+            resync_releases,
+            ..
+        } = &mut *model;
         let name = if let Some(name) = provided.pop_first() {
             Some(name)
         } else if !cursor.checked_package {
@@ -122,10 +129,6 @@ impl HubRuntime {
             cursor.after = name.clone();
             name
         } else {
-            let fanout = self
-                .package_entity_fanout
-                .lock()
-                .expect("package entity fanout lock");
             let name = fanout.next_package_family(package, cursor.queued_after.as_deref());
             cursor.queued_after = name.clone();
             name
@@ -136,9 +139,7 @@ impl HubRuntime {
                 .is_some_and(|family| family.generation < epoch)
             {
                 let family = families.remove(&name).expect("the old family is present");
-                self.package_entity_resync_releases
-                    .borrow_mut()
-                    .remove(&(name.clone(), family.generation));
+                resync_releases.remove(&(name.clone(), family.generation));
                 Some(family)
             } else {
                 None
