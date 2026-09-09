@@ -113,6 +113,7 @@ pub struct HubRuntime {
     entity_publish_retirement: std::cell::RefCell<Option<PublicationRetirement>>,
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
     package_entity_epoch: std::cell::Cell<u64>,
+    next_provider_token: Cell<u64>,
     package_entity_resync_releases: std::cell::RefCell<BTreeSet<(String, u64)>>,
     package_entity_resync_changed: std::cell::Cell<bool>,
     package_entity_fanout: Arc<Mutex<PackageEntityFanoutQueue>>,
@@ -241,7 +242,8 @@ pub(crate) struct PluginEntitySnapshotInvocation {
     pub(crate) request: PluginInvocationRequest,
     entity_kind: EntityKind,
     pub(crate) family_generation: u64,
-    scope_id: Option<u64>,
+    // The retained scope ID and invocation token identify this exact lease.
+    causal_lease: Option<(u64, u64)>,
 }
 
 impl PluginEntitySnapshotInvocation {
@@ -360,6 +362,7 @@ impl HubRuntime {
             entity_publish_retirement: std::cell::RefCell::new(None),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_epoch: std::cell::Cell::new(0),
+            next_provider_token: Cell::new(1),
             package_entity_resync_releases: std::cell::RefCell::new(BTreeSet::new()),
             package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(PackageEntityFanoutQueue::default())),
@@ -462,6 +465,7 @@ impl HubRuntime {
             entity_publish_retirement: std::cell::RefCell::new(None),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_epoch: std::cell::Cell::new(0),
+            next_provider_token: Cell::new(1),
             package_entity_resync_releases: std::cell::RefCell::new(BTreeSet::new()),
             package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(PackageEntityFanoutQueue::default())),
@@ -2709,12 +2713,10 @@ impl HubRuntime {
             None,
         )?;
         let result = self.invoke_plugin(invocation.request.clone()).result;
-        if let Some(scope_id) = invocation.scope_id {
+        if let Some((scope_id, invocation_token)) = invocation.causal_lease {
             reservation.commit(CausalOp::Release {
                 scope_id,
-                identity: LeaseIdentity::ProviderInFlight {
-                    request_id: invocation.request.request_id.0.clone(),
-                },
+                identity: LeaseIdentity::ProviderInFlight { invocation_token },
             });
         }
         self.complete_plugin_entity_snapshot(invocation, result)
@@ -2768,19 +2770,29 @@ impl HubRuntime {
                 "could not acquire provider causal lease",
             ));
         }
-        if let Some(scope_id) = scope_id
-            && !self.causal_scopes.acquire(
+        let causal_lease = if let Some(scope_id) = scope_id {
+            let invocation_token = self.next_provider_token.get();
+            if invocation_token == 0 {
+                return Err(crate::McpToolError::new(
+                    "entity_provider_token_exhausted",
+                    "provider invocation tokens are exhausted",
+                ));
+            }
+            self.next_provider_token
+                .set(invocation_token.checked_add(1).unwrap_or(0));
+            if !self.causal_scopes.acquire(
                 scope_id,
-                crate::package_event_router::LeaseIdentity::ProviderInFlight {
-                    request_id: request_id.0.clone(),
-                },
-            )
-        {
-            return Err(crate::McpToolError::new(
-                "causal_scope_busy",
-                "could not acquire provider causal lease",
-            ));
-        }
+                LeaseIdentity::ProviderInFlight { invocation_token },
+            ) {
+                return Err(crate::McpToolError::new(
+                    "causal_scope_busy",
+                    "could not acquire provider causal lease",
+                ));
+            }
+            Some((scope_id, invocation_token))
+        } else {
+            None
+        };
         let metadata = scope_id
             .map(|scope_id| BoundaryJson(serde_json::json!({ "causal_scope_id": scope_id })));
         let request = PluginInvocationRequest {
@@ -2804,7 +2816,7 @@ impl HubRuntime {
             request,
             entity_kind,
             family_generation,
-            scope_id,
+            causal_lease,
         })
     }
 
@@ -2813,10 +2825,7 @@ impl HubRuntime {
         &self,
         invocation: &PluginEntitySnapshotInvocation,
     ) -> CausalTransitionStatus {
-        self.release_plugin_entity_snapshot_lease(
-            invocation.scope_id,
-            &invocation.request.request_id,
-        )
+        self.release_plugin_entity_snapshot_lease(invocation.causal_lease)
     }
 
     /// Convert one entity-provider completion and release its causal lease.
@@ -2890,10 +2899,9 @@ impl HubRuntime {
 
     fn release_plugin_entity_snapshot_lease(
         &self,
-        scope_id: Option<u64>,
-        request_id: &RequestId,
+        causal_lease: Option<(u64, u64)>,
     ) -> CausalTransitionStatus {
-        let Some(scope_id) = scope_id else {
+        let Some((scope_id, invocation_token)) = causal_lease else {
             return CausalTransitionStatus::Applied;
         };
         let reservation = match self.reserve_causal_transition() {
@@ -2902,9 +2910,7 @@ impl HubRuntime {
         };
         reservation.commit(CausalOp::Release {
             scope_id,
-            identity: LeaseIdentity::ProviderInFlight {
-                request_id: request_id.0.clone(),
-            },
+            identity: LeaseIdentity::ProviderInFlight { invocation_token },
         });
         CausalTransitionStatus::Applied
     }
@@ -3096,9 +3102,7 @@ impl HubRuntime {
                     "package-event-test-{}-{}-{}",
                     delivery.name, delivery.envelope_id, delivery.holder.handler_id
                 ));
-                let identity = crate::package_event_router::LeaseIdentity::EventInFlight {
-                    request_id: request_id.0.clone(),
-                };
+                let identity = crate::package_event_router::LeaseIdentity::EventInFlight;
                 let Some(scope_id) = self.causal_scopes.mint_with_lease(Some(identity.clone()))
                 else {
                     pending.push(PendingTestEvent::Requeue {
@@ -5497,10 +5501,8 @@ pub(crate) mod tests {
     fn causal_finish_fifo_moves_one_operation_per_owner_phase() {
         let runtime = family_runtime("causal-finish-phase");
         let mut scopes = Vec::new();
-        for index in 0..6 {
-            let identity = LeaseIdentity::EventInFlight {
-                request_id: format!("{index}"),
-            };
+        for _ in 0..6 {
+            let identity = LeaseIdentity::EventInFlight;
             let scope_id = runtime
                 .causal_scopes
                 .mint_with_lease(Some(identity.clone()))
@@ -5533,9 +5535,7 @@ pub(crate) mod tests {
         let family = "producer.item";
         let scope = runtime
             .causal_scopes
-            .mint_with_lease(Some(LeaseIdentity::EventInFlight {
-                request_id: "root".into(),
-            }))
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight))
             .unwrap();
         for generation in [0, 1] {
             let lease = EntityMutationLease {
@@ -5634,6 +5634,74 @@ return botster.register({ handlers = {{
             .load_lua_plugin_package(policy.registry(), "producer")
             .unwrap();
         (runtime, root)
+    }
+
+    #[test]
+    fn provider_tokens_preserve_distinct_leases_through_exhaustion_and_retry() {
+        let (runtime, root) = publication_provider_runtime("provider-tokens");
+        let scope_id = runtime
+            .causal_scopes
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight))
+            .unwrap();
+        runtime.mark_package_entity_resync_needed("producer.item");
+        runtime.test_store_resync_lease(scope_id, "producer.item");
+        let prepare = || {
+            runtime.prepare_plugin_entity_snapshot(
+                "producer.item",
+                "subscription",
+                RequestId("same-request".into()),
+                None,
+            )
+        };
+        let first = prepare().unwrap();
+        runtime.next_provider_token.set(u64::MAX);
+        let last = prepare().unwrap();
+        assert_eq!(first.causal_lease, Some((scope_id, 1)));
+        assert_eq!(last.causal_lease, Some((scope_id, u64::MAX)));
+        assert!(prepare().is_err());
+        assert_eq!(runtime.causal_scopes.lease_count(scope_id), Some(3));
+        for _ in 0..CAUSAL_OWNER_CAPACITY {
+            assert_eq!(
+                runtime.admit_causal_op(CausalOp::Release {
+                    scope_id: 0,
+                    identity: LeaseIdentity::EventInFlight,
+                }),
+                CausalAdmitResult::Applied
+            );
+        }
+        assert_eq!(
+            runtime.retire_plugin_entity_snapshot(&first),
+            CausalTransitionStatus::Waiting
+        );
+        assert_eq!(first.causal_lease, Some((scope_id, 1)));
+        for _ in 0..CAUSAL_OWNER_CAPACITY {
+            runtime.apply_causal_owner_ops();
+        }
+        assert_eq!(runtime.causal_operation_count(), 0);
+        assert_eq!(
+            runtime.retire_plugin_entity_snapshot(&first),
+            CausalTransitionStatus::Applied
+        );
+        runtime.apply_causal_owner_ops();
+        assert_eq!(
+            runtime.causal_scopes.identities(scope_id).unwrap(),
+            BTreeSet::from([
+                LeaseIdentity::EventInFlight,
+                LeaseIdentity::ProviderInFlight {
+                    invocation_token: u64::MAX,
+                },
+            ])
+        );
+        assert_eq!(
+            runtime.retire_plugin_entity_snapshot(&last),
+            CausalTransitionStatus::Applied
+        );
+        runtime.apply_causal_owner_ops();
+        assert_eq!(runtime.causal_scopes.lease_count(scope_id), Some(1));
+        drop(first);
+        drop(last);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5826,9 +5894,7 @@ return botster.register({ handlers = {{
         let old_generation = runtime.package_entity_family_generation(family).unwrap();
         let scope_id = runtime
             .causal_scopes
-            .mint_with_lease(Some(LeaseIdentity::EventInFlight {
-                request_id: "root".into(),
-            }))
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight))
             .unwrap();
         let identities = |generation| {
             [
@@ -5851,9 +5917,7 @@ return botster.register({ handlers = {{
                 assert_eq!(
                     runtime.admit_causal_op(CausalOp::Release {
                         scope_id: u64::MAX,
-                        identity: LeaseIdentity::EventInFlight {
-                            request_id: "absent".into()
-                        }
+                        identity: LeaseIdentity::EventInFlight
                     }),
                     CausalAdmitResult::Applied
                 );
@@ -5918,9 +5982,7 @@ return botster.register({ handlers = {{
         let runtime = family_runtime("causal-poison-readiness");
         let op = CausalOp::Release {
             scope_id: 1,
-            identity: LeaseIdentity::EventInFlight {
-                request_id: "retained".into(),
-            },
+            identity: LeaseIdentity::EventInFlight,
         };
         assert_eq!(
             runtime.admit_causal_op(op.clone()),
@@ -6029,9 +6091,7 @@ return botster.register({ handlers = {{
                 assert_eq!(
                     runtime.admit_causal_op(CausalOp::Release {
                         scope_id: u64::MAX,
-                        identity: LeaseIdentity::EventInFlight {
-                            request_id: "absent".into()
-                        },
+                        identity: LeaseIdentity::EventInFlight,
                     }),
                     CausalAdmitResult::Applied
                 );
@@ -6092,9 +6152,7 @@ return botster.register({ handlers = {{
         runtime.test_store_family_payload(payload());
         let scope = runtime
             .causal_scopes
-            .mint_with_lease(Some(LeaseIdentity::EventInFlight {
-                request_id: "root".into(),
-            }))
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight))
             .unwrap();
         let identity = |generation| LeaseIdentity::AdmittedEntityMutation {
             family: family.into(),

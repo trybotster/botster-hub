@@ -111,9 +111,7 @@ mod tests {
         assert!(queue.reserve().is_none());
         reservations.pop().unwrap().commit(CausalOp::Release {
             scope_id: 1,
-            identity: LeaseIdentity::EventInFlight {
-                request_id: "event".into(),
-            },
+            identity: LeaseIdentity::EventInFlight,
         });
         assert!(
             queue.reserve().is_none(),

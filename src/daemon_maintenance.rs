@@ -1301,9 +1301,7 @@ fn retire_event_holder(runtime: &HubRuntime, flight: &mut EventDeliveryFlight) -
         return matches!(
             runtime.admit_causal_op(crate::package_event_router::CausalOp::Release {
                 scope_id,
-                identity: crate::package_event_router::LeaseIdentity::EventInFlight {
-                    request_id: flight.request_id.clone(),
-                },
+                identity: crate::package_event_router::LeaseIdentity::EventInFlight,
             }),
             crate::package_event_router::CausalAdmitResult::Applied
         );
@@ -1383,9 +1381,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             }
         };
         let Some(scope_id) = runtime.causal_scopes().mint_with_lease(Some(
-            crate::package_event_router::LeaseIdentity::EventInFlight {
-                request_id: request_id.0.clone(),
-            },
+            crate::package_event_router::LeaseIdentity::EventInFlight,
         )) else {
             let mut flight = event_flight(&delivery, None, request_id.0.clone());
             if !retire_event_holder(runtime, &mut flight) {
@@ -1434,9 +1430,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             PluginAdmissionResult::Backpressured { .. } => {
                 reservation.commit(crate::package_event_router::CausalOp::Release {
                     scope_id,
-                    identity: crate::package_event_router::LeaseIdentity::EventInFlight {
-                        request_id: request_id.0.clone(),
-                    },
+                    identity: crate::package_event_router::LeaseIdentity::EventInFlight,
                 });
                 match runtime.package_event_router().requeue_delivery(delivery) {
                     Ok(()) => {
@@ -1453,9 +1447,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
             _ => {
                 reservation.commit(crate::package_event_router::CausalOp::Release {
                     scope_id,
-                    identity: crate::package_event_router::LeaseIdentity::EventInFlight {
-                        request_id: request_id.0.clone(),
-                    },
+                    identity: crate::package_event_router::LeaseIdentity::EventInFlight,
                 });
                 let mut flight = event_flight(&delivery, None, request_id.0);
                 if !retire_event_holder(runtime, &mut flight) {
@@ -3673,9 +3665,7 @@ mod tests {
                     delivery.holder.generation,
                 )
                 .expect("admit");
-            let identity = crate::package_event_router::LeaseIdentity::EventInFlight {
-                request_id: request_id.0.clone(),
-            };
+            let identity = crate::package_event_router::LeaseIdentity::EventInFlight;
             let scope_id = runtime
                 .causal_scopes()
                 .mint_with_lease(Some(identity))
@@ -3937,9 +3927,7 @@ return botster.register({})
             assert_eq!(
                 runtime.admit_causal_op(CausalOp::Release {
                     scope_id: u64::MAX,
-                    identity: LeaseIdentity::EventInFlight {
-                        request_id: "capacity-filler".into()
-                    },
+                    identity: LeaseIdentity::EventInFlight,
                 }),
                 CausalAdmitResult::Applied
             );
@@ -3974,6 +3962,24 @@ return botster.register({})
             "resumed admission acquires one event scope"
         );
         assert_eq!(runtime.causal_operation_count(), CAUSAL_OWNER_CAPACITY);
+        let old_scope = after + 1;
+        runtime.apply_causal_owner_ops();
+        assert!(runtime.take_causal_capacity_notification());
+        state.note_causal_capacity_progress();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        let new_scope = resumed + 1;
+        assert_eq!(scopes.lease_count(old_scope), Some(1));
+        assert_eq!(scopes.lease_count(new_scope), Some(1));
+        assert_eq!(runtime.causal_operation_count(), CAUSAL_OWNER_CAPACITY);
+        while runtime.causal_operation_count() > 2 {
+            runtime.apply_causal_owner_ops();
+        }
+        runtime.apply_causal_owner_ops();
+        assert!(!scopes.is_live(old_scope));
+        assert!(
+            scopes.is_live(new_scope),
+            "the old event release must preserve the scope from the next admission"
+        );
         assert_eq!(
             runtime
                 .package_event_router()
@@ -3996,6 +4002,7 @@ return botster.register({})
             None,
             "the refused event must release its scope"
         );
+        assert!(!scopes.is_live(new_scope));
         let _ = std::fs::remove_dir_all(data_directory);
     }
 

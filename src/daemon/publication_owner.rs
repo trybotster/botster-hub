@@ -471,9 +471,7 @@ mod tests {
                 assert!(matches!(
                     runtime.admit_causal_op(CausalOp::Release {
                         scope_id: u64::MAX,
-                        identity: LeaseIdentity::EventInFlight {
-                            request_id: "filler".into()
-                        }
+                        identity: LeaseIdentity::EventInFlight
                     }),
                     CausalAdmitResult::Applied
                 ));
