@@ -270,6 +270,9 @@ pub(crate) fn handle_runtime(
                     if crate::daemon::control::entities::plugin_entity_cleanup_pending(state) {
                         return ControlPoll::Pending;
                     }
+                    if runtime.event_plane_owner_ops_pending() {
+                        return ControlPoll::Pending;
+                    }
                     // The dispatcher removes this waiter while it runs this continuation.
                     if !state.pending_requests.is_empty() {
                         return ControlPoll::Pending;

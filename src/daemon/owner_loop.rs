@@ -1750,6 +1750,107 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_waits_for_queued_event_worker_cleanup() {
+        use crate::package_event_router::{OwnerOp, OwnerOpKind};
+
+        let root = unique_package_control_dir("shutdown-event-owner");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+            .expect("start queued cleanup shutdown daemon");
+        let mut state = DaemonControlState::default();
+        let router = daemon.runtime().unwrap().package_event_router().clone();
+        daemon
+            .runtime()
+            .unwrap()
+            .record_event_plane_owner_op(OwnerOp {
+                kind: OwnerOpKind::Unload,
+                owner: "queued".into(),
+                generation: 0,
+            });
+        let mut reply = None;
+        router.test_with_inner_held(|| {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(!daemon.runtime().unwrap().event_plane_owner_op_ready());
+            let mut response = start_async_control_request(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::DaemonShutdown,
+                "shutdown-client",
+                "shutdown-request",
+            );
+            let waiter = state.shutdown_waiter.expect("accepted shutdown");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(
+                    !drive_ready_test_turn(&mut daemon, &mut state),
+                    "shutdown must not finish before the event worker"
+                );
+                assert!(matches!(
+                    response.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                if state
+                    .pending_requests
+                    .get(&waiter)
+                    .is_some_and(|entry| entry.last_core_phase > 0)
+                    && state.owner_ready.is_empty()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "shutdown must reach its cleanup wait"
+                );
+                thread::yield_now();
+            }
+            assert!(daemon.runtime().unwrap().event_plane_owner_ops_pending());
+            // The other worker must pass every earlier job before this barrier starts.
+            let barrier = std::sync::Arc::new(crate::host_executor::TestHostGate::default());
+            barrier.release();
+            let executor = daemon.runtime().unwrap().host_executor();
+            executor
+                .submit(
+                    crate::host_executor::HostJobIdentity::first(state.waiter_ids.next().unwrap()),
+                    crate::host_executor::HostCommand::Wait {
+                        generation: 0,
+                        gate: barrier.clone(),
+                    },
+                    executor.try_reserve().expect("reserve the worker barrier"),
+                )
+                .expect("submit the worker barrier");
+            while !barrier.has_started() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the free worker must reach the barrier"
+                );
+                thread::yield_now();
+            }
+            assert!(
+                !drive_ready_test_turn(&mut daemon, &mut state),
+                "the free worker must not finish shutdown before cleanup"
+            );
+            assert!(matches!(
+                response.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            reply = Some(response);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !drive_ready_test_turn(&mut daemon, &mut state) {
+            assert!(
+                Instant::now() < deadline,
+                "event completion must wake shutdown"
+            );
+            thread::yield_now();
+        }
+        let response = receive_test_control_reply(reply.unwrap()).expect("shutdown response");
+        assert_eq!(response.kind, DaemonResponseKind::Shutdown);
+        assert!(!daemon.runtime().unwrap().event_plane_owner_ops_pending());
+        assert_eq!(state.budget.outstanding(), 0);
+        daemon.stop();
+        std::fs::remove_dir_all(root).expect("remove queued cleanup shutdown test directory");
+    }
+
+    #[test]
     fn event_owner_waits_for_capacity_and_worker_completion_without_spinning() {
         use crate::package_event_router::{OwnerOp, OwnerOpKind};
 
