@@ -646,8 +646,14 @@ Retirement closes writes even when another object retains the cell. An already c
 Live Empty rows remain registered. An exact generation key protects another generation with the same name.
 Cell retirement also checks Arc identity. A delayed old mailbox retirement must not remove or close its replacement.
 
+Mailbox cleanup retires diagnostics while it holds the existing mailbox lock. Refused cleanup retains the mailbox for the existing cleanup retry.
+This boundary serializes retirement with metric publication. The final mailbox Drop provides an exclusive fallback.
+Router retirement and metric publication share the RouterInner lock. Consumer rebind retires the old Arc, including same-generation replacement.
+
 Required tests cover immediate row removal, retained closed handles, live Empty rows, generation isolation, and delayed old-cell retirement.
 This change removes the two global pruning scans. It does not establish diagnostic lock progress or close other owner scheduling findings.
 
 Validation used Rust 1.97.0 with `CARGO_INCREMENTAL=0` and two Cargo jobs.
 The `event_plane_counters::tests` suite passed 17 tests. The `package_event_router::tests` suite passed 60 tests.
+After caller serialization changed, `subscription::package_events::tests` passed all 21 tests.
+The focused same-generation consumer rebind test also passed.

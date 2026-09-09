@@ -1,8 +1,8 @@
 //! Bounded event-plane observability stored beside `PackageEventRouter`.
 //!
 //! Saturation-time reads use atomics and short registry read guards. They never
-//! take `PackageEventRouter::inner`. Event and retirement paths update cells
-//! through a direct `Arc` and never take the registry lock.
+//! take `PackageEventRouter::inner`. Queue writers update cells through a direct
+//! `Arc`. Lifecycle retirement removes exact rows under the registry write guard.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
@@ -20,6 +20,7 @@ const NIL: u32 = u32::MAX;
 const EMPTY_OLDEST: u64 = u64::MAX;
 
 /// Oldest-age cell for one producer generation, consumer identity, or mailbox.
+/// The queue owner must serialize metric writes and lifecycle retirement.
 pub struct QueueAgeMetric {
     version: AtomicU64,
     count: AtomicU64,
@@ -65,6 +66,7 @@ impl QueueAgeMetric {
         self.write_closed.store(true, Ordering::Release);
     }
 
+    // The caller owns the queue lock or has exclusive ownership during Drop.
     fn retire(&self) {
         self.close_writes();
         self.version.fetch_add(1, Ordering::AcqRel);
@@ -588,11 +590,6 @@ impl EventPlaneCounters {
             .unwrap_or(0)
     }
 
-    #[must_use]
-    pub fn live_registry_len(&self) -> usize {
-        self.registry_len()
-    }
-
     /// Saturation-safe snapshot. Never takes the router inner lock.
     #[must_use]
     pub fn snapshot(&self) -> DaemonObservabilityCounters {
@@ -1034,7 +1031,7 @@ mod tests {
         };
         counters.register_cell(old_identity.clone(), Arc::new(QueueAgeMetric::new(0)));
         counters.retire_identity(&old_identity);
-        assert_eq!(counters.live_registry_len(), 1);
+        assert_eq!(counters.registry_len(), 1);
         assert_eq!(
             counters.snapshot().queue_ages[0].state,
             DaemonQueueAgeState::Empty
