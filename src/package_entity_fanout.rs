@@ -176,6 +176,118 @@ pub struct EntityMutationLease {
     pub seq: u64,
 }
 
+/// One queued mutation retains its generation even without a causal lease.
+#[derive(Debug, PartialEq)]
+pub(crate) struct LeasedFanoutMutation {
+    pub(crate) generation: u64,
+    pub(crate) mutation: PackageEntityMutation,
+    pub(crate) lease: Option<EntityMutationLease>,
+}
+
+/// Delivery uses global FIFO order. Cleanup selects one exact family generation.
+#[derive(Debug, Default)]
+pub(crate) struct PackageEntityFanoutQueue {
+    next_sequence: u64,
+    pending_by_seq: BTreeMap<u64, LeasedFanoutMutation>,
+    sequences_by_family: BTreeMap<(String, u64), BTreeSet<u64>>,
+}
+
+impl PackageEntityFanoutQueue {
+    /// Check capacity before admission can release pending mutations and the incoming mutation.
+    ///
+    /// Use `PackageEntityFamilyState::pending_by_seq.len()` for `family_pending_count`.
+    /// This check limits sequence allocation, not queue size.
+    /// This conservative check can refuse admission even when fewer mutations would become ready.
+    /// The caller must retain exclusive queue access through admission and insertion.
+    /// This check reserves no sequences. Only successful insertion advances the sequence.
+    #[must_use]
+    pub(crate) fn has_capacity_for_admission(&self, family_pending_count: usize) -> bool {
+        family_pending_count
+            .checked_add(1)
+            .and_then(|bound| u64::try_from(bound).ok())
+            .and_then(|bound| self.next_sequence.checked_add(bound))
+            .is_some()
+    }
+
+    /// Return the owned mutation unchanged if the sequence cannot advance.
+    pub(crate) fn try_push(
+        &mut self,
+        item: LeasedFanoutMutation,
+    ) -> Result<(), LeasedFanoutMutation> {
+        let Some(next_sequence) = self.next_sequence.checked_add(1) else {
+            return Err(item);
+        };
+        let family = (item.mutation.entity_type().to_string(), item.generation);
+        self.sequences_by_family
+            .entry(family)
+            .or_default()
+            .insert(self.next_sequence);
+        self.pending_by_seq.insert(self.next_sequence, item);
+        self.next_sequence = next_sequence;
+        Ok(())
+    }
+
+    pub(crate) fn pop_first(&mut self) -> Option<LeasedFanoutMutation> {
+        let sequence = *self.pending_by_seq.first_key_value()?.0;
+        Some(self.remove(sequence))
+    }
+
+    pub(crate) fn take_one_family(
+        &mut self,
+        family: &str,
+        generation: u64,
+    ) -> Option<LeasedFanoutMutation> {
+        let sequence = *self
+            .sequences_by_family
+            .get(&(family.to_string(), generation))?
+            .first()?;
+        Some(self.remove(sequence))
+    }
+
+    fn remove(&mut self, sequence: u64) -> LeasedFanoutMutation {
+        let item = self
+            .pending_by_seq
+            .remove(&sequence)
+            .expect("the selected sequence has a queued mutation");
+        let family = (item.mutation.entity_type().to_string(), item.generation);
+        let sequences = self
+            .sequences_by_family
+            .get_mut(&family)
+            .expect("a queued mutation has family membership");
+        assert!(
+            sequences.remove(&sequence),
+            "each queued mutation leaves once"
+        );
+        if sequences.is_empty() {
+            self.sequences_by_family.remove(&family);
+        }
+        item
+    }
+
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending_by_seq.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.pending_by_seq.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_sequence_for_test(&mut self, sequence: u64) {
+        assert!(
+            self.pending_by_seq.is_empty(),
+            "the test queue must be empty"
+        );
+        assert!(
+            self.sequences_by_family.is_empty(),
+            "the test index must be empty"
+        );
+        self.next_sequence = sequence;
+    }
+}
+
 /// Coalesced provider resync schedule for one family.
 #[derive(Debug, Clone)]
 pub struct PackageEntityResyncState {
@@ -654,6 +766,169 @@ fn validate_mutation_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fanout_item(family: &str, generation: u64, seq: u64, leased: bool) -> LeasedFanoutMutation {
+        LeasedFanoutMutation {
+            generation,
+            mutation: PackageEntityMutation::Upsert {
+                entity_type: family.into(),
+                snapshot_seq: seq,
+                id: format!("item-{seq}"),
+                entity: json!({"payload": format!("payload-{family}-{generation}-{seq}")}),
+            },
+            lease: leased.then(|| EntityMutationLease {
+                scope_id: 17,
+                family: family.into(),
+                generation,
+                seq,
+            }),
+        }
+    }
+
+    fn assert_fanout_membership(queue: &PackageEntityFanoutQueue) {
+        let mut expected: BTreeMap<(String, u64), BTreeSet<u64>> = BTreeMap::new();
+        for (sequence, item) in &queue.pending_by_seq {
+            assert!(*sequence < queue.next_sequence);
+            expected
+                .entry((item.mutation.entity_type().into(), item.generation))
+                .or_default()
+                .insert(*sequence);
+        }
+        assert_eq!(queue.sequences_by_family, expected);
+        assert_eq!(
+            queue.len(),
+            expected.values().map(BTreeSet::len).sum::<usize>()
+        );
+        assert_eq!(queue.is_empty(), expected.is_empty());
+    }
+
+    #[test]
+    fn fanout_fifo_survives_exact_generation_cleanup() {
+        let mut queue = PackageEntityFanoutQueue::default();
+        assert_eq!(queue.pop_first(), None);
+        assert_eq!(queue.take_one_family("a", 1), None);
+        assert_fanout_membership(&queue);
+        for (family, generation, seq, leased) in [
+            ("a", 1, 1, true),
+            ("b", 7, 1, false),
+            ("a", 1, 2, false),
+            ("a", 2, 1, true),
+            ("a", 1, 3, true),
+            ("c", 4, 1, true),
+        ] {
+            queue
+                .try_push(fanout_item(family, generation, seq, leased))
+                .expect("insert");
+            assert_fanout_membership(&queue);
+        }
+        assert_eq!(queue.pop_first(), Some(fanout_item("a", 1, 1, true)));
+        assert_fanout_membership(&queue);
+        assert_eq!(
+            queue.take_one_family("a", 1),
+            Some(fanout_item("a", 1, 2, false))
+        );
+        assert_fanout_membership(&queue);
+        queue
+            .try_push(fanout_item("a", 2, 2, false))
+            .expect("recreated family");
+        assert_fanout_membership(&queue);
+        assert_eq!(
+            queue.take_one_family("a", 1),
+            Some(fanout_item("a", 1, 3, true))
+        );
+        assert_fanout_membership(&queue);
+        for family in ["a", "missing"] {
+            assert_eq!(queue.take_one_family(family, 1), None);
+            assert_fanout_membership(&queue);
+        }
+        for (family, generation, seq, leased) in [
+            ("b", 7, 1, false),
+            ("a", 2, 1, true),
+            ("c", 4, 1, true),
+            ("a", 2, 2, false),
+        ] {
+            assert_eq!(
+                queue.pop_first(),
+                Some(fanout_item(family, generation, seq, leased))
+            );
+            assert_fanout_membership(&queue);
+        }
+        assert!(queue.is_empty());
+        assert_eq!(queue.next_sequence, 7);
+        assert_eq!(queue.pop_first(), None);
+        assert_fanout_membership(&queue);
+    }
+
+    #[test]
+    fn fanout_capacity_check_is_conservative_and_consumes_no_sequences() {
+        let mut queue = PackageEntityFanoutQueue::default();
+        queue.set_next_sequence_for_test(u64::MAX - 2);
+        assert!(!queue.has_capacity_for_admission(usize::MAX));
+        assert!(!queue.has_capacity_for_admission(2));
+        assert!(queue.has_capacity_for_admission(1));
+        assert!(queue.has_capacity_for_admission(0));
+        assert_eq!(queue.next_sequence, u64::MAX - 2);
+        assert!(queue.is_empty());
+        assert_fanout_membership(&queue);
+        queue
+            .try_push(fanout_item("a", 1, 1, true))
+            .expect("only one item becomes ready");
+        assert_eq!(queue.next_sequence, u64::MAX - 1);
+        assert!(!queue.has_capacity_for_admission(1));
+        assert!(queue.has_capacity_for_admission(0));
+        assert_fanout_membership(&queue);
+        queue
+            .try_push(fanout_item("a", 2, 1, false))
+            .expect("last available sequence");
+        assert_eq!(queue.next_sequence, u64::MAX);
+        assert!(!queue.has_capacity_for_admission(0));
+        assert_fanout_membership(&queue);
+        assert_eq!(
+            queue.take_one_family("a", 1),
+            Some(fanout_item("a", 1, 1, true))
+        );
+        assert_fanout_membership(&queue);
+        assert_eq!(queue.pop_first(), Some(fanout_item("a", 2, 1, false)));
+        assert!(queue.is_empty());
+        assert!(
+            !queue.has_capacity_for_admission(0),
+            "removal must not reuse sequences"
+        );
+        assert_fanout_membership(&queue);
+    }
+
+    #[test]
+    fn fanout_exhaustion_returns_the_owned_payload_and_preserves_both_maps() {
+        let mut queue = PackageEntityFanoutQueue::default();
+        queue.set_next_sequence_for_test(u64::MAX - 1);
+        queue
+            .try_push(fanout_item("existing", 9, 1, true))
+            .expect("last insertion");
+        let before = queue.sequences_by_family.clone();
+        let item = fanout_item("refused", 12, 4, true);
+        let payload_address = match &item.mutation {
+            PackageEntityMutation::Upsert { entity, .. } => {
+                entity["payload"].as_str().expect("payload").as_ptr()
+            }
+            _ => unreachable!(),
+        };
+        let refused = queue.try_push(item).expect_err("sequence exhausted");
+        assert_eq!(refused, fanout_item("refused", 12, 4, true));
+        match &refused.mutation {
+            PackageEntityMutation::Upsert { entity, .. } => assert_eq!(
+                entity["payload"].as_str().expect("owned payload").as_ptr(),
+                payload_address
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(queue.next_sequence, u64::MAX);
+        assert_eq!(queue.sequences_by_family, before);
+        assert_eq!(
+            queue.pending_by_seq.get(&(u64::MAX - 1)),
+            Some(&fanout_item("existing", 9, 1, true))
+        );
+        assert_fanout_membership(&queue);
+    }
 
     #[test]
     fn next_resync_deadline_preserves_backoff_and_the_rolling_rate_limit() {
