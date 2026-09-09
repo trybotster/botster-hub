@@ -4049,7 +4049,8 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
         scopes.is_live(success),
         "fanout-created resync must keep the mutation scope"
     );
-    hub.plugin_entity_snapshot("lease-probe.item", "fanout-resync")
+    let (snapshot_seq, _) = hub
+        .plugin_entity_snapshot("lease-probe.item", "fanout-resync")
         .expect("provider after fanout resync");
     let provider = hub.invoke_plugin(scoped_command(
         "lease-probe",
@@ -4075,6 +4076,15 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
             }
         ]))
     );
+    hub.begin_package_entity_provider_snapshot("lease-probe.item", snapshot_seq);
+    assert!(matches!(
+        hub.step_package_entity_provider_snapshot("lease-probe.item"),
+        botster_hub::runtime::PackageEntitySnapshotStep::Pending
+    ));
+    assert!(matches!(
+        hub.step_package_entity_provider_snapshot("lease-probe.item"),
+        botster_hub::runtime::PackageEntitySnapshotStep::Complete(_)
+    ));
     let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while hub.causal_owner_ops_pending() {
         assert!(std::time::Instant::now() < cleanup_deadline);

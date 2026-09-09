@@ -681,5 +681,8 @@ The package recovery test passed both event failure and family epoch exhaustion 
 The first lease integration run stopped during setup because the candidate environment was absent. It did not execute the test bodies.
 The matched e233753 candidate then passed six lease tests and failed three. That candidate did not pass integration validation.
 Two failed tests used event readiness to drain causal cleanup. Their progress checks now use causal readiness and retain eventual-release assertions.
-The third fixture now drains its earlier successful resync before it tests a separate degraded scope.
-These test changes require validation against a new matched candidate.
+The third fixture now applies its provider snapshot through the public begin/step path before it tests a separate degraded scope.
+Reading the snapshot alone does not complete family resync or release its lease.
+All nine lease tests passed against the ce96389 matched binaries after this test-only correction.
+The direct cleanup regression and repeated recovery request regression also passed.
+This evidence does not close the remaining family cleanup work listed above.
