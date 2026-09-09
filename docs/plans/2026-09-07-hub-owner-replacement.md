@@ -1047,3 +1047,100 @@ They use the existing candidate worker and the current linked library, not final
 The two owner checks pass for refused admission retirement and shutdown with retained entity payloads.
 Formatting and the patch whitespace check pass.
 Provider preparation, Core admission encoding, family-string routing, and complete memory/work accounting remain open.
+
+### Entity model execution boundary: source map under review
+
+This section records the next replacement boundary at `f188592`.
+It does not claim implementation or acceptance.
+The owner still performs family string comparisons, allocations, and destruction in the paths below.
+Moving only publication validation does not meet the shared owner budget.
+
+The candidate boundary moves the existing family model through finite Host phases.
+The model contains the family map, fanout queue, resync release index, epoch, and family token counter.
+The owner retains causal table authority and the shared scheduler.
+The existing Host executor supplies execution and completion capacity.
+No additional executor, scheduler, family history map, or numeric limit is proposed.
+
+| Existing operation | Host phase | Owner result and ordering |
+| --- | --- | --- |
+| `admit_package_entity_publish_inner` | Check the retained registration, admit one mutation, and update the fanout and resync indices. | Retain the publication response and original credit. Apply at most one causal transition before another model phase. |
+| `advance_entity_publish` | Move one consecutive pending mutation into global fanout. | Retain the same publication continuation. Complete its response only at the existing retirement boundary. |
+| `take_one_package_entity_fanout` | Remove one global FIFO entry. | Retain its finish record and publication credit through delivery and reclamation. |
+| `prepare_finish_op` | Update resync state and construct the corresponding transition together. | Apply one transition after the existing payload reclamation boundary. |
+| `begin_package_entity_provider_snapshot` | Advance the provider floor and update the resync release index. | Apply scalar progress before subscriber delivery. Keep exclusive delivery ownership separate from model ownership. |
+| `step_package_entity_provider_snapshot` | Remove one payload, remove one resync obligation, or return completion. | Retain the removed payload through delivery or reclamation. Apply any release before restoring model availability. |
+| `mark_package_entity_resync_needed` and `rearm_package_entity_resync` | Update one family and its resync release index. | Publish the existing resync change notification after the model returns. |
+| `record_package_entity_resync_attempt` | Update one attempt and inspect degradation. | Retain the existing retry policy. Separate any obligation release into its own causal result. |
+| `retry_family_resync_release` and `release_one_degraded_package_entity_resync_lease` | Remove one exact releasable obligation and update its index. | Apply one release before restoring model availability. |
+| `step_host_package_entity_cleanup` | Advance the existing cleanup cursor by one item. | Retain each release through payload reclamation. A detached family belongs to the cursor and does not reserve the live model. |
+| Family generation, progress, and resync deadline readers | Read the model within a Host phase. | Consume scalar results under the same ordering as mutations. Revalidate the family when a later phase starts. |
+| `next_package_entity_resync_family` | Advance the existing family cursor. | Retain the current change and deadline rules. Move family names opaquely through the owner. |
+| `prepare_plugin_entity_snapshot` | Select the provider and its exact family obligation. Prepare the invocation off the owner. | Acquire `ProviderInFlight` on the owner before Core admission. Retain the selected publication credit until acquisition or retirement. |
+
+The daemon callers include `publication_owner`, the entity delivery continuation, package cleanup, and `subscription::entity_resync`.
+The entity delivery continuation currently reads family generation on every activation, including before it consumes a Host completion.
+That reader must change with the mutation boundary.
+The request completion path also calls `package_entity_work_pending`, which scans family resync state.
+That readiness query must use a published scalar result or the existing resync notification.
+Synchronous runtime helpers must call the same model operations outside daemon execution.
+They must not create a second implementation.
+
+The selected ownership boundary keeps one shared `PackageEntities` model.
+It consolidates the existing family and fanout locks with the related model indices.
+Host workers lock this model during finite phases.
+The production owner does not lock the model.
+An owner-held reservation orders each phase through causal table application.
+The owner reserves Host capacity before it grants the model reservation.
+The owner releases the model reservation only after the causal result reaches the table.
+Existing queued causal work must precede that result.
+FIFO admission alone does not order the later direct provider acquisition.
+Causal draining and its table wake must not require the model reservation.
+The owner retains the fixed causal result independently and applies it without another Host phase.
+
+Moving the sole model through Host commands was considered and rejected.
+Generic panic handling, result normalization, and unmatched completion handling can destroy a command or result.
+Shared ownership preserves the model across those paths and avoids a separate protocol for returning the sole model.
+Partial mutation still requires a faulted reservation and the original ownership records.
+
+Model ownership must not span Core execution or subscriber delivery.
+Each later model phase revalidates the family generation or token.
+Reload preserves existing family state, including state for a removed descriptor family.
+Unload cleanup retains its existing epoch and namespace rules.
+This replacement must not add family cleanup to reload.
+
+Two premises remain unresolved before Host execution:
+
+1. Partial mutation must remain faulted with its original ownership records.
+   Submission refusal, phase exhaustion, and mismatched completion must retain the exact command or result and model reservation.
+   Cancellation can suppress the response but must preserve the exact job identity and completion route.
+   Result normalization must not discard a pending causal result.
+   Queued-job destruction and completion disconnection require an explicit terminal shutdown boundary.
+2. Provider preparation needs a retained byte charge after its finite Host phase ends.
+   Core admission encodes the invocation on its caller, so that call must also move off the owner.
+   Holding all eight Host permits during Lua execution can prevent provider publications from advancing.
+   Keeping eight full prepared-byte charges can cause the same dependency after execution slots return.
+   The replacement needs an existing, sufficient metadata budget before it releases those reservations.
+
+The next decisive check is the complete ownership protocol for these two conditions.
+The first production proof must combine publication, provider snapshots, and cleanup through the actual owner dispatcher.
+It must include full Host capacity, causal contention, cancellation, stale completion, and retained fault ownership.
+Family model relocation alone will not close subscription string accounting, causal allocator work, or the complete memory inventory.
+
+The first extraction now places family state, fanout, the resync release index, epoch, and family token counter in `PackageEntities`.
+One shared lock replaces the separate family and fanout locks.
+The model returns publication and fanout causal transitions to the runtime.
+The runtime keeps its existing causal reservations and table authority.
+The existing cleanup cursor accesses the related indices through one model guard.
+These calls still execute synchronously; Host execution and the model reservation remain unimplemented.
+
+The selected regression group passes 67 library tests, including the actual full-Host-capacity test and resync deadline tests.
+Review found an extra resync notification for stale fanout finishes.
+The model now returns a change flag that preserves the previous notification condition.
+The extended stale-family test passes and checks that notification directly.
+The initial check failed on a test guard lifetime after the lock consolidation.
+The corrected test uses its existing model guard and releases that guard before runtime destruction.
+Four Lua integration checks pass for lease completion, detached resync cleanup, and retained fanout transitions.
+They use the existing candidate worker and the current linked Hub library.
+These results do not establish final matched artifacts or owner work-budget closure.
+Rust 1.97.0 `check --tests`, formatting, and the patch whitespace check pass.
+Independent review found no remaining extraction defect after the notification correction.
