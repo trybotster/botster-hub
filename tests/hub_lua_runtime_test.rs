@@ -2983,10 +2983,12 @@ return botster.register({
             .contains("duplicate record id run-1")
     );
 
-    let cleanup = hub.unload_plugin_package(
-        RequestId("unload-entity-provider".to_string()),
-        "project-pipelines",
-    );
+    let cleanup = hub
+        .unload_plugin_package(
+            RequestId("unload-entity-provider".to_string()),
+            "project-pipelines",
+        )
+        .expect("unload entity provider");
     assert!(cleanup.removed_resources.iter().any(|resource| {
         resource.kind == botster_core::PluginResourceKind::EntityProvider
             && resource.resource_id == "project-pipelines.run"
@@ -4063,6 +4065,25 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
         panic!("provider status command should complete");
     };
     assert_eq!(payload.0["status"], "rejected_causal_scope");
+
+    assert_eq!(
+        scopes.identities(success),
+        Some(std::collections::BTreeSet::from([
+            LeaseIdentity::ProviderResyncNeed {
+                generation: 0,
+                family: "lease-probe.item".into(),
+            }
+        ]))
+    );
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while hub.causal_owner_ops_pending() {
+        assert!(std::time::Instant::now() < cleanup_deadline);
+        let _ = hub.apply_event_plane_owner_ops();
+    }
+    assert!(
+        !scopes.is_live(success),
+        "completed resync releases its scope"
+    );
 
     let errored = scopes.mint_with_lease(None).expect("error scope");
     let failed = hub.invoke_plugin(scoped_command(
@@ -5576,7 +5597,13 @@ fn lock_held_release_stays_owned_when_source_ops_is_full() {
         assert!(hub.test_source_held());
         assert!(scopes.is_live(extra));
     });
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+    assert!(hub.causal_owner_ops_pending());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while hub.causal_owner_ops_pending() || hub.event_plane_owner_ops_pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "source release must finish"
+        );
         let _ = hub.apply_event_plane_owner_ops();
         let _ = scopes.flush_pending();
     }
@@ -6033,7 +6060,13 @@ fn unloading_resync_leases_stop_after_the_slice() {
         remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
         "one owner turn must stop resync-lease release: {remaining}"
     );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
+    assert!(hub.causal_owner_ops_pending());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while hub.causal_owner_ops_pending() || hub.event_plane_owner_ops_pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resync release must finish"
+        );
         let _ = hub.apply_event_plane_owner_ops();
         let _ = scopes.flush_pending();
     }

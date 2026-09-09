@@ -216,7 +216,7 @@ pub use runtime::CoreOperationTracker;
 pub mod test_internals;
 pub use runtime::{
     HubLuaPluginLoadError, HubRuntime, HubRuntimeError, HubRuntimeObservation, HubRuntimeOutput,
-    daemon_session_to_core_session,
+    PackageEntityCleanupError, daemon_session_to_core_session,
 };
 pub use session_types::{
     HubSessionContext, HubSessionType, HubSessionTypeDefinition, HubSessionTypeSource,

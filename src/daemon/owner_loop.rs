@@ -1851,6 +1851,30 @@ mod tests {
             assert_eq!(state.budget.outstanding(), 2);
             assert_eq!(state.host_recovery.len(), 1);
             assert_eq!(state.pending_requests.len(), 1);
+            let expected_code = if family_failure {
+                "entity_family_generation_exhausted"
+            } else {
+                "event_plane_cleanup_failed"
+            };
+            for _ in 0..crate::host_executor::HOST_OPERATION_CAPACITY {
+                let response = drive_package_request_with_state(
+                    &mut daemon,
+                    &mut state,
+                    DaemonRequest::DisablePackage {
+                        package_name: "alpha.plugin".into(),
+                    },
+                )
+                .expect("new package work must fail before Host admission");
+                assert_eq!(response.error.expect("recovery error").code, expected_code);
+                assert_eq!(state.host_recovery.len(), 1);
+                assert_eq!(state.budget.outstanding(), 2);
+            }
+            for request in [DaemonRequest::Status, DaemonRequest::DaemonShutdown] {
+                assert!(
+                    crate::daemon::control::host_work::recovery_response(&state, &request)
+                        .is_none()
+                );
+            }
             let other_host_slots = (2..crate::host_executor::HOST_OPERATION_CAPACITY)
                 .map(|_| {
                     daemon
