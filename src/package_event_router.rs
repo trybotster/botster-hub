@@ -2402,6 +2402,7 @@ impl CausalScopeTable {
         CausalAdmitResult::Retry(op)
     }
 
+    /// Attempt one queued operation. The caller supplies the shared turn budget.
     pub fn flush_pending(&self) -> usize {
         let Ok(mut pending) = self.pending.try_lock() else {
             return 0;
@@ -2648,6 +2649,7 @@ mod tests {
                 .keys()
                 .all(|id| inner.envelopes.contains_key(id))
         );
+        assert!(inner.admitted.values().all(|holders| !holders.is_empty()));
     }
 
     #[test]
@@ -2673,6 +2675,9 @@ mod tests {
             .expect("worker method ends before subscriptions");
         let worker = &production[run_start..run_end];
         assert_eq!(worker.matches("router.inner.lock()").count(), 2);
+        assert_eq!(worker.matches(".lock(").count(), 2);
+        assert_eq!(worker.matches("fn ").count(), 1);
+        assert!(!worker.contains("Mutex::lock"));
         let owner_apis = format!("{}{}", &production[..run_start], &production[run_end..]);
         let without_try = owner_apis.replace("try_lock", "TRY");
         assert!(
@@ -3725,6 +3730,7 @@ mod tests {
 
     #[test]
     fn populated_unload_reports_concurrent_unrelated_publication_without_a_lock_gate() {
+        // This measurement reports contention. It does not establish a time bound.
         let policy = PackageEventPlanePolicy {
             package_burst: u32::MAX,
             producer_queue_max_events: 512,
