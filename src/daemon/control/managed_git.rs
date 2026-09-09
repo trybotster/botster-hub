@@ -58,6 +58,7 @@ struct ManagedSpawnOperation {
 }
 
 pub(crate) struct ManagedGitRecoveryRequired {
+    pub(crate) owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
     pub(crate) code: String,
     pub(crate) message: String,
     _prepared: PreparedManagedWorktree,
@@ -794,6 +795,7 @@ impl ManagedSpawnOperation {
         state.host_recovery.insert(
             self.waiter_id,
             HostRecoveryRequired::ManagedGit(ManagedGitRecoveryRequired {
+                owner_permit: None,
                 code: error.code,
                 message: error.message,
                 _prepared: prepared,
