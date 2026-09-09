@@ -242,7 +242,7 @@ impl ReadyQueues {
     }
 
     #[cfg(test)]
-    fn with_next_enqueue_serial(next_enqueue_serial: u64) -> Self {
+    pub(crate) fn with_next_enqueue_serial(next_enqueue_serial: u64) -> Self {
         Self {
             next_enqueue_serial,
             ..Self::new()

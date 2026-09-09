@@ -60,6 +60,8 @@ enum BackgroundWork {
     HostCompletion,
     CausalProgress,
     CausalDrain,
+    EntityPublish,
+    CausalFamilyRelease,
     EventOwner,
     ManagedSpawn,
     PluginReady,
@@ -68,6 +70,18 @@ enum BackgroundWork {
     Maintenance(MaintenanceSliceKind),
     PumpObserve,
     InventoryReconcile,
+}
+
+fn causal_waiter_upper_bound(
+    state: &DaemonControlState,
+) -> Option<crate::owner_identity::WaiterId> {
+    state
+        .family_cleanup_waiters
+        .last_key_value()
+        .map(|(id, _)| *id)
+        .into_iter()
+        .chain(state.plugin_entities.causal_waiters.last().copied())
+        .max()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -223,7 +237,10 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
         BackgroundWork::HostCompletion
         | BackgroundWork::CausalProgress
         | BackgroundWork::ManagedSpawn => ReadyClass::HostCompletion,
-        BackgroundWork::EventOwner | BackgroundWork::CausalDrain => ReadyClass::HostBridge,
+        BackgroundWork::EventOwner
+        | BackgroundWork::EntityPublish
+        | BackgroundWork::CausalDrain
+        | BackgroundWork::CausalFamilyRelease => ReadyClass::HostBridge,
         BackgroundWork::PluginReady | BackgroundWork::PluginEntityReady => {
             ReadyClass::PluginCompletion
         }
@@ -345,15 +362,27 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         if runtime.take_core_completion_notification() {
             mark_background_ready(state, BackgroundWork::CoreCompletion);
         }
-        let causal_progress = runtime.causal_scopes().take_progress_notification();
+        let table_progress = runtime.causal_scopes().take_progress_notification();
+        let capacity_progress = runtime.take_causal_capacity_notification();
+        runtime.note_entity_publish_progress(table_progress, capacity_progress);
+        runtime.entity_publish_bridge().take_progress_notification();
+        if runtime.entity_publish_ready() {
+            mark_background_ready(state, BackgroundWork::EntityPublish);
+        }
+        let causal_progress = table_progress | capacity_progress;
         if causal_progress {
-            if state.family_cleanup_wake_active {
-                state.family_cleanup_wake_again = true;
+            if state.causal_wake_active {
+                state.causal_wake_again = true;
             } else {
-                state.family_cleanup_wake_active = true;
-                state.family_cleanup_wake_after = None;
+                state.causal_wake_active = true;
+                state.causal_wake_after = None;
+                state.causal_wake_through = causal_waiter_upper_bound(state);
             }
+            state.maintenance.note_causal_capacity_progress();
             mark_background_ready(state, BackgroundWork::CausalProgress);
+        }
+        if runtime.causal_family_release_ready() {
+            mark_background_ready(state, BackgroundWork::CausalFamilyRelease);
         }
         if runtime.causal_owner_ops_ready() {
             mark_background_ready(state, BackgroundWork::CausalDrain);
@@ -511,6 +540,7 @@ fn control_ready_class(message: &ControlMessage) -> crate::daemon::owner_schedul
             ReadyClass::CoreCompletion
         }
         ControlMessage::HostProgressPublished
+        | ControlMessage::EntityPublishProgress
         | ControlMessage::CausalProgressPublished
         | ControlMessage::ManagedSessionSpawnQueued => ReadyClass::HostCompletion,
         ControlMessage::PluginCompletionPublished
@@ -690,6 +720,14 @@ pub(crate) fn run_background_ready_item(
                 mark_background_ready(state, BackgroundWork::HostCompletion);
             }
         }
+        BackgroundWork::EntityPublish => {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.step_entity_publish();
+                if runtime.entity_publish_ready() {
+                    mark_background_ready(state, BackgroundWork::EntityPublish);
+                }
+            }
+        }
         BackgroundWork::CausalDrain => {
             if let Some(runtime) = daemon.runtime() {
                 runtime.apply_causal_owner_ops();
@@ -698,33 +736,62 @@ pub(crate) fn run_background_ready_item(
                 }
             }
         }
-        BackgroundWork::CausalProgress => {
-            use std::ops::Bound::{Excluded, Unbounded};
-            let next = match state.family_cleanup_wake_after {
-                Some(after) => state
-                    .family_cleanup_waiters
-                    .range((Excluded(after), Unbounded))
-                    .next(),
-                None => state.family_cleanup_waiters.first_key_value(),
+        BackgroundWork::CausalFamilyRelease => {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.retry_family_resync_release();
+                if runtime.causal_family_release_ready() {
+                    mark_background_ready(state, BackgroundWork::CausalFamilyRelease);
+                }
             }
-            .map(|(waiter, phase)| (*waiter, *phase));
-            if let Some((waiter, _phase)) = next {
-                state.family_cleanup_wake_after = Some(waiter);
-                if !crate::daemon::control::pending::mark_owner_ready(
-                    state,
-                    waiter,
-                    crate::daemon::owner_schedule::ReadyClass::HostCompletion,
-                    crate::daemon::control::pending::READY_HOST_COMPLETION,
-                ) {
-                    state.family_cleanup_waiters.remove(&waiter);
+        }
+        BackgroundWork::CausalProgress => {
+            use std::ops::Bound::{Excluded, Included, Unbounded};
+            let next = state.causal_wake_through.and_then(|through| {
+                let lower = state.causal_wake_after.map_or(Unbounded, Excluded);
+                let family = state
+                    .family_cleanup_waiters
+                    .range((lower, Included(through)))
+                    .next()
+                    .map(|(id, _)| *id);
+                let entity = state
+                    .plugin_entities
+                    .causal_waiters
+                    .range((lower, Included(through)))
+                    .next()
+                    .copied();
+                family.into_iter().chain(entity).min()
+            });
+            if let Some(waiter) = next {
+                state.causal_wake_after = Some(waiter);
+                if state.plugin_entities.causal_waiters.contains(&waiter) {
+                    let marked = crate::daemon::control::entities::mark_plugin_entity_ready(
+                        state,
+                        waiter,
+                        crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                        crate::daemon::control::pending::READY_HOST_COMPLETION,
+                    );
+                    if marked || !state.plugin_entities.has_waiter(waiter) {
+                        state.plugin_entities.causal_waiters.remove(&waiter);
+                    }
+                } else {
+                    let marked = crate::daemon::control::pending::mark_owner_ready(
+                        state,
+                        waiter,
+                        crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                        crate::daemon::control::pending::READY_HOST_COMPLETION,
+                    );
+                    if marked || !state.pending_requests.contains_key(&waiter) {
+                        state.family_cleanup_waiters.remove(&waiter);
+                    }
                 }
                 mark_background_ready(state, BackgroundWork::CausalProgress);
-            } else if state.family_cleanup_wake_again {
-                state.family_cleanup_wake_again = false;
-                state.family_cleanup_wake_after = None;
+            } else if state.causal_wake_again {
+                state.causal_wake_again = false;
+                state.causal_wake_after = None;
+                state.causal_wake_through = causal_waiter_upper_bound(state);
                 mark_background_ready(state, BackgroundWork::CausalProgress);
             } else {
-                state.family_cleanup_wake_active = false;
+                state.causal_wake_active = false;
             }
         }
         BackgroundWork::EventOwner => {
@@ -1428,9 +1495,10 @@ pub(crate) struct DaemonControlState {
         crate::daemon::control::host_work::HostRecoveryRequired,
     >,
     pub(crate) family_cleanup_waiters: BTreeMap<crate::owner_identity::WaiterId, u64>,
-    family_cleanup_wake_after: Option<crate::owner_identity::WaiterId>,
-    family_cleanup_wake_active: bool,
-    family_cleanup_wake_again: bool,
+    causal_wake_after: Option<crate::owner_identity::WaiterId>,
+    causal_wake_through: Option<crate::owner_identity::WaiterId>,
+    causal_wake_active: bool,
+    causal_wake_again: bool,
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
     pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
     pub(crate) host_completion_drain_pending: bool,
@@ -1514,9 +1582,10 @@ impl Default for DaemonControlState {
             background_core_waiters: BTreeMap::new(),
             host_completions: BTreeMap::new(),
             family_cleanup_waiters: BTreeMap::new(),
-            family_cleanup_wake_after: None,
-            family_cleanup_wake_active: false,
-            family_cleanup_wake_again: false,
+            causal_wake_after: None,
+            causal_wake_through: None,
+            causal_wake_active: false,
+            causal_wake_again: false,
             host_recovery: BTreeMap::new(),
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
@@ -1849,15 +1918,17 @@ mod tests {
             }
             if contended {
                 scopes.test_with_inner_held(|| {
-                    for _ in 0..crate::package_event_router::CAUSAL_PENDING_MAX {
+                    for _ in 0..crate::runtime::CAUSAL_OWNER_CAPACITY {
                         assert_eq!(
-                            scopes.try_admit(crate::package_event_router::CausalOp::Release {
-                                scope_id: u64::MAX,
-                                identity:
-                                    crate::package_event_router::LeaseIdentity::EventInFlight {
-                                        request_id: "absent".into()
-                                    },
-                            }),
+                            daemon.runtime().unwrap().admit_causal_op(
+                                crate::package_event_router::CausalOp::Release {
+                                    scope_id: u64::MAX,
+                                    identity:
+                                        crate::package_event_router::LeaseIdentity::EventInFlight {
+                                            request_id: "absent".into()
+                                        },
+                                }
+                            ),
                             crate::package_event_router::CausalAdmitResult::Applied
                         );
                     }
@@ -1948,7 +2019,7 @@ mod tests {
             );
             assert!(state.host_recovery.is_empty());
             assert!(state.family_cleanup_waiters.is_empty());
-            while scopes.pending_ops() {
+            while daemon.runtime().unwrap().causal_operation_count() > 0 {
                 assert!(Instant::now() < deadline, "admitted releases must drain");
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             }
@@ -2302,6 +2373,241 @@ mod tests {
         }
     }
 
+    fn retain_family_waiter_for_wake_test(state: &mut DaemonControlState, id: u64) {
+        use crate::daemon::control::pending::{OwnerRequestCompletion, PendingControlRequest};
+        let waiter_id = crate::owner_identity::WaiterId(id);
+        let (reply_tx, _reply) = crate::daemon::control::message::control_reply_channel();
+        let permit = state.budget.reserve().unwrap();
+        state.pending_requests.insert(
+            waiter_id,
+            PendingControlRequest {
+                waiter_id,
+                ready_class: crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                ready_key: None,
+                deadline_key: None,
+                last_core_phase: 0,
+                last_host_phase: 0,
+                completion: OwnerRequestCompletion::default(),
+                reply_tx,
+                response_delivery_rx: None,
+                grant_id: None,
+                client: None,
+                permit: Some(permit),
+                must_finish: true,
+                past_deadline: false,
+                continuation: Box::new(|_, _| {
+                    crate::daemon::control::pending::ControlPoll::Pending
+                }),
+                retire: None,
+            },
+        );
+        state.family_cleanup_waiters.insert(waiter_id, 1);
+    }
+
+    #[test]
+    fn causal_wake_pass_preserves_its_cursor_and_upper_bound_during_reinsertion() {
+        use crate::owner_identity::WaiterId;
+        let root = unique_package_control_dir("causal-wake-reinsertion");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        for id in [10, 20, 30] {
+            retain_family_waiter_for_wake_test(&mut state, id);
+        }
+        state.causal_wake_active = true;
+        state.causal_wake_through = causal_waiter_upper_bound(&state);
+        assert!(mark_background_ready(
+            &mut state,
+            BackgroundWork::CausalProgress
+        ));
+        let item = state.owner_ready.pop_next().unwrap();
+        let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+        run_background_ready_item(&mut daemon, &mut state, item, &mut budget);
+        assert_eq!(state.causal_wake_after, Some(WaiterId(10)));
+        let key = state
+            .pending_requests
+            .get_mut(&WaiterId(10))
+            .unwrap()
+            .ready_key
+            .take()
+            .unwrap();
+        assert!(state.owner_ready.remove(key));
+        state.family_cleanup_waiters.insert(WaiterId(10), 2);
+        retain_family_waiter_for_wake_test(&mut state, 40);
+        let runtime = daemon.runtime().unwrap();
+        assert!(matches!(
+            runtime.admit_causal_op(crate::package_event_router::CausalOp::Release {
+                scope_id: u64::MAX,
+                identity: crate::package_event_router::LeaseIdentity::EventInFlight {
+                    request_id: "wake".into()
+                },
+            }),
+            crate::package_event_router::CausalAdmitResult::Applied
+        ));
+        runtime.apply_causal_owner_ops();
+        publish_completion_wakes(&daemon, &mut state);
+        assert!(state.causal_wake_again);
+        assert_eq!(state.causal_wake_through, Some(WaiterId(30)));
+        for expected in [20, 30] {
+            run_background_ready_item(&mut daemon, &mut state, item, &mut budget);
+            assert_eq!(state.causal_wake_after, Some(WaiterId(expected)));
+            assert!(
+                !state
+                    .family_cleanup_waiters
+                    .contains_key(&WaiterId(expected))
+            );
+        }
+        assert!(state.family_cleanup_waiters.contains_key(&WaiterId(10)));
+        assert!(state.family_cleanup_waiters.contains_key(&WaiterId(40)));
+        run_background_ready_item(&mut daemon, &mut state, item, &mut budget);
+        assert_eq!(state.causal_wake_after, None);
+        assert_eq!(state.causal_wake_through, Some(WaiterId(40)));
+        for expected in [10, 40] {
+            run_background_ready_item(&mut daemon, &mut state, item, &mut budget);
+            assert_eq!(state.causal_wake_after, Some(WaiterId(expected)));
+        }
+        assert!(state.family_cleanup_waiters.is_empty());
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn causal_wake_retains_a_live_waiter_when_ready_serials_are_exhausted() {
+        use crate::owner_identity::WaiterId;
+        let root = unique_package_control_dir("causal-wake-serial-exhaustion");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        retain_family_waiter_for_wake_test(&mut state, 10);
+        state.causal_wake_active = true;
+        state.causal_wake_through = Some(WaiterId(10));
+        assert!(mark_background_ready(
+            &mut state,
+            BackgroundWork::CausalProgress
+        ));
+        let item = state.owner_ready.pop_next().unwrap();
+        state.owner_ready =
+            crate::daemon::owner_schedule::ReadyQueues::with_next_enqueue_serial(u64::MAX);
+        let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+        run_background_ready_item(&mut daemon, &mut state, item, &mut budget);
+        assert!(state.pending_requests.contains_key(&WaiterId(10)));
+        assert!(state.family_cleanup_waiters.contains_key(&WaiterId(10)));
+        assert!(state.pending_requests[&WaiterId(10)].ready_key.is_none());
+        assert_eq!(state.budget.outstanding(), 1);
+        assert_eq!(
+            state.causal_wake_after,
+            Some(WaiterId(10)),
+            "the current pass must not poll the same failed waiter"
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_wait_ignores_capacity_progress_until_causal_unlock() {
+        use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
+        let root = unique_package_control_dir("publication-table-wait");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let runtime = daemon.runtime().unwrap();
+        let scopes = runtime.causal_scopes();
+        let scope = scopes.mint().unwrap();
+        for _ in 0..crate::runtime::CAUSAL_OWNER_CAPACITY - 1 {
+            assert!(matches!(
+                runtime.admit_causal_op(CausalOp::Release {
+                    scope_id: u64::MAX,
+                    identity: LeaseIdentity::EventInFlight {
+                        request_id: "filler".into()
+                    },
+                }),
+                CausalAdmitResult::Applied
+            ));
+        }
+        let bridge = runtime.entity_publish_bridge();
+        let response = bridge.test_queue_publish(
+            botster_core::PluginKey("absent".into()),
+            serde_json::json!({}),
+            Some(scope),
+        );
+        scopes.test_with_inner_held(|| {
+            runtime.step_entity_publish();
+            assert_eq!(bridge.pending_publish_count(), 1);
+            assert!(response.try_recv().is_err());
+            assert!(!runtime.entity_publish_ready());
+            let capacity = runtime.take_causal_capacity_notification();
+            assert!(capacity, "the unused final reservation returns capacity");
+            runtime.note_entity_publish_progress(false, capacity);
+            assert!(
+                !runtime.entity_publish_ready(),
+                "capacity must not retry a table-lock wait"
+            );
+            assert!(!scopes.take_progress_notification());
+        });
+        let progress = scopes.take_progress_notification();
+        assert!(progress);
+        runtime.note_entity_publish_progress(progress, false);
+        assert!(runtime.entity_publish_ready());
+        runtime.step_entity_publish();
+        assert_eq!(bridge.pending_publish_count(), 0);
+        assert!(
+            response.try_recv().unwrap().is_err(),
+            "the absent plugin rejects after acquisition"
+        );
+        while runtime.causal_operation_count() > 0 {
+            runtime.apply_causal_owner_ops();
+        }
+        assert!(!scopes.is_live(scope));
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_capacity_wait_enters_fault_retention_on_table_progress() {
+        use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
+        let root = unique_package_control_dir("publication-capacity-fault");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let runtime = daemon.runtime().unwrap();
+        let scopes = runtime.causal_scopes().clone();
+        for _ in 0..crate::runtime::CAUSAL_OWNER_CAPACITY {
+            assert!(matches!(
+                runtime.admit_causal_op(CausalOp::Release {
+                    scope_id: u64::MAX,
+                    identity: LeaseIdentity::EventInFlight {
+                        request_id: "filler".into()
+                    },
+                }),
+                CausalAdmitResult::Applied
+            ));
+        }
+        let bridge = runtime.entity_publish_bridge();
+        let _response = bridge.test_queue_publish(
+            botster_core::PluginKey("absent".into()),
+            serde_json::json!({}),
+            None,
+        );
+        runtime.step_entity_publish();
+        assert!(!runtime.entity_publish_ready());
+        assert_eq!(bridge.pending_publish_count(), 1);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scopes.test_with_inner_held(|| panic!("inject causal table fault"));
+        }));
+        publish_completion_wakes(&daemon, &mut state);
+        assert!(daemon.runtime().unwrap().entity_publish_ready());
+        daemon.runtime().unwrap().step_entity_publish();
+        assert!(!daemon.runtime().unwrap().entity_publish_ready());
+        let refusal = bridge.test_queue_publish(
+            botster_core::PluginKey("absent".into()),
+            serde_json::json!({}),
+            None,
+        );
+        assert!(refusal.try_recv().unwrap().is_err());
+        assert_eq!(
+            bridge.pending_publish_count(),
+            1,
+            "fault retention preserves the original queued source"
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn causal_operations_share_the_owner_budget_without_control_traffic() {
         use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
@@ -2319,7 +2625,7 @@ mod tests {
                 };
                 let scope_id = scopes.mint_with_lease(Some(identity.clone())).unwrap();
                 assert!(matches!(
-                    runtime.keep_causal_op(CausalOp::Release { scope_id, identity }),
+                    runtime.admit_causal_op(CausalOp::Release { scope_id, identity }),
                     CausalAdmitResult::Applied
                 ));
                 scope_id
@@ -3743,6 +4049,212 @@ return botster.register({
             transport_request_id,
         );
         finish_async_plugin_control(daemon, state, reply_rx)
+    }
+
+    #[test]
+    fn refused_entity_admission_retires_without_a_host_completion() {
+        use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
+        let root = unique_package_control_dir("entity-admission-retirement");
+        let package_dir = root.join("owner-entity-gate");
+        write_package_control_manifest(
+            &package_dir,
+            "owner-entity-gate",
+            serde_json::json!({
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        write_controlled_entity_gate_lua_plugin(&package_dir);
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner-entity-gate".into(),
+            },
+        )
+        .unwrap();
+        let runtime = daemon.runtime().unwrap();
+        let scopes = runtime.causal_scopes().clone();
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
+                family: "owner-entity-gate.entity".into(),
+                generation: 0,
+            }))
+            .unwrap();
+        runtime.test_store_resync_lease(scope, "owner-entity-gate.entity");
+        for _ in 0..crate::runtime::CAUSAL_OWNER_CAPACITY {
+            assert!(matches!(
+                runtime.admit_causal_op(CausalOp::Release {
+                    scope_id: u64::MAX,
+                    identity: LeaseIdentity::EventInFlight {
+                        request_id: "filler".into()
+                    },
+                }),
+                CausalAdmitResult::Applied
+            ));
+        }
+        let executor = runtime.host_executor();
+        let mut host_permits = Vec::new();
+        while let Some(permit) = executor.try_reserve() {
+            host_permits.push(permit);
+        }
+        runtime.set_test_plugin_admit_backpressure(true);
+        let mut state = DaemonControlState::default();
+        let (frame_tx, _frame_rx) = tokio_mpsc::channel(1);
+        let (reply_tx, mut reply) = crate::daemon::control::message::control_reply_channel();
+        crate::daemon::control::entities::handle(
+            &mut daemon,
+            &mut state,
+            ControlMessage::SubscribeEntities {
+                entity_type: "owner-entity-gate.entity".into(),
+                subscription_id: "refused".into(),
+                transport_request_id: None,
+                client_id: None,
+                frame_tx: crate::subscription::entity::EntityFrameSender::Async(frame_tx),
+                frame_rx: None,
+                reply_tx,
+                grant_id: None,
+            },
+        );
+        let item = state
+            .owner_ready
+            .pop_next()
+            .expect("refusal schedules its retirement");
+        let waiter = item.key().waiter_id();
+        crate::daemon::control::entities::drive_plugin_entity_ready_item(
+            &mut daemon,
+            &mut state,
+            item,
+        );
+        assert!(state.plugin_entities.causal_waiters.contains(&waiter));
+        assert_eq!(state.budget.outstanding(), 1);
+        assert!(
+            reply.try_recv().is_err(),
+            "the refusal waits for lease retirement admission"
+        );
+        assert!(
+            scopes
+                .identities(scope)
+                .unwrap()
+                .iter()
+                .any(|identity| matches!(identity, LeaseIdentity::ProviderInFlight { .. }))
+        );
+        daemon.runtime().unwrap().apply_causal_owner_ops();
+        assert!(crate::daemon::control::entities::mark_plugin_entity_ready(
+            &mut state,
+            waiter,
+            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+            crate::daemon::control::pending::READY_HOST_COMPLETION
+        ));
+        let item = state.owner_ready.pop_next().unwrap();
+        crate::daemon::control::entities::drive_plugin_entity_ready_item(
+            &mut daemon,
+            &mut state,
+            item,
+        );
+        let response = receive_test_control_reply(reply).unwrap();
+        assert!(response.error.is_some());
+        assert_eq!(state.budget.outstanding(), 0);
+        assert!(!state.plugin_entities.has_waiter(waiter));
+        assert!(!state.plugin_entities.causal_waiters.contains(&waiter));
+        let runtime = daemon.runtime().unwrap();
+        while runtime.causal_operation_count() > 0 {
+            runtime.apply_causal_owner_ops();
+        }
+        assert!(
+            !scopes
+                .identities(scope)
+                .unwrap()
+                .iter()
+                .any(|identity| matches!(identity, LeaseIdentity::ProviderInFlight { .. }))
+        );
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .host_executor()
+                .try_reserve()
+                .is_none(),
+            "retirement required no Host slot"
+        );
+        drop(host_permits);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn asynchronous_lua_publications_complete_through_owner_ready_work() {
+        let root = unique_package_control_dir("async-entity-publish");
+        let package_dir = root.join("owner-publisher");
+        write_package_control_manifest(
+            &package_dir,
+            "owner-publisher",
+            serde_json::json!({
+                "capabilities": [{ "surface": "mcp" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(package_dir.join("plugin.lua"), r#"
+return botster.register({
+  tools = {{
+    name = "owner-publisher.publish", description = "Publish two mutations.",
+    input_schema = { type = "object" }, handler = "publish",
+    call = function()
+      local first = botster.entity_publish({ type = "entity_upsert", entity_type = "owner-publisher.item", snapshot_seq = 1, id = "one", entity = { id = "one" } })
+      local second = botster.entity_publish({ type = "entity_upsert", entity_type = "owner-publisher.item", snapshot_seq = 2, id = "two", entity = { id = "two" } })
+      return { first = first.ok, second = second.ok }
+    end,
+  }},
+  handlers = {{
+    id = "items", kind = "entity_provider", descriptor_id = "owner-publisher.item",
+    descriptor = { entity_type = "owner-publisher.item", id_field = "id" },
+    call = function() return { type = "entity_snapshot", entity_type = "owner-publisher.item", snapshot_seq = 0, items = {} } end,
+  }},
+})
+"#).unwrap();
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner-publisher".into(),
+            },
+        )
+        .unwrap();
+        let mut state = DaemonControlState::default();
+        let response = drive_async_plugin_control(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::PluginMcpCallTool {
+                name: "owner-publisher.publish".into(),
+                arguments: serde_json::json!({}),
+            },
+            "async-publish",
+        )
+        .unwrap();
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(
+            response.plugin_tool_result,
+            serde_json::json!({"first":true,"second":true})
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .entity_publish_bridge()
+                .pending_publish_count(),
+            0
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

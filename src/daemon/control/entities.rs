@@ -78,6 +78,8 @@ pub(crate) struct PluginEntityState {
     ready: VecDeque<crate::owner_identity::WaiterId>,
     completion_inconsistencies: u64,
     capacity_waiters: BTreeSet<crate::owner_identity::WaiterId>,
+    pub(crate) causal_waiters: BTreeSet<crate::owner_identity::WaiterId>,
+    causal_faults: BTreeSet<crate::owner_identity::WaiterId>,
     delivery_waiters: BTreeSet<crate::owner_identity::WaiterId>,
     active_delivery: Option<crate::owner_identity::WaiterId>,
 }
@@ -87,6 +89,7 @@ impl std::fmt::Debug for PluginEntityState {
         formatter
             .debug_struct("PluginEntityState")
             .field("pending", &self.pending.len())
+            .field("causal_faults", &self.causal_faults.len())
             .field(
                 "completion_inconsistencies",
                 &self.completion_inconsistencies,
@@ -96,6 +99,10 @@ impl std::fmt::Debug for PluginEntityState {
 }
 
 impl PluginEntityState {
+    pub(crate) fn has_waiter(&self, waiter: crate::owner_identity::WaiterId) -> bool {
+        self.by_waiter.contains_key(&waiter)
+    }
+
     fn next_request_id(&mut self) -> Option<RequestId> {
         self.next_serial = self.next_serial.checked_add(1)?;
         Some(RequestId(format!(
@@ -636,14 +643,25 @@ fn begin_plugin_entity_subscription(
                 .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
         }
         admission => {
-            runtime.retire_plugin_entity_snapshot(&invocation);
-            state.budget.release(permit);
-            let (code, message) = plugin_entity_admission_error(admission);
-            let _ = request.reply_tx.send(Ok(entity_subscription_error(
-                code,
-                &request.subscription_id,
-                &message,
-            )));
+            let refusal = plugin_entity_admission_error(admission);
+            state.plugin_entities.insert(
+                waiter_id,
+                invocation,
+                identity,
+                PendingPluginEntityKind::Subscribe(PendingEntitySubscribe { request, permit }),
+            );
+            let entry = state
+                .plugin_entities
+                .entry_for_waiter_mut(waiter_id)
+                .expect("the refused invocation stays owned");
+            entry.work.stage = worker::Stage::AdmissionRetirement;
+            entry.work.admission_refusal = Some(refusal);
+            mark_plugin_entity_ready(
+                state,
+                waiter_id,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            );
         }
     }
     false
@@ -738,8 +756,27 @@ pub(crate) fn begin_plugin_entity_resync(
                 .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
         }
         _ => {
-            runtime.retire_plugin_entity_snapshot(&invocation);
-            state.budget.release(permit);
+            state.plugin_entities.insert(
+                waiter_id,
+                invocation,
+                identity,
+                PendingPluginEntityKind::Resync {
+                    entity_type,
+                    permit,
+                },
+            );
+            state
+                .plugin_entities
+                .entry_for_waiter_mut(waiter_id)
+                .expect("the refused invocation stays owned")
+                .work
+                .stage = worker::Stage::AdmissionRetirement;
+            mark_plugin_entity_ready(
+                state,
+                waiter_id,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            );
         }
     }
 }
@@ -808,6 +845,8 @@ pub(crate) fn drive_plugin_entity_ready_item(
             }
             state.deadlines.retire(waiter_id);
             state.plugin_entities.capacity_waiters.remove(&waiter_id);
+            state.plugin_entities.causal_waiters.remove(&waiter_id);
+            state.plugin_entities.causal_faults.remove(&waiter_id);
             state.plugin_entities.delivery_waiters.remove(&waiter_id);
             if state.plugin_entities.active_delivery == Some(waiter_id) {
                 state.plugin_entities.active_delivery = None;

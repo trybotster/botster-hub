@@ -521,6 +521,8 @@ pub struct MaintenanceState {
     pub projection_dirty: bool,
     pub event_in_flight: BTreeMap<String, EventDeliveryFlight>,
     pub pending_retirements: VecDeque<EventDeliveryFlight>,
+    pub event_causal_blocked: bool,
+    pub event_causal_faulted: bool,
     /// Core reported a lifecycle-journal advance since the last consumer read it.
     pub journal_wake_pending: bool,
 }
@@ -587,6 +589,13 @@ fn event_flight(
 }
 
 impl MaintenanceState {
+    pub(crate) fn note_causal_capacity_progress(&mut self) {
+        if self.event_causal_blocked && !self.event_causal_faulted {
+            self.event_causal_blocked = false;
+            self.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
+        }
+    }
+
     /// Coalesce one O(1) wake after an authoritative mutation.
     pub fn try_wake(&mut self) {
         self.wakes.mark_all();
@@ -615,7 +624,9 @@ impl MaintenanceState {
             || self.baseline.is_some()
             || !self.pending_changes.is_empty()
             || self.session_family.has_work()
-            || !self.pending_retirements.is_empty()
+            || (!self.pending_retirements.is_empty()
+                && !self.event_causal_blocked
+                && !self.event_causal_faulted)
     }
 
     /// True when the canonical session projection has consumed the latest
@@ -1244,15 +1255,22 @@ const EVENT_DELIVERY_MAX_BYTES: usize = 32 * 1024;
 const EVENT_DELIVERY_MAX_ELAPSED: Duration = Duration::from_millis(8);
 
 fn flush_pending_event_retirements(runtime: &HubRuntime, state: &mut MaintenanceState) {
-    let mut kept = VecDeque::new();
-    while let Some(mut flight) = state.pending_retirements.pop_front() {
-        if !retire_event_holder(runtime, &mut flight) {
-            kept.push_back(flight);
-        }
+    if state.event_causal_blocked || state.event_causal_faulted {
+        return;
     }
-    state.pending_retirements = kept;
-    if !state.pending_retirements.is_empty() {
-        state.wakes.mark_all();
+    let Some(mut flight) = state.pending_retirements.pop_front() else {
+        return;
+    };
+    if !retire_event_holder(runtime, &mut flight) {
+        state.event_causal_blocked = flight.holder_retired && flight.scope_id.is_some();
+        state.event_causal_faulted = state.event_causal_blocked && runtime.causal_faulted();
+        state.pending_retirements.push_front(flight);
+    }
+    if !state.pending_retirements.is_empty()
+        && !state.event_causal_blocked
+        && !state.event_causal_faulted
+    {
+        state.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
     }
 }
 
@@ -1293,13 +1311,26 @@ fn retire_event_holder(runtime: &HubRuntime, flight: &mut EventDeliveryFlight) -
     true
 }
 
-fn queue_event_retirement(state: &mut MaintenanceState, flight: EventDeliveryFlight) {
+fn queue_event_retirement(
+    runtime: &HubRuntime,
+    state: &mut MaintenanceState,
+    flight: EventDeliveryFlight,
+) {
+    if flight.holder_retired && flight.scope_id.is_some() {
+        state.event_causal_blocked = true;
+        state.event_causal_faulted |= runtime.causal_faulted();
+    }
     state.pending_retirements.push_back(flight);
-    state.wakes.mark_all();
+    if !state.event_causal_blocked && !state.event_causal_faulted {
+        state.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
+    }
 }
 
 fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     flush_pending_event_retirements(runtime, state);
+    if state.event_causal_blocked || state.event_causal_faulted {
+        return;
+    }
     let woke = runtime.package_event_router().take_delivery_wake();
     if runtime.package_event_router().peek_delivery_wake() {
         state.wakes.mark_all();
@@ -1330,9 +1361,26 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         ) else {
             let mut flight = event_flight(&delivery, None, request_id.0);
             if !retire_event_holder(runtime, &mut flight) {
-                queue_event_retirement(state, flight);
+                queue_event_retirement(runtime, state, flight);
             }
             continue;
+        };
+        let reservation = match runtime.reserve_causal_transition() {
+            Ok(reservation) => reservation,
+            Err(status) => {
+                state.event_causal_blocked = true;
+                state.event_causal_faulted |=
+                    status == crate::runtime::CausalTransitionStatus::Fault;
+                if let Err((delivery, _)) =
+                    runtime.package_event_router().requeue_delivery(delivery)
+                {
+                    let mut flight = event_flight(&delivery, None, request_id.0);
+                    if !retire_event_holder(runtime, &mut flight) {
+                        queue_event_retirement(runtime, state, flight);
+                    }
+                }
+                continue;
+            }
         };
         let Some(scope_id) = runtime.causal_scopes().mint_with_lease(Some(
             crate::package_event_router::LeaseIdentity::EventInFlight {
@@ -1341,7 +1389,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         )) else {
             let mut flight = event_flight(&delivery, None, request_id.0.clone());
             if !retire_event_holder(runtime, &mut flight) {
-                queue_event_retirement(state, flight);
+                queue_event_retirement(runtime, state, flight);
             }
             continue;
         };
@@ -1384,7 +1432,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                 );
             }
             PluginAdmissionResult::Backpressured { .. } => {
-                let _ = runtime.admit_causal_op(crate::package_event_router::CausalOp::Release {
+                reservation.commit(crate::package_event_router::CausalOp::Release {
                     scope_id,
                     identity: crate::package_event_router::LeaseIdentity::EventInFlight {
                         request_id: request_id.0.clone(),
@@ -1397,23 +1445,30 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     Err((delivery, _)) => {
                         let mut flight = event_flight(&delivery, None, request_id.0);
                         if !retire_event_holder(runtime, &mut flight) {
-                            queue_event_retirement(state, flight);
+                            queue_event_retirement(runtime, state, flight);
                         }
                     }
                 }
             }
             _ => {
-                let mut flight = event_flight(&delivery, Some(scope_id), request_id.0);
+                reservation.commit(crate::package_event_router::CausalOp::Release {
+                    scope_id,
+                    identity: crate::package_event_router::LeaseIdentity::EventInFlight {
+                        request_id: request_id.0.clone(),
+                    },
+                });
+                let mut flight = event_flight(&delivery, None, request_id.0);
                 if !retire_event_holder(runtime, &mut flight) {
-                    queue_event_retirement(state, flight);
+                    queue_event_retirement(runtime, state, flight);
                 }
             }
         }
     }
     if runtime.package_event_router().peek_delivery_wake()
-        || !state.event_in_flight.is_empty()
+        && !state.event_causal_blocked
+        && !state.event_causal_faulted
     {
-        state.wakes.mark_all();
+        state.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
     }
 }
 
@@ -1532,7 +1587,7 @@ fn apply_plugin_completion(
     }
     if let Some(mut flight) = state.event_in_flight.remove(&request_id.0) {
         if !retire_event_holder(runtime, &mut flight) {
-            queue_event_retirement(state, flight);
+            queue_event_retirement(runtime, state, flight);
         }
         state.wakes.mark_all();
         return;
@@ -3786,7 +3841,9 @@ return botster.register({})
         );
         assert!(state.pending_retirements.is_empty());
         assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
-        let _ = runtime.causal_scopes().flush_pending();
+        while runtime.causal_operation_count() > 0 {
+            runtime.apply_causal_owner_ops();
+        }
         for scope_id in scopes {
             assert!(
                 !runtime.causal_scopes().is_live(scope_id),
@@ -3862,6 +3919,83 @@ return botster.register({})
         assert!(state.event_in_flight.is_empty());
 
         let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn backpressured_event_admission_retains_release_when_causal_table_is_full() {
+        use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
+        use crate::runtime::CAUSAL_OWNER_CAPACITY;
+
+        let (runtime, data_directory) = event_delivery_runtime("backpressure-causal-release");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        runtime.insert_test_event_handler("consumer", "worktree_created");
+        ingress_worktree_created(&runtime);
+        runtime.set_test_plugin_admit_backpressure(true);
+        let scopes = runtime.causal_scopes();
+        for _ in 0..CAUSAL_OWNER_CAPACITY {
+            assert_eq!(
+                runtime.admit_causal_op(CausalOp::Release {
+                    scope_id: u64::MAX,
+                    identity: LeaseIdentity::EventInFlight {
+                        request_id: "capacity-filler".into()
+                    },
+                }),
+                CausalAdmitResult::Applied
+            );
+        }
+        let before = scopes.mint().expect("scope before event admission");
+        let mut state = MaintenanceState::default();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        let after = scopes.mint().expect("scope after refused event admission");
+        assert_eq!(
+            after - before,
+            1,
+            "full capacity must prevent event lease acquisition"
+        );
+        assert!(state.event_causal_blocked);
+        assert_eq!(
+            runtime
+                .package_event_router()
+                .snapshot()
+                .unwrap()
+                .queued_holders,
+            1
+        );
+        assert!(state.pending_retirements.is_empty());
+        runtime.apply_causal_owner_ops();
+        assert!(runtime.take_causal_capacity_notification());
+        state.note_causal_capacity_progress();
+        run_package_event_delivery_slice(&runtime, &mut state);
+        let resumed = scopes.mint().expect("scope after resumed event admission");
+        assert_eq!(
+            resumed - after,
+            2,
+            "resumed admission acquires one event scope"
+        );
+        assert_eq!(runtime.causal_operation_count(), CAUSAL_OWNER_CAPACITY);
+        assert_eq!(
+            runtime
+                .package_event_router()
+                .snapshot()
+                .unwrap()
+                .queued_holders,
+            1
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.causal_owner_ops_pending() || !state.pending_retirements.is_empty() {
+            assert!(Instant::now() < deadline, "the event release must complete");
+            let _ = runtime.apply_event_plane_owner_ops();
+            if runtime.take_causal_capacity_notification() {
+                state.note_causal_capacity_progress();
+            }
+            flush_pending_event_retirements(&runtime, &mut state);
+        }
+        assert_eq!(
+            scopes.identities(after + 1),
+            None,
+            "the refused event must release its scope"
+        );
         let _ = std::fs::remove_dir_all(data_directory);
     }
 
