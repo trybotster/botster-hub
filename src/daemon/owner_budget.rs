@@ -90,6 +90,7 @@ pub(crate) struct OwnerBudgetCounters {
 pub(crate) struct OwnerBudget {
     capacity: usize,
     outstanding: usize,
+    released: bool,
     /// Permits reserved by admitted WebRTC peers, keyed by grant id.
     peer_permits: std::collections::BTreeMap<String, OwnerPermit>,
     obligations: std::collections::BTreeMap<crate::owner_identity::WaiterId, CleanupObligation>,
@@ -120,6 +121,7 @@ impl OwnerBudget {
         Self {
             capacity,
             outstanding: 0,
+            released: false,
             peer_permits: std::collections::BTreeMap::new(),
             obligations: std::collections::BTreeMap::new(),
             counters: OwnerBudgetCounters::default(),
@@ -151,6 +153,11 @@ impl OwnerBudget {
     pub(crate) fn release(&mut self, permit: OwnerPermit) {
         drop(permit);
         self.outstanding = self.outstanding.saturating_sub(1);
+        self.released = true;
+    }
+
+    pub(crate) fn take_capacity_notification(&mut self) -> bool {
+        std::mem::take(&mut self.released)
     }
 
     /// Reserve the permit an accepted connection carries in its cleanup

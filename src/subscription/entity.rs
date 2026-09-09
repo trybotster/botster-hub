@@ -566,6 +566,7 @@ impl SessionTypeCatalogCache {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
             HostResult::PluginEntity(_)
+            | HostResult::EventOwner(_)
             | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
@@ -628,6 +629,7 @@ impl SessionTypeCatalogCache {
                 self.failure = Some((generation, error));
             }
             HostResult::PluginEntity(_)
+            | HostResult::EventOwner(_)
             | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
@@ -1263,7 +1265,10 @@ pub(crate) fn absorb_session_type_catalog_completions(
     {
         match executor.poll_completion() {
             HostCompletionPoll::Ready(completion) => {
-                if state.session_type_catalog.accepts(completion.identity) {
+                if state.event_owner.accepts(completion.identity) {
+                    state.event_owner.retain_completion(completion);
+                    crate::daemon::owner_loop::mark_event_owner_ready(state);
+                } else if state.session_type_catalog.accepts(completion.identity) {
                     let waiter_id = completion.identity.waiter_id;
                     if state
                         .session_type_catalog
@@ -1361,6 +1366,9 @@ fn publish_catalog_capacity_wake(state: &mut DaemonControlState, owner_turn: &mu
             .maintenance
             .wakes
             .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
+    }
+    if state.event_owner.waiting_for_host {
+        crate::daemon::owner_loop::mark_event_owner_ready(state);
     }
     while state.plugin_controls.has_capacity_waiters() {
         if owner_turn

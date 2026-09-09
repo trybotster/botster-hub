@@ -355,7 +355,7 @@ fn finish(
     }
     if daemon.runtime().is_some_and(|runtime| {
         runtime.package_event_router().peek_delivery_wake()
-            || runtime.event_plane_owner_ops_pending()
+            || runtime.causal_owner_ops_pending()
             || runtime.package_entity_work_pending()
             || runtime.package_entity_resync_still_needed()
     }) {

@@ -127,6 +127,12 @@ pub struct HubRuntime {
     unsettled_op: std::cell::RefCell<Option<CausalOp>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
     event_plane_owner_ops_changed: std::cell::Cell<bool>,
+    event_plane_cleanup_faults: std::cell::RefCell<
+        Vec<(
+            Option<Result<u64, EventPlaneStatus>>,
+            crate::package_event_router::EventOwnerWorkError,
+        )>,
+    >,
     acknowledged_spawn_ids: Mutex<BTreeSet<String>>,
     force_plugin_admit_backpressure: std::sync::atomic::AtomicBool,
     pending_test_event_settlements: Mutex<Vec<PendingTestEvent>>,
@@ -381,6 +387,7 @@ impl HubRuntime {
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
             event_plane_owner_ops_changed: std::cell::Cell::new(false),
+            event_plane_cleanup_faults: std::cell::RefCell::new(Vec::new()),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
             force_plugin_admit_backpressure: std::sync::atomic::AtomicBool::new(false),
             pending_test_event_settlements: Mutex::new(Vec::new()),
@@ -489,6 +496,7 @@ impl HubRuntime {
                 crate::package_event_router::EventPlaneOwnerOps::default(),
             ),
             event_plane_owner_ops_changed: std::cell::Cell::new(false),
+            event_plane_cleanup_faults: std::cell::RefCell::new(Vec::new()),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
             force_plugin_admit_backpressure: std::sync::atomic::AtomicBool::new(false),
             pending_test_event_settlements: Mutex::new(Vec::new()),
@@ -618,10 +626,6 @@ impl HubRuntime {
 
     pub fn record_event_plane_owner_op(&self, op: crate::package_event_router::OwnerOp) {
         self.event_plane_owner_ops.borrow_mut().record(op);
-        let _ = self
-            .event_plane_owner_ops
-            .borrow_mut()
-            .apply_ready(&self.package_event_router);
         if !self.event_plane_owner_ops.borrow().is_empty() {
             self.event_plane_owner_ops_changed.set(true);
         }
@@ -633,8 +637,11 @@ impl HubRuntime {
 
     #[must_use]
     pub fn event_plane_owner_ops_pending(&self) -> bool {
-        !self.event_plane_owner_ops.borrow().is_empty()
-            || self.causal_scopes.pending_ops()
+        !self.event_plane_owner_ops.borrow().is_empty() || self.causal_owner_ops_pending()
+    }
+
+    pub(crate) fn causal_owner_ops_pending(&self) -> bool {
+        self.causal_scopes.pending_ops()
             || self.entity_publish_bridge.has_pending_releases()
             || self
                 .unfinished_finishes
@@ -664,7 +671,55 @@ impl HubRuntime {
             || self.has_family_leftovers()
     }
 
+    /// Complete one operation for synchronous runtime callers outside the daemon owner loop.
+    /// The daemon uses retained Host dispatch through `step_event_plane_owner_op`.
     pub fn apply_event_plane_owner_ops(&self) -> Vec<crate::package_event_router::OwnerOp> {
+        self.apply_causal_owner_ops();
+        match self.step_event_plane_owner_op() {
+            crate::package_event_router::OwnerStep::Applied(op) => vec![op],
+            crate::package_event_router::OwnerStep::Work(work) => {
+                match work.run(&self.package_event_router) {
+                    Ok(completion) => self
+                        .complete_event_plane_owner_op(completion)
+                        .into_iter()
+                        .collect(),
+                    Err(error) => {
+                        self.event_plane_cleanup_faults
+                            .borrow_mut()
+                            .push((None, error));
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn event_plane_owner_op_ready(&self) -> bool {
+        self.event_plane_owner_ops.borrow().has_ready()
+    }
+
+    pub(crate) fn step_event_plane_owner_op(&self) -> crate::package_event_router::OwnerStep {
+        self.event_plane_owner_ops
+            .borrow_mut()
+            .apply_ready(&self.package_event_router)
+    }
+
+    pub(crate) fn complete_event_plane_owner_op(
+        &self,
+        completion: crate::package_event_router::EventOwnerCompletion,
+    ) -> Option<crate::package_event_router::OwnerOp> {
+        self.event_plane_owner_ops.borrow_mut().complete(completion)
+    }
+
+    pub(crate) fn restart_event_plane_owner_op(
+        &self,
+        identity: &crate::package_event_router::EventOwnerWorkId,
+    ) -> Option<crate::package_event_router::EventOwnerWork> {
+        self.event_plane_owner_ops.borrow_mut().restart(identity)
+    }
+
+    pub(crate) fn apply_causal_owner_ops(&self) {
         let _ = self.causal_scopes.flush_pending();
         self.retry_unsettled();
         self.retry_in_hand();
@@ -675,9 +730,6 @@ impl HubRuntime {
         self.retry_unfinished_finishes();
         self.retry_finish_only_fanout();
         let _ = self.causal_scopes.flush_pending();
-        self.event_plane_owner_ops
-            .borrow_mut()
-            .apply_ready(&self.package_event_router)
     }
 
     /// Admit a required causal op. Retry means the caller still owns it.
@@ -1492,6 +1544,12 @@ impl HubRuntime {
 
     /// Apply cleanup identities after host execution completes.
     pub(crate) fn apply_host_package_cleanup(&mut self, cleanup: HostPackageCleanup) {
+        self.event_plane_cleanup_faults.borrow_mut().extend(
+            cleanup
+                .event_plane_faults
+                .into_iter()
+                .map(|(result, error)| (Some(result), error)),
+        );
         for operation in cleanup.event_plane_unloads {
             self.record_event_plane_owner_op(operation);
         }
@@ -4749,12 +4807,14 @@ pub enum HubLuaPluginLoadError {
     Lua(LuaPluginRuntimeError),
     Lifecycle(crate::HubLifecycleError),
     EventPlane(EventPlaneStatus),
+    EventPlaneCleanup,
 }
 
 impl HubLuaPluginLoadError {
     pub(crate) const fn is_package_scoped_startup_failure(&self) -> bool {
         match self {
             Self::Package(_) | Self::Lua(_) | Self::Lifecycle(_) => true,
+            Self::EventPlaneCleanup => false,
             // List package failures explicitly. A new event-plane status must
             // stop startup until code classifies it as package-scoped.
             Self::EventPlane(status) => matches!(
@@ -4776,6 +4836,7 @@ impl HubLuaPluginLoadError {
             Self::Lua(_) => "lua_load_failed",
             Self::Lifecycle(_) => "plugin_lifecycle_rejected",
             Self::EventPlane(status) => status.as_str(),
+            Self::EventPlaneCleanup => "event_plane_cleanup_failed",
         }
     }
 }
@@ -4787,6 +4848,9 @@ impl fmt::Display for HubLuaPluginLoadError {
             Self::Lua(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error:?}"),
             Self::EventPlane(status) => write!(formatter, "{}", status.as_str()),
+            Self::EventPlaneCleanup => {
+                formatter.write_str("event router cleanup requires recovery")
+            }
         }
     }
 }
@@ -4798,6 +4862,7 @@ impl Error for HubLuaPluginLoadError {
             Self::Lua(error) => Some(error),
             Self::Lifecycle(_) => None,
             Self::EventPlane(_) => None,
+            Self::EventPlaneCleanup => None,
         }
     }
 }
