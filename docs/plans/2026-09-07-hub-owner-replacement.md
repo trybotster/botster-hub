@@ -742,7 +742,12 @@ The terminal recovery test also passed with two accepted package requests.
 The readiness review found and corrected three maintenance wake decisions that used logical causal ownership.
 No production wake decision in the four reviewed predicate pairs still uses the ownership predicate.
 The review covered causal table readiness, runtime causal readiness, event owner readiness, and the owner queue readiness split.
-Matched-candidate integration validation remains pending for this section.
+The canonical development build produced matched Hub and worker binaries for `a9c56ce`.
+All nine lease integration tests passed against that candidate. Active resync and old-family detachment integrations also passed.
+All seven plugin lifecycle integration tests passed with serial execution.
+The candidate and its manifest are in `/private/tmp/hub-retained-family-candidate-2026-09-08`.
+A final test-only extension also verifies that detached cleanup preserves the recreated family's resync lease in the same causal scope.
+That focused test passed. Production code remains the tested `a9c56ce` revision.
 
 Poison latches for the table lifetime. The new family path reports explicit recovery; a daemon restart replaces the table.
 The broader audit of legacy retry callers and fault visibility remains open.
