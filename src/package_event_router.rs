@@ -463,6 +463,7 @@ struct TokenBucket {
 struct RouterInner {
     policy: PackageEventPlanePolicy,
     contracts: HashMap<String, HashMap<String, EmittedContract>>,
+    contract_name_counts: HashMap<String, usize>,
     subscriptions: HashMap<String, HashMap<String, Vec<EventSubscription>>>,
     client_holders: HashMap<String, HashMap<String, Vec<RegisteredClientEventHolder>>>,
     client_by_id: HashMap<(String, String), (String, String)>,
@@ -470,6 +471,12 @@ struct RouterInner {
     subscription_events_by_plugin: HashMap<String, HashMap<(String, String), usize>>,
     producer: HashMap<String, ProducerOccupancy>,
     consumers: HashMap<String, ConsumerQueue>,
+    ready_consumers: BTreeSet<String>,
+    last_ready_consumer: Option<String>,
+    #[cfg(test)]
+    ready_key_visits: usize,
+    #[cfg(test)]
+    ready_key_clones: usize,
     queued_by_producer: HashMap<String, HashMap<String, usize>>,
     retiring_by_cleanup: HashMap<(String, u64), HashSet<u64>>,
     #[cfg(test)]
@@ -519,6 +526,7 @@ impl PackageEventRouter {
                 },
             );
         }
+        let contract_name_counts = hub_contracts.keys().map(|name| (name.clone(), 1)).collect();
         let contracts = HashMap::from([(HUB_EVENT_OWNER.to_string(), hub_contracts)]);
         let counters = Arc::new(EventPlaneCounters::new());
         let hub_cell = Arc::new(QueueAgeMetric::new(0));
@@ -547,6 +555,7 @@ impl PackageEventRouter {
             inner: Mutex::new(RouterInner {
                 policy,
                 contracts,
+                contract_name_counts,
                 subscriptions: HashMap::new(),
                 client_holders: HashMap::new(),
                 client_by_id: HashMap::new(),
@@ -554,6 +563,12 @@ impl PackageEventRouter {
                 subscription_events_by_plugin: HashMap::new(),
                 producer,
                 consumers: HashMap::new(),
+                ready_consumers: BTreeSet::new(),
+                last_ready_consumer: None,
+                #[cfg(test)]
+                ready_key_visits: 0,
+                #[cfg(test)]
+                ready_key_clones: 0,
                 queued_by_producer: HashMap::new(),
                 retiring_by_cleanup: HashMap::new(),
                 #[cfg(test)]
@@ -632,11 +647,7 @@ impl PackageEventRouter {
                 .copied()
                 .unwrap_or(0);
             contract.package_generation = generation;
-            inner
-                .contracts
-                .entry(contract.owner.clone())
-                .or_default()
-                .insert(contract.name.clone(), contract);
+            inner.insert_contract(contract);
         }
         for owner in owners {
             let generation = inner.package_generation.get(&owner).copied().unwrap_or(0);
@@ -978,10 +989,38 @@ impl PackageEventRouter {
         let mut inner = lock_inner(&self.inner)?;
         let mut ready = Vec::new();
         let mut used_bytes = 0;
-        let consumer_keys: Vec<String> = inner.consumers.keys().cloned().collect();
-        for plugin_key in consumer_keys {
+        let consumer_count = inner.ready_consumers.len();
+        #[cfg(test)]
+        {
+            inner.ready_key_visits = 0;
+            inner.ready_key_clones = 0;
+        }
+        // No new consumer enters during this pull. One pass prevents retries
+        // of byte-blocked heads while the cursor rotates between calls.
+        for _ in 0..consumer_count {
             if ready.len() >= max_items || started.elapsed() >= max_elapsed {
                 break;
+            }
+            let next = inner
+                .last_ready_consumer
+                .as_ref()
+                .and_then(|cursor| {
+                    inner
+                        .ready_consumers
+                        .range::<String, _>((
+                            std::ops::Bound::Excluded(cursor),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                })
+                .or_else(|| inner.ready_consumers.first());
+            let Some(next) = next else { break };
+            let plugin_key = next.clone();
+            inner.last_ready_consumer = Some(plugin_key.clone());
+            #[cfg(test)]
+            {
+                inner.ready_key_visits += 1;
+                inner.ready_key_clones += 2;
             }
             loop {
                 if ready.len() >= max_items || started.elapsed() >= max_elapsed {
@@ -1023,6 +1062,11 @@ impl PackageEventRouter {
                 }
                 if used_bytes + size > max_bytes && !ready.is_empty() {
                     inner.note_queued_copy(&copy.holder);
+                    if let Some(queue) = inner.consumers.get_mut(&plugin_key) {
+                        if queue.copies.is_empty() {
+                            inner.ready_consumers.insert(plugin_key.clone());
+                        }
+                    }
                     if let Some(queue) = inner.consumers.get_mut(&plugin_key) {
                         queue.events += 1;
                         queue.bytes += size;
@@ -1158,10 +1202,14 @@ impl PackageEventRouter {
             .get_mut(&delivery.holder.plugin_key)
             .expect("the accepted requeue has a consumer");
         let plugin_key = delivery.holder.plugin_key.clone();
+        let was_empty = consumer.copies.is_empty();
         consumer.copies.push_front(QueuedCopy {
             envelope_id: delivery.envelope_id,
             holder: delivery.holder,
         });
+        if was_empty {
+            inner.ready_consumers.insert(plugin_key.clone());
+        }
         update_consumer_age(&mut inner, &plugin_key, &self.counters);
         self.delivery_wake.store(true, Ordering::SeqCst);
         Ok(())
@@ -1346,9 +1394,44 @@ impl RouterInner {
     }
 
     fn pop_queued_copy(&mut self, plugin_key: &str) -> Option<QueuedCopy> {
-        let copy = self.consumers.get_mut(plugin_key)?.copies.pop_front()?;
+        let queue = self.consumers.get_mut(plugin_key)?;
+        let copy = queue.copies.pop_front()?;
+        if queue.copies.is_empty() {
+            self.ready_consumers.remove(plugin_key);
+        }
         self.forget_queued_copy(&copy.holder);
         Some(copy)
+    }
+
+    fn insert_contract(&mut self, contract: EmittedContract) {
+        let name = contract.name.clone();
+        let previous = self
+            .contracts
+            .entry(contract.owner.clone())
+            .or_default()
+            .insert(name.clone(), contract);
+        if previous.is_none() {
+            *self.contract_name_counts.entry(name).or_default() += 1;
+        }
+    }
+
+    fn remove_contract(&mut self, owner: &str, name: &str) {
+        let Some(events) = self.contracts.get_mut(owner) else {
+            return;
+        };
+        if events.remove(name).is_some() {
+            let count = self
+                .contract_name_counts
+                .get_mut(name)
+                .expect("a contract has name membership");
+            *count = count.checked_sub(1).expect("each contract leaves once");
+            if *count == 0 {
+                self.contract_name_counts.remove(name);
+            }
+        }
+        if events.is_empty() {
+            self.contracts.remove(owner);
+        }
     }
 }
 
@@ -1370,10 +1453,14 @@ fn is_wildcard(value: &str) -> bool {
 }
 
 fn name_owned_by_other(inner: &RouterInner, caller: &str, name: &str) -> bool {
-    inner
-        .contracts
-        .iter()
-        .any(|(owner, events)| owner != caller && events.contains_key(name))
+    // The caller checks its own exact contract before this lookup.
+    debug_assert!(
+        !inner
+            .contracts
+            .get(caller)
+            .is_some_and(|events| events.contains_key(name))
+    );
+    inner.contract_name_counts.contains_key(name)
 }
 
 fn consume_token(inner: &mut RouterInner, owner: &str, now: Instant) -> bool {
@@ -1496,21 +1583,15 @@ fn restore_admission(inner: &mut RouterInner, snapshot: AdmissionSnapshot) {
     for (name, previous) in snapshot.contracts {
         match previous {
             Some(contract) => {
-                inner
-                    .contracts
-                    .entry(snapshot.owner.clone())
-                    .or_default()
-                    .insert(name, contract);
+                inner.insert_contract(contract);
             }
             None => {
-                if let Some(events) = inner.contracts.get_mut(&snapshot.owner) {
-                    events.remove(&name);
-                    if events.is_empty() && !snapshot.had_contract_owner {
-                        inner.contracts.remove(&snapshot.owner);
-                    }
-                }
+                inner.remove_contract(&snapshot.owner, &name);
             }
         }
+    }
+    if snapshot.had_contract_owner {
+        inner.contracts.entry(snapshot.owner.clone()).or_default();
     }
     for ((owner, name), previous) in snapshot.subscriptions {
         match previous {
@@ -1715,11 +1796,7 @@ fn commit_package_generation_locked(
     let generation = bump_package_generation(inner, owner);
     for mut contract in contracts {
         contract.package_generation = generation;
-        inner
-            .contracts
-            .entry(contract.owner.clone())
-            .or_default()
-            .insert(contract.name.clone(), contract);
+        inner.insert_contract(contract);
     }
     for subscription in subscriptions {
         let status = subscribe_locked(inner, subscription);
@@ -1943,13 +2020,20 @@ fn apply_unload(
     {
         inner.cleanup_visits = CleanupVisits::default();
     }
-    if let Some(contracts) = inner.contracts.get_mut(owner) {
+    if let Some(contracts) = inner.contracts.get(owner) {
         #[cfg(test)]
         {
             inner.cleanup_visits.contracts += contracts.len();
         }
-        contracts.retain(|_, contract| contract.package_generation > generation);
-        if contracts.is_empty() {
+        let removed: Vec<String> = contracts
+            .iter()
+            .filter(|(_, contract)| contract.package_generation <= generation)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in removed {
+            inner.remove_contract(owner, &name);
+        }
+        if inner.contracts.get(owner).is_some_and(HashMap::is_empty) {
             inner.contracts.remove(owner);
         }
     }
@@ -2110,6 +2194,9 @@ fn drop_queued_for_owner(
         });
         let removed = previous_len - queue.copies.len();
         if removed > 0 {
+            if queue.copies.is_empty() {
+                inner.ready_consumers.remove(&plugin_key);
+            }
             queue.events = queue
                 .events
                 .checked_sub(removed)
@@ -2348,6 +2435,11 @@ fn enqueue_consumer_copy(
             .expect("consumer queue exists");
         consumer.events += 1;
         consumer.bytes += size;
+        if consumer.copies.is_empty() {
+            inner
+                .ready_consumers
+                .insert(subscription.plugin_key.clone());
+        }
         consumer.copies.push_back(QueuedCopy {
             envelope_id,
             holder: subscription,
@@ -3168,6 +3260,20 @@ mod tests {
     }
 
     fn assert_router_indexes(inner: &RouterInner) {
+        let mut names = HashMap::new();
+        for events in inner.contracts.values() {
+            for name in events.keys() {
+                *names.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(inner.contract_name_counts, names);
+        let ready: BTreeSet<String> = inner
+            .consumers
+            .iter()
+            .filter(|(_, queue)| !queue.copies.is_empty())
+            .map(|(consumer, _)| consumer.clone())
+            .collect();
+        assert_eq!(inner.ready_consumers, ready);
         let mut subscriptions: HashMap<String, HashMap<(String, String), usize>> = HashMap::new();
         let mut subscription_counts: HashMap<String, usize> = HashMap::new();
         for (owner, events) in &inner.subscriptions {
@@ -3213,6 +3319,202 @@ mod tests {
             }
         }
         assert_eq!(inner.retiring_by_cleanup, retiring);
+    }
+
+    #[test]
+    fn contract_name_membership_tracks_shared_names_and_generations() {
+        let router = router();
+        router
+            .try_register_contracts(vec![
+                sample_contract("first", "shared"),
+                sample_contract("second", "shared"),
+            ])
+            .expect("shared contracts");
+        router
+            .try_register_contracts(vec![sample_contract("first", "shared")])
+            .expect("overwrite");
+        {
+            let inner = lock_inner(&router.inner).expect("names");
+            assert_router_indexes(&inner);
+            assert_eq!(inner.contract_name_counts["shared"], 2);
+        }
+        run_unload(&router, "first", 1);
+        run_unload(&router, "second", 1);
+        {
+            let inner = lock_inner(&router.inner).expect("surviving name");
+            assert_router_indexes(&inner);
+            assert_eq!(inner.contract_name_counts["shared"], 1);
+        }
+        assert_eq!(
+            router.try_ingress(
+                "outsider",
+                "shared",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::RejectedForeign
+        );
+        assert!(
+            !lock_inner(&router.inner)
+                .expect("no token charge")
+                .buckets
+                .contains_key("outsider")
+        );
+        run_unload(&router, "first", 2);
+        assert_eq!(
+            router.try_ingress(
+                "outsider",
+                "shared",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::RejectedUndeclared
+        );
+        let inner = lock_inner(&router.inner).expect("last name removed");
+        assert_router_indexes(&inner);
+        assert!(!inner.contract_name_counts.contains_key("shared"));
+        assert!(!inner.buckets.contains_key("outsider"));
+    }
+
+    #[test]
+    fn ready_selection_ignores_empty_history_and_rotates_partial_queues() {
+        for historical_count in [0, 1024] {
+            let router = router();
+            router
+                .try_register_contracts(vec![sample_contract("producer", "ready")])
+                .expect("contract");
+            subscribe(&router, "a", "producer", "ready");
+            subscribe(&router, "b", "producer", "ready");
+            {
+                let mut inner = lock_inner(&router.inner).expect("historical queues");
+                for index in 0..historical_count {
+                    inner
+                        .consumers
+                        .insert(format!("history-{index}"), ConsumerQueue::default());
+                }
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    router.try_ingress(
+                        "producer",
+                        "ready",
+                        &serde_json::json!({"ok": true}),
+                        Instant::now()
+                    ),
+                    EventPlaneStatus::Accepted
+                );
+            }
+            for (items, elapsed) in [(0, StdDuration::from_secs(1)), (1, StdDuration::ZERO)] {
+                assert!(
+                    router
+                        .pull_ready_batch(items, usize::MAX, Instant::now(), elapsed)
+                        .expect("budget guard")
+                        .is_empty()
+                );
+                let inner = lock_inner(&router.inner).expect("no selection");
+                assert_eq!((inner.ready_key_visits, inner.ready_key_clones), (0, 0));
+                assert_eq!(inner.last_ready_consumer, None);
+            }
+            let mut ids = HashMap::new();
+            for expected in ["a", "b", "a", "b"] {
+                let delivery = router
+                    .pull_ready_batch(1, usize::MAX, Instant::now(), StdDuration::from_secs(1))
+                    .expect("one delivery")
+                    .pop()
+                    .expect("ready copy");
+                assert_eq!(delivery.holder.plugin_key, expected);
+                if let Some(previous) = ids.insert(expected, delivery.envelope_id) {
+                    assert!(
+                        previous < delivery.envelope_id,
+                        "each consumer keeps FIFO order"
+                    );
+                }
+                {
+                    let inner = lock_inner(&router.inner).expect("selection cost");
+                    assert_eq!((inner.ready_key_visits, inner.ready_key_clones), (1, 2));
+                }
+                router.complete_pulled_delivery(delivery).expect("complete");
+                assert_router_accounting(&router);
+            }
+            assert!(
+                lock_inner(&router.inner)
+                    .expect("all drained")
+                    .ready_consumers
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_preserves_front_requeue_and_byte_budget_put_back() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        subscribe(&router, "consumer", "producer", "ready");
+        for _ in 0..2 {
+            assert_eq!(
+                router.try_ingress(
+                    "producer",
+                    "ready",
+                    &serde_json::json!({"ok": true}),
+                    Instant::now()
+                ),
+                EventPlaneStatus::Accepted
+            );
+        }
+        let first = router
+            .pull_ready_batch(8, 1, Instant::now(), StdDuration::from_secs(1))
+            .expect("first item exceeds byte budget")
+            .pop()
+            .expect("first delivery");
+        let first_id = first.envelope_id;
+        assert_router_accounting(&router);
+        router.requeue_delivery(first).expect("front requeue");
+        assert_router_accounting(&router);
+        let batch = router
+            .pull_ready_batch(8, usize::MAX, Instant::now(), StdDuration::from_secs(1))
+            .expect("drain");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].envelope_id, first_id);
+        assert!(batch[1].envelope_id > first_id);
+        assert_router_accounting(&router);
+        for delivery in batch {
+            router.complete_pulled_delivery(delivery).expect("complete");
+        }
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn ready_selection_visits_each_consumer_once_when_byte_blocked() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        for consumer in ["a", "b", "c"] {
+            subscribe(&router, consumer, "producer", "ready");
+        }
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "ready",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let batch = router
+            .pull_ready_batch(8, 1, Instant::now(), StdDuration::from_secs(1))
+            .expect("byte limited");
+        assert_eq!(batch.len(), 1);
+        {
+            let inner = lock_inner(&router.inner).expect("selection cost");
+            assert_eq!((inner.ready_key_visits, inner.ready_key_clones), (3, 6));
+        }
+        assert_router_accounting(&router);
+        for delivery in batch {
+            router.complete_pulled_delivery(delivery).expect("complete");
+        }
     }
 
     #[test]
