@@ -97,7 +97,8 @@ child.wait(timeout=10)
             assert len(samples) == 2
             for index in (0, 1):
                 processes = [row for row in live if row["event"] == "process" and row["sample"] == index]
-                assert {root_pid, child_pid} <= {row["pid"] for row in processes}
+                assert len(processes) == 2
+                assert {root_pid, child_pid} == {row["pid"] for row in processes}
                 for row in processes:
                     assert row["role"] == "owned-fixture" and row["root_pid"] == root_pid
                     for name in ("own_user", "own_system", "reaped_child_user", "reaped_child_system"):
