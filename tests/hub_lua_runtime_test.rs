@@ -14,8 +14,8 @@ use botster_core::{
     SessionId,
 };
 use botster_hub::package_event_router::{
-    CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, CausalScopeTable,
-    LeaseIdentity, release_or_retract,
+    CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, CausalScopeTable, LeaseIdentity,
+    release_or_retract,
 };
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
@@ -27,6 +27,19 @@ use botster_ui_contract::{UiActionRequest, UiActionResultState, UiAuthoredNodeId
 
 mod support;
 use support::candidate_session_worker_binary_path;
+
+const CAUSAL_TEST_BACKLOG: usize = 40;
+
+fn drain_causal_owner_work(hub: &HubRuntime) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while hub.causal_owner_ops_pending() || hub.event_plane_owner_ops_pending() {
+        assert!(
+            Instant::now() < deadline,
+            "owned causal operations must finish"
+        );
+        let _ = hub.apply_event_plane_owner_ops();
+    }
+}
 
 fn explicit_runtime(name: &str) -> HubRuntime {
     let data_directory = PathBuf::from("target")
@@ -4229,11 +4242,7 @@ fn production_fanout_finish_returns_the_513th_op_without_spinning() {
         "finish must not commit the transfer before retry ownership is durable"
     );
     let first = scopes.flush_pending();
-    assert!(first > 0);
-    assert!(
-        first <= CAUSAL_FLUSH_MAX,
-        "one owner turn must not drain without a bound: {first}"
-    );
+    assert_eq!(first, 1, "one phase applies one pending operation");
     assert_eq!(
         scopes.identities(fillers[0]),
         Some(std::collections::BTreeSet::from([
@@ -4398,10 +4407,7 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
         assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX * 3 + 1);
     });
     let _ = hub.apply_event_plane_owner_ops();
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!scopes.is_live(live));
 }
 
@@ -4429,10 +4435,7 @@ fn never_queued_mark_returns_the_op_when_orphan_stores_are_held() {
     });
     assert_eq!(bridge.mark_orphan(overflow), CausalAdmitResult::Applied);
     let _ = hub.apply_event_plane_owner_ops();
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!scopes.is_live(live));
 }
 
@@ -4517,10 +4520,7 @@ fn park_release_keeps_both_identities_for_one_scope() {
         assert_eq!(bridge.release_count(), CAUSAL_PENDING_MAX + 2);
     });
     let _ = hub.apply_event_plane_owner_ops();
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!scopes.is_live(live));
 }
 
@@ -4643,17 +4643,21 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
         (transfer, release)
     });
     let before = hub.unfinished_finish_count();
-    let _ = hub.apply_event_plane_owner_ops();
-    assert!(
-        hub.unfinished_finish_count() < before,
-        "owner turn must slice unfinished work"
-    );
+    let mut remaining = before;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while before - remaining < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "owner phases must make admission room"
+        );
+        let _ = hub.apply_event_plane_owner_ops();
+        let next = hub.unfinished_finish_count();
+        assert!(remaining - next <= 1, "one phase moves at most one finish");
+        remaining = next;
+    }
     assert_eq!(hub.keep_causal_op(transfer), CausalAdmitResult::Applied);
     assert_eq!(hub.keep_causal_op(release), CausalAdmitResult::Applied);
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert_eq!(hub.unfinished_finish_count(), 0);
     assert!(
         !scopes.is_live(live),
@@ -4750,10 +4754,7 @@ fn keep_owned_park_retry_stays_at_source_when_every_store_is_full() {
         );
         assert!(hub.event_plane_owner_ops_pending());
     });
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(
         !scopes.is_live(live),
         "in-hand and retry-queue Releases must stay owned and later close the scope"
@@ -4769,7 +4770,7 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
         .expect("load");
     let scopes = hub.causal_scopes().clone();
     let mut lives = Vec::new();
-    for seq in 0..(CAUSAL_FLUSH_MAX + 8) {
+    for seq in 0..CAUSAL_TEST_BACKLOG {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
                 generation: 0,
@@ -5126,10 +5127,7 @@ fn family_causal_is_one_global_fifo_and_258th_stays_at_source() {
         remaining > 0 && remaining < CAUSAL_PENDING_MAX,
         "one owner turn must stop family_causal iteration: {remaining}"
     );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert_eq!(hub.test_family_causal_len(), 0);
     assert!(!hub.test_family_held());
     assert!(!hub.test_family_source());
@@ -5147,7 +5145,7 @@ fn package_cleanup_detaches_all_old_families() {
     let hub = explicit_runtime("lease-family-detach");
     let scopes = hub.causal_scopes().clone();
     let mut lives = Vec::new();
-    for index in 0..(CAUSAL_FLUSH_MAX + 8) {
+    for index in 0..CAUSAL_TEST_BACKLOG {
         let family = format!("unload.item{index}");
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
@@ -5191,10 +5189,7 @@ fn held_retry_does_not_delete_active_family_sequence() {
         hub.test_park_family_causal(family_release(leftover, "other.item", 1)),
         CausalAdmitResult::Applied
     );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(hub.test_family_exists("active.item"));
     assert_eq!(hub.test_family_seq("active.item"), 5);
     assert!(!scopes.is_live(leftover));
@@ -5336,10 +5331,7 @@ fn production_enqueue_or_family_owns_the_259th() {
         );
         assert!(hub.test_family_overflow());
     });
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!hub.test_family_overflow());
     assert!(!scopes.is_live(extra));
 }
@@ -5492,10 +5484,7 @@ fn production_source_owns_the_260th() {
         );
         assert_eq!(hub.test_source_ops_len(), 1);
     });
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert_eq!(hub.test_source_ops_len(), 0);
     assert!(hub.test_family_exists("source.item"));
     assert_eq!(hub.test_family_seq("source.item"), 1);
@@ -5554,10 +5543,7 @@ fn source_ops_are_one_global_store_across_families() {
     );
     assert_eq!(hub.test_source_ops_len(), CAUSAL_PENDING_MAX);
     assert!(!scopes.is_live(extra));
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert_eq!(hub.test_family_causal_len(), 0);
     assert_eq!(hub.test_source_ops_len(), 0);
     for scope in parked.into_iter().chain(sourced) {
@@ -5673,10 +5659,7 @@ fn lock_held_second_overflow_stays_owned() {
         );
         assert_eq!(hub.test_resync_lease_count("probe.item"), 1);
     });
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert_eq!(hub.test_source_held_len(), 0);
     assert!(!scopes.is_live(first));
     assert!(!scopes.is_live(second));
@@ -5691,10 +5674,7 @@ fn lock_held_second_overflow_stays_owned() {
         }),
         CausalAdmitResult::Applied
     );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!scopes.is_live(transfer));
 }
 
@@ -5720,10 +5700,7 @@ fn production_release_stays_owned_when_every_store_is_full() {
         );
         assert!(hub.test_unsettled());
     });
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!hub.test_unsettled());
     assert!(!scopes.is_live(live));
 }
@@ -5748,10 +5725,7 @@ fn production_transfer_stays_owned_when_every_store_is_full() {
         assert!(hub.test_unsettled());
         assert_eq!(hub.test_resync_lease_count("probe.item"), 0);
     });
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!hub.test_unsettled());
     assert_eq!(
         hub.keep_owned_op(CausalOp::Release {
@@ -5764,10 +5738,7 @@ fn production_transfer_stays_owned_when_every_store_is_full() {
         }),
         CausalAdmitResult::Applied
     );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!scopes.is_live(live));
 }
 
@@ -5818,10 +5789,7 @@ fn fulfill_leaves_the_next_publish_on_the_bridge_until_a_slot_frees() {
     assert_eq!(bridge.pending_publish_count(), 1);
     hub.test_fulfill_pending_publishes();
     assert_eq!(bridge.pending_publish_count(), 0);
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert_eq!(
         hub.keep_owned_op(CausalOp::Release {
             scope_id: first,
@@ -5843,10 +5811,7 @@ fn fulfill_leaves_the_next_publish_on_the_bridge_until_a_slot_frees() {
         }),
         CausalAdmitResult::Applied
     );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!scopes.is_live(first));
     assert!(!scopes.is_live(second));
 }
@@ -5896,10 +5861,7 @@ fn provider_snapshot_stays_busy_when_every_store_is_full() {
         ),
         "provider snapshot must not acquire ProviderInFlight when the leftover gate is closed"
     );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!hub.test_unsettled());
 }
 
@@ -5959,10 +5921,7 @@ fn lock_held_transfer_stays_owned_after_family_commit() {
             "full-store Transfer must stay owned instead of retracting"
         );
     });
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!hub.test_source_held());
     assert_eq!(
         hub.keep_owned_op(CausalOp::Release {
@@ -5986,10 +5945,7 @@ fn lock_held_transfer_stays_owned_after_family_commit() {
         }),
         CausalAdmitResult::Applied
     );
-    while scopes.pending_ops() || hub.event_plane_owner_ops_pending() {
-        let _ = hub.apply_event_plane_owner_ops();
-        let _ = scopes.flush_pending();
-    }
+    drain_causal_owner_work(&hub);
     assert!(!scopes.is_live(live));
     assert!(!scopes.is_live(parked));
     for scope in sourced {
@@ -6003,7 +5959,7 @@ fn active_resync_leftovers_retry_after_convergence() {
     let scopes = hub.causal_scopes().clone();
     hub.test_set_family_seq("active.item", 4);
     let mut lives = Vec::new();
-    for _ in 0..(CAUSAL_FLUSH_MAX + 8) {
+    for _ in 0..CAUSAL_TEST_BACKLOG {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
                 generation: 0,
@@ -6016,15 +5972,20 @@ fn active_resync_leftovers_retry_after_convergence() {
     assert!(hub.test_family_exists("active.item"));
     assert_eq!(
         hub.test_resync_lease_count("active.item"),
-        CAUSAL_FLUSH_MAX + 8
+        CAUSAL_TEST_BACKLOG
     );
     assert!(hub.causal_owner_ops_pending());
-    let _ = hub.apply_event_plane_owner_ops();
-    let remaining = hub.test_resync_lease_count("active.item");
-    assert!(
-        remaining > 0 && remaining < CAUSAL_FLUSH_MAX + 8,
-        "one owner turn must retry active resync leftovers: {remaining}"
-    );
+    let mut remaining = hub.test_resync_lease_count("active.item");
+    for _ in 0..16 {
+        let _ = hub.apply_event_plane_owner_ops();
+        let next = hub.test_resync_lease_count("active.item");
+        assert!(
+            remaining - next <= 1,
+            "one phase releases at most one resync lease"
+        );
+        remaining = next;
+    }
+    assert_eq!(remaining, CAUSAL_TEST_BACKLOG - 1);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while hub.causal_owner_ops_pending() || hub.event_plane_owner_ops_pending() {
         assert!(
@@ -6047,7 +6008,7 @@ fn package_cleanup_releases_detached_resync_leases() {
     let hub = explicit_runtime("lease-resync-slice");
     let scopes = hub.causal_scopes().clone();
     let mut lives = Vec::new();
-    for _ in 0..(CAUSAL_FLUSH_MAX + 8) {
+    for _ in 0..CAUSAL_TEST_BACKLOG {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
                 generation: 0,

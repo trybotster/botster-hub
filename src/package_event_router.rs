@@ -2876,7 +2876,6 @@ pub fn release_or_retract(
 }
 
 pub const CAUSAL_PENDING_MAX: usize = 256;
-pub const CAUSAL_FLUSH_MAX: usize = 32;
 
 /// Causal-scope lease table. Send + Sync. Lives beside the router.
 pub struct CausalScopeTable {
