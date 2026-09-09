@@ -325,19 +325,20 @@ impl HubPluginLifecycle {
             })
     }
 
-    /// Return the one loaded provider descriptor for an exact entity family.
-    #[must_use]
-    pub fn entity_provider_descriptor(&self, entity_type: &str) -> Option<PluginOwnedDescriptor> {
-        self.descriptors
+    /// Read one exact provider without cloning its descriptor body.
+    pub(crate) fn with_entity_provider_descriptor<T>(
+        &self,
+        entity_type: &str,
+        read: impl FnOnce(Option<&PluginOwnedDescriptor>) -> T,
+    ) -> T {
+        let descriptors = self
+            .descriptors
             .lock()
-            .expect("hub plugin lifecycle descriptors lock")
-            .values()
-            .flatten()
-            .find(|descriptor| {
-                descriptor.descriptor.kind == PluginDescriptorKind::EntityProvider
-                    && descriptor.descriptor.descriptor_id == entity_type
-            })
-            .cloned()
+            .expect("hub plugin lifecycle descriptors lock");
+        read(descriptors.values().flatten().find(|descriptor| {
+            descriptor.descriptor.kind == PluginDescriptorKind::EntityProvider
+                && descriptor.descriptor.descriptor_id == entity_type
+        }))
     }
 
     /// Return Event-kind plugin handlers subscribed to one exact event name.

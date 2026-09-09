@@ -5,10 +5,7 @@ mod worker;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
-use botster_core::{
-    PluginAdmissionResult, PluginHandlerRef, PluginInvocationClass, PluginInvocationResult,
-    RequestId,
-};
+use botster_core::{PluginHandlerRef, PluginInvocationClass, PluginInvocationResult, RequestId};
 
 use crate::HubDaemon;
 use crate::client_api_dto::response::daemon_response_base;
@@ -31,8 +28,6 @@ struct PluginEntityIdentity {
     connection_id: String,
     connection_generation: String,
     transport_request_id: String,
-    plugin_key: String,
-    handler: PluginHandlerRef,
 }
 
 struct PendingEntitySubscribe {
@@ -43,7 +38,7 @@ struct PendingEntitySubscribe {
 enum PendingPluginEntityKind {
     Subscribe(PendingEntitySubscribe),
     Resync {
-        entity_type: String,
+        entity_type: std::sync::Arc<String>,
         permit: OwnerPermit,
     },
     Fanout {
@@ -132,26 +127,21 @@ impl PluginEntityState {
     fn insert(
         &mut self,
         waiter_id: crate::owner_identity::WaiterId,
-        invocation: PluginEntitySnapshotInvocation,
+        request_id: RequestId,
         identity: PluginEntityIdentity,
-        mut kind: PendingPluginEntityKind,
+        kind: PendingPluginEntityKind,
+        input: crate::plugin_entity::ProviderInput,
     ) {
-        let request_id = invocation.request.request_id.0.clone();
-        let target = match &mut kind {
-            PendingPluginEntityKind::Subscribe(subscribe) => {
-                Some(std::sync::Arc::new(crate::plugin_entity::Target {
-                    subscription_id: std::mem::take(&mut subscribe.request.subscription_id),
-                    entity_type: std::mem::take(&mut subscribe.request.entity_type),
-                    sender: subscribe.request.frame_tx.clone(),
-                }))
+        let target = match &input {
+            crate::plugin_entity::ProviderInput::Subscribe(target) => {
+                Some(std::sync::Arc::clone(target))
             }
             _ => None,
         };
         let mut work = worker::EntityWork::new(target);
-        work.family_generation = Some(invocation.family_generation);
-        work.family = Some(std::sync::Arc::new(
-            invocation.expected_entity_kind().as_str().to_string(),
-        ));
+        work.provider_input = Some(input);
+        work.stage = worker::Stage::PrepareProvider;
+        let request_id = request_id.0;
         self.by_waiter.insert(waiter_id, request_id.clone());
         self.pending.insert(
             request_id.clone(),
@@ -161,7 +151,7 @@ impl PluginEntityState {
                 ready_key: None,
                 deadline_key: None,
                 identity: Some(identity),
-                invocation: Some(invocation),
+                invocation: None,
                 kind,
                 result: None,
                 work,
@@ -174,8 +164,6 @@ impl PluginEntityState {
         completion: RetainedPluginResult<botster_core::PluginCompletion>,
     ) -> Option<RetainedPluginResult<botster_core::PluginCompletion>> {
         let (request_id, handler) = plugin_completion_identity(&completion.value().result);
-        let request_id = request_id.clone();
-        let handler = handler.clone();
         if !request_id.0.starts_with(OWNER_ENTITY_REQUEST_PREFIX) {
             return Some(completion);
         }
@@ -184,9 +172,10 @@ impl PluginEntityState {
         };
         let mut became_ready = false;
         if completion.value().class != PluginInvocationClass::RequestResponse
-            || !entry.identity.as_ref().is_some_and(|identity| {
-                identity.plugin_key == handler.plugin_key.0 && identity.handler == handler
-            })
+            || !entry
+                .invocation
+                .as_ref()
+                .is_some_and(|invocation| invocation.expected.handler == *handler)
         {
             self.completion_inconsistencies = self.completion_inconsistencies.saturating_add(1);
             if entry.result.is_none() {
@@ -223,7 +212,7 @@ impl PluginEntityState {
                 PendingPluginEntityKind::Resync {
                     entity_type: pending,
                     ..
-                } if pending == entity_type
+                } if pending.as_str() == entity_type
             )
         })
     }
@@ -284,6 +273,18 @@ impl PluginEntityState {
             .work
             .retain_completion(completion)
             .expect("the entity completion matches its retained phase");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_provider_lease(
+        &self,
+        waiter: crate::owner_identity::WaiterId,
+    ) -> Option<(u64, u64)> {
+        self.by_waiter
+            .get(&waiter)
+            .and_then(|request| self.pending.get(request))
+            .and_then(|entry| entry.invocation.as_ref())
+            .and_then(|invocation| invocation.causal_lease)
     }
 
     pub(crate) fn has_capacity_waiters(&self) -> bool {
@@ -507,7 +508,7 @@ fn subscribe(
 fn begin_plugin_entity_subscription(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
-    request: EntitySubscribeRequest,
+    mut request: EntitySubscribeRequest,
 ) -> bool {
     if state
         .entity_subscriptions
@@ -586,29 +587,12 @@ fn begin_plugin_entity_subscription(
         )));
         return false;
     };
-    let Some(runtime) = daemon.runtime() else {
+    if daemon.runtime().is_none() {
         state.budget.release(permit);
         let _ = request
             .reply_tx
             .send(Err(DaemonTransportError::DaemonNotRunning));
         return false;
-    };
-    let invocation = match runtime.prepare_plugin_entity_snapshot(
-        &request.entity_type,
-        &request.subscription_id,
-        request_id,
-        None,
-    ) {
-        Ok(invocation) => invocation,
-        Err(error) => {
-            state.budget.release(permit);
-            let _ = request.reply_tx.send(Ok(entity_subscription_error(
-                &error.code,
-                &request.subscription_id,
-                &error.message,
-            )));
-            return false;
-        }
     };
     let identity = PluginEntityIdentity {
         connection_id,
@@ -616,75 +600,37 @@ fn begin_plugin_entity_subscription(
         transport_request_id: request
             .transport_request_id
             .clone()
-            .unwrap_or_else(|| invocation.request.request_id.0.clone()),
-        plugin_key: invocation.request.handler.plugin_key.0.clone(),
-        handler: invocation.request.handler.clone(),
+            .unwrap_or_else(|| request_id.0.clone()),
     };
-    match runtime.try_admit_plugin(
-        PluginInvocationClass::RequestResponse,
-        invocation.request.clone(),
-    ) {
-        PluginAdmissionResult::Queued { .. } => {
-            state.plugin_entities.insert(
-                waiter_id,
-                invocation,
-                identity,
-                PendingPluginEntityKind::Subscribe(PendingEntitySubscribe { request, permit }),
-            );
-            let now = Instant::now();
-            let arm = state
-                .deadlines
-                .arm(waiter_id, now + RETAINED_OPERATION_DEADLINE, now)
-                .expect("an initial entity deadline always makes progress");
-            state
-                .plugin_entities
-                .entry_for_waiter_mut(waiter_id)
-                .expect("the entity waiter was inserted")
-                .deadline_key = Some(arm.key());
-            state
-                .maintenance
-                .wakes
-                .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
-        }
-        admission => {
-            let refusal = plugin_entity_admission_error(admission);
-            state.plugin_entities.insert(
-                waiter_id,
-                invocation,
-                identity,
-                PendingPluginEntityKind::Subscribe(PendingEntitySubscribe { request, permit }),
-            );
-            let entry = state
-                .plugin_entities
-                .entry_for_waiter_mut(waiter_id)
-                .expect("the refused invocation stays owned");
-            entry.work.stage = worker::Stage::AdmissionRetirement;
-            entry.work.admission_refusal = Some(refusal);
-            mark_plugin_entity_ready(
-                state,
-                waiter_id,
-                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
-                crate::daemon::control::pending::READY_HOST_COMPLETION,
-            );
-        }
-    }
+    let target = std::sync::Arc::new(crate::plugin_entity::Target {
+        entity_type: std::mem::take(&mut request.entity_type),
+        subscription_id: std::mem::take(&mut request.subscription_id),
+        sender: request.frame_tx.clone(),
+    });
+    state.plugin_entities.insert(
+        waiter_id,
+        request_id,
+        identity,
+        PendingPluginEntityKind::Subscribe(PendingEntitySubscribe { request, permit }),
+        crate::plugin_entity::ProviderInput::Subscribe(target),
+    );
+    let now = Instant::now();
+    let arm = state
+        .deadlines
+        .arm(waiter_id, now + RETAINED_OPERATION_DEADLINE, now)
+        .expect("an initial entity deadline always makes progress");
+    state
+        .plugin_entities
+        .entry_for_waiter_mut(waiter_id)
+        .unwrap()
+        .deadline_key = Some(arm.key());
+    mark_plugin_entity_ready(
+        state,
+        waiter_id,
+        crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+        crate::daemon::control::pending::READY_HOST_COMPLETION,
+    );
     false
-}
-
-fn plugin_entity_admission_error(admission: PluginAdmissionResult) -> (&'static str, String) {
-    match admission {
-        PluginAdmissionResult::Backpressured { reason, .. } => {
-            ("plugin_invocation_backpressured", reason)
-        }
-        PluginAdmissionResult::RejectedBudget { reason, .. } => {
-            ("plugin_invocation_rejected", reason)
-        }
-        PluginAdmissionResult::WorkerStopped { reason, .. } => ("plugin_worker_stopped", reason),
-        _ => (
-            "plugin_invocation_rejected",
-            "the plugin worker refused the invocation".to_string(),
-        ),
-    }
 }
 
 pub(crate) fn begin_plugin_entity_resync(
@@ -707,82 +653,45 @@ pub(crate) fn begin_plugin_entity_resync(
         state.budget.release(permit);
         return;
     };
-    let Some(runtime) = daemon.runtime() else {
+    if daemon.runtime().is_none() {
         state.budget.release(permit);
         return;
-    };
-    let invocation = match runtime.prepare_plugin_entity_snapshot(
-        &entity_type,
-        &subscription_id,
-        request_id,
-        None,
-    ) {
-        Ok(invocation) => invocation,
-        Err(_) => {
-            state.budget.release(permit);
-            return;
-        }
     };
     let identity = PluginEntityIdentity {
         connection_id: format!("entity-resync:{entity_type}"),
         connection_generation: subscription_id.clone(),
-        transport_request_id: invocation.request.request_id.0.clone(),
-        plugin_key: invocation.request.handler.plugin_key.0.clone(),
-        handler: invocation.request.handler.clone(),
+        transport_request_id: request_id.0.clone(),
     };
-    match runtime.try_admit_plugin(
-        PluginInvocationClass::RequestResponse,
-        invocation.request.clone(),
-    ) {
-        PluginAdmissionResult::Queued { .. } => {
-            state.plugin_entities.insert(
-                waiter_id,
-                invocation,
-                identity,
-                PendingPluginEntityKind::Resync {
-                    entity_type,
-                    permit,
-                },
-            );
-            let now = Instant::now();
-            let arm = state
-                .deadlines
-                .arm(waiter_id, now + RETAINED_OPERATION_DEADLINE, now)
-                .expect("an initial entity deadline always makes progress");
-            state
-                .plugin_entities
-                .entry_for_waiter_mut(waiter_id)
-                .expect("the entity waiter was inserted")
-                .deadline_key = Some(arm.key());
-            state
-                .maintenance
-                .wakes
-                .mark(crate::daemon_maintenance::MaintenanceSliceKind::CompletionDrain);
-        }
-        _ => {
-            state.plugin_entities.insert(
-                waiter_id,
-                invocation,
-                identity,
-                PendingPluginEntityKind::Resync {
-                    entity_type,
-                    permit,
-                },
-            );
-            state
-                .plugin_entities
-                .entry_for_waiter_mut(waiter_id)
-                .expect("the refused invocation stays owned")
-                .work
-                .stage = worker::Stage::AdmissionRetirement;
-            mark_plugin_entity_ready(
-                state,
-                waiter_id,
-                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
-                crate::daemon::control::pending::READY_HOST_COMPLETION,
-            );
-        }
-    }
+    let entity_type = std::sync::Arc::new(entity_type);
+    state.plugin_entities.insert(
+        waiter_id,
+        request_id,
+        identity,
+        PendingPluginEntityKind::Resync {
+            entity_type: std::sync::Arc::clone(&entity_type),
+            permit,
+        },
+        crate::plugin_entity::ProviderInput::Resync {
+            family: entity_type,
+            subscription_id,
+        },
+    );
+    let now = Instant::now();
+    let arm = state
+        .deadlines
+        .arm(waiter_id, now + RETAINED_OPERATION_DEADLINE, now)
+        .expect("an initial entity deadline always makes progress");
+    state
+        .plugin_entities
+        .entry_for_waiter_mut(waiter_id)
+        .unwrap()
+        .deadline_key = Some(arm.key());
+    mark_plugin_entity_ready(
+        state,
+        waiter_id,
+        crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+        crate::daemon::control::pending::READY_HOST_COMPLETION,
+    );
 }
 
 pub(crate) fn begin_package_entity_fanout(daemon: &HubDaemon, state: &mut DaemonControlState) {

@@ -30,13 +30,18 @@ pub(super) struct EntityWork {
     pub(super) registered: bool,
     pub(super) error: Option<(&'static str, &'static str)>,
     pub(super) finish: Option<crate::runtime::PackageEntityFanoutFinish>,
-    pub(super) admission_refusal: Option<(&'static str, String)>,
+    pub(super) provider_input: Option<crate::plugin_entity::ProviderInput>,
+    pub(super) provider_plan: Option<crate::runtime::provider::ProviderRequestPlan>,
+    pub(super) provider_refusal: Option<crate::McpToolError>,
     pub(super) stage: Stage,
     phase: Phase,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Stage {
+    PrepareProvider,
+    AcquireProvider,
+    AdmitProvider,
     AdmissionRetirement,
     CausalRecovery,
     Provider,
@@ -49,7 +54,7 @@ pub(super) enum Stage {
 
 /// A failed submission keeps the exact command and its original permit.
 enum Phase {
-    Unreserved,
+    Unreserved(Option<HostJobIdentity>),
     Ready {
         identity: HostJobIdentity,
         permit: HostWorkPermit,
@@ -58,6 +63,9 @@ enum Phase {
     Completed(HostCompletion),
     Rejected(HostSubmissionFailure),
     Exhausted {
+        _completion: HostCompletion,
+    },
+    Faulted {
         _completion: HostCompletion,
     },
     Terminal,
@@ -90,9 +98,11 @@ impl EntityWork {
             registered: false,
             error: None,
             finish: None,
-            admission_refusal: None,
+            provider_input: None,
+            provider_plan: None,
+            provider_refusal: None,
             stage: Stage::Provider,
-            phase: Phase::Unreserved,
+            phase: Phase::Unreserved(None),
         }
     }
 
@@ -106,12 +116,12 @@ impl EntityWork {
 
     /// Reserve capacity before the caller takes a provider result or mutation.
     pub(super) fn reserve(&mut self, executor: &HostExecutor, waiter: WaiterId) -> Advance {
-        if matches!(self.phase, Phase::Unreserved) {
+        if let Phase::Unreserved(next) = self.phase {
             let Some(permit) = executor.try_reserve() else {
                 return Advance::Capacity;
             };
             self.phase = Phase::Ready {
-                identity: HostJobIdentity::first(waiter),
+                identity: next.unwrap_or_else(|| HostJobIdentity::first(waiter)),
                 permit,
             };
         }
@@ -145,6 +155,46 @@ impl EntityWork {
         let Phase::Completed(completion) = &self.phase else {
             return None;
         };
+        let expected = matches!(
+            (&completion.result, self.stage),
+            (
+                HostResult::PluginEntity(Completion::ProviderPrepared(_)),
+                Stage::PrepareProvider
+            ) | (
+                HostResult::PluginEntity(Completion::ProviderAdmitted(_)),
+                Stage::AdmitProvider
+            ) | (
+                HostResult::PluginEntity(Completion::Prepared { .. }),
+                Stage::PrepareProvider
+                    | Stage::Provider
+                    | Stage::Begin
+                    | Stage::Deliver
+                    | Stage::Drain
+            ) | (
+                HostResult::PluginEntity(Completion::Delivered { .. }),
+                Stage::Deliver
+            ) | (
+                HostResult::PluginEntity(Completion::Reclaimed),
+                Stage::Drain | Stage::Release
+            ) | (
+                HostResult::PluginEntity(Completion::Finished { .. }),
+                Stage::Finish
+            )
+        );
+        if !expected {
+            let Phase::Completed(completion) = std::mem::replace(&mut self.phase, Phase::Terminal)
+            else {
+                unreachable!()
+            };
+            self.phase = Phase::Faulted {
+                _completion: completion,
+            };
+            return None;
+        }
+        let admitted = matches!(
+            completion.result,
+            HostResult::PluginEntity(Completion::ProviderAdmitted(None))
+        );
         let terminal = matches!(
             completion.result,
             HostResult::PluginEntity(Completion::Finished { .. })
@@ -168,7 +218,10 @@ impl EntityWork {
         let HostResult::PluginEntity(result) = result else {
             unreachable!("an entity phase returns an entity completion")
         };
-        if !terminal {
+        if admitted {
+            self.phase = Phase::Unreserved(next);
+            drop(permit);
+        } else if !terminal {
             self.phase = Phase::Ready {
                 identity: next.expect("the next phase was checked"),
                 permit,
@@ -216,7 +269,9 @@ impl EntityWork {
     fn retry(&mut self, executor: &HostExecutor) -> Advance {
         match &self.phase {
             Phase::Rejected(failure) if matches!(failure.error, HostSubmitError::Full) => {}
-            Phase::Rejected(_) | Phase::Exhausted { .. } => return Advance::Degraded,
+            Phase::Rejected(_) | Phase::Exhausted { .. } | Phase::Faulted { .. } => {
+                return Advance::Degraded;
+            }
             _ => return Advance::Waiting,
         }
         let Phase::Rejected(failure) = std::mem::replace(&mut self.phase, Phase::Terminal) else {
@@ -336,6 +391,70 @@ mod tests {
             assert_reserved_slots(&executor, 1);
             drop(returned);
         }
+    }
+
+    #[test]
+    fn unexpected_provider_completion_retains_capacity_and_never_advances() {
+        for stage in [
+            Stage::PrepareProvider,
+            Stage::AcquireProvider,
+            Stage::Provider,
+        ] {
+            let executor = HostExecutor::new();
+            let identity = HostJobIdentity::first(WaiterId(705));
+            let mut work = EntityWork::new(None);
+            work.stage = stage;
+            work.phase = Phase::Running(identity);
+            let completion = HostCompletion::for_test(
+                identity,
+                HostResult::PluginEntity(Completion::ProviderAdmitted(None)),
+                executor.try_reserve().unwrap(),
+            );
+            work.retain_completion(completion).unwrap();
+            assert!(work.take_completion().is_none());
+            work.cancel();
+            assert!(matches!(
+                work.reserve(&executor, identity.waiter_id),
+                Advance::Degraded
+            ));
+            let Phase::Faulted {
+                _completion: retained,
+            } = &work.phase
+            else {
+                panic!("an unexpected admission completion must remain faulted");
+            };
+            assert_eq!(retained.identity, identity);
+            assert_eq!(work.stage, stage);
+            assert_reserved_slots(&executor, 1);
+        }
+    }
+
+    #[test]
+    fn known_provider_admission_releases_capacity_and_preserves_the_next_phase() {
+        let executor = HostExecutor::new();
+        let identity = HostJobIdentity {
+            waiter_id: WaiterId(706),
+            phase: 9,
+        };
+        let mut work = EntityWork::new(None);
+        work.stage = Stage::AdmitProvider;
+        work.phase = Phase::Running(identity);
+        work.retain_completion(HostCompletion::for_test(
+            identity,
+            HostResult::PluginEntity(Completion::ProviderAdmitted(None)),
+            executor.try_reserve().unwrap(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            work.take_completion(),
+            Some((_, Completion::ProviderAdmitted(None)))
+        ));
+        assert_reserved_slots(&executor, 0);
+        assert!(matches!(
+            work.reserve(&executor, identity.waiter_id),
+            Advance::Waiting
+        ));
+        assert_eq!(work.ready_identity(), identity.next_phase());
     }
 
     #[test]
@@ -660,32 +779,34 @@ pub(super) fn step(
         return Step::Waiting;
     }
     if entry.work.stage == Stage::AdmissionRetirement {
-        let invocation = entry
-            .invocation
-            .as_ref()
-            .expect("refused admission retains its invocation");
-        let status = runtime.retire_plugin_entity_snapshot(invocation);
-        if let Some(step) = retain_causal_transition(state, entry, status) {
-            return step;
+        if let Some(invocation) = entry.invocation.as_ref() {
+            let status = runtime.retire_plugin_entity_snapshot(invocation);
+            if let Some(step) = retain_causal_transition(state, entry, status) {
+                return step;
+            }
         }
-        entry.invocation = None;
-        if let Some((code, message)) = entry.work.admission_refusal.take()
-            && let super::PendingPluginEntityKind::Subscribe(subscribe) = &mut entry.kind
-        {
-            let target = entry
-                .work
-                .target
-                .as_ref()
-                .expect("subscribe retains its target");
-            let _ = subscribe.request.reply_tx.take().send(Ok(
-                crate::subscription::entity::entity_subscription_error(
-                    code,
-                    &target.subscription_id,
-                    &message,
-                ),
-            ));
-        }
-        return Step::Done;
+        entry.work.family_generation = None;
+        let command = if entry.work.cancelled {
+            entry.work.stage = Stage::Release;
+            Command::DiscardProvider {
+                plan: entry.work.provider_plan.take(),
+                invocation: entry.invocation.take(),
+                input: entry.work.provider_input.take(),
+                refusal: entry.work.provider_refusal.take(),
+            }
+        } else {
+            entry.work.stage = Stage::Begin;
+            Command::RefuseProvider {
+                plan: entry.work.provider_plan.take(),
+                invocation: entry.invocation.take(),
+                error: entry
+                    .work
+                    .provider_refusal
+                    .take()
+                    .expect("refusal retains its error"),
+            }
+        };
+        return submission_step(state, waiter, entry.work.submit(executor, command));
     }
     if matches!(&entry.work.phase, Phase::Completed(completion) if matches!(&completion.result, HostResult::PluginEntity(Completion::Reclaimed)))
         && let Some(finish) = entry.work.finish.as_ref()
@@ -711,6 +832,19 @@ pub(super) fn step(
     }
     if let Some((identity, completion)) = entry.work.take_completion() {
         match completion {
+            Completion::ProviderPrepared(plan) => {
+                entry.work.provider_plan = Some(plan);
+                entry.work.stage = Stage::AcquireProvider;
+            }
+            Completion::ProviderAdmitted(refusal) => {
+                entry.work.stage = if let Some(error) = refusal {
+                    entry.work.provider_refusal = Some(error);
+                    Stage::AdmissionRetirement
+                } else {
+                    Stage::Provider
+                };
+            }
+
             Completion::Prepared {
                 payload,
                 family,
@@ -792,6 +926,14 @@ pub(super) fn step(
         return Step::Waiting;
     };
     if entry.work.cancelled && entry.work.stage != Stage::Provider {
+        if entry.work.provider_input.is_some()
+            || entry.work.provider_plan.is_some()
+            || entry.invocation.is_some()
+        {
+            entry.work.stage = Stage::AdmissionRetirement;
+            return Step::Again;
+        }
+
         if generation_is_current
             && state.plugin_entities.active_delivery == Some(waiter)
             && let Some(family) = &entry.work.family
@@ -811,6 +953,86 @@ pub(super) fn step(
         return submission_step(state, waiter, entry.work.submit(executor, command));
     }
     match entry.work.stage {
+        Stage::PrepareProvider => {
+            let (lifecycle, _) = runtime.plugin_provider_admission();
+            let command = Command::PrepareProvider {
+                lifecycle,
+                budget: runtime.shared_view_budget(),
+                input: entry
+                    .work
+                    .provider_input
+                    .take()
+                    .expect("provider preparation retains its input"),
+                request_id: botster_core::RequestId(entry.request_id.clone()),
+            };
+            submission_step(state, waiter, entry.work.submit(executor, command))
+        }
+        Stage::AcquireProvider => {
+            if entry.invocation.is_none() {
+                let plan = entry
+                    .work
+                    .provider_plan
+                    .as_ref()
+                    .expect("provider acquisition retains its plan");
+                match runtime.select_plugin_entity_snapshot(&plan.expected) {
+                    Ok(invocation) => {
+                        entry.work.family_generation = Some(invocation.family_generation);
+                        entry.invocation = Some(invocation);
+                    }
+                    Err(error) => {
+                        entry.work.provider_refusal = Some(error);
+                        entry.work.stage = Stage::AdmissionRetirement;
+                        return Step::Again;
+                    }
+                }
+            }
+            use crate::package_event_router::CausalAcquireResult;
+            match runtime.try_acquire_plugin_entity_snapshot(entry.invocation.as_mut().unwrap()) {
+                CausalAcquireResult::Acquired => {
+                    state.plugin_entities.causal_waiters.remove(&waiter);
+                    entry.work.stage = Stage::AdmitProvider;
+                    Step::Again
+                }
+                CausalAcquireResult::Waiting => {
+                    state.plugin_entities.causal_waiters.insert(waiter);
+                    Step::Waiting
+                }
+                CausalAcquireResult::MissingScope => {
+                    entry.work.provider_refusal = Some(crate::McpToolError::new(
+                        "causal_scope_busy",
+                        "could not acquire provider causal lease",
+                    ));
+                    entry.work.stage = Stage::AdmissionRetirement;
+                    Step::Again
+                }
+                CausalAcquireResult::Fault => retain_causal_transition(
+                    state,
+                    entry,
+                    crate::runtime::CausalTransitionStatus::Fault,
+                )
+                .unwrap(),
+            }
+        }
+        Stage::AdmitProvider => {
+            let (lifecycle, force_backpressure) = runtime.plugin_provider_admission();
+            let command = Command::AdmitProvider {
+                lifecycle,
+                plan: entry
+                    .work
+                    .provider_plan
+                    .take()
+                    .expect("provider admission retains its request"),
+                scope_id: entry
+                    .invocation
+                    .as_ref()
+                    .unwrap()
+                    .causal_lease
+                    .map(|(scope, _)| scope),
+                force_backpressure,
+            };
+            submission_step(state, waiter, entry.work.submit(executor, command))
+        }
+
         Stage::AdmissionRetirement | Stage::CausalRecovery => {
             unreachable!("retirement states return before Host work")
         }

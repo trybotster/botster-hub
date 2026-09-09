@@ -4045,6 +4045,504 @@ return botster.register({
         .expect("write controlled entity gate lua plugin");
     }
 
+    fn collect_entity_test_host_completions(daemon: &HubDaemon, state: &mut DaemonControlState) {
+        while let crate::host_executor::HostCompletionPoll::Ready(completion) =
+            daemon.runtime().unwrap().host_executor().poll_completion()
+        {
+            let waiter = completion.identity.waiter_id;
+            assert!(
+                state
+                    .plugin_entities
+                    .accepts_host_completion(completion.identity)
+            );
+            state.plugin_entities.retain_host_completion(completion);
+            crate::daemon::control::entities::mark_plugin_entity_ready(
+                state,
+                waiter,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            );
+        }
+    }
+
+    #[test]
+    fn early_provider_result_waits_for_admission_and_survives_ambiguous_host_failure() {
+        use crate::host_executor::{HostCompletion, HostCompletionPoll, HostError, HostResult};
+        use crate::package_event_router::LeaseIdentity;
+        for outcome in [
+            "prepare_cancel",
+            "acquire_cancel",
+            "deliver",
+            "cancel",
+            "fault",
+        ] {
+            let fault = outcome == "fault";
+            let before_admission = matches!(outcome, "prepare_cancel" | "acquire_cancel");
+            let root = unique_package_control_dir(&format!("early-provider-{outcome}"));
+            let package_dir = root.join("owner-entity-gate");
+            write_package_control_manifest(
+                &package_dir,
+                "owner-entity-gate",
+                serde_json::json!({"entrypoints": [{"runtime":"lua", "path":"plugin.lua", "bootstrap":false}]}),
+            );
+            write_controlled_entity_gate_lua_plugin(&package_dir);
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::InstallPackageLocalPath { path: package_dir },
+            )
+            .unwrap();
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::EnablePackage {
+                    package_name: "owner-entity-gate".into(),
+                },
+            )
+            .unwrap();
+            let runtime = daemon.runtime().unwrap();
+            let metadata = runtime.shared_view_budget();
+            let metadata_baseline = metadata.used();
+            let scopes = runtime.causal_scopes().clone();
+            let scope = scopes
+                .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
+                    family_token: runtime.test_family_causal_token("owner-entity-gate.entity"),
+                }))
+                .unwrap();
+            runtime.test_store_resync_lease(scope, "owner-entity-gate.entity");
+            let mut state = DaemonControlState::default();
+            runtime.install_plugin_completion_notifier(
+                state.plugin_result_budget.completion_notifier(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (completion, mut reply, mut frames) = 'admission: loop {
+                let (frame_tx, frame_rx) = tokio_mpsc::channel(8);
+                let (reply_tx, mut reply_rx) =
+                    crate::daemon::control::message::control_reply_channel();
+                crate::daemon::control::entities::handle(
+                    &mut daemon,
+                    &mut state,
+                    ControlMessage::SubscribeEntities {
+                        entity_type: "owner-entity-gate.entity".into(),
+                        subscription_id: "early-provider".into(),
+                        transport_request_id: None,
+                        client_id: Some("early-client".into()),
+                        frame_tx: crate::subscription::entity::EntityFrameSender::Async(frame_tx),
+                        frame_rx: None,
+                        reply_tx,
+                        grant_id: None,
+                    },
+                );
+                let mut refused = false;
+                loop {
+                    if let HostCompletionPoll::Ready(completion) =
+                        daemon.runtime().unwrap().host_executor().poll_completion()
+                    {
+                        if (before_admission
+                            && matches!(
+                                completion.result,
+                                HostResult::PluginEntity(
+                                    crate::plugin_entity::Completion::ProviderPrepared(_)
+                                )
+                            ))
+                            || matches!(
+                                completion.result,
+                                HostResult::PluginEntity(
+                                    crate::plugin_entity::Completion::ProviderAdmitted(None)
+                                )
+                            )
+                        {
+                            break 'admission (completion, reply_rx, frame_rx);
+                        }
+                        let waiter = completion.identity.waiter_id;
+                        state.plugin_entities.retain_host_completion(completion);
+                        crate::daemon::control::entities::mark_plugin_entity_ready(
+                            &mut state,
+                            waiter,
+                            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                            crate::daemon::control::pending::READY_HOST_COMPLETION,
+                        );
+                    }
+                    if let Some(item) = state.owner_ready.pop_next() {
+                        crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                            &mut daemon,
+                            &mut state,
+                            item,
+                        );
+                    }
+                    if let Ok(response) = reply_rx.try_recv() {
+                        assert_eq!(
+                            response.into_parts().0.unwrap().error.unwrap().code,
+                            "plugin_invocation_backpressured"
+                        );
+                        refused = true;
+                    }
+                    if refused && state.budget.outstanding() == 0 {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "provider admission must finish");
+                    thread::yield_now();
+                }
+            };
+            let waiter = completion.identity.waiter_id;
+            if before_admission {
+                assert!(metadata.used() > metadata_baseline);
+                state.plugin_entities.retain_host_completion(completion);
+                crate::daemon::control::entities::mark_plugin_entity_ready(
+                    &mut state,
+                    waiter,
+                    crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                    crate::daemon::control::pending::READY_HOST_COMPLETION,
+                );
+                if outcome == "acquire_cancel" {
+                    let item = state.owner_ready.pop_next().unwrap();
+                    crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                        &mut daemon,
+                        &mut state,
+                        item,
+                    );
+                    scopes.test_with_inner_held(|| {
+                        let item = state.owner_ready.pop_next().unwrap();
+                        crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                            &mut daemon,
+                            &mut state,
+                            item,
+                        );
+                    });
+                    let (selected_scope, token) =
+                        state.plugin_entities.test_provider_lease(waiter).unwrap();
+                    assert_eq!(selected_scope, scope);
+                    assert!(!scopes.identities(scope).unwrap().contains(
+                        &LeaseIdentity::ProviderInFlight {
+                            invocation_token: token
+                        }
+                    ));
+                    assert!(state.plugin_entities.causal_waiters.contains(&waiter));
+                }
+                crate::daemon::control::entities::retire_plugin_entity_connection(
+                    &daemon,
+                    &mut state,
+                    "early-client",
+                );
+                while state.plugin_entities.has_waiter(waiter) {
+                    collect_entity_test_host_completions(&daemon, &mut state);
+                    if let Some(item) = state.owner_ready.pop_next() {
+                        crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                            &mut daemon,
+                            &mut state,
+                            item,
+                        );
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "cancelled preparation must dispose of its metadata on Host"
+                    );
+                    thread::yield_now();
+                }
+                assert_eq!(metadata.used(), metadata_baseline);
+                assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+                assert_eq!(state.budget.outstanding(), 0);
+                assert!(reply.try_recv().is_err());
+                assert!(frames.try_recv().is_err());
+                assert_eq!(
+                    run_completion_drain_slice_for_owner(
+                        daemon.runtime().unwrap(),
+                        &mut state.maintenance,
+                        &mut state.plugin_controls,
+                        &mut state.plugin_entities,
+                        &state.plugin_result_budget,
+                    )
+                    .item_count,
+                    0
+                );
+                daemon.stop();
+                drop(state);
+                std::fs::remove_dir_all(root).unwrap();
+                continue;
+            }
+            let (accepted_scope, invocation_token) =
+                state.plugin_entities.test_provider_lease(waiter).unwrap();
+            assert_eq!(accepted_scope, scope);
+            let accepted_lease = LeaseIdentity::ProviderInFlight { invocation_token };
+            let retained_metadata = metadata.used();
+            assert!(retained_metadata > metadata_baseline);
+            loop {
+                let count = run_completion_drain_slice_for_owner(
+                    daemon.runtime().unwrap(),
+                    &mut state.maintenance,
+                    &mut state.plugin_controls,
+                    &mut state.plugin_entities,
+                    &state.plugin_result_budget,
+                )
+                .item_count;
+                if count > 0 {
+                    assert_eq!(count, 1);
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Core must finish before admission completion is delivered"
+                );
+                thread::yield_now();
+            }
+            let retained_bytes = state.plugin_result_budget.retained_bytes();
+            assert!(retained_bytes > 0);
+            for ready in state
+                .plugin_entities
+                .take_ready_waiters(crate::host_executor::HOST_OPERATION_CAPACITY)
+            {
+                crate::daemon::control::entities::mark_plugin_entity_ready(
+                    &mut state,
+                    ready,
+                    crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                    crate::daemon::control::pending::READY_HOST_COMPLETION,
+                );
+            }
+            while let Some(item) = state.owner_ready.pop_next() {
+                crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                    &mut daemon,
+                    &mut state,
+                    item,
+                );
+            }
+            assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+            assert!(frames.try_recv().is_err());
+            assert!(reply.try_recv().is_err());
+            assert!(
+                scopes
+                    .identities(scope)
+                    .unwrap()
+                    .iter()
+                    .any(|lease| *lease == accepted_lease)
+            );
+            let completion = if fault {
+                let (identity, result, permit) = completion.into_parts();
+                drop(result);
+                HostCompletion::for_test(
+                    identity,
+                    HostResult::Failed {
+                        generation: 0,
+                        error: HostError::new(
+                            "host_worker_panicked",
+                            "injected failure after Core admission",
+                        ),
+                    },
+                    permit,
+                )
+            } else {
+                completion
+            };
+            state.plugin_entities.retain_host_completion(completion);
+            crate::daemon::control::entities::mark_plugin_entity_ready(
+                &mut state,
+                waiter,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            );
+            if outcome != "deliver" {
+                crate::daemon::control::entities::retire_plugin_entity_connection(
+                    &daemon,
+                    &mut state,
+                    "early-client",
+                );
+            }
+            if fault {
+                while let Some(item) = state.owner_ready.pop_next() {
+                    crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                        &mut daemon,
+                        &mut state,
+                        item,
+                    );
+                }
+                assert!(state.plugin_entities.has_waiter(waiter));
+                assert_eq!(state.budget.outstanding(), 1);
+                assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+                assert_eq!(state.plugin_result_budget.retained_bytes(), retained_bytes);
+                assert_eq!(metadata.used(), retained_metadata);
+                assert!(
+                    scopes
+                        .identities(scope)
+                        .unwrap()
+                        .iter()
+                        .any(|lease| *lease == accepted_lease)
+                );
+                assert!(reply.try_recv().is_err());
+                assert!(frames.try_recv().is_err());
+            } else {
+                while state.plugin_entities.has_waiter(waiter) {
+                    assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                    assert!(
+                        Instant::now() < deadline,
+                        "known admission must deliver the retained result"
+                    );
+                    thread::yield_now();
+                }
+                if outcome == "deliver" {
+                    assert!(receive_test_control_reply(reply).unwrap().error.is_none());
+                    assert!(frames.try_recv().is_ok());
+                } else {
+                    assert!(reply.try_recv().is_err());
+                    assert!(frames.try_recv().is_err());
+                }
+                assert_eq!(state.plugin_result_budget.retained_bytes(), 0);
+                assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+                while daemon.runtime().unwrap().causal_operation_count() > 0 {
+                    daemon.runtime().unwrap().apply_causal_owner_ops();
+                }
+                assert!(
+                    !scopes
+                        .identities(accepted_scope)
+                        .unwrap_or_default()
+                        .contains(&accepted_lease)
+                );
+            }
+            daemon.stop();
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn admitted_providers_publish_while_all_expectations_remain_charged() {
+        let root = unique_package_control_dir("provider-publish-capacity");
+        let package_dir = root.join("owner-entity-gate");
+        write_package_control_manifest(
+            &package_dir,
+            "owner-entity-gate",
+            serde_json::json!({"entrypoints": [{"runtime":"lua", "path":"plugin.lua", "bootstrap":false}]}),
+        );
+        std::fs::write(package_dir.join("plugin.lua"), r#"
+local sequence = 0
+return botster.register({ handlers = {{
+  id = "controlled_gate", kind = "entity_provider", descriptor_id = "owner-entity-gate.entity",
+  descriptor = { entity_type = "owner-entity-gate.entity", id_field = "id" },
+  call = function(_request)
+    sequence = sequence + 1
+    local result = botster.entity_publish({ type = "entity_remove", entity_type = "owner-entity-gate.entity",
+      snapshot_seq = sequence, id = "removed" })
+    assert(result.ok)
+    return { type = "entity_snapshot", entity_type = "owner-entity-gate.entity",
+      snapshot_seq = sequence, items = {{ id = "item" }} }
+  end,
+}} })
+"#).unwrap();
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "owner-entity-gate".into(),
+            },
+        )
+        .unwrap();
+        let mut state = DaemonControlState::default();
+        daemon
+            .runtime()
+            .unwrap()
+            .install_plugin_completion_notifier(state.plugin_result_budget.completion_notifier());
+        let metadata = daemon.runtime().unwrap().shared_view_budget();
+        let baseline = metadata.used();
+        let mut replies = Vec::new();
+        let mut frames = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        crate::lua_runtime::arm_test_plugin_invocation_gate();
+        for index in 0..crate::host_executor::HOST_OPERATION_CAPACITY {
+            loop {
+                let previous_metadata = metadata.used();
+                let (frame_tx, frame_rx) = tokio_mpsc::channel(32);
+                let (reply_tx, mut reply_rx) =
+                    crate::daemon::control::message::control_reply_channel();
+                crate::daemon::control::entities::handle(
+                    &mut daemon,
+                    &mut state,
+                    ControlMessage::SubscribeEntities {
+                        entity_type: "owner-entity-gate.entity".into(),
+                        subscription_id: format!("publishing-{index}"),
+                        transport_request_id: None,
+                        client_id: None,
+                        frame_tx: crate::subscription::entity::EntityFrameSender::Async(frame_tx),
+                        frame_rx: None,
+                        reply_tx,
+                        grant_id: None,
+                    },
+                );
+                let mut refused = false;
+                loop {
+                    assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                    if let Ok(response) = reply_rx.try_recv() {
+                        assert_eq!(
+                            response.into_parts().0.unwrap().error.unwrap().code,
+                            "plugin_invocation_backpressured"
+                        );
+                        refused = true;
+                    }
+                    if daemon.runtime().unwrap().host_executor().outstanding() == 0
+                        && (refused || metadata.used() > previous_metadata)
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "admission must release Host capacity while Lua waits"
+                    );
+                    thread::yield_now();
+                }
+                if refused {
+                    continue;
+                }
+                replies.push(reply_rx);
+                frames.push(frame_rx);
+                break;
+            }
+        }
+        assert!(crate::lua_runtime::wait_for_test_plugin_invocation_gate(
+            Duration::ZERO
+        ));
+        assert_eq!(
+            state.budget.outstanding(),
+            crate::host_executor::HOST_OPERATION_CAPACITY
+        );
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+        assert!(metadata.used() > baseline);
+        let mut available = Vec::new();
+        while let Some(permit) = daemon.runtime().unwrap().host_executor().try_reserve() {
+            available.push(permit);
+        }
+        assert_eq!(
+            available.len(),
+            crate::host_executor::HOST_OPERATION_CAPACITY
+        );
+        drop(available);
+        crate::lua_runtime::release_test_plugin_invocation_gate();
+        while state.budget.outstanding() != 0
+            || daemon.runtime().unwrap().package_entity_work_pending()
+        {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "providers must publish and finish through the owner dispatcher"
+            );
+            thread::yield_now();
+        }
+        for reply in replies {
+            assert!(receive_test_control_reply(reply).unwrap().error.is_none());
+        }
+        for mut frame in frames {
+            assert!(frame.try_recv().is_ok());
+        }
+        assert_eq!(state.plugin_result_budget.retained_bytes(), 0);
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+        assert!(
+            state.lifecycle_counters.package_entity_publish_accepted
+                >= crate::host_executor::HOST_OPERATION_CAPACITY as u64
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn prepared_snapshots_and_fanout_progress_when_host_capacity_is_full() {
         let root = unique_package_control_dir("entity-delivery-capacity-order");
@@ -4075,6 +4573,7 @@ return botster.register({
             .runtime()
             .unwrap()
             .install_plugin_completion_notifier(state.plugin_result_budget.completion_notifier());
+        let mut deferred = Vec::new();
         let mut replies = Vec::new();
         let mut frames = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -4097,6 +4596,8 @@ return botster.register({
                         grant_id: None,
                     },
                 );
+                let mut provider_completed = false;
+                let mut refused = false;
                 loop {
                     let completed = run_completion_drain_slice_for_owner(
                         daemon.runtime().unwrap(),
@@ -4108,6 +4609,14 @@ return botster.register({
                     .item_count;
                     if completed > 0 {
                         assert_eq!(completed, 1);
+                        provider_completed = true;
+                    }
+                    if provider_completed
+                        && daemon.runtime().unwrap().host_executor().outstanding() == 0
+                    {
+                        while let Some(item) = state.owner_ready.pop_next() {
+                            deferred.push(item);
+                        }
                         break 'request (reply_rx, frame_rx);
                     }
                     if let Ok(reply) = reply_rx.try_recv() {
@@ -4116,10 +4625,13 @@ return botster.register({
                             response.error.unwrap().code,
                             "plugin_invocation_backpressured"
                         );
+                        refused = true;
+                    }
+                    if refused && daemon.runtime().unwrap().host_executor().outstanding() == 0 {
                         break;
                     }
-                    // Core can refuse transient admission contention. Retire that refusal before retrying.
-                    // Host preparation results remain in their mailbox until all eight providers are ready.
+                    // Collect admission phases before retaining each completed provider.
+                    collect_entity_test_host_completions(&daemon, &mut state);
                     if let Some(item) = state.owner_ready.pop_next() {
                         let mut budget =
                             crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
@@ -4140,6 +4652,15 @@ return botster.register({
             };
             replies.push(reply);
             frames.push(frame);
+        }
+        for item in deferred {
+            let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+            assert!(!dispatch_owner_ready_item(
+                &mut daemon,
+                &mut state,
+                item,
+                &mut budget
+            ));
         }
         // Route all real Core results before the next owner dispatch batch.
         let waiters = state
@@ -4430,7 +4951,7 @@ return botster.register({
     }
 
     #[test]
-    fn refused_entity_admission_retires_without_a_host_completion() {
+    fn refused_entity_admission_retires_with_reserved_host_capacity() {
         use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
         let root = unique_package_control_dir("entity-admission-retirement");
         let package_dir = root.join("owner-entity-gate");
@@ -4477,8 +4998,8 @@ return botster.register({
         }
         let executor = runtime.host_executor();
         let mut host_permits = Vec::new();
-        while let Some(permit) = executor.try_reserve() {
-            host_permits.push(permit);
+        for _ in 1..crate::host_executor::HOST_OPERATION_CAPACITY {
+            host_permits.push(executor.try_reserve().unwrap());
         }
         runtime.set_test_plugin_admit_backpressure(true);
         let mut state = DaemonControlState::default();
@@ -4508,6 +5029,26 @@ return botster.register({
             &mut state,
             item,
         );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.plugin_entities.causal_waiters.contains(&waiter) {
+            collect_entity_test_host_completions(&daemon, &mut state);
+            if let Some(item) = state.owner_ready.pop_next() {
+                crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                    &mut daemon,
+                    &mut state,
+                    item,
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "refusal must reach causal retirement"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            daemon.runtime().unwrap().host_executor().outstanding(),
+            crate::host_executor::HOST_OPERATION_CAPACITY
+        );
         assert!(state.plugin_entities.causal_waiters.contains(&waiter));
         assert_eq!(state.budget.outstanding(), 1);
         assert!(
@@ -4534,6 +5075,14 @@ return botster.register({
             &mut state,
             item,
         );
+        while state.plugin_entities.has_waiter(waiter) {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "refusal must finish with its reserved Host slot"
+            );
+            thread::yield_now();
+        }
         let response = receive_test_control_reply(reply).unwrap();
         assert!(response.error.is_some());
         assert_eq!(state.budget.outstanding(), 0);
@@ -4546,18 +5095,13 @@ return botster.register({
         assert!(
             !scopes
                 .identities(scope)
-                .unwrap()
+                .unwrap_or_default()
                 .iter()
                 .any(|identity| matches!(identity, LeaseIdentity::ProviderInFlight { .. }))
         );
-        assert!(
-            daemon
-                .runtime()
-                .unwrap()
-                .host_executor()
-                .try_reserve()
-                .is_none(),
-            "retirement required no Host slot"
+        assert_eq!(
+            daemon.runtime().unwrap().host_executor().outstanding(),
+            host_permits.len()
         );
         drop(host_permits);
         daemon.stop();
@@ -5870,10 +6414,17 @@ return botster.register({
                 },
             );
             assert_eq!(state.budget.outstanding(), baseline + 1);
-            assert!(
-                crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::from_secs(2)),
-                "the controlled entity worker must enter the gate"
-            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !crate::lua_runtime::wait_for_test_plugin_invocation_gate(Duration::ZERO)
+                || daemon.runtime().unwrap().host_executor().outstanding() != 0
+            {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "provider admission must release Host capacity while Lua waits"
+                );
+                thread::yield_now();
+            }
 
             if retire_reason == "connection_close" {
                 crate::daemon::control::entities::retire_plugin_entity_connection(
