@@ -2457,7 +2457,6 @@ fn commit_diagnostic_state(
     owner: &str,
     generation: u64,
 ) {
-    counters.prune_retired();
     if let Some(occupancy) = inner.producer.get_mut(owner)
         && occupancy.current_generation != generation
     {

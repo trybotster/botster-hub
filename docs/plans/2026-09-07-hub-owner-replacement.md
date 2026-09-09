@@ -635,3 +635,19 @@ would need one, and this plan contains no measurement.
   draft said otherwise; that is withdrawn.
 - The causal wake set for the timer gate is not established.
 - The idle wake rate is read from source, not observed. Proof 5 is the check.
+
+## 11. Diagnostic retirement contract, 2026-09-08
+
+Lifecycle retirement removes the exact diagnostic row immediately. Registration does not scan the registry for retired rows.
+This decision supersedes deferred admission pruning in the historical observability plan, S1d/AC11.
+
+Retirement resets the cell to zero count and bytes. It also clears the age, prior-generation gate, and invalid sample flag.
+Retirement closes writes even when another object retains the cell. An already closed cell must still reach the empty retired state.
+Live Empty rows remain registered. An exact generation key protects another generation with the same name.
+Cell retirement also checks Arc identity. A delayed old mailbox retirement must not remove or close its replacement.
+
+Required tests cover immediate row removal, retained closed handles, live Empty rows, generation isolation, and delayed old-cell retirement.
+This change removes the two global pruning scans. It does not establish diagnostic lock progress or close other owner scheduling findings.
+
+Validation used Rust 1.97.0 with `CARGO_INCREMENTAL=0` and two Cargo jobs.
+The `event_plane_counters::tests` suite passed 17 tests. The `package_event_router::tests` suite passed 60 tests.
