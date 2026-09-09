@@ -110,6 +110,7 @@ pub struct HubRuntime {
     coordination_bridge: HubCoordinationBridge,
     entity_publish_bridge: HubEntityPublishBridge,
     entity_publish_wait: Cell<PublicationWait>,
+    entity_publish_retirement: std::cell::RefCell<Option<PublicationRetirement>>,
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
     package_entity_epoch: std::cell::Cell<u64>,
     package_entity_resync_releases: std::cell::RefCell<BTreeSet<(String, u64)>>,
@@ -356,6 +357,7 @@ impl HubRuntime {
             coordination_bridge: HubCoordinationBridge::new(),
             entity_publish_bridge: HubEntityPublishBridge::new(),
             entity_publish_wait: Cell::new(PublicationWait::Ready),
+            entity_publish_retirement: std::cell::RefCell::new(None),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_epoch: std::cell::Cell::new(0),
             package_entity_resync_releases: std::cell::RefCell::new(BTreeSet::new()),
@@ -457,6 +459,7 @@ impl HubRuntime {
             coordination_bridge: HubCoordinationBridge::new(),
             entity_publish_bridge: HubEntityPublishBridge::new(),
             entity_publish_wait: Cell::new(PublicationWait::Ready),
+            entity_publish_retirement: std::cell::RefCell::new(None),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_epoch: std::cell::Cell::new(0),
             package_entity_resync_releases: std::cell::RefCell::new(BTreeSet::new()),
@@ -849,6 +852,11 @@ impl HubRuntime {
             .map(|state| state.generation)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_stop_host_submissions(&mut self) {
+        self.host_executor.test_stop_submissions();
+    }
+
     #[doc(hidden)]
     pub fn test_fulfill_pending_publishes(&self) {
         self.fulfill_pending_entity_publish_requests();
@@ -879,13 +887,28 @@ impl HubRuntime {
                 return Err(error);
             }
         };
-        self.admit_package_entity_publish(
+        let (result, discarded, release) = self.admit_package_entity_publish(
             PluginKey(plugin_key.to_string()),
             mutation,
             scope_id,
             0,
             reservation,
-        )
+        );
+        drop(discarded);
+        let (response, receiver) = std::sync::mpsc::channel();
+        assert!(self.entity_publish_retirement.borrow().is_none());
+        *self.entity_publish_retirement.borrow_mut() = Some(PublicationRetirement {
+            disposed: false,
+            worker_owned: false,
+            response,
+            result,
+            release,
+        });
+        self.complete_entity_publish_disposal();
+        self.finish_entity_publish_retirement();
+        receiver
+            .try_recv()
+            .unwrap_or_else(|_| Err("publication retirement is pending".into()))
     }
 
     #[doc(hidden)]
@@ -1592,6 +1615,7 @@ impl HubRuntime {
 
     pub(crate) fn entity_publish_ready(&self) -> bool {
         self.entity_publish_wait.get() == PublicationWait::Ready
+            && self.entity_publish_retirement.borrow().is_none()
             && self.entity_publish_bridge.ready()
     }
 
@@ -1613,10 +1637,70 @@ impl HubRuntime {
         }
     }
 
+    /// Synchronous runtime pumping uses the same admission and retirement transitions.
     pub(crate) fn step_entity_publish(&self) {
+        if self
+            .entity_publish_retirement
+            .borrow()
+            .as_ref()
+            .is_some_and(|pending| pending.worker_owned)
+        {
+            return;
+        }
+        if self.entity_publish_retirement.borrow().is_none() {
+            if let Some(payload) = self.begin_entity_publish() {
+                drop(payload);
+                self.complete_entity_publish_disposal();
+            }
+        }
+        self.finish_entity_publish_retirement();
+    }
+
+    pub(crate) fn entity_publish_retirement_pending(&self) -> bool {
+        self.entity_publish_retirement.borrow().is_some()
+    }
+
+    pub(crate) fn mark_entity_publish_worker_owned(&self) {
+        self.entity_publish_retirement
+            .borrow_mut()
+            .as_mut()
+            .expect("worker retains its publication")
+            .worker_owned = true;
+    }
+
+    pub(crate) fn complete_entity_publish_disposal(&self) {
+        self.entity_publish_retirement
+            .borrow_mut()
+            .as_mut()
+            .expect("disposal retains its publication")
+            .disposed = true;
+    }
+
+    pub(crate) fn finish_entity_publish_retirement(&self) -> CausalTransitionStatus {
+        let mut retirement = self.entity_publish_retirement.borrow_mut();
+        let Some(pending) = retirement.as_mut() else {
+            return CausalTransitionStatus::Applied;
+        };
+        if !pending.disposed {
+            return CausalTransitionStatus::Waiting;
+        }
+        if pending.release.is_some() {
+            let reservation = match self.reserve_causal_transition() {
+                Ok(reservation) => reservation,
+                Err(status) => return status,
+            };
+            reservation.commit(pending.release.take().unwrap());
+        }
+        let pending = retirement.take().unwrap();
+        let _ = pending.response.send(pending.result);
+        CausalTransitionStatus::Applied
+    }
+
+    /// The daemon must reserve Host and Owner capacity before this call.
+    pub(crate) fn begin_entity_publish(&self) -> Option<PackageEntityMutation> {
         use crate::package_event_router::CausalAcquireResult;
         if !self.entity_publish_ready() {
-            return;
+            return None;
         }
         let selected = self.entity_publish_bridge.take_if(|pending| {
             let reservation = match self.reserve_causal_transition() {
@@ -1654,9 +1738,9 @@ impl HubRuntime {
             Some((reservation, acquired))
         });
         let Some((pending, (reservation, acquired))) = selected else {
-            return;
+            return None;
         };
-        let result = if acquired {
+        let (result, discarded, release) = if acquired {
             self.admit_package_entity_publish(
                 pending.plugin_key,
                 pending.mutation,
@@ -1665,9 +1749,25 @@ impl HubRuntime {
                 reservation,
             )
         } else {
-            Err("causal scope no longer exists".into())
+            (
+                Err("causal scope no longer exists".into()),
+                Some(pending.mutation),
+                None,
+            )
         };
-        let _ = pending.response.send(result);
+        if discarded.is_some() {
+            *self.entity_publish_retirement.borrow_mut() = Some(PublicationRetirement {
+                disposed: false,
+                worker_owned: false,
+                response: pending.response,
+                result,
+                release,
+            });
+        } else {
+            assert!(release.is_none());
+            let _ = pending.response.send(result);
+        }
+        discarded
     }
 
     fn admit_package_entity_publish(
@@ -1677,31 +1777,33 @@ impl HubRuntime {
         scope_id: Option<u64>,
         publication_token: u64,
         reservation: CausalReservation<'_>,
-    ) -> Result<PackageEntityPublishResult, String> {
+    ) -> (
+        Result<PackageEntityPublishResult, String>,
+        Option<PackageEntityMutation>,
+        Option<CausalOp>,
+    ) {
         let pending_identity = LeaseIdentity::PendingEntityPublish {
             plugin_key: plugin_key.0.clone(),
             publication_token,
         };
         let mut reservation = Some(reservation);
-        let result = self.admit_package_entity_publish_inner(
-            plugin_key.clone(),
+        let (result, discarded) = match self.admit_package_entity_publish_inner(
+            plugin_key,
             mutation,
             scope_id,
             publication_token,
             &mut reservation,
-        );
-        if let Some(scope_id) = scope_id
-            && result.is_err()
-        {
-            reservation
-                .take()
-                .expect("publication retains its transition reservation")
-                .commit(CausalOp::Release {
-                    scope_id,
-                    identity: pending_identity,
-                });
-        }
-        result
+        ) {
+            Ok((result, discarded)) => (Ok(result), discarded),
+            Err((error, mutation)) => (Err(error), Some(mutation)),
+        };
+        let release = scope_id
+            .filter(|_| discarded.is_some())
+            .map(|scope_id| CausalOp::Release {
+                scope_id,
+                identity: pending_identity,
+            });
+        (result, discarded, release)
     }
 
     fn admit_package_entity_publish_inner(
@@ -1711,20 +1813,27 @@ impl HubRuntime {
         scope_id: Option<u64>,
         publication_token: u64,
         reservation: &mut Option<CausalReservation<'_>>,
-    ) -> Result<PackageEntityPublishResult, String> {
+    ) -> Result<
+        (PackageEntityPublishResult, Option<PackageEntityMutation>),
+        (String, PackageEntityMutation),
+    > {
         let mutation_seq = mutation.snapshot_seq();
         let entity_type = mutation.entity_type().to_string();
         let package_name = plugin_key.0.as_str();
         let owned_families = self.plugin_entity_provider_families(package_name);
         if !owned_families.contains(&entity_type) {
-            return Err(format!(
-                "entity_publish family {entity_type} is not provided by package {package_name}"
+            return Err((
+                format!(
+                    "entity_publish family {entity_type} is not provided by package {package_name}"
+                ),
+                mutation,
             ));
         }
         let entity_kind = EntityKind(entity_type.clone());
         let owner_token = package_entity_owner_token(package_name);
-        EntityContract::validate_entity_type(&entity_kind, Some(&owner_token))
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = EntityContract::validate_entity_type(&entity_kind, Some(&owner_token)) {
+            return Err((error.to_string(), mutation));
+        }
 
         let now = Instant::now();
         let mut families = self
@@ -1740,14 +1849,15 @@ impl HubRuntime {
             .map_or(0, |family| family.pending_by_seq.len());
         // The pending count bounds every mutation that this admission can release.
         if !fanout.has_capacity_for_admission(pending_count) {
-            return Err(
+            return Err((
                 "entity_publish queue sequence exhausted (entity_fanout_sequence_exhausted)".into(),
-            );
+                mutation,
+            ));
         }
         let family = families
             .entry(entity_type.clone())
             .or_insert_with(|| self.new_package_entity_family());
-        let (result, ready) = family.admit(mutation, now);
+        let (result, ready, discarded) = family.admit(mutation, now);
         let incoming_lease = scope_id.map(|scope_id| EntityMutationLease {
             scope_id,
             family: entity_type.clone(),
@@ -1772,7 +1882,7 @@ impl HubRuntime {
             });
         }
         if let Some(scope_id) = scope_id {
-            self.settle_entity_publish_lease(
+            let mut op = settle_entity_publish_op(
                 family,
                 scope_id,
                 &plugin_key.0,
@@ -1780,10 +1890,20 @@ impl HubRuntime {
                 &entity_type,
                 mutation_seq,
                 &result,
-                reservation
-                    .take()
-                    .expect("publication retains its transition reservation"),
             );
+            if discarded.is_some() {
+                if let CausalOp::Transfer { from, to, .. } = &mut op {
+                    // Resync can finish before disposal. Keep the publication lease until both finish.
+                    to.push(from.clone());
+                    reservation.take().unwrap().commit(op);
+                    family.remember_resync_lease(scope_id, entity_type.clone());
+                }
+            } else {
+                reservation.take().unwrap().commit(op);
+                if result.ok && result.resync_needed {
+                    family.remember_resync_lease(scope_id, entity_type.clone());
+                }
+            }
         }
         self.index_family_resync_releases(&entity_type, family);
         drop(families);
@@ -1794,7 +1914,7 @@ impl HubRuntime {
         }
         drop(fanout);
         self.note_package_entity_resync_changed();
-        Ok(result)
+        Ok((result, discarded))
     }
 
     /// Take admitted mutations for callers outside the owner delivery path.
@@ -1861,7 +1981,7 @@ impl HubRuntime {
             result,
         );
         reservation.commit(op);
-        if result.resync_needed {
+        if result.ok && result.resync_needed {
             family.remember_resync_lease(scope_id, entity_type.to_string());
         }
     }
@@ -5423,10 +5543,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fanout_sequence_exhaustion_preserves_publication_state() {
-        let mut runtime = family_runtime("fanout-admission-exhaustion");
-        let root = std::env::temp_dir().join(format!("fanout-provider-{}", std::process::id()));
+    fn publication_provider_runtime(label: &str) -> (HubRuntime, std::path::PathBuf) {
+        let mut runtime = family_runtime(label);
+        let root =
+            std::env::temp_dir().join(format!("fanout-provider-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("botster-package.json"),
@@ -5460,6 +5580,12 @@ return botster.register({ handlers = {{
         runtime
             .load_lua_plugin_package(policy.registry(), "producer")
             .unwrap();
+        (runtime, root)
+    }
+
+    #[test]
+    fn fanout_sequence_exhaustion_preserves_publication_state() {
+        let (runtime, root) = publication_provider_runtime("fanout-admission-exhaustion");
         let frame = |seq| {
             serde_json::json!({
                 "type": "entity_upsert", "entity_type": "producer.item",
@@ -5512,6 +5638,82 @@ return botster.register({ handlers = {{
             runtime.apply_causal_owner_ops();
         }
         assert!(runtime.causal_scopes.identities(scope_id).is_none());
+        drop(families);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_disposal_preserves_resync_in_both_release_orders() {
+        for resync_first in [false, true] {
+            let (runtime, root) = publication_provider_runtime(if resync_first {
+                "resync-first"
+            } else {
+                "disposal-first"
+            });
+            let scope = runtime.causal_scopes.mint().unwrap();
+            let bridge = runtime.entity_publish_bridge();
+            let response = bridge.test_queue_publish(PluginKey("producer".into()),
+                serde_json::json!({"type": "entity_remove", "entity_type": "producer.item", "snapshot_seq": 100, "id": "item"}), Some(scope));
+            let payload = runtime
+                .begin_entity_publish()
+                .expect("out-of-window publication returns its original payload");
+            runtime.mark_entity_publish_worker_owned();
+            let pending = LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+                publication_token: 1,
+            };
+            let resync = LeaseIdentity::ProviderResyncNeed {
+                family: "producer.item".into(),
+                generation: runtime
+                    .package_entity_family_generation("producer.item")
+                    .unwrap(),
+            };
+            if resync_first {
+                assert!(matches!(
+                    runtime.admit_causal_op(CausalOp::Release {
+                        scope_id: scope,
+                        identity: resync.clone()
+                    }),
+                    CausalAdmitResult::Applied
+                ));
+                runtime.apply_causal_owner_ops();
+                runtime.apply_causal_owner_ops();
+                assert_eq!(
+                    runtime.causal_scopes.identities(scope).unwrap(),
+                    BTreeSet::from([pending.clone()])
+                );
+            }
+            drop(payload);
+            runtime.complete_entity_publish_disposal();
+            assert_eq!(
+                runtime.finish_entity_publish_retirement(),
+                CausalTransitionStatus::Applied
+            );
+            assert_eq!(
+                response.try_recv().unwrap().unwrap().status,
+                PackageEntityPublishStatus::ResyncScheduled
+            );
+            if !resync_first {
+                runtime.apply_causal_owner_ops();
+                runtime.apply_causal_owner_ops();
+                assert_eq!(
+                    runtime.causal_scopes.identities(scope).unwrap(),
+                    BTreeSet::from([resync.clone()])
+                );
+                assert!(matches!(
+                    runtime.admit_causal_op(CausalOp::Release {
+                        scope_id: scope,
+                        identity: resync
+                    }),
+                    CausalAdmitResult::Applied
+                ));
+            }
+            runtime.apply_causal_owner_ops();
+            assert!(!runtime.causal_scopes.is_live(scope));
+            drop(runtime);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -6732,6 +6934,14 @@ return botster.register({ handlers = {{
         assert!(!scopes.is_live(errored));
         assert_eq!(scopes.lease_count(errored), None);
     }
+}
+
+struct PublicationRetirement {
+    disposed: bool,
+    worker_owned: bool,
+    response: std::sync::mpsc::Sender<Result<PackageEntityPublishResult, String>>,
+    result: Result<PackageEntityPublishResult, String>,
+    release: Option<CausalOp>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

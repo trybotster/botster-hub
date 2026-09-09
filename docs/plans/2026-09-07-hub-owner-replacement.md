@@ -797,6 +797,27 @@ The owner uses a nonblocking try/arm/retry lock protocol before it reserves caus
 The owner removes the exact head only after those prerequisites succeed.
 Capacity waits and table-lock waits have separate wake sources.
 A fault latches under the bridge guard. After that boundary, timeout cannot retract the retained source.
+
+Daemon publication admission reserves Host and Owner permits and an exact dispatch identity before it removes the bridge head.
+Family admission and validation return each discarded mutation to the caller.
+The daemon transfers that mutation to the existing Host disposal command.
+One runtime row retains the response, scalar result, and required publication release.
+The Host slot bounds the removed payload while the bridge can refill.
+This adds at most one removed request to the bridge's logical byte limit.
+
+An out-of-window publication can start resync work while its payload still requires disposal.
+Admission first commits a transfer that retains `PendingEntityPublish` and establishes `ProviderResyncNeed`.
+Only then does the runtime expose the resync obligation.
+The exact Host completion confirms disposal before the owner admits the separate publication release.
+Either release order preserves the remaining obligation.
+MissingScope never releases an unacquired lease.
+
+FIFO pressure retains the completion, response, release, and both permits.
+Submission failure retains the original command and both permits for recovery.
+Causal faults retain the row even after the response receiver closes.
+Synchronous runtime pumping cannot finish a disposal owned by a Host worker.
+Shutdown waits for queued publications and retained disposal.
+Bridge retraction wakes the shutdown waiter even when no publication remains ready.
 Before that boundary, timeout can retract an unacquired request.
 
 Each pending publication lease includes its unique checked token.
@@ -822,6 +843,10 @@ Current local evidence:
 - Two wake tests passed for a retained scan cursor, a captured upper bound, and a live waiter after ready-queue exhaustion.
 - The configured full Lua integration run passed 43 tests and failed five.
 - The rerun outside the sandbox passed 46 tests and failed one cross-package managed-spawn test.
+- The disposal checkpoint passed 32 focused library tests.
+- Those tests cover actual Host execution, independent capacity waits, stopped submission, causal pressure, fault retention, shutdown wake, and both resync release orders.
+- The disposal checkpoint also passed 13 integration tests and the asynchronous Lua daemon publication test.
+- The integration fixture now applies queued causal work before it checks the final lease set after out-of-window publication.
 
 The first integration run found an oversize error-text mismatch, an obsolete directory-recovery fixture, a spawn timeout, and two socket-permission failures.
 The bridge now preserves the existing oversize error code.
@@ -838,7 +863,8 @@ They do not establish a matching final Hub binary or complete foundation accepta
 Identity byte accounting for the causal FIFO remains open.
 Causal table updates compare and clone identity strings, but dispatch still uses an opaque movement charge.
 Publication parsing and mutation size validation now run on the Lua worker.
-The owner still checks current family ownership and destroys rejected payloads.
+The daemon now disposes of rejected payloads on a Host worker.
+The owner still checks current family ownership and clones the provider-family set.
 Family admission can also release a complete consecutive pending run in one owner step.
-The next implementation step must transfer disposal to a worker and make family admission incremental.
+The next implementation step must make family admission incremental and bound the remaining owner inspection work.
 The broader owner scheduling, memory, final Core pin, and matched client requirements remain open.

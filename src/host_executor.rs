@@ -533,6 +533,11 @@ impl HostExecutor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_stop_submissions(&mut self) {
+        self.jobs.take();
+    }
+
     pub(crate) fn bind_owner_wake(&self, sender: ControlSender) {
         self.wake.bind(sender);
     }

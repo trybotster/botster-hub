@@ -270,6 +270,11 @@ pub(crate) fn handle_runtime(
                     if crate::daemon::control::entities::plugin_entity_cleanup_pending(state) {
                         return ControlPoll::Pending;
                     }
+                    if runtime.entity_publish_retirement_pending()
+                        || runtime.entity_publish_bridge().pending_publish_count() > 0
+                    {
+                        return ControlPoll::Pending;
+                    }
                     if runtime.event_plane_owner_ops_pending() {
                         return ControlPoll::Pending;
                     }

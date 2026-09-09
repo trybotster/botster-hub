@@ -331,6 +331,10 @@ pub(crate) fn mark_package_entity_resync_deadline_ready(
     true
 }
 
+pub(crate) fn mark_publication_owner_ready(state: &mut DaemonControlState) {
+    mark_background_ready(state, BackgroundWork::EntityPublish);
+}
+
 pub(crate) fn mark_event_owner_ready(state: &mut DaemonControlState) {
     mark_background_ready(state, BackgroundWork::EventOwner);
 }
@@ -346,8 +350,11 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
 /// Read persistent notification bits before the owner can block.
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
-    if state.budget.take_capacity_notification() && state.event_owner.waiting_for_owner {
-        mark_event_owner_ready(state);
+    if state.budget.take_capacity_notification() {
+        if state.event_owner.waiting_for_owner {
+            mark_event_owner_ready(state);
+        }
+        state.publication_owner.waiting_for_owner = false;
     }
     if let Some(runtime) = daemon.runtime() {
         if runtime.take_event_plane_owner_ops_notification() {
@@ -365,11 +372,16 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         let table_progress = runtime.causal_scopes().take_progress_notification();
         let capacity_progress = runtime.take_causal_capacity_notification();
         runtime.note_entity_publish_progress(table_progress, capacity_progress);
-        runtime.entity_publish_bridge().take_progress_notification();
-        if runtime.entity_publish_ready() {
-            mark_background_ready(state, BackgroundWork::EntityPublish);
+        if runtime.entity_publish_bridge().take_progress_notification() {
+            crate::daemon::control::pending::wake_shutdown_waiter(state);
         }
         let causal_progress = table_progress | capacity_progress;
+        if causal_progress {
+            state.publication_owner.note_causal_progress();
+        }
+        if state.publication_owner.ready(runtime) {
+            mark_background_ready(state, BackgroundWork::EntityPublish);
+        }
         if causal_progress {
             if state.causal_wake_active {
                 state.causal_wake_again = true;
@@ -721,11 +733,8 @@ pub(crate) fn run_background_ready_item(
             }
         }
         BackgroundWork::EntityPublish => {
-            if let Some(runtime) = daemon.runtime() {
-                runtime.step_entity_publish();
-                if runtime.entity_publish_ready() {
-                    mark_background_ready(state, BackgroundWork::EntityPublish);
-                }
+            if crate::daemon::publication_owner::drive(daemon, state) {
+                mark_background_ready(state, BackgroundWork::EntityPublish);
             }
         }
         BackgroundWork::CausalDrain => {
@@ -1458,6 +1467,7 @@ fn run_pump_observe_phase(
 
 pub(crate) struct DaemonControlState {
     pub(crate) event_owner: crate::daemon::event_owner::EventOwnerState,
+    pub(crate) publication_owner: crate::daemon::publication_owner::PublicationOwnerState,
     pub(crate) logical_clock: u64,
     pub(crate) drain_cursors: BTreeMap<String, u64>,
     pub(crate) egress_diagnostics: DaemonEgressDiagnostics,
@@ -1555,6 +1565,7 @@ impl Default for DaemonControlState {
     fn default() -> Self {
         Self {
             event_owner: crate::daemon::event_owner::EventOwnerState::default(),
+            publication_owner: crate::daemon::publication_owner::PublicationOwnerState::default(),
             logical_clock: 1,
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
@@ -2497,6 +2508,28 @@ mod tests {
             Some(WaiterId(10)),
             "the current pass must not poll the same failed waiter"
         );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_retraction_wakes_the_shutdown_waiter_without_a_completion() {
+        let root = unique_package_control_dir("publication-retraction-shutdown");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let waiter = crate::owner_identity::WaiterId(10);
+        retain_family_waiter_for_wake_test(&mut state, 10);
+        state.family_cleanup_waiters.clear();
+        state.shutdown_waiter = Some(waiter);
+        let bridge = daemon.runtime().unwrap().entity_publish_bridge();
+        let _response = bridge.test_queue_publish(botster_core::PluginKey("absent".into()),
+            serde_json::json!({"type": "entity_remove", "entity_type": "absent.items", "snapshot_seq": 1, "id": "item"}), None);
+        bridge.take_progress_notification();
+        assert!(state.pending_requests[&waiter].ready_key.is_none());
+        assert!(bridge.test_retract(1));
+        assert_eq!(bridge.pending_publish_count(), 0);
+        publish_completion_wakes(&daemon, &mut state);
+        assert!(state.pending_requests[&waiter].ready_key.is_some());
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }
