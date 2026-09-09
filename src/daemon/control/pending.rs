@@ -32,6 +32,18 @@ pub(crate) const READY_BACKGROUND: ReadyReasons = ReadyReasons::from_bits(1 << 5
 
 /// Outcome of one continuation poll.
 pub(crate) enum ControlPoll {
+    DeliverStatusResponse(
+        crate::status_response::PreparedStatusResponse,
+        crate::host_executor::HostWorkPermit,
+        u64,
+    ),
+    StatusResponseDelivered {
+        shutdown: bool,
+        received: bool,
+    },
+    StatusResponseRefused {
+        shutdown: bool,
+    },
     /// The request waits for a completion or another explicit wake.
     Pending,
     /// This request made partial progress and can continue through the ready queue.
@@ -286,8 +298,7 @@ impl OwnerRequestCompletion {
 pub(crate) fn request_must_finish(request: &DaemonRequest) -> bool {
     !matches!(
         request,
-        DaemonRequest::Status { .. }
-            | DaemonRequest::ListSessions { .. }
+        DaemonRequest::ListSessions { .. }
             | DaemonRequest::Whoami { .. }
             | DaemonRequest::ReadScreen { .. }
             | DaemonRequest::ReadModeFlags { .. }
@@ -549,6 +560,49 @@ pub(crate) fn poll_ready_request_item(
         let poll = (entry.continuation)(daemon, state);
         state.current_waiter_id = None;
         let reply = match poll {
+            ControlPoll::StatusResponseRefused { shutdown } => {
+                if reasons.contains(READY_DEADLINE) && entry.must_finish {
+                    flag_past_deadline(state, &mut entry);
+                }
+                state.deadlines.retire(waiter_id);
+                if let Some(runtime) = daemon.runtime() {
+                    runtime.retire_owner_core_waiter(waiter_id);
+                }
+                let received = entry
+                    .reply_tx
+                    .take()
+                    .send(Err(
+                        crate::daemon::error::DaemonTransportError::ControlThreadStopped,
+                    ))
+                    .is_ok();
+                let should_stop =
+                    super::request::finish_status_delivery(state, entry, shutdown, received);
+                if !should_stop {
+                    wake_shutdown_waiter(state);
+                }
+                return should_stop;
+            }
+            ControlPoll::DeliverStatusResponse(prepared, permit, phase) => {
+                again = super::status::submit_delivery(
+                    daemon, state, &mut entry, prepared, permit, phase,
+                );
+                None
+            }
+            ControlPoll::StatusResponseDelivered { shutdown, received } => {
+                if reasons.contains(READY_DEADLINE) && entry.must_finish {
+                    flag_past_deadline(state, &mut entry);
+                }
+                state.deadlines.retire(waiter_id);
+                if let Some(runtime) = daemon.runtime() {
+                    runtime.retire_owner_core_waiter(waiter_id);
+                }
+                let should_stop =
+                    super::request::finish_status_delivery(state, entry, shutdown, received);
+                if !should_stop {
+                    wake_shutdown_waiter(state);
+                }
+                return should_stop;
+            }
             ControlPoll::Pending => None,
             ControlPoll::Again => {
                 again = true;

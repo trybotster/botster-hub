@@ -397,6 +397,16 @@ impl Default for EventPlaneCounters {
     }
 }
 
+fn sort_queue_ages(rows: &mut [DaemonQueueAgeObservation]) {
+    rows.sort_by(|left, right| {
+        left.kind
+            .as_str()
+            .cmp(right.kind.as_str())
+            .then(left.identity.cmp(&right.identity))
+            .then(left.producer_generation.cmp(&right.producer_generation))
+    });
+}
+
 impl EventPlaneCounters {
     #[must_use]
     pub fn new() -> Self {
@@ -593,6 +603,51 @@ impl EventPlaneCounters {
     /// Saturation-safe snapshot. Never takes the router inner lock.
     #[must_use]
     pub fn snapshot(&self) -> DaemonObservabilityCounters {
+        self.snapshot_with_rows(self.snapshot_queue_ages())
+    }
+
+    /// Admit logical row, string, map, histogram, and sorting storage before allocation.
+    pub(crate) fn bounded_snapshot(
+        &self,
+        limit: usize,
+    ) -> Option<(DaemonObservabilityCounters, usize)> {
+        let registry = self.registry.read().ok();
+        let mut bytes = std::mem::size_of::<DaemonObservabilityCounters>();
+        bytes = bytes.checked_add(2 * LATENCY_BUCKETS * std::mem::size_of::<u64>())?;
+        // Counts can change during capture. Reserve every shed reason.
+        for index in 0..self.shed_by_reason.len() {
+            bytes = bytes.checked_add(std::mem::size_of::<(String, u64)>())?;
+            bytes = bytes.checked_add(status_name(index).len())?;
+        }
+        if let Some(registry) = registry.as_ref() {
+            // Stable sorting can allocate scratch storage for the complete row vector.
+            bytes = bytes.checked_add(
+                registry
+                    .len()
+                    .checked_mul(2 * std::mem::size_of::<DaemonQueueAgeObservation>())?,
+            )?;
+            for identity in registry.keys() {
+                bytes = bytes.checked_add(identity.identity.len())?;
+            }
+        }
+        if bytes > limit {
+            return None;
+        }
+        let mut rows = Vec::with_capacity(registry.as_ref().map_or(0, |rows| rows.len()));
+        if let Some(registry) = registry.as_ref() {
+            for (identity, entry) in registry.iter() {
+                rows.push(self.observation_for(identity, entry));
+            }
+        }
+        drop(registry);
+        sort_queue_ages(&mut rows);
+        Some((self.snapshot_with_rows(rows), bytes))
+    }
+
+    fn snapshot_with_rows(
+        &self,
+        queue_ages: Vec<DaemonQueueAgeObservation>,
+    ) -> DaemonObservabilityCounters {
         let mut event_shed_by_reason = BTreeMap::new();
         for (index, slot) in self.shed_by_reason.iter().enumerate() {
             let count = slot.load(Ordering::Relaxed);
@@ -600,7 +655,6 @@ impl EventPlaneCounters {
                 event_shed_by_reason.insert(status_name(index).to_string(), count);
             }
         }
-        let queue_ages = self.snapshot_queue_ages();
         let mut snapshot = DaemonObservabilityCounters::default();
         snapshot.event_shed_by_reason = event_shed_by_reason;
         snapshot.event_admission_attempts = self.admission_attempts.load(Ordering::Relaxed);
@@ -644,13 +698,7 @@ impl EventPlaneCounters {
         for (identity, entry) in registry.iter() {
             rows.push(self.observation_for(identity, entry));
         }
-        rows.sort_by(|left, right| {
-            left.kind
-                .as_str()
-                .cmp(right.kind.as_str())
-                .then(left.identity.cmp(&right.identity))
-                .then(left.producer_generation.cmp(&right.producer_generation))
-        });
+        sort_queue_ages(&mut rows);
         rows
     }
 

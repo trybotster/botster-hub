@@ -1356,3 +1356,64 @@ The 21 lower package-event tests also pass after the reader changes.
 Changed Rust files pass formatting and the patch whitespace check.
 Terminal disposal of retained Host owners also remains open.
 This checkpoint does not establish complete Owner accounting or matched client evidence.
+
+## 2026-09-09 Status construction and output checkpoint
+
+The Status and Shutdown request families now use `control/status.rs`.
+One existing Host job constructs and encodes each diagnostic response.
+The Host worker destroys the typed response and its seed before publishing encoded output.
+Shutdown retains that output and its original Host permit through `StopForStatus`.
+A later Host phase sends the response after the stop phase.
+The Owner receives only the shutdown and delivery-result scalars.
+The Owner still resolves a pending update reply and waits for the existing delivery acknowledgment.
+A failed send returns its allocation to the Host worker for destruction.
+
+Preparation checks logical storage before copying the seed into the response.
+The count includes vector elements, map entries, strings, both histograms, and stable-sort scratch storage.
+The counter registry remains locked between sizing and copying its rows.
+Preparation counts encoded JSON before allocating the encoded frame.
+The existing 8 MiB preparation reservation and 1 MiB response limit remain unchanged.
+These checks cover logical storage bytes. They do not measure allocator capacity or map-node padding.
+
+Each Host permit retains a sender for the existing job channel.
+`HostWorkPermit::dispose` uses that permit to submit disposal without another slot.
+A refused disposal returns the original command and permit without adding nested wrappers.
+A lost completion stops ordinary execution and leaves workers available for disposal.
+Workers exit after the last retained sender is released and queued jobs are drained.
+No additional pool or worker thread exists.
+
+The separated Status source checkpoint passed 12 focused tests:
+
+- Three response tests preserve frame fields, reject typed or encoded overflow, and preserve Shutdown when fallback encoding fails.
+- Two disposal tests verify worker destruction and eventual worker exit after executor or completion loss.
+- One shutdown test verifies the original slot and charge through preparation, stop, and delivery.
+- One failed-send test verifies charge release and the shutdown result.
+- One Host test verifies that an unencodable response still stops entrypoints and releases its charge.
+- Two production continuation tests verify oversized Shutdown output and delivery refusal after the stop phase.
+- Two existing tests verify retained submission failures and worktree adoption after completion loss.
+
+The command `cargo test --lib --no-run --jobs 2` compiled the separated source.
+All 12 tests ran individually from that test binary with exact test names.
+The raw logs are `/private/tmp/botster-status-only-check-1.log` and `/private/tmp/botster-status-only-focused-1.log`.
+This evidence does not close the complete Owner accounting contract.
+
+The following dependencies remain explicit:
+
+- `request::handle` creates observability before family-level Host admission.
+  Its egress diagnostics and lifecycle map still require Owner sizing and copy accounting.
+- `control::status::handle` calls `HubDaemon::status` to capture host identity, package counts, and reconciliation vectors on Owner.
+- The Core inventory producer still uses the old complete-vector API in this checkpoint.
+  Its replacement must admit the result before allocation and retain the original Host reservation with the ticket.
+- `control::status::handle` still calls `live_attach_occupancy_rows` on Owner after the Core result.
+- `control::status::capture_input` still captures software, installation, compatibility, and WebRTC records on Owner.
+  These operations are not free or off-owner work.
+- Counter sampling now occurs during the Host preparation phase, before Shutdown stops entrypoints.
+- Status retains its request row through Host completion after the reply closes or its deadline passes.
+  This prevents ordinary request retirement from dropping retained Host work on Owner.
+- Buffered Host completions at executor destruction require a separate disposal transfer.
+- Final destruction of `host_recovery` and retained continuations still needs an explicit terminal ownership handoff.
+  Exceptional disposal refusal at that final boundary has no accepted retention or destruction policy.
+- Root approved an explicit capacity response for oversized Shutdown output.
+  The Host preserves the original request ID and the admitted stop effect independently from the wire response kind.
+  An unencodable fallback closes the reply on Host after the stop phase.
+  The production continuation and fallback regressions passed in the separated Status source checkpoint.

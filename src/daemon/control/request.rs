@@ -216,6 +216,48 @@ pub(crate) fn poll_one_ready(
 
 /// Post-process one complete response and send it. Returns `true` after a
 /// `shutdown` response.
+pub(crate) fn finish_status_delivery(
+    state: &mut DaemonControlState,
+    entry: PendingControlRequest,
+    shutdown: bool,
+    received: bool,
+) -> bool {
+    if let Some(permit) = entry.permit {
+        if let Some(recovery) = state.host_recovery.get_mut(&entry.waiter_id) {
+            recovery.retain_owner_permit(permit);
+        } else {
+            state.budget.release(permit);
+        }
+    }
+    if shutdown {
+        state.shutdown_waiter = None;
+        finish_shutdown_update_reply(state);
+    }
+    crate::daemon::owner_loop::wait_for_response_delivery(
+        shutdown,
+        received,
+        entry.response_delivery_rx,
+    );
+    shutdown
+}
+
+fn finish_shutdown_update_reply(state: &mut DaemonControlState) {
+    if let Some(update_reply_tx) = state.pending_hub_update_reply.take() {
+        let _ = send_control_response(
+            update_reply_tx,
+            Ok(daemon_hub_update(DaemonHubUpdate {
+                state: DaemonHubUpdateState::Unavailable,
+                current_version: software_identity().version,
+                available_version: None,
+                build_revision: None,
+                reason: Some("daemon_shutdown".to_string()),
+                action: Some("retry".to_string()),
+            })),
+            None,
+        );
+    }
+}
+
 fn finish(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
@@ -368,20 +410,8 @@ fn finish(
     if response
         .as_ref()
         .is_ok_and(|response| response.kind == DaemonResponseKind::Shutdown)
-        && let Some(update_reply_tx) = state.pending_hub_update_reply.take()
     {
-        let _ = send_control_response(
-            update_reply_tx,
-            Ok(daemon_hub_update(DaemonHubUpdate {
-                state: DaemonHubUpdateState::Unavailable,
-                current_version: software_identity().version,
-                available_version: None,
-                build_revision: None,
-                reason: Some("daemon_shutdown".to_string()),
-                action: Some("retry".to_string()),
-            })),
-            None,
-        );
+        finish_shutdown_update_reply(state);
     }
     // Reply first so surface-action publish can return before fanout delivery.
     // Attach writes `attaching` before Core attach work. Bound adapters then
