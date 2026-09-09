@@ -62,12 +62,13 @@ impl HubRuntime {
                     cursor.release = Some(mutation_release(lease));
                     return FamilyCleanupStep::Pending;
                 }
-                if let Some((scope_id, family_name)) = family.resync.leases.pop_first() {
+                if let Some(scope_id) = family.resync.leases.pop_first() {
                     cursor.release = Some(CausalOp::Release {
                         scope_id,
                         identity: LeaseIdentity::ProviderResyncNeed {
-                            family: family_name,
-                            generation: family.generation,
+                            family_token: family
+                                .causal_token
+                                .expect("resync lease has a family token"),
                         },
                     });
                     return FamilyCleanupStep::Pending;
@@ -187,8 +188,7 @@ fn mutation_release(lease: crate::package_entity_fanout::EntityMutationLease) ->
     CausalOp::Release {
         scope_id: lease.scope_id,
         identity: LeaseIdentity::AdmittedEntityMutation {
-            family: lease.family,
-            generation: lease.generation,
+            family_token: lease.family_token,
             seq: lease.seq,
         },
     }

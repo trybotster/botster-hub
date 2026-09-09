@@ -410,8 +410,7 @@ mod tests {
         let scope = runtime
             .causal_scopes()
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
-                family: family.into(),
-                generation: runtime.package_entity_family_generation(family).unwrap(),
+                family_token: runtime.test_family_causal_token(family),
                 seq: 1,
             }))
             .unwrap();

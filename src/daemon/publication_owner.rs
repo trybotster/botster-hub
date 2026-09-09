@@ -383,12 +383,8 @@ mod tests {
         assert!(!drive(&daemon, &mut state));
         assert!(gap.try_recv().unwrap().unwrap().resync_needed);
         runtime.apply_causal_owner_ops();
-        let generation = runtime
-            .package_entity_family_generation("producer.item")
-            .unwrap();
         let admitted = LeaseIdentity::AdmittedEntityMutation {
-            family: "producer.item".into(),
-            generation,
+            family_token: runtime.test_family_causal_token("producer.item"),
             seq: 2,
         };
         assert!(

@@ -3900,8 +3900,7 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
         scopes.identities(success),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::AdmittedEntityMutation {
-                generation: 0,
-                family: "lease-probe.item".into(),
+                family_token: hub.test_family_causal_token("lease-probe.item"),
                 seq: 1,
             }
         ]))
@@ -3947,8 +3946,7 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
         scopes.identities(success),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::ProviderResyncNeed {
-                generation: 0,
-                family: "lease-probe.item".into(),
+                family_token: hub.test_family_causal_token("lease-probe.item"),
             }
         ]))
     );
@@ -3998,8 +3996,7 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
         scopes.identities(degraded),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::ProviderResyncNeed {
-                generation: 0,
-                family: "lease-probe.item".into(),
+                family_token: hub.test_family_causal_token("lease-probe.item"),
             }
         ]))
     );
@@ -4078,8 +4075,7 @@ fn package_cleanup_detaches_all_old_families() {
         let family = format!("unload.item{index}");
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
-                generation: 0,
-                family: family.clone(),
+                family_token: hub.test_family_causal_token(&family),
                 seq: index as u64,
             }))
             .expect("mint");
@@ -4111,8 +4107,7 @@ fn active_resync_leftovers_retry_after_convergence() {
     for _ in 0..CAUSAL_TEST_BACKLOG {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
-                generation: 0,
-                family: "active.item".into(),
+                family_token: hub.test_family_causal_token("active.item"),
             }))
             .expect("mint");
         hub.test_store_resync_lease(scope, "active.item");
@@ -4159,8 +4154,7 @@ fn package_cleanup_releases_detached_resync_leases() {
     for _ in 0..CAUSAL_TEST_BACKLOG {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
-                generation: 0,
-                family: "resync.item".into(),
+                family_token: hub.test_family_causal_token("resync.item"),
             }))
             .expect("mint");
         hub.test_store_resync_lease(scope, "resync.item");
@@ -4307,8 +4301,7 @@ fn production_fanout_finish_retains_its_original_state_until_capacity_returns() 
         scopes.identities(live),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::AdmittedEntityMutation {
-                family: "lease-probe.item".into(),
-                generation: 0,
+                family_token: hub.test_family_causal_token("lease-probe.item"),
                 seq: 1
             }
         ]))
@@ -4324,8 +4317,7 @@ fn production_fanout_finish_retains_its_original_state_until_capacity_returns() 
         scopes.identities(live),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::ProviderResyncNeed {
-                family: "lease-probe.item".into(),
-                generation: 0
+                family_token: hub.test_family_causal_token("lease-probe.item"),
             }
         ]))
     );
@@ -4426,8 +4418,7 @@ fn owner_causal_queue_retains_its_head_during_reader_contention() {
             },
             to: [
                 Some(LeaseIdentity::AdmittedEntityMutation {
-                    family: "item".into(),
-                    generation: 0,
+                    family_token: 1,
                     seq: 1
                 }),
                 None,
@@ -4440,8 +4431,7 @@ fn owner_causal_queue_retains_its_head_during_reader_contention() {
         hub.admit_causal_op(CausalOp::Release {
             scope_id: live,
             identity: LeaseIdentity::AdmittedEntityMutation {
-                family: "item".into(),
-                generation: 0,
+                family_token: 1,
                 seq: 1
             },
         }),

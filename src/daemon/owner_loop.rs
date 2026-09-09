@@ -1811,12 +1811,10 @@ mod tests {
                     scopes.acquire(
                         scope,
                         crate::package_event_router::LeaseIdentity::AdmittedEntityMutation {
-                            family: "cleanup.plugin.item".into(),
-                            generation: daemon
+                            family_token: daemon
                                 .runtime()
                                 .unwrap()
-                                .package_entity_family_generation("cleanup.plugin.item")
-                                .unwrap(),
+                                .test_family_causal_token("cleanup.plugin.item"),
                             seq,
                         }
                     )
@@ -4164,8 +4162,10 @@ return botster.register({
         let scopes = runtime.causal_scopes().clone();
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
-                family: "owner-entity-gate.entity".into(),
-                generation: 0,
+                family_token: daemon
+                    .runtime()
+                    .unwrap()
+                    .test_family_causal_token("owner-entity-gate.entity"),
             }))
             .unwrap();
         runtime.test_store_resync_lease(scope, "owner-entity-gate.entity");
