@@ -3215,6 +3215,34 @@ impl CausalScopeTable {
         self.admit_causal(op, true)
     }
 
+    /// Apply only the owner FIFO head. This method never queues an operation.
+    /// Waiting and Fault return the operation without changing its ownership.
+    /// The owner must not mix this path with independent pending-queue admission.
+    pub(crate) fn try_apply_or_wait(&self, op: CausalOp) -> CausalWaitResult {
+        let notice = CausalUnlockNotice::new(self);
+        if self.causal_fault(&notice) {
+            return CausalWaitResult::Fault(op);
+        }
+        if self.drain_blocked.load(Ordering::SeqCst) & CAUSAL_INNER_UNLOCK != 0 {
+            return CausalWaitResult::Waiting(op);
+        }
+        match self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, true, true) {
+            Ok(mut inner) => {
+                apply_causal_locked(&mut inner, &op);
+                CausalWaitResult::Applied
+            }
+            Err(CausalLockError::Busy) => CausalWaitResult::Waiting(op),
+            Err(CausalLockError::Poisoned) => CausalWaitResult::Fault(op),
+        }
+    }
+
+    /// The owner can try its FIFO head unless an inner unlock or fault blocks it.
+    /// This query does not indicate whether the owner FIFO contains an operation.
+    #[must_use]
+    pub(crate) fn apply_ready(&self) -> bool {
+        self.drain_blocked.load(Ordering::SeqCst) & CAUSAL_INNER_UNLOCK == 0 && !self.is_faulted()
+    }
+
     fn admit_causal(&self, op: CausalOp, wait: bool) -> CausalWaitResult {
         let notice = CausalUnlockNotice::new(self);
         if self.causal_fault(&notice) {
@@ -3410,6 +3438,235 @@ mod tests {
             .inner
             .try_lock()
             .expect("inner is unlocked before notification");
+    }
+
+    #[test]
+    fn causal_owner_apply_changes_only_the_supplied_operation_without_queue_access() {
+        let table = CausalScopeTable::new();
+        let pending_identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+        };
+        let scope_id = table
+            .mint_with_lease(Some(pending_identity.clone()))
+            .unwrap();
+        let mutation = LeaseIdentity::AdmittedEntityMutation {
+            family: "producer.item".into(),
+            generation: 4,
+            seq: 1,
+        };
+        let resync = LeaseIdentity::ProviderResyncNeed {
+            family: "producer.item".into(),
+            generation: 4,
+        };
+        assert!(table.apply_ready());
+        {
+            // A held legacy queue cannot block this path or receive the operation.
+            let _pending = table.pending.try_lock().unwrap();
+            assert_eq!(
+                table.try_apply_or_wait(CausalOp::Transfer {
+                    scope_id,
+                    from: pending_identity,
+                    to: vec![mutation.clone(), resync.clone()],
+                }),
+                CausalWaitResult::Applied
+            );
+            assert_eq!(table.pending_len.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(
+            table.identities(scope_id),
+            Some(BTreeSet::from([mutation.clone(), resync.clone()]))
+        );
+        assert_eq!(
+            table.try_apply_or_wait(CausalOp::Release {
+                scope_id,
+                identity: mutation
+            }),
+            CausalWaitResult::Applied
+        );
+        assert_eq!(
+            table.identities(scope_id),
+            Some(BTreeSet::from([resync.clone()]))
+        );
+        assert_eq!(
+            table.try_apply_or_wait(CausalOp::Release {
+                scope_id,
+                identity: resync
+            }),
+            CausalWaitResult::Applied
+        );
+        assert_eq!(table.identities(scope_id), None);
+        assert!(!table.pending_ops());
+        assert!(table.apply_ready());
+        assert!(
+            !table.take_progress_notification(),
+            "uncontended application does not wake itself"
+        );
+    }
+
+    #[test]
+    fn causal_owner_apply_closes_inner_unlock_races_before_arm_and_retry() {
+        for release_point in [
+            CausalTestPoint::BeforeInnerArm,
+            CausalTestPoint::BeforeInnerRetry,
+        ] {
+            let table = Arc::new(CausalScopeTable::new());
+            let identity = LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            };
+            let scope_id = table.mint_with_lease(Some(identity.clone())).unwrap();
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker_table = Arc::clone(&table);
+            let worker = thread::spawn(move || {
+                worker_table.test_with_inner_held(|| {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                done_tx.send(()).unwrap();
+            });
+            held_rx.recv().unwrap();
+            let done_rx = Mutex::new(done_rx);
+            let weak = Arc::downgrade(&table);
+            *table.progress_test_probe.try_lock().unwrap() = Some(Arc::new(move |point| {
+                if point == release_point {
+                    release_tx.send(()).unwrap();
+                    done_rx.lock().unwrap().recv().unwrap();
+                }
+                if point == CausalTestPoint::BeforeNotify {
+                    assert_causal_locks_free(&weak.upgrade().unwrap());
+                }
+            }));
+            assert_eq!(
+                table.try_apply_or_wait(CausalOp::Release { scope_id, identity }),
+                CausalWaitResult::Applied
+            );
+            worker.join().unwrap();
+            assert_eq!(table.identities(scope_id), None);
+            assert!(table.apply_ready());
+            assert_eq!(table.interests.load(Ordering::SeqCst), 0);
+            assert_eq!(table.drain_blocked.load(Ordering::SeqCst), 0);
+            assert!(!table.pending_ops());
+            assert!(table.take_progress_notification());
+        }
+    }
+
+    #[test]
+    fn causal_owner_apply_parks_without_polling_and_retains_a_full_channel_wake() {
+        let table = Arc::new(CausalScopeTable::new());
+        let identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+        };
+        let scope_id = table.mint_with_lease(Some(identity.clone())).unwrap();
+        let op = CausalOp::Release { scope_id, identity };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(ControlMessage::CausalProgressPublished)
+            .unwrap();
+        table.bind_owner_wake(sender);
+        let arms = Arc::new(AtomicUsize::new(0));
+        let retries = Arc::new(AtomicUsize::new(0));
+        let observed_arms = Arc::clone(&arms);
+        let observed_retries = Arc::clone(&retries);
+        let weak = Arc::downgrade(&table);
+        *table.progress_test_probe.try_lock().unwrap() = Some(Arc::new(move |point| match point {
+            CausalTestPoint::BeforeInnerArm => {
+                observed_arms.fetch_add(1, Ordering::SeqCst);
+            }
+            CausalTestPoint::BeforeInnerRetry => {
+                observed_retries.fetch_add(1, Ordering::SeqCst);
+            }
+            CausalTestPoint::BeforeNotify => assert_causal_locks_free(&weak.upgrade().unwrap()),
+            _ => {}
+        }));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_table = Arc::clone(&table);
+        let worker = thread::spawn(move || {
+            worker_table.test_with_inner_held(|| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        held_rx.recv().unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                table.try_apply_or_wait(op.clone()),
+                CausalWaitResult::Waiting(op.clone())
+            );
+            assert!(!table.apply_ready());
+            assert!(!table.pending_ops());
+            assert!(!table.take_progress_notification());
+        }
+        assert_eq!(arms.load(Ordering::SeqCst), 1);
+        assert_eq!(retries.load(Ordering::SeqCst), 1);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(table.apply_ready());
+        assert!(
+            table.take_progress_notification(),
+            "the bit survives a full channel"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CausalProgressPublished)
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(table.try_apply_or_wait(op), CausalWaitResult::Applied);
+        assert_eq!(table.identities(scope_id), None);
+        assert!(!table.pending_ops());
+        assert!(!table.take_progress_notification());
+    }
+
+    #[test]
+    fn causal_owner_apply_fault_retains_the_operation_and_prebind_notification() {
+        let table = CausalScopeTable::new();
+        let identity = LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+        };
+        let scope_id = table.mint_with_lease(Some(identity.clone())).unwrap();
+        let op = CausalOp::Release {
+            scope_id,
+            identity: identity.clone(),
+        };
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.test_with_inner_held(|| {
+                assert_eq!(
+                    table.try_apply_or_wait(op.clone()),
+                    CausalWaitResult::Waiting(op.clone())
+                );
+                panic!("poison the inner lock while the owner waits");
+            });
+        }));
+        assert!(fault.is_err());
+        assert!(table.is_faulted());
+        assert!(!table.apply_ready());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        table.bind_owner_wake(sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CausalProgressPublished)
+        ));
+        assert!(table.take_progress_notification());
+        for _ in 0..3 {
+            assert_eq!(
+                table.try_apply_or_wait(op.clone()),
+                CausalWaitResult::Fault(op.clone())
+            );
+            assert!(
+                !table.take_progress_notification(),
+                "a persistent fault does not poll"
+            );
+            assert!(!table.pending_ops());
+        }
+        let inner = match table.inner.try_lock() {
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            _ => panic!("the oracle must observe a poisoned lock"),
+        };
+        assert_eq!(
+            inner.scopes.get(&scope_id).unwrap().identities,
+            BTreeSet::from([identity])
+        );
     }
 
     #[test]
