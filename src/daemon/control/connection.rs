@@ -37,12 +37,14 @@ pub(crate) fn handle(
         | ControlMessage::ConnectionCleanup(_)
         | ControlMessage::RejectedConnection => false,
         ControlMessage::RegisterUnixAdmission {
+            event_reader,
             client_id,
             admission,
             reply_tx,
             host_required_features,
         } => register_unix_admission(
             state,
+            event_reader,
             client_id,
             admission,
             reply_tx,
@@ -85,6 +87,7 @@ pub(crate) fn handle(
 
 fn register_unix_admission(
     state: &mut DaemonControlState,
+    event_reader: Arc<crate::subscription::package_events::ClientEventReader>,
     client_id: String,
     admission: UnixTerminalAdmission,
     reply_tx: oneshot::Sender<()>,
@@ -97,6 +100,7 @@ fn register_unix_admission(
     state.pending_runtime.admission.host_compatibility.insert(
         client_id.clone(),
         HostCompatibilityRecord {
+            event_reader: Some(event_reader),
             required_features: host_required_features,
         },
     );
@@ -126,6 +130,7 @@ fn register_webrtc_admission(
         state.pending_runtime.admission.host_compatibility.insert(
             grant_id.clone(),
             HostCompatibilityRecord {
+                event_reader: None,
                 required_features: host_required_features,
             },
         );
@@ -638,16 +643,10 @@ pub(crate) fn retire_route_owner(
             }
         }
         ChannelClass::Event => {
-            if let Some(runtime) = daemon.runtime()
-                && let crate::admission::reservations::ReservationBinding::Event { mailbox } =
-                    &reservation.binding
+            if let crate::admission::reservations::ReservationBinding::Event { mailbox } =
+                &reservation.binding
             {
-                state.event_plane.cleanup_subscription_if_mailbox(
-                    grant_id,
-                    &reservation.subscription_id,
-                    mailbox,
-                    runtime.package_event_router(),
-                );
+                crate::daemon::client_events::retire_mailbox(state, mailbox);
             }
         }
         ChannelClass::Control | ChannelClass::Terminal => {}

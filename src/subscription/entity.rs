@@ -568,6 +568,7 @@ impl SessionTypeCatalogCache {
             HostResult::EntityModelComplete(_)
             | HostResult::PluginEntity(_)
             | HostResult::EventOwner(_)
+            | HostResult::ClientEventCleanup(_)
             | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
@@ -632,6 +633,7 @@ impl SessionTypeCatalogCache {
             HostResult::EntityModelComplete(_)
             | HostResult::PluginEntity(_)
             | HostResult::EventOwner(_)
+            | HostResult::ClientEventCleanup(_)
             | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
@@ -1241,6 +1243,9 @@ pub(crate) fn absorb_session_type_catalog_completions(
     state: &mut DaemonControlState,
     owner_turn: &mut OwnerTurnBudget,
 ) {
+    if state.host_completion_drain_faulted {
+        return;
+    }
     let Some(runtime) = daemon.runtime() else {
         return;
     };
@@ -1267,48 +1272,7 @@ pub(crate) fn absorb_session_type_catalog_completions(
     {
         match executor.poll_completion() {
             HostCompletionPoll::Ready(completion) => {
-                if state.publication_owner.accepts(completion.identity) {
-                    state.publication_owner.retain_completion(completion);
-                    crate::daemon::owner_loop::mark_publication_owner_ready(state);
-                } else if state
-                    .package_entity_resync_scan
-                    .accepts(completion.identity)
-                {
-                    state
-                        .package_entity_resync_scan
-                        .retain_completion(completion);
-                    crate::subscription::entity_resync::mark_ready(state);
-                } else if state.event_owner.accepts(completion.identity) {
-                    state.event_owner.retain_completion(completion);
-                    crate::daemon::owner_loop::mark_event_owner_ready(state);
-                } else if state.session_type_catalog.accepts(completion.identity) {
-                    let waiter_id = completion.identity.waiter_id;
-                    if state
-                        .session_type_catalog
-                        .retain_completion(completion)
-                        .is_some()
-                    {
-                        let _ = state.owner_ready.mark(
-                            waiter_id,
-                            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
-                            crate::daemon::control::pending::READY_HOST_COMPLETION,
-                        );
-                    }
-                } else if state
-                    .plugin_entities
-                    .accepts_host_completion(completion.identity)
-                {
-                    let waiter = completion.identity.waiter_id;
-                    state.plugin_entities.retain_host_completion(completion);
-                    crate::daemon::control::entities::mark_plugin_entity_ready(
-                        state,
-                        waiter,
-                        crate::daemon::owner_schedule::ReadyClass::HostCompletion,
-                        crate::daemon::control::pending::READY_HOST_COMPLETION,
-                    );
-                } else {
-                    crate::daemon::control::pending::absorb_host_completion(state, completion);
-                }
+                route_host_completion(state, completion);
             }
             HostCompletionPoll::Empty => {
                 state.host_completion_drain_pending = false;
@@ -1332,6 +1296,59 @@ pub(crate) fn absorb_session_type_catalog_completions(
             .maintenance
             .wakes
             .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
+    }
+}
+
+/// Route by the original waiter before each family validates its exact phase and receipt.
+pub(crate) fn route_host_completion(state: &mut DaemonControlState, completion: HostCompletion) {
+    if state
+        .client_events
+        .owns_waiter(completion.identity.waiter_id)
+    {
+        let waiter = completion.identity.waiter_id;
+        state.client_events.retain_completion(completion);
+        crate::daemon::client_events::mark_ready(state, waiter);
+    } else if state.publication_owner.accepts(completion.identity) {
+        state.publication_owner.retain_completion(completion);
+        crate::daemon::owner_loop::mark_publication_owner_ready(state);
+    } else if state
+        .package_entity_resync_scan
+        .accepts(completion.identity)
+    {
+        state
+            .package_entity_resync_scan
+            .retain_completion(completion);
+        crate::subscription::entity_resync::mark_ready(state);
+    } else if state.event_owner.accepts(completion.identity) {
+        state.event_owner.retain_completion(completion);
+        crate::daemon::owner_loop::mark_event_owner_ready(state);
+    } else if state.session_type_catalog.accepts(completion.identity) {
+        let waiter_id = completion.identity.waiter_id;
+        if state
+            .session_type_catalog
+            .retain_completion(completion)
+            .is_some()
+        {
+            let _ = state.owner_ready.mark(
+                waiter_id,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            );
+        }
+    } else if state
+        .plugin_entities
+        .accepts_host_completion(completion.identity)
+    {
+        let waiter = completion.identity.waiter_id;
+        state.plugin_entities.retain_host_completion(completion);
+        crate::daemon::control::entities::mark_plugin_entity_ready(
+            state,
+            waiter,
+            crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+            crate::daemon::control::pending::READY_HOST_COMPLETION,
+        );
+    } else {
+        crate::daemon::control::pending::absorb_host_completion(state, completion);
     }
 }
 
@@ -1390,6 +1407,17 @@ fn publish_catalog_capacity_wake(state: &mut DaemonControlState, owner_turn: &mu
     }
     if state.event_owner.waiting_for_host {
         crate::daemon::owner_loop::mark_event_owner_ready(state);
+    }
+    while state.client_events.has_capacity_waiters() {
+        if owner_turn
+            .try_charge(Instant::now(), OwnerTurnCharge::opaque_move())
+            .is_err()
+        {
+            return;
+        }
+        if let Some(waiter) = state.client_events.pop_capacity_waiter() {
+            crate::daemon::client_events::mark_ready(state, waiter);
+        }
     }
     while state.plugin_controls.has_capacity_waiters() {
         if owner_turn

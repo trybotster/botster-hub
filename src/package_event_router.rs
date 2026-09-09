@@ -752,25 +752,38 @@ impl PackageEventRouter {
         subscribe_client_locked(&mut inner, holder)
     }
 
-    pub(crate) fn try_unsubscribe_client(
+    /// Run on a host worker. An absent or replaced holder has no remaining cleanup effect.
+    pub(crate) fn cleanup_client_holder(
         &self,
         connection_id: &str,
         subscription_id: &str,
-    ) -> EventPlaneStatus {
-        let mut inner = match lock_inner(&self.inner) {
-            Ok(inner) => inner,
-            Err(status) => return status,
+        mailbox: &Arc<crate::subscription::package_events::ClientEventMailbox>,
+    ) -> Result<(), crate::subscription::package_events::ClientCleanupFault> {
+        use crate::subscription::package_events::ClientCleanupFault;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ClientCleanupFault::RouterPoisoned)?;
+        let identity = (connection_id.to_string(), subscription_id.to_string());
+        let Some(key) = inner.client_by_id.get(&identity) else {
+            return Ok(());
         };
-        unsubscribe_client_locked(&mut inner, connection_id, subscription_id)
-    }
-
-    pub(crate) fn try_cleanup_client_connection(&self, connection_id: &str) -> EventPlaneStatus {
-        let mut inner = match lock_inner(&self.inner) {
-            Ok(inner) => inner,
-            Err(status) => return status,
-        };
-        cleanup_client_connection_locked(&mut inner, connection_id);
-        EventPlaneStatus::Accepted
+        let matches = inner
+            .client_holders
+            .get(&key.0)
+            .and_then(|events| events.get(&key.1))
+            .is_some_and(|holders| {
+                holders.iter().any(|registered| {
+                    let holder = &registered.holder;
+                    holder.connection_id == connection_id
+                        && holder.subscription_id == subscription_id
+                        && Arc::ptr_eq(&holder.mailbox, mailbox)
+                })
+            });
+        if matches {
+            let _ = unsubscribe_client_locked(&mut inner, connection_id, subscription_id);
+        }
+        Ok(())
     }
 
     pub fn try_ingress(
@@ -1936,18 +1949,6 @@ fn unsubscribe_client_locked(
         }
     }
     EventPlaneStatus::Accepted
-}
-
-fn cleanup_client_connection_locked(inner: &mut RouterInner, connection_id: &str) {
-    let identities: Vec<(String, String)> = inner
-        .client_by_id
-        .keys()
-        .filter(|(holder_connection, _)| holder_connection == connection_id)
-        .cloned()
-        .collect();
-    for (holder_connection, subscription_id) in identities {
-        let _ = unsubscribe_client_locked(inner, &holder_connection, &subscription_id);
-    }
 }
 
 fn deliver_to_client_holders(

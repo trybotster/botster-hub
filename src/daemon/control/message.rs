@@ -145,6 +145,7 @@ pub(crate) enum ControlMessage {
         terminal_record: LocalWebrtcSenderTerminalRecord,
     },
     RegisterUnixAdmission {
+        event_reader: std::sync::Arc<crate::subscription::package_events::ClientEventReader>,
         client_id: String,
         admission: UnixTerminalAdmission,
         reply_tx: oneshot::Sender<()>,

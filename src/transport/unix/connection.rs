@@ -127,7 +127,6 @@ pub(crate) async fn handle_connection_async(
     control_tx: ControlSender,
     cleanup_permit: tokio_mpsc::OwnedPermit<ControlMessage>,
     mut shutdown_rx: watch::Receiver<bool>,
-    event_plane: std::sync::Arc<crate::subscription::package_events::ClientEventPlane>,
     permit: OwnerPermit,
 ) -> DaemonTransportResult<()> {
     let client_id = format!(
@@ -185,9 +184,12 @@ pub(crate) async fn handle_connection_async(
         UnixTerminalAdmission::Admitted { mux, .. } => mux.clone(),
         UnixTerminalAdmission::Rejected { .. } => UnixConnectionMux::new(),
     };
+    let event_reader =
+        std::sync::Arc::new(crate::subscription::package_events::ClientEventReader::default());
     let (admission_ack_tx, admission_ack_rx) = oneshot::channel();
     control_tx
         .send(ControlMessage::RegisterUnixAdmission {
+            event_reader: std::sync::Arc::clone(&event_reader),
             client_id: client_id.clone(),
             admission,
             reply_tx: admission_ack_tx,
@@ -208,10 +210,14 @@ pub(crate) async fn handle_connection_async(
             let inbound = read_async_inbound(&mut reader, None);
             tokio::pin!(inbound);
             loop {
-                let event_mailbox = event_plane.mailbox(&client_id);
+                let event_mailbox = event_reader.mailbox();
                 let event_output_ready = event_mailbox
                     .as_ref()
                     .is_some_and(|mailbox| mailbox.has_ready_event());
+                #[cfg(test)]
+                if !event_output_ready {
+                    event_reader.test_after_empty_read();
+                }
                 tokio::select! {
                     biased;
                     inbound = &mut inbound => break inbound,
@@ -269,18 +275,8 @@ pub(crate) async fn handle_connection_async(
                             }
                         }
                     }
-                    _ = async {
-                        if let Some(mailbox) = event_mailbox.as_ref() {
-                            let notified = mailbox.notify().notified();
-                            tokio::pin!(notified);
-                            if mailbox.take_wake() || mailbox.has_ready_event() {
-                                return;
-                            }
-                            notified.await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    } => {
+                    _ = event_reader.wait() => {
+                        let event_mailbox = event_reader.mailbox();
                         mux.clear_deferred_flushes();
                         if let Err(error) = flush_unix_mux_writes(
                             &mut write_half,
@@ -294,6 +290,8 @@ pub(crate) async fn handle_connection_async(
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_millis(25)), if mux.has_unsent_mux_writes() || mux_write.has_pending() || event_output_ready => {
+                        #[cfg(test)]
+                        event_reader.test_note_timer();
                         mux.clear_deferred_flushes();
                         if let Err(error) = flush_unix_mux_writes(
                             &mut write_half,
@@ -339,7 +337,7 @@ pub(crate) async fn handle_connection_async(
                     &mut write_half,
                     &mux,
                     &mut mux_write,
-                    event_plane.mailbox(&client_id).as_deref(),
+                    event_reader.mailbox().as_deref(),
                 )
                 .await
                 {
@@ -389,7 +387,7 @@ pub(crate) async fn handle_connection_async(
                 &mux,
                 &mut mux_write,
                 Instant::now(),
-                event_plane.mailbox(&client_id).as_deref(),
+                event_reader.mailbox().as_deref(),
             )
             .await
             {
@@ -801,11 +799,7 @@ pub(crate) fn handle_connection_cleanup(
         .admission
         .host_compatibility
         .remove(&cleanup.client_id);
-    if let Some(runtime) = daemon.runtime() {
-        state
-            .event_plane
-            .cleanup_connection(&cleanup.client_id, runtime.package_event_router());
-    }
+    crate::daemon::client_events::close_connection(state, &cleanup.client_id);
     if let Some(UnixTerminalAdmission::Admitted { mux, .. }) = unix_admission {
         mux.close_all();
     }
@@ -834,6 +828,7 @@ pub(crate) fn handle_connection_cleanup(
         permit,
         "unix_connection_cleanup",
         Some(capture_owner),
+        Some(cleanup.client_id),
         candidates,
         now,
         |state, applied| {
@@ -887,7 +882,6 @@ pub(crate) fn handle_connection(
         control_tx,
         cleanup_permit,
         shutdown_rx,
-        std::sync::Arc::new(crate::subscription::package_events::ClientEventPlane::default()),
         permit,
     ));
     let _ = cleanup_control_rx.try_recv();

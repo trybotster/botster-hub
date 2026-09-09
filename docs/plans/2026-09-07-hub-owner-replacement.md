@@ -1291,3 +1291,68 @@ This boundary does not establish complete Owner work or memory accounting.
 Pending-provider scans, subscriber lookup, and resync request metadata still require the separate accounting review.
 `Readiness::read` scans family resync state on Host; it is not a constant-work Host query.
 Final Core allowance integration, canonical pins, and matched client evidence remain open.
+
+## Client event cleanup replacement, 2026-09-09
+
+Client event cleanup now retains the original connection record and subscription slots.
+The connection's original Owner permit covers live, provisional, retiring, and failed slots.
+The existing limit remains 64 slots per connection.
+The existing event and byte residency checks remain unchanged.
+No child Owner permit or additional cleanup pool was added.
+
+Subscribe records each provisional slot before router and residency effects.
+Reservation rollback and explicit unsubscribe retire that exact mailbox.
+Disconnect closes the original connection record.
+The first cleanup request publishes its own ready item.
+A full Host executor parks the record on the existing capacity wake.
+An active phase waits for its exact Host completion.
+Permanent faults retain the record and original permits without scheduling another attempt.
+
+The Host worker removes the exact router holder and reclaims mailbox payloads.
+The worker releases each payload before it releases the corresponding residency charge.
+The worker holds the connection slot lock only while it selects or removes a slot.
+Router contention during cleanup therefore does not hold the slot lock used by live readers.
+The disconnect obligation releases its Owner permit after route cleanup and event cleanup finish.
+
+The Unix transport retains one reader for its connection lifetime.
+Each sibling mailbox signals that reader.
+The reader registers its wake before it checks the wake bit and ready state.
+The reader uses the original connection handle without a global connection lookup.
+A slot-lock release signals the reader only when a reader observed contention.
+
+The focused production suite passed 10 tests in 3.60 seconds.
+The Unix test uses the real connection handler and two real event subscriptions.
+It retires one subscription while the router lock blocks reclamation.
+The sibling receives two events without more inbound traffic or timer assistance.
+The first event arrives between the reader's empty check and wake registration.
+Final connection cleanup releases the original Owner permit.
+
+Other passing cases cover full Host capacity, 64 retained slots, reservation expiry, and WebRTC disconnect without routes.
+Fault cases cover router, mailbox, residency, connection, lookup, submission, phase, panic, and forged completion identity.
+Waiter exhaustion refuses before subscription effects.
+Client ready-serial exhaustion retains initial work or an already-routed completion.
+Unsubscribe after package unload finishes; a duplicate unsubscribe does not cause repeated cleanup.
+
+The first expanded run passed eight tests and failed two test checks.
+The Unix test incorrectly sent final cleanup through the generic handler, which does not handle connection cleanup.
+The corrected test uses the production cleanup handler.
+The ready-exhaustion test originally stopped the shared Host drain before the receipt reached the client coordinator.
+The focused test now routes the actual worker receipt through the production completion dispatcher.
+The shared Host drain now records a terminal fault when its ready admission fails.
+The executor retains the original receipts and permits.
+The drain does not schedule another attempt or consume the mailbox after that fault.
+A separate production wake test verifies retention and no retry, even after the test installs a fresh ready queue.
+
+The final focused cleanup run passed 12 tests in 3.81 seconds.
+It includes the stronger Unix checkpoint immediately before the worker waits for the router.
+Reservation rollback checks cover a missing connection budget and a duplicate reservation.
+Both cases retain the original slot at full Host capacity and reclaim it after a capacity wake.
+The live sibling slot remains admitted.
+
+Three WebRTC tests initially stopped at peer creation because the sandbox denied socket access.
+The rerun with socket access passed all three tests in 2.63 seconds.
+Those tests cover feature negotiation, event and gap delivery without later traffic, and control progress during an event flood.
+The 21 lower package-event tests also pass after the reader changes.
+Changed Rust files pass formatting and the patch whitespace check.
+Terminal disposal of retained Host owners also remains open.
+This checkpoint does not establish complete Owner accounting or matched client evidence.

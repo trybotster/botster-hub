@@ -60,7 +60,11 @@ pub(crate) fn handle_client_event_request(
                     "subscribe_events",
                 );
             }
-            match state.event_plane.try_subscribe(
+            if let Err(error) = crate::daemon::client_events::admit_connection(state, connection_id)
+            {
+                return client_event_operator_error(error, &subscription_id, "subscribe_events");
+            }
+            match state.event_plane.subscribe_mailbox(
                 connection_id,
                 &subscription_id,
                 &owner,
@@ -69,7 +73,7 @@ pub(crate) fn handle_client_event_request(
                 runtime.package_event_router().policy(),
                 runtime.package_event_router(),
             ) {
-                Ok(()) => {
+                Ok(mailbox) => {
                     let mut response = subscribe_events_response();
                     let peer_generation = state
                         .pending_runtime
@@ -87,23 +91,6 @@ pub(crate) fn handle_client_event_request(
                             } => *peer_generation,
                         });
                     if let Some(peer_generation) = peer_generation {
-                        let Some(mailbox) = state
-                            .event_plane
-                            .subscription_mailbox(connection_id, &subscription_id)
-                        else {
-                            let _ = state.event_plane.try_unsubscribe(
-                                connection_id,
-                                &subscription_id,
-                                runtime.package_event_router(),
-                            );
-                            return client_event_operator_error(
-                                ClientEventAdmitError::Router(
-                                    crate::package_event_router::EventPlaneStatus::ShedBusy,
-                                ),
-                                &subscription_id,
-                                "subscribe_events",
-                            );
-                        };
                         state.pending_runtime.admission.next_subscription_generation = state
                             .pending_runtime
                             .admission
@@ -122,7 +109,7 @@ pub(crate) fn handle_client_event_request(
                                 peer_generation,
                                 crate::admission::reservations::now_seconds(),
                                 crate::admission::reservations::ReservationBinding::Event {
-                                    mailbox,
+                                    mailbox: std::sync::Arc::clone(&mailbox),
                                 },
                             );
                         match reserved {
@@ -164,11 +151,7 @@ pub(crate) fn handle_client_event_request(
                                         .admission
                                         .reservations
                                         .forget_label(&reservation.label, peer_generation);
-                                    let _ = state.event_plane.try_unsubscribe(
-                                        connection_id,
-                                        &subscription_id,
-                                        runtime.package_event_router(),
-                                    );
+                                    crate::daemon::client_events::retire_mailbox(state, &mailbox);
                                     return client_event_operator_error(
                                         ClientEventAdmitError::ConnectionCapacity,
                                         &subscription_id,
@@ -177,11 +160,7 @@ pub(crate) fn handle_client_event_request(
                                 }
                             }
                             Err(_) => {
-                                let _ = state.event_plane.try_unsubscribe(
-                                    connection_id,
-                                    &subscription_id,
-                                    runtime.package_event_router(),
-                                );
+                                crate::daemon::client_events::retire_mailbox(state, &mailbox);
                                 return client_event_operator_error(
                                     ClientEventAdmitError::DuplicateSubscription,
                                     &subscription_id,
@@ -193,6 +172,7 @@ pub(crate) fn handle_client_event_request(
                     response
                 }
                 Err(error) => {
+                    crate::daemon::client_events::note_cleanup(state, connection_id);
                     client_event_operator_error(error, &subscription_id, "subscribe_events")
                 }
             }
@@ -205,12 +185,12 @@ pub(crate) fn handle_client_event_request(
                     "unsubscribe_events",
                 );
             }
-            match state.event_plane.try_unsubscribe(
-                connection_id,
-                &subscription_id,
-                runtime.package_event_router(),
-            ) {
-                Ok(()) => {
+            match state
+                .event_plane
+                .retire_subscription(connection_id, &subscription_id)
+            {
+                Ok(mailbox) => {
+                    crate::daemon::client_events::retire_mailbox(state, &mailbox);
                     if let Some(peer_generation) = state
                         .pending_runtime
                         .admission

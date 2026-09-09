@@ -50,6 +50,8 @@ pub(crate) enum WebrtcTerminalAdmission {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HostCompatibilityRecord {
     pub required_features: Vec<String>,
+    pub event_reader:
+        Option<std::sync::Arc<crate::subscription::package_events::ClientEventReader>>,
 }
 
 #[derive(Default)]

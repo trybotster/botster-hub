@@ -46,6 +46,10 @@ impl HostError {
 }
 
 pub(crate) enum HostCommand {
+    ClientEventCleanup {
+        router: Arc<crate::package_event_router::PackageEventRouter>,
+        work: crate::subscription::package_events::ClientCleanupWork,
+    },
     EntityModel(crate::runtime::entity_model::Work),
     ReclaimEntityModel(crate::runtime::entity_model::Work),
     EventOwner {
@@ -94,7 +98,7 @@ impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
             Self::EntityModel(_) | Self::ReclaimEntityModel(_) => 0,
-            Self::EventOwner { .. } => 0,
+            Self::EventOwner { .. } | Self::ClientEventCleanup { .. } => 0,
             Self::PluginEntity(_) | Self::PreparePluginResponse { .. } | Self::StopEntrypoints => 0,
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
             Self::Mutation(_) => 0,
@@ -111,6 +115,7 @@ impl HostCommand {
 impl std::fmt::Debug for HostCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ClientEventCleanup { .. } => formatter.write_str("ClientEventCleanup"),
             Self::EntityModel(work) => formatter
                 .debug_tuple("EntityModel")
                 .field(&work.kind())
@@ -165,6 +170,12 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
+    ClientEventCleanup(
+        Result<
+            crate::subscription::package_events::ClientCleanupCompletion,
+            crate::subscription::package_events::ClientCleanupFailure,
+        >,
+    ),
     EntityModelComplete(crate::runtime::entity_model::Kind),
     EventOwner(
         Result<
@@ -201,7 +212,7 @@ impl HostResult {
     fn generation(&self) -> u64 {
         match self {
             Self::EntityModelComplete(_) => 0,
-            Self::EventOwner(_) => 0,
+            Self::EventOwner(_) | Self::ClientEventCleanup(_) => 0,
             Self::PluginEntity(_)
             | Self::PluginResponseAbandoned
             | Self::PluginResponseDelivered { .. }
@@ -286,7 +297,7 @@ fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
         HostResult::EntityModelComplete(_) => 0,
         // The router retains each allocation charge until worker destruction completes.
-        HostResult::EventOwner(_) => 0,
+        HostResult::EventOwner(_) | HostResult::ClientEventCleanup(_) => 0,
         HostResult::PluginEntity(crate::plugin_entity::Completion::Finished { .. }) => 0,
         HostResult::PluginEntity(_) => HOST_PREPARED_BYTE_CAPACITY,
         HostResult::PluginResponseAbandoned
@@ -780,6 +791,9 @@ fn execute(
         }
 
         HostCommand::EventOwner { router, work } => HostResult::EventOwner(work.run(&router)),
+        HostCommand::ClientEventCleanup { router, work } => {
+            HostResult::ClientEventCleanup(work.run(&router))
+        }
         HostCommand::PluginEntity(command) => {
             HostResult::PluginEntity(crate::plugin_entity::execute(command, permit))
         }
