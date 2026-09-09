@@ -739,6 +739,19 @@ pub(crate) fn run_background_ready_item(
         }
         BackgroundWork::CausalDrain => {
             if let Some(runtime) = daemon.runtime() {
+                // Charge the supplied operation. Table traversal has separate costs.
+                if owner_turn
+                    .try_charge(
+                        Instant::now(),
+                        crate::daemon::owner_turn::OwnerTurnCharge::inspection(
+                            std::mem::size_of::<crate::package_event_router::CausalOp>(),
+                        ),
+                    )
+                    .is_err()
+                {
+                    mark_background_ready(state, BackgroundWork::CausalDrain);
+                    return true;
+                }
                 runtime.apply_causal_owner_ops();
                 if runtime.causal_owner_ops_ready() {
                     mark_background_ready(state, BackgroundWork::CausalDrain);
@@ -2687,6 +2700,67 @@ mod tests {
             1,
             "fault retention preserves the original queued source"
         );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn causal_operation_waits_for_its_metadata_budget_without_removing_the_head() {
+        use crate::daemon::owner_turn::{
+            OWNER_TURN_INSPECTED_BYTE_LIMIT, OwnerTurnBudget, OwnerTurnCharge,
+        };
+        use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
+        let root = unique_package_control_dir("causal-metadata-budget");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let runtime = daemon.runtime().unwrap();
+        let scopes = runtime.causal_scopes().clone();
+        let scope_id = scopes
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight))
+            .unwrap();
+        assert_eq!(
+            runtime.admit_causal_op(CausalOp::Release {
+                scope_id,
+                identity: LeaseIdentity::EventInFlight,
+            }),
+            CausalAdmitResult::Applied
+        );
+        assert!(mark_background_ready(
+            &mut state,
+            BackgroundWork::CausalDrain
+        ));
+        let ready = state.owner_ready.pop_next().unwrap();
+        let operation_bytes = std::mem::size_of::<CausalOp>();
+        let now = Instant::now();
+        let mut budget = OwnerTurnBudget::new(now);
+        let initial_bytes = OWNER_TURN_INSPECTED_BYTE_LIMIT - operation_bytes + 1;
+        budget
+            .try_charge(now, OwnerTurnCharge::inspection(initial_bytes))
+            .unwrap();
+        assert!(run_background_ready_item(
+            &mut daemon,
+            &mut state,
+            ready,
+            &mut budget
+        ));
+        assert_eq!(budget.spent_inspected_bytes(), initial_bytes);
+        assert_eq!(daemon.runtime().unwrap().causal_operation_count(), 1);
+        assert_eq!(scopes.lease_count(scope_id), Some(1));
+
+        let ready = state
+            .owner_ready
+            .pop_next()
+            .expect("the deferred drain remains ready");
+        let mut next_turn = OwnerTurnBudget::new(Instant::now());
+        assert!(run_background_ready_item(
+            &mut daemon,
+            &mut state,
+            ready,
+            &mut next_turn
+        ));
+        assert_eq!(next_turn.spent_inspected_bytes(), operation_bytes);
+        assert_eq!(daemon.runtime().unwrap().causal_operation_count(), 0);
+        assert_eq!(scopes.lease_count(scope_id), None);
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }

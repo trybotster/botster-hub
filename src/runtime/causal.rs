@@ -6,6 +6,9 @@ use std::collections::VecDeque;
 use crate::package_event_router::CausalOp;
 
 pub const CAUSAL_OWNER_CAPACITY: usize = 256;
+/// Maximum occupied payload bytes, excluding the queue header and allocator overhead.
+pub const CAUSAL_OWNER_PAYLOAD_BYTES: usize =
+    CAUSAL_OWNER_CAPACITY * std::mem::size_of::<CausalOp>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CausalTransitionStatus {
@@ -14,11 +17,20 @@ pub enum CausalTransitionStatus {
     Fault,
 }
 
-#[derive(Default)]
 pub(super) struct CausalOwnerQueue {
     pending: RefCell<VecDeque<CausalOp>>,
     reserved: Cell<usize>,
     capacity_changed: Cell<bool>,
+}
+
+impl Default for CausalOwnerQueue {
+    fn default() -> Self {
+        Self {
+            pending: RefCell::new(VecDeque::with_capacity(CAUSAL_OWNER_CAPACITY)),
+            reserved: Cell::new(0),
+            capacity_changed: Cell::new(false),
+        }
+    }
 }
 
 /// A reservation covers the immediate transition, before its source changes.
@@ -101,6 +113,37 @@ impl Drop for CausalReservation<'_> {
 mod tests {
     use super::*;
     use crate::package_event_router::LeaseIdentity;
+
+    #[test]
+    fn full_queue_wrap_and_retry_preserve_the_initial_allocation() {
+        let queue = CausalOwnerQueue::default();
+        let capacity = queue.pending.borrow().capacity();
+        assert!(capacity >= CAUSAL_OWNER_CAPACITY);
+        assert!(!std::mem::needs_drop::<CausalOp>());
+        for scope_id in 0..CAUSAL_OWNER_CAPACITY as u64 {
+            queue.reserve().unwrap().commit(CausalOp::Release {
+                scope_id,
+                identity: LeaseIdentity::EventInFlight,
+            });
+        }
+        assert_eq!(
+            queue.len() * std::mem::size_of::<CausalOp>(),
+            CAUSAL_OWNER_PAYLOAD_BYTES
+        );
+        for scope_id in 0..(2 * CAUSAL_OWNER_CAPACITY) as u64 {
+            assert!(queue.reserve().is_none());
+            let head = queue.take_head().unwrap();
+            queue.restore_head(head);
+            assert_eq!(queue.take_head(), Some(head));
+            queue.note_applied();
+            queue.reserve().unwrap().commit(CausalOp::Release {
+                scope_id,
+                identity: LeaseIdentity::EventInFlight,
+            });
+            assert_eq!(queue.pending.borrow().capacity(), capacity);
+            assert_eq!(queue.len(), CAUSAL_OWNER_CAPACITY);
+        }
+    }
 
     #[test]
     fn reservations_and_operations_share_capacity() {
