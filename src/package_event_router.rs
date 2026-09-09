@@ -4,14 +4,16 @@
 //! and transient queues. It must not import HubRuntime, CoreDaemon, mlua, plugin
 //! persistence, or the owner loop.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::config::PackageEventPlanePolicy;
+use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::event_plane_counters::{
     AgeIdentity, EventPlaneCounters, ProducerAgeList, ProducerAgeRef, QueueAgeMetric,
 };
@@ -2709,6 +2711,15 @@ pub enum CausalAdmitResult {
     Retry(CausalOp),
 }
 
+/// A waiting or faulted operation remains owned by its caller.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum CausalWaitResult {
+    Applied,
+    Waiting(CausalOp),
+    Fault(CausalOp),
+}
+
 /// Owner-thread-only keyed operations. No mutex. Workers never read this map.
 #[derive(Debug, Default)]
 pub struct EventPlaneOwnerOps {
@@ -2873,6 +2884,80 @@ pub struct CausalScopeTable {
     pending: Mutex<VecDeque<CausalOp>>,
     pending_len: AtomicUsize,
     next_id: AtomicU64,
+    owner_wake: OnceLock<ControlSender>,
+    progress_pending: AtomicBool,
+    interests: AtomicUsize,
+    drain_blocked: AtomicUsize,
+    faulted: AtomicBool,
+    #[cfg(test)]
+    progress_test_probe: Mutex<Option<Arc<dyn Fn(CausalTestPoint) + Send + Sync>>>,
+}
+
+const CAUSAL_PENDING_UNLOCK: usize = 1;
+const CAUSAL_INNER_UNLOCK: usize = 2;
+const CAUSAL_CAPACITY: usize = 4;
+
+#[derive(Debug, PartialEq, Eq)]
+enum CausalLockError {
+    Busy,
+    Poisoned,
+}
+
+/// Declare this notice before every causal guard so notification follows all unlocks.
+struct CausalUnlockNotice<'a> {
+    table: &'a CausalScopeTable,
+    acquired: Cell<usize>,
+    capacity: Cell<bool>,
+    queued: Cell<bool>,
+    poisoned: Cell<bool>,
+}
+
+impl<'a> CausalUnlockNotice<'a> {
+    fn new(table: &'a CausalScopeTable) -> Self {
+        Self {
+            table,
+            acquired: Cell::new(0),
+            capacity: Cell::new(false),
+            queued: Cell::new(false),
+            poisoned: Cell::new(false),
+        }
+    }
+}
+
+impl Drop for CausalUnlockNotice<'_> {
+    fn drop(&mut self) {
+        let acquired = self.acquired.get();
+        let poisoned = self.poisoned.get()
+            || (acquired & CAUSAL_PENDING_UNLOCK != 0 && self.table.pending.is_poisoned())
+            || (acquired & CAUSAL_INNER_UNLOCK != 0 && self.table.inner.is_poisoned());
+        let new_fault = poisoned && !self.table.faulted.swap(true, Ordering::SeqCst);
+        self.table
+            .drain_blocked
+            .fetch_and(!acquired, Ordering::SeqCst);
+        let completed = acquired
+            | if self.capacity.get() {
+                CAUSAL_CAPACITY
+            } else {
+                0
+            };
+        let interested = self.table.interests.fetch_and(!completed, Ordering::SeqCst) & completed;
+        if interested != 0 || self.queued.get() || new_fault {
+            #[cfg(test)]
+            self.table
+                .run_progress_test_probe(CausalTestPoint::BeforeNotify);
+            self.table.publish_progress();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CausalTestPoint {
+    BeforePendingArm,
+    BeforePendingRetry,
+    BeforeInnerArm,
+    BeforeInnerRetry,
+    BeforeNotify,
 }
 
 #[derive(Debug, Default)]
@@ -2922,6 +3007,125 @@ impl CausalScopeTable {
             pending: Mutex::new(VecDeque::new()),
             pending_len: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
+            owner_wake: OnceLock::new(),
+            progress_pending: AtomicBool::new(false),
+            interests: AtomicUsize::new(0),
+            drain_blocked: AtomicUsize::new(0),
+            faulted: AtomicBool::new(false),
+            #[cfg(test)]
+            progress_test_probe: Mutex::new(None),
+        }
+    }
+
+    /// Bind once at owner startup. Repeating the same channel is harmless.
+    pub(crate) fn bind_owner_wake(&self, sender: ControlSender) {
+        if let Err(sender) = self.owner_wake.set(sender) {
+            assert!(
+                self.owner_wake
+                    .get()
+                    .expect("owner is bound")
+                    .same_channel(&sender),
+                "a causal table keeps its original owner channel"
+            );
+        }
+        if self.progress_pending.load(Ordering::SeqCst) {
+            self.send_progress_doorbell();
+        }
+    }
+
+    /// Harvest this retained bit after control traffic, even if the doorbell could not fit.
+    pub(crate) fn take_progress_notification(&self) -> bool {
+        self.progress_pending.swap(false, Ordering::SeqCst)
+    }
+
+    fn publish_progress(&self) {
+        if !self.progress_pending.swap(true, Ordering::SeqCst) {
+            self.send_progress_doorbell();
+        }
+    }
+
+    fn send_progress_doorbell(&self) {
+        if let Some(sender) = self.owner_wake.get() {
+            let _ = sender.try_send(ControlMessage::CausalProgressPublished);
+        }
+    }
+
+    fn causal_lock<'a, T>(
+        &'a self,
+        mutex: &'a Mutex<T>,
+        notice: &CausalUnlockNotice<'_>,
+        kind: usize,
+        wait: bool,
+        drain: bool,
+    ) -> Result<MutexGuard<'a, T>, CausalLockError> {
+        let first = self.try_causal_guard(mutex, notice, kind);
+        match first {
+            Err(CausalLockError::Busy) if wait => {
+                #[cfg(test)]
+                self.run_progress_test_probe(if kind == CAUSAL_PENDING_UNLOCK {
+                    CausalTestPoint::BeforePendingArm
+                } else {
+                    CausalTestPoint::BeforeInnerArm
+                });
+                if drain {
+                    self.drain_blocked.fetch_or(kind, Ordering::SeqCst);
+                }
+                self.interests.fetch_or(kind, Ordering::SeqCst);
+                #[cfg(test)]
+                self.run_progress_test_probe(if kind == CAUSAL_PENDING_UNLOCK {
+                    CausalTestPoint::BeforePendingRetry
+                } else {
+                    CausalTestPoint::BeforeInnerRetry
+                });
+                // The second attempt closes an unlock before interest registration.
+                let result = self.try_causal_guard(mutex, notice, kind);
+                if result.is_ok() && drain {
+                    self.drain_blocked.fetch_and(!kind, Ordering::SeqCst);
+                }
+                result
+            }
+            result => result,
+        }
+    }
+
+    fn try_causal_guard<'a, T>(
+        &'a self,
+        mutex: &'a Mutex<T>,
+        notice: &CausalUnlockNotice<'_>,
+        kind: usize,
+    ) -> Result<MutexGuard<'a, T>, CausalLockError> {
+        match mutex.try_lock() {
+            Ok(guard) => {
+                notice.acquired.set(notice.acquired.get() | kind);
+                Ok(guard)
+            }
+            Err(TryLockError::WouldBlock) => Err(CausalLockError::Busy),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                notice.acquired.set(notice.acquired.get() | kind);
+                notice.poisoned.set(true);
+                drop(poisoned.into_inner());
+                Err(CausalLockError::Poisoned)
+            }
+        }
+    }
+
+    fn causal_fault(&self, notice: &CausalUnlockNotice<'_>) -> bool {
+        let faulted = self.faulted.load(Ordering::SeqCst)
+            || self.pending.is_poisoned()
+            || self.inner.is_poisoned();
+        notice.poisoned.set(faulted);
+        faulted
+    }
+
+    #[cfg(test)]
+    fn run_progress_test_probe(&self, point: CausalTestPoint) {
+        let probe = self
+            .progress_test_probe
+            .try_lock()
+            .expect("test probe lock")
+            .clone();
+        if let Some(probe) = probe {
+            probe(point);
         }
     }
 
@@ -2932,8 +3136,11 @@ impl CausalScopeTable {
 
     #[must_use]
     pub fn mint_with_lease(&self, identity: Option<LeaseIdentity>) -> Option<u64> {
+        let notice = CausalUnlockNotice::new(self);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut inner = lock_causal(&self.inner)?;
+        let mut inner = self
+            .causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
+            .ok()?;
         let mut identities = BTreeSet::new();
         let mut leases = 0;
         if let Some(identity) = identity {
@@ -2945,7 +3152,10 @@ impl CausalScopeTable {
     }
 
     pub fn acquire(&self, scope_id: u64, identity: LeaseIdentity) -> bool {
-        let Ok(mut inner) = self.inner.try_lock() else {
+        let notice = CausalUnlockNotice::new(self);
+        let Ok(mut inner) =
+            self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
+        else {
             return false;
         };
         let Some(scope) = inner.scopes.get_mut(&scope_id) else {
@@ -2978,7 +3188,10 @@ impl CausalScopeTable {
 
     /// Undo one identity immediately when the caller still owns it.
     pub fn try_retract(&self, scope_id: u64, identity: LeaseIdentity) -> bool {
-        let Ok(mut inner) = self.inner.try_lock() else {
+        let notice = CausalUnlockNotice::new(self);
+        let Ok(mut inner) =
+            self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
+        else {
             return false;
         };
         apply_causal_locked(&mut inner, &CausalOp::Release { scope_id, identity });
@@ -2989,35 +3202,72 @@ impl CausalScopeTable {
     ///
     /// Later operations always append behind already-queued operations.
     pub fn try_admit(&self, op: CausalOp) -> CausalAdmitResult {
-        let Ok(mut pending) = self.pending.try_lock() else {
-            return CausalAdmitResult::Retry(op);
-        };
-        if pending.is_empty()
-            && let Ok(mut inner) = self.inner.try_lock()
-        {
-            apply_causal_locked(&mut inner, &op);
-            return CausalAdmitResult::Applied;
+        match self.admit_causal(op, false) {
+            CausalWaitResult::Applied => CausalAdmitResult::Applied,
+            CausalWaitResult::Waiting(op) | CausalWaitResult::Fault(op) => {
+                CausalAdmitResult::Retry(op)
+            }
+        }
+    }
+
+    /// Register the owner waiter before calling. Waiting never transfers operation ownership.
+    pub(crate) fn try_admit_or_wait(&self, op: CausalOp) -> CausalWaitResult {
+        self.admit_causal(op, true)
+    }
+
+    fn admit_causal(&self, op: CausalOp, wait: bool) -> CausalWaitResult {
+        let notice = CausalUnlockNotice::new(self);
+        if self.causal_fault(&notice) {
+            return CausalWaitResult::Fault(op);
+        }
+        let mut pending =
+            match self.causal_lock(&self.pending, &notice, CAUSAL_PENDING_UNLOCK, wait, false) {
+                Ok(pending) => pending,
+                Err(CausalLockError::Busy) => return CausalWaitResult::Waiting(op),
+                Err(CausalLockError::Poisoned) => return CausalWaitResult::Fault(op),
+            };
+        if pending.is_empty() {
+            match self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false) {
+                Ok(mut inner) => {
+                    apply_causal_locked(&mut inner, &op);
+                    return CausalWaitResult::Applied;
+                }
+                Err(CausalLockError::Poisoned) => return CausalWaitResult::Fault(op),
+                Err(CausalLockError::Busy) => {}
+            }
         }
         if pending.len() < CAUSAL_PENDING_MAX {
+            notice.queued.set(pending.is_empty());
             pending.push_back(op);
             self.pending_len.fetch_add(1, Ordering::SeqCst);
-            return CausalAdmitResult::Applied;
+            return CausalWaitResult::Applied;
         }
-        CausalAdmitResult::Retry(op)
+        if wait {
+            self.interests.fetch_or(CAUSAL_CAPACITY, Ordering::SeqCst);
+        }
+        CausalWaitResult::Waiting(op)
     }
 
     /// Attempt at most one queued operation without waiting for either lock.
     pub fn flush_pending(&self) -> usize {
-        let Ok(mut pending) = self.pending.try_lock() else {
+        let notice = CausalUnlockNotice::new(self);
+        if self.causal_fault(&notice) || !self.pending_ops() {
+            return 0;
+        }
+        let Ok(mut pending) =
+            self.causal_lock(&self.pending, &notice, CAUSAL_PENDING_UNLOCK, true, true)
+        else {
             return 0;
         };
-        let Ok(mut inner) = self.inner.try_lock() else {
+        let Ok(mut inner) = self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, true, true)
+        else {
             return 0;
         };
         let Some(op) = pending.pop_front() else {
             return 0;
         };
         self.pending_len.fetch_sub(1, Ordering::SeqCst);
+        notice.capacity.set(true);
         apply_causal_locked(&mut inner, &op);
         1
     }
@@ -3027,41 +3277,50 @@ impl CausalScopeTable {
         self.pending_len.load(Ordering::SeqCst) > 0
     }
 
+    /// A mutex unlock re-enables draining after contention. Poison requires owner recovery.
+    #[must_use]
+    pub(crate) fn pending_ready(&self) -> bool {
+        self.pending_ops()
+            && self.drain_blocked.load(Ordering::SeqCst) == 0
+            && !self.faulted.load(Ordering::SeqCst)
+            && !self.pending.is_poisoned()
+            && !self.inner.is_poisoned()
+    }
+
     #[doc(hidden)]
     pub fn test_with_inner_held<R>(&self, body: impl FnOnce() -> R) -> R {
+        let notice = CausalUnlockNotice::new(self);
         let _guard = self
-            .inner
-            .try_lock()
+            .causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
             .expect("test hold must acquire causal inner");
         body()
     }
 
     #[must_use]
     pub fn is_live(&self, scope_id: u64) -> bool {
-        match self.inner.try_lock() {
+        let notice = CausalUnlockNotice::new(self);
+        match self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false) {
             Ok(inner) => inner
                 .scopes
                 .get(&scope_id)
                 .is_some_and(|scope| scope.leases > 0),
-            Err(TryLockError::WouldBlock) => true,
-            Err(TryLockError::Poisoned(poisoned)) => {
-                drop(poisoned.into_inner());
-                true
-            }
+            Err(_) => true,
         }
     }
 
     #[must_use]
     pub fn lease_count(&self, scope_id: u64) -> Option<u32> {
-        self.inner
-            .try_lock()
+        let notice = CausalUnlockNotice::new(self);
+        self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
             .ok()
             .and_then(|inner| inner.scopes.get(&scope_id).map(|scope| scope.leases))
     }
 
     #[must_use]
     pub fn pending_publish_leases(&self) -> Vec<(u64, LeaseIdentity)> {
-        let Ok(inner) = self.inner.try_lock() else {
+        let notice = CausalUnlockNotice::new(self);
+        let Ok(inner) = self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
+        else {
             return Vec::new();
         };
         inner
@@ -3079,12 +3338,15 @@ impl CausalScopeTable {
     #[doc(hidden)]
     #[must_use]
     pub fn identities(&self, scope_id: u64) -> Option<BTreeSet<LeaseIdentity>> {
-        self.inner.try_lock().ok().and_then(|inner| {
-            inner
-                .scopes
-                .get(&scope_id)
-                .map(|scope| scope.identities.clone())
-        })
+        let notice = CausalUnlockNotice::new(self);
+        self.causal_lock(&self.inner, &notice, CAUSAL_INNER_UNLOCK, false, false)
+            .ok()
+            .and_then(|inner| {
+                inner
+                    .scopes
+                    .get(&scope_id)
+                    .map(|scope| scope.identities.clone())
+            })
     }
 }
 
@@ -3118,17 +3380,6 @@ fn apply_causal_locked(inner: &mut CausalInner, op: &CausalOp) {
     }
 }
 
-fn lock_causal(mutex: &Mutex<CausalInner>) -> Option<std::sync::MutexGuard<'_, CausalInner>> {
-    match mutex.try_lock() {
-        Ok(guard) => Some(guard),
-        Err(TryLockError::WouldBlock) => None,
-        Err(TryLockError::Poisoned(poisoned)) => {
-            drop(poisoned.into_inner());
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3136,6 +3387,395 @@ mod tests {
     use crate::subscription::package_events::ClientEventMailbox;
     use std::thread;
     use std::time::Duration as StdDuration;
+
+    fn causal_test_op(sequence: u64) -> CausalOp {
+        CausalOp::Release {
+            scope_id: sequence,
+            identity: LeaseIdentity::AdmittedEntityMutation {
+                family: "producer.item".into(),
+                generation: 4,
+                seq: sequence,
+            },
+        }
+    }
+
+    fn assert_causal_locks_free(table: &CausalScopeTable) {
+        let _pending = table
+            .pending
+            .try_lock()
+            .expect("pending is unlocked before notification");
+        let _inner = table
+            .inner
+            .try_lock()
+            .expect("inner is unlocked before notification");
+    }
+
+    #[test]
+    fn causal_progress_survives_binding_and_a_full_control_channel() {
+        let table = CausalScopeTable::new();
+        table.test_with_inner_held(|| {
+            assert_eq!(
+                table.try_admit(causal_test_op(1)),
+                CausalAdmitResult::Applied
+            );
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(ControlMessage::CausalProgressPublished)
+            .expect("fill channel");
+        table.bind_owner_wake(sender.clone());
+        table.bind_owner_wake(sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CausalProgressPublished)
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "the doorbell never exceeds channel capacity"
+        );
+        assert!(
+            table.take_progress_notification(),
+            "the bit survives a refused doorbell"
+        );
+        assert!(!table.take_progress_notification());
+        assert!(table.pending_ready());
+        assert_eq!(table.flush_pending(), 1);
+        table.test_with_inner_held(|| {
+            assert_eq!(
+                table.try_admit(causal_test_op(2)),
+                CausalAdmitResult::Applied
+            );
+            assert_eq!(
+                table.try_admit(causal_test_op(3)),
+                CausalAdmitResult::Applied
+            );
+        });
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CausalProgressPublished)
+        ));
+        assert!(receiver.try_recv().is_err(), "progress coalesces");
+        assert!(table.take_progress_notification());
+    }
+
+    #[test]
+    fn causal_pending_unlock_before_registration_or_retry_cannot_lose_progress() {
+        for release_point in [
+            CausalTestPoint::BeforePendingArm,
+            CausalTestPoint::BeforePendingRetry,
+        ] {
+            let table = Arc::new(CausalScopeTable::new());
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker_table = Arc::clone(&table);
+            let worker = thread::spawn(move || {
+                {
+                    let notice = CausalUnlockNotice::new(&worker_table);
+                    let _pending = worker_table
+                        .causal_lock(
+                            &worker_table.pending,
+                            &notice,
+                            CAUSAL_PENDING_UNLOCK,
+                            false,
+                            false,
+                        )
+                        .expect("hold pending");
+                    held_tx.send(()).expect("holder started");
+                    release_rx.recv().expect("release holder");
+                }
+                done_tx.send(()).expect("holder unlocked");
+            });
+            held_rx.recv().expect("pending held");
+            let done_rx = Mutex::new(done_rx);
+            let weak = Arc::downgrade(&table);
+            *table.progress_test_probe.try_lock().unwrap() = Some(Arc::new(move |point| {
+                if point == release_point {
+                    release_tx.send(()).expect("release at the race boundary");
+                    done_rx.lock().unwrap().recv().expect("unlock before retry");
+                }
+                if point == CausalTestPoint::BeforeNotify {
+                    assert_causal_locks_free(&weak.upgrade().expect("table lives"));
+                }
+            }));
+            assert_eq!(
+                table.try_admit_or_wait(causal_test_op(1)),
+                CausalWaitResult::Applied
+            );
+            worker.join().expect("holder joins");
+            assert_eq!(table.pending_len.load(Ordering::SeqCst), 0);
+            assert_eq!(table.interests.load(Ordering::SeqCst), 0);
+            assert!(table.take_progress_notification());
+        }
+    }
+
+    #[test]
+    fn causal_pending_unlock_wakes_an_owned_waiter_after_both_attempts_fail() {
+        let table = Arc::new(CausalScopeTable::new());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        table.bind_owner_wake(sender);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_table = Arc::clone(&table);
+        let worker = thread::spawn(move || {
+            let notice = CausalUnlockNotice::new(&worker_table);
+            let _pending = worker_table
+                .causal_lock(
+                    &worker_table.pending,
+                    &notice,
+                    CAUSAL_PENDING_UNLOCK,
+                    false,
+                    false,
+                )
+                .expect("hold pending");
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let op = causal_test_op(9);
+        assert_eq!(
+            table.try_admit_or_wait(op.clone()),
+            CausalWaitResult::Waiting(op.clone())
+        );
+        assert!(!table.take_progress_notification());
+        assert!(receiver.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CausalProgressPublished)
+        ));
+        assert!(table.take_progress_notification());
+        assert_eq!(table.try_admit_or_wait(op), CausalWaitResult::Applied);
+        assert!(!table.take_progress_notification());
+    }
+
+    #[test]
+    fn causal_full_queue_waits_for_capacity_and_rearms_after_a_competing_insert() {
+        let table = Arc::new(CausalScopeTable::new());
+        table.test_with_inner_held(|| {
+            for sequence in 0..CAUSAL_PENDING_MAX {
+                assert_eq!(
+                    table.try_admit(causal_test_op(sequence as u64)),
+                    CausalAdmitResult::Applied
+                );
+            }
+        });
+        assert!(table.take_progress_notification());
+        let weak = Arc::downgrade(&table);
+        *table.progress_test_probe.try_lock().unwrap() = Some(Arc::new(move |point| {
+            if point == CausalTestPoint::BeforeNotify {
+                assert_causal_locks_free(&weak.upgrade().expect("table lives"));
+            }
+        }));
+        let waiting = causal_test_op(900);
+        for _ in 0..3 {
+            assert_eq!(
+                table.try_admit_or_wait(waiting.clone()),
+                CausalWaitResult::Waiting(waiting.clone())
+            );
+            assert!(
+                !table.take_progress_notification(),
+                "full refusal must not wake itself"
+            );
+        }
+        assert_eq!(table.flush_pending(), 1);
+        assert!(table.take_progress_notification());
+        assert_eq!(
+            table.try_admit(causal_test_op(901)),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(
+            table.try_admit_or_wait(waiting.clone()),
+            CausalWaitResult::Waiting(waiting.clone())
+        );
+        assert!(!table.take_progress_notification());
+        assert_eq!(table.flush_pending(), 1);
+        assert!(
+            table.take_progress_notification(),
+            "the next free slot wakes the re-armed waiter"
+        );
+        assert_eq!(
+            table.try_admit_or_wait(waiting.clone()),
+            CausalWaitResult::Applied
+        );
+        let pending = table.pending.try_lock().unwrap();
+        assert_eq!(
+            pending.back(),
+            Some(&waiting),
+            "the admitted release keeps FIFO order"
+        );
+        assert_eq!(pending.len(), CAUSAL_PENDING_MAX);
+    }
+
+    #[test]
+    fn causal_inner_unlock_resumes_blocked_flush_before_capacity_admission() {
+        let table = CausalScopeTable::new();
+        let waiting = causal_test_op(900);
+        table.test_with_inner_held(|| {
+            for sequence in 0..CAUSAL_PENDING_MAX {
+                assert_eq!(
+                    table.try_admit(causal_test_op(sequence as u64)),
+                    CausalAdmitResult::Applied
+                );
+            }
+            assert!(table.take_progress_notification());
+            assert_eq!(
+                table.try_admit_or_wait(waiting.clone()),
+                CausalWaitResult::Waiting(waiting.clone())
+            );
+            assert_eq!(table.flush_pending(), 0);
+            assert!(table.pending_ops());
+            assert!(!table.pending_ready(), "the owner parks until inner unlock");
+            assert!(
+                !table.take_progress_notification(),
+                "a failed flush must not poll itself"
+            );
+        });
+        assert!(
+            table.take_progress_notification(),
+            "inner unlock wakes flushing"
+        );
+        assert!(table.pending_ready());
+        assert_eq!(table.flush_pending(), 1);
+        assert!(
+            table.take_progress_notification(),
+            "the pop wakes the capacity waiter"
+        );
+        assert_eq!(table.try_admit_or_wait(waiting), CausalWaitResult::Applied);
+    }
+
+    #[test]
+    fn causal_pending_unlock_resumes_blocked_flush() {
+        let table = CausalScopeTable::new();
+        table.test_with_inner_held(|| {
+            assert_eq!(
+                table.try_admit(causal_test_op(1)),
+                CausalAdmitResult::Applied
+            );
+        });
+        assert!(table.take_progress_notification());
+        {
+            let notice = CausalUnlockNotice::new(&table);
+            let _pending = table
+                .causal_lock(&table.pending, &notice, CAUSAL_PENDING_UNLOCK, false, false)
+                .unwrap();
+            assert_eq!(table.flush_pending(), 0);
+            assert!(!table.pending_ready());
+            assert!(!table.take_progress_notification());
+        }
+        assert!(table.take_progress_notification());
+        assert!(table.pending_ready());
+        assert_eq!(table.flush_pending(), 1);
+        assert!(!table.pending_ready());
+    }
+
+    #[test]
+    fn causal_inner_readers_and_early_returns_publish_only_after_unlock() {
+        let table = Arc::new(CausalScopeTable::new());
+        let weak = Arc::downgrade(&table);
+        *table.progress_test_probe.try_lock().unwrap() = Some(Arc::new(move |point| {
+            if point == CausalTestPoint::BeforeNotify {
+                assert_causal_locks_free(&weak.upgrade().unwrap());
+            }
+        }));
+        let actions: &[fn(&CausalScopeTable)] = &[
+            |table| {
+                let _ = table.mint();
+            },
+            |table| {
+                assert!(!table.acquire(
+                    u64::MAX,
+                    LeaseIdentity::EventInFlight {
+                        request_id: "absent".into()
+                    }
+                ));
+            },
+            |table| {
+                let _ = table.try_retract(
+                    1,
+                    LeaseIdentity::EventInFlight {
+                        request_id: "absent".into(),
+                    },
+                );
+            },
+            |table| {
+                let _ = table.is_live(1);
+            },
+            |table| {
+                let _ = table.lease_count(1);
+            },
+            |table| {
+                let _ = table.pending_publish_leases();
+            },
+            |table| {
+                let _ = table.identities(1);
+            },
+            |table| {
+                table.test_with_inner_held(|| {});
+            },
+        ];
+        for action in actions {
+            table.interests.store(CAUSAL_INNER_UNLOCK, Ordering::SeqCst);
+            table
+                .drain_blocked
+                .store(CAUSAL_INNER_UNLOCK, Ordering::SeqCst);
+            action(&table);
+            assert!(table.take_progress_notification());
+            assert_eq!(table.drain_blocked.load(Ordering::SeqCst), 0);
+            assert_eq!(table.interests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn causal_poison_returns_the_owned_operation_and_publishes_one_fault() {
+        for kind in [CAUSAL_PENDING_UNLOCK, CAUSAL_INNER_UNLOCK] {
+            let table = CausalScopeTable::new();
+            table.test_with_inner_held(|| {
+                assert_eq!(
+                    table.try_admit(causal_test_op(1)),
+                    CausalAdmitResult::Applied
+                );
+            });
+            assert!(table.take_progress_notification());
+            let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let notice = CausalUnlockNotice::new(&table);
+                if kind == CAUSAL_PENDING_UNLOCK {
+                    let _pending = table
+                        .causal_lock(&table.pending, &notice, kind, false, false)
+                        .unwrap();
+                    panic!("poison pending");
+                } else {
+                    let _inner = table
+                        .causal_lock(&table.inner, &notice, kind, false, false)
+                        .unwrap();
+                    panic!("poison inner");
+                }
+            }));
+            assert!(fault.is_err());
+            assert!(
+                table.take_progress_notification(),
+                "poison wakes retained owner work"
+            );
+            let op = causal_test_op(2);
+            assert_eq!(
+                table.try_admit_or_wait(op.clone()),
+                CausalWaitResult::Fault(op.clone())
+            );
+            assert_eq!(table.try_admit(op.clone()), CausalAdmitResult::Retry(op));
+            assert!(!table.pending_ready());
+            assert_eq!(table.flush_pending(), 0);
+            assert_eq!(
+                table.pending_len.load(Ordering::SeqCst),
+                1,
+                "fault preserves admitted backlog"
+            );
+            assert!(
+                !table.take_progress_notification(),
+                "a persistent fault does not poll"
+            );
+        }
+    }
 
     fn router() -> PackageEventRouter {
         PackageEventRouter::new(PackageEventPlanePolicy::default())
