@@ -1704,6 +1704,10 @@ fn commit_package_generation_locked(
     contracts: Vec<EmittedContract>,
     subscriptions: Vec<EventSubscription>,
 ) -> Result<u64, EventPlaneStatus> {
+    debug_assert!(
+        contracts.iter().all(|contract| contract.owner == owner),
+        "the caller validates contract ownership before admission"
+    );
     if contracts.is_empty() && subscriptions.is_empty() {
         return Ok(inner.package_generation.get(owner).copied().unwrap_or(0));
     }
