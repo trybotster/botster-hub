@@ -178,6 +178,29 @@ pub enum EventOwnerWorkError {
     RouterPoisoned(EventOwnerWork),
 }
 
+/// A replacement error preserves its commit result and any terminal cleanup work.
+#[derive(Debug)]
+pub struct EventPlaneReplaceError {
+    result: Result<u64, EventPlaneStatus>,
+    cleanup: Option<EventOwnerWorkError>,
+}
+
+impl EventPlaneReplaceError {
+    #[must_use]
+    pub fn into_parts(self) -> (Result<u64, EventPlaneStatus>, Option<EventOwnerWorkError>) {
+        (self.result, self.cleanup)
+    }
+}
+
+impl From<EventPlaneStatus> for EventPlaneReplaceError {
+    fn from(status: EventPlaneStatus) -> Self {
+        Self {
+            result: Err(status),
+            cleanup: None,
+        }
+    }
+}
+
 /// One owner operation. Waiting requires a worker completion notification.
 #[derive(Debug)]
 #[must_use]
@@ -374,8 +397,6 @@ struct QueuedCopy {
 }
 
 struct AdmittedHolder {
-    #[allow(dead_code)]
-    envelope_id: u64,
     retired: bool,
 }
 
@@ -413,7 +434,7 @@ struct RouterInner {
     consumers: HashMap<String, ConsumerQueue>,
     envelopes: HashMap<u64, Envelope>,
     global_in_flight_bytes: usize,
-    admitted: HashMap<(u64, String, u64), AdmittedHolder>,
+    admitted: HashMap<u64, HashMap<(String, u64), AdmittedHolder>>,
     buckets: HashMap<String, TokenBucket>,
     next_envelope: u64,
     next_pull: u64,
@@ -603,14 +624,14 @@ impl PackageEventRouter {
         owner: &str,
         contracts: Vec<EmittedContract>,
         subscriptions: Vec<EventSubscription>,
-    ) -> Result<u64, EventPlaneStatus> {
+    ) -> Result<u64, EventPlaneReplaceError> {
         if owner == HUB_EVENT_OWNER {
-            return Err(EventPlaneStatus::RejectedForeign);
+            return Err(EventPlaneStatus::RejectedForeign.into());
         }
         let mut inner = lock_inner(&self.inner)?;
         for contract in &contracts {
             if contract.owner == HUB_EVENT_OWNER || contract.owner != owner {
-                return Err(EventPlaneStatus::RejectedForeign);
+                return Err(EventPlaneStatus::RejectedForeign.into());
             }
         }
         preview_package_replacement(&inner, owner, &contracts, &subscriptions)?;
@@ -631,8 +652,13 @@ impl PackageEventRouter {
         });
         work.metadata_applied = true;
         work.retired_payloads = retired_payloads;
-        work.run(self).map_err(|_| EventPlaneStatus::ShedBusy)?;
-        result
+        if let Err(cleanup) = work.run(self) {
+            return Err(EventPlaneReplaceError {
+                result,
+                cleanup: Some(cleanup),
+            });
+        }
+        result.map_err(EventPlaneReplaceError::from)
     }
 
     pub fn try_subscribe(&self, subscription: EventSubscription) -> EventPlaneStatus {
@@ -989,13 +1015,14 @@ impl PackageEventRouter {
         generation: u64,
     ) -> Result<(), EventPlaneStatus> {
         let mut inner = lock_inner(&self.inner)?;
-        inner.admitted.insert(
-            (envelope_id, plugin_key.to_string(), generation),
-            AdmittedHolder {
-                envelope_id,
-                retired: false,
-            },
-        );
+        if inner.live_envelope(envelope_id).is_some() {
+            inner
+                .admitted
+                .entry(envelope_id)
+                .or_default()
+                .entry((plugin_key.to_string(), generation))
+                .or_insert(AdmittedHolder { retired: false });
+        }
         Ok(())
     }
 
@@ -1082,17 +1109,6 @@ impl PackageEventRouter {
         if !inner.outstanding_pulls.remove(&delivery.pull_id) {
             return Err((Box::new(delivery), EventPlaneStatus::RejectedInvalid));
         }
-        inner.admitted.insert(
-            (
-                delivery.envelope_id,
-                delivery.holder.plugin_key.clone(),
-                delivery.holder.generation,
-            ),
-            AdmittedHolder {
-                envelope_id: delivery.envelope_id,
-                retired: false,
-            },
-        );
         retire_holder_locked(
             &mut inner,
             &self.counters,
@@ -1137,6 +1153,7 @@ impl PackageEventRouter {
             admitted_holders: inner
                 .admitted
                 .values()
+                .flat_map(|holders| holders.values())
                 .filter(|holder| !holder.retired)
                 .count(),
             queued_holders: inner
@@ -1718,20 +1735,15 @@ fn mark_holder_retired(
     if inner.live_envelope(envelope_id).is_none() {
         return false;
     }
-    let key = (envelope_id, plugin_key.to_string(), generation);
-    if let Some(holder) = inner.admitted.get_mut(&key) {
+    let holders = inner.admitted.entry(envelope_id).or_default();
+    let key = (plugin_key.to_string(), generation);
+    if let Some(holder) = holders.get_mut(&key) {
         if holder.retired {
             return false;
         }
         holder.retired = true;
     } else {
-        inner.admitted.insert(
-            key,
-            AdmittedHolder {
-                envelope_id,
-                retired: true,
-            },
-        );
+        holders.insert(key, AdmittedHolder { retired: true });
     }
     let Some(envelope) = inner.envelopes.get_mut(&envelope_id) else {
         return false;
@@ -1751,6 +1763,7 @@ fn retire_envelope_locked(
     let Some(envelope) = inner.envelopes.remove(&envelope_id) else {
         return;
     };
+    inner.admitted.remove(&envelope_id);
     let owner = &envelope.owner;
     let size = envelope.size;
     let age_ref = envelope.producer_age_ref;
@@ -1924,6 +1937,7 @@ fn retire_producer_age(
     list.remove(age_ref.slot);
     list.publish();
     let live = list.live();
+    let writes_closed = list.cell().is_write_closed();
     let current_generation = inner
         .producer
         .get(owner)
@@ -1947,7 +1961,7 @@ fn retire_producer_age(
             );
         }
     }
-    if age_ref.generation != current_generation && live == 0 {
+    if live == 0 && (age_ref.generation != current_generation || writes_closed) {
         if let Some(list) = inner.producer_age_lists.remove(&key) {
             list.cell().close_writes();
         }
@@ -2067,11 +2081,20 @@ fn retire_owner_diagnostics(
     owner: &str,
     generation: u64,
 ) {
+    // Producer retirement names the exact generation, never the replacement cell.
     counters.retire_identity(&AgeIdentity {
         kind: DaemonQueueKind::Producer,
         identity: owner.to_string(),
         generation: Some(generation),
     });
+    let producer_key = (owner.to_string(), generation);
+    if inner
+        .producer_age_lists
+        .get(&producer_key)
+        .is_some_and(|list| list.live() == 0)
+    {
+        inner.producer_age_lists.remove(&producer_key);
+    }
     if let Some(queue) = inner.consumers.get_mut(owner)
         && queue.generation <= generation
         && let Some(cell) = queue.age_cell.as_ref()
@@ -2142,6 +2165,7 @@ impl EventPlaneOwnerOps {
 
     /// Attempt one operation. Advance the owner cursor even when its worker must wait.
     /// The caller must reserve Host admission before this method can return Work.
+    /// If submission fails, the caller must call [`Self::retry`] with the returned work identity.
     pub fn apply_ready(&mut self, router: &PackageEventRouter) -> OwnerStep {
         use std::ops::Bound::{Excluded, Unbounded};
 
@@ -2579,6 +2603,53 @@ mod tests {
         }
     }
 
+    fn assert_router_accounting(router: &PackageEventRouter) {
+        let inner = lock_inner(&router.inner).expect("accounting lock");
+        let bytes: usize = inner.envelopes.values().map(|envelope| envelope.size).sum();
+        assert_eq!(inner.global_bytes(), bytes);
+        assert_eq!(
+            router.counters.snapshot().global_in_flight_bytes,
+            bytes as u64
+        );
+        for (owner, occupancy) in &inner.producer {
+            let envelopes: Vec<_> = inner
+                .envelopes
+                .values()
+                .filter(|envelope| &envelope.owner == owner)
+                .collect();
+            assert_eq!(occupancy.events, envelopes.len(), "producer {owner}");
+            assert_eq!(
+                occupancy.bytes,
+                envelopes
+                    .iter()
+                    .map(|envelope| envelope.size)
+                    .sum::<usize>()
+            );
+        }
+        for (consumer, queue) in &inner.consumers {
+            assert_eq!(queue.events, queue.copies.len(), "consumer {consumer}");
+            assert_eq!(
+                queue.bytes,
+                queue
+                    .copies
+                    .iter()
+                    .map(|copy| {
+                        inner
+                            .live_envelope(copy.envelope_id)
+                            .expect("queued envelope is live")
+                            .size
+                    })
+                    .sum::<usize>()
+            );
+        }
+        assert!(
+            inner
+                .admitted
+                .keys()
+                .all(|id| inner.envelopes.contains_key(id))
+        );
+    }
+
     #[test]
     fn router_module_forbids_hub_runtime_and_blocking_lock() {
         let source = include_str!("package_event_router.rs");
@@ -2927,6 +2998,840 @@ mod tests {
     }
 
     #[test]
+    fn owner_completions_reject_retries_duplicates_and_repeated_operations() {
+        let router = router();
+        let mut ops = EventPlaneOwnerOps::default();
+        let op = OwnerOp {
+            kind: OwnerOpKind::Unload,
+            owner: "producer".into(),
+            generation: 1,
+        };
+        ops.record(op.clone());
+        ops.record(op.clone());
+        let OwnerStep::Work(first) = ops.apply_ready(&router) else {
+            panic!("first work");
+        };
+        let first_id = first.identity().clone();
+        let first_completion = run_work(&router, first);
+        assert!(ops.retry(&first_id));
+        assert!(!ops.retry(&first_id));
+        assert!(ops.complete(first_completion).is_none());
+        assert_eq!(ops.pending_for("producer"), vec![op.clone(), op.clone()]);
+        assert!(ops.has_ready());
+
+        let OwnerStep::Work(second) = ops.apply_ready(&router) else {
+            panic!("retry work");
+        };
+        let second_id = second.identity().clone();
+        assert_ne!(first_id, second_id);
+        assert_eq!(ops.complete(run_work(&router, second)), Some(op.clone()));
+        let OwnerStep::Work(third) = ops.apply_ready(&router) else {
+            panic!("repeated operation work");
+        };
+        assert_ne!(&second_id, third.identity());
+        assert!(
+            ops.complete(EventOwnerCompletion {
+                identity: second_id
+            })
+            .is_none()
+        );
+        assert_eq!(ops.pending_for("producer"), vec![op.clone()]);
+        assert_eq!(ops.complete(run_work(&router, third)), Some(op));
+        assert!(ops.is_empty());
+        assert!(!ops.has_ready());
+        assert!(matches!(ops.apply_ready(&router), OwnerStep::Idle));
+    }
+
+    #[test]
+    fn stale_unload_keeps_newer_producer_and_consumer_copies() {
+        for unload_producer in [true, false] {
+            let router = router();
+            router
+                .try_register_contracts(vec![sample_contract("producer", "ready")])
+                .expect("old producer");
+            router
+                .begin_package_generation("consumer")
+                .expect("old consumer");
+            subscribe(&router, "consumer", "producer", "ready");
+            let old_payload = serde_json::json!({"ok": false});
+            assert_eq!(
+                router.try_ingress("producer", "ready", &old_payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
+
+            router
+                .try_register_contracts(vec![sample_contract("producer", "ready")])
+                .expect("new producer");
+            router
+                .begin_package_generation("consumer")
+                .expect("new consumer");
+            assert_eq!(
+                router.try_subscribe(EventSubscription {
+                    plugin_key: "consumer".into(),
+                    owner: "producer".into(),
+                    name: "ready".into(),
+                    handler_id: "replacement".into(),
+                    generation: 2,
+                    ..EventSubscription::default()
+                }),
+                EventPlaneStatus::Accepted
+            );
+            let new_payload = serde_json::json!({"ok": true});
+            assert_eq!(
+                router.try_ingress("producer", "ready", &new_payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
+            assert_router_accounting(&router);
+
+            run_unload(
+                &router,
+                if unload_producer {
+                    "producer"
+                } else {
+                    "consumer"
+                },
+                1,
+            );
+            assert_router_accounting(&router);
+            let snapshot = router.snapshot().expect("remaining occupancy");
+            assert_eq!(snapshot.queued_holders, 1);
+            assert_eq!(snapshot.producer_events["producer"], 1);
+            let mut batch = router
+                .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
+                .expect("new delivery");
+            assert_eq!(batch.len(), 1);
+            let delivery = batch.pop().expect("replacement copy");
+            assert_eq!(delivery.payload_json, new_payload);
+            assert_eq!(delivery.holder.event_generation, 2);
+            assert_eq!(delivery.holder.plugin_generation, 2);
+            router
+                .complete_pulled_delivery(delivery)
+                .expect("complete new copy");
+            assert_router_accounting(&router);
+            assert_eq!(
+                router.snapshot().expect("retired").global_in_flight_bytes,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn stale_unload_preserves_new_client_registration_and_consumer_cell() {
+        let router = router();
+        let mut contract = sample_contract("producer", "ready");
+        contract.audience.insert(EventAudience::Clients);
+        router
+            .try_register_contracts(vec![contract.clone()])
+            .expect("old producer");
+        let mailbox = Arc::new(ClientEventMailbox::new(router.policy()));
+        for (id, replacement) in [("old", false), ("new", true)] {
+            if replacement {
+                router
+                    .try_register_contracts(vec![contract.clone()])
+                    .expect("new producer");
+            }
+            let gap = mailbox
+                .register_gap_slot(id, "producer", "ready")
+                .expect("gap slot");
+            assert_eq!(
+                router.try_subscribe_client(ClientEventHolder {
+                    connection_id: "connection".into(),
+                    subscription_id: id.into(),
+                    owner: "producer".into(),
+                    name: "ready".into(),
+                    subjects: BTreeSet::new(),
+                    mailbox: Arc::clone(&mailbox),
+                    gap,
+                }),
+                EventPlaneStatus::Accepted
+            );
+        }
+        router
+            .begin_package_generation("consumer")
+            .expect("old consumer");
+        router
+            .begin_package_generation("consumer")
+            .expect("new consumer");
+        subscribe(&router, "consumer", "producer", "ready");
+        let before = consumer_row(&router, "consumer");
+        run_unload(&router, "consumer", 1);
+        assert_eq!(consumer_row(&router, "consumer"), before);
+        run_unload(&router, "producer", 1);
+        assert_eq!(router.test_client_holder_count("connection"), 1);
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "ready",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        assert!(mailbox.take_ready_event().is_some());
+        assert!(mailbox.take_ready_event().is_none());
+        assert_eq!(consumer_row(&router, "consumer").queue_count, Some(1));
+        assert_router_accounting(&router);
+        run_unload(&router, "producer", 2);
+        assert_eq!(router.test_client_holder_count("connection"), 0);
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn unload_retains_one_mib_charge_until_worker_destruction_and_reap() {
+        const BYTES: usize = 1024 * 1024;
+        let policy = PackageEventPlanePolicy {
+            payload_max_bytes: BYTES,
+            producer_queue_max_bytes: BYTES,
+            consumer_queue_max_bytes: BYTES,
+            global_in_flight_bytes: BYTES,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        let mut large = sample_contract("producer", "large");
+        large.schema = CompiledEventSchema::compile(&serde_json::json!({
+            "type": "object", "properties": {"text": {"type": "string"}}
+        }))
+        .expect("large schema");
+        router
+            .try_register_contracts(vec![large, sample_contract("unrelated", "ready")])
+            .expect("contracts");
+        subscribe(&router, "consumer-a", "producer", "large");
+        subscribe(&router, "consumer-b", "producer", "large");
+        subscribe(&router, "other-consumer", "unrelated", "ready");
+        let payload = serde_json::json!({"text": "x".repeat(BYTES - 11)});
+        assert_eq!(serde_json::to_vec(&payload).expect("encoding").len(), BYTES);
+        assert_eq!(
+            router.try_ingress("producer", "large", &payload, Instant::now()),
+            EventPlaneStatus::Accepted
+        );
+        assert_router_accounting(&router);
+        let delivery = router
+            .pull_ready_batch(1, BYTES, Instant::now(), StdDuration::from_secs(1))
+            .expect("pull")
+            .pop()
+            .expect("one delivery");
+        router
+            .note_admitted(
+                delivery.envelope_id,
+                &delivery.holder.plugin_key,
+                delivery.holder.generation,
+            )
+            .expect("admit");
+        assert!(
+            !router
+                .retire_holder(
+                    delivery.envelope_id,
+                    &delivery.holder.plugin_key,
+                    delivery.holder.generation
+                )
+                .expect("first holder retires")
+        );
+        assert_router_accounting(&router);
+        let weak_payload = {
+            let inner = lock_inner(&router.inner).expect("payload lock");
+            Arc::downgrade(
+                &inner
+                    .live_envelope(delivery.envelope_id)
+                    .expect("remaining holder")
+                    .payload,
+            )
+        };
+        let mut ops = EventPlaneOwnerOps::default();
+        ops.record(OwnerOp {
+            kind: OwnerOpKind::Unload,
+            owner: "producer".into(),
+            generation: 1,
+        });
+        let OwnerStep::Work(work) = ops.apply_ready(&router) else {
+            panic!("unload work")
+        };
+        let (phase_tx, phase_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        *router.unload_test_probe.try_lock().expect("probe") = Some(Box::new(move |phase| {
+            if phase != UnloadTestPhase::Locked {
+                phase_tx.send(phase).expect("phase sent");
+                resume_rx.recv().expect("owner resumes worker");
+            }
+        }));
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| work.run(&router));
+            assert_eq!(
+                phase_rx.recv().expect("detached"),
+                UnloadTestPhase::Detached
+            );
+            assert!(!ops.has_ready());
+            assert!(matches!(ops.apply_ready(&router), OwnerStep::Waiting));
+            assert_router_accounting(&router);
+            assert!(weak_payload.upgrade().is_some());
+            assert_eq!(
+                router
+                    .snapshot()
+                    .expect("retained snapshot")
+                    .global_in_flight_bytes,
+                BYTES
+            );
+            assert_eq!(
+                router.try_ingress(
+                    "unrelated",
+                    "ready",
+                    &serde_json::json!({"ok": true}),
+                    Instant::now()
+                ),
+                EventPlaneStatus::ShedFull
+            );
+            router
+                .requeue_delivery(delivery)
+                .expect("late requeue is an empty success");
+            assert!(
+                router
+                    .pull_ready_batch(8, BYTES, Instant::now(), StdDuration::from_secs(1))
+                    .expect("no retired payload delivery")
+                    .is_empty()
+            );
+            assert_eq!(router.test_outstanding_pulls(), 0);
+            assert_router_accounting(&router);
+            resume_tx.send(()).expect("destroy payload");
+
+            assert_eq!(
+                phase_rx.recv().expect("destroyed"),
+                UnloadTestPhase::Destroyed
+            );
+            assert!(weak_payload.upgrade().is_none());
+            assert_eq!(
+                router
+                    .snapshot()
+                    .expect("charge before reap")
+                    .global_in_flight_bytes,
+                BYTES
+            );
+            assert_eq!(
+                router.try_ingress(
+                    "unrelated",
+                    "ready",
+                    &serde_json::json!({"ok": true}),
+                    Instant::now()
+                ),
+                EventPlaneStatus::ShedFull
+            );
+            assert_router_accounting(&router);
+            resume_tx.send(()).expect("reap charge");
+            let completion = worker
+                .join()
+                .expect("worker joins")
+                .expect("worker completes");
+            assert!(ops.complete(completion).is_some());
+        });
+        assert_router_accounting(&router);
+        let snapshot = router.snapshot().expect("finished snapshot");
+        assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_eq!(snapshot.producer_events["producer"], 0);
+        assert_eq!(snapshot.producer_bytes["producer"], 0);
+        assert!(snapshot.consumer_events.values().all(|events| *events == 0));
+        assert!(snapshot.consumer_bytes.values().all(|bytes| *bytes == 0));
+        assert_eq!(snapshot.admitted_holders, 0);
+        assert_eq!(
+            router.try_ingress(
+                "unrelated",
+                "ready",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn worker_termination_after_detachment_keeps_charge_until_exact_retry() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        subscribe(&router, "consumer", "producer", "ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "ready",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let before = router.snapshot().expect("before").global_in_flight_bytes;
+        let mut ops = EventPlaneOwnerOps::default();
+        ops.record(OwnerOp {
+            kind: OwnerOpKind::Unload,
+            owner: "producer".into(),
+            generation: 1,
+        });
+        let OwnerStep::Work(work) = ops.apply_ready(&router) else {
+            panic!("unload work")
+        };
+        let identity = work.identity().clone();
+        *router.unload_test_probe.try_lock().expect("probe") = Some(Box::new(|phase| {
+            if phase == UnloadTestPhase::Detached {
+                panic!("injected worker termination after payload detachment");
+            }
+        }));
+        thread::scope(|scope| {
+            assert!(scope.spawn(|| work.run(&router)).join().is_err());
+        });
+        assert!(!router.inner.is_poisoned());
+        assert_eq!(
+            router
+                .snapshot()
+                .expect("retained charge")
+                .global_in_flight_bytes,
+            before
+        );
+        assert_router_accounting(&router);
+        assert!(!ops.has_ready());
+        assert!(ops.retry(&identity));
+        assert!(
+            ops.complete(EventOwnerCompletion {
+                identity: identity.clone()
+            })
+            .is_none()
+        );
+        let OwnerStep::Work(retry) = ops.apply_ready(&router) else {
+            panic!("retry work")
+        };
+        assert_ne!(retry.identity(), &identity);
+        assert!(ops.complete(run_work(&router, retry)).is_some());
+        assert!(ops.is_empty());
+        assert_eq!(
+            router
+                .snapshot()
+                .expect("reaped charge")
+                .global_in_flight_bytes,
+            0
+        );
+        assert_router_accounting(&router);
+        let inner = lock_inner(&router.inner).expect("retired rows");
+        assert!(inner.envelopes.is_empty());
+        assert!(inner.admitted.is_empty());
+    }
+
+    #[test]
+    fn replacement_poison_returns_committed_generation_and_owned_cleanup() {
+        let router = Arc::new(router());
+        router
+            .try_register_contracts(vec![sample_contract("producer", "old")])
+            .expect("old generation");
+        subscribe(&router, "consumer", "producer", "old");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "old",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let probe_router = Arc::clone(&router);
+        *router.unload_test_probe.try_lock().expect("probe") = Some(Box::new(move |phase| {
+            if phase == UnloadTestPhase::Destroyed {
+                let router = Arc::clone(&probe_router);
+                assert!(
+                    thread::spawn(move || {
+                        let _guard = router
+                            .inner
+                            .try_lock()
+                            .expect("poison outside the worker guard");
+                        panic!("injected router poison");
+                    })
+                    .join()
+                    .is_err()
+                );
+            }
+        }));
+        let error = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    router.try_replace_package_generation(
+                        "producer",
+                        vec![sample_contract("producer", "new")],
+                        Vec::new(),
+                    )
+                })
+                .join()
+                .expect("replacement worker returns")
+                .expect_err("terminal cleanup error")
+        });
+        let (result, cleanup) = error.into_parts();
+        assert_eq!(result, Ok(2));
+        let Some(EventOwnerWorkError::RouterPoisoned(work)) = cleanup else {
+            panic!("poison retains owned work")
+        };
+        assert_eq!(work.identity().operation().generation, 1);
+        assert!(work.metadata_applied);
+        assert!(work.retired_payloads.is_empty());
+        let Err(TryLockError::Poisoned(poisoned)) = router.inner.try_lock() else {
+            panic!("poisoned guard");
+        };
+        let inner = poisoned.into_inner();
+        assert_eq!(inner.package_generation["producer"], 2);
+        assert!(
+            inner
+                .contracts
+                .contains_key(&("producer".into(), "new".into()))
+        );
+        assert_eq!(inner.envelopes.len(), 1);
+        assert_eq!(
+            inner.global_bytes(),
+            inner
+                .envelopes
+                .values()
+                .map(|envelope| envelope.size)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn repeated_delivery_retirement_prunes_holders_without_readmitting_late_acks() {
+        let router = PackageEventRouter::new(PackageEventPlanePolicy {
+            package_burst: 1_000,
+            ..PackageEventPlanePolicy::default()
+        });
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        subscribe(&router, "one", "producer", "ready");
+        subscribe(&router, "two", "producer", "ready");
+        for _ in 0..256 {
+            assert_eq!(
+                router.try_ingress(
+                    "producer",
+                    "ready",
+                    &serde_json::json!({"ok": true}),
+                    Instant::now()
+                ),
+                EventPlaneStatus::Accepted
+            );
+            assert_router_accounting(&router);
+            let first = router
+                .pull_ready_batch(1, 64 * 1024, Instant::now(), StdDuration::from_secs(1))
+                .expect("first pull")
+                .pop()
+                .expect("first copy");
+            assert_router_accounting(&router);
+            router.requeue_delivery(first).expect("requeue");
+            assert_router_accounting(&router);
+            let mut deliveries = router
+                .pull_ready_batch(2, 64 * 1024, Instant::now(), StdDuration::from_secs(1))
+                .expect("both copies");
+            assert_eq!(deliveries.len(), 2);
+            let first = deliveries.pop().expect("first copy");
+            let id = first.envelope_id;
+            let plugin = first.holder.plugin_key.clone();
+            let generation = first.holder.generation;
+            router
+                .note_admitted(id, &plugin, generation)
+                .expect("admit");
+            assert!(
+                !router
+                    .retire_holder(id, &plugin, generation)
+                    .expect("retire first")
+            );
+            router
+                .note_admitted(id, &plugin, generation)
+                .expect("late duplicate admission");
+            assert!(
+                !router
+                    .retire_holder(id, &plugin, generation)
+                    .expect("duplicate retirement")
+            );
+            router
+                .complete_pulled_delivery(first)
+                .expect("complete retired pull");
+            assert_eq!(
+                router
+                    .snapshot()
+                    .expect("one holder remains")
+                    .producer_events["producer"],
+                1
+            );
+            assert_router_accounting(&router);
+            router
+                .complete_pulled_delivery(deliveries.pop().expect("last copy"))
+                .expect("complete final holder");
+            router
+                .note_admitted(id, &plugin, generation)
+                .expect("late acknowledgement after envelope removal");
+            assert!(
+                !router
+                    .retire_holder(id, &plugin, generation)
+                    .expect("late retirement")
+            );
+            assert_router_accounting(&router);
+            let inner = lock_inner(&router.inner).expect("retired metadata");
+            assert!(inner.admitted.is_empty());
+            assert!(inner.envelopes.is_empty());
+            assert!(inner.outstanding_pulls.is_empty());
+        }
+    }
+
+    #[test]
+    fn unload_releases_empty_and_destroyed_producer_age_lists() {
+        let router = router();
+        for generation in 1..=64 {
+            router
+                .try_register_contracts(vec![sample_contract("producer", "ready")])
+                .expect("generation");
+            if generation % 2 == 0 {
+                subscribe(&router, "consumer", "producer", "ready");
+                assert_eq!(
+                    router.try_ingress(
+                        "producer",
+                        "ready",
+                        &serde_json::json!({"ok": true}),
+                        Instant::now()
+                    ),
+                    EventPlaneStatus::Accepted
+                );
+            }
+            run_unload(&router, "producer", generation);
+            assert_router_accounting(&router);
+            let inner = lock_inner(&router.inner).expect("retired age lists");
+            assert_eq!(
+                inner.producer_age_lists.len(),
+                1,
+                "only the Hub list remains"
+            );
+            assert!(
+                inner
+                    .producer_age_lists
+                    .contains_key(&(HUB_EVENT_OWNER.into(), 0))
+            );
+            assert!(inner.admitted.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_submission_restores_readiness_without_applying_unload() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        let mut ops = EventPlaneOwnerOps::default();
+        ops.record(OwnerOp {
+            kind: OwnerOpKind::Unload,
+            owner: "producer".into(),
+            generation: 1,
+        });
+        let OwnerStep::Work(work) = ops.apply_ready(&router) else {
+            panic!("unsubmitted work")
+        };
+        let identity = work.identity().clone();
+        assert!(!ops.has_ready());
+        assert!(router.test_has_contract("producer", "ready"));
+        drop(work);
+        assert!(ops.retry(&identity));
+        assert!(ops.has_ready());
+        assert!(router.test_has_contract("producer", "ready"));
+        assert_eq!(apply_owner_step(&mut ops, &router).len(), 1);
+        assert!(!router.test_has_contract("producer", "ready"));
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn worker_router_lock_sheds_unrelated_publication_without_blocking_owner_dispatch() {
+        let router = router();
+        let mut contracts = Vec::new();
+        for index in 0..128 {
+            contracts.push(sample_contract("producer", &format!("event-{index}")));
+        }
+        contracts.push(sample_contract("unrelated", "ready"));
+        router
+            .try_register_contracts(contracts)
+            .expect("populated contracts");
+        subscribe(&router, "consumer", "producer", "event-0");
+        subscribe(&router, "other-consumer", "unrelated", "ready");
+        for _ in 0..64 {
+            assert_eq!(
+                router.try_ingress(
+                    "producer",
+                    "event-0",
+                    &serde_json::json!({"ok": true}),
+                    Instant::now()
+                ),
+                EventPlaneStatus::Accepted
+            );
+        }
+        let mut ops = EventPlaneOwnerOps::default();
+        ops.record(OwnerOp {
+            kind: OwnerOpKind::Unload,
+            owner: "producer".into(),
+            generation: 1,
+        });
+        let OwnerStep::Work(work) = ops.apply_ready(&router) else {
+            panic!("worker work")
+        };
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *router.unload_test_probe.try_lock().expect("probe") = Some(Box::new(move |phase| {
+            if phase == UnloadTestPhase::Locked {
+                locked_tx.send(()).expect("locked notification");
+                release_rx.recv().expect("release worker guard");
+            }
+        }));
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| work.run(&router));
+            locked_rx.recv().expect("worker owns router lock");
+            assert_eq!(router.snapshot(), Err(EventPlaneStatus::ShedBusy));
+            assert_eq!(
+                router.try_ingress(
+                    "unrelated",
+                    "ready",
+                    &serde_json::json!({"ok": true}),
+                    Instant::now()
+                ),
+                EventPlaneStatus::ShedBusy
+            );
+            ops.record(OwnerOp {
+                kind: OwnerOpKind::Reload,
+                owner: "unrelated".into(),
+                generation: 1,
+            });
+            assert!(ops.has_ready());
+            let OwnerStep::Applied(op) = ops.apply_ready(&router) else {
+                panic!("unrelated owner remains runnable")
+            };
+            assert_eq!(op.owner, "unrelated");
+            assert!(matches!(ops.apply_ready(&router), OwnerStep::Waiting));
+            release_tx.send(()).expect("release worker");
+            assert!(
+                ops.complete(
+                    worker
+                        .join()
+                        .expect("worker joins")
+                        .expect("worker completes")
+                )
+                .is_some()
+            );
+        });
+        assert!(ops.is_empty());
+        assert_eq!(
+            router.try_ingress(
+                "unrelated",
+                "ready",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        assert_router_accounting(&router);
+    }
+
+    #[test]
+    fn populated_unload_reports_concurrent_unrelated_publication_without_a_lock_gate() {
+        let policy = PackageEventPlanePolicy {
+            package_burst: u32::MAX,
+            producer_queue_max_events: 512,
+            consumer_queue_max_events: 512,
+            ..PackageEventPlanePolicy::default()
+        };
+        let router = PackageEventRouter::new(policy);
+        let mut contracts = Vec::new();
+        for owner in 0..32 {
+            for event in 0..16 {
+                contracts.push(sample_contract(
+                    &format!("producer-{owner}"),
+                    &format!("event-{event}"),
+                ));
+            }
+        }
+        let mut unrelated = sample_contract("unrelated", "ready");
+        unrelated.audience = BTreeSet::from([EventAudience::Clients]);
+        contracts.push(unrelated);
+        router
+            .try_register_contracts(contracts)
+            .expect("populated contracts");
+        for owner in 0..32 {
+            for event in 0..16 {
+                subscribe(
+                    &router,
+                    &format!("consumer-{owner}"),
+                    &format!("producer-{owner}"),
+                    &format!("event-{event}"),
+                );
+            }
+            for _ in 0..128 {
+                assert_eq!(
+                    router.try_ingress(
+                        &format!("producer-{owner}"),
+                        "event-0",
+                        &serde_json::json!({"ok": true}),
+                        Instant::now()
+                    ),
+                    EventPlaneStatus::Accepted
+                );
+            }
+        }
+        let mut ops = EventPlaneOwnerOps::default();
+        ops.record(OwnerOp {
+            kind: OwnerOpKind::Unload,
+            owner: "producer-0".into(),
+            generation: 1,
+        });
+        let OwnerStep::Work(work) = ops.apply_ready(&router) else {
+            panic!("worker work")
+        };
+        let barrier = std::sync::Barrier::new(2);
+        let done = AtomicBool::new(false);
+        let mut accepted = 0;
+        let mut busy = 0;
+        let mut longest_call = StdDuration::ZERO;
+        let elapsed = thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                barrier.wait();
+                let started = Instant::now();
+                let completion = work.run(&router).expect("worker completes");
+                let elapsed = started.elapsed();
+                done.store(true, Ordering::Release);
+                (completion, elapsed)
+            });
+            barrier.wait();
+            while !done.load(Ordering::Acquire) {
+                let started = Instant::now();
+                match router.try_ingress(
+                    "unrelated",
+                    "ready",
+                    &serde_json::json!({"ok": true}),
+                    Instant::now(),
+                ) {
+                    EventPlaneStatus::Accepted => accepted += 1,
+                    EventPlaneStatus::ShedBusy => busy += 1,
+                    other => panic!("unexpected unrelated publication result: {other:?}"),
+                }
+                longest_call = longest_call.max(started.elapsed());
+                thread::yield_now();
+            }
+            let (completion, elapsed) = worker.join().expect("worker joins");
+            assert!(ops.complete(completion).is_some());
+            elapsed
+        });
+        eprintln!(
+            "populated unload: contracts=513 subscriptions=512 envelopes=4096; worker_us={} accepted={} shed_busy={} longest_publish_us={}",
+            elapsed.as_micros(),
+            accepted,
+            busy,
+            longest_call.as_micros()
+        );
+        assert!(ops.is_empty());
+        assert_eq!(
+            router.try_ingress(
+                "unrelated",
+                "ready",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        assert_router_accounting(&router);
+    }
+
+    #[test]
     fn expired_queued_copy_does_not_deliver() {
         let policy = PackageEventPlanePolicy {
             queue_age: StdDuration::from_millis(1),
@@ -2946,6 +3851,7 @@ mod tests {
             ),
             EventPlaneStatus::Accepted
         );
+        assert_router_accounting(&router);
         thread::sleep(StdDuration::from_millis(3));
         let batch = router
             .pull_ready_batch(8, 64 * 1024, Instant::now(), StdDuration::from_millis(8))
@@ -2953,6 +3859,7 @@ mod tests {
         assert!(batch.is_empty());
         let snapshot = router.snapshot().expect("snapshot");
         assert_eq!(snapshot.global_in_flight_bytes, 0);
+        assert_router_accounting(&router);
     }
 
     #[test]
@@ -3334,6 +4241,36 @@ mod tests {
     }
 
     #[test]
+    fn causal_flush_contention_retains_the_next_exact_lease_operation() {
+        let table = CausalScopeTable::new();
+        let identity = LeaseIdentity::EventInFlight {
+            request_id: "request".into(),
+        };
+        let scope = table
+            .mint_with_lease(Some(identity.clone()))
+            .expect("scope");
+        table.test_with_inner_held(|| {
+            assert_eq!(
+                table.release(scope, identity.clone()),
+                CausalAdmitResult::Applied
+            );
+            assert_eq!(table.flush_pending(), 0);
+            assert_eq!(table.pending_len.load(Ordering::SeqCst), 1);
+        });
+        {
+            let _pending = table.pending.try_lock().expect("hold pending queue");
+            assert_eq!(table.flush_pending(), 0);
+            assert!(table.pending_ops());
+            assert_eq!(table.identities(scope), Some(BTreeSet::from([identity])));
+        }
+        assert_eq!(table.flush_pending(), 1);
+        assert_eq!(table.pending_len.load(Ordering::SeqCst), 0);
+        assert!(!table.pending_ops());
+        assert!(!table.is_live(scope));
+        assert_eq!(table.flush_pending(), 0);
+    }
+
+    #[test]
     fn ordered_pending_path_keeps_fifo_and_returns_the_257th() {
         let table = CausalScopeTable::new();
         let mut scopes = Vec::new();
@@ -3548,18 +4485,24 @@ mod tests {
             .current_package_generation("producer")
             .expect("old gen");
         assert_eq!(
-            router.try_replace_package_generation(
-                "producer",
-                vec![sample_contract("producer", "new")],
-                vec![EventSubscription {
-                    plugin_key: "consumer".into(),
-                    owner: "producer".into(),
-                    name: "missing".into(),
-                    handler_id: "missing".into(),
-                    generation: 1,
-                    ..EventSubscription::default()
-                }],
-            ),
+            router
+                .try_replace_package_generation(
+                    "producer",
+                    vec![sample_contract("producer", "new")],
+                    vec![EventSubscription {
+                        plugin_key: "consumer".into(),
+                        owner: "producer".into(),
+                        name: "missing".into(),
+                        handler_id: "missing".into(),
+                        generation: 1,
+                        ..EventSubscription::default()
+                    }],
+                )
+                .map_err(|error| {
+                    let (result, cleanup) = error.into_parts();
+                    assert!(cleanup.is_none());
+                    result.expect_err("replacement admission failed")
+                }),
             Err(EventPlaneStatus::RejectedUndeclared)
         );
         assert!(router.test_has_contract("producer", "old"));
@@ -3589,18 +4532,24 @@ mod tests {
         let before = router.snapshot().expect("before");
         assert_eq!(before.queued_holders, 1);
         assert_eq!(
-            router.try_replace_package_generation(
-                "producer",
-                vec![sample_contract("producer", "new")],
-                vec![EventSubscription {
-                    plugin_key: "consumer".into(),
-                    owner: "producer".into(),
-                    name: "missing".into(),
-                    handler_id: "missing".into(),
-                    generation: 1,
-                    ..EventSubscription::default()
-                }],
-            ),
+            router
+                .try_replace_package_generation(
+                    "producer",
+                    vec![sample_contract("producer", "new")],
+                    vec![EventSubscription {
+                        plugin_key: "consumer".into(),
+                        owner: "producer".into(),
+                        name: "missing".into(),
+                        handler_id: "missing".into(),
+                        generation: 1,
+                        ..EventSubscription::default()
+                    }],
+                )
+                .map_err(|error| {
+                    let (result, cleanup) = error.into_parts();
+                    assert!(cleanup.is_none());
+                    result.expect_err("replacement admission failed")
+                }),
             Err(EventPlaneStatus::RejectedUndeclared)
         );
         assert!(router.test_has_contract("producer", "old"));
