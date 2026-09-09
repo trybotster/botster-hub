@@ -879,7 +879,6 @@ impl HubRuntime {
                     reservation.commit(CausalOp::Release {
                         scope_id,
                         identity: LeaseIdentity::PendingEntityPublish {
-                            plugin_key: plugin_key.to_string(),
                             publication_token: 0,
                         },
                     });
@@ -914,14 +913,7 @@ impl HubRuntime {
     }
 
     #[doc(hidden)]
-    pub fn test_settle_publish(
-        &self,
-        family: &str,
-        scope_id: u64,
-        plugin_key: &str,
-        seq: u64,
-        resync_needed: bool,
-    ) {
+    pub fn test_settle_publish(&self, family: &str, scope_id: u64, seq: u64, resync_needed: bool) {
         let result = crate::package_entity_fanout::PackageEntityPublishResult {
             ok: true,
             status: crate::package_entity_fanout::PackageEntityPublishStatus::Accepted,
@@ -940,16 +932,7 @@ impl HubRuntime {
         let reservation = self
             .reserve_causal_transition()
             .expect("test transition capacity");
-        self.settle_entity_publish_lease(
-            entry,
-            scope_id,
-            plugin_key,
-            0,
-            family,
-            seq,
-            &result,
-            reservation,
-        );
+        self.settle_entity_publish_lease(entry, scope_id, 0, family, seq, &result, reservation);
         self.index_family_resync_releases(family, entry);
     }
 
@@ -1844,10 +1827,7 @@ impl HubRuntime {
         Option<CausalOp>,
         Option<(String, u64)>,
     ) {
-        let pending_identity = LeaseIdentity::PendingEntityPublish {
-            plugin_key: plugin_key.0.clone(),
-            publication_token,
-        };
+        let pending_identity = LeaseIdentity::PendingEntityPublish { publication_token };
         let mut reservation = Some(reservation);
         let (result, discarded, drain) = match self.admit_package_entity_publish_inner(
             plugin_key,
@@ -1942,7 +1922,6 @@ impl HubRuntime {
             let mut op = settle_entity_publish_op(
                 family,
                 scope_id,
-                &plugin_key.0,
                 publication_token,
                 &entity_type,
                 mutation_seq,
@@ -1951,7 +1930,7 @@ impl HubRuntime {
             if discarded.is_some() {
                 if let CausalOp::Transfer { from, to, .. } = &mut op {
                     // Resync can finish before disposal. Keep the publication lease until both finish.
-                    to.push(from.clone());
+                    to[2] = Some(from.clone());
                     reservation.take().unwrap().commit(op);
                     family.remember_resync_lease(scope_id, entity_type.clone());
                 }
@@ -2021,7 +2000,6 @@ impl HubRuntime {
         &self,
         family: &mut PackageEntityFamilyState,
         scope_id: u64,
-        plugin_key: &str,
         publication_token: u64,
         entity_type: &str,
         mutation_seq: u64,
@@ -2031,7 +2009,6 @@ impl HubRuntime {
         let op = settle_entity_publish_op(
             family,
             scope_id,
-            plugin_key,
             publication_token,
             entity_type,
             mutation_seq,
@@ -2091,10 +2068,14 @@ impl HubRuntime {
                 return CausalOp::Transfer {
                     scope_id: lease.scope_id,
                     from: admitted,
-                    to: vec![LeaseIdentity::ProviderResyncNeed {
-                        family: lease.family.clone(),
-                        generation: lease.generation,
-                    }],
+                    to: [
+                        Some(LeaseIdentity::ProviderResyncNeed {
+                            family: lease.family.clone(),
+                            generation: lease.generation,
+                        }),
+                        None,
+                        None,
+                    ],
                 };
             }
         }
@@ -4658,40 +4639,36 @@ pub struct PackageEntityFanoutFinish {
 fn settle_entity_publish_op(
     family: &mut PackageEntityFamilyState,
     scope_id: u64,
-    plugin_key: &str,
     publication_token: u64,
     entity_type: &str,
     mutation_seq: u64,
     result: &PackageEntityPublishResult,
 ) -> CausalOp {
-    let pending = LeaseIdentity::PendingEntityPublish {
-        plugin_key: plugin_key.to_string(),
-        publication_token,
-    };
+    let pending = LeaseIdentity::PendingEntityPublish { publication_token };
     if !result.ok {
         return CausalOp::Release {
             scope_id,
             identity: pending,
         };
     }
-    let mut next = Vec::new();
+    let mut next = [None, None, None];
     if matches!(
         result.status,
         PackageEntityPublishStatus::Accepted | PackageEntityPublishStatus::PendingGap
     ) {
-        next.push(LeaseIdentity::AdmittedEntityMutation {
+        next[0] = Some(LeaseIdentity::AdmittedEntityMutation {
             family: entity_type.to_string(),
             generation: family.generation,
             seq: mutation_seq,
         });
     }
     if result.resync_needed {
-        next.push(LeaseIdentity::ProviderResyncNeed {
+        next[1] = Some(LeaseIdentity::ProviderResyncNeed {
             family: entity_type.to_string(),
             generation: family.generation,
         });
     }
-    if next.is_empty() {
+    if next.iter().all(Option::is_none) {
         CausalOp::Release {
             scope_id,
             identity: pending,
@@ -5470,7 +5447,6 @@ pub(crate) mod tests {
     fn causal_fifo_preserves_transfer_before_release_at_capacity() {
         let runtime = family_runtime("causal-finish-fifo");
         let pending = LeaseIdentity::PendingEntityPublish {
-            plugin_key: "producer".into(),
             publication_token: 0,
         };
         let admitted = LeaseIdentity::AdmittedEntityMutation {
@@ -5495,7 +5471,7 @@ pub(crate) mod tests {
             runtime.admit_causal_op(CausalOp::Transfer {
                 scope_id,
                 from: pending,
-                to: vec![admitted.clone()],
+                to: [Some(admitted.clone()), None, None],
             }),
             CausalAdmitResult::Applied
         ));
@@ -5698,7 +5674,6 @@ return botster.register({ handlers = {{
         let scope_id = runtime
             .causal_scopes
             .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
                 publication_token: 0,
             }))
             .unwrap();
@@ -5742,7 +5717,6 @@ return botster.register({ handlers = {{
                 .expect("out-of-window publication returns its original payload");
             runtime.mark_entity_publish_daemon_owned();
             let pending = LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
                 publication_token: 1,
             };
             let resync = LeaseIdentity::ProviderResyncNeed {
@@ -6950,7 +6924,6 @@ return botster.register({ handlers = {{
         let mut family = PackageEntityFamilyState::default();
         let accepted = scopes
             .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
                 publication_token: 0,
             }))
             .expect("mint");
@@ -6958,7 +6931,6 @@ return botster.register({ handlers = {{
             scopes.try_apply_or_wait(settle_entity_publish_op(
                 &mut family,
                 accepted,
-                "producer",
                 0,
                 "producer.item",
                 32,
@@ -6990,7 +6962,6 @@ return botster.register({ handlers = {{
 
         let errored = scopes
             .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
                 publication_token: 0,
             }))
             .expect("mint error scope");
@@ -6998,7 +6969,6 @@ return botster.register({ handlers = {{
             scopes.try_apply_or_wait(settle_entity_publish_op(
                 &mut family,
                 errored,
-                "producer",
                 0,
                 "producer.item",
                 1,

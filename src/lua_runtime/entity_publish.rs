@@ -216,7 +216,6 @@ impl HubEntityPublishBridge {
             .ok_or_else(|| fail("entity publish token exhausted"))?;
         let (response, receiver) = mpsc::channel();
         let identity = crate::package_event_router::LeaseIdentity::PendingEntityPublish {
-            plugin_key: plugin_key.0.clone(),
             publication_token: token,
         };
         queue.pending.push_back(PendingEntityPublishRequest {

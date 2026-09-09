@@ -2695,7 +2695,8 @@ pub enum CausalOp {
     Transfer {
         scope_id: u64,
         from: LeaseIdentity,
-        to: Vec<LeaseIdentity>,
+        // One mutation, one resync, and the source retained through payload disposal.
+        to: [Option<LeaseIdentity>; 3],
     },
     Release {
         scope_id: u64,
@@ -2958,7 +2959,6 @@ pub enum LeaseIdentity {
         request_id: String,
     },
     PendingEntityPublish {
-        plugin_key: String,
         publication_token: u64,
     },
     AdmittedEntityMutation {
@@ -3100,7 +3100,12 @@ impl CausalScopeTable {
     #[must_use]
     pub fn mint_with_lease(&self, identity: Option<LeaseIdentity>) -> Option<u64> {
         let notice = CausalUnlockNotice::new(self);
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = self
+            .next_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+                (id != 0).then(|| id.checked_add(1).unwrap_or(0))
+            })
+            .ok()?;
         let mut inner = self.causal_lock(&notice, false).ok()?;
         let mut identities = BTreeSet::new();
         let mut leases = 0;
@@ -3245,7 +3250,7 @@ fn apply_causal_locked(inner: &mut CausalInner, op: &CausalOp) {
                 if scope.identities.remove(from) {
                     scope.leases = scope.leases.saturating_sub(1);
                 }
-                for identity in to {
+                for identity in to.iter().flatten() {
                     if scope.identities.insert(identity.clone()) {
                         scope.leases = scope.leases.saturating_add(1);
                     }
@@ -3277,6 +3282,32 @@ mod tests {
     use std::thread;
     use std::time::Duration as StdDuration;
 
+    #[test]
+    fn causal_scope_exhaustion_preserves_existing_leases() {
+        let table = CausalScopeTable::new();
+        let identity = LeaseIdentity::PendingEntityPublish {
+            publication_token: 1,
+        };
+        let first = table.mint_with_lease(Some(identity.clone())).unwrap();
+        table.next_id.store(u64::MAX, Ordering::SeqCst);
+        let last = table.mint_with_lease(Some(identity.clone())).unwrap();
+        assert_eq!(last, u64::MAX);
+        assert_eq!(table.mint(), None);
+        assert_eq!(table.mint_with_lease(Some(identity.clone())), None);
+        assert_eq!(table.lease_count(first), Some(1));
+        assert_eq!(table.lease_count(last), Some(1));
+        for scope_id in [first, last] {
+            assert_eq!(
+                table.try_apply_or_wait(CausalOp::Release {
+                    scope_id,
+                    identity: identity.clone(),
+                }),
+                CausalWaitResult::Applied
+            );
+            assert!(!table.is_live(scope_id));
+        }
+    }
+
     fn causal_test_op(sequence: u64) -> CausalOp {
         CausalOp::Release {
             scope_id: sequence,
@@ -3299,7 +3330,6 @@ mod tests {
     fn causal_owner_apply_changes_only_the_supplied_operation() {
         let table = CausalScopeTable::new();
         let pending_identity = LeaseIdentity::PendingEntityPublish {
-            plugin_key: "producer".into(),
             publication_token: 0,
         };
         let scope_id = table
@@ -3319,7 +3349,7 @@ mod tests {
             table.try_apply_or_wait(CausalOp::Transfer {
                 scope_id,
                 from: pending_identity,
-                to: vec![mutation.clone(), resync.clone()],
+                to: [Some(mutation.clone()), Some(resync.clone()), None],
             }),
             CausalWaitResult::Applied
         );
@@ -3363,7 +3393,6 @@ mod tests {
         ] {
             let table = Arc::new(CausalScopeTable::new());
             let identity = LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
                 publication_token: 0,
             };
             let scope_id = table
@@ -3422,7 +3451,6 @@ mod tests {
     fn causal_owner_apply_parks_without_polling_and_retains_a_full_channel_wake() {
         let table = Arc::new(CausalScopeTable::new());
         let identity = LeaseIdentity::PendingEntityPublish {
-            plugin_key: "producer".into(),
             publication_token: 0,
         };
         let scope_id = table.mint_with_lease(Some(identity.clone())).unwrap();
@@ -3487,7 +3515,6 @@ mod tests {
     fn causal_owner_apply_fault_retains_the_operation_and_prebind_notification() {
         let table = CausalScopeTable::new();
         let identity = LeaseIdentity::PendingEntityPublish {
-            plugin_key: "producer".into(),
             publication_token: 0,
         };
         let scope_id = table.mint_with_lease(Some(identity.clone())).unwrap();
@@ -3539,7 +3566,6 @@ mod tests {
         let table = CausalScopeTable::new();
         let scope_id = table.mint().unwrap();
         let identity = LeaseIdentity::PendingEntityPublish {
-            plugin_key: "producer".into(),
             publication_token: 0,
         };
         assert_eq!(
@@ -3566,7 +3592,6 @@ mod tests {
         let table = CausalScopeTable::new();
         let scope_id = table.mint().unwrap();
         let identity = LeaseIdentity::PendingEntityPublish {
-            plugin_key: "producer".into(),
             publication_token: 0,
         };
         table.test_with_inner_held(|| {
@@ -3661,7 +3686,6 @@ mod tests {
             table.try_acquire_or_wait(
                 u64::MAX,
                 &LeaseIdentity::PendingEntityPublish {
-                    plugin_key: "absent".into(),
                     publication_token: 0
                 }
             ),
@@ -6221,7 +6245,6 @@ mod tests {
         let table = CausalScopeTable::new();
         let scope = table
             .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-                plugin_key: "producer".into(),
                 publication_token: 0,
             }))
             .expect("mint");
@@ -6229,14 +6252,17 @@ mod tests {
             table.try_apply_or_wait(CausalOp::Transfer {
                 scope_id: scope,
                 from: LeaseIdentity::PendingEntityPublish {
-                    plugin_key: "producer".into(),
                     publication_token: 0
                 },
-                to: vec![LeaseIdentity::AdmittedEntityMutation {
-                    generation: 0,
-                    family: "producer.item".into(),
-                    seq: 32,
-                }],
+                to: [
+                    Some(LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
+                        family: "producer.item".into(),
+                        seq: 32,
+                    }),
+                    None,
+                    None
+                ],
             }),
             CausalWaitResult::Applied
         );

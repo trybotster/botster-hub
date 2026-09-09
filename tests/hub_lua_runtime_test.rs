@@ -4185,9 +4185,8 @@ fn package_cleanup_releases_detached_resync_leases() {
 
 fn fill_causal_owner_queue(hub: &HubRuntime, count: usize) -> Vec<u64> {
     (0..count)
-        .map(|index| {
+        .map(|_| {
             let identity = LeaseIdentity::PendingEntityPublish {
-                plugin_key: format!("filler-{index}"),
                 publication_token: 0,
             };
             let scope_id = hub
@@ -4252,7 +4251,6 @@ fn production_fanout_finish_preserves_a_retained_publish_transfer() {
         scopes.identities(live),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::PendingEntityPublish {
-                plugin_key: "lease-probe".into(),
                 publication_token: 1
             }
         ]))
@@ -4417,7 +4415,6 @@ fn owner_causal_queue_retains_its_head_during_reader_contention() {
     let scopes = hub.causal_scopes();
     let live = scopes
         .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
-            plugin_key: "source".into(),
             publication_token: 0,
         }))
         .unwrap();
@@ -4425,14 +4422,17 @@ fn owner_causal_queue_retains_its_head_during_reader_contention() {
         hub.admit_causal_op(CausalOp::Transfer {
             scope_id: live,
             from: LeaseIdentity::PendingEntityPublish {
-                plugin_key: "source".into(),
                 publication_token: 0
             },
-            to: vec![LeaseIdentity::AdmittedEntityMutation {
-                family: "item".into(),
-                generation: 0,
-                seq: 1
-            }],
+            to: [
+                Some(LeaseIdentity::AdmittedEntityMutation {
+                    family: "item".into(),
+                    generation: 0,
+                    seq: 1
+                }),
+                None,
+                None
+            ],
         }),
         CausalAdmitResult::Applied
     );
@@ -4490,11 +4490,9 @@ fn two_publications_keep_distinct_pending_leases_before_owner_transfers_apply() 
         scopes.identities(live),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::PendingEntityPublish {
-                plugin_key: "lease-probe".into(),
                 publication_token: 1
             },
             LeaseIdentity::PendingEntityPublish {
-                plugin_key: "lease-probe".into(),
                 publication_token: 2
             },
         ]))
@@ -4502,11 +4500,9 @@ fn two_publications_keep_distinct_pending_leases_before_owner_transfers_apply() 
     let _ = hub.apply_event_plane_owner_ops();
     let identities = scopes.identities(live).unwrap();
     assert!(identities.contains(&LeaseIdentity::PendingEntityPublish {
-        plugin_key: "lease-probe".into(),
         publication_token: 2
     }));
     assert!(!identities.contains(&LeaseIdentity::PendingEntityPublish {
-        plugin_key: "lease-probe".into(),
         publication_token: 1
     }));
     while let Some(item) = hub.take_one_package_entity_fanout() {
