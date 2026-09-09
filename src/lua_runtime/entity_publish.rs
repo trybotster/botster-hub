@@ -311,6 +311,11 @@ impl HubEntityPublishBridge {
         true
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_retract(&self, token: u64) -> bool {
+        self.try_retract(token)
+    }
+
     /// Keep the exact head until the owner reserves and acquires its transition.
     pub(crate) fn take_if<T>(
         &self,

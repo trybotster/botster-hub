@@ -487,27 +487,34 @@ pub struct PackageEntityFamilyState {
 }
 
 impl PackageEntityFamilyState {
-    /// Admit one mutation and return frames ready for immediate fanout.
+    /// Admit one mutation and return ready frames and the original discarded mutation.
     pub fn admit(
         &mut self,
         mutation: PackageEntityMutation,
         now: Instant,
-    ) -> (PackageEntityPublishResult, Vec<PackageEntityMutation>) {
+    ) -> (
+        PackageEntityPublishResult,
+        Vec<PackageEntityMutation>,
+        Option<PackageEntityMutation>,
+    ) {
         let seq = mutation.snapshot_seq();
         if seq < self.last_accepted_seq {
             return (
                 self.result(PackageEntityPublishStatus::StaleSequence),
                 Vec::new(),
+                Some(mutation),
             );
         }
         if seq == self.last_accepted_seq {
             return (
                 self.result(PackageEntityPublishStatus::DuplicateSequence),
                 Vec::new(),
+                Some(mutation),
             );
         }
 
         let mut ready = Vec::new();
+        let mut discarded = None;
         let status = if self.last_accepted_seq.checked_add(1) == Some(seq) {
             self.high_water_seq = self.high_water_seq.max(seq);
             self.last_accepted_seq = seq;
@@ -526,6 +533,7 @@ impl PackageEntityFamilyState {
                 return (
                     self.result(PackageEntityPublishStatus::DuplicateSequence),
                     Vec::new(),
+                    Some(mutation),
                 );
             }
             self.high_water_seq = self.high_water_seq.max(seq);
@@ -536,10 +544,11 @@ impl PackageEntityFamilyState {
         } else {
             self.high_water_seq = self.high_water_seq.max(seq);
             self.resync.rearm(now);
+            discarded = Some(mutation);
             PackageEntityPublishStatus::ResyncScheduled
         };
 
-        (self.result(status), ready)
+        (self.result(status), ready, discarded)
     }
 
     fn after_publish_progress(&mut self, now: Instant) {
@@ -1315,7 +1324,8 @@ mod tests {
             })
         ));
 
-        let (duplicate, ready) = state.admit(pending_mutation(u64::MAX, "duplicate"), now);
+        let (duplicate, ready, _discarded) =
+            state.admit(pending_mutation(u64::MAX, "duplicate"), now);
         assert_eq!(
             duplicate.status,
             PackageEntityPublishStatus::DuplicateSequence
@@ -1350,7 +1360,7 @@ mod tests {
     fn admission_accepts_in_order_and_drains_pending() {
         let mut state = PackageEntityFamilyState::default();
         let now = Instant::now();
-        let (result, ready) = state.admit(
+        let (result, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
                 snapshot_seq: 1,
@@ -1362,7 +1372,7 @@ mod tests {
         assert_eq!(result.status, PackageEntityPublishStatus::Accepted);
         assert_eq!(ready.len(), 1);
 
-        let (gap, ready) = state.admit(
+        let (gap, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
                 snapshot_seq: 3,
@@ -1375,7 +1385,7 @@ mod tests {
         assert!(ready.is_empty());
         assert!(state.resync.needed);
 
-        let (accepted, ready) = state.admit(
+        let (accepted, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
                 snapshot_seq: 2,
@@ -1395,7 +1405,7 @@ mod tests {
     fn pending_and_resync_rows_keep_distinct_scope_identities() {
         let mut state = PackageEntityFamilyState::default();
         let now = Instant::now();
-        let (gap, ready) = state.admit(
+        let (gap, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
                 snapshot_seq: 3,
@@ -1413,7 +1423,7 @@ mod tests {
             seq: 3,
         });
         assert!(state.remember_resync_lease(7, "f".into()));
-        let (later, _) = state.admit(
+        let (later, _, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
                 snapshot_seq: 4,
@@ -1443,7 +1453,7 @@ mod tests {
             ..Default::default()
         };
         let now = Instant::now();
-        let (result, ready) = state.admit(
+        let (result, ready, _discarded) = state.admit(
             PackageEntityMutation::Remove {
                 entity_type: "f".into(),
                 snapshot_seq: 20,
@@ -1468,10 +1478,10 @@ mod tests {
             id: "first".into(),
             entity: json!({"id":"first","status":"original"}),
         };
-        let (gap, ready) = state.admit(first.clone(), now);
+        let (gap, ready, _discarded) = state.admit(first.clone(), now);
         assert_eq!(gap.status, PackageEntityPublishStatus::PendingGap);
         assert!(ready.is_empty());
-        let (dup, ready) = state.admit(
+        let (dup, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
                 snapshot_seq: 2,
@@ -1616,7 +1626,7 @@ mod tests {
         );
         state.resync.degraded = true;
         state.resync.needed = false;
-        let (result, _) = state.admit(
+        let (result, _, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
                 snapshot_seq: 2,
@@ -1634,7 +1644,7 @@ mod tests {
         state.last_accepted_seq = 19;
         state.resync.degraded = true;
         state.resync.needed = false;
-        let (done, _) = state.admit(
+        let (done, _, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
                 snapshot_seq: 20,

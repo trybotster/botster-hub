@@ -3992,6 +3992,8 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
         degraded,
     ));
     assert!(matches!(far.result, PluginInvocationResult::Completed(_)));
+    // The response follows release admission. The owner applies that release in a later phase.
+    drain_causal_owner_work(&hub);
     assert_eq!(
         scopes.identities(degraded),
         Some(std::collections::BTreeSet::from([
