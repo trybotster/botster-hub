@@ -6173,8 +6173,14 @@ return botster.register({ handlers = {{
             generation,
             seq: 1,
         };
+        let resync_identity = |generation| LeaseIdentity::ProviderResyncNeed {
+            family: family.into(),
+            generation,
+        };
         assert!(runtime.causal_scopes.acquire(scope, identity(0)));
+        assert!(runtime.causal_scopes.acquire(scope, resync_identity(0)));
         runtime.test_store_pending_lease(scope, family, 1);
+        runtime.test_store_resync_lease(scope, family);
         let mut cleanup = HostPackageCleanup {
             unloaded_families: vec![("producer".into(), BTreeSet::from([family.into()]))],
             ..HostPackageCleanup::default()
@@ -6190,6 +6196,8 @@ return botster.register({ handlers = {{
         runtime.test_store_family_payload(payload());
         runtime.test_store_pending_lease(scope, family, 1);
         assert!(runtime.causal_scopes.acquire(scope, identity(1)));
+        assert!(runtime.causal_scopes.acquire(scope, resync_identity(1)));
+        runtime.test_store_resync_lease(scope, family);
         let FamilyCleanupStep::Payload(old_payload) =
             runtime.step_host_package_entity_cleanup(&mut cleanup)
         else {
@@ -6224,10 +6232,13 @@ return botster.register({ handlers = {{
         let live = runtime.causal_scopes.identities(scope).unwrap();
         assert!(!live.contains(&identity(0)));
         assert!(live.contains(&identity(1)));
+        assert!(!live.contains(&resync_identity(0)));
+        assert!(live.contains(&resync_identity(1)));
         let families = runtime.package_entity_families.lock().unwrap();
         assert_eq!(families[family].generation, 1);
         assert_eq!(families[family].pending_by_seq.len(), 1);
         assert_eq!(families[family].pending_leases.len(), 1);
+        assert_eq!(families[family].resync.leases.len(), 1);
     }
 
     #[test]
