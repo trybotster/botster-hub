@@ -1935,9 +1935,7 @@ mod tests {
                                 crate::package_event_router::CausalOp::Release {
                                     scope_id: u64::MAX,
                                     identity:
-                                        crate::package_event_router::LeaseIdentity::EventInFlight {
-                                            request_id: "absent".into()
-                                        },
+                                        crate::package_event_router::LeaseIdentity::EventInFlight,
                                 }
                             ),
                             crate::package_event_router::CausalAdmitResult::Applied
@@ -2448,9 +2446,7 @@ mod tests {
         assert!(matches!(
             runtime.admit_causal_op(crate::package_event_router::CausalOp::Release {
                 scope_id: u64::MAX,
-                identity: crate::package_event_router::LeaseIdentity::EventInFlight {
-                    request_id: "wake".into()
-                },
+                identity: crate::package_event_router::LeaseIdentity::EventInFlight,
             }),
             crate::package_event_router::CausalAdmitResult::Applied
         ));
@@ -2606,9 +2602,7 @@ mod tests {
             assert!(matches!(
                 runtime.admit_causal_op(CausalOp::Release {
                     scope_id: u64::MAX,
-                    identity: LeaseIdentity::EventInFlight {
-                        request_id: "filler".into()
-                    },
+                    identity: LeaseIdentity::EventInFlight,
                 }),
                 CausalAdmitResult::Applied
             ));
@@ -2663,9 +2657,7 @@ mod tests {
             assert!(matches!(
                 runtime.admit_causal_op(CausalOp::Release {
                     scope_id: u64::MAX,
-                    identity: LeaseIdentity::EventInFlight {
-                        request_id: "filler".into()
-                    },
+                    identity: LeaseIdentity::EventInFlight,
                 }),
                 CausalAdmitResult::Applied
             ));
@@ -2712,10 +2704,8 @@ mod tests {
         let runtime = daemon.runtime().expect("runtime");
         let scopes = runtime.causal_scopes().clone();
         let ids: Vec<_> = (0..100)
-            .map(|index| {
-                let identity = LeaseIdentity::EventInFlight {
-                    request_id: format!("causal-budget-{index}"),
-                };
+            .map(|_| {
+                let identity = LeaseIdentity::EventInFlight;
                 let scope_id = scopes.mint_with_lease(Some(identity.clone())).unwrap();
                 assert!(matches!(
                     runtime.admit_causal_op(CausalOp::Release { scope_id, identity }),
@@ -4183,9 +4173,7 @@ return botster.register({
             assert!(matches!(
                 runtime.admit_causal_op(CausalOp::Release {
                     scope_id: u64::MAX,
-                    identity: LeaseIdentity::EventInFlight {
-                        request_id: "filler".into()
-                    },
+                    identity: LeaseIdentity::EventInFlight,
                 }),
                 CausalAdmitResult::Applied
             ));

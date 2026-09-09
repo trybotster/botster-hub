@@ -458,13 +458,11 @@ mod tests {
         let runtime = daemon.runtime().unwrap();
         let mut state = crate::daemon::owner_loop::DaemonControlState::default();
         let (mut entry, scope) = retained_fanout(runtime, &mut state);
-        for index in 0..crate::runtime::CAUSAL_OWNER_CAPACITY {
+        for _ in 0..crate::runtime::CAUSAL_OWNER_CAPACITY {
             assert!(matches!(
                 runtime.admit_causal_op(CausalOp::Release {
                     scope_id: u64::MAX,
-                    identity: LeaseIdentity::EventInFlight {
-                        request_id: format!("filler-{index}")
-                    },
+                    identity: LeaseIdentity::EventInFlight,
                 }),
                 CausalAdmitResult::Applied
             ));

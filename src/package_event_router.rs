@@ -2955,9 +2955,8 @@ struct CausalScope {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LeaseIdentity {
-    EventInFlight {
-        request_id: String,
-    },
+    /// Each event owns the root lease in a newly minted scope.
+    EventInFlight,
     PendingEntityPublish {
         publication_token: u64,
     },
@@ -2971,7 +2970,7 @@ pub enum LeaseIdentity {
         generation: u64,
     },
     ProviderInFlight {
-        request_id: String,
+        invocation_token: u64,
     },
 }
 
@@ -3642,12 +3641,7 @@ mod tests {
                 let _ = table.mint();
             },
             |table| {
-                assert!(!table.acquire(
-                    u64::MAX,
-                    LeaseIdentity::EventInFlight {
-                        request_id: "absent".into()
-                    }
-                ));
+                assert!(!table.acquire(u64::MAX, LeaseIdentity::EventInFlight));
             },
             |table| {
                 let _ = table.is_live(1);
@@ -6184,9 +6178,7 @@ mod tests {
     fn mint_with_lease_is_live_before_any_later_acquire() {
         let table = CausalScopeTable::new();
         let scope = table
-            .mint_with_lease(Some(LeaseIdentity::EventInFlight {
-                request_id: "req-1".into(),
-            }))
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight))
             .expect("mint");
         assert!(table.is_live(scope));
         assert_eq!(table.lease_count(scope), Some(1));
