@@ -649,6 +649,8 @@ Cell retirement also checks Arc identity. A delayed old mailbox retirement must 
 Mailbox cleanup retires diagnostics while it holds the existing mailbox lock. Refused cleanup retains the mailbox for the existing cleanup retry.
 This boundary serializes retirement with metric publication. The final mailbox Drop provides an exclusive fallback.
 Router retirement and metric publication share the RouterInner lock. Consumer rebind retires the old Arc, including same-generation replacement.
+Consumer rebind retires the old registered cell before it registers the new cell. A diagnostic snapshot can observe that temporary absence.
+The registry snapshot does not represent an atomic router lifecycle snapshot.
 
 Required tests cover immediate row removal, retained closed handles, live Empty rows, generation isolation, and delayed old-cell retirement.
 This change removes the two global pruning scans. It does not establish diagnostic lock progress or close other owner scheduling findings.
@@ -657,3 +659,21 @@ Validation used Rust 1.97.0 with `CARGO_INCREMENTAL=0` and two Cargo jobs.
 The `event_plane_counters::tests` suite passed 17 tests. The `package_event_router::tests` suite passed 60 tests.
 After caller serialization changed, `subscription::package_events::tests` passed all 21 tests.
 The focused same-generation consumer rebind test also passed.
+
+## 12. Intermediate family generation migration, 2026-09-08
+
+Mutation and resync causal identities now include the family generation. New family state captures the current owner-held epoch.
+An accepted package cleanup reserves its next epoch before family removal. A retained cleanup reserves that epoch only once.
+Epoch exhaustion retains the exact package result, fault, Host permit, and Owner permit through terminal recovery.
+
+Provider preparation captures the family generation before asynchronous admission. Owner delivery phases compare that generation with live family state.
+A late fanout finish releases its old lease without recreating an absent family or marking a newer family for resync.
+
+This is an intermediate migration. Cleanup still reinserts unloading family state into the live map.
+Detached retired state, generation-specific fanout membership, bounded cleanup phases, and causal notification progress remain incomplete.
+The retained-old-state and new-admission test remains required.
+
+Rust 1.97.0 `check --tests` passed. Nine family-focused library tests passed.
+The package recovery test passed both event failure and family epoch exhaustion with two previously accepted requests.
+The first lease integration run stopped during setup because the candidate environment was absent. It did not execute the test bodies.
+A clean candidate build and integration rerun are required after this checkpoint.

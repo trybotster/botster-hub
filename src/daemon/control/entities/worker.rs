@@ -16,6 +16,7 @@ pub(super) struct EntityWork {
     pub(super) target: Option<Arc<Target>>,
     pub(super) payload: Option<Payload>,
     pub(super) family: Option<Arc<String>>,
+    pub(super) family_generation: Option<u64>,
     pub(super) registration: Option<Registration>,
     pub(super) reservation_identity: Option<PreparedSubscriptionIdentity>,
     pub(super) cursor: Option<Arc<Target>>,
@@ -72,6 +73,7 @@ impl EntityWork {
             target,
             payload: None,
             family: None,
+            family_generation: None,
             registration: None,
             reservation_identity: None,
             cursor: None,
@@ -409,6 +411,19 @@ pub(super) fn step(
     };
     let executor = runtime.host_executor();
     let waiter = entry.waiter_id;
+    let generation_is_current = match (&entry.work.family, entry.work.family_generation) {
+        (Some(family), Some(generation)) => {
+            runtime.package_entity_family_generation(family) == Some(generation)
+        }
+        _ => true,
+    };
+    if !generation_is_current {
+        entry.work.cancel();
+        entry.work.error = Some((
+            "entity_provider_stale",
+            "the entity family changed during delivery",
+        ));
+    }
     if let Some((identity, completion)) = entry.work.take_completion() {
         match completion {
             Completion::Prepared {
@@ -444,7 +459,7 @@ pub(super) fn step(
                     entry.work.floor,
                     status,
                 );
-                if catching_up {
+                if catching_up && generation_is_current {
                     runtime.mark_package_entity_resync_needed(&target.entity_type);
                     if let Some(finish) = &mut entry.work.finish {
                         finish.scheduled_resync = true;
@@ -495,7 +510,8 @@ pub(super) fn step(
         return Step::Waiting;
     };
     if entry.work.cancelled && entry.work.stage != Stage::Provider {
-        if state.plugin_entities.active_delivery == Some(waiter)
+        if generation_is_current
+            && state.plugin_entities.active_delivery == Some(waiter)
             && let Some(family) = &entry.work.family
         {
             runtime.mark_package_entity_resync_needed(family);
@@ -540,6 +556,7 @@ pub(super) fn step(
                 let Some(item) = runtime.take_one_package_entity_fanout() else {
                     return Step::Done;
                 };
+                entry.work.family_generation = Some(item.generation);
                 let (mutation, finish) = item.into_parts();
                 entry.work.finish = Some(finish);
                 entry.work.stage = Stage::Deliver;

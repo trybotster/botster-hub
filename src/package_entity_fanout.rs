@@ -172,6 +172,7 @@ pub struct PackageEntityPublishResult {
 pub struct EntityMutationLease {
     pub scope_id: u64,
     pub family: String,
+    pub generation: u64,
     pub seq: u64,
 }
 
@@ -342,6 +343,7 @@ pub enum PackageEntityFamilyStep {
 /// Per-family runtime admission state.
 #[derive(Debug, Clone, Default)]
 pub struct PackageEntityFamilyState {
+    pub generation: u64,
     pub last_accepted_seq: u64,
     pub high_water_seq: u64,
     pub pending_by_seq: BTreeMap<u64, PackageEntityMutation>,
@@ -702,6 +704,7 @@ mod tests {
     ) {
         state.pending_by_seq.insert(seq, pending_mutation(seq, id));
         state.store_pending_lease(EntityMutationLease {
+            generation: 0,
             scope_id,
             family: "f".into(),
             seq,
@@ -734,6 +737,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    generation: 0,
                     scope_id: 101,
                     seq: 1,
                     ..
@@ -752,6 +756,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    generation: 0,
                     scope_id: 102,
                     seq: 2,
                     ..
@@ -796,6 +801,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    generation: 0,
                     scope_id: 203,
                     seq: 3,
                     ..
@@ -814,6 +820,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    generation: 0,
                     scope_id: 204,
                     seq: 4,
                     ..
@@ -939,6 +946,7 @@ mod tests {
                     ..
                 },
                 lease: Some(EntityMutationLease {
+                    generation: 0,
                     scope_id: 501,
                     seq: u64::MAX,
                     ..
@@ -1047,6 +1055,7 @@ mod tests {
         assert_eq!(gap.status, PackageEntityPublishStatus::PendingGap);
         assert!(ready.is_empty());
         state.store_pending_lease(EntityMutationLease {
+            generation: 0,
             scope_id: 7,
             family: "f".into(),
             seq: 3,
@@ -1063,6 +1072,7 @@ mod tests {
         );
         assert_eq!(later.status, PackageEntityPublishStatus::PendingGap);
         state.store_pending_lease(EntityMutationLease {
+            generation: 0,
             scope_id: 8,
             family: "f".into(),
             seq: 4,

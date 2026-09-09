@@ -26,6 +26,12 @@ pub(crate) enum DocumentAdmission {
 
 /// One unresolved host operation. Each variant retains the original operation slot.
 pub(crate) enum HostRecoveryRequired {
+    PackageFamilies {
+        owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
+        _result: Box<HostMutationResult>,
+        _fault: crate::runtime::PackageEntityCleanupError,
+        _permit: HostWorkPermit,
+    },
     PackageEvents {
         owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
         _result: Box<HostMutationResult>,
@@ -47,9 +53,9 @@ impl HostRecoveryRequired {
     /// Recovery rows live until daemon teardown. Live removal must release this permit through OwnerBudget.
     pub(crate) fn retain_owner_permit(&mut self, permit: crate::daemon::owner_budget::OwnerPermit) {
         let retained = match self {
-            Self::PackageEvents { owner_permit, .. } | Self::Submission { owner_permit, .. } => {
-                owner_permit
-            }
+            Self::PackageEvents { owner_permit, .. }
+            | Self::PackageFamilies { owner_permit, .. }
+            | Self::Submission { owner_permit, .. } => owner_permit,
             Self::Package(recovery) => &mut recovery.owner_permit,
             Self::ManagedGit(recovery) => &mut recovery.owner_permit,
         };
@@ -313,6 +319,26 @@ pub(crate) fn handle(
                         &mut next_phase,
                         &mut event_cleanup,
                     );
+                }
+                if let Err(fault) = daemon
+                    .runtime()
+                    .expect("family cleanup retains its runtime")
+                    .begin_host_package_entity_cleanup(cleanup)
+                {
+                    state.host_recovery.insert(
+                        waiter_id,
+                        HostRecoveryRequired::PackageFamilies {
+                            owner_permit: None,
+                            _result: Box::new(result),
+                            _fault: fault,
+                            _permit: permit,
+                        },
+                    );
+                    return ControlPoll::Ready(Ok(error_response(
+                        "entity_family_generation_exhausted",
+                        "packages",
+                        "entity family cleanup exhausted generation identifiers",
+                    )));
                 }
             }
             match result {
