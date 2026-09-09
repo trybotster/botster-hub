@@ -116,6 +116,8 @@ struct BridgeReleaseProgress {
     blocked: AtomicUsize,
     interests: AtomicUsize,
     poisoned: AtomicUsize,
+    // Only the owner consumer advances this shared cursor.
+    next_release_store: AtomicUsize,
     #[cfg(test)]
     probe: Mutex<Option<Arc<dyn Fn(ReleaseTestPoint) + Send + Sync>>>,
 }
@@ -201,6 +203,7 @@ enum ReleaseLockError {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReleaseTestPoint {
+    Select(ReleaseStore),
     BeforeArm(ReleaseStore),
     BeforeRetry(ReleaseStore),
     BeforeNotify,
@@ -463,13 +466,44 @@ impl HubEntityPublishBridge {
         }
     }
 
+    /// The owner is the only consumer that calls this method.
+    /// Each call visits at most five stores and removes at most one operation.
+    /// A continuously ready store with an available lock receives service within
+    /// five successful calls, even when producers continuously refill other stores.
     pub fn take_release(&self) -> Option<CausalOp> {
         let notice = ReleaseUnlockNotice::new(self);
-        self.take_release_queue(&self.pending_releases, &notice, ReleaseStore::Pending)
-            .or_else(|| self.take_release_queue(&self.scope_releases, &notice, ReleaseStore::Scope))
-            .or_else(|| self.take_release_queue(&self.orphan_ops, &notice, ReleaseStore::Orphan))
-            .or_else(|| self.take_release_slot(&self.held_release, &notice, ReleaseStore::Held))
-            .or_else(|| self.take_release_slot(&self.source_release, &notice, ReleaseStore::Source))
+        // The cursor selects a store; the store locks synchronize its operations.
+        let start = self
+            .release_progress
+            .next_release_store
+            .load(Ordering::Relaxed);
+        for offset in 0..ReleaseStore::ALL.len() {
+            let index = (start + offset) % ReleaseStore::ALL.len();
+            let store = ReleaseStore::ALL[index];
+            #[cfg(test)]
+            self.release_progress
+                .run_probe(ReleaseTestPoint::Select(store));
+            let op = match store {
+                ReleaseStore::Pending => {
+                    self.take_release_queue(&self.pending_releases, &notice, store)
+                }
+                ReleaseStore::Scope => {
+                    self.take_release_queue(&self.scope_releases, &notice, store)
+                }
+                ReleaseStore::Orphan => self.take_release_queue(&self.orphan_ops, &notice, store),
+                ReleaseStore::Held => self.take_release_slot(&self.held_release, &notice, store),
+                ReleaseStore::Source => {
+                    self.take_release_slot(&self.source_release, &notice, store)
+                }
+            };
+            if op.is_some() {
+                self.release_progress
+                    .next_release_store
+                    .store((index + 1) % ReleaseStore::ALL.len(), Ordering::Relaxed);
+                return op;
+            }
+        }
+        None
     }
 
     #[must_use]
@@ -2300,6 +2334,190 @@ mod release_readiness_tests {
                 plugin_key: "producer".to_string(),
             },
         }
+    }
+
+    fn store_release(store: ReleaseStore, sequence: u64) -> CausalOp {
+        CausalOp::Release {
+            scope_id: sequence,
+            identity: LeaseIdentity::PendingEntityPublish {
+                plugin_key: format!("{store:?}"),
+            },
+        }
+    }
+
+    #[test]
+    fn release_cursor_serves_every_store_under_continuous_refill() {
+        let bridge = HubEntityPublishBridge::new();
+        let consumer = bridge.clone();
+        for store in ReleaseStore::ALL {
+            assert_eq!(
+                push_store(&bridge, store, store_release(store, 0)),
+                CausalAdmitResult::Applied
+            );
+        }
+        for sequence in 0..4 {
+            for store in ReleaseStore::ALL {
+                // Alternating handles must use the same cursor.
+                let handle = if store as usize % 2 == 0 {
+                    &bridge
+                } else {
+                    &consumer
+                };
+                assert_eq!(handle.take_release(), Some(store_release(store, sequence)));
+                assert_eq!(bridge.release_count(), 4);
+                assert_membership(&bridge);
+                assert_eq!(
+                    push_store(&bridge, store, store_release(store, sequence + 1)),
+                    CausalAdmitResult::Applied
+                );
+                assert_eq!(bridge.release_count(), 5);
+                assert_membership(&bridge);
+            }
+        }
+    }
+
+    #[test]
+    fn release_cursor_skips_unavailable_stores_and_serves_after_unlock() {
+        let bridge = HubEntityPublishBridge::new();
+        for store in [
+            ReleaseStore::Pending,
+            ReleaseStore::Scope,
+            ReleaseStore::Held,
+            ReleaseStore::Source,
+        ] {
+            assert_eq!(
+                push_store(&bridge, store, store_release(store, 0)),
+                CausalAdmitResult::Applied
+            );
+        }
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_store(&bridge, ReleaseStore::Scope, || {
+                panic!("poison scope store")
+            });
+        }));
+        assert!(fault.is_err());
+        with_store(&bridge, ReleaseStore::Pending, || {
+            assert_eq!(
+                bridge.take_release(),
+                Some(store_release(ReleaseStore::Held, 0))
+            );
+            assert_eq!(
+                bridge.take_release(),
+                Some(store_release(ReleaseStore::Source, 0))
+            );
+            assert_eq!(bridge.take_release(), None);
+            assert_eq!(
+                bridge
+                    .release_progress
+                    .next_release_store
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(bridge.release_count(), 2);
+            assert!(!bridge.release_ready());
+            bridge.take_progress_notification();
+        });
+        assert!(bridge.take_progress_notification());
+        assert!(bridge.release_ready());
+        assert_membership(&bridge);
+        assert_eq!(
+            bridge.take_release(),
+            Some(store_release(ReleaseStore::Pending, 0))
+        );
+        assert_eq!(
+            bridge
+                .release_progress
+                .next_release_store
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(bridge.take_release(), None);
+        assert_eq!(
+            bridge
+                .release_progress
+                .next_release_store
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(bridge.release_count(), 1);
+        assert!(bridge.release_faulted());
+        assert_membership(&bridge);
+    }
+
+    #[test]
+    fn release_scan_is_bounded_and_explicit_source_take_preserves_cursor() {
+        let bridge = HubEntityPublishBridge::new();
+        assert_eq!(
+            push_store(&bridge, ReleaseStore::Scope, release()),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(bridge.take_release(), Some(release()));
+        assert_eq!(
+            bridge
+                .release_progress
+                .next_release_store
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(bridge.leave_source(release()), CausalAdmitResult::Applied);
+        assert_eq!(bridge.take_source(), Some(release()));
+        assert_eq!(
+            bridge
+                .release_progress
+                .next_release_store
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_membership(&bridge);
+
+        let visits = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&visits);
+        *bridge.release_progress.probe.try_lock().unwrap() = Some(Arc::new(move |point| {
+            if let ReleaseTestPoint::Select(store) = point {
+                recorded.lock().unwrap().push(store);
+            }
+        }));
+        for _ in 0..3 {
+            visits.lock().unwrap().clear();
+            assert_eq!(bridge.take_release(), None);
+            assert_eq!(
+                bridge
+                    .release_progress
+                    .next_release_store
+                    .load(Ordering::Relaxed),
+                2
+            );
+            assert_eq!(
+                *visits.lock().unwrap(),
+                vec![
+                    ReleaseStore::Orphan,
+                    ReleaseStore::Held,
+                    ReleaseStore::Source,
+                    ReleaseStore::Pending,
+                    ReleaseStore::Scope
+                ]
+            );
+        }
+        assert_eq!(
+            bridge.park_release(store_release(ReleaseStore::Pending, 1)),
+            CausalAdmitResult::Applied
+        );
+        assert_eq!(
+            bridge.park_release(store_release(ReleaseStore::Pending, 2)),
+            CausalAdmitResult::Applied
+        );
+        visits.lock().unwrap().clear();
+        assert_eq!(
+            bridge.take_release(),
+            Some(store_release(ReleaseStore::Pending, 1))
+        );
+        assert_eq!(visits.lock().unwrap().len(), 4);
+        assert_eq!(bridge.release_count(), 1);
+        assert_eq!(
+            bridge.take_release(),
+            Some(store_release(ReleaseStore::Pending, 2))
+        );
+        assert_membership(&bridge);
     }
 
     fn push_store(
