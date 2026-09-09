@@ -135,6 +135,7 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
         OwnerStep::Applied(_) | OwnerStep::Idle | OwnerStep::Waiting => {
             drop(permit);
             state.budget.release(owner_permit);
+            crate::daemon::control::pending::wake_shutdown_waiter(state);
             runtime.event_plane_owner_op_ready()
         }
     }

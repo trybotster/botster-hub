@@ -637,7 +637,7 @@ impl HubRuntime {
 
     #[must_use]
     pub fn event_plane_owner_ops_pending(&self) -> bool {
-        !self.event_plane_owner_ops.borrow().is_empty() || self.causal_owner_ops_pending()
+        !self.event_plane_owner_ops.borrow().is_empty()
     }
 
     pub(crate) fn causal_owner_ops_pending(&self) -> bool {
