@@ -240,6 +240,7 @@ pub(crate) fn retain_route_cleanup(
     permit: OwnerPermit,
     label: &'static str,
     capture_owner: Option<CaptureOwner>,
+    event_connection: Option<String>,
     mut candidates: Vec<CleanupCandidate>,
     now: u64,
     mut on_done: impl FnMut(&mut DaemonControlState, CleanupApplied) + Send + 'static,
@@ -256,6 +257,15 @@ pub(crate) fn retain_route_cleanup(
         move |daemon, state, waiter_id| {
             if slot.is_none() {
                 if candidates.is_empty() && capture_owner.is_none() && page.is_empty() {
+                    if let Some(connection_id) = event_connection.as_ref()
+                        && !crate::daemon::client_events::finish_connection(
+                            state,
+                            connection_id,
+                            waiter_id,
+                        )
+                    {
+                        return ObligationPoll::Pending;
+                    }
                     on_done(state, applied);
                     return ObligationPoll::Done;
                 }
@@ -283,8 +293,10 @@ pub(crate) fn retain_route_cleanup(
                 CoreWorkPoll::Retry => ObligationPoll::ReadyAgain,
                 CoreWorkPoll::Lost => {
                     applied.failed = true;
-                    on_done(state, applied);
-                    ObligationPoll::Done
+                    candidates.clear();
+                    page.clear();
+                    capture_owner = None;
+                    ObligationPoll::ReadyAgain
                 }
                 CoreWorkPoll::Ready(reports) => {
                     // The page and the capture release are committed in Core;

@@ -282,6 +282,16 @@ fn mark_background_ready(state: &mut DaemonControlState, work: BackgroundWork) -
         .is_ok()
 }
 
+fn mark_host_drain_ready(state: &mut DaemonControlState) {
+    if state.host_completion_drain_faulted {
+        return;
+    }
+    if !mark_background_ready(state, BackgroundWork::HostCompletion) {
+        // The executor retains every receipt and permit when scheduling becomes impossible.
+        state.host_completion_drain_faulted = true;
+    }
+}
+
 /// Use the shared deadline index for the next resync policy deadline.
 pub(crate) fn arm_package_entity_resync_deadline(
     state: &mut DaemonControlState,
@@ -405,7 +415,7 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         state.host_completion_drain_pending |= executor.take_completion_notification();
         state.host_capacity_wake_pending |= executor.take_capacity_notification();
         if state.host_completion_drain_pending || state.host_capacity_wake_pending {
-            mark_background_ready(state, BackgroundWork::HostCompletion);
+            mark_host_drain_ready(state);
         }
         if runtime.take_managed_spawn_notification() {
             mark_background_ready(state, BackgroundWork::ManagedSpawn);
@@ -589,24 +599,11 @@ fn enqueue_control_message(
     Ok(())
 }
 
-fn retry_client_event_cleanups(daemon: &HubDaemon, state: &mut DaemonControlState) {
-    let Some(runtime) = daemon.runtime() else {
-        return;
-    };
-    if state
-        .event_plane
-        .apply_pending_cleanups(runtime.package_event_router())
-    {
-        state.maintenance.try_wake();
-    }
-}
-
 fn run_owner_maintenance_slice(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     kind: MaintenanceSliceKind,
 ) {
-    retry_client_event_cleanups(daemon, state);
     let started = Instant::now();
     match kind {
         MaintenanceSliceKind::SubscriberDelivery => {
@@ -731,7 +728,7 @@ pub(crate) fn run_background_ready_item(
                 daemon, state, owner_turn,
             );
             if state.host_completion_drain_pending || state.host_capacity_wake_pending {
-                mark_background_ready(state, BackgroundWork::HostCompletion);
+                mark_host_drain_ready(state);
             }
         }
         BackgroundWork::EntityPublish => {
@@ -884,14 +881,12 @@ pub(crate) fn dispatch_owner_ready_item(
     item: crate::daemon::owner_schedule::ReadyItem,
     owner_turn: &mut crate::daemon::owner_turn::OwnerTurnBudget,
 ) -> bool {
-    let handled =
-        crate::subscription::entity::drive_session_type_catalog_ready_item(daemon, state, item)
-            || run_reservation_deadline_item(daemon, state, item)
-            || run_background_ready_item(daemon, state, item, owner_turn)
-            || crate::daemon::control::entities::drive_plugin_entity_ready_item(
-                daemon, state, item,
-            )
-            || crate::daemon::owner_budget::poll_owner_obligation_item(daemon, state, item);
+    let handled = crate::daemon::client_events::drive_ready(daemon, state, item)
+        || crate::subscription::entity::drive_session_type_catalog_ready_item(daemon, state, item)
+        || run_reservation_deadline_item(daemon, state, item)
+        || run_background_ready_item(daemon, state, item, owner_turn)
+        || crate::daemon::control::entities::drive_plugin_entity_ready_item(daemon, state, item)
+        || crate::daemon::owner_budget::poll_owner_obligation_item(daemon, state, item);
     let shutdown = !handled && crate::daemon::control::request::poll_one_ready(daemon, state, item);
     publish_maintenance_wakes(state);
     shutdown
@@ -960,7 +955,6 @@ fn run_control_ingress_item(
                 .saturating_add(1);
             let tx = control_tx.clone();
             let shutdown = shutdown_tx.subscribe();
-            let event_plane = state.event_plane.clone();
             state.lifecycle_counters.live_connections =
                 state.lifecycle_counters.live_connections.saturating_add(1);
             state.lifecycle_counters.high_water_live_connections = state
@@ -969,15 +963,9 @@ fn run_control_ingress_item(
                 .max(state.lifecycle_counters.live_connections);
             connection_tasks.push(transport_runtime.spawn(async move {
                 let _admission_permit = admission_permit;
-                if let Err(error) = handle_connection_async(
-                    stream,
-                    tx,
-                    cleanup_permit,
-                    shutdown,
-                    event_plane,
-                    connection_permit,
-                )
-                .await
+                if let Err(error) =
+                    handle_connection_async(stream, tx, cleanup_permit, shutdown, connection_permit)
+                        .await
                 {
                     eprintln!("botster-hub daemon connection error: {error}");
                 }
@@ -1025,6 +1013,7 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
     }
     let mut control_state = DaemonControlState {
         event_plane: daemon.local_webrtc().event_plane(),
+        client_events: crate::daemon::client_events::ClientEvents::default(),
         pending_runtime: PendingRuntimeState {
             close_source: daemon
                 .runtime()
@@ -1489,6 +1478,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) egress_diagnostics: DaemonEgressDiagnostics,
     pub(crate) entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
     pub(crate) event_plane: std::sync::Arc<crate::subscription::package_events::ClientEventPlane>,
+    pub(crate) client_events: crate::daemon::client_events::ClientEvents,
     pub(crate) pending_runtime: PendingRuntimeState,
     pub(crate) lifecycle_counters: DaemonLifecycleCounters,
     pub(crate) maintenance: MaintenanceState,
@@ -1528,6 +1518,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) document_owner: Option<crate::owner_identity::WaiterId>,
     pub(crate) document_waiters: std::collections::BTreeSet<crate::owner_identity::WaiterId>,
     pub(crate) host_completion_drain_pending: bool,
+    pub(crate) host_completion_drain_faulted: bool,
     pub(crate) host_capacity_wake_pending: bool,
     pub(crate) blocked_session_type_roots:
         BTreeMap<std::path::PathBuf, crate::owner_identity::WaiterId>,
@@ -1586,6 +1577,7 @@ impl Default for DaemonControlState {
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
             entity_subscriptions: BTreeMap::new(),
+            client_events: crate::daemon::client_events::ClientEvents::default(),
             event_plane: std::sync::Arc::new(
                 crate::subscription::package_events::ClientEventPlane::default(),
             ),
@@ -1617,6 +1609,7 @@ impl Default for DaemonControlState {
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
             host_completion_drain_pending: false,
+            host_completion_drain_faulted: false,
             host_capacity_wake_pending: false,
             blocked_session_type_roots: BTreeMap::new(),
             plugin_controls: crate::daemon::control::plugins::PluginControlState::default(),
@@ -1784,6 +1777,1224 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn admit_cleanup_test_subscription(daemon: &HubDaemon, state: &mut DaemonControlState) {
+        use crate::package_event_router::{EmittedContract, EventAudience};
+
+        let router = daemon.runtime().unwrap().package_event_router();
+        router
+            .try_register_contracts(vec![EmittedContract {
+                owner: "cleanup-owner".into(),
+                name: "ready".into(),
+                audience: std::collections::BTreeSet::from([EventAudience::Clients]),
+                schema: crate::package_event_schema::CompiledEventSchema::compile(
+                    &serde_json::json!({"type": "object", "additionalProperties": true}),
+                )
+                .expect("compile cleanup contract"),
+                package_generation: 1,
+            }])
+            .expect("register cleanup contract");
+        crate::daemon::client_events::admit_connection(state, "cleanup-connection").unwrap();
+        state
+            .event_plane
+            .try_subscribe(
+                "cleanup-connection",
+                "cleanup-subscription",
+                "cleanup-owner",
+                "ready",
+                Vec::new(),
+                router.policy(),
+                router,
+            )
+            .expect("admit cleanup subscription");
+    }
+
+    fn settle_cleanup_test_owner(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(!drive_ready_test_turn(daemon, state));
+            if state.owner_ready.is_empty()
+                && daemon.runtime().unwrap().host_executor().outstanding() == 0
+                && !state.maintenance.wakes.has_any()
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "initial owner work must settle");
+            thread::yield_now();
+        }
+    }
+
+    fn close_cleanup_test_connection(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        permit: crate::daemon::owner_budget::OwnerPermit,
+    ) {
+        use crate::transport::unix::connection::{
+            ConnectionCleanupGuard, ConnectionTerminalReason,
+        };
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(1);
+        let cleanup_permit = control_tx.clone().try_reserve_owned().unwrap();
+        drop(ConnectionCleanupGuard::new(
+            cleanup_permit,
+            "cleanup-connection".into(),
+            ConnectionTerminalReason::NormalClose,
+            permit,
+        ));
+        let ControlMessage::ConnectionCleanup(cleanup) = control_rx.try_recv().unwrap() else {
+            panic!("the connection guard must send its cleanup message");
+        };
+        handle_connection_cleanup(daemon, state, control_tx, cleanup);
+    }
+
+    #[test]
+    fn client_event_cleanup_unix_sibling_wakes_during_blocked_reclamation() {
+        use crate::daemon::control::handle_control_message;
+        use crate::package_event_router::{EmittedContract, EventAudience};
+        use crate::transport::unix::connection::handle_connection_async;
+
+        let root = unique_package_control_dir("client-event-unix-sibling-wake");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let permit = state.budget.reserve_connection().unwrap();
+        let router = daemon.runtime().unwrap().package_event_router().clone();
+        router
+            .try_register_contracts(vec![EmittedContract {
+                owner: "cleanup-owner".into(),
+                name: "ready".into(),
+                audience: std::collections::BTreeSet::from([EventAudience::Clients]),
+                schema: crate::package_event_schema::CompiledEventSchema::compile(
+                    &serde_json::json!({"type": "object", "additionalProperties": true}),
+                )
+                .unwrap(),
+                package_generation: 1,
+            }])
+            .unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(32);
+        let connection_tx = control_tx.clone();
+        let cleanup_permit = connection_tx.clone().try_reserve_owned().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let transport = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let stream = {
+                let _entered = runtime.enter();
+                tokio::net::UnixStream::from_std(server).unwrap()
+            };
+            runtime.block_on(handle_connection_async(
+                stream,
+                connection_tx,
+                cleanup_permit,
+                shutdown_rx,
+                permit,
+            ))
+        });
+        write_client_frame(
+            &mut client,
+            &ClientFrame::Hello {
+                hello: DaemonHello {
+                    protocol: PROTOCOL.into(),
+                    compatibility: DaemonCompatibilityRequirement::for_package_event_subscriptions(
+                    ),
+                    terminal_compatibility: None,
+                },
+            },
+        )
+        .unwrap();
+        let mut reader = DaemonUnixFrameReader::new();
+        read_hello_ack(&mut client, &mut reader);
+        let registration = receive_test_control_message(&mut control_rx);
+        let (client_id, event_reader) = match &registration {
+            ControlMessage::RegisterUnixAdmission {
+                client_id,
+                event_reader,
+                ..
+            } => (client_id.clone(), event_reader.clone()),
+            _ => panic!("expected Unix admission"),
+        };
+        let owner_transport = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(!handle_control_message(
+            &mut daemon,
+            &mut state,
+            owner_transport.handle(),
+            control_tx.clone(),
+            registration
+        ));
+        for (serial, subscription_id) in [(1, "retiring"), (2, "sibling")] {
+            write_request(
+                &mut client,
+                serial,
+                DaemonRequest::SubscribeEvents {
+                    subscription_id: subscription_id.into(),
+                    owner: "cleanup-owner".into(),
+                    name: "ready".into(),
+                    subjects: Vec::new(),
+                },
+            );
+            let message = receive_test_control_message(&mut control_rx);
+            assert!(!handle_control_message(
+                &mut daemon,
+                &mut state,
+                owner_transport.handle(),
+                control_tx.clone(),
+                message
+            ));
+            assert!(
+                read_response(&mut client, &mut reader, serial)
+                    .error
+                    .is_none()
+            );
+        }
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        let retiring = state
+            .event_plane
+            .subscription_mailbox(&client_id, "retiring")
+            .unwrap();
+        let sibling = state
+            .event_plane
+            .subscription_mailbox(&client_id, "sibling")
+            .unwrap();
+        let connection = retiring.connection().unwrap();
+        router.test_with_inner_held(|| {
+            write_request(
+                &mut client,
+                3,
+                DaemonRequest::UnsubscribeEvents {
+                    subscription_id: "retiring".into(),
+                },
+            );
+            let message = receive_test_control_message(&mut control_rx);
+            assert!(!handle_control_message(
+                &mut daemon,
+                &mut state,
+                owner_transport.handle(),
+                control_tx.clone(),
+                message
+            ));
+            assert!(read_response(&mut client, &mut reader, 3).error.is_none());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !connection.test_cleanup_started() {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "cleanup must reach the held router"
+                );
+                thread::yield_now();
+            }
+            // Hold the reader after its empty read, before it registers the next wake.
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            event_reader.test_on_empty_read(move || {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let timer_ticks = event_reader.test_timer_ticks();
+            sibling
+                .try_push(
+                    "sibling",
+                    "cleanup-owner",
+                    "ready",
+                    serde_json::json!({"serial": 1}),
+                    12,
+                )
+                .unwrap();
+            resume_tx.send(()).unwrap();
+            for serial in 1..=2 {
+                match reader
+                    .read_frame(&mut client)
+                    .expect("sibling event must wake the idle Unix writer")
+                {
+                    DaemonUnixMuxFrame::Server(ServerFrame::Event {
+                        event:
+                            botster_hub_client::DaemonEvent::PackageEvent {
+                                subscription_id,
+                                payload,
+                                ..
+                            },
+                    }) => {
+                        assert_eq!(subscription_id, "sibling");
+                        assert_eq!(payload, serde_json::json!({"serial": serial}));
+                    }
+                    other => panic!("expected sibling event, got {other:?}"),
+                }
+                assert_eq!(
+                    event_reader.test_timer_ticks(),
+                    timer_ticks,
+                    "delivery must not need a timer"
+                );
+                if serial == 1 {
+                    sibling
+                        .try_push(
+                            "sibling",
+                            "cleanup-owner",
+                            "ready",
+                            serde_json::json!({"serial": 2}),
+                            12,
+                        )
+                        .unwrap();
+                }
+            }
+        });
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        shutdown_tx.send(true).unwrap();
+        transport.join().unwrap().unwrap();
+        let ControlMessage::ConnectionCleanup(cleanup) =
+            receive_test_control_message(&mut control_rx)
+        else {
+            panic!("the Unix transport must return its original cleanup permit");
+        };
+        handle_connection_cleanup(&mut daemon, &mut state, control_tx.clone(), cleanup);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.budget.outstanding() != 0 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "connection cleanup must release admission"
+            );
+            thread::yield_now();
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn client_event_cleanup_waiter_exhaustion_refuses_before_subscription_effects() {
+        let root = unique_package_control_dir("client-event-waiter-exhaustion");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let permit = state.budget.reserve_connection().unwrap();
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        state.pending_runtime.admission.host_compatibility.insert(
+            "exhausted-connection".into(),
+            crate::admission::unix_hello::HostCompatibilityRecord {
+                event_reader: None,
+                required_features: vec![
+                    botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.into(),
+                ],
+            },
+        );
+        state.waiter_ids = crate::owner_identity::WaiterIdSource::with_next(u64::MAX);
+        let response = crate::daemon::control::events::handle_client_event_request(
+            &mut daemon,
+            &mut state,
+            "exhausted-connection",
+            DaemonRequest::SubscribeEvents {
+                subscription_id: "refused".into(),
+                owner: "cleanup-owner".into(),
+                name: "ready".into(),
+                subjects: Vec::new(),
+            },
+        );
+        assert!(response.error.is_some());
+        assert_eq!(
+            state.event_plane.test_residency("exhausted-connection"),
+            None
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .package_event_router()
+                .test_client_holder_count("exhausted-connection"),
+            0
+        );
+        assert_eq!(state.budget.outstanding(), 1);
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+        assert!(state.owner_ready.is_empty());
+        state.budget.release(permit);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn client_event_cleanup_ready_exhaustion_retains_initial_and_completed_work() {
+        for completed in [false, true] {
+            let root = unique_package_control_dir("client-event-ready-exhaustion");
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+            let mut state = DaemonControlState::default();
+            let permit = state.budget.reserve_connection().unwrap();
+            admit_cleanup_test_subscription(&daemon, &mut state);
+            settle_cleanup_test_owner(&mut daemon, &mut state);
+            if completed {
+                close_cleanup_test_connection(&mut daemon, &mut state, permit);
+                let item = state.owner_ready.pop_next().unwrap();
+                let mut turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                assert!(!dispatch_owner_ready_item(
+                    &mut daemon,
+                    &mut state,
+                    item,
+                    &mut turn
+                ));
+                state.owner_ready =
+                    crate::daemon::owner_schedule::ReadyQueues::with_next_enqueue_serial(u64::MAX);
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let completion = loop {
+                    match daemon.runtime().unwrap().host_executor().poll_completion() {
+                        crate::host_executor::HostCompletionPoll::Ready(completion) => {
+                            break completion;
+                        }
+                        crate::host_executor::HostCompletionPoll::Empty => {
+                            assert!(Instant::now() < deadline, "the cleanup worker must finish");
+                            thread::yield_now();
+                        }
+                        crate::host_executor::HostCompletionPoll::Stopped => {
+                            panic!("the executor remains live")
+                        }
+                    }
+                };
+                crate::subscription::entity::route_host_completion(&mut state, completion);
+                assert!(state.client_events.test_recovery("cleanup-connection"));
+                assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+            } else {
+                state.owner_ready =
+                    crate::daemon::owner_schedule::ReadyQueues::with_next_enqueue_serial(u64::MAX);
+                close_cleanup_test_connection(&mut daemon, &mut state, permit);
+                assert!(state.client_events.test_recovery("cleanup-connection"));
+                assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+                assert_eq!(
+                    daemon
+                        .runtime()
+                        .unwrap()
+                        .package_event_router()
+                        .test_client_holder_count("cleanup-connection"),
+                    1
+                );
+            }
+            assert_eq!(state.budget.outstanding(), 1);
+            for _ in 0..3 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(state.owner_ready.is_empty());
+            }
+            daemon.stop();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn client_event_cleanup_unsubscribe_after_unload_finishes_without_retry() {
+        use crate::package_event_router::{OwnerOp, OwnerOpKind};
+        let root = unique_package_control_dir("client-event-unsubscribe-after-unload");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let permit = state.budget.reserve_connection().unwrap();
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        state.pending_runtime.admission.host_compatibility.insert(
+            "cleanup-connection".into(),
+            crate::admission::unix_hello::HostCompatibilityRecord {
+                event_reader: None,
+                required_features: vec![
+                    botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.into(),
+                ],
+            },
+        );
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        daemon
+            .runtime()
+            .unwrap()
+            .record_event_plane_owner_op(OwnerOp {
+                kind: OwnerOpKind::Unload,
+                owner: "cleanup-owner".into(),
+                generation: 1,
+            });
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .package_event_router()
+                .test_client_holder_count("cleanup-connection"),
+            0
+        );
+        let response = crate::daemon::control::events::handle_client_event_request(
+            &mut daemon,
+            &mut state,
+            "cleanup-connection",
+            DaemonRequest::UnsubscribeEvents {
+                subscription_id: "cleanup-subscription".into(),
+            },
+        );
+        assert_eq!(response.kind, DaemonResponseKind::EventUnsubscribed);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        assert_eq!(
+            state.event_plane.test_residency("cleanup-connection"),
+            Some((0, 0, 0))
+        );
+        let duplicate = crate::daemon::control::events::handle_client_event_request(
+            &mut daemon,
+            &mut state,
+            "cleanup-connection",
+            DaemonRequest::UnsubscribeEvents {
+                subscription_id: "cleanup-subscription".into(),
+            },
+        );
+        assert!(duplicate.error.is_some());
+        for _ in 0..3 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(state.owner_ready.is_empty());
+        }
+        close_cleanup_test_connection(&mut daemon, &mut state, permit);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.budget.outstanding() != 0 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn client_event_cleanup_reservation_rollback_keeps_the_original_slot_until_reclaimed() {
+        use crate::admission::connection_budget::ChannelClass;
+        use crate::admission::reservations::ReservationBinding;
+        for duplicate in [false, true] {
+            let root = unique_package_control_dir("client-event-reservation-rollback");
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+            let mut state = DaemonControlState::default();
+            let permit = state.budget.reserve_connection().unwrap();
+            admit_cleanup_test_subscription(&daemon, &mut state);
+            settle_cleanup_test_owner(&mut daemon, &mut state);
+            state.pending_runtime.admission.host_compatibility.insert(
+                "cleanup-connection".into(),
+                crate::admission::unix_hello::HostCompatibilityRecord {
+                    event_reader: None,
+                    required_features: vec![
+                        botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.into(),
+                    ],
+                },
+            );
+            state.pending_runtime.admission.webrtc_admissions.insert(
+                "cleanup-connection".into(),
+                WebrtcTerminalAdmission::Admitted {
+                    required_features: Vec::new(),
+                    terminal_requirement: None,
+                    mux: crate::transport::webrtc::WebRtcConnectionMux::new(),
+                    peer_generation: 7,
+                },
+            );
+            let original = state
+                .event_plane
+                .subscription_mailbox("cleanup-connection", "cleanup-subscription")
+                .unwrap();
+            let connection = original.connection().unwrap();
+            let reservation = duplicate.then(|| {
+                state
+                    .pending_runtime
+                    .admission
+                    .reservations
+                    .reserve_subscription(
+                        ChannelClass::Event,
+                        "rollback".into(),
+                        1,
+                        7,
+                        crate::admission::reservations::now_seconds(),
+                        ReservationBinding::Event {
+                            mailbox: original.clone(),
+                        },
+                    )
+                    .unwrap()
+            });
+            let permits = (0..crate::host_executor::HOST_OPERATION_CAPACITY)
+                .map(|_| {
+                    daemon
+                        .runtime()
+                        .unwrap()
+                        .host_executor()
+                        .try_reserve()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let response = crate::daemon::control::events::handle_client_event_request(
+                &mut daemon,
+                &mut state,
+                "cleanup-connection",
+                DaemonRequest::SubscribeEvents {
+                    subscription_id: "rollback".into(),
+                    owner: "cleanup-owner".into(),
+                    name: "ready".into(),
+                    subjects: Vec::new(),
+                },
+            );
+            assert!(response.error.is_some());
+            assert_eq!(connection.test_slot_count(), 2);
+            assert_eq!(
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .package_event_router()
+                    .test_client_holder_count("cleanup-connection"),
+                2
+            );
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(state.client_events.has_capacity_waiters());
+            assert_eq!(state.budget.outstanding(), 1);
+            for _ in 0..3 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(state.owner_ready.is_empty());
+            }
+            drop(permits);
+            settle_cleanup_test_owner(&mut daemon, &mut state);
+            assert_eq!(connection.test_slot_count(), 1);
+            assert_eq!(
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .package_event_router()
+                    .test_client_holder_count("cleanup-connection"),
+                1
+            );
+            assert!(!original.is_retired());
+            if let Some(reservation) = reservation {
+                assert!(
+                    state
+                        .pending_runtime
+                        .admission
+                        .reservations
+                        .forget_label(&reservation.label, 7)
+                );
+            }
+            close_cleanup_test_connection(&mut daemon, &mut state, permit);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while state.budget.outstanding() != 0 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            daemon.stop();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn client_event_cleanup_global_drain_exhaustion_retains_the_executor_receipt() {
+        let root = unique_package_control_dir("client-event-global-drain-exhaustion");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let permit = state.budget.reserve_connection().unwrap();
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        close_cleanup_test_connection(&mut daemon, &mut state, permit);
+        let item = state.owner_ready.pop_next().unwrap();
+        let mut turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+        assert!(!dispatch_owner_ready_item(
+            &mut daemon,
+            &mut state,
+            item,
+            &mut turn
+        ));
+        state.owner_ready =
+            crate::daemon::owner_schedule::ReadyQueues::with_next_enqueue_serial(u64::MAX);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.host_completion_drain_faulted {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "the production Host wake must record scheduling failure"
+            );
+            thread::yield_now();
+        }
+        assert!(state.host_completion_drain_pending);
+        assert!(!state.client_events.test_recovery("cleanup-connection"));
+        assert_eq!(state.budget.outstanding(), 1);
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+        // Even a fresh test queue must not restart a terminal drain fault.
+        state.owner_ready = crate::daemon::owner_schedule::ReadyQueues::new();
+        for _ in 0..3 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(state.owner_ready.is_empty());
+            assert!(state.host_completion_drain_faulted);
+        }
+        let crate::host_executor::HostCompletionPoll::Ready(receipt) =
+            daemon.runtime().unwrap().host_executor().poll_completion()
+        else {
+            panic!("the executor must retain the original receipt");
+        };
+        assert!(matches!(
+            &receipt.result,
+            crate::host_executor::HostResult::ClientEventCleanup(Ok(_))
+        ));
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+        drop(receipt);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn client_event_cleanup_faults_keep_the_original_connection_and_host_permits() {
+        for fault in [
+            "router",
+            "mailbox",
+            "pool",
+            "connection",
+            "lookup",
+            "submission",
+            "phase",
+            "panic",
+        ] {
+            let root = unique_package_control_dir(&format!("client-cleanup-fault-{fault}"));
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+            let mut state = DaemonControlState::default();
+            let permit = state.budget.reserve_connection().unwrap();
+            admit_cleanup_test_subscription(&daemon, &mut state);
+            settle_cleanup_test_owner(&mut daemon, &mut state);
+            let router = daemon.runtime().unwrap().package_event_router().clone();
+            let mailbox = state
+                .event_plane
+                .subscription_mailbox("cleanup-connection", "cleanup-subscription")
+                .unwrap();
+            mailbox
+                .try_push(
+                    "cleanup-subscription",
+                    "cleanup-owner",
+                    "ready",
+                    serde_json::json!({"value": 1}),
+                    23,
+                )
+                .unwrap();
+            let connection = mailbox.connection().unwrap();
+            match fault {
+                "router" => {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        router.test_with_inner_held(|| panic!("poison cleanup router"))
+                    }));
+                }
+                "mailbox" => {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        mailbox.test_with_inner_held(|| panic!("poison cleanup mailbox"))
+                    }));
+                }
+                "pool" | "connection" => connection.test_poison(fault),
+                "lookup" => state.event_plane.test_poison_lookup(),
+                "submission" => daemon.runtime_mut().unwrap().test_stop_host_submissions(),
+                "phase" => state
+                    .client_events
+                    .test_set_phase("cleanup-connection", u64::MAX),
+                "panic" => connection.test_panic_cleanup(),
+                _ => unreachable!(),
+            }
+            close_cleanup_test_connection(&mut daemon, &mut state, permit);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !state.client_events.test_recovery("cleanup-connection") {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "the cleanup fault must reach recovery: {fault}"
+                );
+                thread::yield_now();
+            }
+            assert_eq!(connection.test_slot_count(), usize::from(fault != "lookup"));
+            assert_eq!(
+                state.budget.outstanding(),
+                1,
+                "the disconnect obligation owns its permit: {fault}"
+            );
+            assert_eq!(
+                daemon.runtime().unwrap().host_executor().outstanding(),
+                1,
+                "recovery owns the submitted Host slot: {fault}"
+            );
+            for _ in 0..3 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    state.owner_ready.is_empty(),
+                    "terminal cleanup faults must not remain runnable: {fault}"
+                );
+            }
+            daemon.stop();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn client_event_cleanup_churn_counts_failed_and_retiring_slots_at_full_host_capacity() {
+        for poison in [false, true] {
+            let root = unique_package_control_dir(&format!("client-cleanup-slot-churn-{poison}"));
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+            let mut state = DaemonControlState::default();
+            let permit = state.budget.reserve_connection().unwrap();
+            admit_cleanup_test_subscription(&daemon, &mut state);
+            settle_cleanup_test_owner(&mut daemon, &mut state);
+            state.pending_runtime.admission.host_compatibility.insert(
+                "cleanup-connection".into(),
+                crate::admission::unix_hello::HostCompatibilityRecord {
+                    event_reader: None,
+                    required_features: vec![
+                        botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.into(),
+                    ],
+                },
+            );
+            let router = daemon.runtime().unwrap().package_event_router().clone();
+            let original = state
+                .event_plane
+                .subscription_mailbox("cleanup-connection", "cleanup-subscription")
+                .unwrap();
+            let connection = original.connection().unwrap();
+            let mut permits = (0..crate::host_executor::HOST_OPERATION_CAPACITY)
+                .map(|_| {
+                    daemon
+                        .runtime()
+                        .unwrap()
+                        .host_executor()
+                        .try_reserve()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let response = crate::daemon::control::events::handle_client_event_request(
+                &mut daemon,
+                &mut state,
+                "cleanup-connection",
+                DaemonRequest::UnsubscribeEvents {
+                    subscription_id: "cleanup-subscription".into(),
+                },
+            );
+            assert_eq!(response.kind, DaemonResponseKind::EventUnsubscribed);
+            assert!(original.is_retired());
+            for index in 1..crate::subscription::package_events::MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                let response = crate::daemon::control::events::handle_client_event_request(
+                    &mut daemon,
+                    &mut state,
+                    "cleanup-connection",
+                    DaemonRequest::SubscribeEvents {
+                        subscription_id: format!("failed-{index}"),
+                        owner: "undeclared".into(),
+                        name: "missing".into(),
+                        subjects: Vec::new(),
+                    },
+                );
+                assert_eq!(response.error.unwrap().code, "rejected_undeclared");
+            }
+            assert_eq!(
+                connection.test_slot_count(),
+                crate::subscription::package_events::MAX_SUBSCRIPTIONS_PER_CONNECTION
+            );
+            for subscription_id in ["cleanup-subscription", "overflow"] {
+                let response = crate::daemon::control::events::handle_client_event_request(
+                    &mut daemon,
+                    &mut state,
+                    "cleanup-connection",
+                    DaemonRequest::SubscribeEvents {
+                        subscription_id: subscription_id.into(),
+                        owner: "cleanup-owner".into(),
+                        name: "ready".into(),
+                        subjects: Vec::new(),
+                    },
+                );
+                assert_eq!(
+                    response.error.unwrap().code,
+                    if subscription_id == "overflow" {
+                        "too_many_event_subscriptions"
+                    } else {
+                        "duplicate_event_subscription"
+                    }
+                );
+            }
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(state.client_events.has_capacity_waiters());
+            for _ in 0..3 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    state.owner_ready.is_empty(),
+                    "capacity waiting must not schedule another cleanup attempt"
+                );
+            }
+            assert_eq!(router.test_client_holder_count("cleanup-connection"), 1);
+            assert_eq!(
+                state.event_plane.test_residency("cleanup-connection"),
+                Some((0, 0, 64))
+            );
+            if poison {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    router.test_with_inner_held(|| panic!("poison full-slot cleanup"))
+                }));
+            }
+            close_cleanup_test_connection(&mut daemon, &mut state, permit);
+            assert_eq!(state.budget.outstanding(), 1);
+            drop(permits.pop());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while if poison {
+                !state.client_events.test_recovery("cleanup-connection")
+            } else {
+                state.budget.outstanding() != 0
+            } {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "capacity release must complete cleanup or retain the exact fault"
+                );
+                thread::yield_now();
+            }
+            if poison {
+                assert_eq!(connection.test_slot_count(), 64);
+                assert_eq!(state.budget.outstanding(), 1);
+                assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 8);
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(state.owner_ready.is_empty());
+            } else {
+                assert_eq!(connection.test_slot_count(), 0);
+                assert_eq!(router.test_client_holder_count("cleanup-connection"), 0);
+                crate::daemon::client_events::retire_mailbox(&mut state, &original);
+                assert!(
+                    state.owner_ready.is_empty(),
+                    "a stale mailbox must not recreate a closed connection row"
+                );
+            }
+            drop(permits);
+            daemon.stop();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn client_event_cleanup_webrtc_without_routes_retains_payload_until_worker_reclamation() {
+        use crate::transport::webrtc::peer::{
+            LocalWebrtcChannelTerminalSignal, LocalWebrtcCleanupDisposition,
+            LocalWebrtcSenderTerminalRecord, LocalWebrtcTerminalCause,
+        };
+
+        let root = unique_package_control_dir("client-cleanup-webrtc-payload");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        assert!(state.budget.reserve_peer("cleanup-connection"));
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        let router = daemon.runtime().unwrap().package_event_router().clone();
+        let mailbox = state
+            .event_plane
+            .subscription_mailbox("cleanup-connection", "cleanup-subscription")
+            .unwrap();
+        let payload = serde_json::json!({"value": "x".repeat(2048)});
+        let bytes = serde_json::to_vec(&payload).unwrap().len();
+        mailbox
+            .try_push(
+                "cleanup-subscription",
+                "cleanup-owner",
+                "ready",
+                payload,
+                bytes,
+            )
+            .unwrap();
+        let mut permits = (0..crate::host_executor::HOST_OPERATION_CAPACITY)
+            .map(|_| {
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .host_executor()
+                    .try_reserve()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (control_tx, _control_rx) = tokio_mpsc::channel(1);
+        crate::daemon::control::webrtc::handle_peer_closed(
+            &mut daemon,
+            &mut state,
+            control_tx,
+            ControlMessage::LocalWebrtcPeerClosed {
+                grant_id: "cleanup-connection".into(),
+                attached_subscriptions: Vec::new(),
+                entity_subscription_ids: Vec::new(),
+                terminal_record: LocalWebrtcSenderTerminalRecord {
+                    schema_version: 1,
+                    grant_id: "cleanup-connection".into(),
+                    request_operation: "event_delivery".into(),
+                    message_id: None,
+                    next_chunk_index: 0,
+                    last_sent_chunk_index: None,
+                    total_chunks: 0,
+                    pressured: false,
+                    peer_connection_state: "closed".into(),
+                    channel_terminal_signal: LocalWebrtcChannelTerminalSignal::None,
+                    cause: LocalWebrtcTerminalCause::PeerClosed,
+                    cleanup_disposition: LocalWebrtcCleanupDisposition::NewlySent,
+                },
+            },
+        );
+        assert_eq!(
+            state.budget.outstanding(),
+            1,
+            "a peer without routes retains its event cleanup permit"
+        );
+        assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+        assert_eq!(router.test_client_holder_count("cleanup-connection"), 1);
+        mailbox.test_with_inner_held(|| {
+            drop(permits.pop());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while router.test_client_holder_count("cleanup-connection") != 0 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "the worker must detach the exact holder before reclamation"
+                );
+                thread::yield_now();
+            }
+            assert_eq!(
+                state.event_plane.test_residency("cleanup-connection"),
+                Some((1, bytes, 1))
+            );
+            assert_eq!(state.budget.outstanding(), 1);
+            assert_eq!(
+                daemon.runtime().unwrap().host_executor().outstanding(),
+                crate::host_executor::HOST_OPERATION_CAPACITY
+            );
+            for _ in 0..3 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    state.owner_ready.is_empty(),
+                    "mailbox contention must not make the Owner retry"
+                );
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.budget.outstanding() != 0 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "worker reclamation must release the peer permit"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            state
+                .event_plane
+                .test_residency("cleanup-connection")
+                .is_none()
+        );
+        drop(permits);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn client_event_cleanup_rejects_a_forged_completion_without_releasing_admission() {
+        for mismatch in ["phase", "connection"] {
+            let root =
+                unique_package_control_dir(&format!("client-cleanup-forged-completion-{mismatch}"));
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+            let mut state = DaemonControlState::default();
+            let permit = state.budget.reserve_connection().unwrap();
+            admit_cleanup_test_subscription(&daemon, &mut state);
+            settle_cleanup_test_owner(&mut daemon, &mut state);
+            close_cleanup_test_connection(&mut daemon, &mut state, permit);
+            // Dispatch the admitted child without consuming its completion.
+            let item = state
+                .owner_ready
+                .pop_next()
+                .expect("initial client cleanup item");
+            let mut turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+            assert!(!dispatch_owner_ready_item(
+                &mut daemon,
+                &mut state,
+                item,
+                &mut turn
+            ));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut completion = loop {
+                match daemon.runtime().unwrap().host_executor().poll_completion() {
+                    crate::host_executor::HostCompletionPoll::Ready(completion) => {
+                        break completion;
+                    }
+                    crate::host_executor::HostCompletionPoll::Empty => {
+                        assert!(Instant::now() < deadline, "the admitted worker must finish");
+                        thread::yield_now();
+                    }
+                    crate::host_executor::HostCompletionPoll::Stopped => {
+                        panic!("the cleanup executor remains live")
+                    }
+                }
+            };
+            if mismatch == "phase" {
+                completion.identity.phase -= 1;
+            } else {
+                let crate::host_executor::HostResult::ClientEventCleanup(Ok(done)) =
+                    &mut completion.result
+                else {
+                    panic!("the original worker must produce a successful cleanup receipt");
+                };
+                done.connection = state
+                    .event_plane
+                    .admit_connection("forged-connection")
+                    .unwrap();
+            }
+            crate::subscription::entity::route_host_completion(&mut state, completion);
+            while !state.client_events.test_recovery("cleanup-connection") {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "the wrong connection receipt must reach recovery"
+                );
+            }
+            assert_eq!(state.budget.outstanding(), 1);
+            assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+            for _ in 0..3 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(state.owner_ready.is_empty());
+            }
+            daemon.stop();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn client_event_cleanup_expiry_publishes_its_initial_wake() {
+        let root = unique_package_control_dir("client-event-cleanup-initial-wake");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+            .expect("start client cleanup daemon");
+        let mut state = DaemonControlState::default();
+        assert!(state.budget.reserve_peer("cleanup-connection"));
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        let mailbox = state
+            .event_plane
+            .subscription_mailbox("cleanup-connection", "cleanup-subscription")
+            .expect("accepted mailbox");
+        let reservation = state
+            .pending_runtime
+            .admission
+            .reservations
+            .reserve_subscription(
+                crate::admission::connection_budget::ChannelClass::Event,
+                "cleanup-subscription".into(),
+                1,
+                1,
+                0,
+                crate::admission::reservations::ReservationBinding::Event { mailbox },
+            )
+            .expect("reserve event channel");
+        state
+            .pending_runtime
+            .admission
+            .grant_by_peer_generation
+            .insert(1, "cleanup-connection".into());
+        assert!(arm_reservation_deadline(
+            &mut state,
+            reservation.label.clone(),
+            1,
+            0,
+        ));
+        let waiter = state.reservation_waiters_by_label[&reservation.label];
+        assert!(mark_reservation_deadline_ready(&mut state, waiter));
+        let item = state.owner_ready.pop_next().expect("reservation deadline");
+        assert!(state.owner_ready.is_empty());
+        let router = daemon.runtime().unwrap().package_event_router().clone();
+        router.test_with_inner_held(|| {
+            let mut turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+            assert!(!dispatch_owner_ready_item(
+                &mut daemon,
+                &mut state,
+                item,
+                &mut turn
+            ));
+            assert!(
+                !state
+                    .reservation_waiters_by_label
+                    .contains_key(&reservation.label)
+            );
+            assert!(
+                !state.owner_ready.is_empty()
+                    || daemon.runtime().unwrap().host_executor().outstanding() > 0,
+                "reservation expiry must publish its own cleanup wake or submit its worker"
+            );
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while router.test_client_holder_count("cleanup-connection") != 0
+            || daemon.runtime().unwrap().host_executor().outstanding() != 0
+        {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "the cleanup wake must retire the holder"
+            );
+            thread::yield_now();
+        }
+        let permit = state.budget.take_peer_permit("cleanup-connection").unwrap();
+        state.budget.release(permit);
+        daemon.stop();
+        std::fs::remove_dir_all(root).expect("remove client cleanup test directory");
+    }
+
+    #[test]
+    fn client_event_cleanup_disconnect_retains_work_at_full_host_capacity() {
+        use crate::transport::unix::connection::{
+            ConnectionCleanupGuard, ConnectionTerminalReason,
+        };
+
+        let root = unique_package_control_dir("client-event-cleanup-full-host");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+            .expect("start client cleanup daemon");
+        let mut state = DaemonControlState::default();
+        let connection_permit = state
+            .budget
+            .reserve_connection()
+            .expect("connection permit");
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        let mut host_permits = (0..crate::host_executor::HOST_OPERATION_CAPACITY)
+            .map(|_| {
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .host_executor()
+                    .try_reserve()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(1);
+        let cleanup_permit = control_tx.clone().try_reserve_owned().unwrap();
+        drop(ConnectionCleanupGuard::new(
+            cleanup_permit,
+            "cleanup-connection".into(),
+            ConnectionTerminalReason::NormalClose,
+            connection_permit,
+        ));
+        let ControlMessage::ConnectionCleanup(cleanup) = control_rx.try_recv().unwrap() else {
+            panic!("the connection guard must send its cleanup message");
+        };
+        handle_connection_cleanup(&mut daemon, &mut state, control_tx, cleanup);
+        let router = daemon.runtime().unwrap().package_event_router().clone();
+        assert_eq!(
+            router.test_client_holder_count("cleanup-connection"),
+            1,
+            "full host capacity must retain the router holder for worker cleanup"
+        );
+        for _ in 0..3 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert_eq!(
+                state.budget.outstanding(),
+                1,
+                "event cleanup retains the connection permit"
+            );
+        }
+        drop(host_permits.pop());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.budget.outstanding() != 0 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "host capacity must resume connection cleanup"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(router.test_client_holder_count("cleanup-connection"), 0);
+        assert!(
+            state
+                .event_plane
+                .subscription_mailbox("cleanup-connection", "cleanup-subscription")
+                .is_none()
+        );
+        drop(host_permits);
+        daemon.stop();
+        std::fs::remove_dir_all(root).expect("remove client cleanup test directory");
+    }
 
     #[test]
     fn package_event_cleanup_reuses_its_slot_at_full_host_capacity() {

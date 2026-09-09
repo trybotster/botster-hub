@@ -364,11 +364,7 @@ pub(crate) fn handle_peer_closed(
             .admission
             .host_compatibility
             .remove(grant_id);
-        if let Some(runtime) = daemon.runtime() {
-            state
-                .event_plane
-                .cleanup_connection(grant_id, runtime.package_event_router());
-        }
+        crate::daemon::client_events::close_connection(state, grant_id);
     }
     // Residual same-grant index rows can survive a no-op Core Detach. Drop them
     // after occupancy release. Preserve replacement owners.
@@ -389,7 +385,7 @@ pub(crate) fn handle_peer_closed(
             continue;
         };
         let candidates = candidates_by_grant.remove(grant).unwrap_or_default();
-        if candidates.is_empty() || daemon.runtime().is_none() {
+        if daemon.runtime().is_none() {
             state.budget.release(permit);
             continue;
         }
@@ -399,6 +395,7 @@ pub(crate) fn handle_peer_closed(
             permit,
             "webrtc_peer_cleanup",
             None,
+            Some(grant.clone()),
             candidates,
             now,
             |state, applied| {
