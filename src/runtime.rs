@@ -62,7 +62,7 @@ use crate::package_entity_fanout::{
     EntityMutationLease, LeasedFanoutMutation, PackageEntityFamilyProgress,
     PackageEntityFamilyState, PackageEntityFamilyStep, PackageEntityFanoutQueue,
     PackageEntityMutation, PackageEntityPublishResult, PackageEntityPublishStatus,
-    coerce_entity_frame_empty_items, parse_publish_mutation,
+    coerce_entity_frame_empty_items, prepare_publish_mutation,
 };
 use crate::package_event_router::{
     CausalAdmitResult, CausalOp, EventPlaneStatus, EventSubscription, LeaseIdentity,
@@ -864,9 +864,24 @@ impl HubRuntime {
         let reservation = self
             .reserve_causal_transition()
             .map_err(|_| "causal transition capacity unavailable".to_string())?;
+        let mutation = match prepare_publish_mutation(frame) {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                if let Some(scope_id) = scope_id {
+                    reservation.commit(CausalOp::Release {
+                        scope_id,
+                        identity: LeaseIdentity::PendingEntityPublish {
+                            plugin_key: plugin_key.to_string(),
+                            publication_token: 0,
+                        },
+                    });
+                }
+                return Err(error);
+            }
+        };
         self.admit_package_entity_publish(
             PluginKey(plugin_key.to_string()),
-            frame,
+            mutation,
             scope_id,
             0,
             reservation,
@@ -1644,7 +1659,7 @@ impl HubRuntime {
         let result = if acquired {
             self.admit_package_entity_publish(
                 pending.plugin_key,
-                pending.frame,
+                pending.mutation,
                 pending.scope_id,
                 pending.token,
                 reservation,
@@ -1658,7 +1673,7 @@ impl HubRuntime {
     fn admit_package_entity_publish(
         &self,
         plugin_key: PluginKey,
-        frame: serde_json::Value,
+        mutation: PackageEntityMutation,
         scope_id: Option<u64>,
         publication_token: u64,
         reservation: CausalReservation<'_>,
@@ -1670,7 +1685,7 @@ impl HubRuntime {
         let mut reservation = Some(reservation);
         let result = self.admit_package_entity_publish_inner(
             plugin_key.clone(),
-            frame,
+            mutation,
             scope_id,
             publication_token,
             &mut reservation,
@@ -1692,12 +1707,11 @@ impl HubRuntime {
     fn admit_package_entity_publish_inner(
         &self,
         plugin_key: PluginKey,
-        frame: serde_json::Value,
+        mutation: PackageEntityMutation,
         scope_id: Option<u64>,
         publication_token: u64,
         reservation: &mut Option<CausalReservation<'_>>,
     ) -> Result<PackageEntityPublishResult, String> {
-        let mutation = parse_publish_mutation(frame)?;
         let mutation_seq = mutation.snapshot_seq();
         let entity_type = mutation.entity_type().to_string();
         let package_name = plugin_key.0.as_str();
@@ -1711,14 +1725,6 @@ impl HubRuntime {
         let owner_token = package_entity_owner_token(package_name);
         EntityContract::validate_entity_type(&entity_kind, Some(&owner_token))
             .map_err(|error| error.to_string())?;
-        // Reject oversized mutation bodies at admission so they never enter
-        // pending/fanout queues (same 1 MiB daemon frame bound as snapshots).
-        if package_entity_mutation_exceeds_limit(&mutation) {
-            return Err(
-                "entity_publish frame exceeds daemon frame limit (entity_provider_frame_too_large)"
-                    .to_string(),
-            );
-        }
 
         let now = Instant::now();
         let mut families = self
@@ -4204,55 +4210,6 @@ fn session_lifecycle_label(lifecycle: SessionLifecycleState) -> &'static str {
         SessionLifecycleState::Exited { .. } => "exited",
         SessionLifecycleState::Failed { .. } => "failed",
     }
-}
-
-fn package_entity_mutation_exceeds_limit(
-    mutation: &crate::package_entity_fanout::PackageEntityMutation,
-) -> bool {
-    // Match daemon_transport DAEMON_MAX_FRAME_BYTES without coupling modules.
-    const DAEMON_MAX_FRAME_BYTES: usize = 1024 * 1024;
-    let frame = match mutation {
-        crate::package_entity_fanout::PackageEntityMutation::Upsert {
-            entity_type,
-            snapshot_seq,
-            id,
-            entity,
-        } => serde_json::json!({
-            "type": "entity_upsert",
-            "subscription_id": "admission-size-check",
-            "entity_type": entity_type,
-            "snapshot_seq": snapshot_seq,
-            "id": id,
-            "entity": entity,
-        }),
-        crate::package_entity_fanout::PackageEntityMutation::Patch {
-            entity_type,
-            snapshot_seq,
-            id,
-            patch,
-        } => serde_json::json!({
-            "type": "entity_patch",
-            "subscription_id": "admission-size-check",
-            "entity_type": entity_type,
-            "snapshot_seq": snapshot_seq,
-            "id": id,
-            "patch": patch,
-        }),
-        crate::package_entity_fanout::PackageEntityMutation::Remove {
-            entity_type,
-            snapshot_seq,
-            id,
-        } => serde_json::json!({
-            "type": "entity_remove",
-            "subscription_id": "admission-size-check",
-            "entity_type": entity_type,
-            "snapshot_seq": snapshot_seq,
-            "id": id,
-        }),
-    };
-    serde_json::to_vec(&frame)
-        .map(|bytes| bytes.len() > DAEMON_MAX_FRAME_BYTES)
-        .unwrap_or(true)
 }
 
 fn completed_plugin_payload(

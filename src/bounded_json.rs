@@ -51,3 +51,58 @@ impl io::Write for CappedVecWriter {
         Ok(())
     }
 }
+
+/// Measure JSON without retaining an encoded allocation.
+pub(crate) fn encoded_len(value: &impl Serialize, limit: usize) -> Result<usize, EncodeError> {
+    let mut writer = CappedCountWriter {
+        bytes: 0,
+        limit,
+        exceeded: false,
+    };
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return Err(if writer.exceeded {
+            EncodeError::TooLarge
+        } else {
+            EncodeError::Serialize
+        });
+    }
+    Ok(writer.bytes)
+}
+
+struct CappedCountWriter {
+    bytes: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl io::Write for CappedCountWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes) {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON byte limit exceeded"));
+        }
+        self.bytes += buffer.len();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measurement_matches_encoding_at_the_limit() {
+        let value = serde_json::json!({"escaped": "\n\"\\", "unicode": "é", "nested": [null, 1]});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert_eq!(encoded_len(&value, bytes.len()), Ok(bytes.len()));
+        assert_eq!(
+            encoded_len(&value, bytes.len() - 1),
+            Err(EncodeError::TooLarge)
+        );
+        assert_eq!(encode(&value, bytes.len()), Ok(bytes));
+    }
+}
