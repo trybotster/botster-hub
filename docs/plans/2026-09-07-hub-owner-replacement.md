@@ -1199,3 +1199,36 @@ Both defects were corrected before the final boundary checks.
 Family model execution, provider family selection, descriptor readiness checks, and variable-length completion routing still touch the owner.
 The next phase must move those operations under the shared model reservation described above.
 Complete owner work and memory accounting, final Core allowance integration, canonical pins, and matched client evidence remain open.
+
+### Causal application receipts: model reservation prerequisite
+
+The causal reservation now owns a reference to the owner-only queue.
+The owner can retain that reservation across a finite Host phase.
+The reservation cannot move to a worker thread.
+The existing 256-operation capacity includes these retained reservations.
+Family release readiness now counts reserved slots as well as queued operations.
+An empty queue therefore does not imply available capacity.
+
+Commit returns a receipt for the operation's FIFO position.
+The receipt becomes applied only after `apply_causal_owner_ops` applies that position to the causal table.
+Taking and restoring a blocked head does not complete its receipt.
+Reservations receive positions at commit, so out-of-order reservation completion preserves FIFO application order.
+Each reservation also reserves an available position before its source changes.
+Checked position exhaustion returns a fault without wrapping or invalidating earlier receipts.
+Existing queued operations can still finish after position exhaustion.
+
+The queue header stores the commit and application counters.
+Receipts share that header; they do not allocate another record for each operation.
+The queue still stores only `CausalOp` values.
+The occupied-payload limit remains 256 times `size_of::<CausalOp>()`.
+The accounting still excludes the queue header and allocator overhead.
+
+The first compile failed on a test assertion that expected a vector instead of the table's set.
+The corrected causal, runtime, and provider selection passed 69 tests.
+A later readiness correction passed seven focused tests.
+Those tests cover retained capacity, actual table contention, commit order, checked exhaustion, and capacity notification.
+Rust 1.97.0 `check --tests`, formatting, and the patch whitespace check pass.
+
+No production model phase consumes these receipts yet.
+The model review handoff remains blocked by automatic approval review.
+This prerequisite does not establish independent acceptance of the model design or complete owner accounting.

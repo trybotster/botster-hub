@@ -643,7 +643,7 @@ impl HubRuntime {
     }
 
     pub(crate) fn causal_faulted(&self) -> bool {
-        self.causal_scopes.is_faulted()
+        self.causal_scopes.is_faulted() || self.causal_queue.is_exhausted()
     }
 
     pub(crate) fn causal_owner_ops_ready(&self) -> bool {
@@ -656,13 +656,11 @@ impl HubRuntime {
 
     pub(crate) fn reserve_causal_transition(
         &self,
-    ) -> Result<CausalReservation<'_>, CausalTransitionStatus> {
+    ) -> Result<CausalReservation, CausalTransitionStatus> {
         if self.causal_scopes.is_faulted() {
             return Err(CausalTransitionStatus::Fault);
         }
-        self.causal_queue
-            .reserve()
-            .ok_or(CausalTransitionStatus::Waiting)
+        self.causal_queue.reserve()
     }
 
     /// Complete one operation for synchronous runtime callers outside the daemon owner loop.
@@ -752,8 +750,8 @@ impl HubRuntime {
 
     pub(crate) fn causal_family_release_ready(&self) -> bool {
         self.has_family_resync_releases()
-            && !self.causal_scopes.is_faulted()
-            && self.causal_queue.len() < CAUSAL_OWNER_CAPACITY
+            && !self.causal_faulted()
+            && self.causal_queue.has_capacity()
     }
 
     pub(crate) fn retry_family_resync_release(&self) {
@@ -1818,7 +1816,7 @@ impl HubRuntime {
         mutation: PackageEntityMutation,
         scope_id: Option<u64>,
         publication_token: u64,
-        reservation: CausalReservation<'_>,
+        reservation: CausalReservation,
     ) -> (
         Result<PackageEntityPublishResult, String>,
         Option<PackageEntityMutation>,
@@ -1852,7 +1850,7 @@ impl HubRuntime {
         mutation: PackageEntityMutation,
         scope_id: Option<u64>,
         publication_token: u64,
-        reservation: &mut Option<CausalReservation<'_>>,
+        reservation: &mut Option<CausalReservation>,
     ) -> Result<
         (
             PackageEntityPublishResult,
@@ -1928,7 +1926,7 @@ impl HubRuntime {
         publication_token: u64,
         mutation_seq: u64,
         result: &PackageEntityPublishResult,
-        reservation: CausalReservation<'_>,
+        reservation: CausalReservation,
     ) {
         let op =
             settle_entity_publish_op(family, scope_id, publication_token, mutation_seq, result);
@@ -2619,7 +2617,7 @@ impl HubRuntime {
             (family.provider_obligation(), family.generation)
         };
         let scope_id = obligation.as_ref().map(|(scope_id, _)| *scope_id);
-        if scope_id.is_some() && self.causal_scopes.is_faulted() {
+        if scope_id.is_some() && self.causal_faulted() {
             return Err(crate::McpToolError::new(
                 "causal_scope_busy",
                 "could not acquire provider causal lease",
@@ -3122,6 +3120,9 @@ impl HubRuntime {
         if invocation.lease_acquired || invocation.causal_lease.is_none() {
             invocation.lease_acquired = true;
             return CausalAcquireResult::Acquired;
+        }
+        if self.causal_faulted() {
+            return CausalAcquireResult::Fault;
         }
         let (scope_id, invocation_token) = invocation.causal_lease.unwrap();
         let result = self.causal_scopes.try_acquire_with_admission_or_wait(
@@ -6608,6 +6609,75 @@ pub(crate) mod tests {
         let families = &model.families;
         assert_eq!(families[family].generation, new_generation);
         assert!(!families[family].resync.needed);
+    }
+
+    #[test]
+    fn retained_causal_reservations_suppress_family_release_readiness_until_capacity_returns() {
+        let runtime = family_runtime("causal-reservation-readiness");
+        let family_token = runtime.test_family_causal_token("producer.item");
+        let scope = runtime
+            .causal_scopes()
+            .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed { family_token }))
+            .unwrap();
+        runtime.test_store_resync_lease(scope, "producer.item");
+        assert!(runtime.causal_family_release_ready());
+        let mut reservations: Vec<_> = (0..CAUSAL_OWNER_CAPACITY)
+            .map(|_| runtime.reserve_causal_transition().unwrap())
+            .collect();
+        assert_eq!(runtime.causal_operation_count(), 0);
+        assert!(!runtime.causal_family_release_ready());
+        drop(reservations.pop());
+        assert!(runtime.take_causal_capacity_notification());
+        assert!(runtime.causal_family_release_ready());
+        runtime.retry_family_resync_release();
+        assert_eq!(runtime.causal_operation_count(), 1);
+        assert!(!runtime.causal_family_release_ready());
+        assert!(runtime.causal_scopes().is_live(scope));
+        runtime.apply_causal_owner_ops();
+        assert!(!runtime.causal_scopes().is_live(scope));
+        drop(reservations);
+    }
+
+    #[test]
+    fn causal_receipt_waits_for_its_exact_table_application_under_contention() {
+        let runtime = family_runtime("causal-receipt-order");
+        let scopes = runtime.causal_scopes();
+        let scope = scopes
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight))
+            .unwrap();
+        let provider = LeaseIdentity::ProviderInFlight {
+            invocation_token: 17,
+        };
+        assert!(scopes.acquire(scope, provider));
+        let retained_reservation = runtime.reserve_causal_transition().unwrap();
+        let first = runtime
+            .reserve_causal_transition()
+            .unwrap()
+            .commit(CausalOp::Release {
+                scope_id: scope,
+                identity: LeaseIdentity::EventInFlight,
+            });
+        let retained = retained_reservation.commit(CausalOp::Release {
+            scope_id: scope,
+            identity: provider,
+        });
+        assert!(!first.is_applied());
+        assert!(!retained.is_applied());
+        scopes.test_with_inner_held(|| runtime.apply_causal_owner_ops());
+        assert_eq!(runtime.causal_operation_count(), 2);
+        assert!(!first.is_applied());
+        assert!(!retained.is_applied());
+        runtime.apply_causal_owner_ops();
+        assert!(first.is_applied());
+        assert!(!retained.is_applied());
+        assert_eq!(
+            scopes.identities(scope).unwrap(),
+            BTreeSet::from([provider])
+        );
+        runtime.apply_causal_owner_ops();
+        assert!(retained.is_applied());
+        assert!(!scopes.is_live(scope));
+        assert_eq!(runtime.causal_operation_count(), 0);
     }
 
     #[test]
