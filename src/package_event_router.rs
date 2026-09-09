@@ -2936,11 +2936,18 @@ struct CausalInner {
 }
 
 impl CausalInner {
-    fn acquire(&mut self, scope_id: u64, identity: LeaseIdentity) -> bool {
+    fn acquire(
+        &mut self,
+        scope_id: u64,
+        identity: LeaseIdentity,
+        admission: Option<crate::lua_runtime::EntityPublishPermit>,
+    ) -> bool {
         let Some(scope) = self.scopes.get_mut(&scope_id) else {
             return false;
         };
-        if scope.identities.insert(identity) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = scope.identities.entry(identity)
+        {
+            entry.insert(admission);
             scope.leases = scope.leases.saturating_add(1);
         }
         true
@@ -2950,7 +2957,7 @@ impl CausalInner {
 #[derive(Debug)]
 struct CausalScope {
     leases: u32,
-    identities: BTreeSet<LeaseIdentity>,
+    identities: BTreeMap<LeaseIdentity, Option<crate::lua_runtime::EntityPublishPermit>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -3104,10 +3111,10 @@ impl CausalScopeTable {
             })
             .ok()?;
         let mut inner = self.causal_lock(&notice, false).ok()?;
-        let mut identities = BTreeSet::new();
+        let mut identities = BTreeMap::new();
         let mut leases = 0;
         if let Some(identity) = identity {
-            identities.insert(identity);
+            identities.insert(identity, None);
             leases = 1;
         }
         inner.scopes.insert(id, CausalScope { leases, identities });
@@ -3115,11 +3122,20 @@ impl CausalScopeTable {
     }
 
     pub fn acquire(&self, scope_id: u64, identity: LeaseIdentity) -> bool {
+        self.acquire_with_admission(scope_id, identity, None)
+    }
+
+    pub(crate) fn acquire_with_admission(
+        &self,
+        scope_id: u64,
+        identity: LeaseIdentity,
+        admission: Option<crate::lua_runtime::EntityPublishPermit>,
+    ) -> bool {
         let notice = CausalUnlockNotice::new(self);
         let Ok(mut inner) = self.causal_lock(&notice, false) else {
             return false;
         };
-        inner.acquire(scope_id, identity)
+        inner.acquire(scope_id, identity, admission)
     }
 
     /// Acquire for the retained publication head without queuing or waiting on a lock.
@@ -3128,6 +3144,15 @@ impl CausalScopeTable {
         &self,
         scope_id: u64,
         identity: &LeaseIdentity,
+    ) -> CausalAcquireResult {
+        self.try_acquire_with_admission_or_wait(scope_id, identity, None)
+    }
+
+    pub(crate) fn try_acquire_with_admission_or_wait(
+        &self,
+        scope_id: u64,
+        identity: &LeaseIdentity,
+        admission: Option<&crate::lua_runtime::EntityPublishPermit>,
     ) -> CausalAcquireResult {
         let notice = CausalUnlockNotice::new(self);
         if self.causal_fault(&notice) {
@@ -3138,7 +3163,7 @@ impl CausalScopeTable {
         }
         match self.causal_lock(&notice, true) {
             Ok(mut inner) => {
-                if inner.acquire(scope_id, identity.clone()) {
+                if inner.acquire(scope_id, *identity, admission.cloned()) {
                     CausalAcquireResult::Acquired
                 } else {
                     CausalAcquireResult::MissingScope
@@ -3219,7 +3244,7 @@ impl CausalScopeTable {
             .scopes
             .iter()
             .filter_map(|(scope_id, scope)| {
-                scope.identities.iter().find_map(|identity| {
+                scope.identities.keys().find_map(|identity| {
                     matches!(identity, LeaseIdentity::PendingEntityPublish { .. })
                         .then(|| (*scope_id, identity.clone()))
                 })
@@ -3235,7 +3260,7 @@ impl CausalScopeTable {
             inner
                 .scopes
                 .get(&scope_id)
-                .map(|scope| scope.identities.clone())
+                .map(|scope| scope.identities.keys().copied().collect())
         })
     }
 }
@@ -3244,11 +3269,16 @@ fn apply_causal_locked(inner: &mut CausalInner, op: &CausalOp) {
     match op {
         CausalOp::Transfer { scope_id, from, to } => {
             if let Some(scope) = inner.scopes.get_mut(scope_id) {
-                if scope.identities.remove(from) {
+                let source = scope.identities.remove(from);
+                if source.is_some() {
                     scope.leases = scope.leases.saturating_sub(1);
                 }
+                // Keep the source charge until every new target owns its reference.
                 for identity in to.iter().flatten() {
-                    if scope.identities.insert(identity.clone()) {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        scope.identities.entry(*identity)
+                    {
+                        entry.insert(source.as_ref().cloned().flatten());
                         scope.leases = scope.leases.saturating_add(1);
                     }
                 }
@@ -3259,7 +3289,7 @@ fn apply_causal_locked(inner: &mut CausalInner, op: &CausalOp) {
         }
         CausalOp::Release { scope_id, identity } => {
             if let Some(scope) = inner.scopes.get_mut(scope_id) {
-                if scope.identities.remove(identity) {
+                if scope.identities.remove(identity).is_some() {
                     scope.leases = scope.leases.saturating_sub(1);
                 }
                 if scope.leases == 0 {
@@ -3548,7 +3578,14 @@ mod tests {
             _ => panic!("the oracle must observe a poisoned lock"),
         };
         assert_eq!(
-            inner.scopes.get(&scope_id).unwrap().identities,
+            inner
+                .scopes
+                .get(&scope_id)
+                .unwrap()
+                .identities
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([identity])
         );
     }

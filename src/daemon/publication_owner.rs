@@ -482,6 +482,7 @@ mod tests {
             assert!(!drive(&daemon, &mut state));
             if condition == "missing" {
                 assert!(!runtime.entity_publish_retirement_pending());
+                assert_eq!(runtime.entity_publish_bridge().retained_counts(), (0, 0));
                 assert!(response.try_recv().unwrap().is_err());
                 assert_eq!(
                     runtime.causal_operation_count(),
@@ -490,6 +491,7 @@ mod tests {
                 assert_eq!(state.budget.outstanding(), 0);
             } else {
                 assert!(state.publication_owner.waiting_for_causal);
+                assert_eq!(runtime.entity_publish_bridge().retained_counts().0, 1);
                 assert!(state.publication_owner.completion.is_some());
                 assert!(runtime.host_executor().try_reserve().is_none());
                 assert!(response.try_recv().is_err());
@@ -508,6 +510,7 @@ mod tests {
                     absorb(&daemon, &mut state);
                     assert!(!drive(&daemon, &mut state));
                     assert!(state.publication_owner.faulted);
+                    assert_eq!(runtime.entity_publish_bridge().retained_counts().0, 1);
                     assert!(state.publication_owner.completion.is_some());
                     assert_eq!(state.budget.outstanding(), 1);
                     assert!(runtime.host_executor().try_reserve().is_none());
@@ -522,6 +525,7 @@ mod tests {
                         runtime.apply_causal_owner_ops();
                     }
                     assert!(!runtime.causal_scopes().is_live(scope));
+                    assert_eq!(runtime.entity_publish_bridge().retained_counts(), (0, 0));
                 }
             }
             drop(host_permits);
@@ -552,6 +556,7 @@ mod tests {
             panic!("recovery retains the original mutation")
         };
         assert_eq!(patch["nested"][0]["body"].as_str().unwrap().len(), 16384);
+        assert_eq!(runtime.entity_publish_bridge().retained_counts().0, 1);
         drop(response);
         runtime.step_entity_publish();
         assert!(runtime.entity_publish_retirement_pending());

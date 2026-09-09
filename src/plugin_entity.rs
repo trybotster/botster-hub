@@ -94,9 +94,11 @@ pub(crate) enum DeliveryStatus {
 
 /// The Host permit covers this allocation through all delivery phases.
 /// The owner reads only the scalar sequence and validity state.
+/// Keep admission after the body so payload destruction finishes before capacity returns.
 #[derive(Debug)]
 pub(crate) struct Payload {
     body: Body,
+    admission: Option<crate::lua_runtime::EntityPublishPermit>,
 }
 
 #[derive(Debug)]
@@ -109,6 +111,7 @@ enum Body {
 impl Payload {
     pub(crate) fn mutation(mutation: PackageEntityMutation) -> Self {
         Self {
+            admission: mutation.admission().cloned(),
             body: Body::Mutation(mutation),
         }
     }
@@ -190,6 +193,7 @@ impl Payload {
                 entity,
                 ..
             } => Body::Mutation(PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type,
                 snapshot_seq,
                 id,
@@ -202,6 +206,7 @@ impl Payload {
                 patch,
                 ..
             } => Body::Mutation(PackageEntityMutation::Patch {
+                admission: None,
                 entity_type,
                 snapshot_seq,
                 id,
@@ -213,6 +218,7 @@ impl Payload {
                 id,
                 ..
             } => Body::Mutation(PackageEntityMutation::Remove {
+                admission: None,
                 entity_type,
                 snapshot_seq,
                 id,
@@ -221,7 +227,10 @@ impl Payload {
                 Body::Error(McpToolError::new(code, message))
             }
         };
-        Self { body }
+        Self {
+            body,
+            admission: None,
+        }
     }
 }
 
@@ -277,7 +286,10 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
             };
             drop(charge);
             Completion::Prepared {
-                payload: Payload { body },
+                payload: Payload {
+                    body,
+                    admission: invocation.admission,
+                },
                 family,
                 registration,
             }
@@ -300,6 +312,7 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
                     status: DeliveryStatus::Cancelled,
                 };
             }
+            let admission = payload.admission.clone();
             let frame = ServerFrame::Entity {
                 entity: payload.into_frame(&target, resync_reason),
             };
@@ -307,7 +320,11 @@ pub(crate) fn execute(command: Command, permit: &mut HostWorkPermit) -> Completi
             let ServerFrame::Entity { entity } = frame else {
                 unreachable!()
             };
-            let payload = Payload::from_frame(entity);
+            let mut payload = Payload::from_frame(entity);
+            if let Body::Mutation(mutation) = &mut payload.body {
+                mutation.set_admission(admission.clone());
+            }
+            payload.admission = admission;
             let status = match prepared {
                 Ok(prepared) => {
                     // The exchange orders publication against owner cancellation.
@@ -444,6 +461,7 @@ mod tests {
                     registration: None,
                     reservation_identity: None,
                     payload: Some(Payload {
+                        admission: None,
                         body: Body::Error(McpToolError::new("provider_error", "provider detail")),
                     }),
                     target,
@@ -510,6 +528,7 @@ mod tests {
             sender: EntityFrameSender::Async(sender),
         });
         let payload = Payload {
+            admission: None,
             body: Body::Snapshot {
                 sequence: 19,
                 items: vec![serde_json::json!({"id": "a", "body": "x".repeat(128 * 1024)})],
@@ -573,6 +592,90 @@ mod tests {
     }
 
     #[test]
+    fn lifetime_budget_survives_worker_delivery_conversions_and_reclaim() {
+        let bridge = crate::lua_runtime::HubEntityPublishBridge::new();
+        let _reply = bridge.test_queue_publish(
+            botster_core::PluginKey("p".into()),
+            serde_json::json!({"type":"entity_patch", "entity_type":"p.item", "snapshot_seq":1,
+                "id":"item", "patch":{"body":"x".repeat(16384)}}),
+            None,
+        );
+        let (request, ()) = bridge.take_if(|_| Some(())).unwrap();
+        let executor = HostExecutor::new();
+        let mut permit = executor.try_reserve().unwrap();
+        let mut identity = OwnerWorkIdentity::first(WaiterId(904));
+        let mut run = |command, permit| {
+            executor
+                .submit(identity, HostCommand::PluginEntity(command), permit)
+                .unwrap();
+            let (returned_identity, result, permit) = completion(&executor).into_parts();
+            assert_eq!(returned_identity, identity);
+            identity = identity.next_phase().unwrap();
+            let HostResult::PluginEntity(result) = result else {
+                panic!("expected entity completion")
+            };
+            (result, permit)
+        };
+        let budget = SharedViewBudget::new();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let target = Arc::new(Target {
+            subscription_id: "sub".into(),
+            entity_type: "p.item".into(),
+            sender: EntityFrameSender::Async(sender),
+        });
+        let mut payload = Payload::mutation(request.mutation);
+        for (live, expected) in [
+            (false, DeliveryStatus::Cancelled),
+            (true, DeliveryStatus::Sent),
+            (true, DeliveryStatus::Full),
+        ] {
+            let (result, returned_permit) = run(
+                Command::Deliver {
+                    payload,
+                    target: Arc::clone(&target),
+                    publication_live: Arc::new(AtomicBool::new(live)),
+                    budget: Arc::clone(&budget),
+                    resync_reason: None,
+                },
+                permit,
+            );
+            permit = returned_permit;
+            let Completion::Delivered {
+                payload: returned,
+                status,
+            } = result
+            else {
+                panic!("delivery returns its payload")
+            };
+            assert_eq!(status, expected);
+            assert_eq!(bridge.retained_counts().0, 1);
+            payload = returned;
+        }
+        drop(receiver);
+        let (result, returned_permit) = run(
+            Command::Deliver {
+                payload,
+                target,
+                publication_live: Arc::new(AtomicBool::new(true)),
+                budget,
+                resync_reason: None,
+            },
+            permit,
+        );
+        permit = returned_permit;
+        let Completion::Delivered { payload, status } = result else {
+            panic!("delivery returns its payload")
+        };
+        assert_eq!(status, DeliveryStatus::Disconnected);
+        assert_eq!(bridge.retained_counts().0, 1);
+        assert!(matches!(
+            run(Command::Reclaim(payload), permit).0,
+            Completion::Reclaimed
+        ));
+        assert_eq!(bridge.retained_counts(), (0, 0));
+    }
+
+    #[test]
     fn cancellation_and_full_queue_keep_the_payload_and_release_new_container_charge() {
         let executor = HostExecutor::new();
         let mut permit = executor.try_reserve().unwrap();
@@ -584,6 +687,7 @@ mod tests {
             sender: EntityFrameSender::Async(sender),
         });
         let mut payload = Payload {
+            admission: None,
             body: Body::Snapshot {
                 sequence: 2,
                 items: vec![],

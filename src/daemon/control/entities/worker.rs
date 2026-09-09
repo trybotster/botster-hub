@@ -259,6 +259,7 @@ mod tests {
 
     fn mutation() -> PackageEntityMutation {
         PackageEntityMutation::Upsert {
+            admission: None,
             entity_type: "task".into(),
             snapshot_seq: 17,
             id: "a".into(),
@@ -402,6 +403,7 @@ mod tests {
         use crate::package_event_router::LeaseIdentity;
         let family = "producer.item";
         runtime.test_store_family_payload(PackageEntityMutation::Upsert {
+            admission: None,
             entity_type: family.into(),
             snapshot_seq: 1,
             id: "item".into(),

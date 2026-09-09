@@ -62,7 +62,7 @@ impl HubRuntime {
                     cursor.release = Some(mutation_release(lease));
                     return FamilyCleanupStep::Pending;
                 }
-                if let Some(scope_id) = family.resync.leases.pop_first() {
+                if let Some((scope_id, _admission)) = family.resync.leases.pop_first() {
                     cursor.release = Some(CausalOp::Release {
                         scope_id,
                         identity: LeaseIdentity::ProviderResyncNeed {

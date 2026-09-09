@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -13,10 +13,48 @@ use crate::package_entity_fanout::{
 };
 use botster_core::PluginKey;
 
-const REQUEST_CAPACITY: usize = 256;
+const PUBLICATION_CAPACITY: usize = 256;
 const REQUEST_BYTE_LIMIT: usize = 1024 * 1024;
-const QUEUE_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
+const PUBLICATION_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
 type PublishResult = Result<PackageEntityPublishResult, String>;
+
+/// One publication charge remains live until its last descendant releases it.
+#[derive(Clone)]
+pub struct EntityPublishPermit(Arc<PublicationCharge>);
+
+struct PublicationCharge {
+    account: Weak<Shared>,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for EntityPublishPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EntityPublishPermit")
+            .field("bytes", &self.0.bytes)
+            .finish()
+    }
+}
+
+impl PartialEq for EntityPublishPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for EntityPublishPermit {}
+
+impl Drop for PublicationCharge {
+    fn drop(&mut self) {
+        if let Some(account) = self.account.upgrade() {
+            account
+                .retained_bytes
+                .fetch_sub(self.bytes, Ordering::SeqCst);
+            account.retained_count.fetch_sub(1, Ordering::SeqCst);
+            account.notify();
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct HubEntityPublishBridge {
@@ -27,6 +65,8 @@ pub struct HubEntityPublishBridge {
 struct Shared {
     queue: Mutex<Queue>,
     count: AtomicUsize,
+    retained_count: AtomicUsize,
+    retained_bytes: AtomicUsize,
     blocked: AtomicBool,
     interest: AtomicBool,
     faulted: AtomicBool,
@@ -37,7 +77,6 @@ struct Shared {
 
 struct Queue {
     pending: VecDeque<PendingEntityPublishRequest>,
-    bytes: usize,
     next_token: u64,
 }
 
@@ -47,7 +86,6 @@ pub(crate) struct PendingEntityPublishRequest {
     pub(crate) mutation: PackageEntityMutation,
     pub(crate) scope_id: Option<u64>,
     pub(crate) response: mpsc::Sender<PublishResult>,
-    bytes: usize,
     pub(crate) identity: crate::package_event_router::LeaseIdentity,
 }
 
@@ -115,10 +153,11 @@ impl HubEntityPublishBridge {
             shared: Arc::new(Shared {
                 queue: Mutex::new(Queue {
                     pending: VecDeque::new(),
-                    bytes: 0,
                     next_token: 1,
                 }),
                 count: AtomicUsize::new(0),
+                retained_count: AtomicUsize::new(0),
+                retained_bytes: AtomicUsize::new(0),
                 blocked: AtomicBool::new(false),
                 interest: AtomicBool::new(false),
                 faulted: AtomicBool::new(false),
@@ -165,6 +204,14 @@ impl HubEntityPublishBridge {
         self.shared.count.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub(crate) fn retained_counts(&self) -> (usize, usize) {
+        (
+            self.shared.retained_count.load(Ordering::SeqCst),
+            self.shared.retained_bytes.load(Ordering::SeqCst),
+        )
+    }
+
     fn enqueue(
         &self,
         plugin_key: PluginKey,
@@ -187,7 +234,8 @@ impl HubEntityPublishBridge {
             })?;
         let request_bytes = key_bytes + frame_bytes;
         // The Lua worker parses, validates, and destroys rejected frames here.
-        let mutation = prepare_publish_mutation(frame).map_err(EntityPublishError::NeverQueued)?;
+        let mut mutation =
+            prepare_publish_mutation(frame).map_err(EntityPublishError::NeverQueued)?;
         let notice = UnlockNotice {
             shared: &self.shared,
             acquired: Cell::new(false),
@@ -203,12 +251,16 @@ impl HubEntityPublishBridge {
         if self.shared.faulted.load(Ordering::SeqCst) {
             return Err(fail("entity publish queue requires recovery"));
         }
-        let bytes = queue
-            .bytes
+        let bytes = self
+            .shared
+            .retained_bytes
+            .load(Ordering::SeqCst)
             .checked_add(request_bytes)
             .ok_or_else(|| fail("entity publish byte count exhausted"))?;
-        if queue.pending.len() >= REQUEST_CAPACITY || bytes > QUEUE_BYTE_CAPACITY {
-            return Err(fail("entity publish queue capacity exhausted"));
+        if self.shared.retained_count.load(Ordering::SeqCst) >= PUBLICATION_CAPACITY
+            || bytes > PUBLICATION_BYTE_CAPACITY
+        {
+            return Err(fail("entity publish capacity exhausted"));
         }
         let token = queue.next_token;
         queue.next_token = token
@@ -218,16 +270,22 @@ impl HubEntityPublishBridge {
         let identity = crate::package_event_router::LeaseIdentity::PendingEntityPublish {
             publication_token: token,
         };
+        self.shared.retained_count.fetch_add(1, Ordering::SeqCst);
+        self.shared
+            .retained_bytes
+            .fetch_add(request_bytes, Ordering::SeqCst);
+        mutation.set_admission(Some(EntityPublishPermit(Arc::new(PublicationCharge {
+            account: Arc::downgrade(&self.shared),
+            bytes: request_bytes,
+        }))));
         queue.pending.push_back(PendingEntityPublishRequest {
             token,
             plugin_key,
             mutation,
             scope_id,
             response,
-            bytes: request_bytes,
             identity,
         });
-        queue.bytes = bytes;
         self.shared
             .count
             .store(queue.pending.len(), Ordering::SeqCst);
@@ -300,7 +358,6 @@ impl HubEntityPublishBridge {
                 return false;
             };
             removed = queue.pending.remove(index).unwrap();
-            queue.bytes -= removed.bytes;
             self.shared
                 .count
                 .store(queue.pending.len(), Ordering::SeqCst);
@@ -344,7 +401,6 @@ impl HubEntityPublishBridge {
         };
         let prepared = prepare(queue.pending.front()?)?;
         let request = queue.pending.pop_front().unwrap();
-        queue.bytes -= request.bytes;
         self.shared
             .count
             .store(queue.pending.len(), Ordering::SeqCst);
@@ -362,10 +418,99 @@ mod tests {
     }
 
     #[test]
+    fn lifetime_budget_keeps_unscoped_payloads_charged_after_queue_removal() {
+        let bridge = HubEntityPublishBridge::new();
+        let mut payloads = Vec::new();
+        for _ in 0..PUBLICATION_CAPACITY {
+            bridge
+                .enqueue(PluginKey("p".into()), publish_frame(0), None)
+                .ok()
+                .unwrap();
+            let (request, ()) = bridge.take_if(|_| Some(())).unwrap();
+            payloads.push(request.mutation);
+        }
+        assert_eq!(bridge.pending_publish_count(), 0);
+        assert_eq!(bridge.retained_counts().0, PUBLICATION_CAPACITY);
+        assert!(matches!(
+            bridge.enqueue(PluginKey("p".into()), publish_frame(0), None),
+            Err(EntityPublishError::NeverQueued(_))
+        ));
+        let payload = payloads.pop().unwrap();
+        let copy = payload.clone();
+        drop(payload);
+        assert_eq!(bridge.retained_counts().0, PUBLICATION_CAPACITY);
+        drop(copy);
+        assert_eq!(bridge.retained_counts().0, PUBLICATION_CAPACITY - 1);
+        bridge
+            .enqueue(PluginKey("p".into()), publish_frame(0), None)
+            .ok()
+            .unwrap();
+        drop(payloads);
+        let (request, ()) = bridge.take_if(|_| Some(())).unwrap();
+        drop(request);
+        assert_eq!(bridge.retained_counts(), (0, 0));
+    }
+
+    #[test]
+    fn lifetime_budget_keeps_original_bytes_and_returns_each_completed_charge() {
+        let bridge = HubEntityPublishBridge::new();
+        let mut payloads = Vec::new();
+        for _ in 0..8 {
+            let mut frame = publish_frame(0);
+            frame["ignored"] = serde_json::json!("x".repeat(REQUEST_BYTE_LIMIT - 256));
+            bridge
+                .enqueue(PluginKey("p".into()), frame, None)
+                .ok()
+                .unwrap();
+            let (request, ()) = bridge.take_if(|_| Some(())).unwrap();
+            payloads.push(request.mutation);
+        }
+        assert_eq!(bridge.pending_publish_count(), 0);
+        assert_eq!(bridge.retained_counts().0, 8);
+        assert!(matches!(
+            bridge.enqueue(
+                PluginKey("p".into()),
+                publish_frame(REQUEST_BYTE_LIMIT - 256),
+                None
+            ),
+            Err(EntityPublishError::NeverQueued(_))
+        ));
+        drop(payloads);
+        assert_eq!(bridge.retained_counts(), (0, 0));
+        for _ in 0..(PUBLICATION_CAPACITY * 2) {
+            bridge
+                .enqueue(PluginKey("p".into()), publish_frame(0), None)
+                .ok()
+                .unwrap();
+            let (request, ()) = bridge.take_if(|_| Some(())).unwrap();
+            drop(request);
+            assert_eq!(bridge.retained_counts(), (0, 0));
+        }
+    }
+
+    #[test]
+    fn lifetime_budget_has_no_cycle_when_the_bridge_is_destroyed() {
+        let bridge = HubEntityPublishBridge::new();
+        bridge
+            .enqueue(PluginKey("p".into()), publish_frame(0), None)
+            .ok()
+            .unwrap();
+        let account = Arc::downgrade(&bridge.shared);
+        let (request, ()) = bridge.take_if(|_| Some(())).unwrap();
+        bridge
+            .enqueue(PluginKey("p".into()), publish_frame(0), None)
+            .ok()
+            .unwrap();
+        drop(bridge);
+        assert!(account.upgrade().is_none());
+        drop(request);
+    }
+
+    #[test]
     fn queue_limits_and_exact_retraction_preserve_other_requests() {
         let bridge = HubEntityPublishBridge::new();
         let mut tokens = Vec::new();
-        for _ in 0..REQUEST_CAPACITY {
+        for _ in 0..PUBLICATION_CAPACITY {
             let (token, _) = bridge
                 .enqueue(PluginKey("p".into()), publish_frame(0), None)
                 .ok()
@@ -378,14 +523,14 @@ mod tests {
         ));
         assert!(bridge.try_retract(tokens[17]));
         assert!(!bridge.try_retract(tokens[17]));
-        assert_eq!(bridge.pending_publish_count(), REQUEST_CAPACITY - 1);
+        assert_eq!(bridge.pending_publish_count(), PUBLICATION_CAPACITY - 1);
         let mut observed = Vec::new();
         while let Some((request, ())) = bridge.take_if(|_| Some(())) {
             observed.push(request.token);
         }
         tokens.remove(17);
         assert_eq!(observed, tokens);
-        assert_eq!(bridge.shared.queue.try_lock().unwrap().bytes, 0);
+        assert_eq!(bridge.shared.retained_bytes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
