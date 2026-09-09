@@ -77,7 +77,7 @@ use crate::session_types::{
 use crate::shared_view::{SharedView, SharedViewBudget};
 
 pub(crate) mod causal;
-pub use causal::{CAUSAL_OWNER_CAPACITY, CausalTransitionStatus};
+pub use causal::{CAUSAL_OWNER_CAPACITY, CAUSAL_OWNER_PAYLOAD_BYTES, CausalTransitionStatus};
 use causal::{CausalOwnerQueue, CausalReservation};
 pub(crate) mod family_cleanup;
 pub(crate) mod package_effect;

@@ -839,6 +839,11 @@ Token exhaustion preserves the original publication for disposal and does not pr
 Causal identities contain only fixed-size values.
 A transfer has three inline target slots for mutation, resync, and publication disposal obligations.
 The causal FIFO therefore retains a fixed payload size per occupied slot.
+The queue allocates its buffer during construction.
+Its logical occupied-payload limit is `CAUSAL_OWNER_PAYLOAD_BYTES`, equal to 256 times `size_of::<CausalOp>()`.
+The buffer capacity can exceed 256; it does not grow while the queue operates within its slot limit.
+The causal handler charges the supplied operation metadata before it removes the head.
+A budget refusal preserves the head and lease and marks the drain ready for a later turn.
 This does not establish a bound for all causal table storage or table update time.
 
 The earlier production regression failed because a retained publication transfer could follow its release.
@@ -888,9 +893,11 @@ The exhaustion test retains the original bridge payload through manual disposal;
 Eleven Lua integration tests pass for lease retirement, resync, cleanup, causal capacity, and distinct publications.
 Six focused tests pass after the final cleanup fixture and settlement signature changes.
 These integration results use the existing candidate worker and the current linked Hub library.
+Three queue and daemon tests pass for allocation stability, metadata-budget refusal, and draining under the shared owner budget.
 
 The owner inspection budget remains open.
-Causal table updates now compare and copy fixed-size identities, but dispatch still uses an opaque movement charge.
+Causal table updates now compare and copy fixed-size identities.
+The handler charges operation metadata, but table lookup, comparison, and allocation work still require separate accounting.
 Publication parsing and mutation size validation now run on the Lua worker.
 The daemon now disposes of rejected payloads on a Host worker.
 The owner still checks current family ownership and clones the provider-family set.

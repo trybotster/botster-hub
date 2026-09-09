@@ -2690,7 +2690,7 @@ fn retire_owner_diagnostics(
 }
 
 /// Required causal transfer or release that has not yet been admitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CausalOp {
     Transfer {
         scope_id: u64,
