@@ -1,6 +1,6 @@
 //! Runtime handles used by typed package effects on host workers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use super::{HubLuaPluginLoadError, PendingEventPlaneReplace};
@@ -14,7 +14,11 @@ use botster_core::{PluginCapabilityRuntime, PluginCleanupResult, PluginKey, Requ
 pub(crate) struct HostPackageCleanup {
     pub(crate) last_capability_cleanup: Option<PluginCleanupResult>,
     pub(crate) unloaded_families: Vec<(String, BTreeSet<String>)>,
-    pub(crate) event_plane_unloads: Vec<crate::package_event_router::OwnerOp>,
+    pub(crate) event_plane_unloads: VecDeque<crate::package_event_router::OwnerOp>,
+    pub(crate) event_plane_faults: Vec<(
+        Result<u64, EventPlaneStatus>,
+        crate::package_event_router::EventOwnerWorkError,
+    )>,
 }
 
 pub(crate) struct HostPackageRuntime {
@@ -24,7 +28,11 @@ pub(crate) struct HostPackageRuntime {
     package_event_router: Arc<PackageEventRouter>,
     last_capability_cleanup: Option<PluginCleanupResult>,
     unloaded_families: Vec<(String, BTreeSet<String>)>,
-    event_plane_unloads: Vec<crate::package_event_router::OwnerOp>,
+    event_plane_unloads: VecDeque<crate::package_event_router::OwnerOp>,
+    event_plane_faults: Vec<(
+        Result<u64, EventPlaneStatus>,
+        crate::package_event_router::EventOwnerWorkError,
+    )>,
 }
 
 impl HostPackageRuntime {
@@ -36,7 +44,8 @@ impl HostPackageRuntime {
             host_api,
             last_capability_cleanup: None,
             unloaded_families: Vec::new(),
-            event_plane_unloads: Vec::new(),
+            event_plane_unloads: VecDeque::new(),
+            event_plane_faults: Vec::new(),
         }
     }
 
@@ -45,12 +54,13 @@ impl HostPackageRuntime {
             last_capability_cleanup: self.last_capability_cleanup,
             unloaded_families: self.unloaded_families,
             event_plane_unloads: self.event_plane_unloads,
+            event_plane_faults: self.event_plane_faults,
         }
     }
 
     pub(crate) fn record_event_plane_unload(&mut self, package_name: &str) {
         self.event_plane_unloads
-            .push(crate::package_event_router::OwnerOp {
+            .push_back(crate::package_event_router::OwnerOp {
                 kind: crate::package_event_router::OwnerOpKind::Unload,
                 owner: package_name.to_string(),
                 generation: self
@@ -129,9 +139,18 @@ impl HostPackageRuntime {
         let staged = self
             .staged_package_event_plane(package_name, registry, &event_handlers)
             .map_err(HubLuaPluginLoadError::EventPlane)?;
-        self.package_event_router
-            .try_replace_package_generation(package_name, staged.contracts, staged.subscriptions)
-            .map_err(HubLuaPluginLoadError::EventPlane)?;
+        if let Err(error) = self.package_event_router.try_replace_package_generation(
+            package_name,
+            staged.contracts,
+            staged.subscriptions,
+        ) {
+            let (result, cleanup) = error.into_parts();
+            if let Some(cleanup) = cleanup {
+                self.event_plane_faults.push((result, cleanup));
+                return Err(HubLuaPluginLoadError::EventPlaneCleanup);
+            }
+            result.map_err(HubLuaPluginLoadError::EventPlane)?;
+        }
         self.reload_plugin_package(request_id, registry, package_name, bundle)
             .map_err(HubLuaPluginLoadError::Lifecycle)
     }

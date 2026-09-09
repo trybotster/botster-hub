@@ -26,6 +26,12 @@ pub(crate) enum DocumentAdmission {
 
 /// One unresolved host operation. Each variant retains the original operation slot.
 pub(crate) enum HostRecoveryRequired {
+    PackageEvents {
+        _result: Box<HostMutationResult>,
+        _fault: Option<crate::package_event_router::EventOwnerWorkError>,
+        _submission: Option<HostSubmissionFailure>,
+        _permit: Option<HostWorkPermit>,
+    },
     Package(PackageRecoveryRequired),
     ManagedGit(crate::daemon::control::managed_git::ManagedGitRecoveryRequired),
     Submission {
@@ -169,6 +175,10 @@ pub(crate) fn handle(
     let mut prior_compensation_failure: Option<HostMutationError> = None;
     let mut failed_package_effect: Option<(PackageRuntimeEffect, DaemonTransportError)> = None;
     let mut next_phase = 2;
+    let mut event_cleanup: Option<(
+        HostMutationResult,
+        crate::package_event_router::EventOwnerWorkId,
+    )> = None;
     Some(ControlStep::pending_in(
         ReadyClass::HostCompletion,
         move |daemon, state| {
@@ -188,7 +198,58 @@ pub(crate) fn handle(
                 return ControlPoll::Pending;
             };
             let (_identity, result, permit) = completion.into_parts();
-            let HostResult::Mutation(result) = result else {
+            let result = if let Some((saved, expected)) = event_cleanup.take() {
+                match result {
+                    HostResult::EventOwner(Ok(completed)) if completed.identity() == &expected => {
+                        saved
+                    }
+                    HostResult::EventOwner(Err(fault)) => {
+                        return retain_event_cleanup(
+                            state,
+                            waiter_id,
+                            saved,
+                            Some(fault),
+                            None,
+                            Some(permit),
+                        );
+                    }
+                    HostResult::Failed { error, .. } if error.code == "host_worker_panicked" => {
+                        // The executor confirmed that the old command cannot run again.
+                        let router = daemon
+                            .runtime()
+                            .expect("cleanup retains its runtime")
+                            .package_event_router()
+                            .clone();
+                        let crate::package_event_router::OwnerApplyResult::Work(work) =
+                            router.try_apply(expected.operation())
+                        else {
+                            unreachable!("package cleanup only submits unload work");
+                        };
+                        return submit_event_cleanup(
+                            daemon,
+                            state,
+                            waiter_id,
+                            saved,
+                            work,
+                            permit,
+                            &mut next_phase,
+                            &mut event_cleanup,
+                        );
+                    }
+                    _ => {
+                        return retain_event_cleanup(
+                            state,
+                            waiter_id,
+                            saved,
+                            None,
+                            None,
+                            Some(permit),
+                        );
+                    }
+                }
+            } else if let HostResult::Mutation(result) = result {
+                result
+            } else {
                 return finish_error(
                     permit,
                     HostMutationError {
@@ -197,6 +258,41 @@ pub(crate) fn handle(
                     },
                 );
             };
+            let mut result = result;
+            if let Some(cleanup) = package_event_cleanup(&mut result) {
+                if !cleanup.event_plane_faults.is_empty() {
+                    return retain_event_cleanup(
+                        state,
+                        waiter_id,
+                        result,
+                        None,
+                        None,
+                        Some(permit),
+                    );
+                }
+                if let Some(operation) = cleanup.event_plane_unloads.pop_front() {
+                    let router = daemon
+                        .runtime()
+                        .expect("cleanup retains its runtime")
+                        .package_event_router()
+                        .clone();
+                    let crate::package_event_router::OwnerApplyResult::Work(work) =
+                        router.try_apply(&operation)
+                    else {
+                        unreachable!("package cleanup only records unload work");
+                    };
+                    return submit_event_cleanup(
+                        daemon,
+                        state,
+                        waiter_id,
+                        result,
+                        work,
+                        permit,
+                        &mut next_phase,
+                        &mut event_cleanup,
+                    );
+                }
+            }
             match result {
                 HostMutationResult::BootstrapReady {
                     base_revision,
@@ -595,6 +691,92 @@ fn admit_or_park_commit(
     }
 }
 
+fn package_event_cleanup(
+    result: &mut HostMutationResult,
+) -> Option<&mut crate::runtime::package_effect::HostPackageCleanup> {
+    match result {
+        HostMutationResult::PackageEffectApplied { cleanup, .. }
+        | HostMutationResult::PackageEffectFailed { cleanup, .. }
+        | HostMutationResult::PackageRuntimeRestored { cleanup, .. } => Some(cleanup),
+        _ => None,
+    }
+}
+
+fn retain_event_cleanup(
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    result: HostMutationResult,
+    fault: Option<crate::package_event_router::EventOwnerWorkError>,
+    submission: Option<HostSubmissionFailure>,
+    permit: Option<HostWorkPermit>,
+) -> ControlPoll {
+    state.host_recovery.insert(
+        waiter_id,
+        HostRecoveryRequired::PackageEvents {
+            _result: Box::new(result),
+            _fault: fault,
+            _submission: submission,
+            _permit: permit,
+        },
+    );
+    ControlPoll::Ready(Ok(error_response(
+        "event_plane_cleanup_failed",
+        "packages",
+        "event router cleanup requires recovery",
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_event_cleanup(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    result: HostMutationResult,
+    work: crate::package_event_router::EventOwnerWork,
+    permit: HostWorkPermit,
+    next_phase: &mut u64,
+    retained: &mut Option<(
+        HostMutationResult,
+        crate::package_event_router::EventOwnerWorkId,
+    )>,
+) -> ControlPoll {
+    let runtime = daemon
+        .runtime()
+        .expect("package cleanup retains its runtime");
+    let expected = work.identity().clone();
+    let identity = HostJobIdentity {
+        waiter_id,
+        phase: *next_phase,
+    };
+    let command = HostCommand::EventOwner {
+        router: runtime.package_event_router().clone(),
+        work,
+    };
+    let Some(later_phase) = next_phase.checked_add(1) else {
+        return retain_event_cleanup(
+            state,
+            waiter_id,
+            result,
+            None,
+            Some(HostSubmissionFailure {
+                error: HostSubmitError::PhaseExhausted,
+                identity,
+                command,
+                permit,
+            }),
+            None,
+        );
+    };
+    match runtime.host_executor().submit(identity, command, permit) {
+        Ok(()) => {
+            *next_phase = later_phase;
+            *retained = Some((result, expected));
+            ControlPoll::Pending
+        }
+        Err(failure) => retain_event_cleanup(state, waiter_id, result, None, Some(failure), None),
+    }
+}
+
 fn submit_phase(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
@@ -740,6 +922,18 @@ pub(crate) fn recovery_response(
     state: &DaemonControlState,
     request: &DaemonRequest,
 ) -> Option<DaemonResponse> {
+    if handles(request)
+        && state
+            .host_recovery
+            .values()
+            .any(|recovery| matches!(recovery, HostRecoveryRequired::PackageEvents { .. }))
+    {
+        return Some(error_response(
+            "event_plane_cleanup_failed",
+            "packages",
+            "event router cleanup requires recovery",
+        ));
+    }
     if handles(request)
         && let Some(failure) = state
             .host_recovery

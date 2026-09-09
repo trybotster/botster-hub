@@ -58,6 +58,7 @@ enum BackgroundWork {
     DataPlaneProgress,
     CoreCompletion,
     HostCompletion,
+    EventOwner,
     ManagedSpawn,
     PluginReady,
     PluginEntityReady,
@@ -218,6 +219,7 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
             ReadyClass::CoreCompletion
         }
         BackgroundWork::HostCompletion | BackgroundWork::ManagedSpawn => ReadyClass::HostCompletion,
+        BackgroundWork::EventOwner => ReadyClass::HostBridge,
         BackgroundWork::PluginReady | BackgroundWork::PluginEntityReady => {
             ReadyClass::PluginCompletion
         }
@@ -308,6 +310,10 @@ pub(crate) fn mark_package_entity_resync_deadline_ready(
     true
 }
 
+pub(crate) fn mark_event_owner_ready(state: &mut DaemonControlState) {
+    mark_background_ready(state, BackgroundWork::EventOwner);
+}
+
 fn publish_maintenance_wakes(state: &mut DaemonControlState) {
     for kind in MaintenanceSliceKind::ALL {
         if state.maintenance.wakes.take(kind) {
@@ -319,12 +325,12 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
 /// Read persistent notification bits before the owner can block.
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if state.budget.take_capacity_notification() && state.event_owner.waiting_for_owner {
+        mark_event_owner_ready(state);
+    }
     if let Some(runtime) = daemon.runtime() {
         if runtime.take_event_plane_owner_ops_notification() {
-            state
-                .maintenance
-                .wakes
-                .mark(MaintenanceSliceKind::HostBridge);
+            mark_event_owner_ready(state);
         }
         if runtime.take_package_entity_resync_notification() {
             crate::subscription::entity_resync::note_package_entity_resync_change(state);
@@ -586,9 +592,9 @@ fn run_owner_maintenance_slice(
         }
         other => {
             if let Some(runtime) = daemon.runtime() {
-                let _ = runtime.apply_event_plane_owner_ops();
+                runtime.apply_causal_owner_ops();
                 if runtime.package_event_router().peek_delivery_wake()
-                    || runtime.event_plane_owner_ops_pending()
+                    || runtime.causal_owner_ops_pending()
                 {
                     state.maintenance.try_wake();
                 }
@@ -668,6 +674,11 @@ pub(crate) fn run_background_ready_item(
             );
             if state.host_completion_drain_pending || state.host_capacity_wake_pending {
                 mark_background_ready(state, BackgroundWork::HostCompletion);
+            }
+        }
+        BackgroundWork::EventOwner => {
+            if crate::daemon::event_owner::drive(daemon, state) {
+                mark_event_owner_ready(state);
             }
         }
         BackgroundWork::ManagedSpawn => {
@@ -1328,6 +1339,7 @@ fn run_pump_observe_phase(
 }
 
 pub(crate) struct DaemonControlState {
+    pub(crate) event_owner: crate::daemon::event_owner::EventOwnerState,
     pub(crate) logical_clock: u64,
     pub(crate) drain_cursors: BTreeMap<String, u64>,
     pub(crate) egress_diagnostics: DaemonEgressDiagnostics,
@@ -1419,6 +1431,7 @@ impl fmt::Debug for DaemonControlState {
 impl Default for DaemonControlState {
     fn default() -> Self {
         Self {
+            event_owner: crate::daemon::event_owner::EventOwnerState::default(),
             logical_clock: 1,
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
@@ -1616,6 +1629,202 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn package_event_cleanup_reuses_its_slot_at_full_host_capacity() {
+        for disconnected in [false, true] {
+            let root = unique_package_control_dir(&format!("event-cleanup-full-{disconnected}"));
+            let package_dir = root.join("cleanup.plugin");
+            write_package_control_manifest(&package_dir, "cleanup.plugin", serde_json::json!({}));
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+                .expect("start package cleanup daemon");
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::InstallPackageLocalPath { path: package_dir },
+            )
+            .expect("install cleanup package");
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::EnablePackage {
+                    package_name: "cleanup.plugin".into(),
+                },
+            )
+            .expect("enable cleanup package");
+            let mut state = DaemonControlState::default();
+            let reply = start_async_control_request(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::DisablePackage {
+                    package_name: "cleanup.plugin".into(),
+                },
+                "cleanup-client",
+                "cleanup-request",
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let retained = state.host_completions.values().any(|completion| matches!(
+                    &completion.result,
+                    crate::host_executor::HostResult::Mutation(crate::host_mutations::HostMutationResult::PackageEffectApplied { cleanup, .. })
+                        if !cleanup.event_plane_unloads.is_empty()
+                ));
+                if retained {
+                    break;
+                }
+                publish_completion_wakes(&daemon, &mut state);
+                publish_maintenance_wakes(&mut state);
+                if let Some(item) = state.owner_ready.pop_next() {
+                    let mut budget =
+                        crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                    assert!(!dispatch_owner_ready_item(
+                        &mut daemon,
+                        &mut state,
+                        item,
+                        &mut budget
+                    ));
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the package effect must return its cleanup identities"
+                );
+                thread::yield_now();
+            }
+            let waiter = *state
+                .host_completions
+                .keys()
+                .next()
+                .expect("retained package result");
+            let reserved = (1..crate::host_executor::HOST_OPERATION_CAPACITY)
+                .map(|_| {
+                    daemon
+                        .runtime()
+                        .unwrap()
+                        .host_executor()
+                        .try_reserve()
+                        .expect("reserve every other Host slot")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .host_executor()
+                    .try_reserve()
+                    .is_none()
+            );
+            let mut reply = Some(reply);
+            if disconnected {
+                drop(reply.take());
+                crate::daemon::control::pending::retire_abandoned_requests(
+                    &mut daemon,
+                    &mut state,
+                    "cleanup-client",
+                );
+            }
+            while state.pending_requests.contains_key(&waiter) {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "cleanup must finish with no second Host admission"
+                );
+                thread::yield_now();
+            }
+            assert!(state.host_recovery.is_empty());
+            assert!(state.document_owner.is_none());
+            assert_eq!(state.budget.outstanding(), 0);
+            if let Some(reply) = reply {
+                let response = receive_test_control_reply(reply).expect("disable response");
+                assert!(response.error.is_none());
+            }
+            assert!(
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .host_executor()
+                    .try_reserve()
+                    .is_some()
+            );
+            drop(reserved);
+            daemon.stop();
+            std::fs::remove_dir_all(root).expect("remove package cleanup test directory");
+        }
+    }
+
+    #[test]
+    fn event_owner_waits_for_capacity_and_worker_completion_without_spinning() {
+        use crate::package_event_router::{OwnerOp, OwnerOpKind};
+
+        for capacity in ["host", "owner"] {
+            let root = unique_package_control_dir(&format!("event-owner-capacity-{capacity}"));
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+                .expect("start queued event cleanup daemon");
+            let mut state = DaemonControlState::default();
+            state.budget = crate::daemon::owner_budget::OwnerBudget::with_capacity(1);
+            let mut owner_permit = (capacity == "owner").then(|| state.budget.reserve().unwrap());
+            let mut host_permits = if capacity == "host" {
+                (0..crate::host_executor::HOST_OPERATION_CAPACITY)
+                    .map(|_| {
+                        daemon
+                            .runtime()
+                            .unwrap()
+                            .host_executor()
+                            .try_reserve()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for _ in 0..2 {
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .record_event_plane_owner_op(OwnerOp {
+                        kind: OwnerOpKind::Unload,
+                        owner: "queued".into(),
+                        generation: 0,
+                    });
+            }
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert_eq!(state.event_owner.waiting_for_host, capacity == "host");
+            assert_eq!(state.event_owner.waiting_for_owner, capacity == "owner");
+            assert!(
+                state.owner_ready.is_empty(),
+                "capacity waiting must not retain a runnable item"
+            );
+
+            let router = daemon.runtime().unwrap().package_event_router().clone();
+            router.test_with_inner_held(|| {
+                if let Some(permit) = owner_permit.take() {
+                    state.budget.release(permit);
+                }
+                drop(host_permits.pop());
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(!daemon.runtime().unwrap().event_plane_owner_op_ready());
+                assert!(daemon.runtime().unwrap().event_plane_owner_ops_pending());
+                assert_eq!(state.budget.outstanding(), 1);
+                for _ in 0..3 {
+                    assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                    assert!(
+                        state.owner_ready.is_empty(),
+                        "an unfinished worker must not make the owner runnable"
+                    );
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while daemon.runtime().unwrap().event_plane_owner_ops_pending() {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "completion must resume the next queued operation"
+                );
+                thread::yield_now();
+            }
+            assert_eq!(state.budget.outstanding(), 0);
+            drop(host_permits);
+            daemon.stop();
+            std::fs::remove_dir_all(root).expect("remove queued cleanup test directory");
+        }
+    }
 
     #[test]
     fn queued_event_owner_operations_resume_without_control_traffic() {
