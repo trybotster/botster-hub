@@ -347,6 +347,7 @@ impl HubRuntime {
         let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
+        let plugin_lifecycle = HubPluginLifecycle::with_config(plugin_worker_config);
         let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
@@ -359,7 +360,9 @@ impl HubRuntime {
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             host_executor: crate::host_executor::HostExecutor::new(),
             coordination_bridge: HubCoordinationBridge::new(),
-            entity_publish_bridge: HubEntityPublishBridge::new(),
+            entity_publish_bridge: HubEntityPublishBridge::new(
+                plugin_lifecycle.entity_provider_registrations(),
+            ),
             entity_publish_wait: Cell::new(PublicationWait::Ready),
             entity_publish_retirement: std::cell::RefCell::new(None),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
@@ -377,7 +380,7 @@ impl HubRuntime {
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
-            plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
+            plugin_lifecycle,
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
@@ -451,6 +454,7 @@ impl HubRuntime {
         let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
+        let plugin_lifecycle = HubPluginLifecycle::with_config(plugin_worker_config);
         let (close_work, data_plane, core_daemon) = start_data_plane(core_config);
         let package_event_router = Arc::new(crate::package_event_router::PackageEventRouter::new(
             config.package_event_plane,
@@ -463,7 +467,9 @@ impl HubRuntime {
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             host_executor: crate::host_executor::HostExecutor::new(),
             coordination_bridge: HubCoordinationBridge::new(),
-            entity_publish_bridge: HubEntityPublishBridge::new(),
+            entity_publish_bridge: HubEntityPublishBridge::new(
+                plugin_lifecycle.entity_provider_registrations(),
+            ),
             entity_publish_wait: Cell::new(PublicationWait::Ready),
             entity_publish_retirement: std::cell::RefCell::new(None),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
@@ -481,7 +487,7 @@ impl HubRuntime {
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
-            plugin_lifecycle: HubPluginLifecycle::with_config(plugin_worker_config),
+            plugin_lifecycle,
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
@@ -914,8 +920,13 @@ impl HubRuntime {
         let reservation = self
             .reserve_causal_transition()
             .map_err(|_| "causal transition capacity unavailable".to_string())?;
-        let mutation = match prepare_publish_mutation(frame) {
-            Ok(mutation) => mutation,
+        let prepared = prepare_publish_mutation(frame).and_then(|mutation| {
+            self.entity_publish_bridge
+                .prepare_registration(plugin_key, &mutation)
+                .map(|registration| (mutation, registration))
+        });
+        let (mutation, registration) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 if let Some(scope_id) = scope_id {
                     reservation.commit(CausalOp::Release {
@@ -928,13 +939,8 @@ impl HubRuntime {
                 return Err(error);
             }
         };
-        let (result, discarded, release, drain) = self.admit_package_entity_publish(
-            PluginKey(plugin_key.to_string()),
-            mutation,
-            scope_id,
-            0,
-            reservation,
-        );
+        let (result, discarded, release, drain) =
+            self.admit_package_entity_publish(registration, mutation, scope_id, 0, reservation);
         drop(discarded);
         let (response, receiver) = std::sync::mpsc::channel();
         assert!(self.entity_publish_retirement.borrow().is_none());
@@ -1845,7 +1851,7 @@ impl HubRuntime {
         };
         let (result, discarded, release, drain) = if acquired {
             self.admit_package_entity_publish(
-                pending.plugin_key,
+                pending.registration,
                 pending.mutation,
                 pending.scope_id,
                 pending.token,
@@ -1877,7 +1883,7 @@ impl HubRuntime {
 
     fn admit_package_entity_publish(
         &self,
-        plugin_key: PluginKey,
+        registration: crate::lifecycle::EntityProviderRegistration,
         mutation: PackageEntityMutation,
         scope_id: Option<u64>,
         publication_token: u64,
@@ -1891,7 +1897,7 @@ impl HubRuntime {
         let pending_identity = LeaseIdentity::PendingEntityPublish { publication_token };
         let mut reservation = Some(reservation);
         let (result, discarded, drain) = match self.admit_package_entity_publish_inner(
-            plugin_key,
+            &registration,
             mutation,
             scope_id,
             publication_token,
@@ -1911,7 +1917,7 @@ impl HubRuntime {
 
     fn admit_package_entity_publish_inner(
         &self,
-        plugin_key: PluginKey,
+        registration: &crate::lifecycle::EntityProviderRegistration,
         mutation: PackageEntityMutation,
         scope_id: Option<u64>,
         publication_token: u64,
@@ -1924,23 +1930,14 @@ impl HubRuntime {
         ),
         (String, PackageEntityMutation),
     > {
-        let mutation_seq = mutation.snapshot_seq();
-        let entity_type = mutation.entity_type().to_string();
-        let package_name = plugin_key.0.as_str();
-        let owned_families = self.plugin_entity_provider_families(package_name);
-        if !owned_families.contains(&entity_type) {
+        if !registration.is_live() {
             return Err((
-                format!(
-                    "entity_publish family {entity_type} is not provided by package {package_name}"
-                ),
+                "entity_publish provider registration is no longer live".into(),
                 mutation,
             ));
         }
-        let entity_kind = EntityKind(entity_type.clone());
-        let owner_token = package_entity_owner_token(package_name);
-        if let Err(error) = EntityContract::validate_entity_type(&entity_kind, Some(&owner_token)) {
-            return Err((error.to_string(), mutation));
-        }
+        let mutation_seq = mutation.snapshot_seq();
+        let entity_type = mutation.entity_type().to_string();
 
         let now = Instant::now();
         let mut families = self
@@ -5746,6 +5743,70 @@ pub(crate) mod tests {
             .load_lua_plugin_package(policy.registry(), "producer")
             .unwrap();
         (runtime, root)
+    }
+
+    #[test]
+    fn provider_registration_rejects_queued_publications_after_reload_and_unload() {
+        let (mut runtime, root) = publication_provider_runtime("registration-replacement");
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install replacement provider")
+            .unwrap();
+        policy
+            .enable("producer", "enable replacement provider")
+            .unwrap();
+        let bridge = runtime.entity_publish_bridge();
+        let frame = || {
+            serde_json::json!({
+                "type": "entity_remove", "entity_type": "producer.item",
+                "snapshot_seq": 1, "id": "item"
+            })
+        };
+        for reload in [true, false] {
+            let scope = runtime.causal_scopes.mint().unwrap();
+            let response =
+                bridge.test_queue_publish(PluginKey("producer".into()), frame(), Some(scope));
+            assert_eq!(bridge.pending_publish_count(), 1);
+            assert_eq!(bridge.retained_counts().0, 1);
+            if reload {
+                runtime
+                    .reload_lua_plugin_package(
+                        RequestId("registration-reload".into()),
+                        policy.registry(),
+                        "producer",
+                    )
+                    .unwrap();
+            } else {
+                let _ = runtime
+                    .plugin_lifecycle
+                    .unload_package(RequestId("registration-unload".into()), "producer");
+            }
+            runtime.test_fulfill_pending_publishes();
+            assert!(
+                response
+                    .try_recv()
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("registration")
+            );
+            while runtime.causal_operation_count() > 0 {
+                runtime.apply_causal_owner_ops();
+            }
+            assert!(!runtime.causal_scopes.is_live(scope));
+            assert!(!runtime.test_family_exists("producer.item"));
+            assert_eq!(bridge.pending_publish_count(), 0);
+            assert_eq!(bridge.retained_counts(), (0, 0));
+        }
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        let response = bridge.test_queue_publish(PluginKey("producer".into()), frame(), None);
+        runtime.test_fulfill_pending_publishes();
+        runtime.test_fulfill_pending_publishes();
+        assert!(response.try_recv().unwrap().is_ok());
+        assert!(runtime.test_family_exists("producer.item"));
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

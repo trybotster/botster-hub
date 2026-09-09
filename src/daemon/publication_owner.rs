@@ -206,7 +206,7 @@ mod tests {
     ) -> std::sync::mpsc::Receiver<
         Result<crate::package_entity_fanout::PackageEntityPublishResult, String>,
     > {
-        runtime.entity_publish_bridge().test_queue_publish(
+        runtime.entity_publish_bridge().test_queue_stale_publish(
             botster_core::PluginKey("absent".into()),
             serde_json::json!({"type": "entity_patch", "entity_type": "absent.items", "snapshot_seq": 1, "id": "item", "patch": {"nested": [{"body": "x".repeat(16384)}]}}),
             scope,

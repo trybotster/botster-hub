@@ -2590,7 +2590,7 @@ mod tests {
         state.family_cleanup_waiters.clear();
         state.shutdown_waiter = Some(waiter);
         let bridge = daemon.runtime().unwrap().entity_publish_bridge();
-        let _response = bridge.test_queue_publish(botster_core::PluginKey("absent".into()),
+        let _response = bridge.test_queue_stale_publish(botster_core::PluginKey("absent".into()),
             serde_json::json!({"type": "entity_remove", "entity_type": "absent.items", "snapshot_seq": 1, "id": "item"}), None);
         bridge.take_progress_notification();
         assert!(state.pending_requests[&waiter].ready_key.is_none());
@@ -2620,9 +2620,9 @@ mod tests {
             ));
         }
         let bridge = runtime.entity_publish_bridge();
-        let response = bridge.test_queue_publish(
+        let response = bridge.test_queue_stale_publish(
             botster_core::PluginKey("absent".into()),
-            serde_json::json!({"type": "entity_remove", "entity_type": "absent:items", "snapshot_seq": 1, "id": "item"}),
+            serde_json::json!({"type": "entity_remove", "entity_type": "absent.items", "snapshot_seq": 1, "id": "item"}),
             Some(scope),
         );
         scopes.test_with_inner_held(|| {
@@ -2647,7 +2647,7 @@ mod tests {
         assert_eq!(bridge.pending_publish_count(), 0);
         assert!(
             response.try_recv().unwrap().is_err(),
-            "the absent plugin rejects after acquisition"
+            "the retired registration rejects after acquisition"
         );
         while runtime.causal_operation_count() > 0 {
             runtime.apply_causal_owner_ops();
@@ -2675,9 +2675,9 @@ mod tests {
             ));
         }
         let bridge = runtime.entity_publish_bridge();
-        let _response = bridge.test_queue_publish(
+        let _response = bridge.test_queue_stale_publish(
             botster_core::PluginKey("absent".into()),
-            serde_json::json!({"type": "entity_remove", "entity_type": "absent:items", "snapshot_seq": 1, "id": "item"}),
+            serde_json::json!({"type": "entity_remove", "entity_type": "absent.items", "snapshot_seq": 1, "id": "item"}),
             None,
         );
         runtime.step_entity_publish();
@@ -2690,9 +2690,9 @@ mod tests {
         assert!(daemon.runtime().unwrap().entity_publish_ready());
         daemon.runtime().unwrap().step_entity_publish();
         assert!(!daemon.runtime().unwrap().entity_publish_ready());
-        let refusal = bridge.test_queue_publish(
+        let refusal = bridge.test_queue_stale_publish(
             botster_core::PluginKey("absent".into()),
-            serde_json::json!({"type": "entity_remove", "entity_type": "absent:items", "snapshot_seq": 1, "id": "item"}),
+            serde_json::json!({"type": "entity_remove", "entity_type": "absent.items", "snapshot_seq": 1, "id": "item"}),
             None,
         );
         assert!(refusal.try_recv().unwrap().is_err());
