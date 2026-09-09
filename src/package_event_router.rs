@@ -2233,6 +2233,18 @@ impl EventPlaneOwnerOps {
         true
     }
 
+    /// Restart the same operation with retained admission and a new serial.
+    /// The caller must confirm that the old worker cannot run.
+    pub fn restart(&mut self, identity: &EventOwnerWorkId) -> Option<EventOwnerWork> {
+        if !self.matches_in_flight(identity) {
+            return None;
+        }
+        let work = EventOwnerWork::new(identity.operation.clone());
+        self.in_flight
+            .insert(identity.operation.owner.clone(), work.identity.clone());
+        Some(work)
+    }
+
     fn matches_in_flight(&self, identity: &EventOwnerWorkId) -> bool {
         self.in_flight.get(&identity.operation.owner) == Some(identity)
             && self
@@ -3047,6 +3059,54 @@ mod tests {
         assert!(ops.is_empty());
         assert!(!ops.has_ready());
         assert!(matches!(ops.apply_ready(&router), OwnerStep::Idle));
+    }
+
+    #[test]
+    fn owner_restart_keeps_exact_operation_and_rejects_stale_receipts() {
+        let router = router();
+        let mut ops = EventPlaneOwnerOps::default();
+        let op = OwnerOp {
+            kind: OwnerOpKind::Unload,
+            owner: "producer".into(),
+            generation: 1,
+        };
+        ops.record(op.clone());
+        ops.record(op.clone());
+        let OwnerStep::Work(first) = ops.apply_ready(&router) else {
+            panic!("first work");
+        };
+        let first_id = first.identity().clone();
+        let first_completion = run_work(&router, first);
+        let other = OwnerOp {
+            owner: "other".into(),
+            ..op.clone()
+        };
+        ops.record(other.clone());
+
+        let restarted = ops.restart(&first_id).expect("restart current operation");
+        let restarted_id = restarted.identity().clone();
+        assert_ne!(first_id, restarted_id);
+        assert_eq!(restarted_id.operation(), &op);
+        assert!(ops.restart(&first_id).is_none());
+        assert!(!ops.retry(&first_id));
+        assert!(ops.complete(first_completion).is_none());
+        assert_eq!(ops.pending_for("producer"), vec![op.clone(), op.clone()]);
+        assert!(!ops.ready.contains("producer"));
+        let OwnerStep::Work(other_work) = ops.apply_ready(&router) else {
+            panic!("other owner remains ready");
+        };
+        assert_eq!(other_work.identity().operation(), &other);
+        assert_eq!(ops.complete(run_work(&router, other_work)), Some(other));
+        assert!(!ops.has_ready());
+        assert_eq!(ops.complete(run_work(&router, restarted)), Some(op.clone()));
+        assert!(ops.restart(&restarted_id).is_none());
+        assert!(ops.has_ready());
+        let OwnerStep::Work(next) = ops.apply_ready(&router) else {
+            panic!("next operation follows completion");
+        };
+        assert_ne!(next.identity(), &restarted_id);
+        assert_eq!(ops.complete(run_work(&router, next)), Some(op));
+        assert!(ops.is_empty());
     }
 
     #[test]
