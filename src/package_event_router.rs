@@ -2404,7 +2404,7 @@ impl CausalScopeTable {
         CausalAdmitResult::Retry(op)
     }
 
-    /// Attempt one queued operation. The caller supplies the shared turn budget.
+    /// Attempt at most one queued operation without waiting for either lock.
     pub fn flush_pending(&self) -> usize {
         let Ok(mut pending) = self.pending.try_lock() else {
             return 0;
