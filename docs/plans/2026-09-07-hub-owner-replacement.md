@@ -962,3 +962,51 @@ The saturated Lua provider rejects its new publication and returns its snapshot 
 Ten Lua integration tests pass for fanout, distinct publications, cleanup, refusal, and causal contention.
 Those integration tests use the existing candidate worker and the current linked Hub library.
 Formatting and the patch whitespace check pass.
+
+### Provider registration before publication admission
+
+The Lua worker now selects an exact package and family registration before enqueue.
+The Lua worker also validates the entity namespace before it reserves publication capacity.
+The queued request retains one fixed registration record instead of the package string.
+Owner admission checks that record before it routes the mutation.
+The owner no longer clones the provider-family set or constructs the namespace token for publication admission.
+The original logical request charge remains unchanged.
+
+The lifecycle keeps only current registrations in its index.
+Each queued request retains its selected record with an `Arc`.
+Replacement and unload permanently invalidate old records and remove them from the index.
+No numeric identity, pointer-derived identity, or registration history map exists.
+
+Registration selection can wait for the index lock on the Lua worker.
+It releases that lock before enqueue or response waiting.
+The lifecycle holds no registration lock while Core stops and joins old workers.
+It stops the old worker, replaces the registrations, and then starts the new worker.
+This uses Core's existing unload and load operations, which compose its reload operation at revision `ca24328`.
+Initial load follows the same order because Core also permits replacement through load.
+The lifecycle preserves the production requirement that package effects execute serially.
+The index does not independently serialize concurrent lifecycle calls.
+
+These changes remove publication ownership validation from the owner path.
+Family strings still participate in owner routing, cloning, and other indices.
+Fixed record destruction still requires allocator work.
+Complete owner work accounting, the memory inventory, final Core pins, and matched client verification remain open.
+
+Registration retirement occurs at the record swap, before the lifecycle call returns.
+An old queued publication can still pass admission while unload remains in progress before that swap.
+Core worker shutdown and registration retirement are not one atomic operation.
+Core load inserts its new worker before it stops the previous worker.
+The explicit unload places that stop before registration replacement.
+
+The selected registration and publication checks pass 37 library tests.
+The runtime test queues publications before real Lua reload and unload, then checks refusal, scope retirement, and returned publication capacity.
+It also checks acceptance after the same package and family load again.
+Four selected Lua integration checks passed with the existing candidate worker and the current linked library.
+The reserved-release integration fixture initially failed because its unowned family now fails before enqueue.
+The corrected fixture queues a valid publication, unloads its package, and then admits the stale record with one causal slot available.
+That check passes through public unload and the runtime publication path.
+The existing lifecycle integration check also passes for returned Core cleanup and stopped runtimes.
+Rust 1.97.0 `check --tests` passes.
+These checks do not establish final matched binaries or complete foundation acceptance.
+The final focused contract test passes for both a different owner namespace and the invalid `p:item` format.
+Both cases fail before queue admission and retain no publication credit.
+Formatting and the patch whitespace check pass.

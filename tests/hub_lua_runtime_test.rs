@@ -4367,13 +4367,19 @@ fn fulfill_leaves_the_next_publish_on_the_bridge_until_a_slot_frees() {
 
 #[test]
 fn rejected_publication_uses_its_reserved_release_capacity() {
-    let hub = loaded_lease_runtime("lease-publish-refusal");
-    let scopes = hub.causal_scopes();
-    fill_causal_owner_queue(&hub, CAUSAL_OWNER_CAPACITY - 1);
+    let mut hub = loaded_lease_runtime("lease-publish-refusal");
+    let scopes = hub.causal_scopes().clone();
     let live = scopes.mint().expect("publication scope");
-    let response = queue_scoped_publication(&hub, live, "not-owned.item", 1);
+    let response = queue_scoped_publication(&hub, live, "lease-probe.item", 1);
+    hub.unload_plugin_package(
+        RequestId("retire-publication-registration".into()),
+        "lease-probe",
+    )
+    .expect("unload before owner admission");
+    fill_causal_owner_queue(&hub, CAUSAL_OWNER_CAPACITY - 1);
     hub.test_fulfill_pending_publishes();
-    assert!(response.try_recv().unwrap().is_err());
+    let error = response.try_recv().unwrap().unwrap_err();
+    assert!(error.contains("registration"));
     assert_eq!(hub.causal_operation_count(), CAUSAL_OWNER_CAPACITY);
     drain_causal_owner_work(&hub);
     assert_eq!(scopes.identities(live), None);

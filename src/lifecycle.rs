@@ -4,6 +4,9 @@
 //! adapter only refuses packages that are not currently enabled, then delegates
 //! load, invoke, reload, unload, and cleanup mechanics to `botster-core`.
 
+mod entity_providers;
+pub(crate) use entity_providers::{EntityProviderRegistration, EntityProviderRegistrations};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
@@ -12,9 +15,9 @@ use botster_core::{
     BoundaryJson, PluginAdmissionResult, PluginCleanupResult, PluginCleanupScope,
     PluginCompletionDrain, PluginCompletionNotifier, PluginDescriptorKind,
     PluginHandlerRegistration, PluginInvocationClass, PluginInvocationOutcome,
-    PluginInvocationRequest, PluginKey, PluginLoadSpec, PluginOwnedDescriptor, PluginReloadSpec,
-    PluginResourceRef, PluginRuntime, PluginUnloadSpec, PluginWorkerDebugSnapshot,
-    PluginWorkerEngine, PluginWorkerEngineConfig, PluginWorkerRegistration, RequestId,
+    PluginInvocationRequest, PluginKey, PluginLoadSpec, PluginOwnedDescriptor, PluginResourceRef,
+    PluginRuntime, PluginUnloadSpec, PluginWorkerDebugSnapshot, PluginWorkerEngine,
+    PluginWorkerEngineConfig, PluginWorkerRegistration, RequestId,
 };
 
 use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, PackageState};
@@ -90,6 +93,7 @@ pub struct HubPluginLifecycle {
     loaded: Arc<Mutex<BTreeSet<String>>>,
     load_failures: Arc<Mutex<BTreeMap<String, HubPluginLoadFailure>>>,
     descriptors: Arc<Mutex<BTreeMap<String, Vec<PluginOwnedDescriptor>>>>,
+    entity_providers: EntityProviderRegistrations,
     event_handlers: Arc<Mutex<BTreeMap<String, Vec<HubPluginEventHandler>>>>,
 }
 
@@ -102,8 +106,13 @@ impl HubPluginLifecycle {
             loaded: Arc::new(Mutex::new(BTreeSet::new())),
             load_failures: Arc::new(Mutex::new(BTreeMap::new())),
             descriptors: Arc::new(Mutex::new(BTreeMap::new())),
+            entity_providers: EntityProviderRegistrations::default(),
             event_handlers: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    pub(crate) fn entity_provider_registrations(&self) -> EntityProviderRegistrations {
+        self.entity_providers.clone()
     }
 
     /// Return Core's authoritative read-only plugin worker snapshot.
@@ -123,8 +132,17 @@ impl HubPluginLifecycle {
         let plugin_key = plugin_key_for(record);
         let descriptors = bundle.descriptors.clone();
         let event_handlers = bundle.event_handlers.clone();
+        let entity_providers = self.entity_providers.prepare(&plugin_key.0, &descriptors);
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
 
+        // Core must stop the previous worker before its registrations change.
+        // The registration index remains unlocked while Core joins workers.
+        self.engine.unload_plugin(PluginUnloadSpec {
+            request_id: RequestId("hub-load-registration".into()),
+            plugin_key: plugin_key.clone(),
+            cleanup: PluginCleanupScope::DescriptorsAndResources,
+        });
+        self.entity_providers.replace(entity_providers);
         self.engine.load_plugin(registration);
         self.loaded
             .lock()
@@ -185,16 +203,15 @@ impl HubPluginLifecycle {
         let plugin_key = plugin_key_for(record);
         let descriptors = bundle.descriptors.clone();
         let event_handlers = bundle.event_handlers.clone();
+        let entity_providers = self.entity_providers.prepare(&plugin_key.0, &descriptors);
         let registration = registration_for(record, plugin_key.clone(), bundle)?;
-        let cleanup = self.engine.reload_plugin(
-            PluginReloadSpec {
-                request_id,
-                plugin_key: plugin_key.clone(),
-                load: registration.load.clone(),
-                cleanup: PluginCleanupScope::DescriptorsAndResources,
-            },
-            registration,
-        );
+        let cleanup = self.engine.unload_plugin(PluginUnloadSpec {
+            request_id,
+            plugin_key: plugin_key.clone(),
+            cleanup: PluginCleanupScope::DescriptorsAndResources,
+        });
+        self.entity_providers.replace(entity_providers);
+        self.engine.load_plugin(registration);
         self.loaded
             .lock()
             .expect("hub plugin lifecycle loaded set lock")
@@ -224,6 +241,7 @@ impl HubPluginLifecycle {
             plugin_key,
             cleanup: PluginCleanupScope::DescriptorsAndResources,
         });
+        self.entity_providers.retire(package_name);
         self.loaded
             .lock()
             .expect("hub plugin lifecycle loaded set lock")

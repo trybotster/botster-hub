@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn lifetime_budget_survives_worker_delivery_conversions_and_reclaim() {
-        let bridge = crate::lua_runtime::HubEntityPublishBridge::new();
+        let bridge = crate::lua_runtime::HubEntityPublishBridge::for_test("p", "p.item");
         let _reply = bridge.test_queue_publish(
             botster_core::PluginKey("p".into()),
             serde_json::json!({"type":"entity_patch", "entity_type":"p.item", "snapshot_seq":1,

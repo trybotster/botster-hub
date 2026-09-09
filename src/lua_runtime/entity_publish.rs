@@ -60,6 +60,7 @@ impl Drop for PublicationCharge {
 pub struct HubEntityPublishBridge {
     owner_thread: thread::ThreadId,
     shared: Arc<Shared>,
+    registrations: crate::lifecycle::EntityProviderRegistrations,
 }
 
 struct Shared {
@@ -82,7 +83,7 @@ struct Queue {
 
 pub(crate) struct PendingEntityPublishRequest {
     pub(crate) token: u64,
-    pub(crate) plugin_key: PluginKey,
+    pub(crate) registration: crate::lifecycle::EntityProviderRegistration,
     pub(crate) mutation: PackageEntityMutation,
     pub(crate) scope_id: Option<u64>,
     pub(crate) response: mpsc::Sender<PublishResult>,
@@ -147,9 +148,10 @@ impl Shared {
 }
 
 impl HubEntityPublishBridge {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(registrations: crate::lifecycle::EntityProviderRegistrations) -> Self {
         Self {
             owner_thread: thread::current().id(),
+            registrations,
             shared: Arc::new(Shared {
                 queue: Mutex::new(Queue {
                     pending: VecDeque::new(),
@@ -212,6 +214,41 @@ impl HubEntityPublishBridge {
         )
     }
 
+    pub(crate) fn prepare_registration(
+        &self,
+        package: &str,
+        mutation: &PackageEntityMutation,
+    ) -> Result<crate::lifecycle::EntityProviderRegistration, String> {
+        let registration = self.registrations.select(package, mutation.entity_type())?;
+        let entity_kind = botster_core::EntityKind(mutation.entity_type().to_string());
+        let owner_token = crate::lifecycle::package_entity_owner_token(package);
+        botster_core::EntityContract::validate_entity_type(&entity_kind, Some(&owner_token))
+            .map_err(|error| error.to_string())?;
+        Ok(registration)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(package: &str, family: &str) -> Self {
+        let registrations = crate::lifecycle::EntityProviderRegistrations::default();
+        registrations.test_register(package, family);
+        Self::new(registrations)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_queue_stale_publish(
+        &self,
+        plugin_key: PluginKey,
+        frame: serde_json::Value,
+        scope_id: Option<u64>,
+    ) -> mpsc::Receiver<PublishResult> {
+        let family = frame["entity_type"].as_str().unwrap();
+        self.registrations.test_register(&plugin_key.0, family);
+        let package = plugin_key.0.clone();
+        let response = self.test_queue_publish(plugin_key, frame, scope_id);
+        self.registrations.test_retire(&package);
+        response
+    }
+
     fn enqueue(
         &self,
         plugin_key: PluginKey,
@@ -236,6 +273,9 @@ impl HubEntityPublishBridge {
         // The Lua worker parses, validates, and destroys rejected frames here.
         let mut mutation =
             prepare_publish_mutation(frame).map_err(EntityPublishError::NeverQueued)?;
+        let registration = self
+            .prepare_registration(&plugin_key.0, &mutation)
+            .map_err(EntityPublishError::NeverQueued)?;
         let notice = UnlockNotice {
             shared: &self.shared,
             acquired: Cell::new(false),
@@ -280,7 +320,7 @@ impl HubEntityPublishBridge {
         }))));
         queue.pending.push_back(PendingEntityPublishRequest {
             token,
-            plugin_key,
+            registration,
             mutation,
             scope_id,
             response,
@@ -413,13 +453,36 @@ mod tests {
     use super::*;
 
     fn publish_frame(bytes: usize) -> serde_json::Value {
-        serde_json::json!({"type": "entity_patch", "entity_type": "p:items", "snapshot_seq": 1,
+        serde_json::json!({"type": "entity_patch", "entity_type": "p.item", "snapshot_seq": 1,
             "id": "item", "patch": {"body": "x".repeat(bytes)}})
     }
 
     #[test]
+    fn provider_registration_refuses_invalid_ownership_before_queue_admission() {
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
+        let frame = publish_frame(0);
+        assert!(matches!(
+            bridge.enqueue(PluginKey("other".into()), frame, Some(42)),
+            Err(EntityPublishError::NeverQueued(_))
+        ));
+        // A declared family must also satisfy the format and owner namespace contract.
+        for family in ["other.item", "p:item"] {
+            bridge.registrations.test_register("p", family);
+            let frame = serde_json::json!({"type": "entity_remove", "entity_type": family,
+                "snapshot_seq": 1, "id": "item"});
+            assert!(matches!(
+                bridge.enqueue(PluginKey("p".into()), frame, Some(42)),
+                Err(EntityPublishError::NeverQueued(_))
+            ));
+        }
+        assert_eq!(bridge.pending_publish_count(), 0);
+        assert_eq!(bridge.retained_counts(), (0, 0));
+        assert!(bridge.take_if(|_| Some(())).is_none());
+    }
+
+    #[test]
     fn lifetime_budget_keeps_unscoped_payloads_charged_after_queue_removal() {
-        let bridge = HubEntityPublishBridge::new();
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
         let mut payloads = Vec::new();
         for _ in 0..PUBLICATION_CAPACITY {
             bridge
@@ -453,7 +516,7 @@ mod tests {
 
     #[test]
     fn lifetime_budget_keeps_original_bytes_and_returns_each_completed_charge() {
-        let bridge = HubEntityPublishBridge::new();
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
         let mut payloads = Vec::new();
         for _ in 0..8 {
             let mut frame = publish_frame(0);
@@ -490,7 +553,7 @@ mod tests {
 
     #[test]
     fn lifetime_budget_has_no_cycle_when_the_bridge_is_destroyed() {
-        let bridge = HubEntityPublishBridge::new();
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
         bridge
             .enqueue(PluginKey("p".into()), publish_frame(0), None)
             .ok()
@@ -508,7 +571,7 @@ mod tests {
 
     #[test]
     fn queue_limits_and_exact_retraction_preserve_other_requests() {
-        let bridge = HubEntityPublishBridge::new();
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
         let mut tokens = Vec::new();
         for _ in 0..PUBLICATION_CAPACITY {
             let (token, _) = bridge
@@ -535,7 +598,7 @@ mod tests {
 
     #[test]
     fn byte_limit_and_token_exhaustion_refuse_before_enqueue() {
-        let bridge = HubEntityPublishBridge::new();
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
         assert!(matches!(
             bridge.enqueue(
                 PluginKey("p".into()),
@@ -555,7 +618,7 @@ mod tests {
 
     #[test]
     fn queue_bytes_bound_admission_below_the_count_limit() {
-        let bridge = HubEntityPublishBridge::new();
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
         for _ in 0..8 {
             bridge
                 .enqueue(
@@ -579,7 +642,7 @@ mod tests {
 
     #[test]
     fn queued_progress_survives_binding_and_a_full_doorbell() {
-        let bridge = HubEntityPublishBridge::new();
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
         bridge
             .enqueue(PluginKey("p".into()), publish_frame(0), None)
             .ok()
@@ -606,7 +669,7 @@ mod tests {
 
     #[test]
     fn bridge_unlock_wakes_a_retained_head_and_fault_keeps_it() {
-        let bridge = HubEntityPublishBridge::new();
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
         bridge
             .enqueue(PluginKey("p".into()), publish_frame(0), None)
             .ok()
@@ -644,7 +707,7 @@ mod tests {
 
     #[test]
     fn fault_latch_preserves_the_head_against_timeout_retraction() {
-        let bridge = HubEntityPublishBridge::new();
+        let bridge = HubEntityPublishBridge::for_test("p", "p.item");
         let (before, _) = bridge
             .enqueue(PluginKey("p".into()), publish_frame(0), None)
             .ok()
