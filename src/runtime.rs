@@ -58,9 +58,10 @@ use crate::managed_git_worktrees::{
     adopt_unrecorded_managed_worktrees, managed_worktree_id,
 };
 use crate::package_entity_fanout::{
-    EntityMutationLease, PackageEntityFamilyProgress, PackageEntityFamilyState,
-    PackageEntityFamilyStep, PackageEntityMutation, PackageEntityPublishResult,
-    PackageEntityPublishStatus, coerce_entity_frame_empty_items, parse_publish_mutation,
+    EntityMutationLease, LeasedFanoutMutation, PackageEntityFamilyProgress,
+    PackageEntityFamilyState, PackageEntityFamilyStep, PackageEntityFanoutQueue,
+    PackageEntityMutation, PackageEntityPublishResult, PackageEntityPublishStatus,
+    coerce_entity_frame_empty_items, parse_publish_mutation,
 };
 use crate::package_event_router::{
     CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, EventPlaneStatus,
@@ -107,7 +108,7 @@ pub struct HubRuntime {
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
     package_entity_epoch: std::cell::Cell<u64>,
     package_entity_resync_changed: std::cell::Cell<bool>,
-    package_entity_fanout: Arc<Mutex<VecDeque<LeasedFanoutMutation>>>,
+    package_entity_fanout: Arc<Mutex<PackageEntityFanoutQueue>>,
     package_entity_finishes: Arc<Mutex<VecDeque<CausalOp>>>,
     last_capability_cleanup: Option<PluginCleanupResult>,
     session_contexts: SharedSessionContexts,
@@ -363,7 +364,7 @@ impl HubRuntime {
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_epoch: std::cell::Cell::new(0),
             package_entity_resync_changed: std::cell::Cell::new(false),
-            package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
+            package_entity_fanout: Arc::new(Mutex::new(PackageEntityFanoutQueue::default())),
             package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
             config,
             state,
@@ -473,7 +474,7 @@ impl HubRuntime {
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
             package_entity_epoch: std::cell::Cell::new(0),
             package_entity_resync_changed: std::cell::Cell::new(false),
-            package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
+            package_entity_fanout: Arc::new(Mutex::new(PackageEntityFanoutQueue::default())),
             package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
             config,
             state,
@@ -2233,6 +2234,19 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
+        let mut fanout = self
+            .package_entity_fanout
+            .lock()
+            .expect("package entity fanout lock");
+        let pending_count = families
+            .get(&entity_type)
+            .map_or(0, |family| family.pending_by_seq.len());
+        // The pending count bounds every mutation that this admission can release.
+        if !fanout.has_capacity_for_admission(pending_count) {
+            return Err(
+                "entity_publish queue sequence exhausted (entity_fanout_sequence_exhausted)".into(),
+            );
+        }
         let family = families
             .entry(entity_type.clone())
             .or_insert_with(|| self.new_package_entity_family());
@@ -2271,13 +2285,12 @@ impl HubRuntime {
             );
         }
         drop(families);
-        if !leased_ready.is_empty() {
-            let mut fanout = self
-                .package_entity_fanout
-                .lock()
-                .expect("package entity fanout lock");
-            fanout.extend(leased_ready);
+        for item in leased_ready {
+            fanout
+                .try_push(item)
+                .expect("exclusive admission preflight guarantees sequence capacity");
         }
+        drop(fanout);
         self.note_package_entity_resync_changed();
         Ok(result)
     }
@@ -2309,7 +2322,7 @@ impl HubRuntime {
         self.package_entity_fanout
             .lock()
             .expect("package entity fanout lock")
-            .pop_front()
+            .pop_first()
             .map(|item| TakenPackageEntityMutation {
                 mutation: item.mutation,
                 finish: PackageEntityFanoutFinish {
@@ -2667,6 +2680,7 @@ impl HubRuntime {
     }
 
     fn drop_package_entity_families(&self, package_name: &str, mut families: BTreeSet<String>) {
+        let cleanup_epoch = self.package_entity_epoch.get();
         self.note_package_entity_resync_changed();
         let mut state = self
             .package_entity_families
@@ -2719,8 +2733,13 @@ impl HubRuntime {
             .lock()
             .expect("package entity fanout lock");
         let mut restore = VecDeque::new();
-        fanout.retain(|item| {
-            if families.contains(item.mutation.entity_type()) {
+        for family_name in families {
+            while let Some(generation) =
+                fanout.next_family_generation_before(&family_name, cleanup_epoch)
+            {
+                let item = fanout
+                    .take_one_family(&family_name, generation)
+                    .expect("the indexed generation contains a queued mutation");
                 if let Some(lease) = item.lease.clone()
                     && let CausalAdmitResult::Retry(op) =
                         self.keep_or_park(self.admit_causal_op(CausalOp::Release {
@@ -2734,11 +2753,8 @@ impl HubRuntime {
                 {
                     restore.push_back(op);
                 }
-                false
-            } else {
-                true
             }
-        });
+        }
         self.package_entity_finishes
             .lock()
             .expect("package entity finish lock")
@@ -5024,12 +5040,6 @@ impl Error for HubLuaPluginLoadError {
     }
 }
 
-struct LeasedFanoutMutation {
-    generation: u64,
-    mutation: PackageEntityMutation,
-    lease: Option<EntityMutationLease>,
-}
-
 struct PendingEventPlaneReplace {
     contracts: Vec<crate::package_event_router::EmittedContract>,
     subscriptions: Vec<EventSubscription>,
@@ -5869,6 +5879,156 @@ mod tests {
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .unwrap();
         HubRuntime::new(config).unwrap()
+    }
+
+    #[test]
+    fn family_cleanup_finds_old_fanout_without_live_state() {
+        let runtime = family_runtime("orphan-fanout-cleanup");
+        let family = "producer.item";
+        let scope = runtime
+            .causal_scopes
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight {
+                request_id: "root".into(),
+            }))
+            .unwrap();
+        for generation in [0, 1] {
+            let lease = EntityMutationLease {
+                scope_id: scope,
+                family: family.into(),
+                generation,
+                seq: 1,
+            };
+            assert!(runtime.causal_scopes.acquire(
+                scope,
+                LeaseIdentity::AdmittedEntityMutation {
+                    family: family.into(),
+                    generation,
+                    seq: 1
+                }
+            ));
+            runtime
+                .package_entity_fanout
+                .lock()
+                .unwrap()
+                .try_push(LeasedFanoutMutation {
+                    generation,
+                    mutation: PackageEntityMutation::Upsert {
+                        entity_type: family.into(),
+                        snapshot_seq: 1,
+                        id: "item".into(),
+                        entity: serde_json::json!({"id": "item"}),
+                    },
+                    lease: Some(lease),
+                })
+                .unwrap();
+        }
+        assert!(!runtime.test_family_exists(family));
+        runtime.advance_package_entity_epoch().unwrap();
+        runtime.drop_package_entity_families("producer", BTreeSet::from([family.into()]));
+        let identities = runtime.causal_scopes.identities(scope).unwrap();
+        assert!(
+            !identities.contains(&LeaseIdentity::AdmittedEntityMutation {
+                family: family.into(),
+                generation: 0,
+                seq: 1
+            })
+        );
+        assert!(identities.contains(&LeaseIdentity::AdmittedEntityMutation {
+            family: family.into(),
+            generation: 1,
+            seq: 1
+        }));
+        let remaining = runtime.take_one_package_entity_fanout().unwrap();
+        assert_eq!(remaining.generation, 1);
+        assert!(runtime.take_one_package_entity_fanout().is_none());
+        runtime.finish_package_entity_fanout(remaining.finish);
+    }
+
+    #[test]
+    fn fanout_sequence_exhaustion_preserves_publication_state() {
+        let mut runtime = family_runtime("fanout-admission-exhaustion");
+        let root = std::env::temp_dir().join(format!("fanout-provider-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("botster-package.json"),
+            serde_json::json!({
+                "name": "producer", "version": "1.0.0", "kind": "plugin",
+                "botster": ">=0.1.0", "capabilities": [],
+                "source": { "type": "path", "path": root.canonicalize().unwrap() },
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("plugin.lua"),
+            r#"
+return botster.register({ handlers = {{
+    id = "items", kind = "entity_provider", descriptor_id = "producer.item",
+    descriptor = { entity_type = "producer.item", id_field = "id" },
+    call = function() return {
+        type = "entity_snapshot", entity_type = "producer.item", snapshot_seq = 0, items = {}
+    } end
+}} })
+"#,
+        )
+        .unwrap();
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install test provider")
+            .unwrap();
+        policy.enable("producer", "enable test provider").unwrap();
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        let frame = |seq| {
+            serde_json::json!({
+                "type": "entity_upsert", "entity_type": "producer.item",
+                "snapshot_seq": seq, "id": "item", "entity": { "id": "item" }
+            })
+        };
+        runtime
+            .package_entity_fanout
+            .lock()
+            .unwrap()
+            .set_next_sequence_for_test(u64::MAX);
+        let error = runtime
+            .admit_package_entity_publish_inner(PluginKey("producer".into()), frame(1), None)
+            .unwrap_err();
+        assert!(error.contains("entity_fanout_sequence_exhausted"));
+        assert!(!runtime.test_family_exists("producer.item"));
+
+        runtime
+            .package_entity_fanout
+            .lock()
+            .unwrap()
+            .set_next_sequence_for_test(u64::MAX - 1);
+        let result = runtime
+            .admit_package_entity_publish_inner(PluginKey("producer".into()), frame(2), None)
+            .unwrap();
+        assert_eq!(result.status, PackageEntityPublishStatus::PendingGap);
+        let before = runtime.package_entity_families.lock().unwrap()["producer.item"].clone();
+        let scope_id = runtime
+            .causal_scopes
+            .mint_with_lease(Some(LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".into(),
+            }))
+            .unwrap();
+        let error = runtime
+            .admit_package_entity_publish(PluginKey("producer".into()), frame(1), Some(scope_id))
+            .unwrap_err();
+        assert!(error.contains("entity_fanout_sequence_exhausted"));
+        let families = runtime.package_entity_families.lock().unwrap();
+        let after = &families["producer.item"];
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.last_accepted_seq, before.last_accepted_seq);
+        assert_eq!(after.high_water_seq, before.high_water_seq);
+        assert_eq!(after.pending_by_seq, before.pending_by_seq);
+        assert_eq!(after.pending_leases, before.pending_leases);
+        assert_eq!(after.resync.needed, before.resync.needed);
+        assert_eq!(after.resync.leases, before.resync.leases);
+        assert!(runtime.package_entity_fanout.lock().unwrap().is_empty());
+        assert!(runtime.causal_scopes.identities(scope_id).is_none());
     }
 
     #[test]
