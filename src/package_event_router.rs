@@ -2235,6 +2235,9 @@ impl EventPlaneOwnerOps {
 
     /// Restart the same operation with retained admission and a new serial.
     /// The caller must confirm that the old worker cannot run.
+    /// If submission fails, the caller must call [`Self::retry`] with the returned work identity.
+    /// Repeating metadata cleanup preserves retiring rows. The full reap recovers their charge
+    /// after the previous worker destroys its payloads during completion or unwind.
     pub fn restart(&mut self, identity: &EventOwnerWorkId) -> Option<EventOwnerWork> {
         if !self.matches_in_flight(identity) {
             return None;
