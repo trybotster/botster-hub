@@ -4342,6 +4342,123 @@ return botster.register({
     }
 
     #[test]
+    fn resync_scopes_outlive_event_and_publication_permits() {
+        use crate::package_event_router::{EventPlaneStatus, HUB_EVENT_OWNER, LeaseIdentity};
+        let root = unique_package_control_dir("retained-resync-scopes");
+        let package_dir = root.join("resync-probe");
+        write_package_control_manifest(
+            &package_dir,
+            "resync-probe",
+            serde_json::json!({
+                "capabilities": [],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            r#"
+events.on("hub", "worktree_created", function()
+  local result = botster.entity_publish({
+    type = "entity_remove", entity_type = "resync-probe.item", snapshot_seq = 100, id = "item"
+  })
+  assert(result.ok)
+end)
+return botster.register({ handlers = {{
+  id = "items", kind = "entity_provider", descriptor_id = "resync-probe.item",
+  descriptor = { entity_type = "resync-probe.item", id_field = "id" },
+  call = function() return {
+    type = "entity_snapshot", entity_type = "resync-probe.item", snapshot_seq = 0, items = {}
+  } end,
+}} })
+"#,
+        )
+        .unwrap();
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "resync-probe".into(),
+            },
+        )
+        .unwrap();
+        let mut state = DaemonControlState::default();
+        daemon
+            .runtime()
+            .unwrap()
+            .install_plugin_completion_notifier(state.plugin_result_budget.completion_notifier());
+        let count = crate::host_executor::HOST_OPERATION_CAPACITY + 1;
+        for expected in 1..=count {
+            assert_eq!(
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .package_event_router()
+                    .try_ingress(
+                        HUB_EVENT_OWNER,
+                        "worktree_created",
+                        &serde_json::json!({"event": "worktree_created"}),
+                        Instant::now()
+                    ),
+                EventPlaneStatus::Accepted
+            );
+            state
+                .maintenance
+                .wakes
+                .mark(MaintenanceSliceKind::PackageEventDelivery);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                drive_ready_test_turn(&mut daemon, &mut state);
+                let runtime = daemon.runtime().unwrap();
+                if runtime
+                    .event_plane_counters()
+                    .snapshot()
+                    .event_handler_completed_ok
+                    == expected as u64
+                    && runtime.causal_operation_count() == 0
+                    && !runtime.entity_publish_retirement_pending()
+                    && state.maintenance.event_in_flight.is_empty()
+                    && state.maintenance.pending_retirements.is_empty()
+                    && state.budget.outstanding() == 0
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "event and publication work must retire"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let runtime = daemon.runtime().unwrap();
+            assert_eq!(
+                runtime.test_resync_lease_count("resync-probe.item"),
+                expected
+            );
+            assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
+        }
+        let runtime = daemon.runtime().unwrap();
+        let token = runtime.test_family_causal_token("resync-probe.item");
+        let scope_ids = runtime.test_resync_scope_ids("resync-probe.item");
+        assert_eq!(scope_ids.len(), count);
+        for scope_id in scope_ids {
+            assert_eq!(
+                runtime.causal_scopes().identities(scope_id),
+                Some(std::collections::BTreeSet::from([
+                    LeaseIdentity::ProviderResyncNeed {
+                        family_token: token
+                    },
+                ]))
+            );
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn asynchronous_lua_publications_complete_through_owner_ready_work() {
         let root = unique_package_control_dir("async-entity-publish");
         let package_dir = root.join("owner-publisher");

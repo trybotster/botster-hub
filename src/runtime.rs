@@ -1008,6 +1008,16 @@ impl HubRuntime {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_resync_scope_ids(&self, name: &str) -> Vec<u64> {
+        self.package_entity_families.lock().unwrap()[name]
+            .resync
+            .leases
+            .iter()
+            .copied()
+            .collect()
+    }
+
     #[must_use]
     #[doc(hidden)]
     pub fn test_family_seq(&self, family: &str) -> u64 {

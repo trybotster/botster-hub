@@ -904,3 +904,12 @@ The owner still checks current family ownership and clones the provider-family s
 Routing leases still contain family strings outside the causal table.
 The next implementation step must account for causal operations and bound the remaining table and routing work.
 The broader owner scheduling, memory, final Core pin, and matched client requirements remain open.
+
+The live causal table has a separate memory gap.
+A production test invokes one Lua event handler nine times; each invocation publishes an out-of-window sequence and completes.
+After each invocation, the owner permits return and the causal FIFO drains, but a distinct resync lease remains.
+The final table contains nine scopes with only `ProviderResyncNeed`.
+This exceeds the eight Host slots and proves that execution permits do not bound these retained obligations.
+The test passes; it does not measure unlimited growth or establish a capacity policy.
+Source inspection shows that later publications can rearm resync while provider snapshots remain below the high-water mark.
+The next memory decision must cover the lifetime of publication descendants, including resync and provider work.
