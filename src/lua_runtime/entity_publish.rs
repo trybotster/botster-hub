@@ -2,14 +2,15 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use crate::daemon::control::message::{ControlMessage, ControlSender};
-use crate::package_entity_fanout::PackageEntityPublishResult;
+use crate::package_entity_fanout::{
+    PackageEntityMutation, PackageEntityPublishResult, prepare_publish_mutation,
+};
 use botster_core::PluginKey;
 
 const REQUEST_CAPACITY: usize = 256;
@@ -43,7 +44,7 @@ struct Queue {
 pub(crate) struct PendingEntityPublishRequest {
     pub(crate) token: u64,
     pub(crate) plugin_key: PluginKey,
-    pub(crate) frame: serde_json::Value,
+    pub(crate) mutation: PackageEntityMutation,
     pub(crate) scope_id: Option<u64>,
     pub(crate) response: mpsc::Sender<PublishResult>,
     bytes: usize,
@@ -174,16 +175,19 @@ impl HubEntityPublishBridge {
         if self.shared.reject_next.swap(false, Ordering::SeqCst) {
             return Err(fail("entity publish rejected before queue"));
         }
-        let mut counter = ByteCounter {
-            bytes: plugin_key
-                .0
-                .len()
-                .checked_mul(2)
-                .ok_or_else(|| fail("entity publish byte count exhausted"))?,
-        };
-        serde_json::to_writer(&mut counter, &frame).map_err(|_| {
-            fail("entity_publish request exceeds frame limit (entity_provider_frame_too_large)")
-        })?;
+        let key_bytes = plugin_key
+            .0
+            .len()
+            .checked_mul(2)
+            .filter(|bytes| *bytes <= REQUEST_BYTE_LIMIT)
+            .ok_or_else(|| fail("entity publish byte count exhausted"))?;
+        let frame_bytes = crate::bounded_json::encoded_len(&frame, REQUEST_BYTE_LIMIT - key_bytes)
+            .map_err(|_| {
+                fail("entity_publish request exceeds frame limit (entity_provider_frame_too_large)")
+            })?;
+        let request_bytes = key_bytes + frame_bytes;
+        // The Lua worker parses, validates, and destroys rejected frames here.
+        let mutation = prepare_publish_mutation(frame).map_err(EntityPublishError::NeverQueued)?;
         let notice = UnlockNotice {
             shared: &self.shared,
             acquired: Cell::new(false),
@@ -201,7 +205,7 @@ impl HubEntityPublishBridge {
         }
         let bytes = queue
             .bytes
-            .checked_add(counter.bytes)
+            .checked_add(request_bytes)
             .ok_or_else(|| fail("entity publish byte count exhausted"))?;
         if queue.pending.len() >= REQUEST_CAPACITY || bytes > QUEUE_BYTE_CAPACITY {
             return Err(fail("entity publish queue capacity exhausted"));
@@ -218,10 +222,10 @@ impl HubEntityPublishBridge {
         queue.pending.push_back(PendingEntityPublishRequest {
             token,
             plugin_key,
-            frame,
+            mutation,
             scope_id,
             response,
-            bytes: counter.bytes,
+            bytes: request_bytes,
             identity,
         });
         queue.bytes = bytes;
@@ -344,27 +348,14 @@ impl HubEntityPublishBridge {
     }
 }
 
-/// Charge encoded JSON bytes and both retained plugin-key strings without a second frame allocation.
-struct ByteCounter {
-    bytes: usize,
-}
-impl Write for ByteCounter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.bytes = self
-            .bytes
-            .checked_add(buffer.len())
-            .filter(|bytes| *bytes <= REQUEST_BYTE_LIMIT)
-            .ok_or_else(|| io::Error::other("entity publish byte limit"))?;
-        Ok(buffer.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn publish_frame(bytes: usize) -> serde_json::Value {
+        serde_json::json!({"type": "entity_patch", "entity_type": "p:items", "snapshot_seq": 1,
+            "id": "item", "patch": {"body": "x".repeat(bytes)}})
+    }
 
     #[test]
     fn queue_limits_and_exact_retraction_preserve_other_requests() {
@@ -372,13 +363,13 @@ mod tests {
         let mut tokens = Vec::new();
         for _ in 0..REQUEST_CAPACITY {
             let (token, _) = bridge
-                .enqueue(PluginKey("p".into()), serde_json::json!({}), None)
+                .enqueue(PluginKey("p".into()), publish_frame(0), None)
                 .ok()
                 .unwrap();
             tokens.push(token);
         }
         assert!(matches!(
-            bridge.enqueue(PluginKey("p".into()), serde_json::json!({}), None),
+            bridge.enqueue(PluginKey("p".into()), publish_frame(0), None),
             Err(EntityPublishError::NeverQueued(_))
         ));
         assert!(bridge.try_retract(tokens[17]));
@@ -407,7 +398,7 @@ mod tests {
         assert_eq!(bridge.pending_publish_count(), 0);
         bridge.shared.queue.try_lock().unwrap().next_token = u64::MAX;
         assert!(matches!(
-            bridge.enqueue(PluginKey("p".into()), serde_json::json!({}), None),
+            bridge.enqueue(PluginKey("p".into()), publish_frame(0), None),
             Err(EntityPublishError::NeverQueued(_))
         ));
         assert_eq!(bridge.pending_publish_count(), 0);
@@ -420,7 +411,7 @@ mod tests {
             bridge
                 .enqueue(
                     PluginKey("p".into()),
-                    serde_json::json!("x".repeat(REQUEST_BYTE_LIMIT - 4)),
+                    publish_frame(REQUEST_BYTE_LIMIT - 256),
                     None,
                 )
                 .ok()
@@ -428,7 +419,11 @@ mod tests {
         }
         assert_eq!(bridge.pending_publish_count(), 8);
         assert!(matches!(
-            bridge.enqueue(PluginKey("p".into()), serde_json::json!({}), None),
+            bridge.enqueue(
+                PluginKey("p".into()),
+                publish_frame(REQUEST_BYTE_LIMIT - 256),
+                None
+            ),
             Err(EntityPublishError::NeverQueued(_))
         ));
     }
@@ -437,7 +432,7 @@ mod tests {
     fn queued_progress_survives_binding_and_a_full_doorbell() {
         let bridge = HubEntityPublishBridge::new();
         bridge
-            .enqueue(PluginKey("p".into()), serde_json::json!({}), None)
+            .enqueue(PluginKey("p".into()), publish_frame(0), None)
             .ok()
             .unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
@@ -449,7 +444,7 @@ mod tests {
         assert!(bridge.ready());
         receiver.try_recv().unwrap();
         bridge
-            .enqueue(PluginKey("p".into()), serde_json::json!({}), None)
+            .enqueue(PluginKey("p".into()), publish_frame(0), None)
             .ok()
             .unwrap();
         assert!(matches!(
@@ -464,7 +459,7 @@ mod tests {
     fn bridge_unlock_wakes_a_retained_head_and_fault_keeps_it() {
         let bridge = HubEntityPublishBridge::new();
         bridge
-            .enqueue(PluginKey("p".into()), serde_json::json!({}), None)
+            .enqueue(PluginKey("p".into()), publish_frame(0), None)
             .ok()
             .unwrap();
         bridge.take_progress_notification();
@@ -502,7 +497,7 @@ mod tests {
     fn fault_latch_preserves_the_head_against_timeout_retraction() {
         let bridge = HubEntityPublishBridge::new();
         let (before, _) = bridge
-            .enqueue(PluginKey("p".into()), serde_json::json!({}), None)
+            .enqueue(PluginKey("p".into()), publish_frame(0), None)
             .ok()
             .unwrap();
         assert!(
@@ -510,7 +505,7 @@ mod tests {
             "an unacquired request can retract before fault retention"
         );
         let (retained, _) = bridge
-            .enqueue(PluginKey("p".into()), serde_json::json!({}), None)
+            .enqueue(PluginKey("p".into()), publish_frame(0), None)
             .ok()
             .unwrap();
         assert!(
@@ -524,7 +519,7 @@ mod tests {
         assert!(!bridge.try_retract(retained));
         assert_eq!(bridge.pending_publish_count(), 1);
         assert!(matches!(
-            bridge.enqueue(PluginKey("p".into()), serde_json::json!({}), None),
+            bridge.enqueue(PluginKey("p".into()), publish_frame(0), None),
             Err(EntityPublishError::NeverQueued(_))
         ));
         assert_eq!(bridge.pending_publish_count(), 1);

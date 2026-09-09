@@ -780,6 +780,15 @@ The new bridge has a daemon ready item and shares its one-request transition wit
 The bridge admits at most 256 queued requests and 8 MiB of logical bytes.
 Each request has a 1 MiB limit. The metric counts encoded JSON bytes and both retained plugin-key strings.
 The bridge measures bytes without allocating a second encoded frame.
+The Lua worker parses and validates each frame before queue admission.
+The bridge retains the typed mutation and charges the original encoded frame plus both plugin-key strings.
+Preparation removes unknown frame fields before retention.
+Malformed frames return `NeverQueued` before causal acquisition.
+The mutation size check serializes borrowed fields through a counting writer.
+The check uses the shared daemon frame limit without cloning or retaining an encoded frame.
+Admission uses the existing subscription placeholder; delivery checks each actual recipient frame separately.
+The preparation check passes 16 focused library tests, including actual asynchronous Lua publication.
+Two Lua integration tests pass for oversized mutations and nested empty objects.
 One removed request can coexist with a refilled queue during owner processing.
 These limits do not claim exact allocator memory usage.
 
@@ -828,6 +837,8 @@ They do not establish a matching final Hub binary or complete foundation accepta
 
 Identity byte accounting for the causal FIFO remains open.
 Causal table updates compare and clone identity strings, but dispatch still uses an opaque movement charge.
-The daemon publication path also exposes parsing, validation, and rejected-payload destruction on the owner.
-The next implementation step must move that proportional work off the owner or provide a valid bounded charge.
+Publication parsing and mutation size validation now run on the Lua worker.
+The owner still checks current family ownership and destroys rejected payloads.
+Family admission can also release a complete consecutive pending run in one owner step.
+The next implementation step must transfer disposal to a worker and make family admission incremental.
 The broader owner scheduling, memory, final Core pin, and matched client requirements remain open.

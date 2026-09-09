@@ -730,6 +730,53 @@ impl PackageEntityFamilyState {
     }
 }
 
+/// Prepare a publication on the calling worker before queue admission.
+pub(crate) fn prepare_publish_mutation(value: Value) -> Result<PackageEntityMutation, String> {
+    let mutation = parse_publish_mutation(value)?;
+    if package_entity_mutation_exceeds_limit(&mutation) {
+        return Err(
+            "entity_publish frame exceeds daemon frame limit (entity_provider_frame_too_large)"
+                .into(),
+        );
+    }
+    Ok(mutation)
+}
+
+fn package_entity_mutation_exceeds_limit(mutation: &PackageEntityMutation) -> bool {
+    #[derive(serde::Serialize)]
+    struct Frame<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        subscription_id: &'static str,
+        entity_type: &'a str,
+        snapshot_seq: u64,
+        id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        entity: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        patch: Option<&'a Value>,
+    }
+    let (kind, id, entity, patch) = match mutation {
+        PackageEntityMutation::Upsert { id, entity, .. } => {
+            ("entity_upsert", id, Some(entity), None)
+        }
+        PackageEntityMutation::Patch { id, patch, .. } => ("entity_patch", id, None, Some(patch)),
+        PackageEntityMutation::Remove { id, .. } => ("entity_remove", id, None, None),
+    };
+    // Admission bounds the mutation. Delivery checks each actual subscription frame.
+    let frame = Frame {
+        kind,
+        subscription_id: "admission-size-check",
+        entity_type: mutation.entity_type(),
+        snapshot_seq: mutation.snapshot_seq(),
+        id,
+        entity,
+        patch,
+    };
+    crate::bounded_json::encoded_len(&frame, crate::admission::budgets::DAEMON_MAX_FRAME_BYTES)
+        .is_err()
+}
+
 /// Parse and validate a publish payload into a mutation frame.
 pub fn parse_publish_mutation(value: Value) -> Result<PackageEntityMutation, String> {
     let value = coerce_entity_frame_empty_items(value);
