@@ -289,7 +289,8 @@ impl EventOwnerWork {
             Ok(inner) => inner,
             Err(_) => return Err(EventOwnerWorkError::RouterPoisoned(self)),
         };
-        retire_destroyed_payloads(&mut inner, &router.counters);
+        let op = &self.identity.operation;
+        retire_destroyed_payloads(&mut inner, &router.counters, &op.owner, op.generation);
         drop(inner);
         Ok(EventOwnerCompletion {
             identity: self.identity,
@@ -372,7 +373,23 @@ struct Envelope {
     enqueued_at: Instant,
     remaining_holders: usize,
     producer_age_ref: Option<ProducerAgeRef>,
-    payload_destroyed: Option<Arc<AtomicBool>>,
+    retirement: Option<EnvelopeRetirement>,
+}
+
+struct EnvelopeRetirement {
+    cleanup: (String, u64),
+    destroyed: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CleanupVisits {
+    contracts: usize,
+    subscriptions: usize,
+    clients: usize,
+    queues: usize,
+    copies: usize,
+    retiring: usize,
 }
 
 /// The empty envelope retains admission while this value owns its payload.
@@ -425,13 +442,18 @@ struct TokenBucket {
 
 struct RouterInner {
     policy: PackageEventPlanePolicy,
-    contracts: HashMap<(String, String), EmittedContract>,
-    subscriptions: HashMap<(String, String), Vec<EventSubscription>>,
-    client_holders: HashMap<(String, String), Vec<RegisteredClientEventHolder>>,
+    contracts: HashMap<String, HashMap<String, EmittedContract>>,
+    subscriptions: HashMap<String, HashMap<String, Vec<EventSubscription>>>,
+    client_holders: HashMap<String, HashMap<String, Vec<RegisteredClientEventHolder>>>,
     client_by_id: HashMap<(String, String), (String, String)>,
     subscriptions_per_plugin: HashMap<String, usize>,
+    subscription_events_by_plugin: HashMap<String, HashMap<(String, String), usize>>,
     producer: HashMap<String, ProducerOccupancy>,
     consumers: HashMap<String, ConsumerQueue>,
+    queued_by_producer: HashMap<String, HashMap<String, usize>>,
+    retiring_by_cleanup: HashMap<(String, u64), HashSet<u64>>,
+    #[cfg(test)]
+    cleanup_visits: CleanupVisits,
     envelopes: HashMap<u64, Envelope>,
     global_in_flight_bytes: usize,
     admitted: HashMap<u64, HashMap<(String, u64), AdmittedHolder>>,
@@ -459,12 +481,11 @@ pub struct PackageEventRouter {
 impl PackageEventRouter {
     #[must_use]
     pub fn new(policy: PackageEventPlanePolicy) -> Self {
-        let mut contracts = HashMap::new();
+        let mut hub_contracts = HashMap::new();
         let schema = worktree_lifecycle_schema();
         for name in WORKTREE_EVENT_NAMES {
-            let key = (HUB_EVENT_OWNER.to_string(), (*name).to_string());
-            contracts.insert(
-                key,
+            hub_contracts.insert(
+                (*name).to_string(),
                 EmittedContract {
                     owner: HUB_EVENT_OWNER.to_string(),
                     name: (*name).to_string(),
@@ -474,6 +495,7 @@ impl PackageEventRouter {
                 },
             );
         }
+        let contracts = HashMap::from([(HUB_EVENT_OWNER.to_string(), hub_contracts)]);
         let counters = Arc::new(EventPlaneCounters::new());
         let hub_cell = Arc::new(QueueAgeMetric::new(0));
         let hub_list =
@@ -505,8 +527,13 @@ impl PackageEventRouter {
                 client_holders: HashMap::new(),
                 client_by_id: HashMap::new(),
                 subscriptions_per_plugin: HashMap::new(),
+                subscription_events_by_plugin: HashMap::new(),
                 producer,
                 consumers: HashMap::new(),
+                queued_by_producer: HashMap::new(),
+                retiring_by_cleanup: HashMap::new(),
+                #[cfg(test)]
+                cleanup_visits: CleanupVisits::default(),
                 envelopes: HashMap::new(),
                 global_in_flight_bytes: 0,
                 admitted: HashMap::new(),
@@ -579,7 +606,9 @@ impl PackageEventRouter {
             contract.package_generation = generation;
             inner
                 .contracts
-                .insert((contract.owner.clone(), contract.name.clone()), contract);
+                .entry(contract.owner.clone())
+                .or_default()
+                .insert(contract.name.clone(), contract);
         }
         for owner in owners {
             let generation = inner.package_generation.get(&owner).copied().unwrap_or(0);
@@ -741,7 +770,8 @@ impl PackageEventRouter {
         };
         let Some(contract) = inner
             .contracts
-            .get(&(caller_owner.to_string(), name.to_string()))
+            .get(caller_owner)
+            .and_then(|events| events.get(name))
             .cloned()
         else {
             if caller_owner != HUB_EVENT_OWNER && name_owned_by_other(&inner, caller_owner, name) {
@@ -766,13 +796,15 @@ impl PackageEventRouter {
         }
         let selected: Vec<EventSubscription> = inner
             .subscriptions
-            .get(&(caller_owner.to_string(), name.to_string()))
+            .get(caller_owner)
+            .and_then(|events| events.get(name))
             .into_iter()
             .flatten()
             .filter(|subscription| {
                 inner
                     .contracts
-                    .get(&(subscription.owner.clone(), subscription.name.clone()))
+                    .get(&subscription.owner)
+                    .and_then(|events| events.get(&subscription.name))
                     .is_some_and(|contract| contract.audience.contains(&EventAudience::Plugins))
             })
             .cloned()
@@ -795,21 +827,33 @@ impl PackageEventRouter {
         let consumer_event_max = inner.policy.consumer_queue_max_events;
         let consumer_byte_max = inner.policy.consumer_queue_max_bytes;
         let mut accepted = Vec::new();
+        let mut projected: HashMap<String, (usize, usize)> = HashMap::new();
         for subscription in selected {
             let consumer = inner
                 .consumers
                 .entry(subscription.plugin_key.clone())
                 .or_default();
-            if consumer.events + 1 > consumer_event_max || consumer.bytes + size > consumer_byte_max
-            {
+            let (events, bytes) = projected
+                .entry(subscription.plugin_key.clone())
+                .or_insert((consumer.events, consumer.bytes));
+            let Some(next_events) = events.checked_add(1) else {
+                continue;
+            };
+            let Some(next_bytes) = bytes.checked_add(size) else {
+                continue;
+            };
+            if next_events > consumer_event_max || next_bytes > consumer_byte_max {
                 continue;
             }
+            *events = next_events;
+            *bytes = next_bytes;
             accepted.push(subscription);
         }
         if accepted.is_empty() {
             return if inner
                 .subscriptions
-                .get(&(caller_owner.to_string(), name.to_string()))
+                .get(caller_owner)
+                .and_then(|events| events.get(name))
                 .is_none_or(Vec::is_empty)
             {
                 deliver_to_client_holders(&inner, caller_owner, name, payload, encoded.len());
@@ -844,7 +888,7 @@ impl PackageEventRouter {
                 enqueued_at: now,
                 remaining_holders: accepted.len(),
                 producer_age_ref,
-                payload_destroyed: None,
+                retirement: None,
             },
         );
         inner.global_in_flight_bytes += size;
@@ -915,11 +959,7 @@ impl PackageEventRouter {
                 if ready.len() >= max_items || started.elapsed() >= max_elapsed {
                     break;
                 }
-                let Some(copy) = inner
-                    .consumers
-                    .get_mut(&plugin_key)
-                    .and_then(|queue| queue.copies.pop_front())
-                else {
+                let Some(copy) = inner.pop_queued_copy(&plugin_key) else {
                     break;
                 };
                 let Some((size, expired)) = inner.live_envelope(copy.envelope_id).map(|envelope| {
@@ -954,6 +994,7 @@ impl PackageEventRouter {
                     continue;
                 }
                 if used_bytes + size > max_bytes && !ready.is_empty() {
+                    inner.note_queued_copy(&copy.holder);
                     if let Some(queue) = inner.consumers.get_mut(&plugin_key) {
                         queue.events += 1;
                         queue.bytes += size;
@@ -997,12 +1038,7 @@ impl PackageEventRouter {
                 });
             }
         }
-        if !ready.is_empty()
-            || inner
-                .consumers
-                .values()
-                .any(|queue| !queue.copies.is_empty())
-        {
+        if !ready.is_empty() || !inner.queued_by_producer.is_empty() {
             self.delivery_wake.store(true, Ordering::SeqCst);
         }
         Ok(ready)
@@ -1088,6 +1124,11 @@ impl PackageEventRouter {
         }
         consumer.events += 1;
         consumer.bytes += delivery.size;
+        inner.note_queued_copy(&delivery.holder);
+        let consumer = inner
+            .consumers
+            .get_mut(&delivery.holder.plugin_key)
+            .expect("the accepted requeue has a consumer");
         let plugin_key = delivery.holder.plugin_key.clone();
         consumer.copies.push_front(QueuedCopy {
             envelope_id: delivery.envelope_id,
@@ -1231,7 +1272,8 @@ impl PackageEventRouter {
             .map(|inner| {
                 inner
                     .contracts
-                    .contains_key(&(owner.to_string(), name.to_string()))
+                    .get(owner)
+                    .is_some_and(|events| events.contains_key(name))
             })
             .unwrap_or(false)
     }
@@ -1245,7 +1287,40 @@ impl RouterInner {
     fn live_envelope(&self, envelope_id: u64) -> Option<&Envelope> {
         self.envelopes
             .get(&envelope_id)
-            .filter(|envelope| envelope.payload_destroyed.is_none())
+            .filter(|envelope| envelope.retirement.is_none())
+    }
+
+    fn note_queued_copy(&mut self, holder: &EventSubscription) {
+        *self
+            .queued_by_producer
+            .entry(holder.owner.clone())
+            .or_default()
+            .entry(holder.plugin_key.clone())
+            .or_default() += 1;
+    }
+
+    fn forget_queued_copy(&mut self, holder: &EventSubscription) {
+        let consumers = self
+            .queued_by_producer
+            .get_mut(&holder.owner)
+            .expect("a queued copy has producer membership");
+        let count = consumers
+            .get_mut(&holder.plugin_key)
+            .expect("a queued copy has consumer membership");
+        *count = count.checked_sub(1).expect("each queued copy leaves once");
+        if *count == 0 {
+            consumers.remove(&holder.plugin_key);
+        }
+        // Delivery readiness also depends on the absence of empty buckets.
+        if consumers.is_empty() {
+            self.queued_by_producer.remove(&holder.owner);
+        }
+    }
+
+    fn pop_queued_copy(&mut self, plugin_key: &str) -> Option<QueuedCopy> {
+        let copy = self.consumers.get_mut(plugin_key)?.copies.pop_front()?;
+        self.forget_queued_copy(&copy.holder);
+        Some(copy)
     }
 }
 
@@ -1269,8 +1344,8 @@ fn is_wildcard(value: &str) -> bool {
 fn name_owned_by_other(inner: &RouterInner, caller: &str, name: &str) -> bool {
     inner
         .contracts
-        .values()
-        .any(|contract| contract.name == name && contract.owner != caller)
+        .iter()
+        .any(|(owner, events)| owner != caller && events.contains_key(name))
 }
 
 fn consume_token(inner: &mut RouterInner, owner: &str, now: Instant) -> bool {
@@ -1294,9 +1369,10 @@ fn consume_token(inner: &mut RouterInner, owner: &str, now: Instant) -> bool {
 }
 
 struct AdmissionSnapshot {
-    contracts: HashMap<(String, String), EmittedContract>,
-    subscriptions: HashMap<(String, String), Vec<EventSubscription>>,
+    contracts: HashMap<String, HashMap<String, EmittedContract>>,
+    subscriptions: HashMap<String, HashMap<String, Vec<EventSubscription>>>,
     subscriptions_per_plugin: HashMap<String, usize>,
+    subscription_events_by_plugin: HashMap<String, HashMap<(String, String), usize>>,
     package_generation: HashMap<String, u64>,
 }
 
@@ -1305,6 +1381,7 @@ fn snapshot_admission(inner: &RouterInner) -> AdmissionSnapshot {
         contracts: inner.contracts.clone(),
         subscriptions: inner.subscriptions.clone(),
         subscriptions_per_plugin: inner.subscriptions_per_plugin.clone(),
+        subscription_events_by_plugin: inner.subscription_events_by_plugin.clone(),
         package_generation: inner.package_generation.clone(),
     }
 }
@@ -1313,6 +1390,7 @@ fn restore_admission(inner: &mut RouterInner, snapshot: AdmissionSnapshot) {
     inner.contracts = snapshot.contracts;
     inner.subscriptions = snapshot.subscriptions;
     inner.subscriptions_per_plugin = snapshot.subscriptions_per_plugin;
+    inner.subscription_events_by_plugin = snapshot.subscription_events_by_plugin;
     inner.package_generation = snapshot.package_generation;
 }
 
@@ -1324,21 +1402,25 @@ fn preview_package_replacement(
 ) -> Result<(), EventPlaneStatus> {
     let unload_generation = inner.package_generation.get(owner).copied().unwrap_or(0);
     let mut contracts_view = inner.contracts.clone();
-    contracts_view.retain(|(contract_owner, _), contract| {
-        contract_owner != owner || contract.package_generation > unload_generation
-    });
+    if let Some(events) = contracts_view.get_mut(owner) {
+        events.retain(|_, contract| contract.package_generation > unload_generation);
+    }
     for contract in contracts {
         if contract.owner == HUB_EVENT_OWNER || contract.owner != owner {
             return Err(EventPlaneStatus::RejectedForeign);
         }
-        contracts_view.insert(
-            (contract.owner.clone(), contract.name.clone()),
-            contract.clone(),
-        );
+        contracts_view
+            .entry(contract.owner.clone())
+            .or_default()
+            .insert(contract.name.clone(), contract.clone());
     }
     let mut plugin_counts = inner.subscriptions_per_plugin.clone();
     let mut event_counts: HashMap<(String, String), usize> = HashMap::new();
-    for (key, event_subs) in &inner.subscriptions {
+    for (producer, name, event_subs) in inner.subscriptions.iter().flat_map(|(producer, events)| {
+        events
+            .iter()
+            .map(move |(name, subscriptions)| (producer, name, subscriptions))
+    }) {
         let mut remaining = 0;
         for subscription in event_subs {
             let drop_producer =
@@ -1353,7 +1435,7 @@ fn preview_package_replacement(
                 remaining += 1;
             }
         }
-        event_counts.insert(key.clone(), remaining);
+        event_counts.insert((producer.clone(), name.clone()), remaining);
     }
     for subscription in subscriptions {
         if is_wildcard(&subscription.owner) || is_wildcard(&subscription.name) {
@@ -1363,7 +1445,10 @@ fn preview_package_replacement(
             return Err(EventPlaneStatus::RejectedInvalid);
         }
         let key = (subscription.owner.clone(), subscription.name.clone());
-        let Some(contract) = contracts_view.get(&key) else {
+        let Some(contract) = contracts_view
+            .get(&subscription.owner)
+            .and_then(|events| events.get(&subscription.name))
+        else {
             return Err(EventPlaneStatus::RejectedUndeclared);
         };
         if !contract.audience.contains(&EventAudience::Plugins) {
@@ -1404,7 +1489,9 @@ fn commit_package_generation_locked(
         contract.package_generation = generation;
         inner
             .contracts
-            .insert((contract.owner.clone(), contract.name.clone()), contract);
+            .entry(contract.owner.clone())
+            .or_default()
+            .insert(contract.name.clone(), contract);
     }
     for subscription in subscriptions {
         let status = subscribe_locked(inner, subscription);
@@ -1425,7 +1512,11 @@ fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) ->
         return EventPlaneStatus::RejectedInvalid;
     }
     let key = (subscription.owner.clone(), subscription.name.clone());
-    let Some(contract) = inner.contracts.get(&key) else {
+    let Some(contract) = inner
+        .contracts
+        .get(&key.0)
+        .and_then(|events| events.get(&key.1))
+    else {
         return EventPlaneStatus::RejectedUndeclared;
     };
     if !contract.audience.contains(&EventAudience::Plugins) {
@@ -1446,7 +1537,12 @@ fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) ->
         return EventPlaneStatus::RejectedInvalid;
     }
     let max_subscribers = inner.policy.subscribers_per_event_max;
-    let event_subs = inner.subscriptions.entry(key).or_default();
+    let event_subs = inner
+        .subscriptions
+        .entry(key.0.clone())
+        .or_default()
+        .entry(key.1.clone())
+        .or_default();
     if event_subs.len() >= max_subscribers {
         return EventPlaneStatus::RejectedOverFanout;
     }
@@ -1455,6 +1551,12 @@ fn subscribe_locked(inner: &mut RouterInner, subscription: EventSubscription) ->
     subscription.plugin_generation = plugin_generation;
     let plugin_key = subscription.plugin_key.clone();
     event_subs.push(subscription);
+    *inner
+        .subscription_events_by_plugin
+        .entry(plugin_key.clone())
+        .or_default()
+        .entry(key)
+        .or_default() += 1;
     *inner
         .subscriptions_per_plugin
         .entry(plugin_key)
@@ -1470,7 +1572,11 @@ fn subscribe_client_locked(inner: &mut RouterInner, holder: ClientEventHolder) -
         return EventPlaneStatus::RejectedInvalid;
     }
     let key = (holder.owner.clone(), holder.name.clone());
-    let Some(contract) = inner.contracts.get(&key) else {
+    let Some(contract) = inner
+        .contracts
+        .get(&key.0)
+        .and_then(|events| events.get(&key.1))
+    else {
         return EventPlaneStatus::RejectedUndeclared;
     };
     if !contract.audience.contains(&EventAudience::Clients) {
@@ -1482,7 +1588,12 @@ fn subscribe_client_locked(inner: &mut RouterInner, holder: ClientEventHolder) -
         return EventPlaneStatus::RejectedInvalid;
     }
     let max_subscribers = inner.policy.subscribers_per_event_max;
-    let holders = inner.client_holders.entry(key).or_default();
+    let holders = inner
+        .client_holders
+        .entry(key.0)
+        .or_default()
+        .entry(key.1)
+        .or_default();
     if holders.len() >= max_subscribers {
         return EventPlaneStatus::RejectedOverFanout;
     }
@@ -1505,13 +1616,18 @@ fn unsubscribe_client_locked(
     let Some(key) = inner.client_by_id.remove(&identity) else {
         return EventPlaneStatus::RejectedInvalid;
     };
-    if let Some(holders) = inner.client_holders.get_mut(&key) {
+    if let Some(events) = inner.client_holders.get_mut(&key.0)
+        && let Some(holders) = events.get_mut(&key.1)
+    {
         holders.retain(|registered| {
             let holder = &registered.holder;
             !(holder.connection_id == connection_id && holder.subscription_id == subscription_id)
         });
         if holders.is_empty() {
-            inner.client_holders.remove(&key);
+            events.remove(&key.1);
+        }
+        if events.is_empty() {
+            inner.client_holders.remove(&key.0);
         }
     }
     EventPlaneStatus::Accepted
@@ -1538,7 +1654,8 @@ fn deliver_to_client_holders(
 ) {
     let Some(holders) = inner
         .client_holders
-        .get(&(owner.to_string(), name.to_string()))
+        .get(owner)
+        .and_then(|events| events.get(name))
     else {
         return;
     };
@@ -1596,51 +1713,119 @@ fn apply_unload(
     if owner == HUB_EVENT_OWNER {
         return Vec::new();
     }
-    inner.contracts.retain(|(contract_owner, _), contract| {
-        contract_owner != owner || contract.package_generation > generation
-    });
-    let mut removed_counts: HashMap<String, usize> = HashMap::new();
-    for subscriptions in inner.subscriptions.values_mut() {
-        subscriptions.retain(|subscription| {
-            if unload_removes_subscription(subscription, owner, generation) {
-                *removed_counts
-                    .entry(subscription.plugin_key.clone())
-                    .or_insert(0) += 1;
-                false
-            } else {
-                true
-            }
-        });
+    #[cfg(test)]
+    {
+        inner.cleanup_visits = CleanupVisits::default();
     }
-    inner
+    if let Some(contracts) = inner.contracts.get_mut(owner) {
+        #[cfg(test)]
+        {
+            inner.cleanup_visits.contracts += contracts.len();
+        }
+        contracts.retain(|_, contract| contract.package_generation > generation);
+        if contracts.is_empty() {
+            inner.contracts.remove(owner);
+        }
+    }
+    let mut event_keys: BTreeSet<(String, String)> = inner
         .subscriptions
-        .retain(|_, subscriptions| !subscriptions.is_empty());
-    let mut removed_client_ids = Vec::new();
-    for holders in inner.client_holders.values_mut() {
-        holders.retain(|registered| {
-            let holder = &registered.holder;
-            let drop_holder = holder.owner == owner && registered.event_generation <= generation;
-            if drop_holder {
-                removed_client_ids
-                    .push((holder.connection_id.clone(), holder.subscription_id.clone()));
-            }
-            !drop_holder
-        });
+        .get(owner)
+        .into_iter()
+        .flat_map(|events| events.keys())
+        .map(|name| (owner.to_string(), name.clone()))
+        .collect();
+    if let Some(events) = inner.subscription_events_by_plugin.get(owner) {
+        event_keys.extend(events.keys().cloned());
     }
-    inner
-        .client_holders
-        .retain(|_, holders| !holders.is_empty());
+    for key in event_keys {
+        remove_unloaded_subscriptions(inner, &key, owner, generation);
+    }
+    let mut removed_client_ids = Vec::new();
+    if let Some(events) = inner.client_holders.get_mut(owner) {
+        events.retain(|_, holders| {
+            #[cfg(test)]
+            {
+                inner.cleanup_visits.clients += holders.len();
+            }
+            holders.retain(|registered| {
+                if registered.event_generation <= generation {
+                    let holder = &registered.holder;
+                    removed_client_ids
+                        .push((holder.connection_id.clone(), holder.subscription_id.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            !holders.is_empty()
+        });
+        if events.is_empty() {
+            inner.client_holders.remove(owner);
+        }
+    }
     for identity in removed_client_ids {
         inner.client_by_id.remove(&identity);
-    }
-    for (plugin, removed) in removed_counts {
-        if let Some(count) = inner.subscriptions_per_plugin.get_mut(&plugin) {
-            *count = count.saturating_sub(removed);
-        }
     }
     let retired_payloads = drop_queued_for_owner(inner, counters, owner, generation);
     retire_owner_diagnostics(inner, counters, owner, generation);
     retired_payloads
+}
+
+fn remove_unloaded_subscriptions(
+    inner: &mut RouterInner,
+    key: &(String, String),
+    owner: &str,
+    generation: u64,
+) {
+    let Some(events) = inner.subscriptions.get_mut(&key.0) else {
+        return;
+    };
+    let Some(subscriptions) = events.get_mut(&key.1) else {
+        return;
+    };
+    #[cfg(test)]
+    {
+        inner.cleanup_visits.subscriptions += subscriptions.len();
+    }
+    let mut removed_plugins = Vec::new();
+    subscriptions.retain(|subscription| {
+        if unload_removes_subscription(subscription, owner, generation) {
+            removed_plugins.push(subscription.plugin_key.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if subscriptions.is_empty() {
+        events.remove(&key.1);
+    }
+    if events.is_empty() {
+        inner.subscriptions.remove(&key.0);
+    }
+    for plugin in removed_plugins {
+        let count = inner
+            .subscriptions_per_plugin
+            .get_mut(&plugin)
+            .expect("a subscription has a plugin count");
+        *count = count.checked_sub(1).expect("each subscription leaves once");
+        if *count == 0 {
+            inner.subscriptions_per_plugin.remove(&plugin);
+        }
+        let events = inner
+            .subscription_events_by_plugin
+            .get_mut(&plugin)
+            .expect("a subscription has plugin membership");
+        let count = events
+            .get_mut(key)
+            .expect("a subscription has event membership");
+        *count = count.checked_sub(1).expect("each subscription leaves once");
+        if *count == 0 {
+            events.remove(key);
+        }
+        if events.is_empty() {
+            inner.subscription_events_by_plugin.remove(&plugin);
+        }
+    }
 }
 
 fn unload_removes_subscription(
@@ -1658,28 +1843,53 @@ fn drop_queued_for_owner(
     owner: &str,
     generation: u64,
 ) -> Vec<RetiringPayload> {
+    // Copies can outlive their subscriptions through a delayed requeue.
+    let mut consumers: BTreeSet<String> = inner
+        .queued_by_producer
+        .get(owner)
+        .into_iter()
+        .flat_map(|consumers| consumers.keys())
+        .cloned()
+        .collect();
+    if inner.consumers.contains_key(owner) {
+        consumers.insert(owner.to_string());
+    }
     let mut dropped = Vec::new();
     let mut changed_consumers = Vec::new();
-    for (plugin_key, queue) in inner.consumers.iter_mut() {
-        let mut kept = VecDeque::new();
-        let mut changed = false;
-        while let Some(copy) = queue.copies.pop_front() {
-            let drop_copy = unload_removes_subscription(&copy.holder, owner, generation);
-            if drop_copy {
-                queue.events = queue.events.saturating_sub(1);
-                dropped.push(copy);
-                changed = true;
-            } else {
-                kept.push_back(copy);
-            }
+    for plugin_key in consumers {
+        let queue = inner
+            .consumers
+            .get_mut(&plugin_key)
+            .expect("copy membership names an existing consumer");
+        #[cfg(test)]
+        {
+            inner.cleanup_visits.queues += 1;
+            inner.cleanup_visits.copies += queue.copies.len();
         }
-        queue.copies = kept;
-        if changed {
-            changed_consumers.push(plugin_key.clone());
+        let previous_len = queue.copies.len();
+        queue.copies.retain_mut(|copy| {
+            if unload_removes_subscription(&copy.holder, owner, generation) {
+                dropped.push(QueuedCopy {
+                    envelope_id: copy.envelope_id,
+                    holder: std::mem::take(&mut copy.holder),
+                });
+                false
+            } else {
+                true
+            }
+        });
+        let removed = previous_len - queue.copies.len();
+        if removed > 0 {
+            queue.events = queue
+                .events
+                .checked_sub(removed)
+                .expect("each queued copy releases one consumer event");
+            changed_consumers.push(plugin_key);
         }
     }
     let mut retired_payloads = Vec::new();
     for copy in dropped {
+        inner.forget_queued_copy(&copy.holder);
         if let Some(envelope) = inner.live_envelope(copy.envelope_id) {
             let size = envelope.size;
             if let Some(queue) = inner.consumers.get_mut(&copy.holder.plugin_key) {
@@ -1692,12 +1902,21 @@ fn drop_queued_for_owner(
             &copy.holder.plugin_key,
             copy.holder.generation,
         ) {
+            let cleanup = (owner.to_string(), generation);
+            inner
+                .retiring_by_cleanup
+                .entry(cleanup.clone())
+                .or_default()
+                .insert(copy.envelope_id);
             let envelope = inner
                 .envelopes
                 .get_mut(&copy.envelope_id)
                 .expect("the final holder retains its envelope");
             let destroyed = Arc::new(AtomicBool::new(false));
-            envelope.payload_destroyed = Some(Arc::clone(&destroyed));
+            envelope.retirement = Some(EnvelopeRetirement {
+                cleanup,
+                destroyed: Arc::clone(&destroyed),
+            });
             retired_payloads.push(RetiringPayload {
                 payload: std::mem::take(&mut envelope.payload),
                 payload_json: std::mem::take(&mut envelope.payload_json),
@@ -1764,6 +1983,19 @@ fn retire_envelope_locked(
         return;
     };
     inner.admitted.remove(&envelope_id);
+    if let Some(retirement) = &envelope.retirement {
+        let ids = inner
+            .retiring_by_cleanup
+            .get_mut(&retirement.cleanup)
+            .expect("a retiring envelope has cleanup membership");
+        assert!(
+            ids.remove(&envelope_id),
+            "each retiring envelope leaves once"
+        );
+        if ids.is_empty() {
+            inner.retiring_by_cleanup.remove(&retirement.cleanup);
+        }
+    }
     let owner = &envelope.owner;
     let size = envelope.size;
     let age_ref = envelope.producer_age_ref;
@@ -1779,18 +2011,31 @@ fn retire_envelope_locked(
     counters.set_global_in_flight_bytes(inner.global_bytes() as u64);
 }
 
-/// A retry also retires payloads destroyed before a previous worker stopped.
-fn retire_destroyed_payloads(inner: &mut RouterInner, counters: &EventPlaneCounters) {
-    let destroyed: Vec<u64> = inner
-        .envelopes
+/// A restart reaches the same operation bucket even though its dispatch serial changes.
+fn retire_destroyed_payloads(
+    inner: &mut RouterInner,
+    counters: &EventPlaneCounters,
+    owner: &str,
+    generation: u64,
+) {
+    let cleanup = (owner.to_string(), generation);
+    let Some(ids) = inner.retiring_by_cleanup.get(&cleanup) else {
+        return;
+    };
+    #[cfg(test)]
+    {
+        inner.cleanup_visits.retiring += ids.len();
+    }
+    let destroyed: Vec<u64> = ids
         .iter()
-        .filter_map(|(id, envelope)| {
-            envelope
-                .payload_destroyed
-                .as_ref()
-                .is_some_and(|destroyed| destroyed.load(Ordering::Acquire))
-                .then_some(*id)
+        .filter(|id| {
+            inner
+                .envelopes
+                .get(*id)
+                .and_then(|envelope| envelope.retirement.as_ref())
+                .is_some_and(|retirement| retirement.destroyed.load(Ordering::Acquire))
         })
+        .copied()
         .collect();
     for envelope_id in destroyed {
         retire_envelope_locked(inner, counters, envelope_id);
@@ -1865,6 +2110,7 @@ fn enqueue_consumer_copy(
             .consumers
             .insert(subscription.plugin_key.clone(), ConsumerQueue::default());
     }
+    inner.note_queued_copy(&subscription);
     let (front_id, count, bytes, cell, gate) = {
         let consumer = inner
             .consumers
@@ -2021,15 +2267,17 @@ fn commit_diagnostic_state(
         },
         cell,
     );
-    let plugin_keys: Vec<String> = inner
+    let mut plugin_keys: BTreeSet<String> = inner
         .subscriptions
-        .values()
-        .flatten()
-        .filter(|subscription| subscription.plugin_key == owner || subscription.owner == owner)
-        .map(|subscription| subscription.plugin_key.clone())
-        .collect::<std::collections::BTreeSet<_>>()
+        .get(owner)
         .into_iter()
+        .flat_map(|events| events.values())
+        .flatten()
+        .map(|subscription| subscription.plugin_key.clone())
         .collect();
+    if inner.subscription_events_by_plugin.contains_key(owner) {
+        plugin_keys.insert(owner.to_string());
+    }
     for plugin_key in plugin_keys {
         bind_consumer_cell(inner, counters, &plugin_key);
     }
@@ -2236,7 +2484,7 @@ impl EventPlaneOwnerOps {
     /// Restart the same operation with retained admission and a new serial.
     /// The caller must confirm that the old worker cannot run.
     /// Before rescheduling a rejected submission, call [`Self::retry`] with the returned work identity.
-    /// Repeating metadata cleanup preserves retiring rows. The full reap recovers their charge
+    /// Repeating metadata cleanup preserves retiring rows. The operation bucket recovers their charge
     /// after the previous worker destroys its payloads during completion or unwind.
     pub fn restart(&mut self, identity: &EventOwnerWorkId) -> Option<EventOwnerWork> {
         if !self.matches_in_flight(identity) {
@@ -2585,13 +2833,15 @@ mod tests {
     }
 
     fn run_work(router: &PackageEventRouter, work: EventOwnerWork) -> EventOwnerCompletion {
-        thread::scope(|scope| {
+        let completion = thread::scope(|scope| {
             scope
                 .spawn(move || work.run(router))
                 .join()
                 .expect("worker joins")
                 .expect("worker completes")
-        })
+        });
+        assert_router_accounting(router);
+        completion
     }
 
     fn run_unload(router: &PackageEventRouter, owner: &str, generation: u64) {
@@ -2623,6 +2873,7 @@ mod tests {
 
     fn assert_router_accounting(router: &PackageEventRouter) {
         let inner = lock_inner(&router.inner).expect("accounting lock");
+        assert_router_indexes(&inner);
         let bytes: usize = inner.envelopes.values().map(|envelope| envelope.size).sum();
         assert_eq!(inner.global_bytes(), bytes);
         assert_eq!(
@@ -2667,6 +2918,327 @@ mod tests {
                 .all(|id| inner.envelopes.contains_key(id))
         );
         assert!(inner.admitted.values().all(|holders| !holders.is_empty()));
+    }
+
+    fn assert_router_indexes(inner: &RouterInner) {
+        let mut subscriptions: HashMap<String, HashMap<(String, String), usize>> = HashMap::new();
+        let mut subscription_counts: HashMap<String, usize> = HashMap::new();
+        for (owner, events) in &inner.subscriptions {
+            for (name, holders) in events {
+                for holder in holders {
+                    assert_eq!(&holder.owner, owner);
+                    assert_eq!(&holder.name, name);
+                    *subscriptions
+                        .entry(holder.plugin_key.clone())
+                        .or_default()
+                        .entry((owner.clone(), name.clone()))
+                        .or_default() += 1;
+                    *subscription_counts
+                        .entry(holder.plugin_key.clone())
+                        .or_default() += 1;
+                }
+            }
+        }
+        assert_eq!(inner.subscription_events_by_plugin, subscriptions);
+        assert_eq!(inner.subscriptions_per_plugin, subscription_counts);
+        let mut queued: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        for (consumer, queue) in &inner.consumers {
+            for copy in &queue.copies {
+                assert_eq!(&copy.holder.plugin_key, consumer);
+                *queued
+                    .entry(copy.holder.owner.clone())
+                    .or_default()
+                    .entry(consumer.clone())
+                    .or_default() += 1;
+            }
+        }
+        assert_eq!(inner.queued_by_producer, queued);
+        let mut retiring: HashMap<(String, u64), HashSet<u64>> = HashMap::new();
+        for (id, envelope) in &inner.envelopes {
+            if let Some(retirement) = &envelope.retirement {
+                assert_eq!(envelope.remaining_holders, 0);
+                assert!(envelope.payload.is_empty());
+                assert!(envelope.payload_json.is_null());
+                retiring
+                    .entry(retirement.cleanup.clone())
+                    .or_default()
+                    .insert(*id);
+            }
+        }
+        assert_eq!(inner.retiring_by_cleanup, retiring);
+    }
+
+    #[test]
+    fn unload_visits_do_not_grow_with_unrelated_owners() {
+        let mut visits = Vec::new();
+        for unrelated_count in [0, 64] {
+            let router = router();
+            let mut owners = vec!["target".to_string(), "remote".to_string()];
+            owners.extend((0..unrelated_count).map(|index| format!("unrelated-{index}")));
+            let contracts = owners
+                .iter()
+                .map(|owner| {
+                    let mut contract = sample_contract(owner, "ready");
+                    contract.audience.insert(EventAudience::Clients);
+                    contract
+                })
+                .collect();
+            router.try_register_contracts(contracts).expect("contracts");
+            subscribe(&router, "target", "target", "ready");
+            subscribe(&router, "shared", "target", "ready");
+            subscribe(&router, "target", "remote", "ready");
+            for owner in &owners {
+                if owner.starts_with("unrelated-") {
+                    subscribe(&router, &format!("consumer-{owner}"), owner, "ready");
+                }
+                if owner != "remote" {
+                    let mailbox = Arc::new(ClientEventMailbox::new(router.policy()));
+                    let gap = mailbox
+                        .register_gap_slot("sub", owner, "ready")
+                        .expect("gap");
+                    assert_eq!(
+                        router.try_subscribe_client(ClientEventHolder {
+                            connection_id: owner.clone(),
+                            subscription_id: "sub".into(),
+                            owner: owner.clone(),
+                            name: "ready".into(),
+                            subjects: BTreeSet::new(),
+                            mailbox,
+                            gap,
+                        }),
+                        EventPlaneStatus::Accepted
+                    );
+                }
+                assert_eq!(
+                    router.try_ingress(
+                        owner,
+                        "ready",
+                        &serde_json::json!({"ok": true}),
+                        Instant::now()
+                    ),
+                    EventPlaneStatus::Accepted
+                );
+            }
+            assert_router_accounting(&router);
+            run_unload(&router, "target", 1);
+            let inner = lock_inner(&router.inner).expect("cleanup visits");
+            visits.push(inner.cleanup_visits);
+            assert_eq!(inner.envelopes.len(), unrelated_count);
+            assert!(!inner.subscription_events_by_plugin.contains_key("target"));
+            assert!(!inner.queued_by_producer.contains_key("target"));
+            assert!(
+                !inner
+                    .client_by_id
+                    .contains_key(&("target".into(), "sub".into()))
+            );
+        }
+        assert_eq!(visits[0], visits[1]);
+        assert_eq!(
+            visits[0],
+            CleanupVisits {
+                contracts: 1,
+                subscriptions: 3,
+                clients: 1,
+                queues: 2,
+                copies: 3,
+                retiring: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn unload_retains_mixed_queue_order_at_the_configured_limit() {
+        let router = PackageEventRouter::new(PackageEventPlanePolicy {
+            consumer_queue_max_events: 6,
+            ..PackageEventPlanePolicy::default()
+        });
+        router
+            .try_register_contracts(vec![
+                sample_contract("removed", "ready"),
+                sample_contract("kept", "ready"),
+            ])
+            .expect("contracts");
+        subscribe(&router, "consumer", "removed", "ready");
+        subscribe(&router, "consumer", "kept", "ready");
+        let owners = ["removed", "kept", "removed", "kept", "removed", "kept"];
+        for owner in owners {
+            assert_eq!(
+                router.try_ingress(
+                    owner,
+                    "ready",
+                    &serde_json::json!({"ok": true}),
+                    Instant::now()
+                ),
+                EventPlaneStatus::Accepted
+            );
+        }
+        let expected = {
+            let inner = lock_inner(&router.inner).expect("original order");
+            inner.consumers["consumer"]
+                .copies
+                .iter()
+                .filter(|copy| copy.holder.owner == "kept")
+                .map(|copy| copy.envelope_id)
+                .collect::<Vec<_>>()
+        };
+        run_unload(&router, "removed", 1);
+        let inner = lock_inner(&router.inner).expect("surviving order");
+        assert_eq!(inner.cleanup_visits.copies, 6);
+        assert_eq!(
+            inner.consumers["consumer"]
+                .copies
+                .iter()
+                .map(|copy| copy.envelope_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn producer_unload_finds_a_copy_requeued_after_subscription_removal() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        subscribe(&router, "consumer", "producer", "ready");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "ready",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let mut batch = router
+            .pull_ready_batch(1, usize::MAX, Instant::now(), StdDuration::from_secs(1))
+            .expect("pull");
+        let delivery = batch.pop().expect("delivery");
+        run_unload(&router, "consumer", 0);
+        assert_eq!(router.test_subscription_count("consumer"), 0);
+        router
+            .requeue_delivery(delivery)
+            .expect("requeue the outstanding live delivery");
+        assert_router_accounting(&router);
+        assert_eq!(router.snapshot().expect("queued again").queued_holders, 1);
+        run_unload(&router, "producer", 1);
+        assert_eq!(
+            router.snapshot().expect("retired").global_in_flight_bytes,
+            0
+        );
+        assert!(
+            lock_inner(&router.inner)
+                .expect("membership")
+                .queued_by_producer
+                .is_empty()
+        );
+        router.take_delivery_wake();
+        assert!(
+            router
+                .pull_ready_batch(1, usize::MAX, Instant::now(), StdDuration::from_secs(1))
+                .expect("empty pull")
+                .is_empty()
+        );
+        assert!(!router.take_delivery_wake());
+    }
+
+    #[test]
+    fn projected_fanout_enforces_event_and_byte_capacity_per_consumer() {
+        let payload = serde_json::json!({"ok": true});
+        let size = serde_json::to_vec(&payload).expect("payload").len();
+        for bytes_limit in [false, true] {
+            let router = PackageEventRouter::new(PackageEventPlanePolicy {
+                consumer_queue_max_events: if bytes_limit { 10 } else { 2 },
+                consumer_queue_max_bytes: if bytes_limit { size * 2 } else { size * 10 },
+                ..PackageEventPlanePolicy::default()
+            });
+            router
+                .try_register_contracts(vec![sample_contract("producer", "ready")])
+                .expect("contract");
+            subscribe(&router, "constrained", "producer", "ready");
+            assert_eq!(
+                router.try_ingress("producer", "ready", &payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
+            assert_eq!(
+                router.try_subscribe(EventSubscription {
+                    plugin_key: "constrained".into(),
+                    owner: "producer".into(),
+                    name: "ready".into(),
+                    handler_id: "second".into(),
+                    generation: 2,
+                    ..EventSubscription::default()
+                }),
+                EventPlaneStatus::Accepted
+            );
+            subscribe(&router, "unaffected", "producer", "ready");
+            assert_eq!(
+                router.try_ingress("producer", "ready", &payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
+            assert_router_accounting(&router);
+            let snapshot = router.snapshot().expect("partial fanout");
+            assert_eq!(snapshot.consumer_events["constrained"], 2);
+            assert_eq!(snapshot.consumer_bytes["constrained"], size * 2);
+            assert_eq!(snapshot.consumer_events["unaffected"], 1);
+            assert_eq!(snapshot.queued_holders, 3);
+            assert_eq!(snapshot.producer_events["producer"], 2);
+            assert_eq!(snapshot.global_in_flight_bytes, size * 2);
+            assert_eq!(
+                router.try_ingress("producer", "ready", &payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
+            assert_router_accounting(&router);
+            assert_eq!(
+                router.snapshot().expect("unaffected fills").consumer_events["unaffected"],
+                2
+            );
+            assert_eq!(
+                router.try_ingress("producer", "ready", &payload, Instant::now()),
+                EventPlaneStatus::ShedFull
+            );
+            assert_router_accounting(&router);
+        }
+    }
+
+    #[test]
+    fn failed_commit_restores_subscription_membership_after_partial_admission() {
+        let router = router();
+        router
+            .try_register_contracts(vec![sample_contract("producer", "ready")])
+            .expect("contract");
+        subscribe(&router, "existing", "producer", "ready");
+        let subscription = EventSubscription {
+            plugin_key: "new-consumer".into(),
+            owner: "producer".into(),
+            name: "ready".into(),
+            handler_id: "valid".into(),
+            generation: 2,
+            ..EventSubscription::default()
+        };
+        let missing = EventSubscription {
+            name: "missing".into(),
+            ..subscription.clone()
+        };
+        assert_eq!(
+            router.try_commit_package_generation(
+                "replacement",
+                Vec::new(),
+                vec![subscription, missing]
+            ),
+            Err(EventPlaneStatus::RejectedUndeclared)
+        );
+        assert_router_accounting(&router);
+        assert_eq!(router.test_subscription_count("existing"), 1);
+        assert_eq!(router.test_subscription_count("new-consumer"), 0);
+        assert_eq!(
+            router
+                .current_package_generation("replacement")
+                .expect("rolled back generation"),
+            0
+        );
+        run_unload(&router, "new-consumer", 0);
+        assert_eq!(router.test_subscription_count("existing"), 1);
     }
 
     #[test]
@@ -3483,6 +4055,150 @@ mod tests {
     }
 
     #[test]
+    fn consumer_restart_recovers_only_its_operation_bucket() {
+        let router = router();
+        router
+            .try_register_contracts(vec![
+                sample_contract("producer", "ready"),
+                sample_contract("other-producer", "ready"),
+            ])
+            .expect("contracts");
+        subscribe(&router, "consumer", "producer", "ready");
+        subscribe(&router, "other-consumer", "other-producer", "ready");
+        let payload = serde_json::json!({"ok": true});
+        let size = serde_json::to_vec(&payload).expect("payload").len();
+        for owner in ["producer", "other-producer"] {
+            assert_eq!(
+                router.try_ingress(owner, "ready", &payload, Instant::now()),
+                EventPlaneStatus::Accepted
+            );
+        }
+        let mut ops = EventPlaneOwnerOps::default();
+        ops.record(OwnerOp {
+            kind: OwnerOpKind::Unload,
+            owner: "consumer".into(),
+            generation: 0,
+        });
+        let OwnerStep::Work(work) = ops.apply_ready(&router) else {
+            panic!("consumer work")
+        };
+        let identity = work.identity().clone();
+        *router.unload_test_probe.try_lock().expect("probe") = Some(Box::new(|phase| {
+            if phase == UnloadTestPhase::Detached {
+                panic!("worker terminates after consumer payload detachment");
+            }
+        }));
+        thread::scope(|scope| {
+            assert!(scope.spawn(|| work.run(&router)).join().is_err());
+        });
+        assert_router_accounting(&router);
+        {
+            let inner = lock_inner(&router.inner).expect("retained recovery bucket");
+            assert_eq!(inner.retiring_by_cleanup[&("consumer".into(), 0)].len(), 1);
+            assert!(
+                !inner
+                    .retiring_by_cleanup
+                    .contains_key(&("producer".into(), 1))
+            );
+        }
+        run_unload(&router, "other-producer", 1);
+        assert_eq!(
+            router
+                .snapshot()
+                .expect("consumer charge remains")
+                .global_in_flight_bytes,
+            size
+        );
+        assert_eq!(
+            lock_inner(&router.inner)
+                .expect("reap visits")
+                .cleanup_visits
+                .retiring,
+            1
+        );
+        let restarted = ops
+            .restart(&identity)
+            .expect("restart with retained admission");
+        assert_ne!(restarted.identity(), &identity);
+        assert!(ops.complete(run_work(&router, restarted)).is_some());
+        assert!(ops.is_empty());
+        assert_eq!(
+            router
+                .snapshot()
+                .expect("consumer charge reaped")
+                .global_in_flight_bytes,
+            0
+        );
+        assert!(
+            lock_inner(&router.inner)
+                .expect("no recovery buckets")
+                .retiring_by_cleanup
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replacement_registers_recovery_before_destroying_payloads() {
+        let router = Arc::new(router());
+        router
+            .try_register_contracts(vec![sample_contract("producer", "old")])
+            .expect("contract");
+        subscribe(&router, "consumer", "producer", "old");
+        assert_eq!(
+            router.try_ingress(
+                "producer",
+                "old",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
+            EventPlaneStatus::Accepted
+        );
+        let before = router.snapshot().expect("before").global_in_flight_bytes;
+        let probe_router = Arc::clone(&router);
+        *router.unload_test_probe.try_lock().expect("probe") = Some(Box::new(move |phase| {
+            if phase == UnloadTestPhase::Detached {
+                assert_router_accounting(&probe_router);
+                let inner = lock_inner(&probe_router.inner).expect("replacement recovery");
+                assert_eq!(inner.retiring_by_cleanup[&("producer".into(), 1)].len(), 1);
+                assert_eq!(inner.global_bytes(), before);
+                assert!(inner.envelopes.values().all(|envelope| {
+                    envelope
+                        .retirement
+                        .as_ref()
+                        .is_some_and(|retirement| !retirement.destroyed.load(Ordering::Acquire))
+                }));
+            }
+        }));
+        let result = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    router.try_replace_package_generation(
+                        "producer",
+                        vec![sample_contract("producer", "new")],
+                        Vec::new(),
+                    )
+                })
+                .join()
+                .expect("replacement worker")
+        });
+        assert_eq!(result.expect("replacement"), 2);
+        assert_router_accounting(&router);
+        assert_eq!(
+            router
+                .snapshot()
+                .expect("retired payload")
+                .global_in_flight_bytes,
+            0
+        );
+        assert!(
+            lock_inner(&router.inner)
+                .expect("retired bucket")
+                .retiring_by_cleanup
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn replacement_poison_returns_committed_generation_and_owned_cleanup() {
         let router = Arc::new(router());
         router
@@ -3540,11 +4256,13 @@ mod tests {
             panic!("poisoned guard");
         };
         let inner = poisoned.into_inner();
+        assert_router_indexes(&inner);
         assert_eq!(inner.package_generation["producer"], 2);
         assert!(
             inner
                 .contracts
-                .contains_key(&("producer".into(), "new".into()))
+                .get("producer")
+                .is_some_and(|events| events.contains_key("new"))
         );
         assert_eq!(inner.envelopes.len(), 1);
         assert_eq!(
