@@ -46,7 +46,8 @@ impl HostError {
 }
 
 pub(crate) enum HostCommand {
-    FamilyCleanup(crate::package_entity_fanout::PackageEntityMutation),
+    EntityModel(crate::runtime::entity_model::Work),
+    ReclaimEntityModel(crate::runtime::entity_model::Work),
     EventOwner {
         router: Arc<crate::package_event_router::PackageEventRouter>,
         work: crate::package_event_router::EventOwnerWork,
@@ -92,7 +93,8 @@ pub(crate) enum HostCommand {
 impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
-            Self::FamilyCleanup(_) | Self::EventOwner { .. } => 0,
+            Self::EntityModel(_) | Self::ReclaimEntityModel(_) => 0,
+            Self::EventOwner { .. } => 0,
             Self::PluginEntity(_) | Self::PreparePluginResponse { .. } | Self::StopEntrypoints => 0,
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
             Self::Mutation(_) => 0,
@@ -109,7 +111,11 @@ impl HostCommand {
 impl std::fmt::Debug for HostCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::FamilyCleanup(_) => formatter.write_str("FamilyCleanup"),
+            Self::EntityModel(work) => formatter
+                .debug_tuple("EntityModel")
+                .field(&work.kind())
+                .finish(),
+            Self::ReclaimEntityModel(_) => formatter.write_str("ReclaimEntityModel"),
             Self::EventOwner { work, .. } => formatter
                 .debug_tuple("EventOwner")
                 .field(work.identity())
@@ -159,10 +165,7 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
-    FamilyCleanupComplete {
-        #[cfg(test)]
-        worker_thread: thread::ThreadId,
-    },
+    EntityModelComplete(crate::runtime::entity_model::Kind),
     EventOwner(
         Result<
             crate::package_event_router::EventOwnerCompletion,
@@ -197,7 +200,8 @@ pub(crate) enum HostResult {
 impl HostResult {
     fn generation(&self) -> u64 {
         match self {
-            Self::FamilyCleanupComplete { .. } | Self::EventOwner(_) => 0,
+            Self::EntityModelComplete(_) => 0,
+            Self::EventOwner(_) => 0,
             Self::PluginEntity(_)
             | Self::PluginResponseAbandoned
             | Self::PluginResponseDelivered { .. }
@@ -280,8 +284,9 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
+        HostResult::EntityModelComplete(_) => 0,
         // The router retains each allocation charge until worker destruction completes.
-        HostResult::FamilyCleanupComplete { .. } | HostResult::EventOwner(_) => 0,
+        HostResult::EventOwner(_) => 0,
         HostResult::PluginEntity(crate::plugin_entity::Completion::Finished { .. }) => 0,
         HostResult::PluginEntity(_) => HOST_PREPARED_BYTE_CAPACITY,
         HostResult::PluginResponseAbandoned
@@ -401,6 +406,7 @@ impl HostPreparedReservation {
         HostPreparedCharge {
             pool: Arc::clone(&self.pool),
             logical_bytes,
+            _retained: None,
         }
     }
 }
@@ -420,6 +426,13 @@ impl Drop for HostPreparedReservation {
 pub(crate) struct HostPreparedCharge {
     pool: Arc<HostPreparedPool>,
     logical_bytes: usize,
+    _retained: Option<Arc<HostPreparedReservation>>,
+}
+
+/// A retained record shares the original reservation until its last handle drops.
+#[derive(Debug, Clone)]
+pub(crate) struct HostRetainedPrepared {
+    _reservation: Arc<HostPreparedReservation>,
 }
 
 impl Drop for HostPreparedCharge {
@@ -436,10 +449,26 @@ impl Drop for HostPreparedCharge {
 #[derive(Debug)]
 pub(crate) struct HostWorkPermit {
     pool: Arc<HostPermitPool>,
-    prepared: Option<HostPreparedReservation>,
+    prepared: Option<Arc<HostPreparedReservation>>,
 }
 
 impl HostWorkPermit {
+    pub(crate) fn has_retained_prepared_reservation(&self) -> bool {
+        self.prepared
+            .as_ref()
+            .is_some_and(|reservation| Arc::strong_count(reservation) > 1)
+    }
+
+    pub(crate) fn retain_prepared_reservation(&self) -> HostRetainedPrepared {
+        HostRetainedPrepared {
+            _reservation: Arc::clone(
+                self.prepared
+                    .as_ref()
+                    .expect("the phase retains its reservation"),
+            ),
+        }
+    }
+
     pub(crate) fn reserved_prepared_bytes(&self) -> usize {
         self.prepared
             .as_ref()
@@ -456,7 +485,14 @@ impl HostWorkPermit {
             .prepared
             .take()
             .expect("host work permit owns a prepared-byte reservation");
-        reservation.into_charge(logical_bytes)
+        match Arc::try_unwrap(reservation) {
+            Ok(reservation) => reservation.into_charge(logical_bytes),
+            Err(reservation) => HostPreparedCharge {
+                pool: Arc::clone(&reservation.pool),
+                logical_bytes: 0,
+                _retained: Some(reservation),
+            },
+        }
     }
 }
 
@@ -578,10 +614,10 @@ impl HostExecutor {
                     }
                     return Some(HostWorkPermit {
                         pool: Arc::clone(&self.permits),
-                        prepared: Some(HostPreparedReservation {
+                        prepared: Some(Arc::new(HostPreparedReservation {
                             pool: Arc::clone(&self.prepared),
                             logical_bytes: HOST_PREPARED_BYTE_CAPACITY,
-                        }),
+                        })),
                     });
                 }
                 Err(observed) => outstanding = observed,
@@ -708,7 +744,7 @@ fn run_worker(
         };
         let generation = command.generation();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute(command, &entrypoints, &mut permit)
+            execute(identity, command, &entrypoints, &mut permit)
         }))
         .unwrap_or_else(|_| HostResult::Failed {
             generation,
@@ -732,18 +768,17 @@ fn run_worker(
 }
 
 fn execute(
+    identity: HostJobIdentity,
     command: HostCommand,
     entrypoints: &Mutex<EntrypointSupervisor>,
     permit: &mut HostWorkPermit,
 ) -> HostResult {
     match command {
-        HostCommand::FamilyCleanup(payload) => {
-            drop(payload);
-            HostResult::FamilyCleanupComplete {
-                #[cfg(test)]
-                worker_thread: thread::current().id(),
-            }
+        HostCommand::EntityModel(work) => HostResult::EntityModelComplete(work.run(identity)),
+        HostCommand::ReclaimEntityModel(work) => {
+            HostResult::EntityModelComplete(work.reclaim(identity))
         }
+
         HostCommand::EventOwner { router, work } => HostResult::EventOwner(work.run(&router)),
         HostCommand::PluginEntity(command) => {
             HostResult::PluginEntity(crate::plugin_entity::execute(command, permit))
@@ -1160,57 +1195,6 @@ mod tests {
                 ));
             }
         }
-    }
-
-    #[test]
-    fn family_payload_cleanup_runs_on_worker_with_original_permit() {
-        let executor = HostExecutor::new();
-        let permit = executor.try_reserve().unwrap();
-        let other = (1..HOST_OPERATION_CAPACITY)
-            .map(|_| executor.try_reserve().unwrap())
-            .collect::<Vec<_>>();
-        let owner_thread = thread::current().id();
-        let identity = HostJobIdentity {
-            waiter_id: WaiterId(92),
-            phase: 7,
-        };
-        executor
-            .submit(
-                identity,
-                HostCommand::FamilyCleanup(
-                    crate::package_entity_fanout::PackageEntityMutation::Upsert {
-                        admission: None,
-                        entity_type: "producer.item".into(),
-                        snapshot_seq: 1,
-                        id: "item".into(),
-                        entity: serde_json::json!({"payload": "x".repeat(1024 * 1024)}),
-                    },
-                ),
-                permit,
-            )
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let completion = loop {
-            match executor.poll_completion() {
-                HostCompletionPoll::Ready(completion) => break completion,
-                HostCompletionPoll::Empty => {
-                    assert!(std::time::Instant::now() < deadline);
-                    thread::yield_now();
-                }
-                HostCompletionPoll::Stopped => panic!("cleanup worker stopped"),
-            }
-        };
-        let (completed, result, permit) = completion.into_parts();
-        assert_eq!(completed, identity);
-        let HostResult::FamilyCleanupComplete { worker_thread } = result else {
-            panic!("cleanup must return its typed completion");
-        };
-        assert_ne!(worker_thread, owner_thread);
-        assert_eq!(executor.outstanding(), HOST_OPERATION_CAPACITY);
-        assert!(executor.try_reserve().is_none());
-        drop(permit);
-        assert_eq!(executor.outstanding(), HOST_OPERATION_CAPACITY - 1);
-        drop(other);
     }
 
     #[test]

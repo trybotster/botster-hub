@@ -183,11 +183,15 @@ impl HubEntityPublishBridge {
         self.shared.progress.swap(false, Ordering::SeqCst)
     }
 
-    /// Call this only from the preparation callback while the bridge guard is held.
+    /// The preparation callback must latch faults before it releases the bridge guard.
     pub(crate) fn retain_faulted(&self) {
         if !self.shared.faulted.swap(true, Ordering::SeqCst) {
             self.shared.notify();
         }
+    }
+
+    pub(crate) fn is_faulted(&self) -> bool {
+        self.shared.faulted.load(Ordering::SeqCst) || self.shared.queue.is_poisoned()
     }
 
     pub(crate) fn ready(&self) -> bool {

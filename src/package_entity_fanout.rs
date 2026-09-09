@@ -233,22 +233,48 @@ impl PackageEntityFanoutQueue {
         &mut self,
         item: LeasedFanoutMutation,
     ) -> Result<(), LeasedFanoutMutation> {
+        let mut retained = Some(item);
+        if self.try_push_from(&mut retained) {
+            Ok(())
+        } else {
+            Err(retained.expect("failed insertion retains the mutation"))
+        }
+    }
+
+    /// Keep custody in the input slot until the queue stores the mutation.
+    pub(crate) fn try_push_from(&mut self, retained: &mut Option<LeasedFanoutMutation>) -> bool {
+        let item = retained.as_ref().expect("insertion requires a mutation");
         let Some(next_sequence) = self.next_sequence.checked_add(1) else {
-            return Err(item);
+            return false;
         };
         let family = (item.mutation.entity_type().to_string(), item.generation);
+        assert!(!self.pending_by_seq.contains_key(&self.next_sequence));
+        self.pending_by_seq.insert(
+            self.next_sequence,
+            retained
+                .take()
+                .expect("the input slot contains the mutation"),
+        );
         self.sequences_by_family
             .entry(family)
             .or_default()
             .insert(self.next_sequence);
-        self.pending_by_seq.insert(self.next_sequence, item);
         self.next_sequence = next_sequence;
-        Ok(())
+        true
     }
 
     pub(crate) fn pop_first(&mut self) -> Option<LeasedFanoutMutation> {
-        let sequence = *self.pending_by_seq.first_key_value()?.0;
-        Some(self.remove(sequence))
+        let mut retained = None;
+        self.pop_first_into(&mut retained);
+        retained
+    }
+
+    /// Store the mutation before changing its family index.
+    pub(crate) fn pop_first_into(&mut self, retained: &mut Option<LeasedFanoutMutation>) {
+        assert!(retained.is_none(), "the output slot must be empty");
+        if let Some((&sequence, _)) = self.pending_by_seq.first_key_value() {
+            self.remove_into(sequence, retained);
+        }
     }
 
     /// Find an old generation even when its live family state is absent.
@@ -279,17 +305,32 @@ impl PackageEntityFanoutQueue {
         family: &str,
         generation: u64,
     ) -> Option<LeasedFanoutMutation> {
-        let sequence = *self
-            .sequences_by_family
-            .get(&(family.to_string(), generation))?
-            .first()?;
-        Some(self.remove(sequence))
+        let mut retained = None;
+        self.take_one_family_into(family, generation, &mut retained);
+        retained
     }
 
-    fn remove(&mut self, sequence: u64) -> LeasedFanoutMutation {
-        let item = self
-            .pending_by_seq
-            .remove(&sequence)
+    pub(crate) fn take_one_family_into(
+        &mut self,
+        family: &str,
+        generation: u64,
+        retained: &mut Option<LeasedFanoutMutation>,
+    ) {
+        assert!(retained.is_none(), "the output slot must be empty");
+        if let Some(&sequence) = self
+            .sequences_by_family
+            .get(&(family.to_string(), generation))
+            .and_then(|sequences| sequences.first())
+        {
+            self.remove_into(sequence, retained);
+        }
+    }
+
+    fn remove_into(&mut self, sequence: u64, retained: &mut Option<LeasedFanoutMutation>) {
+        assert!(retained.is_none(), "the output slot must be empty");
+        *retained = self.pending_by_seq.remove(&sequence);
+        let item = retained
+            .as_ref()
             .expect("the selected sequence has a queued mutation");
         let family = (item.mutation.entity_type().to_string(), item.generation);
         let sequences = self
@@ -303,7 +344,6 @@ impl PackageEntityFanoutQueue {
         if sequences.is_empty() {
             self.sequences_by_family.remove(&family);
         }
-        item
     }
 
     #[must_use]
@@ -499,6 +539,22 @@ pub enum PackageEntityFamilyStep {
     Complete(PackageEntityFamilyProgress),
 }
 
+/// The caller retains this record until the admission phase completes.
+#[derive(Debug, Default)]
+pub(crate) struct FamilyAdmissionWork {
+    pub(crate) input: Option<PackageEntityMutation>,
+    pub(crate) ready: Option<PackageEntityMutation>,
+    pub(crate) discarded: Option<PackageEntityMutation>,
+    pub(crate) result: Option<PackageEntityPublishResult>,
+}
+
+/// Retain a removed resync permit with the snapshot result until Host completion.
+#[derive(Debug, Default)]
+pub(crate) struct FamilySnapshotWork {
+    pub(crate) step: Option<PackageEntityFamilyStep>,
+    pub(crate) resync_lease: Option<(u64, Option<crate::lua_runtime::EntityPublishPermit>)>,
+}
+
 /// Per-family runtime admission state.
 #[derive(Debug, Default)]
 pub struct PackageEntityFamilyState {
@@ -523,30 +579,36 @@ impl PackageEntityFamilyState {
         Option<PackageEntityMutation>,
         Option<PackageEntityMutation>,
     ) {
-        let seq = mutation.snapshot_seq();
-        if seq < self.last_accepted_seq {
-            return (
-                self.result(PackageEntityPublishStatus::StaleSequence),
-                None,
-                Some(mutation),
-            );
-        }
-        if seq == self.last_accepted_seq {
-            return (
-                self.result(PackageEntityPublishStatus::DuplicateSequence),
-                None,
-                Some(mutation),
-            );
-        }
+        let mut work = FamilyAdmissionWork {
+            input: Some(mutation),
+            ..FamilyAdmissionWork::default()
+        };
+        self.admit_retained(&mut work, now);
+        (
+            work.result.expect("admission completed"),
+            work.ready,
+            work.discarded,
+        )
+    }
 
-        let mut ready = None;
-        let mut discarded = None;
-        let status = if self.last_accepted_seq.checked_add(1) == Some(seq) {
+    /// Store each transferred mutation before changing family progress.
+    pub(crate) fn admit_retained(&mut self, work: &mut FamilyAdmissionWork, now: Instant) {
+        assert!(work.ready.is_none() && work.discarded.is_none() && work.result.is_none());
+        let seq = work
+            .input
+            .as_ref()
+            .expect("admission requires a mutation")
+            .snapshot_seq();
+        let status = if seq < self.last_accepted_seq {
+            work.discarded = work.input.take();
+            PackageEntityPublishStatus::StaleSequence
+        } else if seq == self.last_accepted_seq {
+            work.discarded = work.input.take();
+            PackageEntityPublishStatus::DuplicateSequence
+        } else if self.last_accepted_seq.checked_add(1) == Some(seq) {
+            work.ready = work.input.take();
             self.high_water_seq = self.high_water_seq.max(seq);
             self.last_accepted_seq = seq;
-            ready = Some(mutation);
-            // Every accepted publish is progress: re-arm when a gap remains, or
-            // clear degraded fully when the family converges.
             self.after_publish_progress(now);
             PackageEntityPublishStatus::Accepted
         } else if seq
@@ -555,25 +617,22 @@ impl PackageEntityFamilyState {
                 .saturating_add(PACKAGE_ENTITY_PENDING_WINDOW)
         {
             if self.pending_by_seq.contains_key(&seq) {
-                return (
-                    self.result(PackageEntityPublishStatus::DuplicateSequence),
-                    None,
-                    Some(mutation),
-                );
+                work.discarded = work.input.take();
+                PackageEntityPublishStatus::DuplicateSequence
+            } else {
+                self.pending_by_seq
+                    .insert(seq, work.input.take().expect("the input is retained"));
+                self.high_water_seq = self.high_water_seq.max(seq);
+                self.resync.rearm(now);
+                PackageEntityPublishStatus::PendingGap
             }
-            self.high_water_seq = self.high_water_seq.max(seq);
-            self.pending_by_seq.insert(seq, mutation);
-            // New publish re-arms even after degraded.
-            self.resync.rearm(now);
-            PackageEntityPublishStatus::PendingGap
         } else {
+            work.discarded = work.input.take();
             self.high_water_seq = self.high_water_seq.max(seq);
             self.resync.rearm(now);
-            discarded = Some(mutation);
             PackageEntityPublishStatus::ResyncScheduled
         };
-
-        (self.result(status), ready, discarded)
+        work.result = Some(self.result(status));
     }
 
     fn after_publish_progress(&mut self, now: Instant) {
@@ -601,44 +660,72 @@ impl PackageEntityFamilyState {
 
     /// Apply at most one provider snapshot transition step.
     pub fn step_provider_snapshot(&mut self, now: Instant) -> PackageEntityFamilyStep {
-        let next_pending_seq = self.pending_by_seq.first_key_value().map(|(seq, _)| *seq);
-        if next_pending_seq.is_some_and(|seq| seq <= self.last_accepted_seq) {
-            let (seq, mutation) = self
-                .pending_by_seq
-                .pop_first()
-                .expect("the stale pending row was observed");
-            let lease = self.pending_leases.remove(&seq);
-            self.recompute_resync_need(now);
-            return PackageEntityFamilyStep::Discarded { mutation, lease };
-        }
+        let mut work = FamilySnapshotWork::default();
+        self.step_provider_snapshot_into(now, &mut work);
+        work.step.expect("the snapshot step completed")
+    }
 
-        if self
+    pub(crate) fn step_provider_snapshot_into(
+        &mut self,
+        now: Instant,
+        work: &mut FamilySnapshotWork,
+    ) {
+        assert!(work.step.is_none() && work.resync_lease.is_none());
+        let next_pending_seq = self.pending_by_seq.first_key_value().map(|(seq, _)| *seq);
+        let stale = next_pending_seq.is_some_and(|seq| seq <= self.last_accepted_seq);
+        let ready = self
             .last_accepted_seq
             .checked_add(1)
-            .is_some_and(|next| next_pending_seq == Some(next))
-        {
+            .is_some_and(|next| next_pending_seq == Some(next));
+        if stale || ready {
             let (seq, mutation) = self
                 .pending_by_seq
                 .pop_first()
-                .expect("the next ready pending row was observed");
-            let lease = self.pending_leases.remove(&seq);
-            self.last_accepted_seq = seq;
-            self.high_water_seq = self.high_water_seq.max(seq);
+                .expect("the pending row was observed");
+            work.step = Some(if stale {
+                PackageEntityFamilyStep::Discarded {
+                    mutation,
+                    lease: None,
+                }
+            } else {
+                PackageEntityFamilyStep::Ready {
+                    mutation,
+                    lease: None,
+                }
+            });
+            match work.step.as_mut().expect("the mutation was retained") {
+                PackageEntityFamilyStep::Discarded { lease, .. }
+                | PackageEntityFamilyStep::Ready { lease, .. } => {
+                    *lease = self.pending_leases.remove(&seq);
+                }
+                _ => unreachable!("the retained step contains a mutation"),
+            }
+            if ready && !stale {
+                self.last_accepted_seq = seq;
+                self.high_water_seq = self.high_water_seq.max(seq);
+            }
             self.recompute_resync_need(now);
-            return PackageEntityFamilyStep::Ready { mutation, lease };
+            return;
         }
 
         self.recompute_resync_need(now);
-        if self.converged()
-            && let Some((scope_id, _admission)) = self.resync.leases.pop_first()
-        {
-            return PackageEntityFamilyStep::ReleaseResync {
+        if self.converged() && !self.resync.leases.is_empty() {
+            let family_token = self.causal_token.expect("resync lease has a family token");
+            work.resync_lease = self.resync.leases.pop_first();
+            let scope_id = work
+                .resync_lease
+                .as_ref()
+                .expect("the resync lease was retained")
+                .0;
+            work.step = Some(PackageEntityFamilyStep::ReleaseResync {
                 scope_id,
-                family_token: self.causal_token.expect("resync lease has a family token"),
-            };
+                family_token,
+            });
+            return;
         }
-
-        PackageEntityFamilyStep::Complete(self.provider_snapshot_progress())
+        work.step = Some(PackageEntityFamilyStep::Complete(
+            self.provider_snapshot_progress(),
+        ));
     }
 
     pub(crate) fn has_next_pending(&self) -> bool {
@@ -649,17 +736,34 @@ impl PackageEntityFamilyState {
 
     /// Move one consecutive mutation with its existing lease.
     pub(crate) fn take_next_pending(&mut self, now: Instant) -> Option<LeasedFanoutMutation> {
-        let next = self.last_accepted_seq.checked_add(1)?;
-        let mutation = self.pending_by_seq.remove(&next)?;
-        let lease = self.pending_leases.remove(&next);
+        let mut retained = None;
+        self.take_next_pending_into(now, &mut retained);
+        retained
+    }
+
+    /// Retain the mutation and lease before updating family progress.
+    pub(crate) fn take_next_pending_into(
+        &mut self,
+        now: Instant,
+        retained: &mut Option<LeasedFanoutMutation>,
+    ) {
+        assert!(retained.is_none(), "the output slot must be empty");
+        let Some(next) = self.last_accepted_seq.checked_add(1) else {
+            return;
+        };
+        let Some(mutation) = self.pending_by_seq.remove(&next) else {
+            return;
+        };
+        *retained = Some(LeasedFanoutMutation {
+            mutation,
+            lease: None,
+            generation: self.generation,
+        });
+        retained.as_mut().expect("the mutation was retained").lease =
+            self.pending_leases.remove(&next);
         self.last_accepted_seq = next;
         self.high_water_seq = self.high_water_seq.max(next);
         self.after_publish_progress(now);
-        Some(LeasedFanoutMutation {
-            mutation,
-            lease,
-            generation: self.generation,
-        })
     }
 
     pub fn recompute_resync_need(&mut self, now: Instant) {
@@ -934,6 +1038,164 @@ mod tests {
             expected.values().map(BTreeSet::len).sum::<usize>()
         );
         assert_eq!(queue.is_empty(), expected.is_empty());
+    }
+
+    #[test]
+    fn fanout_extraction_retains_payload_and_lease_on_index_fault() {
+        let mut queue = PackageEntityFanoutQueue::default();
+        queue.try_push(fanout_item("a", 7, 3, true)).unwrap();
+        queue.sequences_by_family.clear();
+        let mut retained = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.pop_first_into(&mut retained);
+        }));
+        assert!(result.is_err());
+        assert_eq!(retained, Some(fanout_item("a", 7, 3, true)));
+        assert!(queue.pending_by_seq.is_empty());
+    }
+
+    #[test]
+    fn fanout_extraction_rejects_occupied_output_before_removal() {
+        let mut queue = PackageEntityFanoutQueue::default();
+        queue.try_push(fanout_item("a", 7, 3, true)).unwrap();
+        let mut retained = Some(fanout_item("b", 2, 4, true));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.pop_first_into(&mut retained);
+        }));
+        assert!(result.is_err());
+        assert_eq!(retained, Some(fanout_item("b", 2, 4, true)));
+        assert_eq!(queue.pop_first(), Some(fanout_item("a", 7, 3, true)));
+    }
+
+    #[test]
+    fn fanout_sequence_exhaustion_preserves_input_slot() {
+        let mut queue = PackageEntityFanoutQueue::default();
+        queue.set_next_sequence_for_test(u64::MAX);
+        let mut retained = Some(fanout_item("a", 7, 3, true));
+        assert!(!queue.try_push_from(&mut retained));
+        assert_eq!(retained, Some(fanout_item("a", 7, 3, true)));
+        assert_fanout_membership(&queue);
+    }
+
+    #[test]
+    fn snapshot_release_validates_identity_before_removing_lease() {
+        let mut family = PackageEntityFamilyState::default();
+        family.resync.leases.insert(17, None);
+        let mut work = FamilySnapshotWork::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            family.step_provider_snapshot_into(Instant::now(), &mut work);
+        }));
+        assert!(result.is_err());
+        assert!(family.resync.leases.contains_key(&17));
+        assert!(work.step.is_none());
+        assert!(work.resync_lease.is_none());
+    }
+
+    fn charged_mutation() -> (
+        crate::lua_runtime::HubEntityPublishBridge,
+        PackageEntityMutation,
+    ) {
+        let bridge = crate::lua_runtime::HubEntityPublishBridge::for_test("p", "p.item");
+        let _response = bridge.test_queue_publish(
+            botster_core::PluginKey("p".into()),
+            json!({
+                "type": "entity_upsert",
+                "entity_type": "p.item",
+                "snapshot_seq": 3,
+                "id": "item-3",
+                "entity": {"id": "item-3", "payload": "retained"}
+            }),
+            Some(17),
+        );
+        let (pending, ()) = bridge
+            .take_if(|_| Some(()))
+            .expect("the publication was admitted");
+        (bridge, pending.mutation)
+    }
+
+    #[test]
+    fn snapshot_release_retains_removed_record() {
+        let (bridge, mutation) = charged_mutation();
+        let mut family = PackageEntityFamilyState {
+            causal_token: Some(23),
+            ..PackageEntityFamilyState::default()
+        };
+        family
+            .resync
+            .leases
+            .insert(17, mutation.admission().cloned());
+        drop(mutation);
+        let charged = bridge.retained_counts();
+        assert_eq!(charged.0, 1);
+        assert!(charged.1 > 0);
+        let mut work = FamilySnapshotWork::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            family.step_provider_snapshot_into(Instant::now(), &mut work);
+            panic!("failure after the resync record leaves the family");
+        }));
+        assert!(result.is_err());
+        let (scope_id, admission) = work.resync_lease.as_ref().unwrap();
+        assert_eq!(*scope_id, 17);
+        assert!(admission.is_some());
+        assert_eq!(bridge.retained_counts(), charged);
+        assert_eq!(
+            work.step,
+            Some(PackageEntityFamilyStep::ReleaseResync {
+                scope_id: 17,
+                family_token: 23,
+            })
+        );
+        assert!(family.resync.leases.is_empty());
+        drop(work);
+        assert_eq!(bridge.retained_counts(), (0, 0));
+    }
+
+    #[test]
+    fn fanout_index_fault_retains_original_publication_credit() {
+        let (bridge, mutation) = charged_mutation();
+        let charged = bridge.retained_counts();
+        let lease = EntityMutationLease {
+            admission: mutation.admission().cloned(),
+            scope_id: 17,
+            family_token: 23,
+            family: "p.item".into(),
+            generation: 7,
+            seq: 3,
+        };
+        let mut queue = PackageEntityFanoutQueue::default();
+        queue
+            .try_push(LeasedFanoutMutation {
+                mutation,
+                lease: Some(lease),
+                generation: 7,
+            })
+            .unwrap();
+        queue.sequences_by_family.clear();
+        let mut retained = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.pop_first_into(&mut retained);
+        }));
+        assert!(result.is_err());
+        assert_eq!(bridge.retained_counts(), charged);
+        let item = retained.as_ref().unwrap();
+        let lease = item.lease.as_ref().unwrap();
+        assert_eq!(
+            (
+                lease.scope_id,
+                lease.family_token,
+                lease.generation,
+                lease.seq
+            ),
+            (17, 23, 7, 3)
+        );
+        assert_eq!(lease.admission.as_ref(), item.mutation.admission());
+        let PackageEntityMutation::Upsert { entity, .. } = &item.mutation else {
+            panic!("the original payload is an upsert");
+        };
+        assert_eq!(entity, &json!({"id": "item-3", "payload": "retained"}));
+        assert!(queue.pending_by_seq.is_empty());
+        drop(retained);
+        assert_eq!(bridge.retained_counts(), (0, 0));
     }
 
     #[test]

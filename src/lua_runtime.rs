@@ -67,6 +67,7 @@ pub struct HubCoordinationBridge {
 
 mod entity_publish;
 use entity_publish::EntityPublishError;
+pub(crate) use entity_publish::PendingEntityPublishRequest;
 pub use entity_publish::{EntityPublishPermit, HubEntityPublishBridge};
 
 impl HubCoordinationBridge {

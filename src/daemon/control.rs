@@ -4,6 +4,7 @@ pub(crate) mod connection;
 pub(crate) mod entities;
 pub(crate) mod events;
 pub(crate) mod host;
+mod host_family;
 pub(crate) mod host_work;
 pub(crate) mod managed_git;
 pub(crate) mod message;

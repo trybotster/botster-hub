@@ -1,4 +1,4 @@
-//! Incremental family inspection for package entity resync.
+//! Incremental family inspection through retained Host model phases.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -7,18 +7,47 @@ use crate::HubDaemon;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::DeadlineKey;
 use crate::daemon_maintenance::MaintenanceSliceKind;
+use crate::host_executor::{
+    HostCommand, HostCompletion, HostJobIdentity, HostResult, HostSubmissionFailure, HostWorkPermit,
+};
 use crate::plugin_entity::Target;
+use crate::runtime::CausalTransitionStatus;
+use crate::runtime::entity_model::{Operation, Work};
+use crate::runtime::resync::{Action, Cursor};
 
-/// One cursor covers the family collection. Changes request another complete pass.
+#[derive(Default)]
+enum Stage {
+    #[default]
+    NextFamily,
+    CheckFamily,
+    Target,
+    Attempt,
+    Clear,
+}
+
+/// One scan owns family queries and indexed releases through the existing scheduler.
 #[derive(Default)]
 pub(crate) struct PackageEntityResyncScan {
-    after: Option<String>,
+    cursor: Option<Cursor>,
     target_after: Option<Arc<Target>>,
-    finding_target: bool,
-    releasing_degraded_leases: bool,
+    subscription_id: Option<String>,
+    stage: Stage,
     earliest: Option<Instant>,
     running: bool,
+    scanning: bool,
     changed: bool,
+    identity: Option<HostJobIdentity>,
+    permit: Option<HostWorkPermit>,
+    operation: Option<Operation>,
+    work: Option<Work>,
+    action: Option<Action>,
+    completion: Option<HostCompletion>,
+    failure: Option<HostSubmissionFailure>,
+    faulted: bool,
+    #[cfg(test)]
+    fail_release: bool,
+    waiting_for_progress: bool,
+    pub(crate) waiting_for_host: bool,
     pub(crate) deadline_key: Option<DeadlineKey>,
 }
 
@@ -29,128 +58,280 @@ enum ScanStep {
 }
 
 impl PackageEntityResyncScan {
+    #[cfg(test)]
+    pub(crate) fn test_running(&self) -> bool {
+        self.running
+    }
+
+    #[cfg(test)]
+    fn test_after(&self) -> Option<String> {
+        self.cursor
+            .as_ref()
+            .and_then(|cursor| cursor.after.clone())
+            .or_else(|| self.work.as_ref().and_then(Work::test_resync_after))
+    }
+
+    pub(crate) fn accepts(&self, identity: HostJobIdentity) -> bool {
+        self.identity == Some(identity)
+            && self.work.is_some()
+            && self.permit.is_none()
+            && self.completion.is_none()
+            && self.failure.is_none()
+    }
+
+    pub(crate) fn retain_completion(&mut self, completion: HostCompletion) {
+        self.completion = Some(completion);
+    }
+
+    pub(crate) fn note_progress(&mut self) {
+        self.waiting_for_progress = false;
+    }
+
+    pub(crate) fn ready(&self, runtime: &crate::HubRuntime) -> bool {
+        !self.faulted
+            && self.failure.is_none()
+            && !self.waiting_for_progress
+            && !self.waiting_for_host
+            && (self.completion.is_some()
+                || (self.work.is_none()
+                    && (self.running || self.changed || runtime.entity_model_readiness().releases)))
+    }
+
     fn remember_deadline(&mut self, deadline: Instant) {
         self.earliest = Some(self.earliest.map_or(deadline, |old| old.min(deadline)));
+    }
+
+    fn inspect_family(&mut self, state: &DaemonControlState) {
+        let cursor = self.cursor.as_ref().expect("the scan retains its cursor");
+        let family = cursor
+            .after
+            .as_deref()
+            .expect("the scan retains its family");
+        if !state.plugin_entities.has_resync(family)
+            && let Some(deadline) = cursor.observation.deadline
+        {
+            if deadline <= Instant::now() {
+                self.stage = Stage::Target;
+                return;
+            }
+            self.remember_deadline(deadline);
+        }
+        self.target_after = None;
+        self.stage = Stage::NextFamily;
     }
 
     fn step(&mut self, daemon: &HubDaemon, state: &mut DaemonControlState) -> ScanStep {
         let Some(runtime) = daemon.runtime() else {
             return ScanStep::Idle;
         };
-        if !self.running {
-            if !self.changed {
-                return ScanStep::Idle;
-            }
-            self.running = true;
-            self.changed = false;
-            self.after = None;
-            self.target_after = None;
-            self.finding_target = false;
-            self.releasing_degraded_leases = false;
-            self.earliest = None;
+        if !self.ready(runtime) {
+            return ScanStep::Idle;
         }
-        if self.finding_target {
-            return self.step_target(daemon, state);
-        }
-        if self.releasing_degraded_leases {
-            let family = self
-                .after
-                .as_deref()
-                .expect("lease release retains its family");
-            self.releasing_degraded_leases =
-                runtime.release_one_degraded_package_entity_resync_lease(family);
-            if self.releasing_degraded_leases {
-                state
-                    .maintenance
-                    .wakes
-                    .mark(MaintenanceSliceKind::HostBridge);
-            }
-            return ScanStep::Again;
-        }
-        let Some((family, deadline, degraded_leases)) =
-            runtime.next_package_entity_resync_family(self.after.as_deref())
-        else {
-            self.running = false;
-            return if self.changed {
-                ScanStep::Again
+        if let Some(completion) = self.completion.as_ref() {
+            let identity = self.identity.expect("the scan retains its identity");
+            let status = if completion.identity != identity {
+                CausalTransitionStatus::Fault
+            } else if let HostResult::EntityModelComplete(kind) = completion.result {
+                runtime.observe_entity_model(identity, kind)
             } else {
-                ScanStep::Complete(self.earliest.take())
+                CausalTransitionStatus::Fault
             };
-        };
-        let pending = state.plugin_entities.has_resync(&family);
-        self.after = Some(family);
-        self.releasing_degraded_leases = degraded_leases;
-        if !pending && let Some(deadline) = deadline {
-            if deadline <= Instant::now() {
-                self.finding_target = true;
-                self.target_after = None;
+            match status {
+                CausalTransitionStatus::Waiting => {
+                    self.waiting_for_progress = true;
+                    return ScanStep::Idle;
+                }
+                CausalTransitionStatus::Fault => {
+                    runtime.fault_entity_model(identity);
+                    self.faulted = true;
+                    return ScanStep::Idle;
+                }
+                CausalTransitionStatus::Applied => {}
+            }
+            let Some(next_identity) = identity.next_phase() else {
+                runtime.fault_entity_model(identity);
+                self.faulted = true;
+                return ScanStep::Idle;
+            };
+            let work = self.work.as_ref().unwrap();
+            let mut output = runtime
+                .entity_model_output(work)
+                .expect("the exact receipt permits output access");
+            self.cursor = output.take_resync_cursor();
+            drop(output);
+            assert!(runtime.release_entity_model(work));
+            assert!(work.owner_drop_ready());
+            drop(self.work.take());
+            let (_, _, permit) = self.completion.take().unwrap().into_parts();
+            self.permit = Some(permit);
+            self.identity = Some(next_identity);
+            match self.action.take().unwrap() {
+                Action::Release => {}
+                Action::NextFamily => {
+                    if self
+                        .cursor
+                        .as_ref()
+                        .unwrap()
+                        .observation
+                        .generation
+                        .is_none()
+                    {
+                        self.stage = Stage::Clear;
+                    } else {
+                        self.target_after = None;
+                        self.inspect_family(state);
+                    }
+                }
+                Action::CheckFamily => self.inspect_family(state),
+                Action::RecordAttempt => {
+                    let cursor = self.cursor.as_ref().unwrap();
+                    let observation = cursor.observation;
+                    if observation.attempted {
+                        state.lifecycle_counters.package_entity_resync_attempts = state
+                            .lifecycle_counters
+                            .package_entity_resync_attempts
+                            .saturating_add(1);
+                        if observation.degraded {
+                            state.lifecycle_counters.package_entity_resync_degraded = state
+                                .lifecycle_counters
+                                .package_entity_resync_degraded
+                                .saturating_add(1);
+                        } else {
+                            let family = cursor.after.as_ref().unwrap();
+                            crate::daemon::control::entities::begin_plugin_entity_resync(
+                                daemon,
+                                state,
+                                family.clone(),
+                                self.subscription_id.take().unwrap(),
+                            );
+                            if !state.plugin_entities.has_resync(family)
+                                && let Some(deadline) = observation.deadline
+                            {
+                                self.remember_deadline(deadline);
+                            }
+                        }
+                    } else if let Some(deadline) = observation.deadline {
+                        self.remember_deadline(deadline);
+                    }
+                    self.subscription_id = None;
+                    self.target_after = None;
+                    self.stage = Stage::NextFamily;
+                }
+                Action::Clear => {
+                    drop(self.cursor.take());
+                    drop(self.permit.take());
+                    self.identity = None;
+                    self.running = false;
+                    return if self.changed || runtime.entity_model_readiness().releases {
+                        ScanStep::Again
+                    } else if self.scanning {
+                        ScanStep::Complete(self.earliest.take())
+                    } else {
+                        ScanStep::Idle
+                    };
+                }
+            }
+            return ScanStep::Again;
+        }
+        if !self.running {
+            let Some(permit) = runtime.host_executor().try_reserve() else {
+                self.waiting_for_host = true;
+                return ScanStep::Idle;
+            };
+            let Some(waiter) = state.waiter_ids.next() else {
+                drop(permit);
+                self.faulted = true;
+                return ScanStep::Idle;
+            };
+            self.permit = Some(permit);
+            self.identity = Some(HostJobIdentity::first(waiter));
+            self.running = true;
+            self.scanning = self.changed;
+            self.stage = if self.scanning {
+                Stage::NextFamily
             } else {
-                self.remember_deadline(deadline);
+                Stage::Clear
+            };
+            if self.changed {
+                self.earliest = None;
             }
+            self.changed = false;
+            self.cursor = Some(Cursor::default());
+            return ScanStep::Again;
         }
-        ScanStep::Again
+        if self.operation.is_none() {
+            if matches!(self.stage, Stage::Target) && !runtime.entity_model_readiness().releases {
+                let family = self.cursor.as_ref().unwrap().after.as_ref().unwrap();
+                let target =
+                    super::entity::next_package_entity_target(state, self.target_after.as_deref());
+                self.subscription_id = match target {
+                    Some(target) if target.entity_type == *family => {
+                        Some(target.subscription_id.clone())
+                    }
+                    Some(target) => {
+                        self.target_after = Some(target);
+                        self.stage = Stage::CheckFamily;
+                        return ScanStep::Again;
+                    }
+                    None => Some(format!("package-entity-resync-{family}")),
+                };
+                self.stage = Stage::Attempt;
+            }
+            let action = if runtime.entity_model_readiness().releases {
+                Action::Release
+            } else {
+                match self.stage {
+                    Stage::NextFamily => Action::NextFamily,
+                    Stage::CheckFamily => Action::CheckFamily,
+                    Stage::Attempt => Action::RecordAttempt,
+                    Stage::Clear => Action::Clear,
+                    Stage::Target => unreachable!(),
+                }
+            };
+            self.action = Some(action);
+            self.operation = Some(Operation::Resync {
+                action,
+                retained: self.cursor.take(),
+            });
+        }
+        let identity = self.identity.unwrap();
+        let operation = self.operation.take().unwrap();
+        let work =
+            match runtime.begin_entity_model(identity, operation, self.permit.as_ref().unwrap()) {
+                Ok(work) => work,
+                Err((status, operation)) => {
+                    self.operation = Some(operation);
+                    if status == CausalTransitionStatus::Waiting {
+                        self.waiting_for_progress = true;
+                    } else {
+                        self.faulted = true;
+                    }
+                    return ScanStep::Idle;
+                }
+            };
+        #[cfg(test)]
+        if self.fail_release && self.action == Some(Action::Release) {
+            work.test_fail_after_operation();
+            self.fail_release = false;
+        }
+        self.work = Some(work.clone());
+        if let Err(failure) = runtime.host_executor().submit(
+            identity,
+            HostCommand::EntityModel(work),
+            self.permit.take().unwrap(),
+        ) {
+            runtime.fault_entity_model(identity);
+            self.failure = Some(failure);
+        }
+        ScanStep::Idle
     }
+}
 
-    /// Inspect one subscriber, then admit the provider after a matching subscriber or the end.
-    fn step_target(&mut self, daemon: &HubDaemon, state: &mut DaemonControlState) -> ScanStep {
-        let runtime = daemon.runtime().expect("the scan has a live runtime");
-        let family = self
-            .after
-            .as_ref()
-            .expect("target selection retains the family");
-        let deadline = runtime.package_entity_resync_next_attempt(family);
-        if state.plugin_entities.has_resync(family) || deadline.is_none() {
-            self.finding_target = false;
-            self.target_after = None;
-            return ScanStep::Again;
-        }
-        let deadline = deadline.expect("the resync need was checked");
-        if deadline > Instant::now() {
-            self.finding_target = false;
-            self.target_after = None;
-            self.remember_deadline(deadline);
-            return ScanStep::Again;
-        }
-        let target = super::entity::next_package_entity_target(state, self.target_after.as_deref());
-        let subscription_id = match target {
-            Some(target) if target.entity_type == *family => target.subscription_id.clone(),
-            Some(target) => {
-                self.target_after = Some(target);
-                return ScanStep::Again;
-            }
-            None => format!("package-entity-resync-{family}"),
-        };
-        state.lifecycle_counters.package_entity_resync_attempts = state
-            .lifecycle_counters
-            .package_entity_resync_attempts
-            .saturating_add(1);
-        if runtime.record_package_entity_resync_attempt(family) {
-            self.releasing_degraded_leases = true;
-            state
-                .maintenance
-                .wakes
-                .mark(MaintenanceSliceKind::HostBridge);
-            state.lifecycle_counters.package_entity_resync_degraded = state
-                .lifecycle_counters
-                .package_entity_resync_degraded
-                .saturating_add(1);
-        } else {
-            crate::daemon::control::entities::begin_plugin_entity_resync(
-                daemon,
-                state,
-                family.clone(),
-                subscription_id,
-            );
-            if !state.plugin_entities.has_resync(family)
-                && let Some(deadline) = runtime.package_entity_resync_next_attempt(family)
-            {
-                self.remember_deadline(deadline);
-            }
-        }
-        self.finding_target = false;
-        self.target_after = None;
-        ScanStep::Again
-    }
+pub(crate) fn mark_ready(state: &mut DaemonControlState) {
+    state
+        .maintenance
+        .wakes
+        .mark(MaintenanceSliceKind::ProviderResync);
 }
 
 /// Preserve changes behind the current cursor until the next complete pass.
@@ -159,25 +340,19 @@ pub(crate) fn note_package_entity_resync_change(state: &mut DaemonControlState) 
     if let Some(key) = state.package_entity_resync_scan.deadline_key.take() {
         state.deadlines.disarm(key);
     }
-    state
-        .maintenance
-        .wakes
-        .mark(MaintenanceSliceKind::ProviderResync);
+    mark_ready(state);
 }
 
-/// Perform one family inspection or one subscriber inspection through the owner scheduler.
+/// Advance one retained scan phase through the owner scheduler.
 pub(crate) fn drive_package_entity_resync(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let mut scan = std::mem::take(&mut state.package_entity_resync_scan);
     let step = scan.step(daemon, state);
     state.package_entity_resync_scan = scan;
     match step {
         ScanStep::Idle => {}
-        ScanStep::Again => state
-            .maintenance
-            .wakes
-            .mark(MaintenanceSliceKind::ProviderResync),
+        ScanStep::Again => mark_ready(state),
         ScanStep::Complete(deadline) => {
-            crate::daemon::owner_loop::arm_package_entity_resync_deadline(state, deadline);
+            crate::daemon::owner_loop::arm_package_entity_resync_deadline(state, deadline)
         }
     }
 }
@@ -213,6 +388,364 @@ mod tests {
             HubDaemon::start(config).expect("start the resync test daemon"),
             directory,
         )
+    }
+
+    fn add_release(daemon: &HubDaemon, family: &str) -> u64 {
+        let runtime = daemon.runtime().unwrap();
+        let family_token = runtime.test_family_causal_token(family);
+        let scope = runtime
+            .causal_scopes()
+            .mint_with_lease(Some(
+                crate::package_event_router::LeaseIdentity::ProviderResyncNeed { family_token },
+            ))
+            .unwrap();
+        runtime.test_store_resync_lease(scope, family);
+        scope
+    }
+
+    #[test]
+    fn idle_scan_releases_multiple_leases_through_exact_table_receipts() {
+        let (mut daemon, directory) = daemon("idle-releases");
+        let mut state = DaemonControlState::default();
+        let scopes: Vec<_> = (0..3).map(|_| add_release(&daemon, "releases")).collect();
+        let table = Arc::clone(daemon.runtime().unwrap().causal_scopes());
+        assert!(!state.package_entity_resync_scan.changed);
+        let limit = Instant::now() + Duration::from_secs(3);
+        table.test_with_inner_held(|| {
+            while !state.package_entity_resync_scan.waiting_for_progress
+                || state.package_entity_resync_scan.completion.is_none()
+            {
+                crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+                assert!(
+                    Instant::now() < limit,
+                    "the original release must reach its receipt wait"
+                );
+                std::thread::yield_now();
+            }
+            let identity = state.package_entity_resync_scan.identity;
+            let release = state
+                .package_entity_resync_scan
+                .work
+                .as_ref()
+                .unwrap()
+                .test_resync_release();
+            assert_eq!(release, Some(scopes[0]));
+            assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+            assert_eq!(state.budget.outstanding(), 0);
+            for _ in 0..20 {
+                crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+                assert_eq!(state.package_entity_resync_scan.identity, identity);
+                assert_eq!(
+                    state
+                        .package_entity_resync_scan
+                        .work
+                        .as_ref()
+                        .unwrap()
+                        .test_resync_release(),
+                    release
+                );
+            }
+            assert!(
+                !state
+                    .package_entity_resync_scan
+                    .ready(daemon.runtime().unwrap())
+            );
+        });
+        while scopes.iter().any(|scope| table.is_live(*scope))
+            || state.package_entity_resync_scan.running
+        {
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(
+                Instant::now() < limit,
+                "every release must apply before the scan retires"
+            );
+            std::thread::yield_now();
+        }
+        assert!(!daemon.runtime().unwrap().entity_model_readiness().releases);
+        assert!(
+            !state
+                .package_entity_resync_scan
+                .ready(daemon.runtime().unwrap())
+        );
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+        assert_eq!(state.budget.outstanding(), 0);
+        assert!(!state.package_entity_resync_scan.changed);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexed_release_progresses_when_owner_capacity_refuses_new_providers() {
+        let (mut daemon, directory) = daemon("release-full-owner");
+        let mut state = DaemonControlState::default();
+        let mut permits = Vec::new();
+        while let Some(permit) = state.budget.reserve() {
+            permits.push(permit);
+        }
+        let scope = add_release(&daemon, "releases");
+        daemon
+            .runtime()
+            .unwrap()
+            .mark_package_entity_resync_needed("missing.family");
+        let limit = Instant::now() + Duration::from_secs(3);
+        while daemon.runtime().unwrap().causal_scopes().is_live(scope)
+            || state.package_entity_resync_scan.running
+            || state.package_entity_resync_scan.deadline_key.is_none()
+        {
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(
+                Instant::now() < limit,
+                "existing releases must not need new Owner capacity"
+            );
+            assert_eq!(state.budget.outstanding(), permits.len());
+            std::thread::yield_now();
+        }
+        assert_eq!(state.lifecycle_counters.package_entity_resync_attempts, 1);
+        assert!(!state.plugin_entities.has_resync("missing.family"));
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+        for permit in permits {
+            state.budget.release(permit);
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn release_faults_retain_the_original_work_and_capacity() {
+        for condition in ["host-failure", "phase-exhaustion", "stopped"] {
+            let (mut daemon, directory) = daemon(condition);
+            let mut state = DaemonControlState::default();
+            let scope = add_release(&daemon, "releases");
+            let mut scan = std::mem::take(&mut state.package_entity_resync_scan);
+            assert!(matches!(scan.step(&daemon, &mut state), ScanStep::Again));
+            let limit = Instant::now() + Duration::from_secs(3);
+            match condition {
+                "host-failure" => scan.fail_release = true,
+                "phase-exhaustion" => scan.identity.as_mut().unwrap().phase = u64::MAX,
+                "stopped" => daemon.runtime_mut().unwrap().test_stop_host_submissions(),
+                _ => unreachable!(),
+            }
+            state.package_entity_resync_scan = scan;
+            while !state.package_entity_resync_scan.faulted
+                && state.package_entity_resync_scan.failure.is_none()
+            {
+                crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+                assert!(
+                    Instant::now() < limit,
+                    "the real Host route must retain its failure"
+                );
+                std::thread::yield_now();
+            }
+            let runtime = daemon.runtime().unwrap();
+            let scan = &state.package_entity_resync_scan;
+            assert!(scan.work.is_some());
+            if condition == "stopped" {
+                assert!(scan.failure.is_some());
+                assert_eq!(runtime.test_resync_lease_count("releases"), 1);
+            } else {
+                assert!(scan.completion.is_some());
+                assert_eq!(
+                    scan.work.as_ref().unwrap().test_resync_release(),
+                    Some(scope)
+                );
+            }
+            assert!(!runtime.entity_model_available());
+            assert_eq!(runtime.host_executor().outstanding(), 1);
+            assert_eq!(state.budget.outstanding(), 0);
+            assert!(!scan.ready(runtime));
+            for _ in 0..20 {
+                crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            }
+            assert!(state.package_entity_resync_scan.work.is_some());
+            assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+            daemon.stop();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn indexed_release_preserves_an_existing_provider_retry_deadline() {
+        let (mut daemon, directory) = daemon("release-deadline");
+        let mut state = DaemonControlState::default();
+        daemon
+            .runtime()
+            .unwrap()
+            .mark_package_entity_resync_needed("missing.family");
+        let limit = Instant::now() + Duration::from_secs(3);
+        while state.package_entity_resync_scan.deadline_key.is_none() {
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        let deadline = state.package_entity_resync_scan.deadline_key.unwrap();
+        let attempts = state.lifecycle_counters.package_entity_resync_attempts;
+        assert!(!state.package_entity_resync_scan.changed);
+        let scope = add_release(&daemon, "releases");
+        while daemon.runtime().unwrap().causal_scopes().is_live(scope)
+            || state.package_entity_resync_scan.running
+        {
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            state.package_entity_resync_scan.deadline_key,
+            Some(deadline)
+        );
+        while state.lifecycle_counters.package_entity_resync_attempts == attempts {
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(
+                Instant::now() < limit,
+                "the retained deadline must trigger the next attempt"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn scan_returns_the_last_host_slot_without_provider_progress() {
+        let (mut daemon, directory) = daemon("scan-last-slot");
+        let mut state = DaemonControlState::default();
+        let permits: Vec<_> = (0..7)
+            .map(|_| {
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .host_executor()
+                    .try_reserve()
+                    .unwrap()
+            })
+            .collect();
+        daemon
+            .runtime()
+            .unwrap()
+            .mark_package_entity_resync_needed("missing.family");
+        let limit = Instant::now() + Duration::from_secs(3);
+        while !state.package_entity_resync_scan.running {
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(Instant::now() < limit);
+        }
+        while state.package_entity_resync_scan.running {
+            assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 8);
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(
+                Instant::now() < limit,
+                "the scan must retire without provider Host capacity"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(state.lifecycle_counters.package_entity_resync_attempts, 1);
+        assert!(state.package_entity_resync_scan.permit.is_none());
+        assert!(state.package_entity_resync_scan.cursor.is_none());
+        drop(permits);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrated_fanout_finish_wakes_an_idle_scan_after_table_application() {
+        use crate::host_executor::{HostCommand, HostCompletionPoll, HostJobIdentity, HostResult};
+        use crate::owner_identity::WaiterId;
+        use crate::package_entity_fanout::PackageEntityMutation;
+        use crate::package_event_router::LeaseIdentity;
+        use crate::runtime::entity_model::{Kind, Operation};
+        use crate::runtime::{CausalTransitionStatus, PackageEntitySnapshotStep};
+
+        let (mut daemon, directory) = daemon("model-finish-wake");
+        let mut state = DaemonControlState::default();
+        let runtime = daemon.runtime().unwrap();
+        let family = "idle.family";
+        runtime.test_store_family_payload(PackageEntityMutation::Upsert {
+            admission: None,
+            entity_type: family.into(),
+            snapshot_seq: 1,
+            id: "item".into(),
+            entity: serde_json::json!({"id": "item"}),
+        });
+        let family_token = runtime.test_family_causal_token(family);
+        let scope = runtime
+            .causal_scopes()
+            .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                family_token,
+                seq: 1,
+            }))
+            .unwrap();
+        runtime.test_store_pending_lease(scope, family, 1);
+        runtime.begin_package_entity_provider_snapshot(family, 0);
+        let PackageEntitySnapshotStep::Ready(item) =
+            runtime.step_package_entity_provider_snapshot(family)
+        else {
+            panic!("the fixture retains an admitted mutation");
+        };
+        let (mutation, mut finish) = item.into_parts();
+        drop(mutation);
+        finish.scheduled_resync = true;
+        runtime.take_package_entity_resync_notification();
+        assert!(matches!(
+            state
+                .package_entity_resync_scan
+                .step(&daemon, &mut DaemonControlState::default()),
+            ScanStep::Idle
+        ));
+        assert!(state.package_entity_resync_scan.deadline_key.is_none());
+        let identity = HostJobIdentity::first(WaiterId(39));
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        let work = runtime
+            .begin_entity_model(
+                identity,
+                Operation::FinishFanout {
+                    finish,
+                    retained: None,
+                },
+                &permit,
+            )
+            .unwrap_or_else(|_| panic!("model capacity is available"));
+        runtime
+            .host_executor()
+            .submit(identity, HostCommand::EntityModel(work.clone()), permit)
+            .unwrap();
+        let limit = Instant::now() + Duration::from_secs(3);
+        let completion = loop {
+            match runtime.host_executor().poll_completion() {
+                HostCompletionPoll::Ready(completion) => break completion,
+                HostCompletionPoll::Empty => std::thread::yield_now(),
+                HostCompletionPoll::Stopped => panic!("the Host executor stopped"),
+            }
+            assert!(Instant::now() < limit);
+        };
+        assert!(matches!(
+            completion.result,
+            HostResult::EntityModelComplete(Kind::FinishFanout)
+        ));
+        assert_eq!(
+            runtime.observe_entity_model(identity, Kind::FinishFanout),
+            CausalTransitionStatus::Waiting
+        );
+        assert!(!runtime.take_package_entity_resync_notification());
+        runtime
+            .causal_scopes()
+            .test_with_inner_held(|| runtime.apply_causal_owner_ops());
+        assert!(!runtime.release_entity_model(&work));
+        assert!(!runtime.take_package_entity_resync_notification());
+        runtime.apply_causal_owner_ops();
+        assert_eq!(
+            runtime.observe_entity_model(identity, Kind::FinishFanout),
+            CausalTransitionStatus::Applied
+        );
+        assert!(runtime.release_entity_model(&work));
+        assert!(work.owner_drop_ready());
+        drop(work);
+        drop(completion);
+        crate::daemon::owner_loop::publish_completion_wakes(&daemon, &mut state);
+        assert!(state.package_entity_resync_scan.changed);
+        let mut scan = std::mem::take(&mut state.package_entity_resync_scan);
+        assert!(matches!(scan.step(&daemon, &mut state), ScanStep::Again));
+        assert!(scan.running);
+        state.package_entity_resync_scan = scan;
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -264,7 +797,7 @@ mod tests {
             crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
             if state
                 .package_entity_resync_scan
-                .after
+                .test_after()
                 .as_deref()
                 .is_some_and(|after| after > "family-0000")
             {

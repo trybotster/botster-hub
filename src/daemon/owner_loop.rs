@@ -61,7 +61,6 @@ enum BackgroundWork {
     CausalProgress,
     CausalDrain,
     EntityPublish,
-    CausalFamilyRelease,
     EventOwner,
     ManagedSpawn,
     PluginReady,
@@ -81,6 +80,7 @@ fn causal_waiter_upper_bound(
         .map(|(id, _)| *id)
         .into_iter()
         .chain(state.plugin_entities.causal_waiters.last().copied())
+        .chain(state.plugin_entities.model_waiters.last().copied())
         .max()
 }
 
@@ -239,8 +239,7 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
         | BackgroundWork::ManagedSpawn => ReadyClass::HostCompletion,
         BackgroundWork::EventOwner
         | BackgroundWork::EntityPublish
-        | BackgroundWork::CausalDrain
-        | BackgroundWork::CausalFamilyRelease => ReadyClass::HostBridge,
+        | BackgroundWork::CausalDrain => ReadyClass::HostBridge,
         BackgroundWork::PluginReady | BackgroundWork::PluginEntityReady => {
             ReadyClass::PluginCompletion
         }
@@ -373,16 +372,19 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         let capacity_progress = runtime.take_causal_capacity_notification();
         runtime.note_entity_publish_progress(table_progress, capacity_progress);
         if runtime.entity_publish_bridge().take_progress_notification() {
+            state.publication_owner.note_progress();
             crate::daemon::control::pending::wake_shutdown_waiter(state);
         }
         let causal_progress = table_progress | capacity_progress;
-        if causal_progress {
-            state.publication_owner.note_causal_progress();
+        let model_progress = runtime.take_entity_model_notification();
+        if causal_progress || model_progress {
+            state.publication_owner.note_progress();
+            state.package_entity_resync_scan.note_progress();
         }
         if state.publication_owner.ready(runtime) {
             mark_background_ready(state, BackgroundWork::EntityPublish);
         }
-        if causal_progress {
+        if causal_progress || model_progress {
             if state.causal_wake_active {
                 state.causal_wake_again = true;
             } else {
@@ -393,8 +395,8 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
             state.maintenance.note_causal_capacity_progress();
             mark_background_ready(state, BackgroundWork::CausalProgress);
         }
-        if runtime.causal_family_release_ready() {
-            mark_background_ready(state, BackgroundWork::CausalFamilyRelease);
+        if state.package_entity_resync_scan.ready(runtime) {
+            crate::subscription::entity_resync::mark_ready(state);
         }
         if runtime.causal_owner_ops_ready() {
             mark_background_ready(state, BackgroundWork::CausalDrain);
@@ -758,14 +760,6 @@ pub(crate) fn run_background_ready_item(
                 }
             }
         }
-        BackgroundWork::CausalFamilyRelease => {
-            if let Some(runtime) = daemon.runtime() {
-                runtime.retry_family_resync_release();
-                if runtime.causal_family_release_ready() {
-                    mark_background_ready(state, BackgroundWork::CausalFamilyRelease);
-                }
-            }
-        }
         BackgroundWork::CausalProgress => {
             use std::ops::Bound::{Excluded, Included, Unbounded};
             let next = state.causal_wake_through.and_then(|through| {
@@ -781,11 +775,19 @@ pub(crate) fn run_background_ready_item(
                     .range((lower, Included(through)))
                     .next()
                     .copied();
-                family.into_iter().chain(entity).min()
+                let model = state
+                    .plugin_entities
+                    .model_waiters
+                    .range((lower, Included(through)))
+                    .next()
+                    .copied();
+                family.into_iter().chain(entity).chain(model).min()
             });
             if let Some(waiter) = next {
                 state.causal_wake_after = Some(waiter);
-                if state.plugin_entities.causal_waiters.contains(&waiter) {
+                if state.plugin_entities.causal_waiters.contains(&waiter)
+                    || state.plugin_entities.model_waiters.contains(&waiter)
+                {
                     let marked = crate::daemon::control::entities::mark_plugin_entity_ready(
                         state,
                         waiter,
@@ -794,6 +796,7 @@ pub(crate) fn run_background_ready_item(
                     );
                     if marked || !state.plugin_entities.has_waiter(waiter) {
                         state.plugin_entities.causal_waiters.remove(&waiter);
+                        state.plugin_entities.model_waiters.remove(&waiter);
                     }
                 } else {
                     let marked = crate::daemon::control::pending::mark_owner_ready(
@@ -1914,7 +1917,9 @@ mod tests {
                     if let Some(completion) = state.host_completions.get_mut(&waiter)
                         && matches!(
                             completion.result,
-                            crate::host_executor::HostResult::FamilyCleanupComplete { .. }
+                            crate::host_executor::HostResult::EntityModelComplete(
+                                crate::runtime::entity_model::Kind::CleanupDetached
+                            )
                         )
                     {
                         completion.identity = completion.identity.next_phase().unwrap();
@@ -1999,22 +2004,14 @@ mod tests {
                 let Some(
                     crate::daemon::control::host_work::HostRecoveryRequired::PackageFamilyWork {
                         owner_permit: Some(_),
-                        _result,
-                        _unexpected: Some(_),
-                        _permit: Some(_),
+                        _work,
                         ..
                     },
                 ) = state.host_recovery.get(&waiter)
                 else {
                     panic!("stale completion must retain cleanup and both permits");
                 };
-                let crate::host_mutations::HostMutationResult::PackageEffectApplied {
-                    cleanup, ..
-                } = _result.as_ref()
-                else {
-                    panic!("retain the original package result");
-                };
-                assert!(cleanup.family_cursor.release.is_some());
+                assert!(_work.test_retained_release());
                 assert!(scopes.is_live(scope));
                 assert_eq!(state.budget.outstanding(), 1);
                 assert!(
@@ -2040,7 +2037,9 @@ mod tests {
             );
             assert!(state.host_recovery.is_empty());
             assert!(state.family_cleanup_waiters.is_empty());
-            while daemon.runtime().unwrap().causal_operation_count() > 0 {
+            while daemon.runtime().unwrap().causal_operation_count() > 0
+                || state.package_entity_resync_scan.test_running()
+            {
                 assert!(Instant::now() < deadline, "admitted releases must drain");
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             }
@@ -4072,12 +4071,16 @@ return botster.register({
         for outcome in [
             "prepare_cancel",
             "acquire_cancel",
+            "acquire_queue_cancel",
             "deliver",
             "cancel",
             "fault",
         ] {
             let fault = outcome == "fault";
-            let before_admission = matches!(outcome, "prepare_cancel" | "acquire_cancel");
+            let before_admission = matches!(
+                outcome,
+                "prepare_cancel" | "acquire_cancel" | "acquire_queue_cancel"
+            );
             let root = unique_package_control_dir(&format!("early-provider-{outcome}"));
             let package_dir = root.join("owner-entity-gate");
             write_package_control_manifest(
@@ -4194,20 +4197,23 @@ return botster.register({
                     crate::daemon::control::pending::READY_HOST_COMPLETION,
                 );
                 if outcome == "acquire_cancel" {
-                    let item = state.owner_ready.pop_next().unwrap();
-                    crate::daemon::control::entities::drive_plugin_entity_ready_item(
-                        &mut daemon,
-                        &mut state,
-                        item,
-                    );
-                    scopes.test_with_inner_held(|| {
-                        let item = state.owner_ready.pop_next().unwrap();
-                        crate::daemon::control::entities::drive_plugin_entity_ready_item(
-                            &mut daemon,
-                            &mut state,
-                            item,
+                    while !state.plugin_entities.causal_waiters.contains(&waiter) {
+                        collect_entity_test_host_completions(&daemon, &mut state);
+                        scopes.test_with_inner_held(|| {
+                            if let Some(item) = state.owner_ready.pop_next() {
+                                crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                                    &mut daemon,
+                                    &mut state,
+                                    item,
+                                );
+                            }
+                        });
+                        assert!(
+                            Instant::now() < deadline,
+                            "selection must reach causal acquisition"
                         );
-                    });
+                        thread::yield_now();
+                    }
                     let (selected_scope, token) =
                         state.plugin_entities.test_provider_lease(waiter).unwrap();
                     assert_eq!(selected_scope, scope);
@@ -4218,12 +4224,84 @@ return botster.register({
                     ));
                     assert!(state.plugin_entities.causal_waiters.contains(&waiter));
                 }
+                if outcome == "acquire_queue_cancel" {
+                    let selection = loop {
+                        if let HostCompletionPoll::Ready(completion) =
+                            daemon.runtime().unwrap().host_executor().poll_completion()
+                        {
+                            assert!(matches!(
+                                completion.result,
+                                HostResult::EntityModelComplete(
+                                    crate::runtime::entity_model::Kind::SelectProvider
+                                )
+                            ));
+                            break completion;
+                        }
+                        if let Some(item) = state.owner_ready.pop_next() {
+                            crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                                &mut daemon,
+                                &mut state,
+                                item,
+                            );
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "the Host selection must complete"
+                        );
+                        thread::yield_now();
+                    };
+                    let family_token = daemon
+                        .runtime()
+                        .unwrap()
+                        .test_family_causal_token("owner-entity-gate.entity");
+                    assert!(matches!(
+                        daemon.runtime().unwrap().admit_causal_op(
+                            crate::package_event_router::CausalOp::Release {
+                                scope_id: scope,
+                                identity: LeaseIdentity::ProviderResyncNeed { family_token },
+                            }
+                        ),
+                        crate::package_event_router::CausalAdmitResult::Applied
+                    ));
+                    state.plugin_entities.retain_host_completion(selection);
+                    crate::daemon::control::entities::mark_plugin_entity_ready(
+                        &mut state,
+                        waiter,
+                        crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                        crate::daemon::control::pending::READY_HOST_COMPLETION,
+                    );
+                    let item = state.owner_ready.pop_next().unwrap();
+                    crate::daemon::control::entities::drive_plugin_entity_ready_item(
+                        &mut daemon,
+                        &mut state,
+                        item,
+                    );
+                    assert!(state.plugin_entities.causal_waiters.contains(&waiter));
+                    let (selected_scope, token) =
+                        state.plugin_entities.test_provider_lease(waiter).unwrap();
+                    assert_eq!(selected_scope, scope);
+                    assert!(!scopes.identities(scope).unwrap().contains(
+                        &LeaseIdentity::ProviderInFlight {
+                            invocation_token: token
+                        }
+                    ));
+                    assert_eq!(daemon.runtime().unwrap().causal_operation_count(), 1);
+                    assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+                    assert_eq!(state.budget.outstanding(), 1);
+                    daemon.runtime().unwrap().apply_causal_owner_ops();
+                    assert!(
+                        !scopes.is_live(scope),
+                        "the queued release applies before any provider acquisition"
+                    );
+                }
                 crate::daemon::control::entities::retire_plugin_entity_connection(
                     &daemon,
                     &mut state,
                     "early-client",
                 );
-                while state.plugin_entities.has_waiter(waiter) {
+                while state.plugin_entities.has_waiter(waiter)
+                    || state.package_entity_resync_scan.test_running()
+                {
                     collect_entity_test_host_completions(&daemon, &mut state);
                     if let Some(item) = state.owner_ready.pop_next() {
                         crate::daemon::control::entities::drive_plugin_entity_ready_item(
@@ -4752,6 +4830,7 @@ return botster.register({ handlers = {{
         loop {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state));
             if bridge.pending_publish_count() == 0
+                && state.budget.outstanding() == 0
                 && !daemon
                     .runtime()
                     .unwrap()
@@ -4987,15 +5066,6 @@ return botster.register({
             }))
             .unwrap();
         runtime.test_store_resync_lease(scope, "owner-entity-gate.entity");
-        for _ in 0..crate::runtime::CAUSAL_OWNER_CAPACITY {
-            assert!(matches!(
-                runtime.admit_causal_op(CausalOp::Release {
-                    scope_id: u64::MAX,
-                    identity: LeaseIdentity::EventInFlight,
-                }),
-                CausalAdmitResult::Applied
-            ));
-        }
         let executor = runtime.host_executor();
         let mut host_permits = Vec::new();
         for _ in 1..crate::host_executor::HOST_OPERATION_CAPACITY {
@@ -5030,7 +5100,29 @@ return botster.register({
             item,
         );
         let deadline = Instant::now() + Duration::from_secs(3);
+        let mut causal_filled = false;
         while !state.plugin_entities.causal_waiters.contains(&waiter) {
+            if !causal_filled
+                && scopes
+                    .identities(scope)
+                    .unwrap()
+                    .iter()
+                    .any(|identity| matches!(identity, LeaseIdentity::ProviderInFlight { .. }))
+            {
+                for _ in 0..crate::runtime::CAUSAL_OWNER_CAPACITY {
+                    assert!(matches!(
+                        daemon
+                            .runtime()
+                            .unwrap()
+                            .admit_causal_op(CausalOp::Release {
+                                scope_id: u64::MAX,
+                                identity: LeaseIdentity::EventInFlight,
+                            }),
+                        CausalAdmitResult::Applied
+                    ));
+                }
+                causal_filled = true;
+            }
             collect_entity_test_host_completions(&daemon, &mut state);
             if let Some(item) = state.owner_ready.pop_next() {
                 crate::daemon::control::entities::drive_plugin_entity_ready_item(

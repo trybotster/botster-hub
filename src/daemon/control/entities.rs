@@ -74,6 +74,7 @@ pub(crate) struct PluginEntityState {
     completion_inconsistencies: u64,
     capacity_waiters: BTreeSet<crate::owner_identity::WaiterId>,
     pub(crate) causal_waiters: BTreeSet<crate::owner_identity::WaiterId>,
+    pub(crate) model_waiters: BTreeSet<crate::owner_identity::WaiterId>,
     causal_faults: BTreeSet<crate::owner_identity::WaiterId>,
     delivery_waiters: BTreeSet<crate::owner_identity::WaiterId>,
     active_delivery: Option<crate::owner_identity::WaiterId>,
@@ -760,6 +761,7 @@ pub(crate) fn drive_plugin_entity_ready_item(
             state.deadlines.retire(waiter_id);
             state.plugin_entities.capacity_waiters.remove(&waiter_id);
             state.plugin_entities.causal_waiters.remove(&waiter_id);
+            state.plugin_entities.model_waiters.remove(&waiter_id);
             state.plugin_entities.causal_faults.remove(&waiter_id);
             state.plugin_entities.delivery_waiters.remove(&waiter_id);
             if state.plugin_entities.pending_fanout == Some(waiter_id) {
