@@ -1010,3 +1010,40 @@ These checks do not establish final matched binaries or complete foundation acce
 The final focused contract test passes for both a different owner namespace and the invalid `p:item` format.
 Both cases fail before queue admission and retain no publication credit.
 Formatting and the patch whitespace check pass.
+
+### Entity delivery and Host capacity
+
+The next provider audit found a capacity cycle before the proposed Host admission change.
+Eight provider snapshots can hold all Host permits while they prepare their payloads.
+Fanout previously claimed exclusive delivery before it reserved a Host permit.
+The snapshots then waited for fanout delivery, while fanout waited for a Host permit from those snapshots.
+Cancellation, connection close, shutdown, or the 30-second deadline can break that cycle.
+Normal delivery cannot break it.
+
+A regression uses eight real Lua provider completions and their actual Host preparation permits.
+It starts fanout before the owner collects those preparation results, then resumes the production owner dispatcher.
+The baseline fails its two-second progress check with nine pending operations, one capacity waiter, and eight delivery waiters.
+This result proves the capacity cycle for the tested scheduling order.
+
+The implementation now tracks the pending fanout separately from exclusive delivery ownership.
+Both snapshots and fanout reserve Host capacity before they claim delivery.
+A delivery owner can therefore complete its remaining phases with its retained permit.
+The exact fanout waiter prevents duplicate fanout work while it waits for capacity.
+The final retirement clears that identity, including cancellation and an empty queue.
+The existing capacity and delivery notifications continue to wake their own waiters.
+Fanout still removes mutations in global FIFO order.
+A prepared snapshot can pass fanout that has not obtained Host capacity.
+Verification must check subscriber sequence order after that case.
+
+The corrected capacity test passes with all eight subscriber sequence checks.
+Each subscriber receives snapshot 1, skips the superseded sequence-1 mutation, and receives mutation 2 through bridge admission and owner dispatch.
+The test returns all publication credits and Host permits.
+The related library selection passed 34 tests.
+An earlier selection had 33 passes and a fixture setup failure before the cycle assertion.
+The fixture now retires and retries only explicit Core admission backpressure before it forms the eight-provider test state.
+The final focused test passes after that adjustment.
+Four Lua integration tests pass for lease completion, detached cleanup, and retained fanout transitions.
+They use the existing candidate worker and the current linked library, not final matched artifacts.
+The two owner checks pass for refused admission retirement and shutdown with retained entity payloads.
+Formatting and the patch whitespace check pass.
+Provider preparation, Core admission encoding, family-string routing, and complete memory/work accounting remain open.
