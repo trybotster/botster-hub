@@ -4,17 +4,25 @@ set -eu
 
 usage() {
   cat >&2 <<'USAGE'
-usage: script/build-dev-artifacts --out-dir <dir>
+usage: script/build-dev-artifacts --out-dir <dir> [--with-harness-adapter]
 
-This command writes the canonical two-binary manifest for cross-layer runs.
+The default mode writes the two-binary manifest for cross-layer runs.
 Core's worker-only manifest is valid only for Core-local runs.
+
+--with-harness-adapter also builds the harness_control example from this Hub
+checkout. It records that executable in the same manifest and prints
+BOTSTER_HUB_CLIENT_ADAPTER_BIN with the other environment assignments.
+source_revisions.botster_hub identifies the adapter source revision.
+The existing two-binary manifest verifiers do not verify the optional adapter.
 USAGE
 }
 
 OUT_DIR=""
+WITH_HARNESS_ADAPTER=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --out-dir) OUT_DIR="${2:?--out-dir requires a value}"; shift 2 ;;
+    --with-harness-adapter) WITH_HARNESS_ADAPTER=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unexpected argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -69,11 +77,17 @@ fi
 
 BOTSTER_BUILD_REVISION="$hub_revision" cargo build --locked -p botster-hub --bin botster-hub
 cargo build --locked -p botster-core-daemon --bin botster-session-worker
+if [ "$WITH_HARNESS_ADAPTER" -eq 1 ]; then
+  BOTSTER_BUILD_REVISION="$hub_revision" cargo build --locked -p botster-hub-client --example harness_control
+fi
 
 target_dir=${CARGO_TARGET_DIR:-target}
 mkdir -p "$OUT_DIR"
 cp "$target_dir/debug/botster-hub" "$OUT_DIR/botster-hub"
 cp "$target_dir/debug/botster-session-worker" "$OUT_DIR/botster-session-worker"
+if [ "$WITH_HARNESS_ADAPTER" -eq 1 ]; then
+  cp "$target_dir/debug/examples/harness_control" "$OUT_DIR/harness_control"
+fi
 
 checksum() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -92,6 +106,21 @@ hub_size=$(size_of "$OUT_DIR/botster-hub")
 worker_sha=$(checksum "$OUT_DIR/botster-session-worker")
 worker_size=$(size_of "$OUT_DIR/botster-session-worker")
 
+adapter_artifact=""
+if [ "$WITH_HARNESS_ADAPTER" -eq 1 ]; then
+  adapter_sha=$(checksum "$OUT_DIR/harness_control")
+  adapter_size=$(size_of "$OUT_DIR/harness_control")
+  adapter_artifact=$(cat <<ADAPTER
+,
+    {
+      "name": "harness_control",
+      "size": $adapter_size,
+      "sha256": "$adapter_sha"
+    }
+ADAPTER
+)
+fi
+
 manifest="$OUT_DIR/install-manifest.json"
 cat > "$manifest" <<MANIFEST
 {
@@ -109,7 +138,7 @@ cat > "$manifest" <<MANIFEST
       "name": "botster-session-worker",
       "size": $worker_size,
       "sha256": "$worker_sha"
-    }
+    }$adapter_artifact
   ]
 }
 MANIFEST
@@ -117,3 +146,6 @@ MANIFEST
 echo "BOTSTER_HUB_BIN=$OUT_DIR/botster-hub"
 echo "BOTSTER_SESSION_WORKER_BIN=$OUT_DIR/botster-session-worker"
 echo "BOTSTER_CANDIDATE_MANIFEST=$manifest"
+if [ "$WITH_HARNESS_ADAPTER" -eq 1 ]; then
+  echo "BOTSTER_HUB_CLIENT_ADAPTER_BIN=$OUT_DIR/harness_control"
+fi
