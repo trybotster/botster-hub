@@ -1,11 +1,11 @@
-//! Retain publication ownership until a Host worker disposes of a rejected mutation.
+//! Retain publication ownership through incremental admission or Host disposal.
 
 use crate::daemon::owner_budget::OwnerPermit;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::host_executor::{
-    HostCommand, HostCompletion, HostJobIdentity, HostResult, HostSubmissionFailure,
+    HostCommand, HostCompletion, HostJobIdentity, HostResult, HostSubmissionFailure, HostWorkPermit,
 };
-use crate::runtime::CausalTransitionStatus;
+use crate::runtime::{CausalTransitionStatus, PublicationAdvance};
 use crate::{HubDaemon, HubRuntime};
 
 struct Pending {
@@ -22,6 +22,7 @@ struct Recovery {
 pub(crate) struct PublicationOwnerState {
     pending: Option<Pending>,
     completion: Option<HostCompletion>,
+    admission_permit: Option<HostWorkPermit>,
     recovery: Option<Recovery>,
     faulted: bool,
     waiting_for_causal: bool,
@@ -35,6 +36,7 @@ impl PublicationOwnerState {
             .as_ref()
             .is_some_and(|pending| pending.identity == identity)
             && self.completion.is_none()
+            && self.admission_permit.is_none()
     }
 
     pub(crate) fn retain_completion(&mut self, completion: HostCompletion) {
@@ -54,7 +56,9 @@ impl PublicationOwnerState {
         {
             return false;
         }
-        self.completion.is_some() || (self.pending.is_none() && runtime.entity_publish_ready())
+        self.admission_permit.is_some()
+            || self.completion.is_some()
+            || (self.pending.is_none() && runtime.entity_publish_ready())
     }
 }
 
@@ -64,6 +68,29 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
     };
     if !state.publication_owner.ready(runtime) {
         return false;
+    }
+    if state.publication_owner.admission_permit.is_some() {
+        match runtime.advance_entity_publish() {
+            PublicationAdvance::Again => return true,
+            PublicationAdvance::Fault => {
+                state.publication_owner.faulted = true;
+                return false;
+            }
+            PublicationAdvance::Complete => {}
+        }
+        assert!(matches!(
+            runtime.finish_entity_publish_retirement(),
+            CausalTransitionStatus::Applied
+        ));
+        drop(state.publication_owner.admission_permit.take());
+        let pending = state
+            .publication_owner
+            .pending
+            .take()
+            .expect("admission retains its owner permit");
+        state.budget.release(pending.owner_permit);
+        crate::daemon::control::pending::wake_shutdown_waiter(state);
+        return state.publication_owner.ready(runtime);
     }
     if let Some(completion) = state.publication_owner.completion.as_ref() {
         if !matches!(completion.result, HostResult::FamilyCleanupComplete { .. }) {
@@ -107,13 +134,26 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
         state.publication_owner.faulted = true;
         return false;
     };
-    let Some(payload) = runtime.begin_entity_publish() else {
+    let payload = runtime.begin_entity_publish();
+    if payload.is_none() && runtime.entity_publish_retirement_pending() {
+        runtime.mark_entity_publish_daemon_owned();
+        state.publication_owner.pending = Some(Pending {
+            identity: HostJobIdentity {
+                waiter_id,
+                phase: 1,
+            },
+            owner_permit,
+        });
+        state.publication_owner.admission_permit = Some(permit);
+        return true;
+    }
+    let Some(payload) = payload else {
         drop(permit);
         state.budget.release(owner_permit);
         crate::daemon::control::pending::wake_shutdown_waiter(state);
         return state.publication_owner.ready(runtime);
     };
-    runtime.mark_entity_publish_worker_owned();
+    runtime.mark_entity_publish_daemon_owned();
     let pending = Pending {
         identity: HostJobIdentity {
             waiter_id,
@@ -188,6 +228,219 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn publication_continuation_moves_one_mutation_per_owner_activation() {
+        for mode in [
+            "consecutive",
+            "snapshot",
+            "gap",
+            "replacement",
+            "exhaustion",
+        ] {
+            let (mut daemon, daemon_root) = daemon(mode);
+            let (runtime, provider_root) =
+                crate::runtime::tests::publication_provider_runtime(mode);
+            daemon.runtime = Some(runtime);
+            let runtime = daemon.runtime().unwrap();
+            let mut state = DaemonControlState::default();
+            let frame = |seq| {
+                serde_json::json!({
+                    "type": "entity_upsert", "entity_type": "producer.item",
+                    "snapshot_seq": seq, "id": "item", "entity": {"id": "item"}
+                })
+            };
+            for seq in if mode == "gap" {
+                vec![3, 5]
+            } else {
+                vec![2, 3, 4]
+            } {
+                runtime
+                    .test_admit_publish("producer", frame(seq), None)
+                    .unwrap();
+            }
+            if mode == "exhaustion" {
+                runtime.test_fanout_sequence(Some(u64::MAX - 1));
+            }
+            let response = runtime.entity_publish_bridge().test_queue_publish(
+                botster_core::PluginKey("producer".into()),
+                frame(1),
+                None,
+            );
+            let later = runtime.entity_publish_bridge().test_queue_publish(
+                botster_core::PluginKey("producer".into()),
+                frame(2),
+                None,
+            );
+            assert!(drive(&daemon, &mut state));
+            assert_eq!(runtime.test_family_seq("producer.item"), 1);
+            assert!(response.try_recv().is_err());
+            assert_eq!(state.budget.outstanding(), 1);
+            assert!(
+                !state
+                    .publication_owner
+                    .accepts(state.publication_owner.pending.as_ref().unwrap().identity)
+            );
+            assert!(
+                runtime
+                    .package_entity_resync_next_attempt("producer.item")
+                    .is_none()
+            );
+            // Synchronous pumping cannot advance the daemon's retained publication.
+            runtime.step_entity_publish();
+            assert_eq!(runtime.test_family_seq("producer.item"), 1);
+            assert_eq!(
+                runtime.test_fanout_sequence(None),
+                if mode == "exhaustion" { u64::MAX } else { 1 }
+            );
+            if mode == "exhaustion" {
+                assert!(!drive(&daemon, &mut state));
+                assert!(state.publication_owner.faulted);
+                assert_eq!(runtime.test_family_seq("producer.item"), 1);
+                assert!(runtime.entity_publish_retirement_pending());
+                assert_eq!(state.budget.outstanding(), 1);
+                assert!(state.publication_owner.admission_permit.is_some());
+                assert!(response.try_recv().is_err());
+                assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 1);
+            } else if mode == "replacement" {
+                let generation = runtime.package_entity_family_generation("producer.item");
+                runtime
+                    .drop_package_entity_families_for("producer")
+                    .unwrap();
+                runtime.begin_package_entity_provider_snapshot("producer.item", 40);
+                assert_ne!(
+                    runtime.package_entity_family_generation("producer.item"),
+                    generation
+                );
+                assert!(drive(&daemon, &mut state));
+                let result = response.try_recv().unwrap().unwrap();
+                assert_eq!(result.last_accepted_seq, 1);
+                assert_eq!(runtime.test_family_seq("producer.item"), 40);
+                assert_eq!(runtime.test_fanout_sequence(None), 1);
+                assert_eq!(state.budget.outstanding(), 0);
+            } else if mode == "snapshot" {
+                runtime.begin_package_entity_provider_snapshot("producer.item", 3);
+                assert!(drive(&daemon, &mut state));
+                assert_eq!(runtime.test_family_seq("producer.item"), 4);
+                assert!(response.try_recv().is_err());
+            } else if mode == "consecutive" {
+                for expected in 2..=4 {
+                    assert!(drive(&daemon, &mut state));
+                    assert_eq!(runtime.test_family_seq("producer.item"), expected);
+                    assert_eq!(runtime.test_fanout_sequence(None), expected);
+                    assert!(response.try_recv().is_err());
+                    assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 1);
+                    assert_eq!(state.budget.outstanding(), 1);
+                }
+            }
+            if mode != "replacement" && mode != "exhaustion" {
+                assert!(drive(&daemon, &mut state));
+                let result = response.try_recv().unwrap().unwrap();
+                assert_eq!(
+                    result.status,
+                    crate::package_entity_fanout::PackageEntityPublishStatus::Accepted
+                );
+                assert_eq!(state.budget.outstanding(), 0);
+                assert!(state.publication_owner.admission_permit.is_none());
+                assert!(later.try_recv().is_err());
+                assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 1);
+                if mode == "gap" {
+                    assert_eq!(runtime.test_family_seq("producer.item"), 1);
+                    assert!(
+                        runtime
+                            .package_entity_resync_next_attempt("producer.item")
+                            .is_some()
+                    );
+                    assert!(drive(&daemon, &mut state));
+                    assert!(drive(&daemon, &mut state));
+                    assert_eq!(runtime.test_family_seq("producer.item"), 3);
+                    assert!(!drive(&daemon, &mut state));
+                    assert!(later.try_recv().unwrap().unwrap().resync_needed);
+                }
+            }
+            drop(daemon);
+            std::fs::remove_dir_all(daemon_root).unwrap();
+            std::fs::remove_dir_all(provider_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn publication_continuation_keeps_pending_lease_after_response_closes() {
+        let (mut daemon, daemon_root) = daemon("continuation-leases");
+        let (runtime, provider_root) =
+            crate::runtime::tests::publication_provider_runtime("continuation-leases");
+        daemon.runtime = Some(runtime);
+        let runtime = daemon.runtime().unwrap();
+        let mut state = DaemonControlState::default();
+        let frame = |seq| serde_json::json!({"type": "entity_remove", "entity_type": "producer.item", "snapshot_seq": seq, "id": "item"});
+        let gap_scope = runtime.causal_scopes().mint().unwrap();
+        let gap = runtime.entity_publish_bridge().test_queue_publish(
+            botster_core::PluginKey("producer".into()),
+            frame(2),
+            Some(gap_scope),
+        );
+        assert!(!drive(&daemon, &mut state));
+        assert!(gap.try_recv().unwrap().unwrap().resync_needed);
+        runtime.apply_causal_owner_ops();
+        let generation = runtime
+            .package_entity_family_generation("producer.item")
+            .unwrap();
+        let admitted = LeaseIdentity::AdmittedEntityMutation {
+            family: "producer.item".into(),
+            generation,
+            seq: 2,
+        };
+        assert!(
+            runtime
+                .causal_scopes()
+                .identities(gap_scope)
+                .unwrap()
+                .contains(&admitted)
+        );
+        let scope = runtime.causal_scopes().mint().unwrap();
+        let response = runtime.entity_publish_bridge().test_queue_publish(
+            botster_core::PluginKey("producer".into()),
+            frame(1),
+            Some(scope),
+        );
+        assert!(drive(&daemon, &mut state));
+        drop(response);
+        assert!(drive(&daemon, &mut state));
+        assert!(
+            runtime
+                .causal_scopes()
+                .identities(gap_scope)
+                .unwrap()
+                .contains(&admitted)
+        );
+        assert_eq!(runtime.test_family_seq("producer.item"), 2);
+        assert_eq!(state.budget.outstanding(), 1);
+        assert!(!drive(&daemon, &mut state));
+        assert_eq!(state.budget.outstanding(), 0);
+        while runtime.causal_operation_count() > 0 {
+            runtime.apply_causal_owner_ops();
+        }
+        assert!(
+            runtime
+                .causal_scopes()
+                .identities(gap_scope)
+                .unwrap()
+                .contains(&admitted)
+        );
+        let mutations = runtime.take_package_entity_fanout();
+        assert_eq!(mutations.len(), 2);
+        while runtime.causal_family_release_ready() {
+            runtime.retry_family_resync_release();
+        }
+        while runtime.causal_operation_count() > 0 {
+            runtime.apply_causal_owner_ops();
+        }
+        assert!(!runtime.causal_scopes().is_live(scope));
+        assert!(!runtime.causal_scopes().is_live(gap_scope));
+        drop(daemon);
+        std::fs::remove_dir_all(daemon_root).unwrap();
+        std::fs::remove_dir_all(provider_root).unwrap();
     }
 
     #[test]
