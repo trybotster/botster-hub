@@ -67,7 +67,7 @@ pub struct HubCoordinationBridge {
 
 mod entity_publish;
 use entity_publish::EntityPublishError;
-pub use entity_publish::HubEntityPublishBridge;
+pub use entity_publish::{EntityPublishPermit, HubEntityPublishBridge};
 
 impl HubCoordinationBridge {
     pub(crate) fn new() -> Self {

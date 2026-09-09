@@ -1814,6 +1814,7 @@ mod tests {
             for seq in [1, 2] {
                 daemon.runtime().unwrap().test_store_family_payload(
                     crate::package_entity_fanout::PackageEntityMutation::Upsert {
+                        admission: None,
                         entity_type: "cleanup.plugin.item".into(),
                         snapshot_seq: seq,
                         id: "item".into(),
@@ -4439,6 +4440,10 @@ return botster.register({ handlers = {{
                 expected
             );
             assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
+            assert_eq!(
+                runtime.entity_publish_bridge().retained_counts().0,
+                expected
+            );
         }
         let runtime = daemon.runtime().unwrap();
         let token = runtime.test_family_causal_token("resync-probe.item");
@@ -4454,6 +4459,111 @@ return botster.register({ handlers = {{
                 ]))
             );
         }
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifetime_budget_allows_a_live_event_to_complete_512_publications() {
+        use crate::package_event_router::{EventPlaneStatus, HUB_EVENT_OWNER};
+        let root = unique_package_control_dir("lifetime-live-event");
+        let package_dir = root.join("resync-probe");
+        write_package_control_manifest(
+            &package_dir,
+            "resync-probe",
+            serde_json::json!({
+                "capabilities": [],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            r#"
+events.on("hub", "worktree_created", function()
+  for seq = 1, 512 do
+    local result = botster.entity_publish({
+      type = "entity_remove", entity_type = "resync-probe.item", snapshot_seq = seq, id = "item"
+    })
+    assert(result.ok)
+  end
+end)
+return botster.register({ handlers = {{
+  id = "items", kind = "entity_provider", descriptor_id = "resync-probe.item",
+  descriptor = { entity_type = "resync-probe.item", id_field = "id" },
+  call = function() return {
+    type = "entity_snapshot", entity_type = "resync-probe.item", snapshot_seq = 0, items = {}
+  } end,
+}} })
+"#,
+        )
+        .unwrap();
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .unwrap();
+        drive_package_request(
+            &mut daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "resync-probe".into(),
+            },
+        )
+        .unwrap();
+        let mut state = DaemonControlState::default();
+        daemon
+            .runtime()
+            .unwrap()
+            .install_plugin_completion_notifier(state.plugin_result_budget.completion_notifier());
+        let count = 1;
+        for expected in 1..=count {
+            assert_eq!(
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .package_event_router()
+                    .try_ingress(
+                        HUB_EVENT_OWNER,
+                        "worktree_created",
+                        &serde_json::json!({"event": "worktree_created"}),
+                        Instant::now()
+                    ),
+                EventPlaneStatus::Accepted
+            );
+            state
+                .maintenance
+                .wakes
+                .mark(MaintenanceSliceKind::PackageEventDelivery);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                drive_ready_test_turn(&mut daemon, &mut state);
+                let runtime = daemon.runtime().unwrap();
+                if runtime
+                    .event_plane_counters()
+                    .snapshot()
+                    .event_handler_completed_ok
+                    == expected as u64
+                    && runtime.causal_operation_count() == 0
+                    && !runtime.entity_publish_retirement_pending()
+                    && state.maintenance.event_in_flight.is_empty()
+                    && state.maintenance.pending_retirements.is_empty()
+                    && state.budget.outstanding() == 0
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "event and publication work must retire"
+                );
+                std::thread::yield_now();
+            }
+            let runtime = daemon.runtime().unwrap();
+            assert_eq!(runtime.test_resync_lease_count("resync-probe.item"), 0);
+            assert_eq!(runtime.entity_publish_bridge().pending_publish_count(), 0);
+        }
+        let runtime = daemon.runtime().unwrap();
+        assert_eq!(runtime.test_family_seq("resync-probe.item"), 512);
+        assert_eq!(runtime.entity_publish_bridge().retained_counts(), (0, 0));
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -5512,6 +5622,12 @@ return botster.register({
             .expect("enable controlled entity plugin");
 
             let mut state = DaemonControlState::default();
+            daemon
+                .runtime()
+                .unwrap()
+                .install_plugin_completion_notifier(
+                    state.plugin_result_budget.completion_notifier(),
+                );
             let baseline = state.budget.outstanding();
             let connection_id = format!("entity-connection-{retire_reason}");
             let (frame_tx, _frame_rx) = tokio_mpsc::channel(8);

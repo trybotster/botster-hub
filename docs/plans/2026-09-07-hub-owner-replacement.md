@@ -913,3 +913,52 @@ This exceeds the eight Host slots and proves that execution permits do not bound
 The test passes; it does not measure unlimited growth or establish a capacity policy.
 Source inspection shows that later publications can rearm resync while provider snapshots remain below the high-water mark.
 The next memory decision must cover the lifetime of publication descendants, including resync and provider work.
+
+The implementation now extends the existing publication budget through descendant retirement.
+The limits remain 256 publications, 8 MiB in original logical request bytes, and 1 MiB per request.
+Bridge removal transfers the admission permit; it does not return capacity.
+Mutation, resync, and inherited provider work share one permit from the originating publication.
+An existing resync identity retains its existing permit when later publications coalesce into it.
+A provider inherits the permit from the exact family obligation that selects its scope.
+A publication made by that provider requires its own admission permit.
+Unscoped payloads retain their permits through pending state, fanout, and disposal.
+Queued retirement and faults retain ownership until the original table identity and domain item retire.
+Mandatory retirement does not reserve another publication permit.
+The last descendant returns capacity, even if the original event handler remains active.
+The permit owns fixed accounting data only; it does not own a payload, scope, table row, or descendant.
+
+Admission remains nonblocking: a full budget rejects before enqueue rather than waiting for dependent work.
+This changes when admission capacity returns, not the per-request frame limit.
+Existing event and provider-result budgets remain responsible for their own roots and payloads.
+Acceptance must cover saturation, coalescing, unscoped work, provider inheritance, queued retirement, unload, and fault retention.
+It must also cover a handler that makes more than 256 sequential publications after earlier descendants retire.
+
+
+The shared permit owns fixed accounting data and a weak reference to the bridge account.
+It does not keep the bridge queue alive.
+Rust field order keeps the permit live until payload destruction finishes.
+Provider invocations and prepared snapshots retain the permit after the provider table identity retires.
+Delivery preserves the permit across conversion to and from a protocol frame.
+The original request charge remains unchanged when preparation removes unknown fields.
+
+Ten focused tests cover count and byte saturation, reference sharing, bridge destruction, queued retirement, coalescing, provider inheritance, and family cleanup.
+A live Lua event completes 512 accepted publications through the daemon owner and returns all publication capacity.
+A HostExecutor test covers cancellation, successful delivery, a full queue, disconnection, and reclamation.
+The provider snapshot test invokes Lua and directly executes preparation, delivery, and reclamation after table retirement.
+The family cleanup test uses the production cleanup cursor and manual payload disposal.
+These tests do not establish a complete public unload campaign or final matched artifacts.
+
+The regression selection exposed a missing completion callback in the abandoned-subscription test.
+The test now installs the same callback as the production owner loop before subscription admission.
+No production callback code changed.
+The fixed accounting record still requires allocator work when its last reference drops.
+General routing strings, complete owner work accounting, and the broader foundation acceptance remain open.
+
+
+Rust 1.97.0 `check --tests` passes for the completed change.
+The combined regression selection passed 93 library tests.
+After the final saturation fixture extension, all ten lifetime tests passed again.
+The saturated Lua provider rejects its new publication and returns its snapshot without another publication permit.
+Ten Lua integration tests pass for fanout, distinct publications, cleanup, refusal, and causal contention.
+Those integration tests use the existing candidate worker and the current linked Hub library.
+Formatting and the patch whitespace check pass.

@@ -1179,6 +1179,7 @@ mod tests {
                 identity,
                 HostCommand::FamilyCleanup(
                     crate::package_entity_fanout::PackageEntityMutation::Upsert {
+                        admission: None,
                         entity_type: "producer.item".into(),
                         snapshot_seq: 1,
                         id: "item".into(),

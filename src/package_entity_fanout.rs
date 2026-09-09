@@ -75,6 +75,7 @@ impl PackageEntityPublishStatus {
 }
 
 /// Mutation body admitted for fanout (no subscription id).
+/// Keep each admission field last so payload destruction finishes before capacity returns.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PackageEntityMutation {
     Upsert {
@@ -82,21 +83,43 @@ pub enum PackageEntityMutation {
         snapshot_seq: u64,
         id: String,
         entity: Value,
+        admission: Option<crate::lua_runtime::EntityPublishPermit>,
     },
     Patch {
         entity_type: String,
         snapshot_seq: u64,
         id: String,
         patch: Value,
+        admission: Option<crate::lua_runtime::EntityPublishPermit>,
     },
     Remove {
         entity_type: String,
         snapshot_seq: u64,
         id: String,
+        admission: Option<crate::lua_runtime::EntityPublishPermit>,
     },
 }
 
 impl PackageEntityMutation {
+    pub(crate) fn admission(&self) -> Option<&crate::lua_runtime::EntityPublishPermit> {
+        match self {
+            Self::Upsert { admission, .. }
+            | Self::Patch { admission, .. }
+            | Self::Remove { admission, .. } => admission.as_ref(),
+        }
+    }
+
+    pub(crate) fn set_admission(
+        &mut self,
+        permit: Option<crate::lua_runtime::EntityPublishPermit>,
+    ) {
+        match self {
+            Self::Upsert { admission, .. }
+            | Self::Patch { admission, .. }
+            | Self::Remove { admission, .. } => *admission = permit,
+        }
+    }
+
     #[must_use]
     pub fn entity_type(&self) -> &str {
         match self {
@@ -123,6 +146,7 @@ impl PackageEntityMutation {
                 id,
                 entity,
             } => Ok(Self::Upsert {
+                admission: None,
                 entity_type: entity_type.0,
                 snapshot_seq,
                 id: id.0,
@@ -134,6 +158,7 @@ impl PackageEntityMutation {
                 id,
                 patch,
             } => Ok(Self::Patch {
+                admission: None,
                 entity_type: entity_type.0,
                 snapshot_seq,
                 id: id.0,
@@ -144,6 +169,7 @@ impl PackageEntityMutation {
                 snapshot_seq,
                 id,
             } => Ok(Self::Remove {
+                admission: None,
                 entity_type: entity_type.0,
                 snapshot_seq,
                 id: id.0,
@@ -175,6 +201,7 @@ pub struct EntityMutationLease {
     pub family: String,
     pub generation: u64,
     pub seq: u64,
+    pub admission: Option<crate::lua_runtime::EntityPublishPermit>,
 }
 
 /// One queued mutation retains its generation even without a causal lease.
@@ -317,7 +344,7 @@ pub struct PackageEntityResyncState {
     pub last_attempt_at: Option<Instant>,
     attempt_times: VecDeque<Instant>,
     pub degraded: bool,
-    pub leases: BTreeSet<u64>,
+    pub leases: BTreeMap<u64, Option<crate::lua_runtime::EntityPublishPermit>>,
 }
 
 impl Default for PackageEntityResyncState {
@@ -329,7 +356,7 @@ impl Default for PackageEntityResyncState {
             last_attempt_at: None,
             attempt_times: VecDeque::new(),
             degraded: false,
-            leases: BTreeSet::new(),
+            leases: BTreeMap::new(),
         }
     }
 }
@@ -603,7 +630,7 @@ impl PackageEntityFamilyState {
 
         self.recompute_resync_need(now);
         if self.converged()
-            && let Some(scope_id) = self.resync.leases.pop_first()
+            && let Some((scope_id, _admission)) = self.resync.leases.pop_first()
         {
             return PackageEntityFamilyStep::ReleaseResync {
                 scope_id,
@@ -711,11 +738,26 @@ impl PackageEntityFamilyState {
     }
 
     pub fn remember_resync_lease(&mut self, scope_id: u64) -> bool {
+        self.remember_resync_lease_with_admission(scope_id, None)
+    }
+
+    pub(crate) fn remember_resync_lease_with_admission(
+        &mut self,
+        scope_id: u64,
+        admission: Option<crate::lua_runtime::EntityPublishPermit>,
+    ) -> bool {
         assert!(
             self.causal_token.is_some(),
             "resync lease has a family token"
         );
-        self.resync.leases.insert(scope_id)
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.resync.leases.entry(scope_id)
+        {
+            entry.insert(admission);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn forget_resync_lease(&mut self, scope_id: u64) {
@@ -729,18 +771,28 @@ impl PackageEntityFamilyState {
             .values()
             .map(|lease| lease.scope_id)
             .collect();
-        ids.extend(self.resync.leases.iter().copied());
+        ids.extend(self.resync.leases.keys().copied());
         ids
     }
 
     #[must_use]
     pub fn provider_scope_id(&self) -> Option<u64> {
-        self.resync.leases.iter().copied().next().or_else(|| {
-            self.pending_leases
-                .values()
-                .map(|lease| lease.scope_id)
-                .next()
-        })
+        self.provider_obligation().map(|(scope_id, _)| scope_id)
+    }
+
+    pub(crate) fn provider_obligation(
+        &self,
+    ) -> Option<(u64, Option<crate::lua_runtime::EntityPublishPermit>)> {
+        self.resync
+            .leases
+            .first_key_value()
+            .map(|(scope_id, admission)| (*scope_id, admission.clone()))
+            .or_else(|| {
+                self.pending_leases
+                    .values()
+                    .next()
+                    .map(|lease| (lease.scope_id, lease.admission.clone()))
+            })
     }
 }
 
@@ -850,12 +902,14 @@ mod tests {
         LeasedFanoutMutation {
             generation,
             mutation: PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: family.into(),
                 snapshot_seq: seq,
                 id: format!("item-{seq}"),
                 entity: json!({"payload": format!("payload-{family}-{generation}-{seq}")}),
             },
             lease: leased.then(|| EntityMutationLease {
+                admission: None,
                 family_token: 1,
                 scope_id: 17,
                 family: family.into(),
@@ -1052,6 +1106,7 @@ mod tests {
 
     fn pending_mutation(seq: u64, id: &str) -> PackageEntityMutation {
         PackageEntityMutation::Upsert {
+            admission: None,
             entity_type: "f".into(),
             snapshot_seq: seq,
             id: id.into(),
@@ -1067,6 +1122,7 @@ mod tests {
     ) {
         state.pending_by_seq.insert(seq, pending_mutation(seq, id));
         state.store_pending_lease(EntityMutationLease {
+            admission: None,
             family_token: 1,
             generation: 0,
             scope_id,
@@ -1371,6 +1427,7 @@ mod tests {
         let now = Instant::now();
         let (result, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 1,
                 id: "a".into(),
@@ -1383,6 +1440,7 @@ mod tests {
 
         let (gap, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 3,
                 id: "c".into(),
@@ -1396,6 +1454,7 @@ mod tests {
 
         let (accepted, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 2,
                 id: "b".into(),
@@ -1426,6 +1485,7 @@ mod tests {
         let now = Instant::now();
         let (gap, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 3,
                 id: "c".into(),
@@ -1436,6 +1496,7 @@ mod tests {
         assert_eq!(gap.status, PackageEntityPublishStatus::PendingGap);
         assert!(ready.is_none());
         state.store_pending_lease(EntityMutationLease {
+            admission: None,
             family_token: 1,
             generation: 0,
             scope_id: 7,
@@ -1445,6 +1506,7 @@ mod tests {
         assert!(state.remember_resync_lease(7));
         let (later, _, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 4,
                 id: "d".into(),
@@ -1454,6 +1516,7 @@ mod tests {
         );
         assert_eq!(later.status, PackageEntityPublishStatus::PendingGap);
         state.store_pending_lease(EntityMutationLease {
+            admission: None,
             family_token: 1,
             generation: 0,
             scope_id: 8,
@@ -1476,6 +1539,7 @@ mod tests {
         let now = Instant::now();
         let (result, ready, _discarded) = state.admit(
             PackageEntityMutation::Remove {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 20,
                 id: "x".into(),
@@ -1494,6 +1558,7 @@ mod tests {
         let mut state = PackageEntityFamilyState::default();
         let now = Instant::now();
         let first = PackageEntityMutation::Upsert {
+            admission: None,
             entity_type: "f".into(),
             snapshot_seq: 2,
             id: "first".into(),
@@ -1504,6 +1569,7 @@ mod tests {
         assert!(ready.is_none());
         let (dup, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 2,
                 id: "second".into(),
@@ -1595,6 +1661,7 @@ mod tests {
                 "id": "run-1"
             })),
             Ok(PackageEntityMutation::Remove {
+                admission: None,
                 entity_type: "project-pipelines.run".into(),
                 snapshot_seq: 1,
                 id: "run-1".into(),
@@ -1629,6 +1696,7 @@ mod tests {
         let now = Instant::now();
         let _ = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 1,
                 id: "a".into(),
@@ -1638,6 +1706,7 @@ mod tests {
         );
         let _ = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 20,
                 id: "z".into(),
@@ -1649,6 +1718,7 @@ mod tests {
         state.resync.needed = false;
         let (result, _, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 2,
                 id: "b".into(),
@@ -1667,6 +1737,7 @@ mod tests {
         state.resync.needed = false;
         let (done, _, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
+                admission: None,
                 entity_type: "f".into(),
                 snapshot_seq: 20,
                 id: "z2".into(),
