@@ -193,20 +193,11 @@ pub(crate) struct PackageEntityFanoutQueue {
 }
 
 impl PackageEntityFanoutQueue {
-    /// Check capacity before admission can release pending mutations and the incoming mutation.
-    ///
-    /// Use `PackageEntityFamilyState::pending_by_seq.len()` for `family_pending_count`.
-    /// This check limits sequence allocation, not queue size.
-    /// This conservative check can refuse admission even when fewer mutations would become ready.
-    /// The caller must retain exclusive queue access through admission and insertion.
-    /// This check reserves no sequences. Only successful insertion advances the sequence.
+    /// Check sequence capacity for one insertion without consuming a sequence.
+    /// The caller must retain exclusive queue access through insertion.
     #[must_use]
-    pub(crate) fn has_capacity_for_admission(&self, family_pending_count: usize) -> bool {
-        family_pending_count
-            .checked_add(1)
-            .and_then(|bound| u64::try_from(bound).ok())
-            .and_then(|bound| self.next_sequence.checked_add(bound))
-            .is_some()
+    pub(crate) fn has_sequence_capacity(&self) -> bool {
+        self.next_sequence.checked_add(1).is_some()
     }
 
     /// Return the owned mutation unchanged if the sequence cannot advance.
@@ -295,6 +286,11 @@ impl PackageEntityFanoutQueue {
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.pending_by_seq.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sequence_for_test(&self) -> u64 {
+        self.next_sequence
     }
 
     #[cfg(test)]
@@ -487,39 +483,38 @@ pub struct PackageEntityFamilyState {
 }
 
 impl PackageEntityFamilyState {
-    /// Admit one mutation and return ready frames and the original discarded mutation.
+    /// Admit one mutation and return one ready frame and the original discarded mutation.
     pub fn admit(
         &mut self,
         mutation: PackageEntityMutation,
         now: Instant,
     ) -> (
         PackageEntityPublishResult,
-        Vec<PackageEntityMutation>,
+        Option<PackageEntityMutation>,
         Option<PackageEntityMutation>,
     ) {
         let seq = mutation.snapshot_seq();
         if seq < self.last_accepted_seq {
             return (
                 self.result(PackageEntityPublishStatus::StaleSequence),
-                Vec::new(),
+                None,
                 Some(mutation),
             );
         }
         if seq == self.last_accepted_seq {
             return (
                 self.result(PackageEntityPublishStatus::DuplicateSequence),
-                Vec::new(),
+                None,
                 Some(mutation),
             );
         }
 
-        let mut ready = Vec::new();
+        let mut ready = None;
         let mut discarded = None;
         let status = if self.last_accepted_seq.checked_add(1) == Some(seq) {
             self.high_water_seq = self.high_water_seq.max(seq);
             self.last_accepted_seq = seq;
-            ready.push(mutation);
-            ready.extend(self.drain_consecutive_pending());
+            ready = Some(mutation);
             // Every accepted publish is progress: re-arm when a gap remains, or
             // clear degraded fully when the family converges.
             self.after_publish_progress(now);
@@ -532,7 +527,7 @@ impl PackageEntityFamilyState {
             if self.pending_by_seq.contains_key(&seq) {
                 return (
                     self.result(PackageEntityPublishStatus::DuplicateSequence),
-                    Vec::new(),
+                    None,
                     Some(mutation),
                 );
             }
@@ -613,20 +608,25 @@ impl PackageEntityFamilyState {
         PackageEntityFamilyStep::Complete(self.provider_snapshot_progress())
     }
 
-    fn drain_consecutive_pending(&mut self) -> Vec<PackageEntityMutation> {
-        let mut ready = Vec::new();
-        loop {
-            let Some(next) = self.last_accepted_seq.checked_add(1) else {
-                break;
-            };
-            let Some(mutation) = self.pending_by_seq.remove(&next) else {
-                break;
-            };
-            self.last_accepted_seq = next;
-            self.high_water_seq = self.high_water_seq.max(next);
-            ready.push(mutation);
-        }
-        ready
+    pub(crate) fn has_next_pending(&self) -> bool {
+        self.last_accepted_seq
+            .checked_add(1)
+            .is_some_and(|next| self.pending_by_seq.contains_key(&next))
+    }
+
+    /// Move one consecutive mutation with its existing lease.
+    pub(crate) fn take_next_pending(&mut self, now: Instant) -> Option<LeasedFanoutMutation> {
+        let next = self.last_accepted_seq.checked_add(1)?;
+        let mutation = self.pending_by_seq.remove(&next)?;
+        let lease = self.pending_leases.remove(&next);
+        self.last_accepted_seq = next;
+        self.high_water_seq = self.high_water_seq.max(next);
+        self.after_publish_progress(now);
+        Some(LeasedFanoutMutation {
+            mutation,
+            lease,
+            generation: self.generation,
+        })
     }
 
     pub fn recompute_resync_need(&mut self, now: Instant) {
@@ -672,7 +672,7 @@ impl PackageEntityFamilyState {
     }
 
     #[must_use]
-    fn result(&self, status: PackageEntityPublishStatus) -> PackageEntityPublishResult {
+    pub(crate) fn result(&self, status: PackageEntityPublishStatus) -> PackageEntityPublishResult {
         PackageEntityPublishResult {
             ok: status.ok(),
             status,
@@ -946,13 +946,10 @@ mod tests {
     }
 
     #[test]
-    fn fanout_capacity_check_is_conservative_and_consumes_no_sequences() {
+    fn fanout_capacity_check_consumes_no_sequences() {
         let mut queue = PackageEntityFanoutQueue::default();
         queue.set_next_sequence_for_test(u64::MAX - 2);
-        assert!(!queue.has_capacity_for_admission(usize::MAX));
-        assert!(!queue.has_capacity_for_admission(2));
-        assert!(queue.has_capacity_for_admission(1));
-        assert!(queue.has_capacity_for_admission(0));
+        assert!(queue.has_sequence_capacity());
         assert_eq!(queue.next_sequence, u64::MAX - 2);
         assert!(queue.is_empty());
         assert_fanout_membership(&queue);
@@ -960,14 +957,13 @@ mod tests {
             .try_push(fanout_item("a", 1, 1, true))
             .expect("only one item becomes ready");
         assert_eq!(queue.next_sequence, u64::MAX - 1);
-        assert!(!queue.has_capacity_for_admission(1));
-        assert!(queue.has_capacity_for_admission(0));
+        assert!(queue.has_sequence_capacity());
         assert_fanout_membership(&queue);
         queue
             .try_push(fanout_item("a", 2, 1, false))
             .expect("last available sequence");
         assert_eq!(queue.next_sequence, u64::MAX);
-        assert!(!queue.has_capacity_for_admission(0));
+        assert!(!queue.has_sequence_capacity());
         assert_fanout_membership(&queue);
         assert_eq!(
             queue.take_one_family("a", 1),
@@ -977,7 +973,7 @@ mod tests {
         assert_eq!(queue.pop_first(), Some(fanout_item("a", 2, 1, false)));
         assert!(queue.is_empty());
         assert!(
-            !queue.has_capacity_for_admission(0),
+            !queue.has_sequence_capacity(),
             "removal must not reuse sequences"
         );
         assert_fanout_membership(&queue);
@@ -1330,7 +1326,7 @@ mod tests {
             duplicate.status,
             PackageEntityPublishStatus::DuplicateSequence
         );
-        assert!(ready.is_empty());
+        assert!(ready.is_none());
         assert_eq!(state.begin_provider_snapshot_seq(0, now).floor, u64::MAX);
     }
 
@@ -1370,7 +1366,7 @@ mod tests {
             now,
         );
         assert_eq!(result.status, PackageEntityPublishStatus::Accepted);
-        assert_eq!(ready.len(), 1);
+        assert!(ready.is_some());
 
         let (gap, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
@@ -1382,7 +1378,7 @@ mod tests {
             now,
         );
         assert_eq!(gap.status, PackageEntityPublishStatus::PendingGap);
-        assert!(ready.is_empty());
+        assert!(ready.is_none());
         assert!(state.resync.needed);
 
         let (accepted, ready, _discarded) = state.admit(
@@ -1395,9 +1391,16 @@ mod tests {
             now,
         );
         assert_eq!(accepted.status, PackageEntityPublishStatus::Accepted);
-        assert_eq!(ready.len(), 2);
-        assert_eq!(ready[0].snapshot_seq(), 2);
-        assert_eq!(ready[1].snapshot_seq(), 3);
+        assert_eq!(ready.unwrap().snapshot_seq(), 2);
+        assert_eq!(state.last_accepted_seq, 2);
+        assert_eq!(
+            state
+                .take_next_pending(now)
+                .unwrap()
+                .mutation
+                .snapshot_seq(),
+            3
+        );
         assert_eq!(state.last_accepted_seq, 3);
     }
 
@@ -1415,7 +1418,7 @@ mod tests {
             now,
         );
         assert_eq!(gap.status, PackageEntityPublishStatus::PendingGap);
-        assert!(ready.is_empty());
+        assert!(ready.is_none());
         state.store_pending_lease(EntityMutationLease {
             generation: 0,
             scope_id: 7,
@@ -1462,7 +1465,7 @@ mod tests {
             now,
         );
         assert_eq!(result.status, PackageEntityPublishStatus::ResyncScheduled);
-        assert!(ready.is_empty());
+        assert!(ready.is_none());
         assert!(state.pending_by_seq.is_empty());
         assert_eq!(state.high_water_seq, 20);
         assert!(state.resync.needed);
@@ -1480,7 +1483,7 @@ mod tests {
         };
         let (gap, ready, _discarded) = state.admit(first.clone(), now);
         assert_eq!(gap.status, PackageEntityPublishStatus::PendingGap);
-        assert!(ready.is_empty());
+        assert!(ready.is_none());
         let (dup, ready, _discarded) = state.admit(
             PackageEntityMutation::Upsert {
                 entity_type: "f".into(),
@@ -1491,7 +1494,7 @@ mod tests {
             now,
         );
         assert_eq!(dup.status, PackageEntityPublishStatus::DuplicateSequence);
-        assert!(ready.is_empty());
+        assert!(ready.is_none());
         assert_eq!(
             state.pending_by_seq.get(&2),
             Some(&first),

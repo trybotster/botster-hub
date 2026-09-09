@@ -2513,6 +2513,66 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_finishes_after_publication_continuation() {
+        let root = unique_package_control_dir("publication-continuation-shutdown");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let (runtime, provider_root) =
+            crate::runtime::tests::publication_provider_runtime("shutdown-continuation");
+        daemon.runtime = Some(runtime);
+        let mut state = DaemonControlState::default();
+        let frame = |seq| serde_json::json!({"type": "entity_remove", "entity_type": "producer.item", "snapshot_seq": seq, "id": "item"});
+        for seq in 2..=16 {
+            daemon
+                .runtime()
+                .unwrap()
+                .test_admit_publish("producer", frame(seq), None)
+                .unwrap();
+        }
+        let publication = daemon
+            .runtime()
+            .unwrap()
+            .entity_publish_bridge()
+            .test_queue_publish(botster_core::PluginKey("producer".into()), frame(1), None);
+        assert!(crate::daemon::publication_owner::drive(&daemon, &mut state));
+        assert!(publication.try_recv().is_err());
+        let mut shutdown = start_async_control_request(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::DaemonShutdown,
+            "publication-shutdown",
+            "publication-shutdown",
+        );
+        assert!(shutdown.try_recv().is_err());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            drive_ready_test_turn(&mut daemon, &mut state);
+            if let Ok(reply) = shutdown.try_recv() {
+                assert_eq!(
+                    reply.into_parts().0.unwrap().kind,
+                    DaemonResponseKind::Shutdown
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shutdown must finish after the publication"
+            );
+            thread::yield_now();
+        }
+        let result = publication.try_recv().unwrap().unwrap();
+        assert_eq!(result.last_accepted_seq, 16);
+        assert!(
+            !daemon
+                .runtime()
+                .unwrap()
+                .entity_publish_retirement_pending()
+        );
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(provider_root).unwrap();
+    }
+
+    #[test]
     fn publication_retraction_wakes_the_shutdown_waiter_without_a_completion() {
         let root = unique_package_control_dir("publication-retraction-shutdown");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();

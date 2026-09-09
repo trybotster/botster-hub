@@ -4235,6 +4235,11 @@ fn production_fanout_finish_preserves_a_retained_publish_transfer() {
     let fillers = fill_causal_owner_queue(&hub, CAUSAL_OWNER_CAPACITY - 1);
     let response = queue_scoped_publication(&hub, live, "lease-probe.item", 1);
     hub.test_fulfill_pending_publishes();
+    assert!(
+        response.try_recv().is_err(),
+        "admission retains the response for its continuation"
+    );
+    hub.test_fulfill_pending_publishes();
     let result = response
         .try_recv()
         .expect("owner response")
@@ -4279,6 +4284,11 @@ fn production_fanout_finish_retains_its_original_state_until_capacity_returns() 
     let scopes = hub.causal_scopes();
     let live = scopes.mint().expect("publication scope");
     let response = queue_scoped_publication(&hub, live, "lease-probe.item", 1);
+    hub.test_fulfill_pending_publishes();
+    assert!(
+        response.try_recv().is_err(),
+        "admission retains the response for its continuation"
+    );
     hub.test_fulfill_pending_publishes();
     assert!(response.try_recv().unwrap().unwrap().ok);
     drain_causal_owner_work(&hub);
@@ -4342,6 +4352,11 @@ fn fulfill_leaves_the_next_publish_on_the_bridge_until_a_slot_frees() {
         "a queued source must not acquire a lease before capacity exists"
     );
     let _ = hub.apply_event_plane_owner_ops();
+    hub.test_fulfill_pending_publishes();
+    assert!(
+        response.try_recv().is_err(),
+        "admission retains the response for its continuation"
+    );
     hub.test_fulfill_pending_publishes();
     assert!(response.try_recv().unwrap().unwrap().ok);
     assert_eq!(hub.entity_publish_bridge().pending_publish_count(), 0);
@@ -4458,7 +4473,17 @@ fn two_publications_keep_distinct_pending_leases_before_owner_transfers_apply() 
     let first = queue_scoped_publication(&hub, live, "lease-probe.item", 1);
     let second = queue_scoped_publication(&hub, live, "lease-probe.item", 2);
     hub.test_fulfill_pending_publishes();
+    assert!(
+        first.try_recv().is_err(),
+        "admission retains the response for its continuation"
+    );
+    hub.test_fulfill_pending_publishes();
     assert!(first.try_recv().unwrap().unwrap().ok);
+    hub.test_fulfill_pending_publishes();
+    assert!(
+        second.try_recv().is_err(),
+        "admission retains the response for its continuation"
+    );
     hub.test_fulfill_pending_publishes();
     assert!(second.try_recv().unwrap().unwrap().ok);
     assert_eq!(
