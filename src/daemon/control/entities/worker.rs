@@ -311,7 +311,9 @@ impl EntityWork {
             Err(failure) => {
                 let advance = match failure.error {
                     HostSubmitError::Full => Advance::Capacity,
-                    HostSubmitError::Stopped | HostSubmitError::PhaseExhausted => Advance::Degraded,
+                    HostSubmitError::Stopped
+                    | HostSubmitError::PhaseExhausted
+                    | HostSubmitError::WrongExecutor => Advance::Degraded,
                 };
                 self.phase = Phase::Rejected(failure);
                 advance

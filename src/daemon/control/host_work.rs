@@ -981,6 +981,11 @@ fn host_error_response(error: HostMutationError) -> DaemonResponse {
 
 fn submit_error_response(error: HostSubmitError) -> DaemonResponse {
     match error {
+        HostSubmitError::WrongExecutor => error_response(
+            "host_permit_mismatch",
+            "host_execution",
+            "the host phase used a permit from another executor",
+        ),
         HostSubmitError::Full => error_response(
             "host_executor_full",
             "host_execution",
