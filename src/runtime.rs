@@ -105,6 +105,7 @@ pub struct HubRuntime {
     coordination_bridge: HubCoordinationBridge,
     entity_publish_bridge: HubEntityPublishBridge,
     package_entity_families: Arc<Mutex<BTreeMap<String, PackageEntityFamilyState>>>,
+    package_entity_epoch: std::cell::Cell<u64>,
     package_entity_resync_changed: std::cell::Cell<bool>,
     package_entity_fanout: Arc<Mutex<VecDeque<LeasedFanoutMutation>>>,
     package_entity_finishes: Arc<Mutex<VecDeque<CausalOp>>>,
@@ -234,10 +235,16 @@ pub type SharedSpawnTargets = SharedHubState;
 /// Shared hub-owned worktree view exposed to Lua plugin workers.
 pub type SharedWorktrees = SharedHubState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageEntityCleanupError {
+    GenerationExhausted,
+}
+
 /// Prepared package entity-provider work and its causal lease.
 pub(crate) struct PluginEntitySnapshotInvocation {
     pub(crate) request: PluginInvocationRequest,
     entity_kind: EntityKind,
+    pub(crate) family_generation: u64,
     scope_id: Option<u64>,
 }
 
@@ -354,6 +361,7 @@ impl HubRuntime {
             coordination_bridge: HubCoordinationBridge::new(),
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
+            package_entity_epoch: std::cell::Cell::new(0),
             package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
             package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
@@ -463,6 +471,7 @@ impl HubRuntime {
             coordination_bridge: HubCoordinationBridge::new(),
             entity_publish_bridge: HubEntityPublishBridge::new(),
             package_entity_families: Arc::new(Mutex::new(BTreeMap::new())),
+            package_entity_epoch: std::cell::Cell::new(0),
             package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(VecDeque::new())),
             package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
@@ -1211,6 +1220,7 @@ impl HubRuntime {
                             scope_id: lease.scope_id,
                             identity: LeaseIdentity::AdmittedEntityMutation {
                                 family: lease.family.clone(),
+                                generation: lease.generation,
                                 seq: lease.seq,
                             },
                         }))
@@ -1221,9 +1231,12 @@ impl HubRuntime {
                 family.pending_leases = leftover;
             }
             if family.unloading || !family.resync.needed {
-                for (scope_id, family_name) in
-                    self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
-                {
+                for (scope_id, family_name) in self.release_resync_leases(
+                    family.generation,
+                    family.take_resync_leases(),
+                    &mut applied,
+                    started,
+                ) {
                     family.remember_resync_lease(scope_id, family_name);
                 }
             }
@@ -1278,16 +1291,49 @@ impl HubRuntime {
 
     #[doc(hidden)]
     pub fn test_store_pending_lease(&self, scope_id: u64, family: &str, seq: u64) {
+        let mut families = self
+            .package_entity_families
+            .lock()
+            .expect("package entity family lock");
+        let state = families
+            .entry(family.to_string())
+            .or_insert_with(|| self.new_package_entity_family());
+        state.store_pending_lease(crate::package_entity_fanout::EntityMutationLease {
+            scope_id,
+            family: family.to_string(),
+            generation: state.generation,
+            seq,
+        });
+    }
+
+    fn new_package_entity_family(&self) -> PackageEntityFamilyState {
+        PackageEntityFamilyState {
+            generation: self.package_entity_epoch.get(),
+            ..PackageEntityFamilyState::default()
+        }
+    }
+
+    fn advance_package_entity_epoch(&self) -> Result<u64, PackageEntityCleanupError> {
+        let next = self
+            .package_entity_epoch
+            .get()
+            .checked_add(1)
+            .ok_or(PackageEntityCleanupError::GenerationExhausted)?;
+        self.package_entity_epoch.set(next);
+        Ok(next)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_exhaust_package_entity_epochs(&self) {
+        self.package_entity_epoch.set(u64::MAX);
+    }
+
+    pub(crate) fn package_entity_family_generation(&self, family: &str) -> Option<u64> {
         self.package_entity_families
             .lock()
             .expect("package entity family lock")
-            .entry(family.to_string())
-            .or_default()
-            .store_pending_lease(crate::package_entity_fanout::EntityMutationLease {
-                scope_id,
-                family: family.to_string(),
-                seq,
-            });
+            .get(family)
+            .map(|state| state.generation)
     }
 
     #[doc(hidden)]
@@ -1393,7 +1439,9 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        let entry = state.entry(family.to_string()).or_default();
+        let entry = state
+            .entry(family.to_string())
+            .or_insert_with(|| self.new_package_entity_family());
         self.settle_entity_publish_lease(entry, scope_id, plugin_key, family, seq, &result);
     }
 
@@ -1442,7 +1490,7 @@ impl HubRuntime {
             .lock()
             .expect("package entity family lock")
             .entry(family.to_string())
-            .or_default()
+            .or_insert_with(|| self.new_package_entity_family())
             .remember_resync_lease(scope_id, family.to_string());
     }
 
@@ -1474,7 +1522,9 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        let entry = state.entry(family.to_string()).or_default();
+        let entry = state
+            .entry(family.to_string())
+            .or_insert_with(|| self.new_package_entity_family());
         entry.last_accepted_seq = seq;
         entry.high_water_seq = seq;
     }
@@ -1496,6 +1546,10 @@ impl HubRuntime {
             .expect("package entity family lock")
             .get_mut(family)
         {
+            if !family.unloading {
+                self.advance_package_entity_epoch()
+                    .expect("test family epoch is available");
+            }
             family.unloading = true;
         }
     }
@@ -1544,6 +1598,10 @@ impl HubRuntime {
 
     /// Apply cleanup identities after host execution completes.
     pub(crate) fn apply_host_package_cleanup(&mut self, cleanup: HostPackageCleanup) {
+        assert!(
+            cleanup.unloaded_families.is_empty() || cleanup.family_epoch.is_some(),
+            "family cleanup must reserve its generation boundary first"
+        );
         self.event_plane_cleanup_faults.borrow_mut().extend(
             cleanup
                 .event_plane_faults
@@ -1559,6 +1617,16 @@ impl HubRuntime {
         if let Some(cleanup) = cleanup.last_capability_cleanup {
             self.last_capability_cleanup = Some(cleanup);
         }
+    }
+
+    pub(crate) fn begin_host_package_entity_cleanup(
+        &self,
+        cleanup: &mut HostPackageCleanup,
+    ) -> Result<(), PackageEntityCleanupError> {
+        if !cleanup.unloaded_families.is_empty() && cleanup.family_epoch.is_none() {
+            cleanup.family_epoch = Some(self.advance_package_entity_epoch()?);
+        }
+        Ok(())
     }
 
     /// Load an enabled package through core plugin worker mechanics.
@@ -2147,11 +2215,14 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        let family = families.entry(entity_type.clone()).or_default();
+        let family = families
+            .entry(entity_type.clone())
+            .or_insert_with(|| self.new_package_entity_family());
         let (result, ready) = family.admit(mutation, now);
         let incoming_lease = scope_id.map(|scope_id| EntityMutationLease {
             scope_id,
             family: entity_type.clone(),
+            generation: family.generation,
             seq: mutation_seq,
         });
         if matches!(result.status, PackageEntityPublishStatus::PendingGap)
@@ -2168,6 +2239,7 @@ impl HubRuntime {
             leased_ready.push(LeasedFanoutMutation {
                 mutation: ready_mutation,
                 lease,
+                generation: family.generation,
             });
         }
         if let Some(scope_id) = scope_id {
@@ -2226,6 +2298,7 @@ impl HubRuntime {
                     lease: item.lease,
                     scheduled_resync: false,
                 },
+                generation: item.generation,
             })
     }
 
@@ -2256,6 +2329,7 @@ impl HubRuntime {
 
     fn release_resync_leases(
         &self,
+        generation: u64,
         leases: BTreeSet<(u64, String)>,
         applied: &mut usize,
         started: Instant,
@@ -2276,6 +2350,7 @@ impl HubRuntime {
                     scope_id,
                     identity: LeaseIdentity::ProviderResyncNeed {
                         family: family.clone(),
+                        generation,
                     },
                 }))
             {
@@ -2297,6 +2372,7 @@ impl HubRuntime {
     fn prepare_finish_op(&self, lease: &EntityMutationLease, scheduled_resync: bool) -> CausalOp {
         let admitted = LeaseIdentity::AdmittedEntityMutation {
             family: lease.family.clone(),
+            generation: lease.generation,
             seq: lease.seq,
         };
         if scheduled_resync {
@@ -2305,7 +2381,15 @@ impl HubRuntime {
                 .package_entity_families
                 .lock()
                 .expect("package entity family lock");
-            let family = families.entry(lease.family.clone()).or_default();
+            let Some(family) = families
+                .get_mut(&lease.family)
+                .filter(|family| family.generation == lease.generation)
+            else {
+                return CausalOp::Release {
+                    scope_id: lease.scope_id,
+                    identity: admitted,
+                };
+            };
             family.resync.mark_needed(now);
             let added = family.remember_resync_lease(lease.scope_id, lease.family.clone());
             drop(families);
@@ -2316,6 +2400,7 @@ impl HubRuntime {
                     from: admitted,
                     to: vec![LeaseIdentity::ProviderResyncNeed {
                         family: lease.family.clone(),
+                        generation: lease.generation,
                     }],
                 };
             }
@@ -2350,7 +2435,7 @@ impl HubRuntime {
             .lock()
             .expect("package entity family lock")
             .entry(entity_type.to_string())
-            .or_default()
+            .or_insert_with(|| self.new_package_entity_family())
             .begin_provider_snapshot_seq(snapshot_seq, Instant::now())
     }
 
@@ -2360,17 +2445,24 @@ impl HubRuntime {
         &self,
         entity_type: &str,
     ) -> PackageEntitySnapshotStep {
-        let step = self
-            .package_entity_families
-            .lock()
-            .expect("package entity family lock")
-            .entry(entity_type.to_string())
-            .or_default()
-            .step_provider_snapshot(Instant::now());
+        let (generation, step) = {
+            let mut families = self
+                .package_entity_families
+                .lock()
+                .expect("package entity family lock");
+            let family = families
+                .entry(entity_type.to_string())
+                .or_insert_with(|| self.new_package_entity_family());
+            (
+                family.generation,
+                family.step_provider_snapshot(Instant::now()),
+            )
+        };
         match step {
             PackageEntityFamilyStep::Discarded { mutation, lease } => {
                 PackageEntitySnapshotStep::Discarded(TakenPackageEntityMutation {
                     mutation,
+                    generation,
                     finish: PackageEntityFanoutFinish {
                         lease,
                         scheduled_resync: false,
@@ -2380,6 +2472,7 @@ impl HubRuntime {
             PackageEntityFamilyStep::Ready { mutation, lease } => {
                 PackageEntitySnapshotStep::Ready(TakenPackageEntityMutation {
                     mutation,
+                    generation,
                     finish: PackageEntityFanoutFinish {
                         lease,
                         scheduled_resync: false,
@@ -2391,15 +2484,25 @@ impl HubRuntime {
                     scope_id,
                     identity: LeaseIdentity::ProviderResyncNeed {
                         family: family.clone(),
+                        generation,
                     },
                 };
                 if let CausalAdmitResult::Retry(_) = self.enqueue_retry(self.admit_causal_op(op)) {
-                    self.package_entity_families
+                    let mut families = self
+                        .package_entity_families
                         .lock()
-                        .expect("package entity family lock")
-                        .entry(entity_type.to_string())
-                        .or_default()
-                        .remember_resync_lease(scope_id, family);
+                        .expect("package entity family lock");
+                    if let Some(state) = families
+                        .get_mut(entity_type)
+                        .filter(|state| state.generation == generation)
+                    {
+                        state.remember_resync_lease(scope_id, family);
+                    } else {
+                        self.finish_package_entity_causal_op(CausalOp::Release {
+                            scope_id,
+                            identity: LeaseIdentity::ProviderResyncNeed { family, generation },
+                        });
+                    }
                 }
                 PackageEntitySnapshotStep::Pending
             }
@@ -2422,7 +2525,7 @@ impl HubRuntime {
             .expect("package entity family lock");
         families
             .entry(entity_type.to_string())
-            .or_default()
+            .or_insert_with(|| self.new_package_entity_family())
             .resync
             .mark_needed(now);
     }
@@ -2438,7 +2541,7 @@ impl HubRuntime {
             .expect("package entity family lock");
         families
             .entry(entity_type.to_string())
-            .or_default()
+            .or_insert_with(|| self.new_package_entity_family())
             .resync
             .rearm(now);
     }
@@ -2491,7 +2594,9 @@ impl HubRuntime {
             .package_entity_families
             .lock()
             .expect("package entity family lock");
-        let family = families.entry(entity_type.to_string()).or_default();
+        let family = families
+            .entry(entity_type.to_string())
+            .or_insert_with(|| self.new_package_entity_family());
         let degraded = family.resync.record_attempt(now);
         drop(families);
         if degraded {
@@ -2512,26 +2617,35 @@ impl HubRuntime {
                 .expect("package entity family lock");
             families.get_mut(entity_type).and_then(|family| {
                 if family.resync.degraded {
-                    family.resync.leases.pop_first()
+                    family
+                        .resync
+                        .leases
+                        .pop_first()
+                        .map(|(scope_id, name)| (scope_id, name, family.generation))
                 } else {
                     None
                 }
             })
         };
-        let Some((scope_id, family)) = lease else {
+        let Some((scope_id, family, generation)) = lease else {
             return false;
         };
         self.finish_package_entity_causal_op(CausalOp::Release {
             scope_id,
-            identity: LeaseIdentity::ProviderResyncNeed { family },
+            identity: LeaseIdentity::ProviderResyncNeed { family, generation },
         });
         true
     }
 
     /// Drop all package entity admission state for families owned by a package.
-    pub fn drop_package_entity_families_for(&self, package_name: &str) {
+    pub fn drop_package_entity_families_for(
+        &self,
+        package_name: &str,
+    ) -> Result<(), PackageEntityCleanupError> {
         let families = self.plugin_entity_provider_families(package_name);
+        self.advance_package_entity_epoch()?;
         self.drop_package_entity_families(package_name, families);
+        Ok(())
     }
 
     fn drop_package_entity_families(&self, package_name: &str, mut families: BTreeSet<String>) {
@@ -2557,6 +2671,7 @@ impl HubRuntime {
                             scope_id: lease.scope_id,
                             identity: LeaseIdentity::AdmittedEntityMutation {
                                 family: lease.family.clone(),
+                                generation: lease.generation,
                                 seq: lease.seq,
                             },
                         }))
@@ -2567,9 +2682,12 @@ impl HubRuntime {
                 family.pending_leases = leftover;
                 let started = Instant::now();
                 let mut applied = 0;
-                for (scope_id, name) in
-                    self.release_resync_leases(family.take_resync_leases(), &mut applied, started)
-                {
+                for (scope_id, name) in self.release_resync_leases(
+                    family.generation,
+                    family.take_resync_leases(),
+                    &mut applied,
+                    started,
+                ) {
                     family.remember_resync_lease(scope_id, name);
                 }
                 if !family.pending_leases.is_empty() || !family.resync.leases.is_empty() {
@@ -2591,6 +2709,7 @@ impl HubRuntime {
                             scope_id: lease.scope_id,
                             identity: LeaseIdentity::AdmittedEntityMutation {
                                 family: lease.family,
+                                generation: lease.generation,
                                 seq: lease.seq,
                             },
                         }))
@@ -3005,12 +3124,16 @@ impl HubRuntime {
                 format!("entity provider {entity_type} has no handler"),
             )
         })?;
-        let scope_id = self
-            .package_entity_families
-            .lock()
-            .expect("package entity family lock")
-            .get(entity_type)
-            .and_then(PackageEntityFamilyState::provider_scope_id);
+        let (scope_id, family_generation) = {
+            let mut families = self
+                .package_entity_families
+                .lock()
+                .expect("package entity family lock");
+            let family = families
+                .entry(entity_type.to_string())
+                .or_insert_with(|| self.new_package_entity_family());
+            (family.provider_scope_id(), family.generation)
+        };
         if scope_id.is_some() && !self.leftover_slot_available() {
             return Err(crate::McpToolError::new(
                 "causal_scope_busy",
@@ -3052,6 +3175,7 @@ impl HubRuntime {
         Ok(PluginEntitySnapshotInvocation {
             request,
             entity_kind,
+            family_generation,
             scope_id,
         })
     }
@@ -3077,6 +3201,14 @@ impl HubRuntime {
             invocation.scope_id,
             &invocation.request.request_id,
         );
+        if self.package_entity_family_generation(invocation.entity_kind.as_str())
+            != Some(invocation.family_generation)
+        {
+            return Err(crate::McpToolError::new(
+                "entity_provider_stale",
+                "the entity family changed during the provider request",
+            ));
+        }
         Self::convert_plugin_entity_snapshot(&invocation.entity_kind, result)
     }
 
@@ -4868,6 +5000,7 @@ impl Error for HubLuaPluginLoadError {
 }
 
 struct LeasedFanoutMutation {
+    generation: u64,
     mutation: PackageEntityMutation,
     lease: Option<EntityMutationLease>,
 }
@@ -4887,6 +5020,7 @@ pub enum PackageEntitySnapshotStep {
 
 /// One mutation and its separate completion lease.
 pub struct TakenPackageEntityMutation {
+    pub(crate) generation: u64,
     pub mutation: PackageEntityMutation,
     finish: PackageEntityFanoutFinish,
 }
@@ -4904,7 +5038,7 @@ pub struct PackageEntityFanoutFinish {
 }
 
 fn settle_entity_publish_op(
-    _family: &mut PackageEntityFamilyState,
+    family: &mut PackageEntityFamilyState,
     scope_id: u64,
     plugin_key: &str,
     entity_type: &str,
@@ -4927,12 +5061,14 @@ fn settle_entity_publish_op(
     ) {
         next.push(LeaseIdentity::AdmittedEntityMutation {
             family: entity_type.to_string(),
+            generation: family.generation,
             seq: mutation_seq,
         });
     }
     if result.resync_needed {
         next.push(LeaseIdentity::ProviderResyncNeed {
             family: entity_type.to_string(),
+            generation: family.generation,
         });
     }
     if next.is_empty() {
@@ -5686,6 +5822,158 @@ mod tests {
         SessionDefaults, TransportBindings,
     };
 
+    fn family_runtime(name: &str) -> HubRuntime {
+        let config = HubStartupOptions {
+            host: HostIdentityOptions {
+                id: name.to_string(),
+                display_name: name.to_string(),
+                fingerprint: None,
+            },
+            data_directory: DataDirectoryOption::Explicit(
+                std::env::temp_dir().join(format!("{name}-{}", std::process::id())),
+            ),
+            session_defaults: SessionDefaults {
+                shell: "/bin/sh".to_string(),
+                working_directory: Some(".".into()),
+                initial_rows: 24,
+                initial_cols: 80,
+            },
+            transports: TransportBindings::default(),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        HubRuntime::new(config).unwrap()
+    }
+
+    #[test]
+    fn old_family_releases_preserve_recreated_mutation_and_resync_leases() {
+        let runtime = family_runtime("family-release-generation");
+        let family = "producer.item";
+        runtime.test_set_family_seq(family, 1);
+        runtime.test_set_family_seq("other.item", 1);
+        let old_generation = runtime.package_entity_family_generation(family).unwrap();
+        let scope_id = runtime
+            .causal_scopes
+            .mint_with_lease(Some(LeaseIdentity::EventInFlight {
+                request_id: "root".into(),
+            }))
+            .unwrap();
+        let identities = |generation| {
+            [
+                LeaseIdentity::AdmittedEntityMutation {
+                    family: family.into(),
+                    generation,
+                    seq: 1,
+                },
+                LeaseIdentity::ProviderResyncNeed {
+                    family: family.into(),
+                    generation,
+                },
+            ]
+        };
+        for identity in identities(old_generation) {
+            assert!(runtime.causal_scopes.acquire(scope_id, identity));
+        }
+        let retained = runtime.causal_scopes.test_with_inner_held(|| {
+            for _ in 0..CAUSAL_PENDING_MAX {
+                assert_eq!(
+                    runtime.admit_causal_op(CausalOp::Release {
+                        scope_id: u64::MAX,
+                        identity: LeaseIdentity::EventInFlight {
+                            request_id: "absent".into()
+                        }
+                    }),
+                    CausalAdmitResult::Applied
+                );
+            }
+            identities(old_generation).map(|identity| {
+                let CausalAdmitResult::Retry(op) =
+                    runtime.admit_causal_op(CausalOp::Release { scope_id, identity })
+                else {
+                    panic!("the caller must retain the rejected old release")
+                };
+                op
+            })
+        });
+        while runtime.causal_scopes.pending_ops() {
+            runtime.causal_scopes.flush_pending();
+        }
+        runtime
+            .drop_package_entity_families_for("producer")
+            .unwrap();
+        assert_eq!(
+            runtime.package_entity_family_generation("other.item"),
+            Some(old_generation)
+        );
+        runtime.test_set_family_seq(family, 1);
+        let new_generation = runtime.package_entity_family_generation(family).unwrap();
+        assert_ne!(new_generation, old_generation);
+        for identity in identities(new_generation) {
+            assert!(runtime.causal_scopes.acquire(scope_id, identity));
+        }
+        for op in retained {
+            assert_eq!(runtime.admit_causal_op(op), CausalAdmitResult::Applied);
+        }
+        let live = runtime.causal_scopes.identities(scope_id).unwrap();
+        for identity in identities(new_generation) {
+            assert!(live.contains(&identity));
+        }
+        for identity in identities(old_generation) {
+            assert!(!live.contains(&identity));
+        }
+        runtime.finish_package_entity_fanout(PackageEntityFanoutFinish {
+            lease: Some(EntityMutationLease {
+                scope_id,
+                family: family.into(),
+                generation: old_generation,
+                seq: 1,
+            }),
+            scheduled_resync: true,
+        });
+        let families = runtime.package_entity_families.lock().unwrap();
+        assert_eq!(families[family].generation, new_generation);
+        assert!(!families[family].resync.needed);
+    }
+
+    #[test]
+    fn family_boundary_retry_and_exhaustion_preserve_exact_state() {
+        let runtime = family_runtime("family-boundary-generation");
+        runtime.test_set_family_seq("producer.item", 1);
+        let mut cleanup = HostPackageCleanup::default();
+        cleanup
+            .unloaded_families
+            .push(("producer".into(), BTreeSet::from(["producer.item".into()])));
+        runtime
+            .begin_host_package_entity_cleanup(&mut cleanup)
+            .unwrap();
+        let epoch = runtime.package_entity_epoch.get();
+        runtime
+            .begin_host_package_entity_cleanup(&mut cleanup)
+            .unwrap();
+        assert_eq!(runtime.package_entity_epoch.get(), epoch);
+        assert_eq!(cleanup.family_epoch, Some(epoch));
+        assert_eq!(
+            runtime.package_entity_family_generation("producer.item"),
+            Some(0)
+        );
+        runtime.test_exhaust_package_entity_epochs();
+        let mut refused = HostPackageCleanup::default();
+        refused
+            .unloaded_families
+            .push(("producer".into(), BTreeSet::from(["producer.item".into()])));
+        assert_eq!(
+            runtime.begin_host_package_entity_cleanup(&mut refused),
+            Err(PackageEntityCleanupError::GenerationExhausted)
+        );
+        assert_eq!(refused.family_epoch, None);
+        assert_eq!(refused.unloaded_families.len(), 1);
+        assert_eq!(
+            runtime.package_entity_family_generation("producer.item"),
+            Some(0)
+        );
+    }
+
     fn completed_entity_snapshot(payload: serde_json::Value) -> PluginInvocationResult {
         PluginInvocationResult::Completed(botster_core::PluginInvocationSuccess {
             request_id: RequestId("entity-snapshot-test".to_string()),
@@ -6425,10 +6713,12 @@ mod tests {
             scopes.identities(accepted),
             Some(BTreeSet::from([
                 LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "producer.item".into(),
                     seq: 32,
                 },
                 LeaseIdentity::ProviderResyncNeed {
+                    generation: 0,
                     family: "producer.item".into(),
                 },
             ]))

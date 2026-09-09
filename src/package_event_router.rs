@@ -2532,6 +2532,18 @@ fn bind_consumer_cell(inner: &mut RouterInner, counters: &EventPlaneCounters, pl
     {
         return;
     }
+    if let Some(queue) = inner.consumers.get(plugin_key)
+        && let Some(old) = queue.age_cell.as_ref()
+    {
+        counters.retire_cell(
+            &AgeIdentity {
+                kind: DaemonQueueKind::Consumer,
+                identity: plugin_key.to_string(),
+                generation: Some(queue.generation),
+            },
+            old,
+        );
+    }
     let consumer_cell = Arc::new(QueueAgeMetric::new(generation));
     counters.register_cell(
         AgeIdentity {
@@ -2542,17 +2554,7 @@ fn bind_consumer_cell(inner: &mut RouterInner, counters: &EventPlaneCounters, pl
         Arc::clone(&consumer_cell),
     );
     let queue = inner.consumers.entry(plugin_key.to_string()).or_default();
-    if let Some(old) = queue.age_cell.replace(Arc::clone(&consumer_cell)) {
-        old.close_writes();
-        counters.retire_cell(
-            &AgeIdentity {
-                kind: DaemonQueueKind::Consumer,
-                identity: plugin_key.to_string(),
-                generation: Some(queue.generation),
-            },
-            &old,
-        );
-    }
+    queue.age_cell = Some(Arc::clone(&consumer_cell));
     queue.generation = generation;
     consumer_cell.store(queue.events as u64, u64::MAX, 0, false, queue.bytes as u64);
 }
@@ -2794,11 +2796,24 @@ struct CausalScope {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LeaseIdentity {
-    EventInFlight { request_id: String },
-    PendingEntityPublish { plugin_key: String },
-    AdmittedEntityMutation { family: String, seq: u64 },
-    ProviderResyncNeed { family: String },
-    ProviderInFlight { request_id: String },
+    EventInFlight {
+        request_id: String,
+    },
+    PendingEntityPublish {
+        plugin_key: String,
+    },
+    AdmittedEntityMutation {
+        family: String,
+        generation: u64,
+        seq: u64,
+    },
+    ProviderResyncNeed {
+        family: String,
+        generation: u64,
+    },
+    ProviderInFlight {
+        request_id: String,
+    },
 }
 
 impl Default for CausalScopeTable {
@@ -4319,11 +4334,16 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
+        old.store(2, 10, 0, false, 200);
         old.close_writes();
         bind_consumer_cell(&mut inner, router.counters(), "consumer");
         let new = inner.consumers["consumer"].age_cell.as_ref().unwrap();
         assert!(!Arc::ptr_eq(&old, new));
         assert!(!new.is_write_closed());
+        assert_eq!(
+            old.sample(),
+            crate::event_plane_counters::AgeSample::Empty { count: 0, bytes: 0 }
+        );
         let rows: Vec<_> = router
             .counters()
             .snapshot()
@@ -5375,6 +5395,7 @@ mod tests {
                     plugin_key: "producer".into(),
                 },
                 [LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "producer.item".into(),
                     seq: 32,
                 }],
@@ -5386,6 +5407,7 @@ mod tests {
         assert_eq!(
             table.identities(scope),
             Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "producer.item".into(),
                 seq: 32,
             }]))
@@ -5578,6 +5600,7 @@ mod tests {
                         plugin_key: "producer".into(),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: 1,
                     }],
@@ -5588,6 +5611,7 @@ mod tests {
                 table.release(
                     scope,
                     LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: 1,
                     },
@@ -5661,6 +5685,7 @@ mod tests {
                             plugin_key: format!("p{index}"),
                         },
                         [LeaseIdentity::AdmittedEntityMutation {
+                            generation: 0,
                             family: "f".into(),
                             seq: index as u64,
                         }],
@@ -5674,6 +5699,7 @@ mod tests {
                     plugin_key: format!("p{}", CAUSAL_PENDING_MAX),
                 },
                 [LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "f".into(),
                     seq: CAUSAL_PENDING_MAX as u64,
                 }],
@@ -5691,6 +5717,7 @@ mod tests {
         assert_eq!(
             table.identities(scopes[0]),
             Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "f".into(),
                 seq: 0,
             }]))
@@ -5706,6 +5733,7 @@ mod tests {
             assert_eq!(
                 table.identities(*scope),
                 Some(BTreeSet::from([LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "f".into(),
                     seq: index as u64,
                 }]))
@@ -5740,6 +5768,7 @@ mod tests {
                             plugin_key: format!("p{index}"),
                         },
                         [LeaseIdentity::AdmittedEntityMutation {
+                            generation: 0,
                             family: "f".into(),
                             seq: index as u64,
                         }],
@@ -5754,6 +5783,7 @@ mod tests {
                         plugin_key: "producer".into(),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "producer.item".into(),
                         seq: 1,
                     }],
@@ -5769,6 +5799,7 @@ mod tests {
             table.release(
                 live,
                 LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "producer.item".into(),
                     seq: 1,
                 },
@@ -5811,6 +5842,7 @@ mod tests {
                             plugin_key: format!("p{index}"),
                         },
                         [LeaseIdentity::AdmittedEntityMutation {
+                            generation: 0,
                             family: "f".into(),
                             seq: index as u64,
                         }],

@@ -1750,113 +1750,130 @@ mod tests {
     }
 
     #[test]
-    fn terminal_event_recovery_keeps_owner_admission_for_accepted_requests() {
-        let root = unique_package_control_dir("event-recovery-owner-admission");
-        let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
-            .expect("start event recovery daemon");
-        for name in ["alpha.plugin", "beta.plugin"] {
-            let package_dir = root.join(name);
-            write_package_control_manifest(&package_dir, name, serde_json::json!({}));
-            drive_package_request(
+    fn terminal_package_cleanup_recovery_keeps_owner_admission_for_accepted_requests() {
+        for family_failure in [false, true] {
+            let root = unique_package_control_dir(if family_failure {
+                "family-recovery-owner-admission"
+            } else {
+                "event-recovery-owner-admission"
+            });
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+                .expect("start event recovery daemon");
+            for name in ["alpha.plugin", "beta.plugin"] {
+                let package_dir = root.join(name);
+                write_package_control_manifest(&package_dir, name, serde_json::json!({}));
+                drive_package_request(
+                    &mut daemon,
+                    DaemonRequest::InstallPackageLocalPath { path: package_dir },
+                )
+                .expect("install package");
+                drive_package_request(
+                    &mut daemon,
+                    DaemonRequest::EnablePackage {
+                        package_name: name.into(),
+                    },
+                )
+                .expect("enable package");
+            }
+            let mut state = DaemonControlState::default();
+            state.budget = crate::daemon::owner_budget::OwnerBudget::with_capacity(2);
+            let first_reply = start_async_control_request(
                 &mut daemon,
-                DaemonRequest::InstallPackageLocalPath { path: package_dir },
-            )
-            .expect("install package");
-            drive_package_request(
-                &mut daemon,
-                DaemonRequest::EnablePackage {
-                    package_name: name.into(),
+                &mut state,
+                DaemonRequest::DisablePackage {
+                    package_name: "alpha.plugin".into(),
                 },
-            )
-            .expect("enable package");
-        }
-        let mut state = DaemonControlState::default();
-        state.budget = crate::daemon::owner_budget::OwnerBudget::with_capacity(2);
-        let first_reply = start_async_control_request(
-            &mut daemon,
-            &mut state,
-            DaemonRequest::DisablePackage {
-                package_name: "alpha.plugin".into(),
-            },
-            "alpha-client",
-            "alpha-request",
-        );
-        let second_reply = start_async_control_request(
-            &mut daemon,
-            &mut state,
-            DaemonRequest::DisablePackage {
-                package_name: "beta.plugin".into(),
-            },
-            "beta-client",
-            "beta-request",
-        );
-        assert_eq!(state.budget.outstanding(), 2);
-        assert_eq!(state.pending_requests.len(), 2);
-        let router = daemon.runtime().unwrap().package_event_router().clone();
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            router.test_with_inner_held(|| panic!("inject terminal event router failure"));
-        }));
-        assert!(poisoned.is_err());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while state.host_recovery.is_empty() {
-            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
-            assert!(
-                Instant::now() < deadline,
-                "the accepted cleanup must report terminal recovery"
+                "alpha-client",
+                "alpha-request",
             );
-            thread::yield_now();
-        }
-        assert!(state.host_recovery.values().any(|recovery| matches!(
+            let second_reply = start_async_control_request(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::DisablePackage {
+                    package_name: "beta.plugin".into(),
+                },
+                "beta-client",
+                "beta-request",
+            );
+            assert_eq!(state.budget.outstanding(), 2);
+            assert_eq!(state.pending_requests.len(), 2);
+            if family_failure {
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .test_exhaust_package_entity_epochs();
+            } else {
+                let router = daemon.runtime().unwrap().package_event_router().clone();
+                let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    router.test_with_inner_held(|| panic!("inject terminal event router failure"));
+                }));
+                assert!(poisoned.is_err());
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while state.host_recovery.is_empty() {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "the accepted cleanup must report terminal recovery"
+                );
+                thread::yield_now();
+            }
+            assert!(state.host_recovery.values().any(|recovery| if family_failure {
+            matches!(recovery, crate::daemon::control::host_work::HostRecoveryRequired::PackageFamilies {
+                owner_permit: Some(_), ..
+            })
+        } else { matches!(
             recovery,
             crate::daemon::control::host_work::HostRecoveryRequired::PackageEvents {
                 owner_permit: Some(_),
                 ..
             }
-        )));
-        assert_eq!(
-            state.pending_requests.len(),
-            1,
-            "the other accepted mutation retains its document wait"
-        );
-        assert_eq!(state.budget.outstanding(), 2);
-        assert!(
-            state.budget.reserve().is_none(),
-            "terminal recovery must not free accepted Owner capacity"
-        );
-        drop(first_reply);
-        drop(second_reply);
-        for client in ["alpha-client", "beta-client"] {
-            crate::daemon::control::pending::retire_abandoned_requests(
-                &mut daemon,
-                &mut state,
-                client,
+        ) }));
+            assert_eq!(
+                state.pending_requests.len(),
+                1,
+                "the other accepted mutation retains its document wait"
             );
-        }
-        assert_eq!(state.budget.outstanding(), 2);
-        assert_eq!(state.host_recovery.len(), 1);
-        assert_eq!(state.pending_requests.len(), 1);
-        let other_host_slots = (2..crate::host_executor::HOST_OPERATION_CAPACITY)
-            .map(|_| {
+            assert_eq!(state.budget.outstanding(), 2);
+            assert!(
+                state.budget.reserve().is_none(),
+                "terminal recovery must not free accepted Owner capacity"
+            );
+            drop(first_reply);
+            drop(second_reply);
+            for client in ["alpha-client", "beta-client"] {
+                crate::daemon::control::pending::retire_abandoned_requests(
+                    &mut daemon,
+                    &mut state,
+                    client,
+                );
+            }
+            assert_eq!(state.budget.outstanding(), 2);
+            assert_eq!(state.host_recovery.len(), 1);
+            assert_eq!(state.pending_requests.len(), 1);
+            let other_host_slots = (2..crate::host_executor::HOST_OPERATION_CAPACITY)
+                .map(|_| {
+                    daemon
+                        .runtime()
+                        .unwrap()
+                        .host_executor()
+                        .try_reserve()
+                        .expect("unrelated Host slot")
+                })
+                .collect::<Vec<_>>();
+            assert!(
                 daemon
                     .runtime()
                     .unwrap()
                     .host_executor()
                     .try_reserve()
-                    .expect("unrelated Host slot")
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            daemon
-                .runtime()
-                .unwrap()
-                .host_executor()
-                .try_reserve()
-                .is_none()
-        );
-        drop(other_host_slots);
-        drop(state);
-        daemon.stop();
-        std::fs::remove_dir_all(root).expect("remove event recovery test directory");
+                    .is_none()
+            );
+            drop(other_host_slots);
+            drop(state);
+            daemon.stop();
+            std::fs::remove_dir_all(root).expect("remove event recovery test directory");
+        }
     }
 
     #[test]

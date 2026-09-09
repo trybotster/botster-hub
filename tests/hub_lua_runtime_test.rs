@@ -4025,6 +4025,7 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
         scopes.identities(success),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "lease-probe.item".into(),
                 seq: 1,
             }
@@ -4088,6 +4089,7 @@ fn entity_lease_scope_closes_after_success_error_fanout_degradation_and_unload()
         scopes.identities(degraded),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::ProviderResyncNeed {
+                generation: 0,
                 family: "lease-probe.item".into(),
             }
         ]))
@@ -4164,6 +4166,7 @@ fn production_fanout_finish_returns_the_513th_op_without_spinning() {
                         plugin_key: format!("fill{index}"),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     }],
@@ -4187,6 +4190,7 @@ fn production_fanout_finish_returns_the_513th_op_without_spinning() {
         scopes.identities(success),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "lease-probe.item".into(),
                 seq: 1,
             }
@@ -4203,6 +4207,7 @@ fn production_fanout_finish_returns_the_513th_op_without_spinning() {
         scopes.identities(fillers[0]),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "f".into(),
                 seq: 0,
             }
@@ -4223,6 +4228,7 @@ fn production_fanout_finish_returns_the_513th_op_without_spinning() {
         scopes.identities(success),
         Some(std::collections::BTreeSet::from([
             LeaseIdentity::ProviderResyncNeed {
+                generation: 0,
                 family: "lease-probe.item".into(),
             }
         ]))
@@ -4260,6 +4266,7 @@ fn never_queued_publish_releases_after_full_causal_path() {
                         plugin_key: format!("fill{index}"),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     }],
@@ -4321,6 +4328,7 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
                         plugin_key: format!("fill{index}"),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     }],
@@ -4332,6 +4340,7 @@ fn never_queued_release_stays_owned_when_release_queue_is_full() {
             let op = CausalOp::Release {
                 scope_id: *scope,
                 identity: LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "f".into(),
                     seq: index as u64,
                 },
@@ -4402,13 +4411,17 @@ fn park_release_keeps_both_identities_for_one_scope() {
     let scopes = hub.causal_scopes().clone();
     let live = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "f".into(),
             seq: 1,
         }))
         .expect("live");
     assert!(scopes.acquire(
         live,
-        LeaseIdentity::ProviderResyncNeed { family: "f".into() },
+        LeaseIdentity::ProviderResyncNeed {
+            generation: 0,
+            family: "f".into()
+        },
     ));
     let mut fillers = Vec::new();
     for index in 0..CAUSAL_PENDING_MAX {
@@ -4430,6 +4443,7 @@ fn park_release_keeps_both_identities_for_one_scope() {
                         plugin_key: format!("fill{index}"),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     }],
@@ -4440,6 +4454,7 @@ fn park_release_keeps_both_identities_for_one_scope() {
                 bridge.park_release(CausalOp::Release {
                     scope_id: *scope,
                     identity: LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     },
@@ -4451,6 +4466,7 @@ fn park_release_keeps_both_identities_for_one_scope() {
             bridge.park_release(CausalOp::Release {
                 scope_id: live,
                 identity: LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "f".into(),
                     seq: 1,
                 },
@@ -4460,7 +4476,10 @@ fn park_release_keeps_both_identities_for_one_scope() {
         assert_eq!(
             bridge.park_release(CausalOp::Release {
                 scope_id: live,
-                identity: LeaseIdentity::ProviderResyncNeed { family: "f".into() },
+                identity: LeaseIdentity::ProviderResyncNeed {
+                    generation: 0,
+                    family: "f".into()
+                },
             }),
             CausalAdmitResult::Applied
         );
@@ -4540,6 +4559,7 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
                         plugin_key: format!("fill{index}"),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     }],
@@ -4553,6 +4573,7 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
                     hub.keep_causal_op(CausalOp::Release {
                         scope_id: *scope,
                         identity: LeaseIdentity::AdmittedEntityMutation {
+                            generation: 0,
                             family: "f".into(),
                             seq: index as u64,
                         },
@@ -4568,6 +4589,7 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
                 plugin_key: "producer".into(),
             },
             to: vec![LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "producer.item".into(),
                 seq: 1,
             }],
@@ -4578,6 +4600,7 @@ fn unfinished_finishes_are_bounded_sliced_and_fifo() {
         let release = hub.keep_causal_op(CausalOp::Release {
             scope_id: live,
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "producer.item".into(),
                 seq: 1,
             },
@@ -4636,6 +4659,7 @@ fn keep_owned_park_retry_stays_at_source_when_every_store_is_full() {
                         plugin_key: format!("fill{index}"),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     }],
@@ -4649,6 +4673,7 @@ fn keep_owned_park_retry_stays_at_source_when_every_store_is_full() {
                     hub.keep_causal_op(CausalOp::Release {
                         scope_id: *scope,
                         identity: LeaseIdentity::AdmittedEntityMutation {
+                            generation: 0,
                             family: "f".into(),
                             seq: index as u64,
                         },
@@ -4661,6 +4686,7 @@ fn keep_owned_park_retry_stays_at_source_when_every_store_is_full() {
             let op = CausalOp::Release {
                 scope_id: *scope,
                 identity: LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "f".into(),
                     seq: index as u64,
                 },
@@ -4715,6 +4741,7 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
     for seq in 0..(CAUSAL_FLUSH_MAX + 8) {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "lease-probe.item".into(),
                 seq: seq as u64,
             }))
@@ -4742,6 +4769,7 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
                         plugin_key: format!("fill{index}"),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     }],
@@ -4755,6 +4783,7 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
                     hub.keep_causal_op(CausalOp::Release {
                         scope_id: *scope,
                         identity: LeaseIdentity::AdmittedEntityMutation {
+                            generation: 0,
                             family: "f".into(),
                             seq: index as u64,
                         },
@@ -4767,6 +4796,7 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
             let op = CausalOp::Release {
                 scope_id: *scope,
                 identity: LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "f".into(),
                     seq: index as u64,
                 },
@@ -4780,6 +4810,7 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
         let dummy = CausalOp::Release {
             scope_id: fillers[0],
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "f".into(),
                 seq: 0,
             },
@@ -4795,6 +4826,7 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
                 CausalOp::Release {
                     scope_id: lives[0],
                     identity: LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "lease-probe.item".into(),
                         seq: 0,
                     },
@@ -4802,7 +4834,8 @@ fn unload_retries_restored_family_leases_until_scopes_close() {
             ),
             CausalAdmitResult::Applied
         );
-        hub.drop_package_entity_families_for("lease-probe");
+        hub.drop_package_entity_families_for("lease-probe")
+            .expect("family cleanup boundary");
         assert!(hub.test_family_unloading("lease-probe.item"));
     });
     assert!(hub.test_family_unloading("lease-probe.item"));
@@ -4830,6 +4863,7 @@ fn family_release(scope: u64, family: &str, seq: u64) -> CausalOp {
     CausalOp::Release {
         scope_id: scope,
         identity: LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: family.into(),
             seq,
         },
@@ -4860,6 +4894,7 @@ fn mint_leftover_fill(scopes: &CausalScopeTable) -> LeftoverFill {
         parks.push(
             scopes
                 .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: format!("p{index}"),
                     seq: index as u64,
                 }))
@@ -4871,18 +4906,21 @@ fn mint_leftover_fill(scopes: &CausalScopeTable) -> LeftoverFill {
         parks,
         held: scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "held".into(),
                 seq: 0,
             }))
             .expect("held"),
         source: scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "source".into(),
                 seq: 0,
             }))
             .expect("source"),
         overflow: scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "overflow".into(),
                 seq: 0,
             }))
@@ -4900,6 +4938,7 @@ fn fill_every_leftover_store(hub: &HubRuntime, scopes: &CausalScopeTable, fill: 
                     plugin_key: format!("fill{index}"),
                 },
                 [LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "f".into(),
                     seq: index as u64,
                 }],
@@ -4913,6 +4952,7 @@ fn fill_every_leftover_store(hub: &HubRuntime, scopes: &CausalScopeTable, fill: 
                 hub.keep_causal_op(CausalOp::Release {
                     scope_id: *scope,
                     identity: LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     },
@@ -4925,6 +4965,7 @@ fn fill_every_leftover_store(hub: &HubRuntime, scopes: &CausalScopeTable, fill: 
         let op = CausalOp::Release {
             scope_id: *scope,
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "f".into(),
                 seq: index as u64,
             },
@@ -4938,6 +4979,7 @@ fn fill_every_leftover_store(hub: &HubRuntime, scopes: &CausalScopeTable, fill: 
     let dummy = CausalOp::Release {
         scope_id: fill.fillers[0],
         identity: LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "f".into(),
             seq: 0,
         },
@@ -4998,6 +5040,7 @@ fn family_causal_is_one_global_fifo_and_258th_stays_at_source() {
         let family = format!("f{index}");
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: family.clone(),
                 seq: index as u64,
             }))
@@ -5011,6 +5054,7 @@ fn family_causal_is_one_global_fifo_and_258th_stays_at_source() {
     assert_eq!(hub.test_family_causal_len(), CAUSAL_PENDING_MAX);
     let held_scope = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "held".into(),
             seq: 0,
         }))
@@ -5023,6 +5067,7 @@ fn family_causal_is_one_global_fifo_and_258th_stays_at_source() {
     assert!(hub.test_family_held());
     let source_scope = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "source".into(),
             seq: 0,
         }))
@@ -5039,6 +5084,7 @@ fn family_causal_is_one_global_fifo_and_258th_stays_at_source() {
     assert!(hub.test_family_source());
     let extra = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "extra".into(),
             seq: 0,
         }))
@@ -5079,6 +5125,7 @@ fn unloading_family_scan_stops_after_the_slice() {
         let family = format!("unload{index}");
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: family.clone(),
                 seq: index as u64,
             }))
@@ -5111,6 +5158,7 @@ fn held_retry_does_not_delete_active_family_sequence() {
     hub.test_set_family_seq("active.item", 5);
     let leftover = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "other.item".into(),
             seq: 1,
         }))
@@ -5147,6 +5195,7 @@ fn production_enqueue_or_family_owns_the_259th() {
         parks.push(
             scopes
                 .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: format!("p{index}"),
                     seq: index as u64,
                 }))
@@ -5155,18 +5204,21 @@ fn production_enqueue_or_family_owns_the_259th() {
     }
     let held = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "held".into(),
             seq: 0,
         }))
         .expect("held");
     let source = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "source".into(),
             seq: 0,
         }))
         .expect("source");
     let extra = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "extra".into(),
             seq: 0,
         }))
@@ -5181,6 +5233,7 @@ fn production_enqueue_or_family_owns_the_259th() {
                         plugin_key: format!("fill{index}"),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     }],
@@ -5194,6 +5247,7 @@ fn production_enqueue_or_family_owns_the_259th() {
                     hub.keep_causal_op(CausalOp::Release {
                         scope_id: *scope,
                         identity: LeaseIdentity::AdmittedEntityMutation {
+                            generation: 0,
                             family: "f".into(),
                             seq: index as u64,
                         },
@@ -5206,6 +5260,7 @@ fn production_enqueue_or_family_owns_the_259th() {
             let op = CausalOp::Release {
                 scope_id: *scope,
                 identity: LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "f".into(),
                     seq: index as u64,
                 },
@@ -5219,6 +5274,7 @@ fn production_enqueue_or_family_owns_the_259th() {
         let dummy = CausalOp::Release {
             scope_id: fillers[0],
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "f".into(),
                 seq: 0,
             },
@@ -5284,6 +5340,7 @@ fn production_source_owns_the_260th() {
         parks.push(
             scopes
                 .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: format!("p{index}"),
                     seq: index as u64,
                 }))
@@ -5292,24 +5349,28 @@ fn production_source_owns_the_260th() {
     }
     let held = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "held".into(),
             seq: 0,
         }))
         .expect("held");
     let source = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "source".into(),
             seq: 0,
         }))
         .expect("source");
     let overflow = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "overflow".into(),
             seq: 0,
         }))
         .expect("overflow");
     let extra = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "source.item".into(),
             seq: 2,
         }))
@@ -5324,6 +5385,7 @@ fn production_source_owns_the_260th() {
                         plugin_key: format!("fill{index}"),
                     },
                     [LeaseIdentity::AdmittedEntityMutation {
+                        generation: 0,
                         family: "f".into(),
                         seq: index as u64,
                     }],
@@ -5337,6 +5399,7 @@ fn production_source_owns_the_260th() {
                     hub.keep_causal_op(CausalOp::Release {
                         scope_id: *scope,
                         identity: LeaseIdentity::AdmittedEntityMutation {
+                            generation: 0,
                             family: "f".into(),
                             seq: index as u64,
                         },
@@ -5349,6 +5412,7 @@ fn production_source_owns_the_260th() {
             let op = CausalOp::Release {
                 scope_id: *scope,
                 identity: LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "f".into(),
                     seq: index as u64,
                 },
@@ -5362,6 +5426,7 @@ fn production_source_owns_the_260th() {
         let dummy = CausalOp::Release {
             scope_id: fillers[0],
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "f".into(),
                 seq: 0,
             },
@@ -5422,6 +5487,7 @@ fn source_ops_are_one_global_store_across_families() {
         let family = format!("f{index}");
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: family.clone(),
                 seq: index as u64,
             }))
@@ -5438,6 +5504,7 @@ fn source_ops_are_one_global_store_across_families() {
         let family = format!("s{index}");
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: family.clone(),
                 seq: index as u64,
             }))
@@ -5452,6 +5519,7 @@ fn source_ops_are_one_global_store_across_families() {
     assert_eq!(hub.test_source_ops_len(), CAUSAL_PENDING_MAX);
     let extra = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "missing.item".into(),
             seq: 0,
         }))
@@ -5481,6 +5549,7 @@ fn lock_held_release_stays_owned_when_source_ops_is_full() {
     for index in 0..CAUSAL_PENDING_MAX {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: format!("s{index}"),
                 seq: index as u64,
             }))
@@ -5494,6 +5563,7 @@ fn lock_held_release_stays_owned_when_source_ops_is_full() {
     assert_eq!(hub.test_source_ops_len(), CAUSAL_PENDING_MAX);
     let extra = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "held".into(),
             seq: 0,
         }))
@@ -5524,6 +5594,7 @@ fn lock_held_second_overflow_stays_owned() {
     for index in 0..CAUSAL_PENDING_MAX {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: format!("s{index}"),
                 seq: index as u64,
             }))
@@ -5535,12 +5606,14 @@ fn lock_held_second_overflow_stays_owned() {
     }
     let first = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "first".into(),
             seq: 0,
         }))
         .expect("first");
     let second = scopes
         .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+            generation: 0,
             family: "second".into(),
             seq: 0,
         }))
@@ -5581,6 +5654,7 @@ fn lock_held_second_overflow_stays_owned() {
         hub.keep_owned_op(CausalOp::Release {
             scope_id: transfer,
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "probe.item".into(),
                 seq: 1,
             },
@@ -5653,6 +5727,7 @@ fn production_transfer_stays_owned_when_every_store_is_full() {
         hub.keep_owned_op(CausalOp::Release {
             scope_id: live,
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "probe.item".into(),
                 seq: 1,
             },
@@ -5721,6 +5796,7 @@ fn fulfill_leaves_the_next_publish_on_the_bridge_until_a_slot_frees() {
         hub.keep_owned_op(CausalOp::Release {
             scope_id: first,
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "probe.item".into(),
                 seq: 1,
             },
@@ -5731,6 +5807,7 @@ fn fulfill_leaves_the_next_publish_on_the_bridge_until_a_slot_frees() {
         hub.keep_owned_op(CausalOp::Release {
             scope_id: first,
             identity: LeaseIdentity::ProviderResyncNeed {
+                generation: 0,
                 family: "probe.item".into(),
             },
         }),
@@ -5758,6 +5835,7 @@ fn provider_snapshot_stays_busy_when_every_store_is_full() {
     let fill = mint_leftover_fill(&scopes);
     let provider = scopes
         .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
+            generation: 0,
             family: "lease-probe.item".into(),
         }))
         .expect("provider");
@@ -5780,6 +5858,7 @@ fn provider_snapshot_stays_busy_when_every_store_is_full() {
         scopes.identities(provider),
         Some(
             [LeaseIdentity::ProviderResyncNeed {
+                generation: 0,
                 family: "lease-probe.item".into(),
             }]
             .into_iter()
@@ -5802,6 +5881,7 @@ fn lock_held_transfer_stays_owned_after_family_commit() {
     for index in 0..CAUSAL_PENDING_MAX {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: format!("s{index}"),
                 seq: index as u64,
             }))
@@ -5836,6 +5916,7 @@ fn lock_held_transfer_stays_owned_after_family_commit() {
                     plugin_key: "parked".into(),
                 },
                 to: vec![LeaseIdentity::AdmittedEntityMutation {
+                    generation: 0,
                     family: "probe.item".into(),
                     seq: 2,
                 }],
@@ -5857,6 +5938,7 @@ fn lock_held_transfer_stays_owned_after_family_commit() {
         hub.keep_owned_op(CausalOp::Release {
             scope_id: live,
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "probe.item".into(),
                 seq: 1,
             },
@@ -5867,6 +5949,7 @@ fn lock_held_transfer_stays_owned_after_family_commit() {
         hub.keep_owned_op(CausalOp::Release {
             scope_id: parked,
             identity: LeaseIdentity::AdmittedEntityMutation {
+                generation: 0,
                 family: "probe.item".into(),
                 seq: 2,
             },
@@ -5893,6 +5976,7 @@ fn active_resync_leftovers_retry_after_convergence() {
     for _ in 0..(CAUSAL_FLUSH_MAX + 8) {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
+                generation: 0,
                 family: "active.item".into(),
             }))
             .expect("mint");
@@ -5931,6 +6015,7 @@ fn unloading_resync_leases_stop_after_the_slice() {
     for _ in 0..(CAUSAL_FLUSH_MAX + 8) {
         let scope = scopes
             .mint_with_lease(Some(LeaseIdentity::ProviderResyncNeed {
+                generation: 0,
                 family: "resync.item".into(),
             }))
             .expect("mint");

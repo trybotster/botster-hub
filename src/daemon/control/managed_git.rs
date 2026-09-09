@@ -82,7 +82,9 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             HostRecoveryRequired::Submission { failure, .. } => {
                 Some(submit_error_message(failure.error).to_string())
             }
-            HostRecoveryRequired::Package(_) | HostRecoveryRequired::PackageEvents { .. } => None,
+            HostRecoveryRequired::Package(_)
+            | HostRecoveryRequired::PackageEvents { .. }
+            | HostRecoveryRequired::PackageFamilies { .. } => None,
         })
     {
         let _ = pending

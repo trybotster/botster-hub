@@ -136,6 +136,11 @@ impl PluginEntityState {
             }
             _ => None,
         };
+        let mut work = worker::EntityWork::new(target);
+        work.family_generation = Some(invocation.family_generation);
+        work.family = Some(std::sync::Arc::new(
+            invocation.expected_entity_kind().as_str().to_string(),
+        ));
         self.by_waiter.insert(waiter_id, request_id.clone());
         self.pending.insert(
             request_id.clone(),
@@ -148,7 +153,7 @@ impl PluginEntityState {
                 invocation: Some(invocation),
                 kind,
                 result: None,
-                work: worker::EntityWork::new(target),
+                work,
             },
         );
     }
