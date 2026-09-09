@@ -2,12 +2,12 @@ use std::path::PathBuf;
 
 use botster_hub_client::{
     DaemonApp, DaemonCoordination, DaemonDiagnostic, DaemonEvent, DaemonHubUpdate,
-    DaemonHubUpdateExecution, DaemonLifecycleCounters, DaemonLocalWebrtcAnswer,
-    DaemonLocalWebrtcBootstrap, DaemonOperatorError, DaemonPackageDiagnostic,
-    DaemonPackageInstallEffect, DaemonPackageInstallPlan, DaemonPackageRouteDescriptor,
-    DaemonPackageUpdateStatus, DaemonPluginResourceCounters, DaemonPluginSurface,
-    DaemonResolvedAppLaunch, DaemonResolvedSessionType, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTypeEditableDefinition,
+    DaemonHubUpdateExecution, DaemonLocalWebrtcAnswer, DaemonLocalWebrtcBootstrap,
+    DaemonOperatorError, DaemonPackageDiagnostic, DaemonPackageInstallEffect,
+    DaemonPackageInstallPlan, DaemonPackageRouteDescriptor, DaemonPackageUpdateStatus,
+    DaemonPluginResourceCounters, DaemonPluginSurface, DaemonResolvedAppLaunch,
+    DaemonResolvedSessionType, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonSessionCleanup, DaemonSessionContext, DaemonSessionTypeEditableDefinition,
     DaemonSpawnTargetValidation, DaemonTerminalReservation, DaemonUiTreeSnapshot,
 };
 use botster_ui_contract::{UiActionResult, UiActionResultState};
@@ -24,12 +24,11 @@ use crate::client_api_dto::session::{
     daemon_session_type_mutation_source,
 };
 use crate::client_api_dto::workspace::{daemon_spawn_target, daemon_worktree};
-use crate::daemon_projection::{daemon_status_from_status, package_navigation_entries};
-use crate::maintenance::{installation_identity, software_identity};
+use crate::daemon_projection::package_navigation_entries;
 use crate::{
     AvailablePackage, HubClientPackage, HubClientPackageNavigationEntry,
-    HubClientPluginLifecycleReport, HubClientPluginSurface, HubDaemonStatus, McpToolDescriptor,
-    PackageInstallPlan, ResolvedSessionType, SpawnTarget, SpawnTargetValidation, Worktree,
+    HubClientPluginLifecycleReport, HubClientPluginSurface, McpToolDescriptor, PackageInstallPlan,
+    ResolvedSessionType, SpawnTarget, SpawnTargetValidation, Worktree,
 };
 
 pub(crate) fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
@@ -77,30 +76,6 @@ pub(crate) fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         error: None,
         diagnostics: Vec::new(),
     }
-}
-
-pub(crate) fn daemon_status(
-    status: HubDaemonStatus,
-    session_count: usize,
-    mut egress_diagnostics: Vec<DaemonDiagnostic>,
-    lifecycle_counters: DaemonLifecycleCounters,
-    observability_counters: botster_hub_client::DaemonObservabilityCounters,
-    retention: Option<botster_hub_client::DaemonRetentionAccounting>,
-) -> DaemonResponse {
-    let mut response = daemon_response_base(DaemonResponseKind::Status);
-    response.status = Some(daemon_status_from_status(
-        &status,
-        session_count,
-        egress_diagnostics.clone(),
-        lifecycle_counters,
-        software_identity(),
-        installation_identity(),
-        observability_counters,
-        retention,
-    ));
-    response.diagnostics = vec![DaemonDiagnostic::connected("status")];
-    response.diagnostics.append(&mut egress_diagnostics);
-    response
 }
 
 pub(crate) fn daemon_hub_update(update: DaemonHubUpdate) -> DaemonResponse {

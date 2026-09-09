@@ -569,6 +569,8 @@ impl SessionTypeCatalogCache {
             | HostResult::PluginEntity(_)
             | HostResult::EventOwner(_)
             | HostResult::EntrypointsStopped
+            | HostResult::StatusResponsePrepared(_)
+            | HostResult::StatusResponseDelivered { .. }
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)
@@ -633,6 +635,8 @@ impl SessionTypeCatalogCache {
             | HostResult::PluginEntity(_)
             | HostResult::EventOwner(_)
             | HostResult::EntrypointsStopped
+            | HostResult::StatusResponsePrepared(_)
+            | HostResult::StatusResponseDelivered { .. }
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)

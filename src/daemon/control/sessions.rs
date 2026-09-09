@@ -11,8 +11,8 @@ use botster_core_daemon::{
 };
 use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonDiagnostic, DaemonModeFlags, DaemonOperatorError,
-    DaemonReadScreen, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonRetentionAccounting,
-    DaemonSession, DaemonSnapshotPage, DaemonTerminalAttach, HistoryUnavailableReason,
+    DaemonReadScreen, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
+    DaemonSnapshotPage, DaemonTerminalAttach, HistoryUnavailableReason,
 };
 
 use crate::HubDaemon;
@@ -23,7 +23,7 @@ use crate::admission::unix_hello::{
 use crate::client_api::{client_session_metadata, spawn_request};
 use crate::client_api_dto::response::{
     daemon_events, daemon_response_base, daemon_session_cleanup, daemon_session_context,
-    daemon_spawned, daemon_status, daemon_terminal_reservation, daemon_unknown_session_cleanup,
+    daemon_spawned, daemon_terminal_reservation, daemon_unknown_session_cleanup,
 };
 use crate::client_api_dto::session::lifecycle_label;
 use crate::daemon::control::pending::{ControlPoll, ControlStep};
@@ -40,9 +40,7 @@ use crate::data_plane::driver::{CoreTicket, CoreTicketError, CoreTicketPoll};
 use crate::runtime::core_bridge_error;
 use crate::runtime::{AttachBindFailure, AttachBindPlan, CoreOperationTracker};
 use crate::subscription::attach_routes::RouteReservation;
-use crate::subscription::attach_routes::{
-    AttachStreamOwner, BoundAdapterHandle, overlay_live_attach_occupancy,
-};
+use crate::subscription::attach_routes::{AttachStreamOwner, BoundAdapterHandle};
 use crate::subscription::closed_events::{
     suppress_unix_session_close_events, suppress_webrtc_session_close_events,
 };
@@ -98,12 +96,12 @@ pub(crate) fn core_operator_error(
     response
 }
 
-fn lost_core(operation: &'static str, request_id: &str) -> DaemonResponse {
+pub(super) fn lost_core(operation: &'static str, request_id: &str) -> DaemonResponse {
     core_operator_error(operation, request_id, &CoreDaemonError::Shutdown)
 }
 
 /// Typed refusal: the bounded Core request queue was full, nothing ran.
-fn overloaded_core(operation: &'static str, request_id: &str) -> DaemonResponse {
+pub(super) fn overloaded_core(operation: &'static str, request_id: &str) -> DaemonResponse {
     core_operator_error(
         operation,
         request_id,
@@ -154,21 +152,6 @@ pub(crate) fn projected_sessions(state: &DaemonControlState) -> Vec<DaemonSessio
         .collect()
 }
 
-fn retention_accounting_dto(
-    policy: botster_core_daemon::RetentionPolicy,
-    accounting: botster_core_daemon::RetentionAccounting,
-) -> DaemonRetentionAccounting {
-    DaemonRetentionAccounting {
-        max_object_bytes: policy.max_object_bytes as u64,
-        max_total_bytes: policy.max_total_bytes as u64,
-        max_sessions: u32::try_from(policy.max_sessions).unwrap_or(u32::MAX),
-        total_bytes: accounting.total_bytes as u64,
-        sessions: u32::try_from(accounting.sessions).unwrap_or(u32::MAX),
-        evictions: accounting.evictions,
-    }
-}
-
-/// Poll one Core operation tracker; maps loss and begin errors to responses.
 fn poll_tracker(
     tracker: &mut CoreOperationTracker,
     daemon: &HubDaemon,
@@ -199,7 +182,6 @@ pub(crate) fn handle_runtime(
     observability: DaemonObservability,
     request: DaemonRequest,
 ) -> ControlStep {
-    let status = daemon.status();
     if daemon.runtime().is_none() {
         return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
     }
@@ -246,55 +228,7 @@ pub(crate) fn handle_runtime(
                 }
             })
         }
-        DaemonRequest::Status => {
-            let runtime = daemon.runtime().expect("runtime checked above");
-            let policy = runtime.retention_policy();
-            let mut ticket = runtime.submit_core_for_owner(
-                state.current_waiter_id.expect("owner waiter is assigned"),
-                |daemon| {
-                    (
-                        daemon.retention_accounting(),
-                        daemon.list_terminal_subscriptions(),
-                    )
-                },
-            );
-            let egress = observability.egress.clone();
-            let lifecycle = observability.lifecycle.clone();
-            ControlStep::pending(move |daemon, state| {
-                let (accounting, inventory) = match ticket.poll() {
-                    CoreTicketPoll::Pending => return ControlPoll::Pending,
-                    CoreTicketPoll::Lost => {
-                        return ControlPoll::Ready(Ok(lost_core("status", "daemon-status")));
-                    }
-                    CoreTicketPoll::Refused => {
-                        return ControlPoll::Ready(Ok(overloaded_core("status", "daemon-status")));
-                    }
-                    CoreTicketPoll::Ready(value) => value,
-                };
-                let Some(runtime) = daemon.runtime() else {
-                    return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
-                };
-                let mut response = daemon_status(
-                    status.clone(),
-                    state.maintenance.projection.rows.len(),
-                    egress.clone(),
-                    lifecycle.clone(),
-                    runtime.event_plane_counters_snapshot(),
-                    Some(retention_accounting_dto(policy, accounting)),
-                );
-                if let Some(status) = response.status.as_mut() {
-                    overlay_live_attach_occupancy(
-                        status,
-                        &inventory,
-                        &state.pending_runtime.live_attach_routes,
-                        &state.pending_runtime,
-                    );
-                    let local_webrtc = daemon.local_webrtc();
-                    status.local_webrtc_terminal_records = local_webrtc.terminal_records();
-                }
-                ControlPoll::Ready(Ok(response))
-            })
-        }
+        DaemonRequest::Status => super::status::handle(daemon, state, observability, false),
         DaemonRequest::ListSessions => {
             let mut response = daemon_response_base(DaemonResponseKind::Sessions);
             response.sessions = projected_sessions(state);

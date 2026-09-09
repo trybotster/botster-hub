@@ -16,6 +16,7 @@ pub(crate) mod reply;
 pub(crate) mod request;
 pub(crate) mod session_types;
 pub(crate) mod sessions;
+pub(crate) mod status;
 pub(crate) mod webrtc;
 
 use botster_core::RequestId;
