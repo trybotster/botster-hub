@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -360,6 +360,7 @@ pub(crate) enum HostSubmitError {
     Full,
     Stopped,
     PhaseExhausted,
+    WrongExecutor,
 }
 
 /// Submission failure retains the command and its operation slot.
@@ -370,6 +371,47 @@ pub(crate) struct HostSubmissionFailure {
     pub(crate) command: HostCommand,
     pub(crate) permit: HostWorkPermit,
 }
+
+/// A live shutdown caller retains this complete owner when disposal refuses work.
+/// Final destruction of this owner requires the terminal integration contract.
+#[derive(Debug)]
+pub(crate) struct HostCompletionDisposalFailure {
+    pub(crate) failed: HostSubmissionFailure,
+    remaining: mpsc::Receiver<HostCompletion>,
+}
+
+impl HostCompletionDisposalFailure {
+    pub(crate) fn retry(self) -> Result<(), Self> {
+        dispose_completion_receiver(self.remaining, Some(self.failed))
+    }
+}
+
+fn dispose_completion_receiver(
+    remaining: mpsc::Receiver<HostCompletion>,
+    mut failed: Option<HostSubmissionFailure>,
+) -> Result<(), HostCompletionDisposalFailure> {
+    loop {
+        let (identity, command, permit) = match failed.take() {
+            Some(failed) => (failed.identity, failed.command, failed.permit),
+            None => match remaining.try_recv() {
+                Ok(completion) => {
+                    let (identity, result, permit) = completion.into_parts();
+                    (
+                        identity,
+                        HostCommand::DiscardCompletion(Box::new(result)),
+                        permit,
+                    )
+                }
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
+            },
+        };
+        if let Err(failed) = permit.dispose(identity, command) {
+            return Err(HostCompletionDisposalFailure { failed, remaining });
+        }
+    }
+}
+
+type HostCompletionMailbox = Mutex<Option<mpsc::Receiver<HostCompletion>>>;
 
 #[derive(Debug)]
 pub(crate) enum HostCompletionPoll {
@@ -598,7 +640,7 @@ impl Drop for HostWorkPermit {
 
 pub(crate) struct HostExecutor {
     jobs: Option<mpsc::SyncSender<HostJob>>,
-    completions: Arc<Mutex<mpsc::Receiver<HostCompletion>>>,
+    completions: Arc<HostCompletionMailbox>,
     permits: Arc<HostPermitPool>,
     prepared: Arc<HostPreparedPool>,
     wake: Arc<HostWake>,
@@ -625,7 +667,7 @@ impl HostExecutor {
         let (completions_tx, completions_rx) =
             mpsc::sync_channel::<HostCompletion>(HOST_OPERATION_CAPACITY);
         let jobs_rx = Arc::new(Mutex::new(jobs_rx));
-        let completions = Arc::new(Mutex::new(completions_rx));
+        let completions = Arc::new(Mutex::new(Some(completions_rx)));
         let wake = Arc::new(HostWake::new());
         let permits = Arc::new(HostPermitPool {
             #[cfg(test)]
@@ -644,13 +686,23 @@ impl HostExecutor {
         let workers = (0..HOST_WORKER_COUNT)
             .map(|index| {
                 let jobs = Arc::clone(&jobs_rx);
+                let completion_mailbox = Arc::downgrade(&completions);
                 let completions = completions_tx.clone();
                 let wake = Arc::clone(&wake);
                 let stopping = Arc::clone(&stopping);
                 let entrypoints = Arc::clone(&entrypoints);
                 thread::Builder::new()
                     .name(format!("botster-hub-host-{index}"))
-                    .spawn(move || run_worker(jobs, completions, wake, stopping, entrypoints))
+                    .spawn(move || {
+                        run_worker(
+                            jobs,
+                            completions,
+                            completion_mailbox,
+                            wake,
+                            stopping,
+                            entrypoints,
+                        )
+                    })
                     .expect("start bounded Hub host worker")
             })
             .collect();
@@ -732,6 +784,19 @@ impl HostExecutor {
         command: HostCommand,
         permit: HostWorkPermit,
     ) -> Result<(), HostSubmissionFailure> {
+        if !Arc::ptr_eq(&self.permits, &permit.pool)
+            || permit
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| !Arc::ptr_eq(&self.prepared, &prepared.pool))
+        {
+            return Err(HostSubmissionFailure {
+                error: HostSubmitError::WrongExecutor,
+                identity,
+                command,
+                permit,
+            });
+        }
         if self.stopping.load(Ordering::Acquire) {
             return Err(HostSubmissionFailure {
                 error: HostSubmitError::Stopped,
@@ -787,6 +852,26 @@ impl HostExecutor {
         poll_completion_mailbox(&self.completions)
     }
 
+    /// Close publication under its existing mutex, then transfer buffered results to Host.
+    /// The caller must retain and retry the complete failure owner on refusal.
+    /// A later successful close does not resolve a previously returned failure.
+    pub(crate) fn close_and_dispose_completions(
+        &self,
+    ) -> Result<(), HostCompletionDisposalFailure> {
+        let remaining = {
+            let mut mailbox = self
+                .completions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.stopping.store(true, Ordering::Release);
+            mailbox.take()
+        };
+        match remaining {
+            Some(remaining) => dispose_completion_receiver(remaining, None),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn take_completion_notification(&self) -> bool {
         self.wake.completion_pending.swap(false, Ordering::AcqRel)
     }
@@ -818,14 +903,14 @@ impl HostExecutor {
     }
 }
 
-fn poll_completion_mailbox(
-    completions: &Mutex<mpsc::Receiver<HostCompletion>>,
-) -> HostCompletionPoll {
-    match completions
+fn poll_completion_mailbox(completions: &HostCompletionMailbox) -> HostCompletionPoll {
+    let mailbox = completions
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .try_recv()
-    {
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(receiver) = mailbox.as_ref() else {
+        return HostCompletionPoll::Stopped;
+    };
+    match receiver.try_recv() {
         Ok(completion) => HostCompletionPoll::Ready(completion),
         Err(mpsc::TryRecvError::Empty) => HostCompletionPoll::Empty,
         Err(mpsc::TryRecvError::Disconnected) => HostCompletionPoll::Stopped,
@@ -845,6 +930,7 @@ impl Drop for HostExecutor {
 fn run_worker(
     jobs: Arc<Mutex<mpsc::Receiver<HostJob>>>,
     completions: mpsc::SyncSender<HostCompletion>,
+    completion_mailbox: Weak<HostCompletionMailbox>,
     wake: Arc<HostWake>,
     stopping: Arc<AtomicBool>,
     entrypoints: Arc<Mutex<EntrypointSupervisor>>,
@@ -902,17 +988,56 @@ fn run_worker(
             result,
             permit,
         };
-        if let Err(failure) = completions.try_send(completion) {
+        if let Err((failure, completion)) =
+            publish_completion(completion, &completions, &completion_mailbox, &stopping)
+        {
             // An undelivered created worktree stays in its deterministic path.
             // Startup adoption publishes the same preserved external effect.
-            stopping.store(true, Ordering::Release);
-            eprintln!("Host completion publication failed");
-            drop(failure);
+            eprintln!("Host completion publication failed: {failure:?}");
+            drop(completion);
             continue;
         }
         // The completion is in the mailbox before this bit and doorbell publish.
         wake.publish_completion();
     }
+}
+
+#[derive(Debug)]
+enum HostCompletionPublishFailure {
+    Full,
+    Closed,
+}
+
+fn publish_completion(
+    completion: HostCompletion,
+    sender: &mpsc::SyncSender<HostCompletion>,
+    mailbox: &Weak<HostCompletionMailbox>,
+    stopping: &AtomicBool,
+) -> Result<(), (HostCompletionPublishFailure, HostCompletion)> {
+    // A worker retains this Arc only during publication, never during the next job receive.
+    let Some(mailbox) = mailbox.upgrade() else {
+        stopping.store(true, Ordering::Release);
+        return Err((HostCompletionPublishFailure::Closed, completion));
+    };
+    let guard = mailbox.lock().unwrap_or_else(|error| error.into_inner());
+    let result = if guard.is_none() || stopping.load(Ordering::Acquire) {
+        Err((HostCompletionPublishFailure::Closed, completion))
+    } else {
+        sender.try_send(completion).map_err(|error| match error {
+            mpsc::TrySendError::Full(completion) => {
+                (HostCompletionPublishFailure::Full, completion)
+            }
+            mpsc::TrySendError::Disconnected(completion) => {
+                (HostCompletionPublishFailure::Closed, completion)
+            }
+        })
+    };
+    if result.is_err() {
+        stopping.store(true, Ordering::Release);
+    }
+    drop(guard);
+    drop(mailbox);
+    result
 }
 
 fn execute(
@@ -1204,6 +1329,211 @@ mod tests {
     }
 
     #[test]
+    fn guarded_close_disposes_buffered_completion_on_host() {
+        let mut executor = HostExecutor::new();
+        let permit = executor.try_reserve().unwrap();
+        let (dropped, receiver) = mpsc::channel();
+        let executed = Arc::new(AtomicBool::new(false));
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 1,
+                },
+                HostCommand::DisposalProbe(TestDisposalProbe {
+                    dropped,
+                    executed: executed.clone(),
+                }),
+                permit,
+            )
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !executor.take_completion_notification() {
+            assert!(
+                Instant::now() < deadline,
+                "completion must reach its mailbox"
+            );
+            thread::yield_now();
+        }
+        assert!(executed.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_err());
+        executor.close_and_dispose_completions().unwrap();
+        assert!(matches!(
+            executor.poll_completion(),
+            HostCompletionPoll::Stopped
+        ));
+        let workers = std::mem::take(&mut executor.workers);
+        drop(executor);
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .starts_with("botster-hub-host-")
+        );
+        wait_for_worker_exit(workers);
+    }
+
+    #[test]
+    fn guarded_close_rejects_publication_from_a_running_job() {
+        let mut executor = HostExecutor::new();
+        let permit = executor.try_reserve().unwrap();
+        let pool = permit.pool.clone();
+        let prepared_pool = executor.prepared.clone();
+        let gate = Arc::new(TestHostGate::default());
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 1,
+                },
+                HostCommand::Wait {
+                    generation: 1,
+                    gate: gate.clone(),
+                },
+                permit,
+            )
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !gate.has_started() {
+            assert!(
+                Instant::now() < deadline,
+                "job must start before publication closes"
+            );
+            thread::yield_now();
+        }
+        executor.close_and_dispose_completions().unwrap();
+        assert!(matches!(
+            executor.poll_completion(),
+            HostCompletionPoll::Stopped
+        ));
+        gate.release();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while pool.outstanding.load(Ordering::Acquire) != 0
+            || prepared_pool.used.load(Ordering::Acquire) != 0
+        {
+            assert!(Instant::now() < deadline, "Host must dispose the result");
+            assert!(matches!(
+                executor.poll_completion(),
+                HostCompletionPoll::Stopped
+            ));
+            thread::yield_now();
+        }
+        assert_eq!(pool.outstanding.load(Ordering::Acquire), 0);
+        assert_eq!(prepared_pool.used.load(Ordering::Acquire), 0);
+        let workers = std::mem::take(&mut executor.workers);
+        drop(executor);
+        wait_for_worker_exit(workers);
+    }
+
+    #[test]
+    fn foreign_permit_refusal_preserves_its_original_disposal_owner() {
+        let executor = HostExecutor::new();
+        let foreign = HostExecutor::new();
+        let permit = foreign.try_reserve().unwrap();
+        let (dropped, receiver) = mpsc::channel();
+        let executed = Arc::new(AtomicBool::new(false));
+        let failure = executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 1,
+                },
+                HostCommand::DisposalProbe(TestDisposalProbe {
+                    dropped,
+                    executed: executed.clone(),
+                }),
+                permit,
+            )
+            .expect_err("foreign permit must be refused");
+        assert_eq!(failure.error, HostSubmitError::WrongExecutor);
+        assert_eq!(executor.outstanding(), 0);
+        assert_eq!(foreign.outstanding(), 1);
+        assert!(receiver.try_recv().is_err());
+        failure
+            .permit
+            .dispose(failure.identity, failure.command)
+            .unwrap();
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .starts_with("botster-hub-host-")
+        );
+        assert!(!executed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn guarded_close_refusal_retains_failed_and_remaining_completions_for_retry() {
+        let executor = HostExecutor::new();
+        let mut first = executor.try_reserve().unwrap();
+        let second = executor.try_reserve().unwrap();
+        let original_sender = first.disposal.clone();
+        let (full_sender, _full_receiver) = mpsc::sync_channel(0);
+        first.disposal = full_sender;
+        let (sender, receiver) = mpsc::sync_channel(HOST_OPERATION_CAPACITY);
+        let (dropped, dropped_rx) = mpsc::channel();
+        for (index, permit) in [first, second].into_iter().enumerate() {
+            let result = HostResult::StatusResponsePrepared(
+                crate::status_response::PreparedStatusResponse {
+                    kind: botster_hub_client::DaemonResponseKind::Status,
+                    encoded_frame: None,
+                    shutdown: false,
+                    dispose_probe: Some(TestDisposalProbe {
+                        dropped: dropped.clone(),
+                        executed: Arc::new(AtomicBool::new(false)),
+                    }),
+                },
+            );
+            sender
+                .send(HostCompletion::from_parts(
+                    HostJobIdentity {
+                        waiter_id: WaiterId(index as u64 + 1),
+                        phase: 1,
+                    },
+                    result,
+                    permit,
+                ))
+                .unwrap();
+        }
+        *executor.completions.lock().unwrap() = Some(receiver);
+        let mut failure = executor
+            .close_and_dispose_completions()
+            .expect_err("injected full disposal queue");
+        assert_eq!(failure.failed.error, HostSubmitError::Full);
+        assert_eq!(executor.outstanding(), 2);
+        assert_eq!(executor.prepared_bytes(), 2 * HOST_PREPARED_BYTE_CAPACITY);
+        assert!(dropped_rx.try_recv().is_err());
+        assert!(matches!(
+            failure.failed.command,
+            HostCommand::DiscardCompletion(_)
+        ));
+        executor.close_and_dispose_completions().unwrap();
+        assert_eq!(executor.outstanding(), 2);
+        assert_eq!(executor.prepared_bytes(), 2 * HOST_PREPARED_BYTE_CAPACITY);
+        assert!(dropped_rx.try_recv().is_err());
+        failure.failed.permit.disposal = original_sender;
+        failure
+            .retry()
+            .expect("retry drains both retained completions");
+        for _ in 0..2 {
+            assert!(
+                dropped_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .starts_with("botster-hub-host-")
+            );
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while executor.outstanding() != 0 || executor.prepared_bytes() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "retry releases both original reservations"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
     fn shutdown_snapshot_retains_one_slot_through_stop_and_worker_delivery() {
         let executor = HostExecutor::new();
         let permit = executor.try_reserve().expect("reserve shutdown");
@@ -1403,9 +1733,8 @@ mod tests {
         let mut executor = HostExecutor::new();
         let external = executor.try_reserve().expect("reserve external work");
         let trigger = executor.try_reserve().expect("reserve completion trigger");
-        let (_sender, receiver) = mpsc::sync_channel(HOST_OPERATION_CAPACITY);
-        let old = std::mem::replace(&mut executor.completions, Arc::new(Mutex::new(receiver)));
-        drop(old);
+        let receiver = executor.completions.lock().unwrap().take();
+        drop(receiver);
         executor
             .submit(
                 HostJobIdentity {
@@ -1901,7 +2230,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(1);
         drop(sender);
         assert!(matches!(
-            poll_completion_mailbox(&Mutex::new(receiver)),
+            poll_completion_mailbox(&Mutex::new(Some(receiver))),
             HostCompletionPoll::Stopped
         ));
     }
@@ -2054,6 +2383,7 @@ mod tests {
                 run_worker(
                     Arc::new(Mutex::new(jobs_rx)),
                     completions_tx,
+                    Weak::new(),
                     wake,
                     stopping,
                     Arc::new(Mutex::new(EntrypointSupervisor::default())),

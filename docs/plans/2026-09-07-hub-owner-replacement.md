@@ -1417,3 +1417,40 @@ The following dependencies remain explicit:
   The Host preserves the original request ID and the admitted stop effect independently from the wire response kind.
   An unencodable fallback closes the reply on Host after the stop phase.
   The production continuation and fallback regressions passed in the separated Status source checkpoint.
+
+## 2026-09-09 Host completion close checkpoint
+
+`HostExecutor::close_and_dispose_completions` closes publication while holding the existing completion mutex.
+Workers check the same mutex before publishing a completion.
+The close operation takes the receiver and sets the stopping flag under that mutex.
+The close operation then transfers buffered results to Host through each result's original permit.
+Workers destroy results that cannot publish after closure.
+
+A worker holds a weak mailbox reference between jobs.
+The worker holds a strong reference only during publication.
+This prevents a permanent worker reference from retaining buffered permits and their job senders.
+This reference structure does not establish safe final executor destruction.
+
+Submission rejects a permit from another executor with `WrongExecutor`.
+The refusal returns the command and the original permit.
+Disposal uses the sender retained by that original permit.
+
+If disposal refuses work, `HostCompletionDisposalFailure` retains the failed command, its permit, and the receiver containing the remaining completions.
+The live caller must retain and retry that complete failure.
+A later successful close does not resolve a previously returned failure.
+
+The command `cargo test --lib --no-run --jobs 2` compiled this source checkpoint.
+Four exact tests passed with serial execution:
+
+- Buffered completion disposal destroys the result on Host and allows workers to exit.
+- A running job cannot publish after closure while the executor remains alive.
+  Both its operation charge and prepared-byte charge return to zero.
+- A foreign-permit refusal preserves disposal through the original executor.
+- A disposal refusal retains both buffered completions and their charges until retry succeeds.
+  A second close does not release those retained completions.
+
+The raw logs are `/private/tmp/botster-status-guard-check-1.log` and `/private/tmp/botster-status-guard-focused-1.log`.
+This checkpoint adds the mechanism and its tests.
+It does not add the production shutdown caller or change `HostExecutor::drop`.
+The live shutdown caller must transfer retained recovery rows and buffered completions before runtime destruction.
+Exceptional refusal during final destruction still requires an accepted ownership contract.
