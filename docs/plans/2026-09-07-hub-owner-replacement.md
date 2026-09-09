@@ -686,3 +686,19 @@ Reading the snapshot alone does not complete family resync or release its lease.
 All nine lease tests passed against the ce96389 matched binaries after this test-only correction.
 The direct cleanup regression and repeated recovery request regression also passed.
 This evidence does not close the remaining family cleanup work listed above.
+
+The fanout queue now keeps exact membership by family generation and preserves global FIFO delivery.
+The admission path checks sequence capacity before it creates or changes family state.
+The locked pending count bounds all mutations that admission can release. Unused capacity does not consume sequence values.
+The conservative check can refuse admission when fewer mutations would become ready.
+The queue module passed 20 tests on Rust 1.97.0.
+A runtime test with a loaded Lua provider passed sequence exhaustion before family creation and before pending-gap release.
+That test also verified that refusal releases the pending publication lease and preserves family state.
+The current cleanup caller uses exact generation buckets but still performs bulk cleanup.
+Detached state, retained worker phases, and indexed family readiness remain open.
+Review found that cleanup could miss queued mutations after live family state was removed.
+The queue now finds old generations through its membership index, without a live-state lookup.
+A regression test verifies that cleanup removes only the old queue item and lease when live state is absent.
+The newer item and lease use the same family, causal scope, and mutation sequence. Both survive cleanup.
+All 26 runtime module tests passed. All 20 queue module tests passed after the indexed lookup change.
+The source reviewer closed the queue integration findings. The remaining cleanup work is still open.

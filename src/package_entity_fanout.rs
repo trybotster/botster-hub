@@ -232,6 +232,14 @@ impl PackageEntityFanoutQueue {
         Some(self.remove(sequence))
     }
 
+    /// Find an old generation even when its live family state is absent.
+    pub(crate) fn next_family_generation_before(&self, family: &str, epoch: u64) -> Option<u64> {
+        self.sequences_by_family
+            .range((family.to_string(), 0)..(family.to_string(), epoch))
+            .next()
+            .map(|((_, generation), _)| *generation)
+    }
+
     pub(crate) fn take_one_family(
         &mut self,
         family: &str,
@@ -821,6 +829,15 @@ mod tests {
                 .expect("insert");
             assert_fanout_membership(&queue);
         }
+        assert_eq!(queue.next_family_generation_before("a", 0), None);
+        assert_eq!(queue.next_family_generation_before("a", 1), None);
+        assert_eq!(queue.next_family_generation_before("a", 2), Some(1));
+        assert_eq!(queue.next_family_generation_before("a", 3), Some(1));
+        assert_eq!(
+            queue.next_family_generation_before("missing", u64::MAX),
+            None
+        );
+        assert_fanout_membership(&queue);
         assert_eq!(queue.pop_first(), Some(fanout_item("a", 1, 1, true)));
         assert_fanout_membership(&queue);
         assert_eq!(
@@ -836,6 +853,9 @@ mod tests {
             queue.take_one_family("a", 1),
             Some(fanout_item("a", 1, 3, true))
         );
+        assert_fanout_membership(&queue);
+        assert_eq!(queue.next_family_generation_before("a", 2), None);
+        assert_eq!(queue.next_family_generation_before("a", 3), Some(2));
         assert_fanout_membership(&queue);
         for family in ["a", "missing"] {
             assert_eq!(queue.take_one_family(family, 1), None);
