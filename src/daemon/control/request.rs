@@ -223,6 +223,7 @@ fn finish(
     response: ControlReply,
 ) -> bool {
     let PendingControlRequest {
+        waiter_id,
         completion,
         reply_tx,
         response_delivery_rx,
@@ -232,7 +233,11 @@ fn finish(
         ..
     } = entry;
     if let Some(permit) = permit {
-        state.budget.release(permit);
+        if let Some(recovery) = state.host_recovery.get_mut(&waiter_id) {
+            recovery.retain_owner_permit(permit);
+        } else {
+            state.budget.release(permit);
+        }
     }
     let reconcile_after_request = completion.reconciles_after_success();
     let ControlReply::Typed {

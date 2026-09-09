@@ -27,6 +27,7 @@ pub(crate) enum DocumentAdmission {
 /// One unresolved host operation. Each variant retains the original operation slot.
 pub(crate) enum HostRecoveryRequired {
     PackageEvents {
+        owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
         _result: Box<HostMutationResult>,
         _fault: Option<crate::package_event_router::EventOwnerWorkError>,
         _submission: Option<HostSubmissionFailure>,
@@ -35,10 +36,29 @@ pub(crate) enum HostRecoveryRequired {
     Package(PackageRecoveryRequired),
     ManagedGit(crate::daemon::control::managed_git::ManagedGitRecoveryRequired),
     Submission {
+        owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
         failure: HostSubmissionFailure,
         package_restore: Option<(PackageRuntimeEffect, DaemonTransportError)>,
         managed_worktree: Option<crate::managed_git_worktrees::PreparedManagedWorktree>,
     },
+}
+
+impl HostRecoveryRequired {
+    /// Recovery rows live until daemon teardown. Live removal must release this permit through OwnerBudget.
+    pub(crate) fn retain_owner_permit(&mut self, permit: crate::daemon::owner_budget::OwnerPermit) {
+        let retained = match self {
+            Self::PackageEvents { owner_permit, .. } | Self::Submission { owner_permit, .. } => {
+                owner_permit
+            }
+            Self::Package(recovery) => &mut recovery.owner_permit,
+            Self::ManagedGit(recovery) => &mut recovery.owner_permit,
+        };
+        assert!(
+            retained.is_none(),
+            "terminal recovery receives the original Owner permit once"
+        );
+        *retained = Some(permit);
+    }
 }
 
 /// Retain a rejected phase without releasing its document reservation.
@@ -50,6 +70,7 @@ pub(crate) fn retain_submission(
     state.host_recovery.insert(
         failure.identity.waiter_id,
         HostRecoveryRequired::Submission {
+            owner_permit: None,
             failure,
             package_restore: None,
             managed_worktree: None,
@@ -61,6 +82,7 @@ pub(crate) fn retain_submission(
 /// One package rollback that keeps one host slot until the daemon restarts.
 /// The retained row leaves seven host slots available during degraded operation.
 pub(crate) struct PackageRecoveryRequired {
+    owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
     pub(crate) original: String,
     pub(crate) compensation: String,
     _effect: PackageRuntimeEffect,
@@ -465,6 +487,7 @@ pub(crate) fn handle(
                         state.host_recovery.insert(
                             waiter_id,
                             HostRecoveryRequired::Package(PackageRecoveryRequired {
+                                owner_permit: None,
                                 original: original.to_string(),
                                 compensation: rollbacks
                                     .iter()
@@ -604,6 +627,7 @@ fn retain_package_recovery(
     state.host_recovery.insert(
         waiter_id,
         HostRecoveryRequired::Package(PackageRecoveryRequired {
+            owner_permit: None,
             original: original.to_string(),
             compensation: failure.error.to_string(),
             _effect: effect,
@@ -713,6 +737,7 @@ fn retain_event_cleanup(
     state.host_recovery.insert(
         waiter_id,
         HostRecoveryRequired::PackageEvents {
+            owner_permit: None,
             _result: Box::new(result),
             _fault: fault,
             _submission: submission,
