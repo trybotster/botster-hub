@@ -65,6 +65,17 @@ impl QueueAgeMetric {
         self.write_closed.store(true, Ordering::Release);
     }
 
+    fn retire(&self) {
+        self.close_writes();
+        self.version.fetch_add(1, Ordering::AcqRel);
+        self.count.store(0, Ordering::Relaxed);
+        self.bytes.store(0, Ordering::Relaxed);
+        self.oldest_nanos.store(EMPTY_OLDEST, Ordering::Relaxed);
+        self.gate.store(0, Ordering::Relaxed);
+        self.invalid.store(false, Ordering::Relaxed);
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
     #[must_use]
     pub fn occupied_bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
@@ -203,7 +214,6 @@ pub struct AgeIdentity {
 
 struct AgeRegistryEntry {
     cell: Option<Arc<QueueAgeMetric>>,
-    retired: bool,
 }
 
 /// Intrusive doubly-linked producer age list over preallocated slots.
@@ -528,14 +538,7 @@ impl EventPlaneCounters {
         let Ok(mut registry) = self.registry.write() else {
             return;
         };
-        registry.retain(|_, entry| !entry.retired);
-        registry.insert(
-            identity,
-            AgeRegistryEntry {
-                cell: Some(cell),
-                retired: false,
-            },
-        );
+        registry.insert(identity, AgeRegistryEntry { cell: Some(cell) });
     }
 
     /// Control-path missing-cell marker. Event paths must not call this.
@@ -543,13 +546,7 @@ impl EventPlaneCounters {
         let Ok(mut registry) = self.registry.write() else {
             return;
         };
-        registry.insert(
-            identity,
-            AgeRegistryEntry {
-                cell: None,
-                retired: false,
-            },
-        );
+        registry.insert(identity, AgeRegistryEntry { cell: None });
     }
 
     /// Control-path retirement. Event paths must not call this.
@@ -557,12 +554,10 @@ impl EventPlaneCounters {
         let Ok(mut registry) = self.registry.write() else {
             return;
         };
-        if let Some(entry) = registry.get_mut(identity) {
-            entry.retired = true;
-            if let Some(cell) = &entry.cell {
-                cell.store(0, EMPTY_OLDEST, 0, false, 0);
-                cell.close_writes();
-            }
+        if let Some(entry) = registry.remove(identity)
+            && let Some(cell) = entry.cell
+        {
+            cell.retire();
         }
     }
 
@@ -572,7 +567,7 @@ impl EventPlaneCounters {
         let Ok(mut registry) = self.registry.write() else {
             return;
         };
-        let Some(entry) = registry.get_mut(identity) else {
+        let Some(entry) = registry.get(identity) else {
             return;
         };
         let Some(registered) = &entry.cell else {
@@ -581,16 +576,8 @@ impl EventPlaneCounters {
         if !Arc::ptr_eq(registered, cell) {
             return;
         }
-        entry.retired = true;
-        registered.store(0, EMPTY_OLDEST, 0, false, 0);
-        registered.close_writes();
-    }
-
-    pub fn prune_retired(&self) {
-        let Ok(mut registry) = self.registry.write() else {
-            return;
-        };
-        registry.retain(|_, entry| !entry.retired);
+        registered.retire();
+        registry.remove(identity);
     }
 
     #[must_use]
@@ -603,10 +590,7 @@ impl EventPlaneCounters {
 
     #[must_use]
     pub fn live_registry_len(&self) -> usize {
-        self.registry
-            .read()
-            .map(|registry| registry.values().filter(|entry| !entry.retired).count())
-            .unwrap_or(0)
+        self.registry_len()
     }
 
     /// Saturation-safe snapshot. Never takes the router inner lock.
@@ -1011,29 +995,27 @@ mod tests {
     }
 
     #[test]
-    fn retired_registry_entry_reports_empty_and_prune_drops_it() {
+    fn retirement_removes_exact_row_and_resets_a_closed_cell() {
         let counters = EventPlaneCounters::new();
         let cell = Arc::new(QueueAgeMetric::new(4));
-        cell.store(2, 10, 0, false, 0);
+        cell.store(2, 10, 1, true, 200);
         let identity = AgeIdentity {
             kind: DaemonQueueKind::Consumer,
             identity: "plugin".to_string(),
             generation: Some(4),
         };
         counters.register_cell(identity.clone(), Arc::clone(&cell));
+        cell.close_writes();
         counters.retire_identity(&identity);
-        let row = &counters.snapshot().queue_ages[0];
-        assert_eq!(row.state, DaemonQueueAgeState::Empty);
-        assert_eq!(row.queue_count, Some(0));
-        assert!(row.oldest_age_us.is_none());
-        assert_eq!(counters.registry_len(), 1);
-        counters.prune_retired();
         assert_eq!(counters.registry_len(), 0);
+        assert!(counters.snapshot().queue_ages.is_empty());
+        assert!(cell.is_write_closed());
+        cell.store(3, 20, 0, false, 300);
         assert_eq!(cell.sample(), AgeSample::Empty { count: 0, bytes: 0 });
     }
 
     #[test]
-    fn live_empty_queue_is_not_pruned() {
+    fn retiring_another_generation_preserves_a_live_empty_queue() {
         let counters = EventPlaneCounters::new();
         let cell = Arc::new(QueueAgeMetric::new(1));
         cell.store(0, EMPTY_OLDEST, 0, false, 0);
@@ -1045,12 +1027,38 @@ mod tests {
             },
             cell,
         );
-        counters.prune_retired();
+        let old_identity = AgeIdentity {
+            kind: DaemonQueueKind::Consumer,
+            identity: "live".to_string(),
+            generation: Some(0),
+        };
+        counters.register_cell(old_identity.clone(), Arc::new(QueueAgeMetric::new(0)));
+        counters.retire_identity(&old_identity);
         assert_eq!(counters.live_registry_len(), 1);
         assert_eq!(
             counters.snapshot().queue_ages[0].state,
             DaemonQueueAgeState::Empty
         );
+    }
+
+    #[test]
+    fn delayed_old_cell_retirement_preserves_the_replacement() {
+        let counters = EventPlaneCounters::new();
+        let identity = AgeIdentity {
+            kind: DaemonQueueKind::Consumer,
+            identity: "connection".to_string(),
+            generation: Some(0),
+        };
+        let old = Arc::new(QueueAgeMetric::new(0));
+        let replacement = Arc::new(QueueAgeMetric::new(0));
+        counters.register_cell(identity.clone(), Arc::clone(&old));
+        counters.register_cell(identity.clone(), Arc::clone(&replacement));
+        counters.retire_cell(&identity, &old);
+        assert_eq!(counters.registry_len(), 1);
+        assert!(!replacement.is_write_closed());
+        counters.retire_cell(&identity, &replacement);
+        assert_eq!(counters.registry_len(), 0);
+        assert!(replacement.is_write_closed());
     }
 
     #[test]

@@ -1,5 +1,11 @@
 # Plan — Hub: publish bounded event-plane observability counters and four load-campaign seams
 
+Supersession, 2026-09-08: the current foundation plan replaces S1d/AC11 deferred pruning with exact row removal at lifecycle retirement.
+This change removes the global scans from queue registration. Live Empty rows remain registered.
+Retirement resets and closes the exact cell. Generation keys and cell instance checks protect replacements from delayed retirement.
+The original deferred-pruning rationale remains below as historical context.
+See [the current owner replacement plan](2026-09-07-hub-owner-replacement.md#11-diagnostic-retirement-contract-2026-09-08).
+
 - Ticket: `ticket_1787267568_492780`
 - Run: `run_1787278338_832165`
 - Revision: **15**. Revision 15 answers the two findings in `review_1787293155_249181`: AC10 carried two
