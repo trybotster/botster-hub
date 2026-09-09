@@ -5085,6 +5085,11 @@ mod tests {
             crate::daemon::control::pending::ControlStep::Ready(response) => response,
             crate::daemon::control::pending::ControlStep::Pending(mut step) => loop {
                 match (step.continuation)(daemon, state) {
+                    crate::daemon::control::pending::ControlPoll::DeliverStatusResponse(_, _, _)
+                    | crate::daemon::control::pending::ControlPoll::StatusResponseDelivered { .. }
+                    | crate::daemon::control::pending::ControlPoll::StatusResponseRefused { .. } => {
+                        panic!("package helper must not receive a status response")
+                    }
                     crate::daemon::control::pending::ControlPoll::Again => continue,
                     crate::daemon::control::pending::ControlPoll::Pending => {}
                     crate::daemon::control::pending::ControlPoll::Ready(response) => {
@@ -8555,6 +8560,11 @@ return botster.register({
                 runtime.reap_detached_core_operations();
             }
             match (pending.continuation)(daemon, state) {
+                crate::daemon::control::pending::ControlPoll::DeliverStatusResponse(_, _, _)
+                | crate::daemon::control::pending::ControlPoll::StatusResponseDelivered { .. }
+                | crate::daemon::control::pending::ControlPoll::StatusResponseRefused { .. } => {
+                    panic!("attach helper must not receive a status response")
+                }
                 crate::daemon::control::pending::ControlPoll::Again => continue,
                 crate::daemon::control::pending::ControlPoll::Ready(response) => {
                     break response.expect("attach response");

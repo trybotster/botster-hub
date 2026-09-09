@@ -79,6 +79,7 @@ pub mod packages;
 pub mod persistence;
 pub(crate) mod plugin_entity;
 pub(crate) mod plugin_response;
+pub(crate) mod status_response;
 pub mod profile;
 pub mod runtime;
 mod session_projection;

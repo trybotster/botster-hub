@@ -793,6 +793,7 @@ pub(crate) fn daemon_status_from_status(
     installation: DaemonInstallationIdentity,
     observability: botster_hub_client::DaemonObservabilityCounters,
     retention: Option<botster_hub_client::DaemonRetentionAccounting>,
+    compatibility: DaemonCompatibility,
 ) -> DaemonStatus {
     DaemonStatus {
         lifecycle_state: match status.lifecycle_state {
@@ -801,7 +802,7 @@ pub(crate) fn daemon_status_from_status(
             crate::HubDaemonState::Stopped => "stopped",
         }
         .to_string(),
-        compatibility: DaemonCompatibility::current(),
+        compatibility,
         software,
         installation,
         host_id: status.host_id.clone(),
@@ -1751,6 +1752,7 @@ mod tests {
             installation.clone(),
             botster_hub_client::DaemonObservabilityCounters::default(),
             None,
+            DaemonCompatibility::current(),
         );
         assert_eq!(projected.lifecycle_state, "running");
         assert_eq!(projected.compatibility, DaemonCompatibility::current());

@@ -50,6 +50,10 @@ pub(crate) enum HostCommand {
         router: Arc<crate::package_event_router::PackageEventRouter>,
         work: crate::subscription::package_events::ClientCleanupWork,
     },
+    #[cfg(test)]
+    DisposalProbe(TestDisposalProbe),
+    Dispose(Box<HostCommand>),
+    DiscardCompletion(Box<HostResult>),
     EntityModel(crate::runtime::entity_model::Work),
     ReclaimEntityModel(crate::runtime::entity_model::Work),
     EventOwner {
@@ -61,6 +65,12 @@ pub(crate) enum HostCommand {
         input: crate::plugin_response::PluginResponseInput,
         reply_tx: crate::daemon::control::message::ControlReplySender,
         reply_live: Arc<AtomicBool>,
+    },
+    PrepareStatusResponse(crate::status_response::StatusResponseInput),
+    StopForStatus(crate::status_response::PreparedStatusResponse),
+    DeliverStatusResponse {
+        prepared: crate::status_response::PreparedStatusResponse,
+        reply_tx: crate::daemon::control::message::ControlReplySender,
     },
     StopEntrypoints,
     BuildSessionTypeCatalog {
@@ -97,9 +107,15 @@ pub(crate) enum HostCommand {
 impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
+            #[cfg(test)]
+            Self::DisposalProbe(_) => 0,
+            Self::Dispose(_) | Self::DiscardCompletion(_) => 0,
             Self::EntityModel(_) | Self::ReclaimEntityModel(_) => 0,
             Self::EventOwner { .. } | Self::ClientEventCleanup { .. } => 0,
             Self::PluginEntity(_) | Self::PreparePluginResponse { .. } | Self::StopEntrypoints => 0,
+            Self::PrepareStatusResponse(_)
+            | Self::StopForStatus(_)
+            | Self::DeliverStatusResponse { .. } => 0,
             Self::BuildSessionTypeCatalog { generation, .. } => *generation,
             Self::Mutation(_) => 0,
             Self::ReclaimSessionTypeCatalog(_) => 0,
@@ -116,6 +132,10 @@ impl std::fmt::Debug for HostCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ClientEventCleanup { .. } => formatter.write_str("ClientEventCleanup"),
+            #[cfg(test)]
+            Self::DisposalProbe(_) => formatter.write_str("DisposalProbe"),
+            Self::Dispose(_) => formatter.write_str("Dispose"),
+            Self::DiscardCompletion(_) => formatter.write_str("DiscardCompletion"),
             Self::EntityModel(work) => formatter
                 .debug_tuple("EntityModel")
                 .field(&work.kind())
@@ -127,6 +147,9 @@ impl std::fmt::Debug for HostCommand {
                 .finish(),
             Self::PluginEntity(_) => formatter.write_str("PluginEntity"),
             Self::PreparePluginResponse { .. } => formatter.write_str("PreparePluginResponse"),
+            Self::PrepareStatusResponse(_) => formatter.write_str("PrepareStatusResponse"),
+            Self::StopForStatus(_) => formatter.write_str("StopForStatus"),
+            Self::DeliverStatusResponse { .. } => formatter.write_str("DeliverStatusResponse"),
             Self::StopEntrypoints => formatter.write_str("StopEntrypoints"),
             Self::BuildSessionTypeCatalog { generation, .. } => formatter
                 .debug_struct("BuildSessionTypeCatalog")
@@ -189,6 +212,11 @@ pub(crate) enum HostResult {
         kind: botster_hub_client::DaemonResponseKind,
     },
     EntrypointsStopped,
+    StatusResponsePrepared(crate::status_response::PreparedStatusResponse),
+    StatusResponseDelivered {
+        shutdown: bool,
+        received: bool,
+    },
     SessionTypeCatalogReady {
         generation: u64,
         entities: BTreeMap<String, Value>,
@@ -213,6 +241,7 @@ impl HostResult {
         match self {
             Self::EntityModelComplete(_) => 0,
             Self::EventOwner(_) | Self::ClientEventCleanup(_) => 0,
+            Self::StatusResponsePrepared(_) | Self::StatusResponseDelivered { .. } => 0,
             Self::PluginEntity(_)
             | Self::PluginResponseAbandoned
             | Self::PluginResponseDelivered { .. }
@@ -237,6 +266,18 @@ pub(crate) struct HostCompletion {
 }
 
 impl HostCompletion {
+    pub(crate) fn from_parts(
+        identity: HostJobIdentity,
+        result: HostResult,
+        permit: HostWorkPermit,
+    ) -> Self {
+        Self {
+            identity,
+            result,
+            permit,
+        }
+    }
+
     pub(crate) fn release(self) -> (HostResult, HostPreparedCharge) {
         let Self {
             mut result, permit, ..
@@ -295,6 +336,8 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
+        HostResult::StatusResponsePrepared(prepared) => prepared.logical_bytes(),
+        HostResult::StatusResponseDelivered { .. } => 0,
         HostResult::EntityModelComplete(_) => 0,
         // The router retains each allocation charge until worker destruction completes.
         HostResult::EventOwner(_) | HostResult::ClientEventCleanup(_) => 0,
@@ -390,6 +433,10 @@ impl HostWake {
 
 #[derive(Debug)]
 struct HostPermitPool {
+    #[cfg(test)]
+    status_stops: AtomicUsize,
+    #[cfg(test)]
+    refuse_status_delivery: AtomicBool,
     outstanding: AtomicUsize,
     wake: Arc<HostWake>,
 }
@@ -461,9 +508,43 @@ impl Drop for HostPreparedCharge {
 pub(crate) struct HostWorkPermit {
     pool: Arc<HostPermitPool>,
     prepared: Option<Arc<HostPreparedReservation>>,
+    disposal: mpsc::SyncSender<HostJob>,
 }
 
 impl HostWorkPermit {
+    /// Use the original slot to discard a command on an existing Host worker.
+    /// A refusal returns the complete command and permit to its caller.
+    pub(crate) fn dispose(
+        self,
+        identity: HostJobIdentity,
+        command: HostCommand,
+    ) -> Result<(), HostSubmissionFailure> {
+        let sender = self.disposal.clone();
+        let job = HostJob {
+            identity,
+            command: HostCommand::Dispose(Box::new(command)),
+            permit: self,
+        };
+        match sender.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let (error, job) = match error {
+                    mpsc::TrySendError::Full(job) => (HostSubmitError::Full, job),
+                    mpsc::TrySendError::Disconnected(job) => (HostSubmitError::Stopped, job),
+                };
+                let HostCommand::Dispose(command) = job.command else {
+                    unreachable!("disposal submission retains its wrapper");
+                };
+                Err(HostSubmissionFailure {
+                    error,
+                    identity: job.identity,
+                    command: *command,
+                    permit: job.permit,
+                })
+            }
+        }
+    }
+
     pub(crate) fn has_retained_prepared_reservation(&self) -> bool {
         self.prepared
             .as_ref()
@@ -547,6 +628,10 @@ impl HostExecutor {
         let completions = Arc::new(Mutex::new(completions_rx));
         let wake = Arc::new(HostWake::new());
         let permits = Arc::new(HostPermitPool {
+            #[cfg(test)]
+            status_stops: AtomicUsize::new(0),
+            #[cfg(test)]
+            refuse_status_delivery: AtomicBool::new(false),
             outstanding: AtomicUsize::new(0),
             wake: Arc::clone(&wake),
         });
@@ -590,6 +675,10 @@ impl HostExecutor {
     }
 
     pub(crate) fn try_reserve(&self) -> Option<HostWorkPermit> {
+        if self.stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        let disposal = self.jobs.as_ref()?;
         let mut outstanding = self.permits.outstanding.load(Ordering::Acquire);
         loop {
             if outstanding >= HOST_OPERATION_CAPACITY {
@@ -625,6 +714,7 @@ impl HostExecutor {
                     }
                     return Some(HostWorkPermit {
                         pool: Arc::clone(&self.permits),
+                        disposal: disposal.clone(),
                         prepared: Some(Arc::new(HostPreparedReservation {
                             pool: Arc::clone(&self.prepared),
                             logical_bytes: HOST_PREPARED_BYTE_CAPACITY,
@@ -642,6 +732,25 @@ impl HostExecutor {
         command: HostCommand,
         permit: HostWorkPermit,
     ) -> Result<(), HostSubmissionFailure> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(HostSubmissionFailure {
+                error: HostSubmitError::Stopped,
+                identity,
+                command,
+                permit,
+            });
+        }
+        #[cfg(test)]
+        if matches!(command, HostCommand::DeliverStatusResponse { .. })
+            && self.permits.refuse_status_delivery.load(Ordering::Acquire)
+        {
+            return Err(HostSubmissionFailure {
+                error: HostSubmitError::Stopped,
+                identity,
+                command,
+                permit,
+            });
+        }
         let job = HostJob {
             identity,
             command,
@@ -689,6 +798,23 @@ impl HostExecutor {
     #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
         self.permits.outstanding.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status_stop_count(&self) -> usize {
+        self.permits.status_stops.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_bytes(&self) -> usize {
+        self.prepared.used.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_refuse_status_delivery(&self) {
+        self.permits
+            .refuse_status_delivery
+            .store(true, Ordering::Release);
     }
 }
 
@@ -741,6 +867,16 @@ fn run_worker(
             mut permit,
         } = job;
         let command = match command {
+            HostCommand::DiscardCompletion(result) => {
+                drop(result);
+                drop(permit);
+                continue;
+            }
+            HostCommand::Dispose(command) => {
+                drop(command);
+                drop(permit);
+                continue;
+            }
             HostCommand::ReclaimSessionTypeCatalog(reclamation) => {
                 let SessionTypeCatalogReclamation {
                     entities,
@@ -761,17 +897,18 @@ fn run_worker(
             generation,
             error: HostError::new("host_worker_panicked", "host worker execution panicked"),
         });
-        if completions
-            .send(HostCompletion {
-                identity,
-                result,
-                permit,
-            })
-            .is_err()
-        {
+        let completion = HostCompletion {
+            identity,
+            result,
+            permit,
+        };
+        if let Err(failure) = completions.try_send(completion) {
             // An undelivered created worktree stays in its deterministic path.
             // Startup adoption publishes the same preserved external effect.
-            return;
+            stopping.store(true, Ordering::Release);
+            eprintln!("Host completion publication failed");
+            drop(failure);
+            continue;
         }
         // The completion is in the mailbox before this bit and doorbell publish.
         wake.publish_completion();
@@ -785,6 +922,19 @@ fn execute(
     permit: &mut HostWorkPermit,
 ) -> HostResult {
     match command {
+        #[cfg(test)]
+        HostCommand::DisposalProbe(probe) => {
+            probe.executed.store(true, Ordering::Release);
+            HostResult::StatusResponsePrepared(crate::status_response::PreparedStatusResponse {
+                kind: botster_hub_client::DaemonResponseKind::Status,
+                encoded_frame: None,
+                shutdown: false,
+                dispose_probe: Some(probe),
+            })
+        }
+        HostCommand::Dispose(_) | HostCommand::DiscardCompletion(_) => {
+            unreachable!("worker handles disposal before execution")
+        }
         HostCommand::EntityModel(work) => HostResult::EntityModelComplete(work.run(identity)),
         HostCommand::ReclaimEntityModel(work) => {
             HostResult::EntityModelComplete(work.reclaim(identity))
@@ -831,6 +981,43 @@ fn execute(
             }
         }
 
+        HostCommand::PrepareStatusResponse(input) => HostResult::StatusResponsePrepared(
+            crate::status_response::prepare(input, permit.reserved_prepared_bytes()),
+        ),
+        HostCommand::DeliverStatusResponse { prepared, reply_tx } => {
+            let charge = permit.take_prepared_charge(prepared.logical_bytes());
+            let shutdown = prepared.shutdown;
+            let Some(encoded_frame) = prepared.encoded_frame else {
+                drop(reply_tx);
+                drop(charge);
+                return HostResult::StatusResponseDelivered {
+                    shutdown,
+                    received: false,
+                };
+            };
+            let reply = crate::daemon::control::reply::ControlReply::prepared(
+                prepared.kind,
+                encoded_frame,
+                charge,
+            );
+            let received = match reply_tx.send_reply(reply) {
+                Ok(()) => true,
+                Err(reply) => {
+                    drop(reply);
+                    false
+                }
+            };
+            HostResult::StatusResponseDelivered { shutdown, received }
+        }
+        HostCommand::StopForStatus(prepared) => {
+            let mut entrypoints = entrypoints
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            drop(std::mem::take(&mut *entrypoints));
+            #[cfg(test)]
+            permit.pool.status_stops.fetch_add(1, Ordering::AcqRel);
+            HostResult::StatusResponsePrepared(prepared)
+        }
         HostCommand::StopEntrypoints => {
             let mut entrypoints = entrypoints
                 .lock()
@@ -969,6 +1156,22 @@ impl TestHostGate {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestDisposalProbe {
+    pub(crate) dropped: mpsc::Sender<String>,
+    pub(crate) executed: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl Drop for TestDisposalProbe {
+    fn drop(&mut self) {
+        let _ = self
+            .dropped
+            .send(thread::current().name().unwrap_or("unnamed").to_string());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
@@ -985,6 +1188,268 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     static NEXT_MANAGED_REPOSITORY: AtomicU64 = AtomicU64::new(1);
+
+    fn wait_for_worker_exit(workers: Vec<thread::JoinHandle<()>>) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while workers.iter().any(|worker| !worker.is_finished()) {
+            assert!(
+                Instant::now() < deadline,
+                "last disposal sender must let workers exit"
+            );
+            thread::yield_now();
+        }
+        for worker in workers {
+            worker.join().expect("disposal worker exits normally");
+        }
+    }
+
+    #[test]
+    fn shutdown_snapshot_retains_one_slot_through_stop_and_worker_delivery() {
+        let executor = HostExecutor::new();
+        let permit = executor.try_reserve().expect("reserve shutdown");
+        let (dropped, receiver) = mpsc::channel();
+        let mut input = crate::status_response::test_input(true);
+        input.drop_probe = Some(TestDisposalProbe {
+            dropped,
+            executed: Arc::new(AtomicBool::new(false)),
+        });
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 1,
+                },
+                HostCommand::PrepareStatusResponse(input),
+                permit,
+            )
+            .expect("submit snapshot");
+        let (_, result, permit) = receive_host_completion(&executor).into_parts();
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("typed seed drops")
+                .starts_with("botster-hub-host-")
+        );
+        let HostResult::StatusResponsePrepared(prepared) = result else {
+            panic!("encoded snapshot");
+        };
+        let expected = prepared.encoded_frame.clone().expect("encoded response");
+        assert_eq!(executor.permits.outstanding.load(Ordering::Acquire), 1);
+        assert_eq!(
+            executor.prepared.used.load(Ordering::Acquire),
+            HOST_PREPARED_BYTE_CAPACITY
+        );
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 2,
+                },
+                HostCommand::StopForStatus(prepared),
+                permit,
+            )
+            .expect("submit stop");
+        let (_, result, permit) = receive_host_completion(&executor).into_parts();
+        let HostResult::StatusResponsePrepared(prepared) = result else {
+            panic!("stop preserves encoded snapshot");
+        };
+        assert_eq!(prepared.encoded_frame.as_ref(), Some(&expected));
+        assert_eq!(executor.permits.outstanding.load(Ordering::Acquire), 1);
+        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 3,
+                },
+                HostCommand::DeliverStatusResponse { prepared, reply_tx },
+                permit,
+            )
+            .expect("submit delivery");
+        let (_, result, permit) = receive_host_completion(&executor).into_parts();
+        assert!(matches!(
+            result,
+            HostResult::StatusResponseDelivered {
+                shutdown: true,
+                received: true
+            }
+        ));
+        drop(permit);
+        assert_eq!(executor.permits.outstanding.load(Ordering::Acquire), 0);
+        assert_eq!(
+            executor.prepared.used.load(Ordering::Acquire),
+            expected.len()
+        );
+        let reply = reply_rx.blocking_recv().expect("prepared reply");
+        assert_eq!(
+            reply.kind(),
+            Some(botster_hub_client::DaemonResponseKind::Shutdown)
+        );
+        drop(reply);
+        assert_eq!(executor.prepared.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn failed_shutdown_reply_releases_encoded_charge_on_worker() {
+        let executor = HostExecutor::new();
+        let permit = executor.try_reserve().expect("reserve response");
+        let prepared = crate::status_response::prepare(
+            crate::status_response::test_input(true),
+            HOST_PREPARED_BYTE_CAPACITY,
+        );
+        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+        drop(reply_rx);
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 3,
+                },
+                HostCommand::DeliverStatusResponse { prepared, reply_tx },
+                permit,
+            )
+            .expect("submit failed delivery");
+        let (_, result, permit) = receive_host_completion(&executor).into_parts();
+        assert!(matches!(
+            result,
+            HostResult::StatusResponseDelivered {
+                shutdown: true,
+                received: false
+            }
+        ));
+        assert_eq!(executor.prepared.used.load(Ordering::Acquire), 0);
+        drop(permit);
+    }
+
+    #[test]
+    fn unencodable_shutdown_fallback_still_stops_and_completes_without_a_frame() {
+        let executor = HostExecutor::new();
+        let permit = executor.try_reserve().expect("reserve shutdown slot");
+        let prepared = crate::status_response::prepare(crate::status_response::test_input(true), 1);
+        assert!(prepared.encoded_frame.is_none());
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 2,
+                },
+                HostCommand::StopForStatus(prepared),
+                permit,
+            )
+            .expect("submit no-frame stop");
+        let (_, result, permit) = receive_host_completion(&executor).into_parts();
+        let HostResult::StatusResponsePrepared(prepared) = result else {
+            panic!("stop retains no-frame shutdown");
+        };
+        assert_eq!(executor.status_stop_count(), 1);
+        assert_eq!(executor.outstanding(), 1);
+        assert_eq!(executor.prepared_bytes(), HOST_PREPARED_BYTE_CAPACITY);
+        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 3,
+                },
+                HostCommand::DeliverStatusResponse { prepared, reply_tx },
+                permit,
+            )
+            .expect("submit no-frame completion");
+        let (_, result, permit) = receive_host_completion(&executor).into_parts();
+        assert!(matches!(
+            result,
+            HostResult::StatusResponseDelivered {
+                shutdown: true,
+                received: false
+            }
+        ));
+        assert!(reply_rx.blocking_recv().is_err());
+        assert_eq!(executor.prepared_bytes(), 0);
+        drop(permit);
+        assert_eq!(executor.outstanding(), 0);
+        assert_eq!(executor.status_stop_count(), 1);
+    }
+
+    #[test]
+    fn disposal_after_executor_drop_uses_original_workers_and_releases_last_sender() {
+        let mut executor = HostExecutor::new();
+        let permit = executor.try_reserve().expect("reserve external work");
+        let workers = std::mem::take(&mut executor.workers);
+        let (dropped, receiver) = mpsc::channel();
+        let executed = Arc::new(AtomicBool::new(false));
+        drop(executor);
+        permit
+            .dispose(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 1,
+                },
+                HostCommand::DisposalProbe(TestDisposalProbe {
+                    dropped,
+                    executed: executed.clone(),
+                }),
+            )
+            .expect("external permit preserves a disposal consumer");
+        let thread = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker drops payload");
+        assert!(thread.starts_with("botster-hub-host-"));
+        assert!(!executed.load(Ordering::Acquire));
+        wait_for_worker_exit(workers);
+    }
+
+    #[test]
+    fn completion_loss_stops_execution_but_keeps_disposal_consumers_alive() {
+        let mut executor = HostExecutor::new();
+        let external = executor.try_reserve().expect("reserve external work");
+        let trigger = executor.try_reserve().expect("reserve completion trigger");
+        let (_sender, receiver) = mpsc::sync_channel(HOST_OPERATION_CAPACITY);
+        let old = std::mem::replace(&mut executor.completions, Arc::new(Mutex::new(receiver)));
+        drop(old);
+        executor
+            .submit(
+                HostJobIdentity {
+                    waiter_id: WaiterId(1),
+                    phase: 1,
+                },
+                HostCommand::StopEntrypoints,
+                trigger,
+            )
+            .expect("submit completion-loss trigger");
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !executor.stopping.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "completion loss must stop ordinary execution"
+            );
+            thread::yield_now();
+        }
+        assert!(executor.try_reserve().is_none());
+        let workers = std::mem::take(&mut executor.workers);
+        drop(executor);
+        let (dropped, receiver) = mpsc::channel();
+        let executed = Arc::new(AtomicBool::new(false));
+        external
+            .dispose(
+                HostJobIdentity {
+                    waiter_id: WaiterId(2),
+                    phase: 1,
+                },
+                HostCommand::DisposalProbe(TestDisposalProbe {
+                    dropped,
+                    executed: executed.clone(),
+                }),
+            )
+            .expect("completion loss preserves disposal consumers");
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("worker drops payload")
+                .starts_with("botster-hub-host-")
+        );
+        assert!(!executed.load(Ordering::Acquire));
+        wait_for_worker_exit(workers);
+    }
 
     fn empty_catalog_inputs() -> (SharedView<PackageRegistry>, SharedView<HubState>) {
         let config = HubStartupOptions {
@@ -1228,13 +1693,13 @@ mod tests {
     fn rejected_submission_retains_command_and_both_reservations() {
         for expected in [HostSubmitError::Stopped, HostSubmitError::Full] {
             let mut executor = HostExecutor::new();
+            let permit = executor.try_reserve().expect("reserve rejected operation");
             executor.jobs.take();
             // A zero-capacity queue injects the reserved-queue invariant failure.
             let (sender, receiver) = mpsc::sync_channel(0);
             if expected == HostSubmitError::Full {
                 executor.jobs = Some(sender);
             }
-            let permit = executor.try_reserve().expect("reserve rejected operation");
             let gate = Arc::new(TestHostGate::default());
             let identity = HostJobIdentity {
                 waiter_id: WaiterId(91),
