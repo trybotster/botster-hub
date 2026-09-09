@@ -59,6 +59,7 @@ enum BackgroundWork {
     CoreCompletion,
     HostCompletion,
     CausalProgress,
+    CausalDrain,
     EventOwner,
     ManagedSpawn,
     PluginReady,
@@ -222,7 +223,7 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
         BackgroundWork::HostCompletion
         | BackgroundWork::CausalProgress
         | BackgroundWork::ManagedSpawn => ReadyClass::HostCompletion,
-        BackgroundWork::EventOwner => ReadyClass::HostBridge,
+        BackgroundWork::EventOwner | BackgroundWork::CausalDrain => ReadyClass::HostBridge,
         BackgroundWork::PluginReady | BackgroundWork::PluginEntityReady => {
             ReadyClass::PluginCompletion
         }
@@ -344,7 +345,8 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         if runtime.take_core_completion_notification() {
             mark_background_ready(state, BackgroundWork::CoreCompletion);
         }
-        if runtime.causal_scopes().take_progress_notification() {
+        let causal_progress = runtime.causal_scopes().take_progress_notification();
+        if causal_progress {
             if state.family_cleanup_wake_active {
                 state.family_cleanup_wake_again = true;
             } else {
@@ -352,9 +354,9 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
                 state.family_cleanup_wake_after = None;
             }
             mark_background_ready(state, BackgroundWork::CausalProgress);
-            if runtime.causal_owner_ops_ready() {
-                state.maintenance.try_wake();
-            }
+        }
+        if runtime.causal_owner_ops_ready() {
+            mark_background_ready(state, BackgroundWork::CausalDrain);
         }
         let executor = runtime.host_executor();
         state.host_completion_drain_pending |= executor.take_completion_notification();
@@ -607,10 +609,7 @@ fn run_owner_maintenance_slice(
         }
         other => {
             if let Some(runtime) = daemon.runtime() {
-                runtime.apply_causal_owner_ops();
-                if runtime.package_event_router().peek_delivery_wake()
-                    || runtime.causal_owner_ops_ready()
-                {
+                if runtime.package_event_router().peek_delivery_wake() {
                     state.maintenance.try_wake();
                 }
                 if let Some(core_work) = maintenance_core_work(other) {
@@ -689,6 +688,14 @@ pub(crate) fn run_background_ready_item(
             );
             if state.host_completion_drain_pending || state.host_capacity_wake_pending {
                 mark_background_ready(state, BackgroundWork::HostCompletion);
+            }
+        }
+        BackgroundWork::CausalDrain => {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.apply_causal_owner_ops();
+                if runtime.causal_owner_ops_ready() {
+                    mark_background_ready(state, BackgroundWork::CausalDrain);
+                }
             }
         }
         BackgroundWork::CausalProgress => {
@@ -2293,6 +2300,74 @@ mod tests {
             daemon.stop();
             std::fs::remove_dir_all(root).expect("remove queued cleanup test directory");
         }
+    }
+
+    #[test]
+    fn causal_operations_share_the_owner_budget_without_control_traffic() {
+        use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
+
+        let root = unique_package_control_dir("causal-owner-budget");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+            .expect("start causal owner test daemon");
+        let mut state = DaemonControlState::default();
+        let runtime = daemon.runtime().expect("runtime");
+        let scopes = runtime.causal_scopes().clone();
+        let ids: Vec<_> = (0..100)
+            .map(|index| {
+                let identity = LeaseIdentity::EventInFlight {
+                    request_id: format!("causal-budget-{index}"),
+                };
+                let scope_id = scopes.mint_with_lease(Some(identity.clone())).unwrap();
+                assert!(matches!(
+                    runtime.keep_causal_op(CausalOp::Release { scope_id, identity }),
+                    CausalAdmitResult::Applied
+                ));
+                scope_id
+            })
+            .collect();
+        publish_completion_wakes(&daemon, &mut state);
+        publish_maintenance_wakes(&mut state);
+        let now = Instant::now();
+        let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(now);
+        let mut remaining = ids.len();
+        while budget
+            .try_charge(
+                now,
+                crate::daemon::owner_turn::OwnerTurnCharge::opaque_move(),
+            )
+            .is_ok()
+        {
+            let item = state
+                .owner_ready
+                .pop_next()
+                .expect("causal work remains ready");
+            dispatch_owner_ready_item(&mut daemon, &mut state, item, &mut budget);
+            let next = ids
+                .iter()
+                .filter(|id| scopes.identities(**id).is_some())
+                .count();
+            assert!(
+                remaining - next <= 1,
+                "one ready item releases at most one scope"
+            );
+            remaining = next;
+        }
+        assert_eq!(
+            budget.spent_items(),
+            crate::daemon::owner_turn::OWNER_TURN_ITEM_LIMIT
+        );
+        assert!(remaining > 0 && remaining < ids.len());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while daemon.runtime().unwrap().causal_owner_ops_pending() {
+            drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(
+                Instant::now() < deadline,
+                "causal work must finish without control traffic"
+            );
+        }
+        assert!(ids.iter().all(|id| scopes.identities(*id).is_none()));
+        daemon.stop();
+        std::fs::remove_dir_all(root).expect("remove causal owner test directory");
     }
 
     #[test]

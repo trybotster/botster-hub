@@ -752,3 +752,43 @@ That focused test passed. Production code remains the tested `a9c56ce` revision.
 Poison latches for the table lifetime. The new family path reports explicit recovery; a daemon restart replaces the table.
 The broader audit of legacy retry callers and fault visibility remains open.
 These tests do not close the remaining owner scheduling, notification, or idle-progress proof requirements outside this family cleanup path.
+
+
+## 14. Causal owner phases, 2026-09-09
+
+Causal draining now has one ready item in the existing `HostBridge` class.
+Each dispatch attempts one table operation or advances one of 13 persistent local phases.
+When the table has ready work, table draining alternates with local phases.
+This gives different local queues access to freed table capacity. An empty table does not consume a separate activation.
+Each phase moves or applies at most one operation. Maintenance no longer drains causal operations or wakes itself for causal readiness.
+The obsolete 32-operation flush limit is removed. Synchronous runtime callers step the same cursor outside the daemon owner.
+
+One owner-only FIFO now replaces the three finish segments. The total capacity remains 768 operations.
+New operations append to that FIFO. Each drain releases its borrow before it attempts admission.
+The general finish FIFO and the separate fanout finish queue use `RefCell`.
+Integration fixtures wait for logical causal ownership to clear, including operations retained outside the causal table.
+
+Two regression tests exposed defects before the local corrections.
+A full causal table gave each freed slot to the same early local phase and starved later phases.
+The alternating cursor passes the regression with continuous early-phase refill and later finish or bridge work.
+The finish segments also let a release overtake an earlier transfer at a segment boundary.
+The single finish FIFO passes the ordered transfer-and-release regression.
+
+A source audit corrected the bridge ownership premise used during this work.
+Production workers access the bridge's publication queue. Only owner runtime paths access its five release stores.
+The removed release-store notifier and its synthetic worker tests did not establish a first-party production contention requirement.
+The genuinely shared causal table retains its mutex-release and capacity notifier.
+
+After that removal, all 16 selected causal tests and all 33 runtime tests passed.
+The four production package cleanup cases also passed. The Rust 1.97.0 check with tests passed.
+Matched integration checks remain pending.
+
+The local corrections do not close global causal ordering.
+Direct table admission can still bypass an older transfer retained outside the table.
+Both admitted fanout retirement and provider-resync retirement can follow that path.
+The complete ordered-retention contract remains under review.
+
+This checkpoint bounds operation count. It does not close identity byte accounting.
+Causal table updates compare and clone identity strings, but their owner dispatch currently uses an opaque movement charge.
+The producer byte bounds and the required charge remain under review.
+The shared publication queue and the broader legacy fault-reporting contract also remain outside this checkpoint.

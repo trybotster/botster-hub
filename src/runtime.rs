@@ -64,8 +64,8 @@ use crate::package_entity_fanout::{
     coerce_entity_frame_empty_items, parse_publish_mutation,
 };
 use crate::package_event_router::{
-    CAUSAL_FLUSH_MAX, CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, EventPlaneStatus,
-    EventSubscription, LeaseIdentity, release_or_retract,
+    CAUSAL_PENDING_MAX, CausalAdmitResult, CausalOp, EventPlaneStatus, EventSubscription,
+    LeaseIdentity, release_or_retract,
 };
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
@@ -111,15 +111,15 @@ pub struct HubRuntime {
     package_entity_resync_releases: std::cell::RefCell<BTreeSet<(String, u64)>>,
     package_entity_resync_changed: std::cell::Cell<bool>,
     package_entity_fanout: Arc<Mutex<PackageEntityFanoutQueue>>,
-    package_entity_finishes: Arc<Mutex<VecDeque<CausalOp>>>,
+    package_entity_finishes: std::cell::RefCell<VecDeque<CausalOp>>,
     last_capability_cleanup: Option<PluginCleanupResult>,
     session_contexts: SharedSessionContexts,
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
     event_plane_counters: Arc<crate::event_plane_counters::EventPlaneCounters>,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
-    unfinished_finishes: Mutex<VecDeque<CausalOp>>,
-    unfinished_overflow: Mutex<VecDeque<CausalOp>>,
-    unfinished_held: Mutex<VecDeque<CausalOp>>,
+    causal_local_phase: std::cell::Cell<CausalLocalPhase>,
+    causal_scope_turn: std::cell::Cell<bool>,
+    unfinished_finishes: std::cell::RefCell<VecDeque<CausalOp>>,
     in_hand: std::cell::RefCell<Option<CausalOp>>,
     retry_ops: std::cell::RefCell<VecDeque<CausalOp>>,
     family_causal: std::cell::RefCell<VecDeque<CausalOp>>,
@@ -163,6 +163,45 @@ type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
 const SESSION_TYPE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
 const SOURCE_HELD_MAX: usize = 2;
+const CAUSAL_FINISH_MAX: usize = CAUSAL_PENDING_MAX * 3;
+
+#[derive(Clone, Copy, Default)]
+enum CausalLocalPhase {
+    #[default]
+    Unsettled,
+    InHand,
+    Owner,
+    Family,
+    FamilyHeld,
+    FamilySource,
+    FamilyOverflow,
+    SourceHeld,
+    Source,
+    FamilyResyncRelease,
+    PublishRelease,
+    Finish,
+    FanoutFinish,
+}
+
+impl CausalLocalPhase {
+    const fn next(self) -> Self {
+        match self {
+            Self::Unsettled => Self::InHand,
+            Self::InHand => Self::Owner,
+            Self::Owner => Self::Family,
+            Self::Family => Self::FamilyHeld,
+            Self::FamilyHeld => Self::FamilySource,
+            Self::FamilySource => Self::FamilyOverflow,
+            Self::FamilyOverflow => Self::SourceHeld,
+            Self::SourceHeld => Self::Source,
+            Self::Source => Self::FamilyResyncRelease,
+            Self::FamilyResyncRelease => Self::PublishRelease,
+            Self::PublishRelease => Self::Finish,
+            Self::Finish => Self::FanoutFinish,
+            Self::FanoutFinish => Self::Unsettled,
+        }
+    }
+}
 
 /// Shared hub-owned session-type spawn bridge exposed to Lua plugin workers.
 pub type SharedSessionTypeSpawner = Arc<HubSessionTypeSpawner>;
@@ -368,7 +407,7 @@ impl HubRuntime {
             package_entity_resync_releases: std::cell::RefCell::new(BTreeSet::new()),
             package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(PackageEntityFanoutQueue::default())),
-            package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
+            package_entity_finishes: std::cell::RefCell::new(VecDeque::new()),
             config,
             state,
             core_daemon,
@@ -383,9 +422,9 @@ impl HubRuntime {
             package_event_router,
             event_plane_counters,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
-            unfinished_finishes: Mutex::new(VecDeque::new()),
-            unfinished_overflow: Mutex::new(VecDeque::new()),
-            unfinished_held: Mutex::new(VecDeque::new()),
+            causal_local_phase: std::cell::Cell::new(CausalLocalPhase::default()),
+            causal_scope_turn: std::cell::Cell::new(true),
+            unfinished_finishes: std::cell::RefCell::new(VecDeque::new()),
             in_hand: std::cell::RefCell::new(None),
             retry_ops: std::cell::RefCell::new(VecDeque::new()),
             family_causal: std::cell::RefCell::new(VecDeque::new()),
@@ -479,7 +518,7 @@ impl HubRuntime {
             package_entity_resync_releases: std::cell::RefCell::new(BTreeSet::new()),
             package_entity_resync_changed: std::cell::Cell::new(false),
             package_entity_fanout: Arc::new(Mutex::new(PackageEntityFanoutQueue::default())),
-            package_entity_finishes: Arc::new(Mutex::new(VecDeque::new())),
+            package_entity_finishes: std::cell::RefCell::new(VecDeque::new()),
             config,
             state,
             core_daemon,
@@ -494,9 +533,9 @@ impl HubRuntime {
             package_event_router,
             event_plane_counters,
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
-            unfinished_finishes: Mutex::new(VecDeque::new()),
-            unfinished_overflow: Mutex::new(VecDeque::new()),
-            unfinished_held: Mutex::new(VecDeque::new()),
+            causal_local_phase: std::cell::Cell::new(CausalLocalPhase::default()),
+            causal_scope_turn: std::cell::Cell::new(true),
+            unfinished_finishes: std::cell::RefCell::new(VecDeque::new()),
             in_hand: std::cell::RefCell::new(None),
             retry_ops: std::cell::RefCell::new(VecDeque::new()),
             family_causal: std::cell::RefCell::new(VecDeque::new()),
@@ -658,21 +697,11 @@ impl HubRuntime {
     pub fn causal_owner_ops_pending(&self) -> bool {
         self.causal_scopes.pending_ops()
             || self.entity_publish_bridge.has_pending_releases()
-            || self
-                .unfinished_finishes
-                .lock()
-                .map(|pending| !pending.is_empty())
-                .unwrap_or(false)
-            || self
-                .unfinished_overflow
-                .lock()
-                .map(|pending| !pending.is_empty())
-                .unwrap_or(false)
-            || self
-                .unfinished_held
-                .lock()
-                .map(|pending| !pending.is_empty())
-                .unwrap_or(false)
+            || self.local_causal_ops_pending()
+    }
+
+    fn local_causal_ops_pending(&self) -> bool {
+        !self.unfinished_finishes.borrow().is_empty()
             || self.has_finish_only_fanout()
             || self.in_hand.borrow().is_some()
             || !self.retry_ops.borrow().is_empty()
@@ -693,7 +722,9 @@ impl HubRuntime {
         if self.causal_scopes.pending_ops() && !self.causal_scopes.pending_ready() {
             return false;
         }
-        self.causal_owner_ops_pending()
+        self.causal_scopes.pending_ready()
+            || self.entity_publish_bridge.has_pending_releases()
+            || self.local_causal_ops_pending()
     }
 
     /// Complete one operation for synchronous runtime callers outside the daemon owner loop.
@@ -745,16 +776,30 @@ impl HubRuntime {
     }
 
     pub(crate) fn apply_causal_owner_ops(&self) {
-        let _ = self.causal_scopes.flush_pending();
-        self.retry_unsettled();
-        self.retry_in_hand();
-        self.retry_owner_ops();
-        self.retry_family_causal();
-        self.retry_family_resync_release();
-        self.harvest_publish_releases();
-        self.retry_unfinished_finishes();
-        self.retry_finish_only_fanout();
-        let _ = self.causal_scopes.flush_pending();
+        // Drain one table operation before each local phase when the table has work.
+        // A full table must not give every freed slot to the same local queue.
+        if self.causal_scope_turn.replace(false) && self.causal_scopes.pending_ready() {
+            let _ = self.causal_scopes.flush_pending();
+            return;
+        }
+        self.causal_scope_turn.set(true);
+        let phase = self.causal_local_phase.get();
+        self.causal_local_phase.set(phase.next());
+        match phase {
+            CausalLocalPhase::Unsettled => self.retry_unsettled(),
+            CausalLocalPhase::InHand => self.retry_in_hand(),
+            CausalLocalPhase::Owner => self.retry_owner_ops(),
+            CausalLocalPhase::Family => self.retry_family_queue(&self.family_causal),
+            CausalLocalPhase::FamilyHeld => self.retry_one_held(&self.family_held),
+            CausalLocalPhase::FamilySource => self.retry_one_held(&self.family_source),
+            CausalLocalPhase::FamilyOverflow => self.retry_one_held(&self.family_overflow),
+            CausalLocalPhase::SourceHeld => self.retry_family_queue(&self.source_held),
+            CausalLocalPhase::Source => self.retry_family_queue(&self.source_ops),
+            CausalLocalPhase::FamilyResyncRelease => self.retry_family_resync_release(),
+            CausalLocalPhase::PublishRelease => self.harvest_publish_releases(),
+            CausalLocalPhase::Finish => self.drain_unfinished(),
+            CausalLocalPhase::FanoutFinish => self.retry_finish_only_fanout(),
+        }
     }
 
     /// Admit a required causal op. Retry means the caller still owns it.
@@ -763,81 +808,40 @@ impl HubRuntime {
     }
 
     fn harvest_publish_releases(&self) {
-        let started = Instant::now();
-        let mut applied = 0;
-        while applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
-            if self.in_hand.borrow().is_some() {
-                break;
-            }
-            let Some(op) = self.entity_publish_bridge.take_release() else {
-                break;
-            };
-            if let CausalAdmitResult::Retry(op) = self.causal_scopes.try_admit(op) {
-                let _ = self.keep_or_park(CausalAdmitResult::Retry(op));
-                break;
-            }
-            applied += 1;
+        if self.in_hand.borrow().is_some() {
+            return;
         }
-    }
-
-    fn retry_unfinished_finishes(&self) {
-        let started = Instant::now();
-        let mut applied = 0;
-        self.drain_unfinished(&self.unfinished_finishes, &mut applied, started);
-        if applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
-            self.drain_unfinished(&self.unfinished_overflow, &mut applied, started);
-        }
-        if applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
-            self.drain_unfinished(&self.unfinished_held, &mut applied, started);
-        }
-    }
-
-    fn drain_unfinished(
-        &self,
-        queue: &Mutex<VecDeque<CausalOp>>,
-        applied: &mut usize,
-        started: Instant,
-    ) {
-        let Ok(mut pending) = queue.lock() else {
+        let Some(op) = self.entity_publish_bridge.take_release() else {
             return;
         };
-        let mut leftover = VecDeque::new();
-        while *applied < CAUSAL_FLUSH_MAX && started.elapsed() < Duration::from_millis(8) {
-            let Some(op) = pending.pop_front() else {
-                break;
-            };
-            match self.causal_scopes.try_admit(op) {
-                CausalAdmitResult::Applied => *applied += 1,
-                CausalAdmitResult::Retry(op) => {
-                    leftover.push_front(op);
-                    break;
-                }
-            }
+        if let CausalAdmitResult::Retry(op) = self.causal_scopes.try_admit(op) {
+            let result = self.keep_or_park(CausalAdmitResult::Retry(op));
+            debug_assert!(
+                matches!(result, CausalAdmitResult::Applied),
+                "the empty in-hand slot retains a rejected release"
+            );
         }
-        leftover.append(&mut pending);
-        *pending = leftover;
+    }
+
+    fn drain_unfinished(&self) {
+        let op = self.unfinished_finishes.borrow_mut().pop_front();
+        let Some(op) = op else {
+            return;
+        };
+        if let CausalAdmitResult::Retry(op) = self.causal_scopes.try_admit(op) {
+            // A refused operation stays ahead of every later finish.
+            self.unfinished_finishes.borrow_mut().push_front(op);
+        }
     }
 
     fn keep_unfinished_finish(&self, op: CausalOp) -> CausalAdmitResult {
-        if let Ok(mut pending) = self.unfinished_finishes.lock()
-            && pending.len() < CAUSAL_PENDING_MAX
-        {
+        let mut pending = self.unfinished_finishes.borrow_mut();
+        if pending.len() < CAUSAL_FINISH_MAX {
             pending.push_back(op);
-            return CausalAdmitResult::Applied;
+            CausalAdmitResult::Applied
+        } else {
+            CausalAdmitResult::Retry(op)
         }
-        if let Ok(mut overflow) = self.unfinished_overflow.lock()
-            && overflow.len() < CAUSAL_PENDING_MAX
-        {
-            overflow.push_back(op);
-            return CausalAdmitResult::Applied;
-        }
-        if let Ok(mut held) = self.unfinished_held.lock()
-            && held.len() < CAUSAL_PENDING_MAX
-        {
-            held.push_back(op);
-            return CausalAdmitResult::Applied;
-        }
-        CausalAdmitResult::Retry(op)
     }
 
     fn keep_if_retry(&self, result: CausalAdmitResult) -> CausalAdmitResult {
@@ -915,26 +919,13 @@ impl HubRuntime {
     }
 
     fn retry_owner_ops(&self) {
-        let started = Instant::now();
-        let mut applied = 0;
-        let mut pending = std::mem::take(&mut *self.retry_ops.borrow_mut());
-        let mut leftover = VecDeque::new();
-        while let Some(op) = pending.pop_front() {
-            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-                leftover.push_back(op);
-                leftover.append(&mut pending);
-                break;
-            }
-            match self.keep_or_park(CausalAdmitResult::Retry(op)) {
-                CausalAdmitResult::Applied => applied += 1,
-                CausalAdmitResult::Retry(op) => {
-                    leftover.push_back(op);
-                    leftover.append(&mut pending);
-                    break;
-                }
-            }
+        let op = self.retry_ops.borrow_mut().pop_front();
+        let Some(op) = op else {
+            return;
+        };
+        if let CausalAdmitResult::Retry(op) = self.keep_or_park(CausalAdmitResult::Retry(op)) {
+            self.retry_ops.borrow_mut().push_front(op);
         }
-        self.retry_ops.borrow_mut().append(&mut leftover);
     }
 
     fn index_family_resync_releases(&self, name: &str, family: &PackageEntityFamilyState) {
@@ -1030,20 +1021,7 @@ impl HubRuntime {
     }
 
     fn unfinished_has_room(&self) -> bool {
-        self.unfinished_finishes
-            .lock()
-            .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
-            .unwrap_or(false)
-            || self
-                .unfinished_overflow
-                .lock()
-                .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
-                .unwrap_or(false)
-            || self
-                .unfinished_held
-                .lock()
-                .map(|pending| pending.len() < CAUSAL_PENDING_MAX)
-                .unwrap_or(false)
+        self.unfinished_finishes.borrow().len() < CAUSAL_FINISH_MAX
     }
 
     fn retry_unsettled(&self) {
@@ -1114,84 +1092,24 @@ impl HubRuntime {
         CausalAdmitResult::Applied
     }
 
-    fn retry_one_held(
-        &self,
-        slot: &std::cell::RefCell<Option<CausalOp>>,
-        applied: &mut usize,
-        started: Instant,
-    ) {
-        if *applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-            return;
-        }
-        let Some(op) = slot.borrow_mut().take() else {
+    fn retry_one_held(&self, slot: &std::cell::RefCell<Option<CausalOp>>) {
+        let op = slot.borrow_mut().take();
+        let Some(op) = op else {
             return;
         };
-        match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
-            CausalAdmitResult::Applied => *applied += 1,
-            CausalAdmitResult::Retry(op) => *slot.borrow_mut() = Some(op),
+        if let CausalAdmitResult::Retry(op) = self.enqueue_retry(CausalAdmitResult::Retry(op)) {
+            *slot.borrow_mut() = Some(op);
         }
     }
 
-    fn retry_family_causal(&self) {
-        let started = Instant::now();
-        let mut applied = 0;
-        let mut pending = std::mem::take(&mut *self.family_causal.borrow_mut());
-        let mut leftover = VecDeque::new();
-        while let Some(op) = pending.pop_front() {
-            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-                leftover.push_back(op);
-                leftover.append(&mut pending);
-                break;
-            }
-            match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
-                CausalAdmitResult::Applied => applied += 1,
-                CausalAdmitResult::Retry(op) => {
-                    leftover.push_back(op);
-                    leftover.append(&mut pending);
-                    break;
-                }
-            }
+    fn retry_family_queue(&self, queue: &std::cell::RefCell<VecDeque<CausalOp>>) {
+        let op = queue.borrow_mut().pop_front();
+        let Some(op) = op else {
+            return;
+        };
+        if let CausalAdmitResult::Retry(op) = self.enqueue_retry(CausalAdmitResult::Retry(op)) {
+            queue.borrow_mut().push_front(op);
         }
-        self.family_causal.borrow_mut().append(&mut leftover);
-        self.retry_one_held(&self.family_held, &mut applied, started);
-        self.retry_one_held(&self.family_source, &mut applied, started);
-        self.retry_one_held(&self.family_overflow, &mut applied, started);
-        let mut pending = std::mem::take(&mut *self.source_held.borrow_mut());
-        let mut leftover = VecDeque::new();
-        while let Some(op) = pending.pop_front() {
-            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-                leftover.push_back(op);
-                leftover.append(&mut pending);
-                break;
-            }
-            match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
-                CausalAdmitResult::Applied => applied += 1,
-                CausalAdmitResult::Retry(op) => {
-                    leftover.push_back(op);
-                    leftover.append(&mut pending);
-                    break;
-                }
-            }
-        }
-        self.source_held.borrow_mut().append(&mut leftover);
-        let mut pending = std::mem::take(&mut *self.source_ops.borrow_mut());
-        let mut leftover = VecDeque::new();
-        while let Some(op) = pending.pop_front() {
-            if applied >= CAUSAL_FLUSH_MAX || started.elapsed() >= Duration::from_millis(8) {
-                leftover.push_back(op);
-                leftover.append(&mut pending);
-                break;
-            }
-            match self.enqueue_retry(CausalAdmitResult::Retry(op)) {
-                CausalAdmitResult::Applied => applied += 1,
-                CausalAdmitResult::Retry(op) => {
-                    leftover.push_back(op);
-                    leftover.append(&mut pending);
-                    break;
-                }
-            }
-        }
-        self.source_ops.borrow_mut().append(&mut leftover);
     }
 
     fn retry_family_resync_release(&self) {
@@ -1225,18 +1143,11 @@ impl HubRuntime {
     }
 
     fn has_finish_only_fanout(&self) -> bool {
-        self.package_entity_finishes
-            .lock()
-            .map(|pending| !pending.is_empty())
-            .unwrap_or(false)
+        !self.package_entity_finishes.borrow().is_empty()
     }
 
     fn retry_finish_only_fanout(&self) {
-        let op = self
-            .package_entity_finishes
-            .lock()
-            .expect("package entity finish lock")
-            .pop_front();
+        let op = self.package_entity_finishes.borrow_mut().pop_front();
         if let Some(op) = op {
             self.finish_package_entity_causal_op(op);
         }
@@ -1244,10 +1155,7 @@ impl HubRuntime {
 
     fn finish_package_entity_causal_op(&self, op: CausalOp) {
         if let CausalAdmitResult::Retry(op) = self.keep_owned(self.admit_causal_op(op)) {
-            self.package_entity_finishes
-                .lock()
-                .expect("package entity finish lock")
-                .push_back(op);
+            self.package_entity_finishes.borrow_mut().push_back(op);
         }
     }
 
@@ -1510,22 +1418,7 @@ impl HubRuntime {
 
     #[must_use]
     pub fn unfinished_finish_count(&self) -> usize {
-        let queued = self
-            .unfinished_finishes
-            .lock()
-            .map(|pending| pending.len())
-            .unwrap_or(0);
-        let overflow = self
-            .unfinished_overflow
-            .lock()
-            .map(|pending| pending.len())
-            .unwrap_or(0);
-        let held = self
-            .unfinished_held
-            .lock()
-            .map(|pending| pending.len())
-            .unwrap_or(0);
-        queued + overflow + held
+        self.unfinished_finishes.borrow().len()
     }
 
     /// Return the startup reconciliation decisions made against the core daemon registry.
@@ -5705,6 +5598,149 @@ mod tests {
     }
 
     #[test]
+    fn causal_finish_fifo_preserves_transfer_before_release_across_old_segments() {
+        let runtime = family_runtime("causal-finish-fifo");
+        let pending = LeaseIdentity::PendingEntityPublish {
+            plugin_key: "producer".into(),
+        };
+        let admitted = LeaseIdentity::AdmittedEntityMutation {
+            family: "producer.item".into(),
+            generation: 0,
+            seq: 1,
+        };
+        let scope_id = runtime
+            .causal_scopes
+            .mint_with_lease(Some(pending.clone()))
+            .unwrap();
+        for _ in 0..CAUSAL_PENDING_MAX - 1 {
+            assert!(matches!(
+                runtime.keep_causal_op(CausalOp::Release {
+                    scope_id: 0,
+                    identity: pending.clone(),
+                }),
+                CausalAdmitResult::Applied
+            ));
+        }
+        assert!(matches!(
+            runtime.keep_causal_op(CausalOp::Transfer {
+                scope_id,
+                from: pending,
+                to: vec![admitted.clone()],
+            }),
+            CausalAdmitResult::Applied
+        ));
+        assert!(matches!(
+            runtime.keep_causal_op(CausalOp::Release {
+                scope_id,
+                identity: admitted
+            }),
+            CausalAdmitResult::Applied
+        ));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while runtime.causal_owner_ops_pending() {
+            runtime.apply_causal_owner_ops();
+            assert!(Instant::now() < deadline, "the finish FIFO must drain");
+        }
+        assert!(
+            runtime.causal_scopes.identities(scope_id).is_none(),
+            "a later release must not overtake its transfer at the old segment boundary"
+        );
+    }
+
+    #[test]
+    fn causal_capacity_reaches_later_phases_under_continuous_refill() {
+        for target_bridge in [false, true] {
+            let runtime = family_runtime(if target_bridge {
+                "causal-capacity-bridge"
+            } else {
+                "causal-capacity-finishes"
+            });
+            let dummy = CausalOp::Release {
+                scope_id: 0,
+                identity: LeaseIdentity::EventInFlight {
+                    request_id: "filler".into(),
+                },
+            };
+            let identity = LeaseIdentity::EventInFlight {
+                request_id: "later".into(),
+            };
+            let scope_id = runtime
+                .causal_scopes
+                .mint_with_lease(Some(identity.clone()))
+                .unwrap();
+            runtime.causal_scopes.test_with_inner_held(|| {
+                for _ in 0..CAUSAL_PENDING_MAX {
+                    assert!(matches!(
+                        runtime.causal_scopes.try_admit(dummy.clone()),
+                        CausalAdmitResult::Applied
+                    ));
+                }
+            });
+            let later = CausalOp::Release { scope_id, identity };
+            let admitted = if target_bridge {
+                runtime.entity_publish_bridge.park_release(later)
+            } else {
+                runtime.keep_causal_op(later)
+            };
+            assert!(matches!(admitted, CausalAdmitResult::Applied));
+            for _ in 0..60 {
+                if runtime.unsettled_op.borrow().is_none() {
+                    *runtime.unsettled_op.borrow_mut() = Some(dummy.clone());
+                }
+                runtime.apply_causal_owner_ops();
+            }
+            assert!(
+                runtime.unfinished_finishes.borrow().is_empty()
+                    && !runtime.entity_publish_bridge.has_pending_releases(),
+                "continuous early-phase refill must not take every freed table slot"
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while runtime.causal_owner_ops_pending() {
+                runtime.apply_causal_owner_ops();
+                assert!(
+                    Instant::now() < deadline,
+                    "the admitted release must finish"
+                );
+            }
+            assert!(runtime.causal_scopes.identities(scope_id).is_none());
+        }
+    }
+
+    #[test]
+    fn causal_finish_fifo_moves_one_operation_per_owner_phase() {
+        let runtime = family_runtime("causal-finish-phase");
+        let mut scopes = Vec::new();
+        for index in 0..6 {
+            let identity = LeaseIdentity::EventInFlight {
+                request_id: format!("{index}"),
+            };
+            let scope_id = runtime
+                .causal_scopes
+                .mint_with_lease(Some(identity.clone()))
+                .unwrap();
+            scopes.push(scope_id);
+            assert!(matches!(
+                runtime.keep_causal_op(CausalOp::Release { scope_id, identity }),
+                CausalAdmitResult::Applied
+            ));
+        }
+        let mut previous = runtime.unfinished_finish_count();
+        for _ in 0..128 {
+            runtime.apply_causal_owner_ops();
+            let remaining = runtime.unfinished_finish_count();
+            assert!(
+                previous - remaining <= 1,
+                "one phase must not drain multiple finish operations"
+            );
+            previous = remaining;
+        }
+        assert_eq!(runtime.unfinished_finish_count(), 0);
+        for scope in scopes {
+            assert!(runtime.causal_scopes.identities(scope).is_none());
+        }
+    }
+
+    #[test]
     fn family_cleanup_finds_old_fanout_without_live_state() {
         let runtime = family_runtime("orphan-fanout-cleanup");
         let family = "producer.item";
@@ -6122,7 +6158,7 @@ return botster.register({ handlers = {{
                         identity: identity.clone()
                     })
                 );
-                assert!(runtime.package_entity_finishes.lock().unwrap().is_empty());
+                assert!(runtime.package_entity_finishes.borrow().is_empty());
                 assert!(
                     !runtime.causal_scopes.take_progress_notification(),
                     "a full refusal must not wake itself"
