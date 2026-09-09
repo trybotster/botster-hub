@@ -212,6 +212,17 @@ impl PluginEntityState {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_retained_snapshot_payload(&self) -> bool {
+        self.pending.values().any(|entry| {
+            entry
+                .work
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.sequence().is_some())
+        })
+    }
+
     fn take_waiter(
         &mut self,
         waiter_id: crate::owner_identity::WaiterId,
@@ -422,6 +433,14 @@ fn subscribe(
         reply_tx,
         grant_id,
     } = request;
+    if state.shutdown_waiter.is_some() {
+        let _ = reply_tx.send(Ok(entity_subscription_error(
+            "daemon_shutting_down",
+            &subscription_id,
+            "the daemon is finishing accepted work before shutdown",
+        )));
+        return false;
+    }
     // Late WebRTC control messages after PeerClosed must not recreate peer-owned state.
     if let Some(grant_id) = grant_id.as_deref()
         && !daemon.local_webrtc().has_live_peer(grant_id)
@@ -647,7 +666,7 @@ pub(crate) fn begin_plugin_entity_resync(
     entity_type: String,
     subscription_id: String,
 ) {
-    if state.plugin_entities.has_resync(&entity_type) {
+    if state.shutdown_waiter.is_some() || state.plugin_entities.has_resync(&entity_type) {
         return;
     }
     let Some(permit) = state.budget.reserve() else {
@@ -721,7 +740,8 @@ pub(crate) fn begin_plugin_entity_resync(
 }
 
 pub(crate) fn begin_package_entity_fanout(daemon: &HubDaemon, state: &mut DaemonControlState) {
-    if state.plugin_entities.active_delivery.is_some()
+    if state.shutdown_waiter.is_some()
+        || state.plugin_entities.active_delivery.is_some()
         || !daemon
             .runtime()
             .is_some_and(|runtime| runtime.has_package_entity_fanout())
@@ -805,6 +825,7 @@ pub(crate) fn drive_plugin_entity_ready_item(
                 | PendingPluginEntityKind::Fanout { permit } => permit,
             };
             state.budget.release(permit);
+            crate::daemon::control::pending::wake_shutdown_waiter(state);
         }
         step => {
             state.plugin_entities.restore(entry);
@@ -819,6 +840,46 @@ pub(crate) fn drive_plugin_entity_ready_item(
         }
     }
     true
+}
+
+/// Cancel one retained row. The row keeps its payload and permit until its worker finishes.
+pub(crate) fn cancel_next_plugin_entity_for_shutdown(
+    state: &mut DaemonControlState,
+    after: &mut Option<crate::owner_identity::WaiterId>,
+) -> bool {
+    use std::ops::Bound::{Excluded, Unbounded};
+
+    let next = match *after {
+        Some(after) => state
+            .plugin_entities
+            .by_waiter
+            .range((Excluded(after), Unbounded))
+            .next(),
+        None => state.plugin_entities.by_waiter.first_key_value(),
+    }
+    .map(|(waiter, _)| *waiter);
+    let Some(waiter) = next else {
+        return false;
+    };
+    *after = Some(waiter);
+    let entry = state
+        .plugin_entities
+        .entry_for_waiter_mut(waiter)
+        .expect("the entity waiter index retains its row");
+    entry.work.cancel();
+    entry.deadline_key = None;
+    state.deadlines.retire(waiter);
+    mark_plugin_entity_ready(
+        state,
+        waiter,
+        crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+        crate::daemon::control::pending::READY_HOST_COMPLETION,
+    );
+    true
+}
+
+pub(crate) fn plugin_entity_cleanup_pending(state: &DaemonControlState) -> bool {
+    !state.plugin_entities.pending.is_empty()
 }
 
 /// Retire pending entity-provider replies owned by one closed connection.

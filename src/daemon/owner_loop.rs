@@ -2660,6 +2660,7 @@ mod tests {
             crate::daemon::control::pending::ControlStep::Ready(response) => response,
             crate::daemon::control::pending::ControlStep::Pending(mut step) => loop {
                 match (step.continuation)(daemon, state) {
+                    crate::daemon::control::pending::ControlPoll::Again => continue,
                     crate::daemon::control::pending::ControlPoll::Pending => {}
                     crate::daemon::control::pending::ControlPoll::Ready(response) => {
                         break response;
@@ -3758,6 +3759,190 @@ return botster.register({
     }
 
     #[test]
+    fn shutdown_waits_for_worker_reclamation_of_entity_payload() {
+        for source in ["provider", "fanout"] {
+            let root = unique_package_control_dir(&format!("shutdown-entity-payload-{source}"));
+            let package_dir = root.join("owner-entity-gate");
+            write_package_control_manifest(
+                &package_dir,
+                "owner-entity-gate",
+                serde_json::json!({
+                    "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+                }),
+            );
+            write_controlled_entity_gate_lua_plugin(&package_dir);
+            let mut daemon = HubDaemon::start(package_control_config(root.join("data")))
+                .expect("start entity shutdown daemon");
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::InstallPackageLocalPath { path: package_dir },
+            )
+            .expect("install entity provider");
+            drive_package_request(
+                &mut daemon,
+                DaemonRequest::EnablePackage {
+                    package_name: "owner-entity-gate".into(),
+                },
+            )
+            .expect("enable entity provider");
+            let mut state = DaemonControlState::default();
+            daemon
+                .runtime()
+                .unwrap()
+                .install_plugin_completion_notifier(
+                    state.plugin_result_budget.completion_notifier(),
+                );
+            let baseline = state.budget.outstanding();
+            let (frame_tx, _frame_rx) = tokio_mpsc::channel(8);
+            let (reply_tx, mut entity_reply) =
+                crate::daemon::control::message::control_reply_channel();
+            if source == "provider" {
+                crate::daemon::control::entities::handle(
+                    &mut daemon,
+                    &mut state,
+                    ControlMessage::SubscribeEntities {
+                        entity_type: "owner-entity-gate.entity".into(),
+                        subscription_id: "shutdown-entity".into(),
+                        transport_request_id: Some("entity-request".into()),
+                        client_id: Some("entity-client".into()),
+                        frame_tx: crate::subscription::entity::EntityFrameSender::Async(frame_tx),
+                        frame_rx: None,
+                        reply_tx,
+                        grant_id: None,
+                    },
+                );
+            } else {
+                let admitted = daemon
+                    .runtime()
+                    .unwrap()
+                    .test_admit_publish(
+                        "owner-entity-gate",
+                        serde_json::json!({
+                            "type": "entity_upsert",
+                            "entity_type": "owner-entity-gate.entity",
+                            "snapshot_seq": 1,
+                            "id": "entity-1",
+                            "entity": {"id": "entity-1", "text": "x".repeat(262_144)},
+                        }),
+                        None,
+                    )
+                    .expect("admit the large entity mutation through production admission");
+                assert!(admitted.ok);
+                crate::daemon::control::entities::begin_package_entity_fanout(&daemon, &mut state);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !state.plugin_entities.has_retained_snapshot_payload() {
+                if let Ok(reply) = entity_reply.try_recv() {
+                    panic!(
+                        "the provider must prepare a snapshot before replying: {:?}",
+                        reply.into_parts().0
+                    );
+                }
+                publish_completion_wakes(&daemon, &mut state);
+                publish_maintenance_wakes(&mut state);
+                if let Some(item) = state.owner_ready.pop_next() {
+                    let mut budget =
+                        crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                    assert!(!dispatch_owner_ready_item(
+                        &mut daemon,
+                        &mut state,
+                        item,
+                        &mut budget
+                    ));
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the entity row must retain its prepared payload"
+                );
+                thread::yield_now();
+            }
+            let mut gates = Vec::new();
+            for _ in 0..crate::host_executor::HOST_WORKER_COUNT {
+                let gate = std::sync::Arc::new(crate::host_executor::TestHostGate::default());
+                let executor = daemon.runtime().unwrap().host_executor();
+                executor
+                    .submit(
+                        crate::host_executor::HostJobIdentity::first(
+                            state.waiter_ids.next().unwrap(),
+                        ),
+                        crate::host_executor::HostCommand::Wait {
+                            generation: 0,
+                            gate: gate.clone(),
+                        },
+                        executor.try_reserve().expect("reserve a worker gate"),
+                    )
+                    .expect("submit worker gate");
+                while !gate.has_started() {
+                    assert!(Instant::now() < deadline, "the worker gate must start");
+                    thread::yield_now();
+                }
+                gates.push(gate);
+            }
+            let mut shutdown_reply = start_async_control_request(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::DaemonShutdown,
+                "shutdown-client",
+                "shutdown-request",
+            );
+            let (late_frame_tx, _late_frame_rx) = tokio_mpsc::channel(8);
+            let (late_reply_tx, late_reply_rx) =
+                crate::daemon::control::message::control_reply_channel();
+            crate::daemon::control::entities::handle(
+                &mut daemon,
+                &mut state,
+                ControlMessage::SubscribeEntities {
+                    entity_type: "owner-entity-gate.entity".into(),
+                    subscription_id: "late-entity".into(),
+                    transport_request_id: Some("late-request".into()),
+                    client_id: Some("late-client".into()),
+                    frame_tx: crate::subscription::entity::EntityFrameSender::Async(late_frame_tx),
+                    frame_rx: None,
+                    reply_tx: late_reply_tx,
+                    grant_id: None,
+                },
+            );
+            let refusal =
+                receive_test_control_reply(late_reply_rx).expect("late subscription response");
+            assert_eq!(
+                refusal.error.as_ref().map(|error| error.code.as_str()),
+                Some("daemon_shutting_down")
+            );
+            while state.plugin_entities.has_retained_snapshot_payload() {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    Instant::now() < deadline,
+                    "the payload must transfer to queued worker cleanup"
+                );
+                thread::yield_now();
+            }
+            assert!(crate::daemon::control::entities::plugin_entity_cleanup_pending(&state));
+            assert_eq!(state.budget.outstanding(), baseline + 2);
+            assert!(matches!(
+                shutdown_reply.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            for gate in gates {
+                gate.release();
+            }
+            while !drive_ready_test_turn(&mut daemon, &mut state) {
+                assert!(
+                    Instant::now() < deadline,
+                    "shutdown must wait for entity worker cleanup"
+                );
+                thread::yield_now();
+            }
+            let response = receive_test_control_reply(shutdown_reply).expect("shutdown response");
+            assert_eq!(response.kind, DaemonResponseKind::Shutdown);
+            assert!(!crate::daemon::control::entities::plugin_entity_cleanup_pending(&state));
+            assert_eq!(state.budget.outstanding(), baseline);
+            assert_eq!(state.plugin_result_budget.retained_bytes(), 0);
+            daemon.stop();
+            std::fs::remove_dir_all(root).expect("remove entity shutdown test directory");
+        }
+    }
+
+    #[test]
     fn abandoned_plugin_entity_subscriptions_release_owner_capacity() {
         for retire_reason in ["connection_close", "deadline"] {
             let root =
@@ -4641,6 +4826,7 @@ return botster.register({
                 runtime.reap_detached_core_operations();
             }
             match (pending.continuation)(daemon, state) {
+                crate::daemon::control::pending::ControlPoll::Again => continue,
                 crate::daemon::control::pending::ControlPoll::Ready(response) => {
                     break response.expect("attach response");
                 }

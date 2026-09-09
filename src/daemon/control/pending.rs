@@ -32,8 +32,10 @@ pub(crate) const READY_BACKGROUND: ReadyReasons = ReadyReasons::from_bits(1 << 5
 
 /// Outcome of one continuation poll.
 pub(crate) enum ControlPoll {
-    /// Core has not answered yet.
+    /// The request waits for a completion or another explicit wake.
     Pending,
+    /// This request made partial progress and can continue through the ready queue.
+    Again,
     /// The response is complete.
     Ready(DaemonTransportResult<DaemonResponse>),
     /// Transfer plugin shaping and delivery to the existing host executor.
@@ -549,12 +551,17 @@ pub(crate) fn poll_ready_request_item(
         || reasons.contains(READY_CORE_COMPLETION)
         || reasons.contains(READY_PLUGIN_COMPLETION)
         || reasons.contains(READY_HOST_COMPLETION);
+    let mut again = false;
     if has_completion {
         state.current_waiter_id = Some(waiter_id);
         let poll = (entry.continuation)(daemon, state);
         state.current_waiter_id = None;
         let reply = match poll {
             ControlPoll::Pending => None,
+            ControlPoll::Again => {
+                again = true;
+                None
+            }
             ControlPoll::Ready(response) => Some(ControlReply::plain(response)),
             ControlPoll::PreparePluginResponse(input, permit) => {
                 crate::daemon::control::plugins::submit_response(
@@ -599,6 +606,14 @@ pub(crate) fn poll_ready_request_item(
         }
     }
     state.pending_requests.insert(waiter_id, entry);
+    if again {
+        mark_owner_ready(
+            state,
+            waiter_id,
+            ReadyClass::HostCompletion,
+            READY_HOST_COMPLETION,
+        );
+    }
     false
 }
 
