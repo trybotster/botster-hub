@@ -132,6 +132,8 @@ pub(crate) enum ControlMessage {
     PluginCompletionPublished,
     /// A host job completed or released bounded executor capacity.
     HostProgressPublished,
+    /// The causal table published queue capacity or a mutex release.
+    CausalProgressPublished,
     /// A Lua worker queued one managed worktree and session spawn operation.
     ManagedSessionSpawnQueued,
     LocalWebrtcPeerClosed {

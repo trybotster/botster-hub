@@ -566,6 +566,7 @@ impl SessionTypeCatalogCache {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
             HostResult::PluginEntity(_)
+            | HostResult::FamilyCleanupComplete { .. }
             | HostResult::EventOwner(_)
             | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned
@@ -629,6 +630,7 @@ impl SessionTypeCatalogCache {
                 self.failure = Some((generation, error));
             }
             HostResult::PluginEntity(_)
+            | HostResult::FamilyCleanupComplete { .. }
             | HostResult::EventOwner(_)
             | HostResult::EntrypointsStopped
             | HostResult::PluginResponseAbandoned

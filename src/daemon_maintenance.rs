@@ -1301,7 +1301,7 @@ fn queue_event_retirement(state: &mut MaintenanceState, flight: EventDeliveryFli
 fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     flush_pending_event_retirements(runtime, state);
     runtime.apply_causal_owner_ops();
-    if runtime.causal_owner_ops_pending() {
+    if runtime.causal_owner_ops_ready() {
         state.wakes.mark_all();
     }
     let woke = runtime.package_event_router().take_delivery_wake();
@@ -1416,7 +1416,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
     }
     if runtime.package_event_router().peek_delivery_wake()
         || !state.event_in_flight.is_empty()
-        || runtime.causal_owner_ops_pending()
+        || runtime.causal_owner_ops_ready()
     {
         state.wakes.mark_all();
     }

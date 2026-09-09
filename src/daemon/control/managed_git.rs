@@ -83,6 +83,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
                 Some(submit_error_message(failure.error).to_string())
             }
             HostRecoveryRequired::Package(_)
+            | HostRecoveryRequired::PackageFamilyWork { .. }
             | HostRecoveryRequired::PackageEvents { .. }
             | HostRecoveryRequired::PackageFamilies { .. } => None,
         })

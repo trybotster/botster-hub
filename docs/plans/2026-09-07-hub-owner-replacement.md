@@ -702,3 +702,48 @@ A regression test verifies that cleanup removes only the old queue item and leas
 The newer item and lease use the same family, causal scope, and mutation sequence. Both survive cleanup.
 All 26 runtime module tests passed. All 20 queue module tests passed after the indexed lookup change.
 The source reviewer closed the queue integration findings. The remaining cleanup work is still open.
+
+
+## 13. Retained family cleanup, 2026-09-08
+
+The package operation now retains one cleanup cursor and its original Host permit.
+The cursor detaches one old family from the live map. Cleanup never reinserts retired state.
+The cursor preserves the accepted epoch across every phase and retry.
+Live and queued family lookup use ordered indexes. Cleanup also finds old queue entries without a live family or a declared provider.
+The queue cursor skips all generations of the previous family before it selects the next family.
+
+Each owner phase selects one payload or one causal release. A Host worker destroys each selected payload.
+The owner retains the payload's exact lease until the exact worker phase completes.
+The cursor then attempts release admission. A refused release remains in the cursor and prevents the next payload selection.
+The package result, Host permit, and Owner permit remain owned while release admission waits.
+A stale completion or failed submission enters explicit recovery with the original state and permits.
+Recovery also retains an unexpected completion instead of destroying its result on the owner.
+Synchronous runtime callers drain the same cursor outside the daemon owner. They retain refused releases in the existing direct-call storage.
+Those callers have no admitted Host operation.
+
+An exact family-generation index replaces the scan for releasable resync leases.
+Each resync transition updates that index. Each retry selects one exact family and one lease.
+The causal table now publishes capacity and mutex-release progress through one retained bit and the existing bounded control channel.
+Registration occurs before the admission attempt. A second lock attempt closes the unlock-before-registration race.
+The unlock notice publishes only after both causal guards drop. A full queue refusal does not publish its own wake.
+The owner wakes one registered cleanup per ready item. New notifications preserve the current waiter cursor before another pass starts.
+Maintenance uses causal readiness instead of logical pending work when it decides whether to run again.
+Control completion uses causal readiness for its maintenance wake.
+Shutdown still uses event cleanup ownership to retain unfinished unloads.
+
+The combined Rust 1.97.0 check with tests passed. Eleven causal tests passed, including eight notifier tests.
+Fifteen selected family tests passed. All 30 runtime tests then passed, including the empty poisoned-table readiness test.
+The production package test passed four cases with every other Host slot occupied: normal completion, client disconnect, causal contention, and a stale worker phase.
+The contention case holds the causal inner mutex and fills the pending queue. Cleanup retains both permits while the owner ready queue becomes empty.
+Mutex release resumes cleanup. A stale worker phase instead retains the original release and both permits in recovery.
+The worker test records a different thread identifier after payload destruction and confirms that the original Host slot remains occupied.
+All 73 router tests and all 20 fanout queue tests passed.
+The terminal recovery test also passed with two accepted package requests.
+The readiness review found and corrected three maintenance wake decisions that used logical causal ownership.
+No production wake decision in the four reviewed predicate pairs still uses the ownership predicate.
+The review covered causal table readiness, runtime causal readiness, event owner readiness, and the owner queue readiness split.
+Matched-candidate integration validation remains pending for this section.
+
+Poison latches for the table lifetime. The new family path reports explicit recovery; a daemon restart replaces the table.
+The broader audit of legacy retry callers and fault visibility remains open.
+These tests do not close the remaining owner scheduling, notification, or idle-progress proof requirements outside this family cleanup path.
