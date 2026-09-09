@@ -525,7 +525,9 @@ impl SessionTypeCatalogCache {
                     "host_executor_full",
                     "host executor queue refused a reserved catalog build",
                 ),
-                HostSubmitError::Stopped | HostSubmitError::PhaseExhausted => (
+                HostSubmitError::Stopped
+                | HostSubmitError::PhaseExhausted
+                | HostSubmitError::WrongExecutor => (
                     "host_executor_stopped",
                     "host executor is unavailable for the catalog build",
                 ),

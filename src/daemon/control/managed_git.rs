@@ -835,6 +835,9 @@ fn timeout_error() -> ManagedGitError {
 
 fn submit_error_message(error: HostSubmitError) -> &'static str {
     match error {
+        HostSubmitError::WrongExecutor => {
+            "the managed Git phase used a permit from another executor"
+        }
         HostSubmitError::Full => "the bounded host queue refused a reserved managed Git phase",
         HostSubmitError::Stopped => "the host executor stopped during managed Git work",
         HostSubmitError::PhaseExhausted => "the managed Git host phase identity is exhausted",
