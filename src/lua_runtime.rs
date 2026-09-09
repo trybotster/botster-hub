@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -78,6 +78,7 @@ pub struct HubEntityPublishBridge {
     orphan_ops: Arc<Mutex<VecDeque<CausalOp>>>,
     held_release: Arc<Mutex<Option<CausalOp>>>,
     source_release: Arc<Mutex<Option<CausalOp>>>,
+    release_count: Arc<AtomicUsize>,
     next_token: Arc<AtomicU64>,
     reject_next: Arc<AtomicBool>,
 }
@@ -92,6 +93,7 @@ impl HubEntityPublishBridge {
             orphan_ops: Arc::new(Mutex::new(VecDeque::new())),
             held_release: Arc::new(Mutex::new(None)),
             source_release: Arc::new(Mutex::new(None)),
+            release_count: Arc::new(AtomicUsize::new(0)),
             next_token: Arc::new(AtomicU64::new(1)),
             reject_next: Arc::new(AtomicBool::new(false)),
         }
@@ -102,12 +104,14 @@ impl HubEntityPublishBridge {
             && orphans.len() < CAUSAL_PENDING_MAX
         {
             orphans.push_back(op);
+            self.release_count.fetch_add(1, Ordering::Release);
             return CausalAdmitResult::Applied;
         }
         if let Ok(mut held) = self.held_release.try_lock()
             && held.is_none()
         {
             *held = Some(op);
+            self.release_count.fetch_add(1, Ordering::Release);
             return CausalAdmitResult::Applied;
         }
         CausalAdmitResult::Retry(op)
@@ -118,16 +122,18 @@ impl HubEntityPublishBridge {
             && source.is_none()
         {
             *source = Some(op);
+            self.release_count.fetch_add(1, Ordering::Release);
             return CausalAdmitResult::Applied;
         }
         CausalAdmitResult::Retry(op)
     }
 
     pub fn take_source(&self) -> Option<CausalOp> {
-        self.source_release
-            .try_lock()
-            .ok()
-            .and_then(|mut source| source.take())
+        self.source_release.try_lock().ok().and_then(|mut source| {
+            let op = source.take()?;
+            self.release_count.fetch_sub(1, Ordering::Release);
+            Some(op)
+        })
     }
 
     #[doc(hidden)]
@@ -148,12 +154,14 @@ impl HubEntityPublishBridge {
             && pending.len() < CAUSAL_PENDING_MAX
         {
             pending.push_back(op);
+            self.release_count.fetch_add(1, Ordering::Release);
             return CausalAdmitResult::Applied;
         }
         if let Ok(mut scopes) = self.scope_releases.try_lock()
             && scopes.len() < CAUSAL_PENDING_MAX
         {
             scopes.push_back(op);
+            self.release_count.fetch_add(1, Ordering::Release);
             return CausalAdmitResult::Applied;
         }
         CausalAdmitResult::Retry(op)
@@ -163,21 +171,25 @@ impl HubEntityPublishBridge {
         if let Ok(mut pending) = self.pending_releases.try_lock()
             && let Some(op) = pending.pop_front()
         {
+            self.release_count.fetch_sub(1, Ordering::Release);
             return Some(op);
         }
         if let Ok(mut scopes) = self.scope_releases.try_lock()
             && let Some(op) = scopes.pop_front()
         {
+            self.release_count.fetch_sub(1, Ordering::Release);
             return Some(op);
         }
         if let Ok(mut orphans) = self.orphan_ops.try_lock()
             && let Some(op) = orphans.pop_front()
         {
+            self.release_count.fetch_sub(1, Ordering::Release);
             return Some(op);
         }
         if let Ok(mut held) = self.held_release.try_lock()
             && let Some(op) = held.take()
         {
+            self.release_count.fetch_sub(1, Ordering::Release);
             return Some(op);
         }
         self.take_source()
@@ -185,32 +197,7 @@ impl HubEntityPublishBridge {
 
     #[must_use]
     pub fn release_count(&self) -> usize {
-        let queued = self
-            .pending_releases
-            .try_lock()
-            .map(|pending| pending.len())
-            .unwrap_or(0);
-        let scoped = self
-            .scope_releases
-            .try_lock()
-            .map(|scopes| scopes.len())
-            .unwrap_or(0);
-        let orphans = self
-            .orphan_ops
-            .try_lock()
-            .map(|pending| pending.len())
-            .unwrap_or(0);
-        let held = self
-            .held_release
-            .try_lock()
-            .map(|held| usize::from(held.is_some()))
-            .unwrap_or(0);
-        let source = self
-            .source_release
-            .try_lock()
-            .map(|source| usize::from(source.is_some()))
-            .unwrap_or(0);
-        queued + scoped + orphans + held + source
+        self.release_count.load(Ordering::Acquire)
     }
 
     #[must_use]
@@ -2021,6 +2008,57 @@ fn sanitize_lua_error(error: mlua::Error) -> String {
         .next()
         .unwrap_or("lua runtime error")
         .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod release_readiness_tests {
+    use super::*;
+    use crate::package_event_router::LeaseIdentity;
+
+    fn release() -> CausalOp {
+        CausalOp::Release {
+            scope_id: 1,
+            identity: LeaseIdentity::PendingEntityPublish {
+                plugin_key: "producer".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn retained_releases_remain_visible_when_every_store_is_locked() {
+        let bridge = HubEntityPublishBridge::new();
+        for _ in 0..(CAUSAL_PENDING_MAX * 2) {
+            assert_eq!(bridge.park_release(release()), CausalAdmitResult::Applied);
+        }
+        for _ in 0..=CAUSAL_PENDING_MAX {
+            assert_eq!(bridge.mark_orphan(release()), CausalAdmitResult::Applied);
+        }
+        assert_eq!(bridge.leave_source(release()), CausalAdmitResult::Applied);
+        let expected = CAUSAL_PENDING_MAX * 3 + 2;
+        {
+            let _pending = bridge.pending_releases.lock().unwrap();
+            let _scopes = bridge.scope_releases.lock().unwrap();
+            let _orphans = bridge.orphan_ops.lock().unwrap();
+            let _held = bridge.held_release.lock().unwrap();
+            let _source = bridge.source_release.lock().unwrap();
+            assert!(bridge.has_pending_releases());
+            assert_eq!(bridge.release_count(), expected);
+            assert!(bridge.take_release().is_none());
+            assert_eq!(bridge.release_count(), expected);
+            assert!(matches!(
+                bridge.park_release(release()),
+                CausalAdmitResult::Retry(_)
+            ));
+            assert_eq!(bridge.release_count(), expected);
+        }
+        assert!(bridge.take_source().is_some());
+        for remaining in (0..expected - 1).rev() {
+            assert!(bridge.take_release().is_some());
+            assert_eq!(bridge.release_count(), remaining);
+        }
+        assert!(!bridge.has_pending_releases());
+        assert!(bridge.take_release().is_none());
+    }
 }
 
 #[cfg(test)]
