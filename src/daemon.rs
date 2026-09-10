@@ -92,11 +92,13 @@ pub struct HubDaemon {
     local_webrtc: LocalWebrtcTransport,
     runtime: Option<HubRuntime>,
     lifecycle_state: HubDaemonState,
+    installation_home: Option<std::path::PathBuf>,
 }
 
 impl HubDaemon {
     /// Start the local daemon from explicit, already-validated hub config.
     pub fn start(config: HubConfig) -> HubDaemonResult<Self> {
+        let installation_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let maximum_completion_bytes = config.plugin_worker_config().completion_queue_byte_capacity;
         validate_plugin_result_capacity(maximum_completion_bytes)?;
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
@@ -130,6 +132,7 @@ impl HubDaemon {
             local_webrtc: LocalWebrtcTransport::default(),
             runtime: Some(runtime),
             lifecycle_state: HubDaemonState::Running,
+            installation_home,
         })
     }
 
@@ -205,22 +208,69 @@ impl HubDaemon {
         &mut self.local_webrtc
     }
 
+    /// Status uses the installation home captured at daemon startup.
+    pub(crate) fn installation_home(&self) -> Option<&std::path::Path> {
+        self.installation_home.as_deref()
+    }
+
+    pub(crate) fn installation_home_bytes(&self, limit: usize) -> Option<usize> {
+        let bytes = std::mem::size_of::<Option<std::path::PathBuf>>().checked_add(
+            self.installation_home()
+                .map_or(0, |home| home.as_os_str().len()),
+        )?;
+        (bytes <= limit).then_some(bytes)
+    }
+
+    pub(crate) fn bounded_installation_home(
+        &self,
+        limit: usize,
+    ) -> Option<(Option<std::path::PathBuf>, usize)> {
+        let bytes = self.installation_home_bytes(limit)?;
+        Some((self.installation_home.clone(), bytes))
+    }
+
+    /// Count the snapshot's logical storage before copying source fields.
+    pub(crate) fn status_bytes(&self, limit: usize) -> Option<usize> {
+        let (recovered, stale) = self.runtime.as_ref().map_or((&[][..], &[][..]), |runtime| {
+            let reconciliation = runtime.reconciliation();
+            (
+                reconciliation.recovered_sessions.as_slice(),
+                reconciliation.stale_sessions.as_slice(),
+            )
+        });
+        status_snapshot_bytes(
+            &self.config.host.id,
+            &self.config.host.display_name,
+            recovered,
+            stale,
+            limit,
+        )
+    }
+
+    pub(crate) fn bounded_status(&self, limit: usize) -> Option<(HubDaemonStatus, usize)> {
+        let bytes = self.status_bytes(limit)?;
+        Some((self.status(), bytes))
+    }
+
     /// Return deterministic lifecycle status without exposing local paths.
     #[must_use]
     pub fn status(&self) -> HubDaemonStatus {
-        let packages = self.package_registry.packages();
-        let provider_count = packages
-            .iter()
-            .filter(|record| matches!(record.classification, PackageClassification::Provider))
-            .count();
-        let enabled_provider_count = packages
-            .iter()
-            .filter(|record| {
-                matches!(record.classification, PackageClassification::Provider)
-                    && matches!(record.state, PackageState::Enabled)
-            })
-            .count();
-        let enabled_package_count = packages.iter().filter(|record| record.is_enabled()).count();
+        let packages = self.package_registry.package_records();
+        let package_count = packages.len();
+        let mut provider_count = 0;
+        let mut enabled_provider_count = 0;
+        let mut enabled_package_count = 0;
+        for record in packages {
+            if matches!(record.classification, PackageClassification::Provider) {
+                provider_count += 1;
+                if matches!(record.state, PackageState::Enabled) {
+                    enabled_provider_count += 1;
+                }
+            }
+            if record.is_enabled() {
+                enabled_package_count += 1;
+            }
+        }
         let (recovered_sessions, stale_sessions) = self
             .runtime
             .as_ref()
@@ -240,7 +290,7 @@ impl HubDaemon {
             data_dir_configured: true,
             core_initialized: self.runtime.is_some(),
             state_source: self.state_source,
-            package_count: packages.len(),
+            package_count,
             enabled_package_count,
             provider_count,
             enabled_provider_count,
@@ -259,6 +309,35 @@ impl HubDaemon {
         self.lifecycle_state = HubDaemonState::Stopped;
         self.status()
     }
+}
+
+fn status_snapshot_bytes(
+    host_id: &str,
+    display_name: &str,
+    recovered: &[SessionId],
+    stale: &[SessionId],
+    limit: usize,
+) -> Option<usize> {
+    let mut bytes = std::mem::size_of::<HubDaemonStatus>();
+    for length in [host_id.len(), display_name.len()] {
+        bytes = bytes.checked_add(length)?;
+        if bytes > limit {
+            return None;
+        }
+    }
+    for rows in [recovered, stale] {
+        bytes = bytes.checked_add(rows.len().checked_mul(std::mem::size_of::<SessionId>())?)?;
+        if bytes > limit {
+            return None;
+        }
+        for row in rows {
+            bytes = bytes.checked_add(row.0.len())?;
+            if bytes > limit {
+                return None;
+            }
+        }
+    }
+    Some(bytes)
 }
 
 fn validate_plugin_result_capacity(maximum_completion_bytes: usize) -> HubDaemonResult<()> {
@@ -410,6 +489,58 @@ pub type HubDaemonResult<T> = Result<T, HubDaemonError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_snapshot_preflight_counts_both_reconciliation_vectors_before_copy() {
+        let recovered = vec![SessionId("recovered".into()), SessionId("second".into())];
+        let mut stale = vec![SessionId("stale".into())];
+        let bytes = std::mem::size_of::<HubDaemonStatus>()
+            + "hostdisplay".len()
+            + 3 * std::mem::size_of::<SessionId>()
+            + "recoveredsecondstale".len();
+        assert_eq!(
+            status_snapshot_bytes("host", "display", &recovered, &stale, bytes),
+            Some(bytes)
+        );
+        assert_eq!(
+            status_snapshot_bytes("host", "display", &recovered, &stale, bytes - 1),
+            None
+        );
+        stale[0].0.push('x');
+        assert_eq!(
+            status_snapshot_bytes("host", "display", &recovered, &stale, bytes),
+            None
+        );
+        assert_eq!(
+            status_snapshot_bytes("", "", &[], &[], std::mem::size_of::<HubDaemonStatus>() - 1),
+            None
+        );
+    }
+
+    #[test]
+    fn status_installation_home_preflight_preserves_missing_empty_and_native_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let config = shared_state_config();
+        let root = config.data_directory.clone();
+        let mut daemon = HubDaemon::start(config).unwrap();
+        for home in [
+            None,
+            Some(std::path::PathBuf::new()),
+            Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                vec![b'/', 0xff, b'x'],
+            ))),
+        ] {
+            daemon.installation_home = home.clone();
+            let bytes = daemon.installation_home_bytes(usize::MAX).unwrap();
+            assert!(daemon.bounded_installation_home(bytes - 1).is_none());
+            let (copy, charged) = daemon.bounded_installation_home(bytes).unwrap();
+            assert_eq!(copy, home);
+            assert_eq!(charged, bytes);
+            assert_eq!(daemon.installation_home(), home.as_deref());
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn shared_state_config() -> HubConfig {
         let data_directory = std::path::PathBuf::from("target")

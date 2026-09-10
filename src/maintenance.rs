@@ -13,11 +13,12 @@
 //! not something checked here.
 
 use std::env;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use botster_hub_client::{
-    DaemonHubUpdate, DaemonHubUpdateState, DaemonInstallationDiagnostic,
+    DaemonCompatibility, DaemonHubUpdate, DaemonHubUpdateState, DaemonInstallationDiagnostic,
     DaemonInstallationIdentity, DaemonInstallationMode, DaemonSoftwareIdentity,
 };
 use botster_hub_installation::{
@@ -26,6 +27,8 @@ use botster_hub_installation::{
 };
 use semver::Version;
 use serde::Deserialize;
+
+use crate::host_executor::HostError;
 
 const PRODUCT_ID: &str = "botster-hub";
 const PRODUCT_NAME: &str = "Botster Hub";
@@ -98,6 +101,335 @@ pub fn embedded_build_revision() -> Option<&'static str> {
 #[must_use]
 pub fn installation_identity() -> DaemonInstallationIdentity {
     resolve_receipt().identity
+}
+
+type StatusIdentity = (
+    DaemonSoftwareIdentity,
+    DaemonInstallationIdentity,
+    DaemonCompatibility,
+    usize,
+);
+
+// Mirrors DaemonCompatibility::current's borrowed feature source. The focused
+// test compares the actual output, so extending that private source requires
+// updating this pre-allocation measure, not silently allocating an uncharged row.
+const STATUS_COMPATIBILITY_FEATURES: &[&str] = &[
+    botster_hub_client::FEATURE_SESSIONS,
+    botster_hub_client::FEATURE_PLUGIN_SURFACE_RENDER,
+    botster_hub_client::FEATURE_PLUGIN_SURFACE_ACTION,
+    botster_hub_client::FEATURE_PACKAGE_ROUTES,
+    botster_hub_client::FEATURE_PACKAGE_NAVIGATION,
+    botster_hub_client::FEATURE_SPAWN_TARGETS,
+    botster_hub_client::FEATURE_WORKTREES,
+    botster_hub_client::FEATURE_TERMINAL_READBACK,
+    botster_hub_client::FEATURE_SESSION_ENTITY_SUBSCRIPTIONS,
+    botster_hub_client::FEATURE_SESSION_TYPE_ENTITY_SUBSCRIPTIONS,
+    botster_hub_client::FEATURE_PLUGIN_ENTITY_SUBSCRIPTIONS,
+    botster_hub_client::FEATURE_HUB_SOURCE_UPDATE,
+    botster_hub_client::FEATURE_UNIX_TERMINAL_ADAPTER,
+    botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED,
+    botster_hub_client::FEATURE_WEBRTC_TERMINAL_ADAPTER,
+    botster_hub_client::FEATURE_ATTACH_OCCUPANCY,
+    botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS,
+];
+
+// Field/struct names from installation/src/receipt.rs:39-100. Serde's generated
+// visitors use these in expected-field and expected-struct messages.
+const STATUS_RECEIPT_SCHEMA_WORDS: &[&str] = &[
+    "schema_version",
+    "product_id",
+    "binary_version",
+    "installation_mode",
+    "release_channel",
+    "provider",
+    "source_url",
+    "build_revision",
+    "artifacts",
+    "source_revisions",
+    "signature",
+    "installer",
+    "name",
+    "sha256",
+    "size",
+    "botster_hub",
+    "botster_core",
+    "algorithm",
+    "key_id",
+    "signed_manifest_sha256",
+    "id",
+    "version",
+    "InstallationReceipt",
+    "ReceiptArtifact",
+    "ReceiptSourceRevisions",
+    "ReceiptSignature",
+    "ReceiptInstaller",
+];
+
+// serde_core 1.0.228 src/de/mod.rs:213-297,403-426 and serde_json 1.0.150
+// src/error.rs:433-480. Count the whole finite vocabulary, plus a separator and
+// quoting allowance for EACH schema word, although one failure uses a subset.
+const STATUS_SERDE_ERROR_WORDING: &[&str] = &[
+    "invalid type: , expected ",
+    "invalid value: , expected ",
+    "invalid length , expected ",
+    "unknown field ``, expected ",
+    "missing field ``",
+    "duplicate field ``",
+    "there are no fields",
+    "one of ",
+    "struct ",
+    " with  elements",
+    "field identifier",
+    "a sequence",
+    "a map",
+    "a string",
+    "u16",
+    "u64",
+    "boolean ``",
+    "integer ``",
+    "floating point ``",
+    "string \"\"",
+    "byte array",
+    "unit value",
+    "Option value",
+    "newtype struct",
+    "sequence",
+    "map",
+    "enum",
+    "unit variant",
+    "newtype variant",
+    "tuple variant",
+    "struct variant",
+    "null",
+    " at line ",
+    " column ",
+];
+
+// Every fixed diagnostic kind/message on the READ/VALIDATE path, from shared
+// installation receipt.rs:114-228,296-299; source.rs:15-47; safety.rs:431-434,
+// 515-519,575-585,603-606,617-644; and this module's missing-HOME/fallback path.
+// Format placeholders remain in the literals; all three finite subject labels
+// are added again below, so expansion of {subject} is conservatively covered.
+const STATUS_RECEIPT_DIAGNOSTIC_WORDING: &[&str] = &[
+    "home_unavailable",
+    "HOME is required to resolve the Hub installation receipt",
+    "managed_receipt",
+    "development_build",
+    "manual_install",
+    "unsupported_receipt_schema",
+    "installation receipt schema is unsupported",
+    "receipt_product_mismatch",
+    "installation receipt names a different product",
+    "receipt_binary_mismatch",
+    "installation receipt does not match the running binary version",
+    "unsupported_installation_mode",
+    "installation receipt mode is unsupported",
+    "unsupported_release_channel",
+    "installation receipt release channel is unsupported",
+    "unsupported_release_provider",
+    "installation receipt provider is unsupported",
+    "malformed_receipt_revision",
+    "installation receipt build revision is not a sanitized value",
+    "receipt_build_revision_mismatch",
+    "installation receipt does not match the running binary build revision",
+    "installation receipt source revisions are not canonical object ids",
+    "unsupported_signature_algorithm",
+    "installation receipt signature algorithm is unsupported",
+    "malformed_receipt_field",
+    "installation receipt signature key id is not a sanitized value",
+    "installation receipt installer identity is not a sanitized value",
+    "malformed_receipt_checksum",
+    "installation receipt signed manifest digest is not a SHA-256 hex digest",
+    "installation receipt artifact checksum is not a SHA-256 hex digest",
+    "unknown_receipt_artifact",
+    "installation receipt must record exactly the known artifacts",
+    "installation receipt artifact names are unrecognized",
+    "malformed_receipt",
+    "installation receipt is not valid supported JSON",
+    "invalid_release_source",
+    "installation release source is not a valid absolute URL",
+    "installation release source has no scheme",
+    "installation release source has no host",
+    "installation release source scheme is unsupported",
+    "insecure_release_source",
+    "installation release source must use HTTPS or loopback HTTP",
+    "receipt_too_large",
+    "installation {subject} exceeds the size limit",
+    "receipt_wrong_owner",
+    "installation {subject} is not owned by the current user",
+    "receipt_world_writable",
+    "installation {subject} must not be world-writable",
+    "receipt_io_error",
+    "installation {subject} path contains an interior NUL",
+    "unsafe_receipt_directory",
+    "installation {subject} must not be a symbolic link",
+    "receipt_symlink",
+    "installation {subject} is not a regular directory",
+    "receipt_not_regular_file",
+    "installation {subject} must be a regular file",
+    "receipt_permission_denied",
+    "installation {subject} could not be accessed",
+    "installation_entry_exists",
+    "installation {subject} already exists",
+    "installation {subject} could not be accessed: {error}",
+];
+
+fn status_identity_error_scratch(receipt_bytes: usize) -> Option<usize> {
+    // Strict serde custom errors can Debug-format one unexpected decoded string.
+    // Six output bytes per input byte covers escapes; static wording is separate.
+    let mut parse_text = receipt_bytes.checked_mul(6)?;
+    for word in STATUS_RECEIPT_SCHEMA_WORDS {
+        parse_text = parse_text
+            .checked_add(word.len())?
+            .checked_add("``, or ".len())?;
+    }
+    for wording in STATUS_SERDE_ERROR_WORDING {
+        parse_text = parse_text.checked_add(wording.len())?;
+    }
+    // Numeric error values and source positions, including the formatter scratch.
+    parse_text = parse_text.checked_add((u128::BITS as usize).checked_mul(4)?)?;
+
+    let subjects = "home directory".len() + "receipt_directory".len() + "receipt".len();
+    let mut public_text = 0usize;
+    for wording in STATUS_RECEIPT_DIAGNOSTIC_WORDING {
+        public_text = public_text
+            .checked_add(wording.len())?
+            .checked_add(subjects)?;
+    }
+    // Rust 1.97 commit 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3:
+    // library/std/src/sys/io/error/unix.rs:146-173 uses a 128-byte strerror_r
+    // buffer, then from_utf8_lossy (at most 3 UTF-8 bytes per source byte).
+    // library/std/src/io/error.rs:695-697 adds this fixed suffix and an i32.
+    // https://github.com/rust-lang/rust/blob/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/sys/io/error/unix.rs
+    // https://github.com/rust-lang/rust/blob/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/io/error.rs
+    let os_buffer = 128usize;
+    let os_text = os_buffer
+        .checked_mul(3)?
+        .checked_add(" (os error )".len())?
+        .checked_add("-2147483648".len())?;
+    // Keep OS detail/formatting, InstallationProblem and its copied public DTO
+    // together conservatively. Custom serde errors map to a fixed diagnostic;
+    // they are not substituted for or conflated with the public wording bound.
+    parse_text
+        .checked_add(public_text.checked_mul(2)?)?
+        .checked_add(os_buffer)?
+        .checked_add(os_text.checked_mul(3)?)
+}
+
+/// Additional peak logical bytes for Status identity preparation. The caller
+/// already owns and charges the borrowed startup HOME; only its CString copy
+/// belongs here. No environment lookup, file read or DTO allocation occurs.
+/// The returned bound includes this helper's result wrapper and intermediates;
+/// callers add it once alongside their independently retained Status seed.
+/// Allocator metadata, spare capacity and map-node padding are excluded.
+pub(crate) fn status_identity_prepared_bytes(home: Option<&Path>, limit: usize) -> Option<usize> {
+    let receipt_limit = usize::try_from(botster_hub_installation::MAX_RECEIPT_BYTES).ok()?;
+    let bytes = status_identity_preparation_bound(
+        home.map_or(0, |home| home.as_os_str().as_encoded_bytes().len()),
+        receipt_limit,
+    )?;
+    (bytes <= limit).then_some(bytes)
+}
+
+fn status_identity_preparation_bound(home_bytes: usize, receipt_bytes: usize) -> Option<usize> {
+    // A complete ReceiptArtifact needs two JSON strings and a u64. Even serde's
+    // shortest struct-sequence representation ["","",0] uses nine input bytes.
+    // Do not assume only the two valid artifacts: validation happens AFTER the
+    // whole vector has parsed. Include one partially constructed artifact and
+    // two copies of typed row storage for visitor/result overlap.
+    let artifact_rows = receipt_bytes
+        .checked_div(b"[\"\",\"\",0]".len())?
+        .checked_add(1)?;
+    let artifact_storage = artifact_rows
+        .checked_mul(size_of::<botster_hub_installation::ReceiptArtifact>())?
+        .checked_mul(2)?;
+    let mut bytes = size_of::<StatusIdentity>()
+        .checked_add(size_of::<ReceiptResolution>())?
+        .checked_add(size_of::<InstallationReceipt>().checked_mul(2)?)?
+        .checked_add(artifact_storage)?;
+    // Reader bytes, all parsed String contents, serde's decoded-string scratch,
+    // URI validation's source copy, and the managed identity's copied fields
+    // are each bounded by the existing receipt byte limit. Parse errors, fixed
+    // public diagnostics and raw-OS formatting have separate source-derived terms.
+    bytes = bytes
+        .checked_add(receipt_bytes.checked_mul(5)?)?
+        .checked_add(status_identity_error_scratch(receipt_bytes)?)?;
+    bytes = bytes
+        .checked_add(home_bytes.checked_add(1)?)?
+        .checked_add(
+            botster_hub_installation::RECEIPT_RELATIVE_PATH
+                .len()
+                .checked_add(3)?,
+        )?
+        .checked_add(size_of::<std::ffi::CString>().checked_mul(4)?)?
+        .checked_add(size_of::<botster_hub_installation::DirectoryHandle>().checked_mul(3)?)?
+        .checked_add(size_of::<botster_hub_installation::FileHandle>())?
+        .checked_add(size_of::<InstallationsDirectory>())?
+        .checked_add(size_of::<libc::stat>().checked_mul(2)?)?
+        .checked_add(size_of::<ureq::http::Uri>())?
+        // http 1.4.1 uri/scheme.rs:84-86 boxes nonstandard Scheme's ByteStr;
+        // byte_str.rs:6-8 wraps exactly one Bytes. The shared source is above.
+        .checked_add(size_of::<bytes::Bytes>())?
+        .checked_add(size_of::<serde_json::Error>())?
+        // serde_json 1.0.150 error.rs:483-491 owns ErrorImpl behind its pointer:
+        // an enum carrying a boxed message plus two usize positions. String is
+        // a conservative enum/message header here; count the owned wrapper too.
+        .checked_add(size_of::<(String, usize, usize)>())?
+        .checked_add(size_of::<std::io::Error>())?
+        .checked_add(size_of::<String>().checked_mul(3)?)?
+        .checked_add(size_of::<InstallationProblem>())?
+        .checked_add(size_of::<DaemonInstallationDiagnostic>())?
+        .checked_add(size_of::<Vec<u8>>().checked_mul(2)?)?
+        .checked_add(size_of::<Vec<&str>>())?;
+    for text in [
+        PRODUCT_ID,
+        PRODUCT_NAME,
+        env!("CARGO_PKG_VERSION"),
+        embedded_build_revision().unwrap_or(""),
+        botster_hub_client::PROTOCOL,
+    ] {
+        bytes = bytes.checked_add(text.len())?;
+    }
+    for feature in STATUS_COMPATIBILITY_FEATURES {
+        bytes = bytes
+            .checked_add(size_of::<&str>())?
+            .checked_add(size_of::<String>())?
+            .checked_add(feature.len())?;
+    }
+    Some(bytes)
+}
+
+/// Prepare all installation/software/compatibility facts on Host only after
+/// their worst-case live overlap fits beside the caller's retained inputs.
+/// Status uses the admitted startup HOME, not a second unbounded env allocation.
+/// Existing update-check and public installation-identity behavior is unchanged.
+pub(crate) fn bounded_status_identity(
+    home: Option<&Path>,
+    limit: usize,
+) -> Result<StatusIdentity, HostError> {
+    let bytes = status_identity_prepared_bytes(home, limit).ok_or_else(|| {
+        HostError::new(
+            "host_result_too_large",
+            "status identity preparation exceeds its prepared-byte reservation",
+        )
+    })?;
+    let software = software_identity();
+    let installation = match home.filter(|home| !home.as_os_str().is_empty()) {
+        Some(home) => resolve_receipt_under_home(home).identity,
+        None => {
+            fallback_resolution(Some(diagnostic(
+                "home_unavailable",
+                "HOME is required to resolve the Hub installation receipt",
+            )))
+            .identity
+        }
+    };
+    Ok((
+        software,
+        installation,
+        DaemonCompatibility::current(),
+        bytes,
+    ))
 }
 
 #[must_use]
@@ -419,6 +751,122 @@ mod tests {
             },
         })
         .expect("serialize valid receipt")
+    }
+
+    #[test]
+    fn status_identity_preflight_exact_fit_short_overflow_and_missing_home() {
+        let bound = status_identity_prepared_bytes(None, usize::MAX).unwrap();
+        assert!(status_identity_prepared_bytes(None, bound - 1).is_none());
+        assert_eq!(
+            bounded_status_identity(None, bound - 1).unwrap_err().code,
+            "host_result_too_large"
+        );
+        let (software, installation, compatibility, admitted) =
+            bounded_status_identity(None, bound).unwrap();
+        assert_eq!(admitted, bound);
+        assert_eq!(software, software_identity());
+        assert_eq!(installation.diagnostics[0].kind, "home_unavailable");
+        assert_eq!(compatibility, DaemonCompatibility::current());
+        assert!(
+            compatibility
+                .features
+                .iter()
+                .map(String::as_str)
+                .eq(STATUS_COMPATIBILITY_FEATURES.iter().copied())
+        );
+        let (_, empty, _, _) = bounded_status_identity(Some(Path::new("")), bound).unwrap();
+        assert_eq!(empty, installation);
+        assert!(status_identity_preparation_bound(usize::MAX, 64 * 1024).is_none());
+        assert!(status_identity_preparation_bound(0, usize::MAX).is_none());
+        assert_eq!(
+            status_identity_prepared_bytes(Some(Path::new("abc")), usize::MAX).unwrap(),
+            bound + 3,
+            "only the copied CString path belongs to this helper; the caller retains the source",
+        );
+    }
+
+    #[test]
+    fn status_identity_preflight_preserves_existing_receipt_max_and_invalid_errors() {
+        let fixture = Fixture::new();
+        let maximum = usize::try_from(botster_hub_installation::MAX_RECEIPT_BYTES).unwrap();
+        let bound = status_identity_prepared_bytes(Some(&fixture.root), usize::MAX).unwrap();
+        let mut receipt = serde_json::to_vec(&valid_receipt()).unwrap();
+        receipt.resize(maximum, b' ');
+        fs::write(&fixture.receipt, &receipt).unwrap();
+        assert_eq!(
+            bounded_status_identity(Some(&fixture.root), bound - 1)
+                .unwrap_err()
+                .code,
+            "host_result_too_large"
+        );
+        let (_, identity, _, admitted) =
+            bounded_status_identity(Some(&fixture.root), bound).unwrap();
+        assert_eq!(admitted, bound);
+        assert_eq!(identity, fixture.resolve().identity);
+        assert_eq!(identity.mode, DaemonInstallationMode::Managed);
+
+        receipt.push(b' ');
+        fs::write(&fixture.receipt, &receipt).unwrap();
+        let (_, oversized, _, _) = bounded_status_identity(Some(&fixture.root), bound).unwrap();
+        assert_eq!(oversized, fixture.resolve().identity);
+        assert_eq!(oversized.diagnostics[0].kind, "receipt_too_large");
+
+        receipt.truncate(maximum);
+        receipt.fill(b' ');
+        receipt[0] = b'{';
+        fs::write(&fixture.receipt, &receipt).unwrap();
+        let (_, invalid, _, _) = bounded_status_identity(Some(&fixture.root), bound).unwrap();
+        assert_eq!(invalid, fixture.resolve().identity);
+        assert_eq!(invalid.diagnostics[0].kind, "malformed_receipt");
+    }
+
+    #[test]
+    fn status_identity_preflight_accounts_for_artifacts_before_schema_validation() {
+        let minimum: ReceiptArtifact = serde_json::from_slice(b"[\"\",\"\",0]").unwrap();
+        assert!(minimum.name.is_empty() && minimum.sha256.is_empty());
+        let fixture = Fixture::new();
+        let maximum = usize::try_from(botster_hub_installation::MAX_RECEIPT_BYTES).unwrap();
+        let mut value = valid_receipt();
+        // The strict schema still parses a whole artifact vector before it can
+        // reject its cardinality; the memory proof must not assume two rows.
+        value["artifacts"] =
+            serde_json::Value::Array(vec![serde_json::json!(["", "", 0]); (maximum - 2048) / 10]);
+        assert!(serde_json::to_vec(&value).unwrap().len() <= maximum);
+        fixture.write(value);
+        let bound = status_identity_prepared_bytes(Some(&fixture.root), usize::MAX).unwrap();
+        let (_, identity, _, _) = bounded_status_identity(Some(&fixture.root), bound).unwrap();
+        assert_eq!(identity, fixture.resolve().identity);
+        assert_eq!(identity.diagnostics[0].kind, "unknown_receipt_artifact");
+    }
+
+    #[test]
+    fn status_identity_preflight_separates_unexpected_string_scratch_from_public_diagnostics() {
+        let fixture = Fixture::new();
+        let maximum = usize::try_from(botster_hub_installation::MAX_RECEIPT_BYTES).unwrap();
+        let mut value = valid_receipt();
+        // A numeric field holding a decoded control-character string exercises
+        // serde's transient Unexpected::Str debug escaping before read_receipt
+        // maps the parse error to its fixed public malformed_receipt diagnostic.
+        value["schema_version"] = serde_json::Value::String("\u{7}".repeat((maximum - 2048) / 6));
+        let encoded = serde_json::to_vec(&value).unwrap();
+        assert!(encoded.len() <= maximum);
+        let parse_error = serde_json::from_slice::<InstallationReceipt>(&encoded).unwrap_err();
+        assert!(parse_error.to_string().len() <= status_identity_error_scratch(maximum).unwrap());
+        fixture.write(value);
+        let bound = status_identity_prepared_bytes(Some(&fixture.root), usize::MAX).unwrap();
+        let (_, identity, _, _) = bounded_status_identity(Some(&fixture.root), bound).unwrap();
+        assert_eq!(identity, fixture.resolve().identity);
+        assert_eq!(identity.diagnostics[0].kind, "malformed_receipt");
+        assert_eq!(
+            identity.diagnostics[0].message,
+            "installation receipt is not valid supported JSON"
+        );
+        for errno in [libc::EIO, libc::ENAMETOOLONG, i32::MIN, i32::MAX] {
+            assert!(
+                std::io::Error::from_raw_os_error(errno).to_string().len()
+                    <= 128 * 3 + " (os error )".len() + "-2147483648".len()
+            );
+        }
     }
 
     #[test]

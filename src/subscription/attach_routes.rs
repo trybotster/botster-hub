@@ -853,14 +853,16 @@ pub(crate) fn live_attach_occupancy_rows(
             row.generation.0,
         );
     }
-    for (session_id, subscription_id) in hub_routes {
-        rows.entry((session_id.clone(), subscription_id.clone()))
-            .or_insert_with(|| {
-                pending
-                    .recorded_generation(session_id, subscription_id)
-                    .map(|generation: TerminalSubscriptionGeneration| generation.0)
-                    .unwrap_or(0)
-            });
+    for route in hub_routes {
+        rows.entry(route.clone()).or_insert_with(|| {
+            pending
+                .streams
+                .streams
+                .get(route)
+                .and_then(|stream| stream.generation)
+                .map(|generation: TerminalSubscriptionGeneration| generation.0)
+                .unwrap_or(0)
+        });
     }
     rows.into_iter()
         .map(
@@ -871,6 +873,67 @@ pub(crate) fn live_attach_occupancy_rows(
             },
         )
         .collect()
+}
+
+/// Peak logical storage created by occupancy capture, before the first clone.
+/// Borrowed routes, inventory and pending registry remain the caller's charge.
+/// Count both source collections without deduplication, covering duplicate-key
+/// insertion temporaries as well as the live union. Count map entries and DTO
+/// rows together, plus both key copies even though conversion moves strings.
+/// Allocator metadata, map-node padding and spare capacity are not logical bytes.
+pub(crate) fn live_attach_occupancy_prepared_bytes(
+    hub_routes: &BTreeSet<(String, String)>,
+    inventory: &[TerminalSubscriptionRecord],
+    limit: usize,
+) -> Option<usize> {
+    let mut bytes = std::mem::size_of::<BTreeMap<(String, String), u64>>()
+        .checked_add(std::mem::size_of::<(Vec<DaemonAttachOccupancy>, usize)>())?;
+    if bytes > limit {
+        return None;
+    }
+    for (session, subscription) in inventory
+        .iter()
+        .map(|row| (row.session_id.0.as_str(), row.subscription_id.0.as_str()))
+        .chain(
+            hub_routes
+                .iter()
+                .map(|(session, subscription)| (session.as_str(), subscription.as_str())),
+        )
+    {
+        bytes = bytes.checked_add(occupancy_row_prepared_bytes(
+            session.len(),
+            subscription.len(),
+        )?)?;
+        if bytes > limit {
+            return None;
+        }
+    }
+    Some(bytes)
+}
+
+fn occupancy_row_prepared_bytes(session_bytes: usize, subscription_bytes: usize) -> Option<usize> {
+    std::mem::size_of::<((String, String), u64)>()
+        .checked_add(std::mem::size_of::<DaemonAttachOccupancy>())?
+        .checked_add(
+            session_bytes
+                .checked_add(subscription_bytes)?
+                .checked_mul(2)?,
+        )
+}
+
+/// Capture only after the borrowed-input peak fits the caller's remaining grant.
+/// The returned scalar is the admitted capture bound, not an allocator census.
+pub(crate) fn try_live_attach_occupancy_rows(
+    hub_routes: &BTreeSet<(String, String)>,
+    inventory: &[TerminalSubscriptionRecord],
+    pending: &PendingRuntimeState,
+    limit: usize,
+) -> Option<(Vec<DaemonAttachOccupancy>, usize)> {
+    let bytes = live_attach_occupancy_prepared_bytes(hub_routes, inventory, limit)?;
+    Some((
+        live_attach_occupancy_rows(hub_routes, inventory, pending),
+        bytes,
+    ))
 }
 
 pub(crate) fn apply_attached_subscription_change(
@@ -1381,6 +1444,94 @@ mod tests {
             }),
             "Core-only occupancy must stay visible: {rows:?}"
         );
+    }
+
+    #[test]
+    fn occupancy_capture_preflight_exact_fit_and_short_preserve_union_generations() {
+        let hub_routes = BTreeSet::from([
+            ("session".to_string(), "hub-only".repeat(128)),
+            ("session".to_string(), "shared".repeat(128)),
+        ]);
+        let mut pending = PendingRuntimeState::default();
+        let hub_only = "hub-only".repeat(128);
+        pending.start_attach(owner(), "session".into(), hub_only.clone());
+        pending.record_generation("session", &hub_only, TerminalSubscriptionGeneration(7));
+        let inventory: Vec<_> = [
+            ("shared".repeat(128), 4),
+            ("core-only".into(), 5),
+            ("shared".repeat(128), 9),
+        ]
+        .into_iter()
+        .map(|(subscription, generation)| TerminalSubscriptionRecord {
+            client_id: ClientId("client".into()),
+            session_id: SessionId("session".into()),
+            subscription_id: SubscriptionId(subscription),
+            generation: TerminalSubscriptionGeneration(generation),
+            adapter_bound: false,
+            capabilities: None,
+        })
+        .collect();
+        let bound =
+            live_attach_occupancy_prepared_bytes(&hub_routes, &inventory, usize::MAX).unwrap();
+        assert!(live_attach_occupancy_prepared_bytes(&hub_routes, &inventory, bound - 1).is_none());
+        assert!(
+            try_live_attach_occupancy_rows(&hub_routes, &inventory, &pending, bound - 1).is_none()
+        );
+        let (rows, admitted) =
+            try_live_attach_occupancy_rows(&hub_routes, &inventory, &pending, bound).unwrap();
+        assert_eq!(admitted, bound);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.subscription_id == hub_only)
+                .unwrap()
+                .generation,
+            7
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.subscription_id == "shared".repeat(128))
+                .unwrap()
+                .generation,
+            9
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.subscription_id == "core-only")
+                .unwrap()
+                .generation,
+            5
+        );
+        assert_eq!(
+            pending.recorded_generation("session", &hub_only),
+            Some(TerminalSubscriptionGeneration(7))
+        );
+        // The admitted bound counts every candidate, including both copies of
+        // the duplicate Core route and the overlap with the Hub route set.
+        let candidates = hub_routes.len() + inventory.len();
+        assert!(
+            bound
+                >= candidates
+                    * (std::mem::size_of::<((String, String), u64)>()
+                        + std::mem::size_of::<DaemonAttachOccupancy>())
+        );
+    }
+
+    #[test]
+    fn occupancy_capture_preflight_checks_empty_wrappers_and_arithmetic_overflow() {
+        let routes = BTreeSet::new();
+        let pending = PendingRuntimeState::default();
+        let bound = live_attach_occupancy_prepared_bytes(&routes, &[], usize::MAX).unwrap();
+        assert!(bound >= std::mem::size_of::<Vec<DaemonAttachOccupancy>>());
+        assert!(try_live_attach_occupancy_rows(&routes, &[], &pending, bound - 1).is_none());
+        assert!(
+            try_live_attach_occupancy_rows(&routes, &[], &pending, bound)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert!(occupancy_row_prepared_bytes(usize::MAX, 1).is_none());
+        assert!(occupancy_row_prepared_bytes(usize::MAX / 2 + 1, 0).is_none());
     }
 
     #[test]

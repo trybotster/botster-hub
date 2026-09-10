@@ -143,12 +143,26 @@ pub(crate) fn handle(
             response_delivery_rx,
         );
     };
-    let observability = DaemonObservability {
-        egress: state.egress_diagnostics.diagnostics(),
-        lifecycle: state.lifecycle_counters.clone(),
-        client_id: client_id.clone(),
-        grant_id: grant_id.clone(),
-        transport_request_id,
+    let observability = if matches!(
+        request,
+        DaemonRequest::Status | DaemonRequest::DaemonShutdown
+    ) {
+        // Status captures diagnostics only after its original Host permit is admitted.
+        DaemonObservability {
+            egress: Vec::new(),
+            lifecycle: Default::default(),
+            client_id: None,
+            grant_id: None,
+            transport_request_id,
+        }
+    } else {
+        DaemonObservability {
+            egress: state.egress_diagnostics.diagnostics(),
+            lifecycle: state.lifecycle_counters.clone(),
+            client_id: client_id.clone(),
+            grant_id: grant_id.clone(),
+            transport_request_id,
+        }
     };
     let must_finish = request_must_finish(&request);
     let completion = OwnerRequestCompletion::from_request(&request);

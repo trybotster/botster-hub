@@ -1,9 +1,11 @@
 //! Status and Shutdown preparation through the existing Host executor.
 //!
-//! Owner seed capture and Core inventory allocation remain accounting dependencies.
+//! All Hub copies share the admitted Host allowance. Core inventory preallocation remains open.
 //! Terminal teardown must transfer retained commands before dropping the control state.
 
-use botster_hub_client::{DaemonCompatibility, DaemonRetentionAccounting};
+use botster_hub_client::{DaemonDiagnostic, DaemonLifecycleCounters, DaemonRetentionAccounting};
+use std::mem::size_of;
+use std::path::PathBuf;
 
 use crate::HubDaemon;
 use crate::daemon::control::DaemonObservability;
@@ -14,7 +16,17 @@ use crate::data_plane::driver::CoreTicketPoll;
 use crate::host_executor::{
     HostCommand, HostJobIdentity, HostResult, HostSubmissionFailure, HostWorkPermit,
 };
-use crate::status_response::{PreparedStatusResponse, StatusResponseInput};
+use crate::status_response::{
+    PreparedStatusResponse, StatusCoreSnapshot, StatusResponseInput, StatusResponseSeed,
+    checked_live_bytes, lifecycle_bytes,
+};
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STATUS_CORE_RESULT_GATE: std::cell::RefCell<Option<(
+        std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
+}
 
 pub(crate) fn handle(
     daemon: &mut HubDaemon,
@@ -37,14 +49,33 @@ pub(crate) fn handle(
     };
     let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
     let policy = runtime.retention_policy();
-    let ticket = runtime.submit_core_for_owner(waiter_id, move |core| {
-        (
-            core.retention_accounting(),
-            (!shutdown).then(|| core.list_terminal_subscriptions()),
-        )
+    let input = capture_seed(
+        daemon,
+        state,
+        observability.transport_request_id.unwrap_or_default(),
+        shutdown,
+        permit.reserved_prepared_bytes(),
+    );
+    let ticket = (!input.rejected).then(|| {
+        let reservation = permit.retain_prepared_reservation();
+        #[cfg(test)]
+        let result_gate = TEST_STATUS_CORE_RESULT_GATE.with(|slot| slot.borrow_mut().take());
+        runtime.submit_core_for_owner(waiter_id, move |core| {
+            // This revision cannot preflight Core inventory allocation.
+            // The closure and its returned value retain the original reservation.
+            let snapshot = StatusCoreSnapshot::new(
+                core.retention_accounting(),
+                (!shutdown).then(|| core.list_terminal_subscriptions()),
+                reservation,
+            );
+            #[cfg(test)]
+            if let Some((entered, release)) = result_gate {
+                let _ = entered.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(5));
+            }
+            snapshot
+        })
     });
-    let initial_count = state.maintenance.projection.rows.len();
-    let counters = runtime.event_plane_counters().clone();
     if shutdown {
         state.shutdown_waiter = Some(waiter_id);
     }
@@ -53,10 +84,8 @@ pub(crate) fn handle(
             waiter_id,
             shutdown,
             policy,
-            ticket: Some(ticket),
-            initial_count,
-            counters,
-            seed: Some((daemon.status(), observability)),
+            ticket,
+            input: Some(input),
             permit: Some(permit),
             prepared: None,
             phase: 0,
@@ -72,15 +101,8 @@ pub(crate) struct StatusContinuation {
     waiter_id: crate::owner_identity::WaiterId,
     shutdown: bool,
     policy: botster_core_daemon::RetentionPolicy,
-    ticket: Option<
-        crate::data_plane::driver::CoreTicket<(
-            botster_core_daemon::RetentionAccounting,
-            Option<Vec<botster_core::TerminalSubscriptionRecord>>,
-        )>,
-    >,
-    initial_count: usize,
-    counters: std::sync::Arc<crate::event_plane_counters::EventPlaneCounters>,
-    seed: Option<(crate::HubDaemonStatus, DaemonObservability)>,
+    ticket: Option<crate::data_plane::driver::CoreTicket<StatusCoreSnapshot>>,
+    input: Option<StatusResponseInput>,
     permit: Option<HostWorkPermit>,
     prepared: Option<PreparedStatusResponse>,
     phase: u64,
@@ -113,7 +135,7 @@ impl StatusContinuation {
             permit,
             model: None,
             payload: Box::new((
-                self.seed.take(),
+                self.input.take(),
                 self.prepared.take(),
                 self.ticket.take(),
                 result,
@@ -132,9 +154,7 @@ impl StatusContinuation {
             shutdown,
             policy,
             ticket,
-            initial_count,
-            counters,
-            seed,
+            input,
             permit,
             prepared,
             phase,
@@ -143,7 +163,6 @@ impl StatusContinuation {
         } = self;
         let waiter_id = *waiter_id;
         let shutdown = *shutdown;
-        let initial_count = *initial_count;
         if let Some(delivery) = delivery {
             return match *delivery {
                 Delivery::Waiting(identity) => poll_delivery(state, identity),
@@ -151,77 +170,65 @@ impl StatusContinuation {
             };
         }
         if *phase == 0 {
-            let (accounting, inventory) = match ticket
-                .as_mut()
-                .expect("Status retains its Core ticket")
-                .poll()
-            {
-                CoreTicketPoll::Pending => return ControlPoll::Pending,
-                CoreTicketPoll::Ready((accounting, inventory)) => (Some(accounting), inventory),
-                CoreTicketPoll::Lost | CoreTicketPoll::Refused if shutdown => (None, None),
-                failure @ (CoreTicketPoll::Lost | CoreTicketPoll::Refused) => {
-                    let response = match failure {
-                        CoreTicketPoll::Lost => {
-                            super::sessions::lost_core("status", "daemon-status")
-                        }
-                        CoreTicketPoll::Refused => {
-                            super::sessions::overloaded_core("status", "daemon-status")
-                        }
-                        _ => unreachable!("matched Core failure"),
-                    };
-                    // The seed still requires worker disposal on this error path.
-                    let (status, observability) = seed.take().expect("status seed exists");
-                    let input = capture_input(
-                        daemon,
-                        state,
-                        status,
-                        observability,
-                        counters.clone(),
-                        None,
-                        Vec::new(),
-                        false,
-                        initial_count,
-                    );
-                    let permit = permit.take().expect("status retains its slot");
-                    if let Err(failure) = permit.dispose(
-                        HostJobIdentity {
-                            waiter_id,
-                            phase: 1,
-                        },
-                        HostCommand::PrepareStatusResponse(input),
-                    ) {
-                        return super::host_work::retain_submission(state, failure);
+            let retained = input.as_mut().expect("Status retains its admitted input");
+            if !retained.rejected {
+                match ticket
+                    .as_mut()
+                    .expect("Status retains its Core ticket")
+                    .poll()
+                {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Ready(core) => {
+                        let accounting = &core.accounting;
+                        retained
+                            .seed
+                            .as_mut()
+                            .expect("Status retained its seed")
+                            .retention = Some(DaemonRetentionAccounting {
+                            max_object_bytes: policy.max_object_bytes as u64,
+                            max_total_bytes: policy.max_total_bytes as u64,
+                            max_sessions: u32::try_from(policy.max_sessions).unwrap_or(u32::MAX),
+                            total_bytes: accounting.total_bytes as u64,
+                            sessions: u32::try_from(accounting.sessions).unwrap_or(u32::MAX),
+                            evictions: accounting.evictions,
+                        });
+                        retained.core = Some(core);
                     }
-                    return ControlPoll::Ready(Ok(response));
+                    CoreTicketPoll::Lost | CoreTicketPoll::Refused if shutdown => {}
+                    failure @ (CoreTicketPoll::Lost | CoreTicketPoll::Refused) => {
+                        let response = match failure {
+                            CoreTicketPoll::Lost => {
+                                super::sessions::lost_core("status", "daemon-status")
+                            }
+                            CoreTicketPoll::Refused => {
+                                super::sessions::overloaded_core("status", "daemon-status")
+                            }
+                            _ => unreachable!("matched Core failure"),
+                        };
+                        // Host destroys the retained input before its original reservation ends.
+                        let permit = permit.take().expect("Status retains its slot");
+                        if let Err(failure) = permit.dispose(
+                            HostJobIdentity {
+                                waiter_id,
+                                phase: 1,
+                            },
+                            HostCommand::PrepareStatusResponse(
+                                input.take().expect("Status retains its input"),
+                            ),
+                        ) {
+                            return super::host_work::retain_submission(state, failure);
+                        }
+                        return ControlPoll::Ready(Ok(response));
+                    }
                 }
-            };
-            let retention = accounting.map(|accounting| DaemonRetentionAccounting {
-                max_object_bytes: policy.max_object_bytes as u64,
-                max_total_bytes: policy.max_total_bytes as u64,
-                max_sessions: u32::try_from(policy.max_sessions).unwrap_or(u32::MAX),
-                total_bytes: accounting.total_bytes as u64,
-                sessions: u32::try_from(accounting.sessions).unwrap_or(u32::MAX),
-                evictions: accounting.evictions,
-            });
-            let occupancy = inventory.map_or_else(Vec::new, |inventory| {
-                crate::subscription::attach_routes::live_attach_occupancy_rows(
-                    &state.pending_runtime.live_attach_routes,
-                    &inventory,
-                    &state.pending_runtime,
-                )
-            });
-            let (status, observability) = seed.take().expect("status seed exists");
-            let input = capture_input(
-                daemon,
-                state,
-                status,
-                observability,
-                counters.clone(),
-                retention,
-                occupancy,
-                shutdown,
-                initial_count,
-            );
+                let limit = permit
+                    .as_ref()
+                    .expect("Status retains its slot")
+                    .reserved_prepared_bytes();
+                if capture_current_sources(daemon, state, retained, limit).is_none() {
+                    retained.rejected = true;
+                }
+            }
             *phase = 1;
             return submit(
                 daemon,
@@ -230,8 +237,8 @@ impl StatusContinuation {
                     waiter_id,
                     phase: *phase,
                 },
-                HostCommand::PrepareStatusResponse(input),
-                permit.take().expect("status retains its slot"),
+                HostCommand::PrepareStatusResponse(input.take().expect("Status retains its input")),
+                permit.take().expect("Status retains its slot"),
             );
         }
         if let Some(completion) = state.host_completions.remove(&waiter_id) {
@@ -312,46 +319,129 @@ impl StatusContinuation {
     }
 }
 
-fn capture_input(
-    daemon: &mut HubDaemon,
+fn seed_preflight(
+    daemon: &HubDaemon,
     state: &DaemonControlState,
-    status: crate::HubDaemonStatus,
-    observability: DaemonObservability,
-    counters: std::sync::Arc<crate::event_plane_counters::EventPlaneCounters>,
-    retention: Option<DaemonRetentionAccounting>,
-    occupancy: Vec<botster_hub_client::DaemonAttachOccupancy>,
+    request_id: &str,
     shutdown: bool,
-    initial_count: usize,
+    limit: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let status = daemon.status_bytes(limit)?;
+    let egress = if shutdown {
+        size_of::<Vec<DaemonDiagnostic>>()
+    } else {
+        state.egress_diagnostics.diagnostics_bytes(limit)?
+    };
+    let lifecycle = lifecycle_bytes(&state.lifecycle_counters, limit)?;
+    let home = daemon.installation_home_bytes(limit)?;
+    checked_live_bytes(
+        limit,
+        [
+            size_of::<StatusResponseInput>(),
+            request_id.len(),
+            status.checked_sub(size_of::<crate::HubDaemonStatus>())?,
+            egress.checked_sub(size_of::<Vec<DaemonDiagnostic>>())?,
+            lifecycle.checked_sub(size_of::<DaemonLifecycleCounters>())?,
+            home.checked_sub(size_of::<Option<PathBuf>>())?,
+        ],
+    )?;
+    Some((status, egress, lifecycle, home))
+}
+
+fn capture_seed(
+    daemon: &HubDaemon,
+    state: &DaemonControlState,
+    request_id: String,
+    shutdown: bool,
+    limit: usize,
 ) -> StatusResponseInput {
-    StatusResponseInput {
+    let mut input = StatusResponseInput {
         #[cfg(test)]
         drop_probe: None,
-        status,
-        session_count: if shutdown {
-            initial_count
-        } else {
-            state.maintenance.projection.rows.len()
-        },
-        egress: if shutdown {
-            Vec::new()
-        } else {
-            observability.egress
-        },
-        lifecycle: observability.lifecycle,
-        software: crate::maintenance::software_identity(),
-        installation: crate::maintenance::installation_identity(),
-        compatibility: DaemonCompatibility::current(),
-        counters,
-        retention,
-        occupancy,
-        terminal_records: if shutdown {
-            Vec::new()
-        } else {
-            daemon.local_webrtc().terminal_records()
-        },
-        request_id: observability.transport_request_id.unwrap_or_default(),
+        #[cfg(test)]
+        capture_observer: None,
+        seed: None,
+        core: None,
+        request_id,
         shutdown,
+        rejected: false,
+    };
+    let Some((status_bytes, egress_bytes, lifecycle_bound, home_bytes)) =
+        seed_preflight(daemon, state, &input.request_id, shutdown, limit)
+    else {
+        input.rejected = true;
+        return input;
+    };
+    // These sources cannot mutate between preflight and capture in this Owner slice.
+    let (status, _) = daemon
+        .bounded_status(status_bytes)
+        .expect("the preflighted status is unchanged");
+    let (egress, _) = if shutdown {
+        (Vec::new(), egress_bytes)
+    } else {
+        state
+            .egress_diagnostics
+            .bounded_diagnostics(egress_bytes)
+            .expect("the preflighted diagnostics are unchanged")
+    };
+    assert!(lifecycle_bytes(&state.lifecycle_counters, lifecycle_bound).is_some());
+    let (installation_home, _) = daemon
+        .bounded_installation_home(home_bytes)
+        .expect("the startup installation home is unchanged");
+    input.seed = Some(StatusResponseSeed {
+        status,
+        session_count: state.maintenance.projection.rows.len(),
+        egress,
+        lifecycle: state.lifecycle_counters.clone(),
+        installation_home,
+        counters: daemon
+            .runtime()
+            .expect("the admitted daemon is running")
+            .event_plane_counters()
+            .clone(),
+        retention: None,
+        occupancy: Vec::new(),
+        terminal_records: Vec::new(),
+    });
+    input
+}
+
+/// Recheck current sources after the Core wait before allocating either copy.
+fn capture_current_sources(
+    daemon: &mut HubDaemon,
+    state: &DaemonControlState,
+    input: &mut StatusResponseInput,
+    limit: usize,
+) -> Option<()> {
+    let live = input.logical_bytes(limit)?;
+    if input.shutdown {
+        return Some(());
     }
+    let inventory = input.core.as_ref()?.inventory.as_deref()?;
+    let remaining = limit.checked_sub(live)?;
+    let occupancy_bound = crate::subscription::attach_routes::live_attach_occupancy_prepared_bytes(
+        &state.pending_runtime.live_attach_routes,
+        inventory,
+        remaining,
+    )?;
+    let terminal_bound = daemon.local_webrtc().terminal_records_bytes(remaining)?;
+    // Both construction bounds overlap the retained seed and returned Core inventory.
+    checked_live_bytes(limit, [live, occupancy_bound, terminal_bound])?;
+    let (occupancy, _) = crate::subscription::attach_routes::try_live_attach_occupancy_rows(
+        &state.pending_runtime.live_attach_routes,
+        inventory,
+        &state.pending_runtime,
+        occupancy_bound,
+    )?;
+    let (terminal_records, _) = daemon
+        .local_webrtc()
+        .bounded_terminal_records(terminal_bound)
+        .expect("the preflighted terminal records are unchanged in this Owner slice");
+    let seed = input.seed.as_mut()?;
+    seed.session_count = state.maintenance.projection.rows.len();
+    seed.occupancy = occupancy;
+    seed.terminal_records = terminal_records;
+    Some(())
 }
 
 fn submit(
@@ -492,19 +582,460 @@ mod tests {
     use crate::host_executor::{HOST_OPERATION_CAPACITY, HOST_PREPARED_BYTE_CAPACITY};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    fn test_daemon(name: &str) -> (HubDaemon, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "botster-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let config = crate::HubStartupOptions {
+            data_directory: crate::DataDirectoryOption::Explicit(directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        (HubDaemon::start(config).unwrap(), directory)
+    }
+
+    fn dispatch_status_for_test(
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+    ) -> crate::daemon::control::message::ControlReplyReceiver {
+        let transport = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (control_tx, _) =
+            tokio::sync::mpsc::channel(crate::admission::budgets::DAEMON_CONTROL_QUEUE_CAPACITY);
+        let (reply_tx, reply_rx) = control_reply_channel();
+        assert!(!super::super::request::handle(
+            daemon,
+            state,
+            transport.handle(),
+            control_tx,
+            ControlMessage::Request {
+                request: Box::new(botster_hub_client::DaemonRequest::Status),
+                transport_request_id: Some("41".into()),
+                reply_tx,
+                response_delivery_rx: None,
+                grant_id: None,
+                client_id: None,
+                enqueued_at: Instant::now(),
+            },
+        ));
+        reply_rx
+    }
+
+    #[test]
+    fn status_dispatch_rechecks_grown_sources_after_core_before_aggregate_copy() {
+        use crate::transport::webrtc::peer::{
+            LocalWebrtcChannelTerminalSignal, LocalWebrtcCleanupDisposition,
+            LocalWebrtcSenderTerminalRecord, LocalWebrtcTerminalCause,
+        };
+        let (mut daemon, directory) = test_daemon("status-dispatch-growth");
+        let mut state = DaemonControlState::default();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let mut blocker = daemon.runtime().unwrap().submit_core(move |_| {
+            let _ = entered.send(());
+            let _ = gate.recv_timeout(Duration::from_secs(5));
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let reply = dispatch_status_for_test(&mut daemon, &mut state);
+        let (observed, observation) = std::sync::mpsc::channel();
+        let entry = state.pending_requests.values_mut().next().unwrap();
+        let super::super::pending::ControlContinuation::Status(continuation) =
+            &mut entry.continuation
+        else {
+            panic!("Status continuation");
+        };
+        let input = continuation.input.as_mut().unwrap();
+        input.capture_observer = Some(observed);
+        let live = input.logical_bytes(HOST_PREPARED_BYTE_CAPACITY).unwrap();
+        assert!(!input.rejected);
+        assert!(input.seed.as_ref().unwrap().occupancy.is_empty());
+        assert!(matches!(
+            continuation.ticket.as_mut().unwrap().poll(),
+            CoreTicketPoll::Pending
+        ));
+        daemon
+            .local_webrtc()
+            .retain_terminal_record(LocalWebrtcSenderTerminalRecord {
+                schema_version: 1,
+                grant_id: "grown-peer".into(),
+                request_operation: "status".into(),
+                message_id: Some("grown-message".into()),
+                next_chunk_index: 1,
+                last_sent_chunk_index: Some(0),
+                total_chunks: 2,
+                pressured: true,
+                peer_connection_state: "failed".into(),
+                channel_terminal_signal: LocalWebrtcChannelTerminalSignal::OnClose,
+                cause: LocalWebrtcTerminalCause::PeerFailed,
+                cleanup_disposition: LocalWebrtcCleanupDisposition::NewlySent,
+            })
+            .unwrap();
+        let remaining = HOST_PREPARED_BYTE_CAPACITY - live;
+        let peer_bytes = daemon
+            .local_webrtc()
+            .terminal_records_bytes(remaining)
+            .unwrap();
+        state
+            .pending_runtime
+            .live_attach_routes
+            .insert((String::new(), String::new()));
+        let row_base = crate::subscription::attach_routes::live_attach_occupancy_prepared_bytes(
+            &state.pending_runtime.live_attach_routes,
+            &[],
+            remaining,
+        )
+        .unwrap();
+        state.pending_runtime.live_attach_routes.clear();
+        let key_bytes = (remaining - row_base - peer_bytes / 2) / 2;
+        state
+            .pending_runtime
+            .live_attach_routes
+            .insert(("s".repeat(key_bytes), String::new()));
+        let occupancy_bytes =
+            crate::subscription::attach_routes::live_attach_occupancy_prepared_bytes(
+                &state.pending_runtime.live_attach_routes,
+                &[],
+                remaining,
+            )
+            .unwrap();
+        assert!(
+            checked_live_bytes(
+                HOST_PREPARED_BYTE_CAPACITY,
+                [live, occupancy_bytes, peer_bytes]
+            )
+            .is_none()
+        );
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.pending_requests.is_empty() {
+            assert!(!crate::daemon::owner_loop::drive_ready_test_turn(
+                &mut daemon,
+                &mut state
+            ));
+            assert!(
+                Instant::now() < deadline,
+                "grown Status sources must receive a capacity response"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(blocker.poll(), CoreTicketPoll::Ready(())));
+        assert_eq!(
+            observation.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (true, 0, 0, true)
+        );
+        let (_, charge, encoded) = reply.blocking_recv().unwrap().into_parts();
+        let botster_hub_client::ServerFrame::Response {
+            request_id,
+            response,
+        } = serde_json::from_slice(encoded.as_ref().unwrap()).unwrap()
+        else {
+            panic!("response frame");
+        };
+        assert_eq!(request_id, "41");
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "host_result_too_large");
+        assert_eq!(error.request_id, request_id);
+        assert_eq!(error.operation, "status");
+        drop(charge);
+        assert_eq!(
+            daemon.runtime().unwrap().host_executor().prepared_bytes(),
+            0
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn status_core_result_retains_original_reservation_after_ticket_and_permit_disposal() {
+        check_status_core_retention(true);
+    }
+
+    #[test]
+    fn status_core_queue_retains_original_reservation_after_ticket_and_permit_disposal() {
+        check_status_core_retention(false);
+    }
+
+    fn check_status_core_retention(hold_result: bool) {
+        let (mut daemon, directory) = test_daemon("status-core-result-retention");
+        let mut state = DaemonControlState::default();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let mut blocker = if hold_result {
+            TEST_STATUS_CORE_RESULT_GATE.with(|slot| {
+                assert!(slot.borrow_mut().replace((entered, gate)).is_none());
+            });
+            None
+        } else {
+            let blocker = daemon.runtime().unwrap().submit_core(move |_| {
+                let _ = entered.send(());
+                let _ = gate.recv_timeout(Duration::from_secs(5));
+            });
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            Some(blocker)
+        };
+        let reply = dispatch_status_for_test(&mut daemon, &mut state);
+        if hold_result {
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let waiter = *state.pending_requests.keys().next().unwrap();
+        let mut entry = state.pending_requests.remove(&waiter).unwrap();
+        let super::super::pending::ControlContinuation::Status(continuation) =
+            &mut entry.continuation
+        else {
+            panic!("Status continuation");
+        };
+        assert!(
+            continuation
+                .permit
+                .as_ref()
+                .unwrap()
+                .has_retained_prepared_reservation()
+        );
+        let mut completion = None;
+        let parts = continuation
+            .take_terminal_parts(HostJobIdentity::first(waiter), &mut completion)
+            .unwrap();
+        assert!(continuation.ticket.is_none());
+        let mut job = crate::host_disposal::Job::new(parts);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let permit = loop {
+            match job.poll() {
+                crate::host_disposal::Poll::Disposed(permit) => break permit,
+                crate::host_disposal::Poll::Pending => assert!(Instant::now() < deadline),
+                _ => panic!("terminal input disposal must return the original permit"),
+            }
+            std::thread::yield_now();
+        };
+        drop(permit);
+        let executor = daemon.runtime().unwrap().host_executor();
+        assert_eq!(executor.outstanding(), 0);
+        assert_eq!(executor.prepared_bytes(), HOST_PREPARED_BYTE_CAPACITY);
+        release.send(()).unwrap();
+        while executor.prepared_bytes() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "Core result destruction must release the retained reservation"
+            );
+            std::thread::yield_now();
+        }
+        if let Some(blocker) = blocker.as_mut() {
+            assert!(matches!(blocker.poll(), CoreTicketPoll::Ready(())));
+        }
+        state.budget.release(entry.permit.take().unwrap());
+        drop(entry);
+        drop(reply);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn status_seed_aggregate_precedes_copies_at_exact_fit_and_one_byte_short() {
+        let (mut daemon, directory) = test_daemon("status-seed-boundary");
+        let mut state = DaemonControlState::default();
+        state
+            .lifecycle_counters
+            .cleanup_by_reason
+            .insert("reason".repeat(128), 1);
+        let input = capture_seed(&daemon, &state, "41".into(), false, usize::MAX);
+        let bytes = input.logical_bytes(usize::MAX).unwrap();
+        assert!(daemon.status_bytes(bytes - 1).is_some());
+        assert!(lifecycle_bytes(&state.lifecycle_counters, bytes - 1).is_some());
+        assert!(daemon.installation_home_bytes(bytes - 1).is_some());
+        let exact = capture_seed(&daemon, &state, "41".into(), false, bytes);
+        assert!(!exact.rejected);
+        assert!(exact.seed.is_some());
+        let short = capture_seed(&daemon, &state, "41".into(), false, bytes - 1);
+        assert!(short.rejected);
+        assert!(short.seed.is_none());
+        assert_eq!(short.request_id, "41");
+        state
+            .lifecycle_counters
+            .cleanup_by_reason
+            .insert("later-source-growth".into(), 2);
+        assert!(
+            capture_seed(&daemon, &state, "41".into(), false, bytes)
+                .seed
+                .is_none()
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn status_current_sources_count_inventory_overlap_and_recheck_growth_before_copy() {
+        let (mut daemon, directory) = test_daemon("status-current-boundary");
+        let mut state = DaemonControlState::default();
+        let mut input = capture_seed(&daemon, &state, "41".into(), false, usize::MAX);
+        let permit = daemon
+            .runtime()
+            .unwrap()
+            .host_executor()
+            .try_reserve()
+            .unwrap();
+        input.core = Some(StatusCoreSnapshot::new(
+            Default::default(),
+            Some(vec![botster_core::TerminalSubscriptionRecord {
+                client_id: botster_core::ClientId("client".into()),
+                session_id: botster_core::SessionId("session".into()),
+                subscription_id: botster_core::SubscriptionId("subscription".into()),
+                generation: botster_core::TerminalSubscriptionGeneration(1),
+                adapter_bound: false,
+                capabilities: None,
+            }]),
+            permit.retain_prepared_reservation(),
+        ));
+        state
+            .pending_runtime
+            .live_attach_routes
+            .insert(("session".into(), "subscription".into()));
+        let live = input.logical_bytes(usize::MAX).unwrap();
+        let inventory = input.core.as_ref().unwrap().inventory.as_ref().unwrap();
+        let occupancy = crate::subscription::attach_routes::live_attach_occupancy_prepared_bytes(
+            &state.pending_runtime.live_attach_routes,
+            inventory,
+            usize::MAX,
+        )
+        .unwrap();
+        let terminal = daemon
+            .local_webrtc()
+            .terminal_records_bytes(usize::MAX)
+            .unwrap();
+        let exact = live + occupancy + terminal;
+        assert!(live < exact - 1 && occupancy < exact - 1 && terminal < exact - 1);
+        assert!(capture_current_sources(&mut daemon, &state, &mut input, exact - 1).is_none());
+        assert!(input.seed.as_ref().unwrap().occupancy.is_empty());
+        assert!(input.seed.as_ref().unwrap().terminal_records.is_empty());
+        let growth = ("new-session".repeat(64), "new-subscription".repeat(64));
+        state
+            .pending_runtime
+            .live_attach_routes
+            .insert(growth.clone());
+        assert!(capture_current_sources(&mut daemon, &state, &mut input, exact).is_none());
+        assert!(input.seed.as_ref().unwrap().occupancy.is_empty());
+        state.pending_runtime.live_attach_routes.remove(&growth);
+        assert!(capture_current_sources(&mut daemon, &state, &mut input, exact).is_some());
+        assert_eq!(input.seed.as_ref().unwrap().occupancy.len(), 1);
+        drop(input);
+        drop(permit);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn status_dispatch_preserves_response_and_capacity_error_correlation() {
+        for refuse_seed in [false, true] {
+            let (mut daemon, directory) = test_daemon("status-dispatch");
+            let mut state = DaemonControlState::default();
+            if refuse_seed {
+                state
+                    .lifecycle_counters
+                    .cleanup_by_reason
+                    .insert("x".repeat(HOST_PREPARED_BYTE_CAPACITY), 1);
+            }
+            let transport = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (control_tx, _) = tokio::sync::mpsc::channel(
+                crate::admission::budgets::DAEMON_CONTROL_QUEUE_CAPACITY,
+            );
+            let (reply_tx, reply_rx) = control_reply_channel();
+            assert!(!super::super::request::handle(
+                &mut daemon,
+                &mut state,
+                transport.handle(),
+                control_tx,
+                ControlMessage::Request {
+                    request: Box::new(botster_hub_client::DaemonRequest::Status),
+                    transport_request_id: Some("18446744073709551615".into()),
+                    reply_tx,
+                    response_delivery_rx: None,
+                    grant_id: None,
+                    client_id: None,
+                    enqueued_at: Instant::now(),
+                },
+            ));
+            let entry = state.pending_requests.values().next().unwrap();
+            let super::super::pending::ControlContinuation::Status(continuation) =
+                &entry.continuation
+            else {
+                panic!("Status continuation");
+            };
+            assert_eq!(
+                continuation.input.as_ref().unwrap().seed.is_none(),
+                refuse_seed
+            );
+            assert_eq!(continuation.ticket.is_none(), refuse_seed);
+            assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 1);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !state.pending_requests.is_empty() {
+                assert!(!crate::daemon::owner_loop::drive_ready_test_turn(
+                    &mut daemon,
+                    &mut state
+                ));
+                assert!(Instant::now() < deadline, "Status dispatch must complete");
+                std::thread::yield_now();
+            }
+            let (_, charge, encoded) = reply_rx.blocking_recv().unwrap().into_parts();
+            let encoded = encoded.expect("Host encoded the Status response");
+            let botster_hub_client::ServerFrame::Response {
+                request_id,
+                response,
+            } = serde_json::from_slice(&encoded).unwrap()
+            else {
+                panic!("response frame");
+            };
+            assert_eq!(request_id, "18446744073709551615");
+            if refuse_seed {
+                let error = response.error.expect("capacity error");
+                assert_eq!(error.code, "host_result_too_large");
+                assert_eq!(error.request_id, request_id);
+                assert_eq!(error.operation, "status");
+            } else {
+                assert_eq!(
+                    response.kind,
+                    botster_hub_client::DaemonResponseKind::Status
+                );
+                assert!(response.status.is_some());
+            }
+            let executor = daemon.runtime().unwrap().host_executor();
+            assert_eq!(executor.outstanding(), 0);
+            assert_eq!(executor.prepared_bytes(), encoded.len());
+            drop(charge);
+            assert_eq!(executor.prepared_bytes(), 0);
+            daemon.stop();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     #[test]
     fn oversized_shutdown_keeps_its_stop_effect_and_original_slot_through_delivery() {
         for closed_reply in [false, true] {
-            run_shutdown_case(closed_reply, false);
+            run_shutdown_case(closed_reply, false, false);
         }
     }
 
     #[test]
     fn refused_shutdown_delivery_restores_sender_and_preserves_stop_and_fault_ownership() {
-        run_shutdown_case(false, true);
+        run_shutdown_case(false, true, false);
     }
 
-    fn run_shutdown_case(closed_reply: bool, refuse_delivery: bool) {
+    #[test]
+    fn seed_refused_shutdown_keeps_stop_delivery_and_request_correlation() {
+        run_shutdown_case(false, false, true);
+        run_shutdown_case(true, false, true);
+        run_shutdown_case(false, true, true);
+    }
+
+    fn run_shutdown_case(closed_reply: bool, refuse_delivery: bool, seed_refusal: bool) {
         let directory = std::env::temp_dir().join(format!(
             "botster-status-shutdown-{}-{}",
             std::process::id(),
@@ -529,7 +1060,11 @@ mod tests {
                 .test_refuse_status_delivery();
         }
         state.lifecycle_counters.cleanup_by_reason.insert(
-            "\\".repeat(botster_hub_client::MAX_CONTROL_RESPONSE_BYTES),
+            "\\".repeat(if seed_refusal {
+                HOST_PREPARED_BYTE_CAPACITY
+            } else {
+                botster_hub_client::MAX_CONTROL_RESPONSE_BYTES
+            }),
             1,
         );
         let transport = tokio::runtime::Builder::new_current_thread()
@@ -576,6 +1111,19 @@ mod tests {
             daemon.runtime().unwrap().host_executor().outstanding(),
             HOST_OPERATION_CAPACITY
         );
+        let entry = state
+            .pending_requests
+            .values()
+            .next()
+            .expect("the admitted shutdown is retained");
+        let super::super::pending::ControlContinuation::Status(continuation) = &entry.continuation
+        else {
+            panic!("Status continuation");
+        };
+        let input = continuation.input.as_ref().unwrap();
+        assert_eq!(input.rejected, seed_refusal);
+        assert_eq!(input.seed.is_none(), seed_refusal);
+        assert_eq!(continuation.ticket.is_none(), seed_refusal);
         assert_eq!(
             daemon.runtime().unwrap().host_executor().prepared_bytes(),
             HOST_OPERATION_CAPACITY * HOST_PREPARED_BYTE_CAPACITY

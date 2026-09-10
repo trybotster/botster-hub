@@ -167,6 +167,33 @@ impl LocalWebrtcTransport {
         Ok(())
     }
 
+    /// Retained JSON lengths bound string bytes without copying the records.
+    pub(crate) fn terminal_records_bytes(&self, limit: usize) -> Option<usize> {
+        let mut bytes = std::mem::size_of::<Vec<DaemonLocalWebrtcTerminalRecord>>().checked_add(
+            self.terminal_records
+                .len()
+                .checked_mul(std::mem::size_of::<DaemonLocalWebrtcTerminalRecord>())?,
+        )?;
+        if bytes > limit {
+            return None;
+        }
+        for retained in &self.terminal_records {
+            bytes = bytes.checked_add(retained.encoded_len)?;
+            if bytes > limit {
+                return None;
+            }
+        }
+        Some(bytes)
+    }
+
+    pub(crate) fn bounded_terminal_records(
+        &self,
+        limit: usize,
+    ) -> Option<(Vec<DaemonLocalWebrtcTerminalRecord>, usize)> {
+        let bytes = self.terminal_records_bytes(limit)?;
+        Some((self.terminal_records(), bytes))
+    }
+
     pub(crate) fn terminal_records(&self) -> Vec<DaemonLocalWebrtcTerminalRecord> {
         self.terminal_records
             .iter()
@@ -1061,6 +1088,27 @@ mod tests {
             cause: LocalWebrtcTerminalCause::PeerFailed,
             cleanup_disposition: LocalWebrtcCleanupDisposition::NewlySent,
         }
+    }
+
+    #[test]
+    fn status_terminal_records_preflight_rechecks_growth_before_copy() {
+        let mut transport = LocalWebrtcTransport::default();
+        let empty = std::mem::size_of::<Vec<DaemonLocalWebrtcTerminalRecord>>();
+        assert!(transport.bounded_terminal_records(empty - 1).is_none());
+        assert_eq!(transport.terminal_records_bytes(empty), Some(empty));
+        transport
+            .retain_terminal_record(retained_terminal_record("first"))
+            .unwrap();
+        let bytes = transport.terminal_records_bytes(usize::MAX).unwrap();
+        assert!(transport.bounded_terminal_records(bytes - 1).is_none());
+        let (records, charged) = transport.bounded_terminal_records(bytes).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(charged, bytes);
+        transport
+            .retain_terminal_record(retained_terminal_record("second"))
+            .unwrap();
+        assert!(transport.bounded_terminal_records(bytes).is_none());
+        assert_eq!(transport.terminal_records.len(), 2);
     }
 
     #[test]
