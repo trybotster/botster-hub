@@ -1,7 +1,7 @@
 //! Host construction and encoding for Status and Shutdown responses.
 //!
 //! Owner capture and Host preparation share one retained byte allowance.
-//! Core inventory preallocation remains a separate dependency.
+//! Core preflights inventory under the remaining admitted allowance.
 
 use std::mem::size_of;
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ pub(crate) struct StatusResponseInput {
     #[cfg(test)]
     pub(crate) drop_probe: Option<crate::host_executor::TestDisposalProbe>,
     #[cfg(test)]
-    pub(crate) capture_observer: Option<std::sync::mpsc::Sender<(bool, usize, usize, bool)>>,
+    pub(crate) capture_observer: Option<std::sync::mpsc::Sender<(bool, usize, usize, bool, bool)>>,
     pub(crate) seed: Option<StatusResponseSeed>,
     pub(crate) core: Option<StatusCoreSnapshot>,
     pub(crate) request_id: String,
@@ -46,14 +46,20 @@ pub(crate) struct StatusResponseSeed {
 /// The reservation remains after inventory in field destruction order.
 pub(crate) struct StatusCoreSnapshot {
     pub(crate) accounting: botster_core_daemon::RetentionAccounting,
-    pub(crate) inventory: Option<Vec<botster_core::TerminalSubscriptionRecord>>,
+    pub(crate) inventory: Result<
+        Option<botster_core::TerminalSubscriptionInventory>,
+        botster_core::TerminalSubscriptionInventoryError,
+    >,
     _reservation: HostRetainedPrepared,
 }
 
 impl StatusCoreSnapshot {
     pub(crate) fn new(
         accounting: botster_core_daemon::RetentionAccounting,
-        inventory: Option<Vec<botster_core::TerminalSubscriptionRecord>>,
+        inventory: Result<
+            Option<botster_core::TerminalSubscriptionInventory>,
+            botster_core::TerminalSubscriptionInventoryError,
+        >,
         reservation: HostRetainedPrepared,
     ) -> Self {
         Self {
@@ -64,36 +70,13 @@ impl StatusCoreSnapshot {
     }
 
     pub(crate) fn logical_bytes(&self, limit: usize) -> Option<usize> {
-        let mut bytes = size_of::<Self>();
-        if let Some(inventory) = self.inventory.as_ref() {
-            bytes = checked_live_bytes(
-                limit,
-                [
-                    bytes,
-                    inventory
-                        .len()
-                        .checked_mul(size_of::<botster_core::TerminalSubscriptionRecord>())?,
-                ],
-            )?;
-            for row in inventory {
-                bytes = checked_live_bytes(
-                    limit,
-                    [
-                        bytes,
-                        row.client_id.0.len(),
-                        row.session_id.0.len(),
-                        row.subscription_id.0.len(),
-                    ],
-                )?;
-                if let Some(capabilities) = row.capabilities.as_ref() {
-                    for token in capabilities.iter() {
-                        bytes =
-                            checked_live_bytes(limit, [bytes, size_of::<String>(), token.len()])?;
-                    }
-                }
-            }
-        }
-        (bytes <= limit).then_some(bytes)
+        let heap_bytes = match self.inventory.as_ref() {
+            Ok(Some(inventory)) => inventory
+                .logical_bytes
+                .checked_sub(size_of::<botster_core::TerminalSubscriptionInventory>())?,
+            Ok(None) | Err(_) => 0,
+        };
+        checked_live_bytes(limit, [size_of::<Self>(), heap_bytes])
     }
 }
 
@@ -243,7 +226,16 @@ pub(crate) fn prepare(mut input: StatusResponseInput, limit: usize) -> PreparedS
         let (occupancy, terminals) = input.seed.as_ref().map_or((0, 0), |seed| {
             (seed.occupancy.len(), seed.terminal_records.len())
         });
-        let _ = observer.send((input.rejected, occupancy, terminals, input.core.is_some()));
+        let _ = observer.send((
+            input.rejected,
+            occupancy,
+            terminals,
+            input.core.is_some(),
+            input
+                .core
+                .as_ref()
+                .is_some_and(|core| core.inventory.is_err()),
+        ));
     }
     // Obsolete inventory must drop on Host before metadata creates more owned values.
     drop(input.core.take());

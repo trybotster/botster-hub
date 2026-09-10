@@ -16,7 +16,7 @@ use crate::daemon::owner_loop::DaemonControlState;
 use crate::data_plane::driver::CoreTicket;
 use crate::subscription::attach_routes::{
     AttachStreamOwner, AttachedSubscription, AttachedSubscriptionChange, AttachmentIdentity,
-    RouteReservation, live_generation_for_route, record_attached_subscription_change,
+    RouteReservation, record_attached_subscription_change,
 };
 
 /// Attach streams one owner (Unix client or WebRTC grant) may hold at once.
@@ -114,22 +114,18 @@ fn cleanup_core_turn(
         if let Some(owner) = capture_owner.as_ref() {
             let _ = daemon.release_owner_captures(owner);
         }
-        let inventory = daemon.list_terminal_subscriptions();
         let mut reports = Vec::with_capacity(page.len());
         for candidate in page {
+            let session_id = SessionId(candidate.session_id.clone());
+            let subscription_id = SubscriptionId(candidate.subscription_id.clone());
+            let owner = daemon.terminal_subscription_owner(&session_id, &subscription_id);
             let generation = candidate.generation.or_else(|| {
-                live_generation_for_route(
-                    &inventory,
-                    &candidate.core_client_id,
-                    &candidate.session_id,
-                    &candidate.subscription_id,
-                )
+                owner
+                    .filter(|(client, _)| client.0 == candidate.core_client_id)
+                    .map(|(_, generation)| generation)
             });
-            let foreign_core_owner = inventory.iter().any(|row| {
-                row.session_id.0 == candidate.session_id
-                    && row.subscription_id.0 == candidate.subscription_id
-                    && row.client_id.0 != candidate.core_client_id
-            });
+            let foreign_core_owner =
+                owner.is_some_and(|(client, _)| client.0 != candidate.core_client_id);
             let outcome = match generation {
                 None if foreign_core_owner => CleanupRouteOutcome::Foreign,
                 None => CleanupRouteOutcome::NoGeneration,

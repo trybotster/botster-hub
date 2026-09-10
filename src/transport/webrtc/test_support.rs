@@ -76,6 +76,7 @@ pub(crate) struct FakeDataChannel {
     pub(crate) threshold_fails: AtomicBool,
     pub(crate) outstanding_bytes: std::sync::atomic::AtomicUsize,
     pub(crate) sent_before_low_water: AtomicBool,
+    pub(crate) pressure_active: AtomicBool,
     pub(crate) poll_ends: AtomicBool,
     pub(crate) event_notify: tokio::sync::Notify,
     pub(crate) send_notify: tokio::sync::Notify,
@@ -130,13 +131,7 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
         if fail_after > 0 && self.sent.lock().unwrap().len() >= fail_after {
             return Err("fixture send failure".to_string());
         }
-        if self
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|event| matches!(event, DataChannelEvent::OnBufferedAmountLow))
-        {
+        if self.pressure_active.load(Ordering::Acquire) {
             self.sent_before_low_water.store(true, Ordering::Release);
         }
         self.sent.lock().unwrap().push(text.to_string());
@@ -168,6 +163,15 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
         loop {
             let notified = self.event_notify.notified();
             if let Some(event) = self.events.lock().unwrap().pop_front() {
+                match event {
+                    DataChannelEvent::OnBufferedAmountHigh => {
+                        self.pressure_active.store(true, Ordering::Release)
+                    }
+                    DataChannelEvent::OnBufferedAmountLow => {
+                        self.pressure_active.store(false, Ordering::Release)
+                    }
+                    _ => {}
+                }
                 return Some(event);
             }
             if self.poll_ends.load(Ordering::Acquire) {

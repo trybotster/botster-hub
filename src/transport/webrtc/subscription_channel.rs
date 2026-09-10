@@ -1576,9 +1576,11 @@ mod tests {
             .daemon
             .runtime_mut()
             .expect("runtime")
-            .list_terminal_subscriptions()
+            .list_terminal_subscriptions(crate::host_executor::HOST_PREPARED_BYTE_CAPACITY)
             .wait(Duration::from_secs(5))
             .expect("inventory")
+            .expect("inventory fits the test allowance")
+            .records
             .iter()
             .find(|row| row.session_id.0 == session_id && row.subscription_id.0 == subscription_id)
             .expect("the bound route must be live before the remote close")
@@ -1603,9 +1605,11 @@ mod tests {
             }
             let runtime = harness.daemon.runtime_mut().expect("runtime");
             let core_present = runtime
-                .list_terminal_subscriptions()
+                .list_terminal_subscriptions(crate::host_executor::HOST_PREPARED_BYTE_CAPACITY)
                 .wait(Duration::from_secs(5))
                 .expect("inventory")
+                .expect("inventory fits the test allowance")
+                .records
                 .iter()
                 .any(|row| {
                     row.session_id.0 == session_id && row.subscription_id.0 == subscription_id

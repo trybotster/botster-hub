@@ -1,6 +1,6 @@
 //! Bounded shaping and encoding for plugin control responses.
 
-use botster_core::{PluginInvocationResult, RequestId};
+use botster_core::{PluginInvocationFailureKind, PluginInvocationResult, RequestId};
 use botster_hub_client::{
     DaemonOperatorError, DaemonResponse, DaemonResponseKind, MAX_CONTROL_RESPONSE_BYTES,
     MAX_REQUEST_ID_BYTES,
@@ -98,6 +98,16 @@ fn shape_response(
             transport_request_id,
             format!("plugin completion identity did not match admitted request {request_id}"),
         );
+    }
+    if let Ok(PluginInvocationResult::Failed(failure)) = &result {
+        if failure.kind == PluginInvocationFailureKind::CompletionTooLarge {
+            return plugin_preparation_error(
+                kind,
+                transport_request_id,
+                "plugin_response_too_large",
+                &failure.reason,
+            );
+        }
     }
     let result =
         result.map_err(|message| McpToolError::new("plugin_completion_inconsistent", message));
@@ -283,8 +293,8 @@ pub(crate) fn encode_protocol_bounded_error(
 #[cfg(test)]
 mod tests {
     use botster_core::{
-        BoundaryJson, PluginHandlerKind, PluginHandlerRef, PluginInvocationSuccess, PluginKey,
-        PluginWorkerEngineConfig,
+        BoundaryJson, PluginHandlerKind, PluginHandlerRef, PluginInvocationFailureKind,
+        PluginInvocationSuccess, PluginKey, PluginWorkerEngineConfig,
     };
     use botster_hub_client::ServerFrame;
 
@@ -367,6 +377,48 @@ mod tests {
         let surface = &response_json["plugin_surface"];
         assert!(surface.get("body").is_none());
         assert_eq!(surface["ui_tree_snapshot"]["body"]["id"], "large-body");
+    }
+
+    #[test]
+    fn core_oversized_completion_keeps_transport_correlation() {
+        let result = PluginInvocationResult::Failed(botster_core::PluginInvocationFailure {
+            request_id: RequestId("core-request".to_string()),
+            handler: botster_core::PluginHandlerRef {
+                plugin_key: PluginKey("example.plugin".to_string()),
+                kind: PluginHandlerKind::Command,
+                handler_id: "handler".to_string(),
+            },
+            kind: PluginInvocationFailureKind::CompletionTooLarge,
+            timeout_ms: None,
+            reason: "completion exceeded reserved byte budget".to_string(),
+        });
+        for kind in [
+            PluginResponseKind::McpTool,
+            PluginResponseKind::SurfaceRender {
+                package_name: "example.plugin".to_string(),
+                surface_id: "example.surface".to_string(),
+            },
+            PluginResponseKind::SurfaceAction {
+                package_name: "example.plugin".to_string(),
+                request: serde_json::from_value(serde_json::json!({
+                    "surface_id": "example.surface",
+                    "action_id": "run",
+                    "request_id": "action-request",
+                    "kind": "submit"
+                }))
+                .expect("action request"),
+            },
+        ] {
+            let (input, budget) = input(kind, Ok(result.clone()), "transport-request");
+            let prepared = prepare(input);
+            let (request_id, response) = decode_response(&prepared);
+            assert_eq!(request_id, "transport-request");
+            let error = response.error.expect("typed oversized response");
+            assert_eq!(error.code, "plugin_response_too_large");
+            assert_eq!(error.message, "completion exceeded reserved byte budget");
+            assert_eq!(error.request_id, "transport-request");
+            assert_eq!(budget.retained_bytes(), 0);
+        }
     }
 
     #[test]

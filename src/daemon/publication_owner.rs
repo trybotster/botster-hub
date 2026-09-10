@@ -649,12 +649,13 @@ mod tests {
     #[test]
     fn publication_stopped_submission_retains_the_original_command() {
         let (mut daemon, root) = daemon("stopped");
-        daemon.runtime_mut().unwrap().test_stop_host_submissions();
         let runtime = daemon.runtime().unwrap();
         let mut state = DaemonControlState::default();
         let scope = runtime.causal_scopes().mint().unwrap();
         let response = queue(runtime, Some(scope));
         assert!(drive(&daemon, &mut state));
+        daemon.runtime_mut().unwrap().test_stop_host_submissions();
+        let runtime = daemon.runtime().unwrap();
         assert!(!drive(&daemon, &mut state));
         let recovery = state.publication_owner.recovery.as_ref().unwrap();
         assert_eq!(

@@ -610,7 +610,21 @@ fn bind_terminal_adapter_inventory_echoes_capability_set() {
     .expect("attach");
     logical_clock += 1;
 
-    let before = wait_ticket(runtime.list_terminal_subscriptions());
+    let refusal = wait_ticket(runtime.list_terminal_subscriptions(0))
+        .expect_err("the public wrapper must preserve inventory refusal");
+    assert!(matches!(
+        refusal,
+        botster_core::TerminalSubscriptionInventoryError::BudgetTooSmall { max_bytes: 0, .. }
+    ));
+    let admitted = wait_ticket(
+        runtime.list_terminal_subscriptions(botster_hub_client::MAX_CONTROL_RESPONSE_BYTES),
+    )
+    .expect("inventory fits the test allowance");
+    assert!(wait_ticket(runtime.list_terminal_subscriptions(admitted.logical_bytes - 1)).is_err());
+    let exact = wait_ticket(runtime.list_terminal_subscriptions(admitted.logical_bytes))
+        .expect("the complete inventory fits its exact logical size");
+    assert_eq!(exact, admitted);
+    let before = admitted.records;
     assert!(before.iter().any(|row| {
         row.client_id == client_id
             && row.session_id == session_id
@@ -639,7 +653,11 @@ fn bind_terminal_adapter_inventory_echoes_capability_set() {
     ))
     .expect("bind");
 
-    let after = wait_ticket(runtime.list_terminal_subscriptions());
+    let after = wait_ticket(
+        runtime.list_terminal_subscriptions(botster_hub_client::MAX_CONTROL_RESPONSE_BYTES),
+    )
+    .expect("inventory fits the test allowance")
+    .records;
     let bound = after
         .iter()
         .find(|row| row.generation == generation)

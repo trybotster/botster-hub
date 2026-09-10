@@ -2692,10 +2692,10 @@ mod tests {
                 control_tx.clone(),
                 message
             ));
+            let response = read_response(&mut client, &mut reader, serial);
             assert!(
-                read_response(&mut client, &mut reader, serial)
-                    .error
-                    .is_none()
+                response.error.is_none(),
+                "subscription {subscription_id}: {response:?}"
             );
         }
         settle_cleanup_test_owner(&mut daemon, &mut state);
@@ -3182,7 +3182,6 @@ mod tests {
             "pool",
             "connection",
             "lookup",
-            "submission",
             "phase",
             "panic",
         ] {
@@ -3220,7 +3219,6 @@ mod tests {
                 }
                 "pool" | "connection" => connection.test_poison(fault),
                 "lookup" => state.event_plane.test_poison_lookup(),
-                "submission" => daemon.runtime_mut().unwrap().test_stop_host_submissions(),
                 "phase" => state
                     .client_events
                     .test_set_phase("cleanup-connection", u64::MAX),
@@ -3258,6 +3256,65 @@ mod tests {
             daemon.stop();
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn client_event_cleanup_stopped_host_retains_connection_without_host_admission() {
+        let root = unique_package_control_dir("client-cleanup-stopped-before-admission");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let permit = state.budget.reserve_connection().unwrap();
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        let mailbox = state
+            .event_plane
+            .subscription_mailbox("cleanup-connection", "cleanup-subscription")
+            .unwrap();
+        let connection = mailbox.connection().unwrap();
+        mailbox
+            .try_push(
+                "cleanup-subscription",
+                "cleanup-owner",
+                "ready",
+                serde_json::json!({"value": 1}),
+                23,
+            )
+            .unwrap();
+        daemon.runtime_mut().unwrap().test_stop_host_submissions();
+        close_cleanup_test_connection(&mut daemon, &mut state, permit);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.client_events.has_capacity_waiters() {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < deadline,
+                "cleanup must retain its capacity wait"
+            );
+            thread::yield_now();
+        }
+        assert!(!state.client_events.test_recovery("cleanup-connection"));
+        assert_eq!(connection.test_slot_count(), 1);
+        assert_eq!(state.budget.outstanding(), 1);
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .host_executor()
+                .try_reserve()
+                .is_none()
+        );
+        assert!(!connection.test_cleanup_started());
+        for _ in 0..3 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                state.owner_ready.is_empty(),
+                "a capacity wait must not remain runnable"
+            );
+            assert_eq!(connection.test_slot_count(), 1);
+            assert_eq!(state.budget.outstanding(), 1);
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5142,7 +5199,7 @@ mod tests {
         const TRANSPORT: &str = include_str!("owner_loop.rs");
         let production = TRANSPORT.split("mod tests").next().expect("production");
         let needles = [
-            "async fn accept_connections",
+            "fn accept_connections(",
             "async fn handle_connection_async",
             "struct MuxWriteState",
             "struct ConnectionCleanupGuard",
@@ -5182,7 +5239,7 @@ mod tests {
         let connection = include_str!("../transport/unix/connection.rs");
         let mux = include_str!("../transport/unix/mux_write.rs");
         assert!(
-            listener.contains("pub(crate) async fn accept_connections")
+            listener.contains("pub(crate) fn accept_connections(")
                 && listener.contains("pub(crate) fn prepare_socket_path"),
             "listener owns accept and socket path"
         );
@@ -5994,6 +6051,28 @@ mod tests {
         .expect("write lua plugin");
     }
 
+    struct ControlledPluginGateGuard {
+        _owner: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ControlledPluginGateGuard {
+        fn acquire() -> Self {
+            static OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            Self {
+                _owner: OWNER
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            }
+        }
+    }
+
+    impl Drop for ControlledPluginGateGuard {
+        fn drop(&mut self) {
+            // Release the worker even when a fixture assertion fails.
+            crate::lua_runtime::release_test_plugin_invocation_gate();
+        }
+    }
+
     fn write_controlled_gate_lua_plugin(package_dir: &Path) {
         std::fs::write(
             package_dir.join("plugin.lua"),
@@ -6063,6 +6142,7 @@ return botster.register({
 
     #[test]
     fn early_provider_result_waits_for_admission_and_survives_ambiguous_host_failure() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
         use crate::host_executor::{HostCompletion, HostCompletionPoll, HostError, HostResult};
         use crate::package_event_router::LeaseIdentity;
         for outcome in [
@@ -6458,6 +6538,14 @@ return botster.register({
                     assert!(reply.try_recv().is_err());
                     assert!(frames.try_recv().is_err());
                 }
+                while daemon.runtime().unwrap().host_executor().outstanding() != 0 {
+                    assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                    assert!(
+                        Instant::now() < deadline,
+                        "Host must acknowledge result disposal: {outcome}"
+                    );
+                    thread::yield_now();
+                }
                 assert_eq!(state.plugin_result_budget.retained_bytes(), 0);
                 assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
                 while daemon.runtime().unwrap().causal_operation_count() > 0 {
@@ -6478,6 +6566,7 @@ return botster.register({
 
     #[test]
     fn admitted_providers_publish_while_all_expectations_remain_charged() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
         let root = unique_package_control_dir("provider-publish-capacity");
         let package_dir = root.join("owner-entity-gate");
         write_package_control_manifest(
@@ -6620,6 +6709,7 @@ return botster.register({ handlers = {{
 
     #[test]
     fn prepared_snapshots_and_fanout_progress_when_host_capacity_is_full() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
         let root = unique_package_control_dir("entity-delivery-capacity-order");
         let package_dir = root.join("owner-entity-gate");
         write_package_control_manifest(
@@ -7028,6 +7118,7 @@ return botster.register({
 
     #[test]
     fn refused_entity_admission_retires_with_reserved_host_capacity() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
         use crate::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdentity};
         let root = unique_package_control_dir("entity-admission-retirement");
         let package_dir = root.join("owner-entity-gate");
@@ -7496,6 +7587,7 @@ return botster.register({
 
     #[test]
     fn blocked_plugin_request_does_not_block_unrelated_owner_control() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
         let root = unique_package_control_dir("controlled-plugin-gate");
         let data_directory = root.join("data");
         let package_dir = root.join("owner.controlled-gate");
@@ -7602,6 +7694,7 @@ return botster.register({
 
     #[test]
     fn blocked_plugin_connection_returns_correlated_too_many_requests_before_release() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
         let root = unique_package_control_dir("controlled-plugin-admission-limit");
         let data_directory = root.join("data");
         let package_dir = root.join("owner.controlled-gate");
@@ -7617,6 +7710,13 @@ return botster.register({
         );
         write_controlled_gate_lua_plugin(&package_dir);
         let config = package_control_config(data_directory);
+        let core_capacity = config.plugin_worker_config().completion_queue_byte_capacity
+            / (crate::lifecycle::REQUEST_RESPONSE_COMPLETION_ALLOWANCE
+                + botster_core::PluginWorkerEngine::completion_reservation_metadata_bytes());
+        assert_eq!(
+            core_capacity + 1,
+            botster_hub_client::MAX_OUTSTANDING_REQUESTS
+        );
         let mut daemon = HubDaemon::start(config).expect("start admission-limit daemon");
         drive_package_request(
             &mut daemon,
@@ -7686,6 +7786,7 @@ return botster.register({
             );
         }
 
+        let mut admitted_messages = Vec::new();
         for serial in 1..=botster_hub_client::MAX_OUTSTANDING_REQUESTS {
             let message = receive_test_control_message(&mut control_rx);
             assert!(
@@ -7700,6 +7801,13 @@ return botster.register({
                 ),
                 "request {serial} must reach production connection and owner admission"
             );
+            admitted_messages.push(message);
+        }
+        // The transport must observe all occupied slots before Core can release one.
+        let first_refusal = reader
+            .read_frame(&mut client)
+            .expect("read capacity refusal");
+        for message in admitted_messages {
             assert!(!handle_control_message(
                 &mut daemon,
                 &mut state,
@@ -7713,18 +7821,45 @@ return botster.register({
             "the controlled plugin worker must enter the gate"
         );
 
-        let refused_id = u64::try_from(botster_hub_client::MAX_OUTSTANDING_REQUESTS + 1)
-            .expect("refused request id");
-        let refusal = read_response(&mut client, &mut reader, refused_id);
-        assert_eq!(refusal.kind, DaemonResponseKind::OperatorError);
-        assert_eq!(
-            refusal.error.as_ref().map(|error| error.code.as_str()),
-            Some(botster_hub_client::OPERATOR_ERROR_TOO_MANY_REQUESTS)
-        );
-        assert_eq!(
-            state.pending_requests.len(),
-            botster_hub_client::MAX_OUTSTANDING_REQUESTS
-        );
+        let transport_refused_id = botster_hub_client::MAX_OUTSTANDING_REQUESTS + 1;
+        let core_refused_id = core_capacity + 1;
+        let second_refusal = reader
+            .read_frame(&mut client)
+            .expect("read capacity refusal");
+        let mut refusals = std::collections::BTreeMap::new();
+        for frame in [first_refusal, second_refusal] {
+            let DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                request_id,
+                response,
+            }) = frame
+            else {
+                panic!("capacity refusal must use a response frame");
+            };
+            let request_id = request_id.parse::<usize>().expect("numeric request id");
+            assert!(
+                [core_refused_id, transport_refused_id].contains(&request_id),
+                "unexpected refusal request ID {request_id}"
+            );
+            assert!(
+                refusals.insert(request_id, response).is_none(),
+                "request {request_id} answered twice"
+            );
+        }
+        for (request_id, code) in [
+            (
+                transport_refused_id,
+                botster_hub_client::OPERATOR_ERROR_TOO_MANY_REQUESTS,
+            ),
+            (core_refused_id, "plugin_invocation_backpressured"),
+        ] {
+            let response = refusals
+                .remove(&request_id)
+                .expect("the exact request has a refusal");
+            assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+            assert_eq!(response.error.as_ref().unwrap().code, code);
+        }
+        assert!(refusals.is_empty());
+        assert_eq!(state.pending_requests.len(), core_capacity);
 
         let terminal_body =
             encode_output(b"terminal-after-refusal").expect("encode terminal output after refusal");
@@ -7780,13 +7915,13 @@ return botster.register({
             sibling_status,
         ));
         let sibling_deadline = Instant::now() + Duration::from_secs(2);
-        while state.pending_requests.len() > botster_hub_client::MAX_OUTSTANDING_REQUESTS {
+        while state.pending_requests.len() > core_capacity {
             assert!(!drive_ready_test_turn(&mut daemon, &mut state,));
             assert!(
                 Instant::now() < sibling_deadline,
                 "the sibling Status request must complete while the plugin handler is held"
             );
-            if state.pending_requests.len() > botster_hub_client::MAX_OUTSTANDING_REQUESTS {
+            if state.pending_requests.len() > core_capacity {
                 thread::sleep(Duration::from_millis(5));
             }
         }
@@ -7816,7 +7951,8 @@ return botster.register({
         }
 
         let mut completed = vec![false; botster_hub_client::MAX_OUTSTANDING_REQUESTS + 1];
-        for _ in 0..botster_hub_client::MAX_OUTSTANDING_REQUESTS {
+        completed[core_refused_id] = true;
+        for _ in 0..core_capacity {
             let DaemonUnixMuxFrame::Server(ServerFrame::Response {
                 request_id,
                 response,
@@ -8039,6 +8175,7 @@ return botster.register({
 
     #[test]
     fn plugin_response_waits_for_host_capacity_and_retains_the_same_row_through_cleanup() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
         for retirement in [None, Some("connection_close"), Some("deadline")] {
             let root = unique_package_control_dir(&format!("controlled-plugin-{retirement:?}"));
             let data_directory = root.join("data");
@@ -8262,6 +8399,7 @@ return botster.register({
 
     #[test]
     fn shutdown_waits_for_worker_reclamation_of_entity_payload() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
         for source in ["provider", "fanout"] {
             let root = unique_package_control_dir(&format!("shutdown-entity-payload-{source}"));
             let package_dir = root.join("owner-entity-gate");
@@ -8358,6 +8496,59 @@ return botster.register({
                 );
                 thread::yield_now();
             }
+            let mut shutdown_reply = start_async_control_request(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::DaemonShutdown,
+                "shutdown-client",
+                "shutdown-request",
+            );
+            let shutdown_waiter = state.shutdown_waiter.unwrap();
+            // Hold the real preparation receipt before it can start entity cancellation.
+            // Shutdown preparation must use a Host worker before all workers are gated.
+            let prepared = loop {
+                let runtime = daemon.runtime().unwrap();
+                let identities = runtime.take_owner_core_completions(
+                    crate::data_plane::driver::CORE_OWNER_COMPLETION_CAPACITY,
+                );
+                let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                let consumed = crate::daemon::control::pending::absorb_core_completions(
+                    &mut state,
+                    &identities,
+                    &mut budget,
+                );
+                runtime.restore_owner_core_completions(&identities[consumed..]);
+                let mut entry = state.pending_requests.remove(&shutdown_waiter).unwrap();
+                assert!(matches!(
+                    entry.continuation.poll(&mut daemon, &mut state),
+                    crate::daemon::control::pending::ControlPoll::Pending,
+                ));
+                state.pending_requests.insert(shutdown_waiter, entry);
+                match daemon.runtime().unwrap().host_executor().poll_completion() {
+                    crate::host_executor::HostCompletionPoll::Ready(completion)
+                        if completion.identity.waiter_id == shutdown_waiter =>
+                    {
+                        assert_eq!(completion.identity.phase, 1);
+                        assert!(matches!(
+                            completion.result,
+                            crate::host_executor::HostResult::StatusResponsePrepared(_)
+                        ));
+                        break completion;
+                    }
+                    crate::host_executor::HostCompletionPoll::Ready(completion) => {
+                        crate::subscription::entity::route_host_completion(&mut state, completion);
+                    }
+                    crate::host_executor::HostCompletionPoll::Empty => {}
+                    crate::host_executor::HostCompletionPoll::Stopped => {
+                        panic!("Host must prepare Shutdown")
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Shutdown preparation must complete"
+                );
+                thread::yield_now();
+            };
             let mut gates = Vec::new();
             for _ in 0..crate::host_executor::HOST_WORKER_COUNT {
                 let gate = std::sync::Arc::new(crate::host_executor::TestHostGate::default());
@@ -8380,13 +8571,8 @@ return botster.register({
                 }
                 gates.push(gate);
             }
-            let mut shutdown_reply = start_async_control_request(
-                &mut daemon,
-                &mut state,
-                DaemonRequest::DaemonShutdown,
-                "shutdown-client",
-                "shutdown-request",
-            );
+
+            crate::subscription::entity::route_host_completion(&mut state, prepared);
             let (late_frame_tx, _late_frame_rx) = tokio_mpsc::channel(8);
             let (late_reply_tx, late_reply_rx) =
                 crate::daemon::control::message::control_reply_channel();
@@ -8410,13 +8596,61 @@ return botster.register({
                 refusal.error.as_ref().map(|error| error.code.as_str()),
                 Some("daemon_shutting_down")
             );
-            while state.plugin_entities.has_retained_snapshot_payload() {
+            loop {
                 assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                if !state.host_completions.contains_key(&shutdown_waiter)
+                    && state
+                        .plugin_entities
+                        .test_cancelled_host_identity()
+                        .is_some()
+                    && state.owner_ready.is_empty()
+                {
+                    break;
+                }
                 assert!(
                     Instant::now() < deadline,
-                    "the payload must transfer to queued worker cleanup"
+                    "Shutdown must consume preparation and wait for Host cleanup: {source}"
                 );
                 thread::yield_now();
+            }
+            assert_eq!(state.pending_requests[&shutdown_waiter].last_host_phase, 1);
+            assert_eq!(state.shutdown_waiter, Some(shutdown_waiter));
+            let cancelled_host_identity = state
+                .plugin_entities
+                .test_cancelled_host_identity()
+                .expect("the cancelled entity owns a running Host phase");
+            assert_ne!(cancelled_host_identity.waiter_id, shutdown_waiter);
+            assert!(
+                state
+                    .plugin_entities
+                    .has_waiter(cancelled_host_identity.waiter_id)
+            );
+            assert!(
+                state
+                    .plugin_entities
+                    .accepts_host_completion(cancelled_host_identity)
+            );
+            // Model cleanup can precede payload disposal under the same retained permit.
+            if state.plugin_entities.has_retained_snapshot_payload() {
+                assert!(
+                    !daemon.runtime().unwrap().entity_model_available(),
+                    "a retained payload must wait for its Host model operation: {source}"
+                );
+            }
+            assert!(
+                daemon.runtime().unwrap().host_executor().outstanding()
+                    >= crate::host_executor::HOST_WORKER_COUNT + 2
+            );
+            for _ in 0..3 {
+                assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+                assert!(
+                    state.owner_ready.is_empty(),
+                    "blocked cleanup must not spin: {source}"
+                );
+                assert_eq!(
+                    state.plugin_entities.test_cancelled_host_identity(),
+                    Some(cancelled_host_identity)
+                );
             }
             assert!(crate::daemon::control::entities::plugin_entity_cleanup_pending(&state));
             assert_eq!(state.budget.outstanding(), baseline + 2);
@@ -8437,6 +8671,18 @@ return botster.register({
             let response = receive_test_control_reply(shutdown_reply).expect("shutdown response");
             assert_eq!(response.kind, DaemonResponseKind::Shutdown);
             assert!(!crate::daemon::control::entities::plugin_entity_cleanup_pending(&state));
+            assert!(!state.plugin_entities.has_retained_snapshot_payload());
+            assert!(
+                !state
+                    .plugin_entities
+                    .has_waiter(cancelled_host_identity.waiter_id)
+            );
+            assert!(
+                state
+                    .plugin_entities
+                    .test_cancelled_host_identity()
+                    .is_none()
+            );
             assert_eq!(state.budget.outstanding(), baseline);
             assert_eq!(state.plugin_result_budget.retained_bytes(), 0);
             daemon.stop();
@@ -8446,6 +8692,7 @@ return botster.register({
 
     #[test]
     fn abandoned_plugin_entity_subscriptions_release_owner_capacity() {
+        let _gate_owner = ControlledPluginGateGuard::acquire();
         for retire_reason in ["connection_close", "deadline"] {
             let root =
                 unique_package_control_dir(&format!("controlled-plugin-entity-{retire_reason}"));
@@ -9319,9 +9566,7 @@ return botster.register({
             grant_id: None,
             transport_request_id: None,
         };
-        state.current_waiter_id = daemon
-            .runtime()
-            .and_then(|runtime| runtime.next_waiter_id());
+        state.current_waiter_id = state.waiter_ids.next();
         let step = handle_control_request(
             daemon,
             state,
@@ -9338,6 +9583,11 @@ return botster.register({
         let deadline = Instant::now() + Duration::from_secs(10);
         let response = loop {
             if let Some(runtime) = daemon.runtime() {
+                // Collect registered Core identities before polling their returned values.
+                // Keep reconcile application under the calling fixture's control.
+                runtime.take_owner_core_completions(
+                    crate::data_plane::driver::CORE_OWNER_COMPLETION_CAPACITY,
+                );
                 runtime.reap_detached_core_operations();
             }
             match pending.continuation.poll(daemon, state) {

@@ -300,6 +300,15 @@ impl PluginEntityState {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_cancelled_host_identity(
+        &self,
+    ) -> Option<crate::host_executor::HostJobIdentity> {
+        self.pending
+            .values()
+            .find_map(|entry| entry.work.test_cancelled_host_identity())
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_retained_snapshot_payload(&self) -> bool {
         self.pending.values().any(|entry| {
             entry

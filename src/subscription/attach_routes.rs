@@ -800,24 +800,6 @@ pub(crate) fn hello_requires_terminal_subscription_closed(required_features: &[S
         .any(|feature| feature == FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
 }
 
-pub(crate) fn live_generation_for_route(
-    inventory: &[TerminalSubscriptionRecord],
-    client_id: &str,
-    session_id: &str,
-    subscription_id: &str,
-) -> Option<TerminalSubscriptionGeneration> {
-    inventory.iter().find_map(|row| {
-        if row.client_id.0 == client_id
-            && row.session_id.0 == session_id
-            && row.subscription_id.0 == subscription_id
-        {
-            Some(row.generation)
-        } else {
-            None
-        }
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttachedSubscription {
     pub session_id: String,

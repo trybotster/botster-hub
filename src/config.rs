@@ -643,8 +643,10 @@ impl CoreEngineOptions {
             request_response_queue_byte_capacity: defaults.request_response_queue_byte_capacity,
             background_queue_capacity: defaults.background_queue_capacity,
             background_queue_byte_capacity: defaults.background_queue_byte_capacity,
-            completion_queue_capacity: defaults.completion_queue_capacity,
-            completion_queue_byte_capacity: defaults.completion_queue_byte_capacity,
+            completion_reservation_byte_capacity:
+                crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY,
+            completion_queue_capacity: 256,
+            completion_queue_byte_capacity: 32 * 1024 * 1024,
         }
     }
 
@@ -663,6 +665,7 @@ impl CoreEngineOptions {
                 field: "core_engine.plugin_worker_executor_concurrency",
             });
         }
+        validate_plugin_completion_capacities(&self.plugin_worker_config())?;
         self.session_io_coalescing.validate()?;
         if let Some(path) = &self.session_worker_path {
             validate_non_empty_path("core_engine.session_worker_path", path)?;
@@ -675,6 +678,69 @@ impl CoreEngineOptions {
 
         Ok(())
     }
+}
+
+/// Guard the fixed completion policy against inconsistent changes at startup.
+fn validate_plugin_completion_capacities(
+    config: &PluginWorkerEngineConfig,
+) -> Result<(), HubConfigError> {
+    use crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY;
+    use crate::lifecycle::{
+        BACKGROUND_COMPLETION_ALLOWANCE, REQUEST_RESPONSE_COMPLETION_ALLOWANCE,
+    };
+
+    validate_positive_usize(
+        "plugin_worker.completion_queue_capacity",
+        config.completion_queue_capacity,
+    )?;
+    validate_positive_usize(
+        "plugin_worker.completion_queue_byte_capacity",
+        config.completion_queue_byte_capacity,
+    )?;
+    validate_positive_usize(
+        "plugin_worker.completion_reservation_byte_capacity",
+        config.completion_reservation_byte_capacity,
+    )?;
+    for (field, allowance) in [
+        (
+            "plugin_worker.request_response_completion_allowance",
+            REQUEST_RESPONSE_COMPLETION_ALLOWANCE,
+        ),
+        (
+            "plugin_worker.background_completion_allowance",
+            BACKGROUND_COMPLETION_ALLOWANCE,
+        ),
+    ] {
+        validate_positive_usize(field, allowance)?;
+        if allowance > config.completion_reservation_byte_capacity {
+            return Err(HubConfigError::InvalidPluginCompletionCapacity {
+                field,
+                constraint: "must not exceed the per-completion byte capacity",
+            });
+        }
+    }
+    // Core's per-completion cap bounds payload; its shared pool also charges
+    // logical completion-store metadata. Hub retains only the encoded result.
+    let reservation_bytes = config
+        .completion_reservation_byte_capacity
+        .checked_add(botster_core::PluginWorkerEngine::completion_reservation_metadata_bytes())
+        .ok_or(HubConfigError::InvalidPluginCompletionCapacity {
+            field: "plugin_worker.completion_reservation_byte_capacity",
+            constraint: "payload plus metadata must not overflow",
+        })?;
+    if config.completion_reservation_byte_capacity > RETAINED_PLUGIN_RESULT_BYTE_CAPACITY {
+        return Err(HubConfigError::InvalidPluginCompletionCapacity {
+            field: "plugin_worker.completion_reservation_byte_capacity",
+            constraint: "must not exceed Hub retention",
+        });
+    }
+    if reservation_bytes > config.completion_queue_byte_capacity {
+        return Err(HubConfigError::InvalidPluginCompletionCapacity {
+            field: "plugin_worker.completion_reservation_byte_capacity",
+            constraint: "payload plus metadata must not exceed the Core completion pool",
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -773,6 +839,10 @@ pub enum HubConfigError {
     InvalidCapacity {
         field: &'static str,
     },
+    InvalidPluginCompletionCapacity {
+        field: &'static str,
+        constraint: &'static str,
+    },
     InvalidPluginWorkerReservation {
         field: &'static str,
     },
@@ -796,6 +866,9 @@ impl fmt::Display for HubConfigError {
             ),
             Self::InvalidCapacity { field } => {
                 write!(formatter, "{field} must be greater than zero")
+            }
+            Self::InvalidPluginCompletionCapacity { field, constraint } => {
+                write!(formatter, "{field} {constraint}")
             }
             Self::InvalidPluginWorkerReservation { field } => write!(
                 formatter,
@@ -885,6 +958,122 @@ mod tests {
         assert_eq!(
             mapped.background_queue_capacity,
             defaults.background_queue_capacity
+        );
+    }
+
+    #[test]
+    fn completion_capacity_policy_uses_separate_pool_and_retention_limits() {
+        let config = CoreEngineOptions::default().plugin_worker_config();
+        assert_eq!(config.completion_queue_capacity, 256);
+        assert_eq!(config.completion_queue_byte_capacity, 32 * 1024 * 1024);
+        assert_eq!(config.completion_reservation_byte_capacity, 8 * 1024 * 1024);
+        validate_plugin_completion_capacities(&config).unwrap();
+    }
+
+    #[test]
+    fn completion_capacity_policy_rejects_zero_startup_capacities() {
+        let defaults = CoreEngineOptions::default().plugin_worker_config();
+        for (config, field) in [
+            (
+                PluginWorkerEngineConfig {
+                    completion_queue_capacity: 0,
+                    ..defaults.clone()
+                },
+                "plugin_worker.completion_queue_capacity",
+            ),
+            (
+                PluginWorkerEngineConfig {
+                    completion_queue_byte_capacity: 0,
+                    ..defaults.clone()
+                },
+                "plugin_worker.completion_queue_byte_capacity",
+            ),
+            (
+                PluginWorkerEngineConfig {
+                    completion_reservation_byte_capacity: 0,
+                    ..defaults
+                },
+                "plugin_worker.completion_reservation_byte_capacity",
+            ),
+        ] {
+            assert_eq!(
+                validate_plugin_completion_capacities(&config),
+                Err(HubConfigError::InvalidCapacity { field })
+            );
+        }
+    }
+
+    #[test]
+    fn completion_capacity_policy_identifies_each_invalid_bound() {
+        let defaults = CoreEngineOptions::default().plugin_worker_config();
+        for (config, field, constraint) in [
+            (
+                PluginWorkerEngineConfig {
+                    completion_reservation_byte_capacity: 1024 * 1024 - 1,
+                    ..defaults.clone()
+                },
+                "plugin_worker.request_response_completion_allowance",
+                "must not exceed the per-completion byte capacity",
+            ),
+            (
+                PluginWorkerEngineConfig {
+                    completion_reservation_byte_capacity: 8 * 1024 * 1024 + 1,
+                    ..defaults.clone()
+                },
+                "plugin_worker.completion_reservation_byte_capacity",
+                "must not exceed Hub retention",
+            ),
+            (
+                PluginWorkerEngineConfig {
+                    completion_queue_byte_capacity: 8 * 1024 * 1024 - 1,
+                    ..defaults
+                },
+                "plugin_worker.completion_reservation_byte_capacity",
+                "payload plus metadata must not exceed the Core completion pool",
+            ),
+        ] {
+            assert_eq!(
+                validate_plugin_completion_capacities(&config),
+                Err(HubConfigError::InvalidPluginCompletionCapacity { field, constraint })
+            );
+        }
+    }
+
+    #[test]
+    fn completion_capacity_policy_admits_exact_payload_plus_metadata_pool() {
+        let mut config = CoreEngineOptions::default().plugin_worker_config();
+        let metadata = botster_core::PluginWorkerEngine::completion_reservation_metadata_bytes();
+        assert!(metadata > 0);
+        config.completion_queue_byte_capacity = config
+            .completion_reservation_byte_capacity
+            .checked_add(metadata)
+            .unwrap();
+        assert_eq!(validate_plugin_completion_capacities(&config), Ok(()));
+        config.completion_queue_byte_capacity -= 1;
+        // Payload alone fits, but the full retained reservation does not.
+        assert!(
+            config.completion_queue_byte_capacity >= config.completion_reservation_byte_capacity
+        );
+        assert_eq!(
+            validate_plugin_completion_capacities(&config),
+            Err(HubConfigError::InvalidPluginCompletionCapacity {
+                field: "plugin_worker.completion_reservation_byte_capacity",
+                constraint: "payload plus metadata must not exceed the Core completion pool",
+            })
+        );
+    }
+
+    #[test]
+    fn completion_capacity_policy_rejects_payload_plus_metadata_overflow() {
+        let mut config = CoreEngineOptions::default().plugin_worker_config();
+        config.completion_reservation_byte_capacity = usize::MAX;
+        config.completion_queue_byte_capacity = usize::MAX;
+        assert_eq!(
+            validate_plugin_completion_capacities(&config),
+            Err(HubConfigError::InvalidPluginCompletionCapacity {
+                field: "plugin_worker.completion_reservation_byte_capacity",
+                constraint: "payload plus metadata must not overflow",
+            })
         );
     }
 

@@ -396,10 +396,8 @@ fn hub_runtime_passes_split_plugin_worker_config_to_core_engine() {
         snapshot.configured_background_queue_capacity,
         defaults.background_queue_capacity
     );
-    assert_eq!(
-        snapshot.configured_completion_queue_capacity,
-        defaults.completion_queue_capacity
-    );
+    // Hub fixes the completion count at 256 in src/config.rs.
+    assert_eq!(snapshot.configured_completion_queue_capacity, 256);
     assert_eq!(snapshot.live_plugin_executors, 1);
     assert_eq!(snapshot.live_executor_workers, 3);
 

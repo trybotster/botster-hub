@@ -99,7 +99,9 @@ impl HubDaemon {
     /// Start the local daemon from explicit, already-validated hub config.
     pub fn start(config: HubConfig) -> HubDaemonResult<Self> {
         let installation_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let maximum_completion_bytes = config.plugin_worker_config().completion_queue_byte_capacity;
+        let maximum_completion_bytes = config
+            .plugin_worker_config()
+            .completion_reservation_byte_capacity;
         validate_plugin_result_capacity(maximum_completion_bytes)?;
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let state_source = if store.path().exists() {

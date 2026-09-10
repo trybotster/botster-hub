@@ -951,7 +951,7 @@ mod tests {
         assert!(disposed_rx.try_recv().is_err());
         gate.release();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !state.pending_requests.is_empty() {
+        while !state.pending_requests.is_empty() || runtime.host_executor().prepared_bytes() != 0 {
             dispose_terminal_requests(runtime, &mut state);
             assert_eq!(state.budget.outstanding(), state.pending_requests.len());
             assert!(

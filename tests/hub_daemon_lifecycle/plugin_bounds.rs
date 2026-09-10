@@ -20,10 +20,8 @@ fn daemon_restart_preserves_split_plugin_worker_configuration() {
         initial.configured_background_queue_capacity,
         defaults.background_queue_capacity
     );
-    assert_eq!(
-        initial.configured_completion_queue_capacity,
-        defaults.completion_queue_capacity
-    );
+    // Hub fixes the completion count at 256 in src/config.rs.
+    assert_eq!(initial.configured_completion_queue_capacity, 256);
     daemon.stop();
 
     let mut restarted = HubDaemon::start(config).expect("restart configured daemon");
@@ -41,10 +39,8 @@ fn daemon_restart_preserves_split_plugin_worker_configuration() {
         reopened.configured_background_queue_capacity,
         defaults.background_queue_capacity
     );
-    assert_eq!(
-        reopened.configured_completion_queue_capacity,
-        defaults.completion_queue_capacity
-    );
+    // Hub fixes the completion count at 256 in src/config.rs.
+    assert_eq!(reopened.configured_completion_queue_capacity, 256);
     restarted.stop();
 }
 
@@ -295,4 +291,3 @@ fn focused_plugin_resources_are_bounded_across_reconnect_reload_idle_and_unload(
 
     daemon.shutdown();
 }
-

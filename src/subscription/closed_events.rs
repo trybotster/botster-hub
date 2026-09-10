@@ -751,7 +751,7 @@ mod tests {
             .next()
             .expect("Detach arm end");
         let core = arm
-            .find("HubClientRequest::Detach")
+            .find("runtime.detach_route_exact_or_owned_for_owner")
             .expect("Core Detach request");
         assert_eq!(
             arm[..core].matches("mux.suppress_generation").count(),
