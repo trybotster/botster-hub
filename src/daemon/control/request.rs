@@ -170,7 +170,9 @@ pub(crate) fn handle(
         client,
         permit: Some(permit),
         past_deadline: false,
-        continuation: Box::new(|_, _| crate::daemon::control::pending::ControlPoll::Pending),
+        continuation: crate::daemon::control::pending::ControlContinuation::callback(|_, _| {
+            crate::daemon::control::pending::ControlPoll::Pending
+        }),
         retire: None,
     };
     match step {

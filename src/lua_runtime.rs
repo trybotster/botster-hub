@@ -134,6 +134,8 @@ impl HubCoordinationBridge {
             .lock()
             .map_err(|_| "coordination queue lock poisoned".to_string())?
             .push_back(PendingCoordinationRequest {
+                #[cfg(test)]
+                terminal_drop_probe: None,
                 operation,
                 response,
             });
@@ -148,9 +150,63 @@ impl HubCoordinationBridge {
             .expect("coordination queue lock")
             .pop_front()
     }
+
+    /// Host-only terminal cleanup, after the engine receipt seals all producers.
+    /// Poison cannot invalidate ownership of the actual queue entries: terminal
+    /// cleanup extracts the container without interpreting normal queue state.
+    /// A destructor panic propagates to the enclosing Host disposal receipt.
+    pub(crate) fn dispose_terminal_pending(&self) -> bool {
+        let pending = {
+            let mut queue = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *queue)
+        };
+        drop(pending);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_queue_pending(
+        &self,
+        operation: PendingCoordinationOperation,
+    ) -> mpsc::Receiver<Result<HubCoordinationResponse, String>> {
+        let (response, receiver) = mpsc::channel();
+        self.pending
+            .lock()
+            .unwrap()
+            .push_back(PendingCoordinationRequest {
+                terminal_drop_probe: None,
+                operation,
+                response,
+            });
+        receiver
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_count(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_pending_drop_probe(&self, probe: impl Send + 'static) {
+        let mut queue = self.pending.lock().unwrap();
+        let head = queue
+            .front_mut()
+            .expect("a real pending coordination request");
+        assert!(head.terminal_drop_probe.is_none());
+        head.terminal_drop_probe = Some(Box::new(probe));
+    }
 }
 
 pub(crate) struct PendingCoordinationRequest {
+    // Drop before actual payload fields so terminal tests can pause destruction.
+    #[cfg(test)]
+    terminal_drop_probe: Option<Box<dyn Send>>,
     pub(crate) operation: PendingCoordinationOperation,
     pub(crate) response: mpsc::Sender<Result<HubCoordinationResponse, String>>,
 }
@@ -1727,6 +1783,194 @@ fn sanitize_lua_error(error: mlua::Error) -> String {
         .next()
         .unwrap_or("lua runtime error")
         .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod terminal_bridge_tests {
+    use super::*;
+    use crate::host_executor::{HostExecutor, HostJobIdentity};
+    use crate::owner_identity::WaiterId;
+
+    pub(super) struct PendingDropGate {
+        released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        entered: mpsc::Receiver<(String, bool)>,
+    }
+
+    impl PendingDropGate {
+        pub(super) fn wait(&self) {
+            let (worker, unlocked) = self.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(worker.starts_with("botster-hub-host"));
+            assert!(
+                unlocked,
+                "actual pending payload destruction must follow queue unlock"
+            );
+        }
+
+        pub(super) fn release(&self) {
+            *self.released.0.lock().unwrap() = true;
+            self.released.1.notify_all();
+        }
+    }
+
+    impl Drop for PendingDropGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    pub(super) fn pending_drop_gate(
+        unlocked: impl FnOnce() -> bool + Send + 'static,
+    ) -> (PendingDropGate, Box<dyn Send>) {
+        struct Probe {
+            released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+            entered: mpsc::Sender<(String, bool)>,
+            unlocked: Option<Box<dyn FnOnce() -> bool + Send>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let unlocked = self.unlocked.take().unwrap()();
+                let _ = self.entered.send((
+                    thread::current().name().unwrap_or("unnamed").to_string(),
+                    unlocked,
+                ));
+                let mut released = self.released.0.lock().unwrap();
+                while !*released {
+                    released = self.released.1.wait(released).unwrap();
+                }
+            }
+        }
+        let released = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered, receiver) = mpsc::channel();
+        let probe = Probe {
+            released: released.clone(),
+            entered,
+            unlocked: Some(Box::new(unlocked)),
+        };
+        (
+            PendingDropGate {
+                released,
+                entered: receiver,
+            },
+            Box::new(probe),
+        )
+    }
+
+    pub(super) fn host_clear(
+        clear: impl FnOnce() -> bool + Send + 'static,
+    ) -> (
+        HostExecutor,
+        crate::host_disposal::Job,
+        mpsc::Receiver<bool>,
+    ) {
+        struct Clear {
+            action: Option<Box<dyn FnOnce() -> bool + Send>>,
+            finished: mpsc::Sender<bool>,
+        }
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                let cleared = self.action.take().unwrap()();
+                let _ = self.finished.send(cleared);
+            }
+        }
+        let executor = HostExecutor::new();
+        let (finished, receiver) = mpsc::channel();
+        let job = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+            identity: HostJobIdentity::first(WaiterId(31)),
+            permit: executor.try_reserve().unwrap(),
+            model: None,
+            payload: Box::new(Clear {
+                action: Some(Box::new(clear)),
+                finished,
+            }),
+        });
+        (executor, job, receiver)
+    }
+
+    pub(super) fn finish_host_clear(executor: &HostExecutor, job: &mut crate::host_disposal::Job) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match job.poll() {
+                crate::host_disposal::Poll::Disposed(permit) => {
+                    drop(permit);
+                    break;
+                }
+                crate::host_disposal::Poll::Pending => assert!(Instant::now() < deadline),
+                _ => panic!("actual pending destruction must produce the outer disposal receipt"),
+            }
+            thread::yield_now();
+        }
+        assert_eq!(executor.outstanding(), 0);
+        assert_eq!(executor.prepared_bytes(), 0);
+    }
+
+    #[test]
+    fn terminal_coordination_pending_clears_actual_queue_on_host_even_after_poison() {
+        for poisoned in [false, true] {
+            let bridge = HubCoordinationBridge::new();
+            let responses: Vec<_> = (0..2)
+                .map(|_| {
+                    bridge.test_queue_pending(PendingCoordinationOperation::Drain {
+                        target: EnvelopeTarget::Topic {
+                            topic: "retained-coordination-payload".repeat(256),
+                        },
+                        after: None,
+                        limit: 7,
+                    })
+                })
+                .collect();
+            let queue = bridge.pending.clone();
+            let (gate, probe) = pending_drop_gate(move || {
+                !matches!(queue.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+            });
+            bridge.test_set_pending_drop_probe(probe);
+            if poisoned {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _guard = bridge.pending.lock().unwrap();
+                        panic!("retained coordination queue poison");
+                    }))
+                    .is_err()
+                );
+            }
+            assert_eq!(bridge.test_pending_count(), 2);
+            let worker_bridge = bridge.clone();
+            let (executor, mut job, finished) =
+                host_clear(move || worker_bridge.dispose_terminal_pending());
+            gate.wait();
+            assert_eq!(bridge.test_pending_count(), 0);
+            assert!(matches!(job.poll(), crate::host_disposal::Poll::Pending));
+            assert!(matches!(
+                finished.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            for response in &responses {
+                assert!(
+                    matches!(response.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                    "the extracted requests still own their response senders at the payload gate"
+                );
+            }
+            assert_eq!(executor.outstanding(), 1);
+            gate.release();
+            assert!(finished.recv_timeout(Duration::from_secs(5)).unwrap());
+            finish_host_clear(&executor, &mut job);
+            for response in responses {
+                assert!(matches!(
+                    response.try_recv(),
+                    Err(mpsc::TryRecvError::Disconnected)
+                ));
+            }
+            assert_eq!(
+                bridge.test_pending_count(),
+                0,
+                "a live Owner alias observes actual clearing, not last-Arc drop"
+            );
+            assert_eq!(
+                bridge.pending.is_poisoned(),
+                poisoned,
+                "terminal cleanup does not repair ordinary operation"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

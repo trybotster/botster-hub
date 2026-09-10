@@ -79,6 +79,53 @@ impl std::fmt::Debug for PluginControlState {
 }
 
 impl PluginControlState {
+    pub(crate) fn owns_waiter(&self, waiter: WaiterId) -> bool {
+        self.by_waiter.contains_key(&waiter)
+    }
+
+    pub(crate) fn take_terminal_parts(
+        &mut self,
+        waiter: WaiterId,
+        completion: &mut Option<crate::host_executor::HostCompletion>,
+        executor: &crate::host_executor::HostExecutor,
+    ) -> Option<crate::host_disposal::Parts> {
+        let key = self.by_waiter.get(&waiter)?;
+        let entry = self
+            .pending
+            .get_mut(key)
+            .expect("plugin waiter retains its row");
+        let mut payload: Option<Box<dyn Send>> = None;
+        let (identity, permit) = if let Some(completion) = completion.take() {
+            let (identity, result, permit) = completion.into_parts();
+            payload = Some(Box::new(result));
+            (identity, permit)
+        } else if let Some(failure) = entry.submission_failure.take() {
+            payload = Some(Box::new(failure.command));
+            (failure.identity, failure.permit)
+        } else if entry.kind.is_none() {
+            return None;
+        } else {
+            (OwnerWorkIdentity::first(waiter), executor.try_reserve()?)
+        };
+        entry.reply_live.store(false, Ordering::Release);
+        let index = self
+            .by_waiter
+            .remove(&waiter)
+            .expect("plugin waiter retains its index");
+        let row = self
+            .pending
+            .remove_entry(&index)
+            .expect("plugin waiter retains its row");
+        self.capacity_waiters.remove(&waiter);
+        self.ready_waiters.remove(&waiter);
+        Some(crate::host_disposal::Parts {
+            identity,
+            permit,
+            payload: Box::new((payload, index, row)),
+            model: None,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn has_pending(&self) -> bool {
         !self.pending.is_empty()

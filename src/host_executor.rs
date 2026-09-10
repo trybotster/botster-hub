@@ -53,6 +53,7 @@ pub(crate) enum HostCommand {
     #[cfg(test)]
     DisposalProbe(TestDisposalProbe),
     Dispose(Box<HostCommand>),
+    TerminalDispose(crate::host_disposal::Work),
     DiscardCompletion(Box<HostResult>),
     EntityModel(crate::runtime::entity_model::Work),
     ReclaimEntityModel(crate::runtime::entity_model::Work),
@@ -109,7 +110,7 @@ impl HostCommand {
         match self {
             #[cfg(test)]
             Self::DisposalProbe(_) => 0,
-            Self::Dispose(_) | Self::DiscardCompletion(_) => 0,
+            Self::Dispose(_) | Self::TerminalDispose(_) | Self::DiscardCompletion(_) => 0,
             Self::EntityModel(_) | Self::ReclaimEntityModel(_) => 0,
             Self::EventOwner { .. } | Self::ClientEventCleanup { .. } => 0,
             Self::PluginEntity(_) | Self::PreparePluginResponse { .. } | Self::StopEntrypoints => 0,
@@ -135,6 +136,7 @@ impl std::fmt::Debug for HostCommand {
             #[cfg(test)]
             Self::DisposalProbe(_) => formatter.write_str("DisposalProbe"),
             Self::Dispose(_) => formatter.write_str("Dispose"),
+            Self::TerminalDispose(_) => formatter.write_str("TerminalDispose"),
             Self::DiscardCompletion(_) => formatter.write_str("DiscardCompletion"),
             Self::EntityModel(work) => formatter
                 .debug_tuple("EntityModel")
@@ -425,6 +427,7 @@ struct HostWake {
     completion_pending: AtomicBool,
     capacity_pending: AtomicBool,
     owner: Mutex<Option<ControlSender>>,
+    terminal_owner: Mutex<Option<std::thread::Thread>>,
 }
 
 impl HostWake {
@@ -433,6 +436,7 @@ impl HostWake {
             completion_pending: AtomicBool::new(false),
             capacity_pending: AtomicBool::new(false),
             owner: Mutex::new(None),
+            terminal_owner: Mutex::new(None),
         }
     }
 
@@ -462,6 +466,14 @@ impl HostWake {
     }
 
     fn wake_owner(&self) {
+        if let Some(owner) = self
+            .terminal_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            owner.unpark();
+        }
         if let Some(sender) = self
             .owner
             .lock()
@@ -554,6 +566,11 @@ pub(crate) struct HostWorkPermit {
 }
 
 impl HostWorkPermit {
+    pub(crate) fn disposal_notifier(&self) -> impl FnOnce() + use<> {
+        let wake = Arc::clone(&self.pool.wake);
+        move || wake.publish_completion()
+    }
+
     /// Use the original slot to discard a command on an existing Host worker.
     /// A refusal returns the complete command and permit to its caller.
     pub(crate) fn dispose(
@@ -726,6 +743,15 @@ impl HostExecutor {
         self.wake.bind(sender);
     }
 
+    /// Terminal shutdown keeps a wake even when the control channel has closed.
+    pub(crate) fn bind_terminal_owner(&self) {
+        *self
+            .wake
+            .terminal_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::thread::current());
+    }
+
     pub(crate) fn try_reserve(&self) -> Option<HostWorkPermit> {
         if self.stopping.load(Ordering::Acquire) {
             return None;
@@ -880,9 +906,22 @@ impl HostExecutor {
         self.wake.capacity_pending.swap(false, Ordering::AcqRel)
     }
 
-    #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
         self.permits.outstanding.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_terminal_probe(&self) -> impl Fn() -> (usize, bool, bool) + Send + 'static {
+        let permits = Arc::clone(&self.permits);
+        let mailbox = Arc::clone(&self.completions);
+        let stopping = Arc::clone(&self.stopping);
+        move || {
+            (
+                permits.outstanding.load(Ordering::Acquire),
+                mailbox.lock().unwrap().is_some(),
+                stopping.load(Ordering::Acquire),
+            )
+        }
     }
 
     #[cfg(test)]
@@ -943,10 +982,6 @@ fn run_worker(
         let Ok(job) = job else {
             return;
         };
-        if stopping.load(Ordering::Acquire) {
-            drop(job);
-            continue;
-        }
         let HostJob {
             identity,
             command,
@@ -959,8 +994,17 @@ fn run_worker(
                 continue;
             }
             HostCommand::Dispose(command) => {
-                drop(command);
-                drop(permit);
+                match *command {
+                    HostCommand::TerminalDispose(work) => work.run(permit),
+                    command => {
+                        drop(command);
+                        drop(permit);
+                    }
+                }
+                continue;
+            }
+            HostCommand::TerminalDispose(work) => {
+                work.run(permit);
                 continue;
             }
             HostCommand::ReclaimSessionTypeCatalog(reclamation) => {
@@ -975,6 +1019,11 @@ fn run_worker(
             }
             command => command,
         };
+        if stopping.load(Ordering::Acquire) {
+            drop(command);
+            drop(permit);
+            continue;
+        }
         let generation = command.generation();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             execute(identity, command, &entrypoints, &mut permit)
@@ -1057,7 +1106,9 @@ fn execute(
                 dispose_probe: Some(probe),
             })
         }
-        HostCommand::Dispose(_) | HostCommand::DiscardCompletion(_) => {
+        HostCommand::Dispose(_)
+        | HostCommand::TerminalDispose(_)
+        | HostCommand::DiscardCompletion(_) => {
             unreachable!("worker handles disposal before execution")
         }
         HostCommand::EntityModel(work) => HostResult::EntityModelComplete(work.run(identity)),
@@ -1326,6 +1377,55 @@ mod tests {
         for worker in workers {
             worker.join().expect("disposal worker exits normally");
         }
+    }
+
+    #[test]
+    fn terminal_disposal_refusal_keeps_the_original_payload_and_slot_for_retry() {
+        let executor = HostExecutor::new();
+        let mut permit = executor.try_reserve().unwrap();
+        let original_sender = permit.disposal.clone();
+        let (blocked_sender, _blocked_receiver) = mpsc::sync_channel(0);
+        permit.disposal = blocked_sender;
+        let identity = HostJobIdentity::first(WaiterId(89));
+        let (dropped, receiver) = mpsc::channel();
+        let mut job = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+            identity,
+            permit,
+            payload: Box::new(TestDisposalProbe {
+                dropped,
+                executed: Arc::new(AtomicBool::new(false)),
+            }),
+            model: None,
+        });
+        assert_eq!(job.refused(), Some(HostSubmitError::Full));
+        assert!(matches!(job.poll(), crate::host_disposal::Poll::Pending));
+        assert_eq!(job.refused(), Some(HostSubmitError::Full));
+        assert_eq!(executor.outstanding(), 1);
+        assert_eq!(executor.prepared_bytes(), HOST_PREPARED_BYTE_CAPACITY);
+        assert!(receiver.try_recv().is_err());
+        let failure = job.test_failure_mut().unwrap();
+        assert_eq!(failure.identity, identity);
+        failure.permit.disposal = original_sender;
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
+                drop(permit);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the same disposal record retries its original permit"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .starts_with("botster-hub-host")
+        );
+        assert_eq!(executor.outstanding(), 0);
+        assert_eq!(executor.prepared_bytes(), 0);
     }
 
     #[test]

@@ -79,6 +79,387 @@ mod tests {
     }
 
     #[test]
+    fn terminal_disposal_retains_model_charges_until_the_outer_receipt() {
+        struct Gate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Gate {
+            fn release(&self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+        struct Probe {
+            gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+            entered: std::sync::mpsc::Sender<String>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.entered.send(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_string(),
+                );
+                let mut released = self.gate.0.lock().unwrap();
+                while !*released {
+                    released = self.gate.1.wait(released).unwrap();
+                }
+            }
+        }
+        for poisoned in [false, true] {
+            let runtime = super::super::tests::family_runtime("terminal-model-charge");
+            let (bridge, mutation) = charged_mutation();
+            let charge = bridge.retained_counts();
+            runtime
+                .package_entities
+                .lock()
+                .unwrap()
+                .fanout
+                .try_push(LeasedFanoutMutation {
+                    lease: Some(EntityMutationLease {
+                        scope_id: 17,
+                        family_token: 23,
+                        family: "p.item".into(),
+                        generation: 7,
+                        seq: 3,
+                        admission: mutation.admission().cloned(),
+                    }),
+                    mutation,
+                    generation: 7,
+                })
+                .unwrap();
+            runtime
+                .entity_model_owner
+                .update_readiness(&runtime.package_entities.lock().unwrap());
+            let other_slots: Vec<_> = (1..crate::host_executor::HOST_OPERATION_CAPACITY)
+                .map(|_| runtime.host_executor().try_reserve().unwrap())
+                .collect();
+            let permit = runtime.host_executor().try_reserve().unwrap();
+            let work = runtime
+                .begin_entity_model(
+                    identity(),
+                    Operation::TakeFanout { retained: None },
+                    &permit,
+                )
+                .unwrap_or_else(|_| panic!("model capacity is available"));
+            work.0.state.lock().unwrap().fail_after_operation = poisoned;
+            runtime
+                .host_executor()
+                .submit(identity(), HostCommand::EntityModel(work.clone()), permit)
+                .unwrap();
+            let completed = completion(&runtime);
+            assert!(matches!(
+                (&completed.result, poisoned),
+                (HostResult::EntityModelComplete(Kind::TakeFanout), false)
+                    | (HostResult::Failed { .. }, true)
+            ));
+            let (identity, result, permit) = completed.into_parts();
+            let gate = Gate(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let mut job = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+                identity,
+                permit,
+                model: Some(work.clone()),
+                payload: Box::new((
+                    result,
+                    Probe {
+                        gate: gate.0.clone(),
+                        entered: entered_tx,
+                    },
+                )),
+            });
+            let worker = entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(worker.starts_with("botster-hub-host"));
+            assert!(work.terminal_disposed());
+            assert!(matches!(job.poll(), crate::host_disposal::Poll::Pending));
+            assert!(!runtime.entity_model_available());
+            assert!(runtime.host_executor().try_reserve().is_none());
+            assert_eq!(
+                bridge.retained_counts(),
+                charge,
+                "terminal disposal retains the exact causal charge until the outer receipt"
+            );
+            assert!(work.completed(identity, Kind::TakeFanout).is_none());
+            gate.release();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let permit = loop {
+                if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
+                    break permit;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            };
+            assert_eq!(bridge.retained_counts(), charge);
+            assert!(runtime.retire_terminal_entity_model(&work));
+            drop(work);
+            assert!(runtime.entity_model_available());
+            assert_eq!(bridge.retained_counts(), (0, 0));
+            drop(permit);
+            drop(other_slots);
+            assert_eq!(runtime.host_executor().outstanding(), 0);
+            assert_eq!(runtime.host_executor().prepared_bytes(), 0);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TerminalSnapshotCase {
+        Ready,
+        Discarded,
+        ReleaseResync,
+    }
+
+    fn terminal_snapshot_disposal(case: TerminalSnapshotCase) {
+        struct Gate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Gate {
+            fn release(&self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+        struct OuterPayload {
+            gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+            entered: std::sync::mpsc::Sender<String>,
+        }
+        impl Drop for OuterPayload {
+            fn drop(&mut self) {
+                let _ = self.entered.send(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_string(),
+                );
+                let mut released = self.gate.0.lock().unwrap();
+                while !*released {
+                    released = self.gate.1.wait(released).unwrap();
+                }
+            }
+        }
+
+        let runtime = super::super::tests::family_runtime("terminal-snapshot-charge");
+        // Separate admission owners ensure a mutation permit cannot mask a lost
+        // resync permit (or vice versa), even though both name the same family.
+        let (mutation_bridge, mutation) = charged_mutation();
+        let mutation_charge = mutation_bridge.retained_counts();
+        let (resync_bridge, resync_source) = charged_mutation();
+        let resync_charge = resync_bridge.retained_counts();
+        assert_eq!(mutation_charge.0, 1);
+        assert!(mutation_charge.1 > 0);
+        assert_eq!(resync_charge.0, 1);
+        assert!(resync_charge.1 > 0);
+        let release_resync = matches!(case, TerminalSnapshotCase::ReleaseResync);
+        runtime.with_direct_entity_model(|model| {
+            let family = model.family("p.item");
+            family.generation = 7;
+            family.causal_token = Some(23);
+            assert!(
+                family
+                    .remember_resync_lease_with_admission(29, resync_source.admission().cloned(),)
+            );
+            drop(resync_source);
+            if release_resync {
+                drop(mutation);
+            } else {
+                let lease = EntityMutationLease {
+                    scope_id: 17,
+                    family_token: 23,
+                    family: "p.item".into(),
+                    generation: 7,
+                    seq: 3,
+                    admission: mutation.admission().cloned(),
+                };
+                let (_, ready, discarded) = family.admit(mutation, Instant::now());
+                assert!(ready.is_none() && discarded.is_none());
+                family.store_pending_lease(lease);
+            }
+            let floor = if matches!(case, TerminalSnapshotCase::Ready) {
+                2
+            } else {
+                3
+            };
+            family.begin_provider_snapshot_seq(floor, Instant::now());
+        });
+        let expected_mutation_charge = if release_resync {
+            (0, 0)
+        } else {
+            mutation_charge
+        };
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        let work = runtime
+            .begin_entity_model(
+                identity(),
+                Operation::StepSnapshot {
+                    name: Some(Arc::new("p.item".into())),
+                    expected_generation: 7,
+                    generation: None,
+                    retained: FamilySnapshotWork::default(),
+                },
+                &permit,
+            )
+            .unwrap_or_else(|_| panic!("model capacity is available"));
+        runtime
+            .host_executor()
+            .submit(identity(), HostCommand::EntityModel(work.clone()), permit)
+            .unwrap();
+        let completed = completion(&runtime);
+        assert!(matches!(
+            completed.result,
+            HostResult::EntityModelComplete(Kind::StepSnapshot)
+        ));
+        {
+            let state = work.0.state.lock().unwrap();
+            let Some(Operation::StepSnapshot {
+                generation: Some(7),
+                retained,
+                ..
+            }) = state.operation.as_ref()
+            else {
+                panic!("the real snapshot transition retained its output");
+            };
+            assert!(matches!(
+                (case, retained.step.as_ref()),
+                (
+                    TerminalSnapshotCase::Ready,
+                    Some(PackageEntityFamilyStep::Ready { .. })
+                ) | (
+                    TerminalSnapshotCase::Discarded,
+                    Some(PackageEntityFamilyStep::Discarded { .. })
+                ) | (
+                    TerminalSnapshotCase::ReleaseResync,
+                    Some(PackageEntityFamilyStep::ReleaseResync {
+                        scope_id: 29,
+                        family_token: 23
+                    })
+                )
+            ));
+            assert_eq!(retained.resync_lease.is_some(), release_resync);
+        }
+        let (identity, result, permit) = completed.into_parts();
+        let gate = Gate(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let mut job = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+            identity,
+            permit,
+            model: Some(work.clone()),
+            payload: Box::new((
+                result,
+                OuterPayload {
+                    gate: gate.0.clone(),
+                    entered: entered_tx,
+                },
+            )),
+        });
+        assert!(
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .starts_with("botster-hub-host")
+        );
+        assert!(work.terminal_disposed());
+        assert!(matches!(job.poll(), crate::host_disposal::Poll::Pending));
+        assert!(!runtime.entity_model_available());
+        assert!(runtime.host_executor().prepared_bytes() > 0);
+        {
+            let state = work.0.state.lock().unwrap();
+            assert!(
+                state.operation.is_none(),
+                "Host destroyed mutation and family payloads before the outer gate"
+            );
+            assert!(
+                state.causal.is_none(),
+                "terminal disposal does not apply normal snapshot causality"
+            );
+            let Some(TerminalCausal::Snapshot {
+                _mutation: mutation,
+                _resync: resync,
+            }) = state.terminal_causal.as_ref()
+            else {
+                panic!("snapshot disposal retains its independent charge record");
+            };
+            assert_eq!(mutation.is_some(), !release_resync);
+            assert_eq!(resync.is_some(), release_resync);
+            if let Some(finish) = mutation {
+                let lease = finish.lease.as_ref().unwrap();
+                assert_eq!(
+                    (
+                        lease.scope_id,
+                        lease.family_token,
+                        lease.generation,
+                        lease.seq
+                    ),
+                    (17, 23, 7, 3)
+                );
+                assert!(
+                    lease.family.is_empty(),
+                    "Host destroyed the variable family name"
+                );
+                assert!(lease.admission.is_some());
+                assert!(!finish.scheduled_resync);
+            }
+            if let Some((scope, admission)) = resync {
+                assert_eq!(*scope, 29);
+                assert!(admission.is_some());
+            }
+        }
+        assert_eq!(mutation_bridge.retained_counts(), expected_mutation_charge);
+        assert_eq!(resync_bridge.retained_counts(), resync_charge);
+        assert!(work.completed(identity, Kind::StepSnapshot).is_none());
+        gate.release();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let permit = loop {
+            if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
+                break permit;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(mutation_bridge.retained_counts(), expected_mutation_charge);
+        assert_eq!(resync_bridge.retained_counts(), resync_charge);
+        assert!(runtime.retire_terminal_entity_model(&work));
+        drop(work);
+        assert!(runtime.entity_model_available());
+        assert_eq!(mutation_bridge.retained_counts(), (0, 0));
+        assert_eq!(
+            resync_bridge.retained_counts(),
+            if release_resync {
+                (0, 0)
+            } else {
+                resync_charge
+            }
+        );
+        runtime.with_direct_entity_model(|model| {
+            let family = model.family("p.item");
+            assert!(family.pending_by_seq.is_empty() && family.pending_leases.is_empty());
+            assert_eq!(family.resync.leases.contains_key(&29), !release_resync);
+            // Ready/Discarded must leave the independent resync owner untouched.
+            family.forget_resync_lease(29);
+        });
+        assert_eq!(resync_bridge.retained_counts(), (0, 0));
+        drop(permit);
+        assert_eq!(runtime.host_executor().outstanding(), 0);
+        assert_eq!(runtime.host_executor().prepared_bytes(), 0);
+    }
+
+    #[test]
+    fn terminal_snapshot_disposal_retains_ready_and_discarded_mutation_charges() {
+        terminal_snapshot_disposal(TerminalSnapshotCase::Ready);
+        terminal_snapshot_disposal(TerminalSnapshotCase::Discarded);
+    }
+
+    #[test]
+    fn terminal_snapshot_disposal_retains_independent_resync_charge() {
+        terminal_snapshot_disposal(TerminalSnapshotCase::ReleaseResync);
+    }
+
+    #[test]
     fn host_failure_retains_extracted_payload_credit_and_model_reservation() {
         let runtime = super::super::tests::family_runtime("host-model-extraction-failure");
         let (bridge, mutation) = charged_mutation();
@@ -605,6 +986,7 @@ impl Operation {
 }
 
 pub(crate) struct State {
+    terminal_causal: Option<TerminalCausal>,
     pub(crate) operation: Option<Operation>,
     pub(crate) causal: Option<CausalOp>,
     pub(crate) readiness: Readiness,
@@ -613,6 +995,17 @@ pub(crate) struct State {
     phase: Phase,
     #[cfg(test)]
     fail_after_operation: bool,
+}
+
+/// These exact lease fields retain admission until Owner observes terminal disposal.
+enum TerminalCausal {
+    Provider(ProviderSelection),
+    Fanout(PackageEntityFanoutFinish),
+    Resync((u64, Option<crate::lua_runtime::EntityPublishPermit>)),
+    Snapshot {
+        _mutation: Option<PackageEntityFanoutFinish>,
+        _resync: Option<(u64, Option<crate::lua_runtime::EntityPublishPermit>)>,
+    },
 }
 
 impl State {
@@ -724,6 +1117,7 @@ enum Phase {
     Released,
     ReclaimReady(HostJobIdentity),
     Reclaimed(HostJobIdentity),
+    TerminalDisposed,
 }
 
 struct Shared {
@@ -732,6 +1126,7 @@ struct Shared {
     model: Arc<Mutex<PackageEntities>>,
     state: Mutex<State>,
     _prepared: HostRetainedPrepared,
+    terminal_disposed: std::sync::atomic::AtomicBool,
 }
 
 /// The Owner keeps one handle until exact completion and causal application.
@@ -855,6 +1250,21 @@ impl Owner {
 }
 
 impl super::HubRuntime {
+    /// Retire Owner-local causality only after the worker publishes terminal payload disposal.
+    pub(crate) fn retire_terminal_entity_model(&self, work: &Work) -> bool {
+        if !work.terminal_disposed() {
+            return false;
+        }
+        let mut active = self.entity_model_owner.active.borrow_mut();
+        if active
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.work.0, &work.0))
+        {
+            active.take();
+        }
+        true
+    }
+
     /// Synchronous callers use the same model outside daemon execution.
     pub(super) fn with_direct_entity_model<R>(
         &self,
@@ -1205,6 +1615,7 @@ impl Work {
             kind: operation.kind(),
             model,
             state: Mutex::new(State {
+                terminal_causal: None,
                 operation: Some(operation),
                 causal: None,
                 readiness: Readiness::default(),
@@ -1215,7 +1626,82 @@ impl Work {
                 fail_after_operation: false,
             }),
             _prepared: permit.retain_prepared_reservation(),
+            terminal_disposed: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// Terminal disposal clears owned fields on Host without applying normal model transitions.
+    pub(crate) fn dispose_terminal_payload(&self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut operation = state.operation.take();
+        state.terminal_causal = match operation.as_mut() {
+            Some(Operation::StepSnapshot { retained, .. }) => {
+                let lease = match retained.step.as_mut() {
+                    Some(
+                        PackageEntityFamilyStep::Ready { lease, .. }
+                        | PackageEntityFamilyStep::Discarded { lease, .. },
+                    ) => lease.take(),
+                    _ => None,
+                };
+                let mutation = lease.map(|mut lease| {
+                    drop(std::mem::take(&mut lease.family));
+                    PackageEntityFanoutFinish {
+                        lease: Some(lease),
+                        scheduled_resync: false,
+                    }
+                });
+                Some(TerminalCausal::Snapshot {
+                    _mutation: mutation,
+                    _resync: retained.resync_lease.take(),
+                })
+            }
+            Some(Operation::SelectProvider { selected, .. }) => {
+                selected.take().map(TerminalCausal::Provider)
+            }
+            Some(Operation::TakeFanout {
+                retained: Some(item),
+            }) => item.lease.take().map(|mut lease| {
+                drop(std::mem::take(&mut lease.family));
+                TerminalCausal::Fanout(PackageEntityFanoutFinish {
+                    lease: Some(lease),
+                    scheduled_resync: false,
+                })
+            }),
+            Some(Operation::FinishFanout { finish, .. }) => {
+                if let Some(lease) = finish.lease.as_mut() {
+                    drop(std::mem::take(&mut lease.family));
+                }
+                Some(TerminalCausal::Fanout(std::mem::replace(
+                    finish,
+                    PackageEntityFanoutFinish {
+                        lease: None,
+                        scheduled_resync: false,
+                    },
+                )))
+            }
+            Some(Operation::Resync {
+                retained: Some(cursor),
+                ..
+            }) => cursor.take_terminal_release().map(TerminalCausal::Resync),
+            _ => None,
+        };
+        drop(operation);
+        state.causal = None;
+        state.valid = false;
+        state.phase = Phase::TerminalDisposed;
+        self.0
+            .terminal_disposed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn terminal_disposed(&self) -> bool {
+        self.0
+            .terminal_disposed
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn kind(&self) -> Kind {

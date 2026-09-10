@@ -65,6 +65,7 @@ type ObligationFn = Box<
 
 /// Owner work that must complete: it holds its permit until done.
 pub(crate) struct CleanupObligation {
+    terminal: Option<crate::host_disposal::Job>,
     waiter_id: crate::owner_identity::WaiterId,
     label: &'static str,
     permit: OwnerPermit,
@@ -117,6 +118,59 @@ impl std::fmt::Debug for OwnerBudget {
 }
 
 impl OwnerBudget {
+    /// Shared Host cleanup finishes before terminal shutdown disposes connection obligations.
+    pub(crate) fn dispose_terminal_obligations(
+        &mut self,
+        executor: &crate::host_executor::HostExecutor,
+    ) -> bool {
+        let mut after = None;
+        loop {
+            let next = match after {
+                None => self.obligations.keys().next().copied(),
+                Some(previous) => self
+                    .obligations
+                    .range((
+                        std::ops::Bound::Excluded(previous),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .map(|(key, _)| *key),
+            };
+            let Some(waiter) = next else {
+                break;
+            };
+            after = Some(waiter);
+            let obligation = self
+                .obligations
+                .get_mut(&waiter)
+                .expect("terminal cleanup retains its obligation");
+            if let Some(job) = obligation.terminal.as_mut() {
+                if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
+                    let obligation = self
+                        .obligations
+                        .remove(&waiter)
+                        .expect("the obligation retires after disposal");
+                    self.release(obligation.permit);
+                    drop(permit);
+                }
+            } else if let Some(permit) = executor.try_reserve() {
+                let poll = std::mem::replace(
+                    &mut obligation.poll,
+                    Box::new(|_, _, _| ObligationPoll::Pending),
+                );
+                obligation.terminal = Some(crate::host_disposal::Job::new(
+                    crate::host_disposal::Parts {
+                        identity: crate::host_executor::HostJobIdentity::first(waiter),
+                        permit,
+                        payload: Box::new(poll),
+                        model: None,
+                    },
+                ));
+            }
+        }
+        self.obligations.is_empty()
+    }
+
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             capacity,
@@ -223,6 +277,7 @@ pub(crate) fn retain_owner_obligation(
     state.budget.obligations.insert(
         waiter_id,
         CleanupObligation {
+            terminal: None,
             waiter_id,
             label,
             permit,

@@ -2804,10 +2804,19 @@ impl EventPlaneOwnerOps {
 
     /// Accept one exact completion. A stale or duplicate completion cannot pop an operation.
     pub fn complete(&mut self, completion: EventOwnerCompletion) -> Option<OwnerOp> {
-        if !self.matches_in_flight(&completion.identity) {
+        self.retire_exact(&completion.identity)
+    }
+
+    /// Terminal callers must observe Host payload disposal before they retire this identity.
+    pub(crate) fn retire_terminal(&mut self, identity: &EventOwnerWorkId) -> Option<OwnerOp> {
+        self.retire_exact(identity)
+    }
+
+    fn retire_exact(&mut self, identity: &EventOwnerWorkId) -> Option<OwnerOp> {
+        if !self.matches_in_flight(identity) {
             return None;
         }
-        let owner = &completion.identity.operation.owner;
+        let owner = &identity.operation.owner;
         self.in_flight.remove(owner);
         let queue = self.pending.get_mut(owner).expect("validated owner exists");
         let completed = queue.pop_front();

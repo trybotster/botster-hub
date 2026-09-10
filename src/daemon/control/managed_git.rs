@@ -43,7 +43,7 @@ enum Phase {
     Done,
 }
 
-struct ManagedSpawnOperation {
+pub(crate) struct ManagedSpawnOperation {
     waiter_id: WaiterId,
     pending: Option<PendingManagedSessionSpawn>,
     prepared: Option<PreparedManagedWorktree>,
@@ -63,6 +63,26 @@ pub(crate) struct ManagedGitRecoveryRequired {
     pub(crate) message: String,
     _prepared: PreparedManagedWorktree,
     _permit: HostWorkPermit,
+}
+
+impl ManagedGitRecoveryRequired {
+    pub(super) fn into_terminal(
+        self,
+        identity: HostJobIdentity,
+    ) -> (
+        Option<crate::daemon::owner_budget::OwnerPermit>,
+        crate::host_disposal::Parts,
+    ) {
+        (
+            self.owner_permit,
+            crate::host_disposal::Parts {
+                identity,
+                permit: self._permit,
+                model: None,
+                payload: Box::new((self._prepared, self.code, self.message)),
+            },
+        )
+    }
 }
 
 pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
@@ -86,6 +106,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             | HostRecoveryRequired::PackageFamilyWork { .. }
             | HostRecoveryRequired::PackageEvents { .. }
             | HostRecoveryRequired::PackageFamilies { .. } => None,
+            HostRecoveryRequired::Terminal(_) => None,
         })
     {
         let _ = pending
@@ -144,7 +165,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     }
 
     let accepted_at = pending.accepted_at;
-    let mut operation = ManagedSpawnOperation {
+    let operation = ManagedSpawnOperation {
         waiter_id,
         pending: Some(pending),
         prepared: None,
@@ -175,7 +196,9 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             permit: Some(owner_permit),
             must_finish: true,
             past_deadline: false,
-            continuation: Box::new(move |daemon, state| operation.poll(daemon, state)),
+            continuation: crate::daemon::control::pending::ControlContinuation::ManagedSpawn(
+                Box::new(operation),
+            ),
             retire: None,
         },
     );
@@ -196,7 +219,40 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
 }
 
 impl ManagedSpawnOperation {
-    fn poll(&mut self, daemon: &mut HubDaemon, state: &mut DaemonControlState) -> ControlPoll {
+    pub(crate) fn take_terminal_parts(
+        &mut self,
+        identity: HostJobIdentity,
+        completion: &mut Option<crate::host_executor::HostCompletion>,
+    ) -> Option<crate::host_disposal::Parts> {
+        let mut result = None;
+        let (identity, permit) = if let Some(permit) = self.permit.take() {
+            (identity, permit)
+        } else {
+            let (identity, value, permit) = completion.take()?.into_parts();
+            result = Some(value);
+            (identity, permit)
+        };
+        Some(crate::host_disposal::Parts {
+            identity,
+            permit,
+            model: None,
+            payload: Box::new((
+                self.pending.take(),
+                self.prepared.take(),
+                self.prepared_mutation.take(),
+                self.spawn.take(),
+                self.deferred_error.take(),
+                result,
+                completion.take(),
+            )),
+        })
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+    ) -> ControlPoll {
         if matches!(self.phase, Phase::ParkRecord | Phase::ParkRemoval) {
             return self.admit_parked(daemon, state);
         }

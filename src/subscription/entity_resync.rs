@@ -28,6 +28,8 @@ enum Stage {
 /// One scan owns family queries and indexed releases through the existing scheduler.
 #[derive(Default)]
 pub(crate) struct PackageEntityResyncScan {
+    terminal: Option<crate::host_disposal::Job>,
+    terminal_admission: Option<crate::lua_runtime::EntityPublishPermit>,
     cursor: Option<Cursor>,
     target_after: Option<Arc<Target>>,
     subscription_id: Option<String>,
@@ -58,6 +60,55 @@ enum ScanStep {
 }
 
 impl PackageEntityResyncScan {
+    pub(crate) fn dispose_terminal(&mut self, runtime: &crate::HubRuntime) -> bool {
+        if let Some(job) = self.terminal.as_mut() {
+            if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
+                if let Some(work) = self.work.take() {
+                    assert!(runtime.retire_terminal_entity_model(&work));
+                }
+                self.terminal_admission.take();
+                drop(permit);
+                self.terminal.take();
+                self.identity = None;
+                return true;
+            }
+            return false;
+        }
+        let mut payload: Option<Box<dyn Send>> = None;
+        let (identity, permit) = if let Some(permit) = self.permit.take() {
+            (
+                self.identity.expect("resync retains its Host identity"),
+                permit,
+            )
+        } else if let Some(completion) = self.completion.take() {
+            let (identity, result, permit) = completion.into_parts();
+            payload = Some(Box::new(result));
+            (identity, permit)
+        } else if let Some(failure) = self.failure.take() {
+            payload = Some(Box::new(failure.command));
+            (failure.identity, failure.permit)
+        } else {
+            return self.identity.is_none() && self.work.is_none();
+        };
+        self.terminal_admission = self.cursor.as_ref().and_then(Cursor::terminal_admission);
+        self.terminal = Some(crate::host_disposal::Job::new(
+            crate::host_disposal::Parts {
+                identity,
+                permit,
+                model: self.work.clone(),
+                payload: Box::new((
+                    self.cursor.take(),
+                    self.target_after.take(),
+                    self.subscription_id.take(),
+                    self.operation.take(),
+                    self.action.take(),
+                    payload,
+                )),
+            },
+        ));
+        false
+    }
+
     #[cfg(test)]
     pub(crate) fn test_running(&self) -> bool {
         self.running

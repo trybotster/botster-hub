@@ -63,9 +63,162 @@ pub(crate) enum ControlPoll {
     ),
 }
 
-/// One owner-thread continuation for a request that waits on Core.
-pub(crate) type ControlContinuation =
-    Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll>;
+/// Retained Host work has a typed owner so terminal disposal can extract its original permit.
+pub(crate) enum ControlContinuation {
+    Callback(Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>),
+    HostMutation(Box<super::host_work::HostMutationContinuation>),
+    Status(Box<super::status::StatusContinuation>),
+    ManagedSpawn(Box<super::managed_git::ManagedSpawnOperation>),
+    Terminal(Box<TerminalContinuation>),
+}
+
+pub(crate) struct TerminalContinuation {
+    original: ControlContinuation,
+    job: crate::host_disposal::Job,
+}
+
+impl ControlContinuation {
+    pub(crate) fn callback(
+        callback: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send + 'static,
+    ) -> Self {
+        Self::Callback(Box::new(callback))
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+    ) -> ControlPoll {
+        match self {
+            Self::Callback(callback) => callback(daemon, state),
+            Self::HostMutation(work) => work.poll(daemon, state),
+            Self::Status(work) => work.poll(daemon, state),
+            Self::ManagedSpawn(work) => work.poll(daemon, state),
+            Self::Terminal(_) => panic!("terminal requests cannot resume normal execution"),
+        }
+    }
+
+    /// Keep the original request row until Host destroys its payload.
+    fn take_terminal_parts(
+        &mut self,
+        identity: crate::host_executor::HostJobIdentity,
+        completion: &mut Option<crate::host_executor::HostCompletion>,
+    ) -> Option<crate::host_disposal::Parts> {
+        match self {
+            Self::HostMutation(work) => work.take_terminal_parts(identity, completion),
+            Self::Status(work) => work.take_terminal_parts(identity, completion),
+            Self::ManagedSpawn(work) => work.take_terminal_parts(identity, completion),
+            Self::Callback(_) | Self::Terminal(_) => None,
+        }
+    }
+
+    fn begin_terminal(&mut self, parts: crate::host_disposal::Parts) {
+        let mut original = std::mem::replace(self, Self::callback(|_, _| ControlPoll::Pending));
+        let parts = if matches!(original, Self::Callback(_)) {
+            let Self::Callback(callback) =
+                std::mem::replace(&mut original, Self::callback(|_, _| ControlPoll::Pending))
+            else {
+                unreachable!()
+            };
+            parts.with_payload(callback)
+        } else {
+            parts
+        };
+        *self = Self::Terminal(Box::new(TerminalContinuation {
+            original,
+            job: crate::host_disposal::Job::new(parts),
+        }));
+    }
+
+    pub(crate) fn poll_terminal(&mut self, runtime: &crate::HubRuntime) -> bool {
+        let Self::Terminal(terminal) = self else {
+            return false;
+        };
+        match terminal.job.poll() {
+            crate::host_disposal::Poll::Disposed(permit) => {
+                if let Self::HostMutation(work) = &mut terminal.original {
+                    assert!(
+                        work.retire_terminal(runtime),
+                        "disposal precedes causal retirement"
+                    );
+                }
+                drop(permit);
+                true
+            }
+            crate::host_disposal::Poll::Retired => true,
+            crate::host_disposal::Poll::Pending
+            | crate::host_disposal::Poll::PartialDestruction
+            | crate::host_disposal::Poll::SharedCleanupFault => false,
+        }
+    }
+}
+
+/// The terminal driver calls this only after it seals normal control ingress.
+/// Each request keeps its Owner permit until its original Host slot reports disposal.
+pub(crate) fn dispose_terminal_requests(
+    runtime: &crate::HubRuntime,
+    state: &mut DaemonControlState,
+) {
+    state.pending_requests.retain(|waiter_id, entry| {
+        let mut completion = state.host_completions.remove(waiter_id);
+        let identity = crate::host_executor::HostJobIdentity {
+            waiter_id: *waiter_id,
+            phase: entry.last_host_phase,
+        };
+        let parts = if matches!(entry.continuation, ControlContinuation::Callback(_)) {
+            if state.plugin_controls.owns_waiter(*waiter_id) {
+                state.plugin_controls.take_terminal_parts(
+                    *waiter_id,
+                    &mut completion,
+                    runtime.host_executor(),
+                )
+            } else if let Some(completion) = completion.take() {
+                let (identity, result, permit) = completion.into_parts();
+                Some(crate::host_disposal::Parts {
+                    identity,
+                    permit,
+                    payload: Box::new(result),
+                    model: None,
+                })
+            } else {
+                runtime
+                    .host_executor()
+                    .try_reserve()
+                    .map(|permit| crate::host_disposal::Parts {
+                        identity,
+                        permit,
+                        payload: Box::new(()),
+                        model: None,
+                    })
+            }
+        } else {
+            entry
+                .continuation
+                .take_terminal_parts(identity, &mut completion)
+        };
+        if let Some(parts) = parts {
+            let parts = parts.with_payload((
+                std::mem::take(&mut entry.completion),
+                entry.reply_tx.take(),
+                entry.response_delivery_rx.take(),
+                entry.grant_id.take(),
+                entry.client.take(),
+                entry.retire.take(),
+            ));
+            entry.continuation.begin_terminal(parts);
+        }
+        if let Some(completion) = completion {
+            state.host_completions.insert(*waiter_id, completion);
+        }
+        if !entry.continuation.poll_terminal(runtime) {
+            return true;
+        }
+        if let Some(permit) = entry.permit.take() {
+            state.budget.release(permit);
+        }
+        false
+    });
+}
 
 /// Retirement for a request that owns deferred work. The hook receives the
 /// entry permit. It must cancel, release, or transfer the work to another
@@ -94,10 +247,14 @@ impl ControlStep {
     }
 
     pub(crate) fn pending(
-        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + 'static,
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
+        + Send
+        + 'static,
     ) -> Self {
         Self::Pending(PendingStep {
-            continuation: Box::new(continuation),
+            continuation: crate::daemon::control::pending::ControlContinuation::callback(
+                continuation,
+            ),
             retire: None,
             ready_class: ReadyClass::CoreCompletion,
         })
@@ -105,10 +262,14 @@ impl ControlStep {
 
     pub(crate) fn pending_in(
         ready_class: ReadyClass,
-        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + 'static,
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
+        + Send
+        + 'static,
     ) -> Self {
         Self::Pending(PendingStep {
-            continuation: Box::new(continuation),
+            continuation: crate::daemon::control::pending::ControlContinuation::callback(
+                continuation,
+            ),
             retire: None,
             ready_class,
         })
@@ -117,13 +278,17 @@ impl ControlStep {
     /// A deferred request whose Core work must be cancelled or released
     /// when the request is retired.
     pub(crate) fn pending_retirable(
-        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + 'static,
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
+        + Send
+        + 'static,
         retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit)
         + Send
         + 'static,
     ) -> Self {
         Self::Pending(PendingStep {
-            continuation: Box::new(continuation),
+            continuation: crate::daemon::control::pending::ControlContinuation::callback(
+                continuation,
+            ),
             retire: Some(Box::new(retire)),
             ready_class: ReadyClass::CoreCompletion,
         })
@@ -131,13 +296,17 @@ impl ControlStep {
 
     pub(crate) fn pending_retirable_in(
         ready_class: ReadyClass,
-        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + 'static,
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
+        + Send
+        + 'static,
         retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit)
         + Send
         + 'static,
     ) -> Self {
         Self::Pending(PendingStep {
-            continuation: Box::new(continuation),
+            continuation: crate::daemon::control::pending::ControlContinuation::callback(
+                continuation,
+            ),
             retire: Some(Box::new(retire)),
             ready_class,
         })
@@ -557,7 +726,7 @@ pub(crate) fn poll_ready_request_item(
     let mut again = false;
     if has_completion {
         state.current_waiter_id = Some(waiter_id);
-        let poll = (entry.continuation)(daemon, state);
+        let poll = entry.continuation.poll(daemon, state);
         state.current_waiter_id = None;
         let reply = match poll {
             ControlPoll::StatusResponseRefused { shutdown } => {
@@ -672,6 +841,141 @@ mod tests {
 
     use botster_hub_client::DaemonResponseKind;
 
+    #[test]
+    fn terminal_status_rows_dispose_all_eight_original_slots_before_owner_retirement() {
+        struct Gate(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Gate {
+            fn release(&self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+        struct Probe {
+            disposed: std::sync::mpsc::Sender<String>,
+            entered: std::sync::mpsc::Sender<()>,
+            gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let mut released = self.gate.0.lock().unwrap();
+                while !*released {
+                    released = self.gate.1.wait(released).unwrap();
+                }
+                self.disposed
+                    .send(
+                        std::thread::current()
+                            .name()
+                            .unwrap_or("unnamed")
+                            .to_string(),
+                    )
+                    .unwrap();
+            }
+        }
+        let (mut daemon, directory) = test_daemon("terminal-status-slots");
+        let mut state = DaemonControlState::default();
+        let transport = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(32);
+        let (disposed_tx, disposed_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let gate = Gate(std::sync::Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )));
+        let mut replies = Vec::new();
+        for _ in 0..crate::host_executor::HOST_OPERATION_CAPACITY {
+            let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+            replies.push(reply_rx);
+            assert!(!super::super::request::handle(
+                &mut daemon,
+                &mut state,
+                transport.handle(),
+                control_tx.clone(),
+                crate::daemon::control::message::ControlMessage::Request {
+                    request: Box::new(DaemonRequest::Status),
+                    transport_request_id: None,
+                    reply_tx,
+                    response_delivery_rx: None,
+                    grant_id: None,
+                    client_id: None,
+                    enqueued_at: Instant::now(),
+                },
+            ));
+        }
+        for entry in state.pending_requests.values_mut() {
+            let probe = Probe {
+                disposed: disposed_tx.clone(),
+                entered: entered_tx.clone(),
+                gate: gate.0.clone(),
+            };
+            entry.retire = Some(Box::new(move |_, _, _, _| drop(probe)));
+            assert!(matches!(entry.continuation, ControlContinuation::Status(_)));
+        }
+        drop(disposed_tx);
+        let runtime = daemon.runtime().unwrap();
+        assert_eq!(
+            runtime.host_executor().outstanding(),
+            crate::host_executor::HOST_OPERATION_CAPACITY
+        );
+        assert!(runtime.host_executor().try_reserve().is_none());
+        assert_eq!(
+            state.budget.outstanding(),
+            crate::host_executor::HOST_OPERATION_CAPACITY
+        );
+        dispose_terminal_requests(runtime, &mut state);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a Host worker enters the destructor gate");
+        dispose_terminal_requests(runtime, &mut state);
+        assert_eq!(
+            state.pending_requests.len(),
+            crate::host_executor::HOST_OPERATION_CAPACITY
+        );
+        assert_eq!(
+            state.budget.outstanding(),
+            crate::host_executor::HOST_OPERATION_CAPACITY
+        );
+        assert_eq!(
+            runtime.host_executor().outstanding(),
+            crate::host_executor::HOST_OPERATION_CAPACITY
+        );
+        assert!(runtime.host_executor().try_reserve().is_none());
+        assert!(disposed_rx.try_recv().is_err());
+        gate.release();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.pending_requests.is_empty() {
+            dispose_terminal_requests(runtime, &mut state);
+            assert_eq!(state.budget.outstanding(), state.pending_requests.len());
+            assert!(
+                Instant::now() < deadline,
+                "all original Host slots must dispose"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(runtime.host_executor().outstanding(), 0);
+        assert_eq!(runtime.host_executor().prepared_bytes(), 0);
+        let threads = disposed_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(threads.len(), crate::host_executor::HOST_OPERATION_CAPACITY);
+        assert!(
+            threads
+                .iter()
+                .all(|thread| thread.starts_with("botster-hub-host")),
+            "{threads:?}"
+        );
+        assert_eq!(state.budget.outstanding(), 0);
+        drop(replies);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn test_daemon(label: &str) -> (HubDaemon, PathBuf) {
         static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
         let unique = SystemTime::now()
@@ -734,11 +1038,15 @@ mod tests {
                 permit: Some(permit),
                 must_finish,
                 past_deadline: false,
-                continuation: Box::new(|_, _| {
-                    ControlPoll::Ready(Ok(crate::client_api_dto::response::daemon_response_base(
-                        DaemonResponseKind::Status,
-                    )))
-                }),
+                continuation: crate::daemon::control::pending::ControlContinuation::callback(
+                    |_, _| {
+                        ControlPoll::Ready(Ok(
+                            crate::client_api_dto::response::daemon_response_base(
+                                DaemonResponseKind::Status,
+                            ),
+                        ))
+                    },
+                ),
                 retire: None,
             },
         );
@@ -845,10 +1153,12 @@ mod tests {
                 permit: Some(permit),
                 must_finish: true,
                 past_deadline: false,
-                continuation: Box::new(|_, state| {
-                    state.document_waiters.pop_first();
-                    ControlPoll::Pending
-                }),
+                continuation: crate::daemon::control::pending::ControlContinuation::callback(
+                    |_, state| {
+                        state.document_waiters.pop_first();
+                        ControlPoll::Pending
+                    },
+                ),
                 retire: None,
             },
         );

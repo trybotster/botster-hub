@@ -994,6 +994,31 @@ fn run_control_ingress_item(
 }
 
 pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
+    serve_daemon_inner(
+        config,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+struct ServeTerminalTest {
+    start: Box<dyn FnOnce(&mut tokio_mpsc::Receiver<ControlMessage>, &ControlSender) + Send>,
+    selected: Box<
+        dyn FnOnce(
+                &mut HubDaemon,
+                &mut DaemonControlState,
+                &tokio::runtime::Runtime,
+                &ControlSender,
+            ) + Send,
+    >,
+    stopped: Box<dyn FnOnce() + Send>,
+}
+
+fn serve_daemon_inner(
+    config: HubConfig,
+    #[cfg(test)] terminal_test: Option<ServeTerminalTest>,
+) -> DaemonTransportResult<HubDaemonStatus> {
     let socket_path = socket_path(&config)?;
     let socket_owner = acquire_socket_owner_lock(&socket_path)?;
     prepare_socket_path(&socket_path, &socket_owner)?;
@@ -1004,7 +1029,22 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
 
     let (control_tx, mut control_rx) = tokio_mpsc::channel(DAEMON_CONTROL_QUEUE_CAPACITY);
     let (shutdown_tx, _) = watch::channel(false);
+    #[cfg(test)]
+    if terminal_test.is_none() {
+        install_signal_forwarder(control_tx.clone())?;
+    }
+    #[cfg(not(test))]
     install_signal_forwarder(control_tx.clone())?;
+    let transport_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("botster-hub-transport")
+        .build()
+        .map_err(DaemonTransportError::Io)?;
+    let listener = {
+        let _runtime = transport_runtime.enter();
+        TokioUnixListener::from_std(listener).map_err(DaemonTransportError::Io)?
+    };
     let mut daemon = HubDaemon::start(config)?;
     if let Some(runtime) = daemon.runtime() {
         runtime.bind_data_plane_owner_wake(control_tx.clone());
@@ -1033,23 +1073,21 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
         );
     }
     seed_lifecycle_reconciliation(&mut daemon, &mut control_state);
-    let transport_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .thread_name("botster-hub-transport")
-        .build()
-        .map_err(DaemonTransportError::Io)?;
-    let listener = {
-        let _runtime = transport_runtime.enter();
-        TokioUnixListener::from_std(listener).map_err(DaemonTransportError::Io)?
-    };
     let mut connection_tasks = vec![transport_runtime.spawn(accept_connections(
         listener,
         control_tx.clone(),
         shutdown_tx.subscribe(),
         Arc::new(Semaphore::new(DAEMON_MAX_CONNECTIONS)),
     ))];
-    loop {
+    #[cfg(test)]
+    let (selected, stopped) = match terminal_test {
+        Some(test) => {
+            (test.start)(&mut control_rx, &control_tx);
+            (Some(test.selected), Some(test.stopped))
+        }
+        None => (None, None),
+    };
+    let outcome = 'owner: loop {
         let mut owner_turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
         reap_finished_connection_tasks(&mut connection_tasks);
         publish_completion_wakes(&daemon, &mut control_state);
@@ -1081,12 +1119,12 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                             );
                             continue;
                         }
-                        return Err(DaemonTransportError::Protocol(
+                        break 'owner Err(DaemonTransportError::Protocol(
                             "owner waiter identifiers are exhausted",
                         ));
                     }
                 }
-                None => return Err(DaemonTransportError::ControlThreadStopped),
+                None => break 'owner Err(DaemonTransportError::ControlThreadStopped),
             }
         }
         publish_maintenance_wakes(&mut control_state);
@@ -1113,38 +1151,129 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
                 item,
             ) {
                 if shutdown {
-                    let _ = shutdown_tx.send(true);
-                    wait_for_connection_tasks(
-                        &transport_runtime,
-                        &mut connection_tasks,
-                        &mut control_rx,
-                        &mut daemon,
-                        &mut control_state,
-                        control_tx.clone(),
-                    );
-                    let status = daemon.stop();
-                    cleanup_socket_path(&socket_path, socket_owner);
-                    return Ok(status);
+                    break 'owner Ok(());
                 }
                 continue;
             }
             if dispatch_owner_ready_item(&mut daemon, &mut control_state, item, &mut owner_turn) {
-                let _ = shutdown_tx.send(true);
-                wait_for_connection_tasks(
-                    &transport_runtime,
-                    &mut connection_tasks,
-                    &mut control_rx,
-                    &mut daemon,
-                    &mut control_state,
-                    control_tx.clone(),
-                );
-                let status = daemon.stop();
-                cleanup_socket_path(&socket_path, socket_owner);
-                return Ok(status);
+                break 'owner Ok(());
             }
             publish_maintenance_wakes(&mut control_state);
         }
+    };
+    #[cfg(test)]
+    if let Some(selected) = selected {
+        selected(
+            &mut daemon,
+            &mut control_state,
+            &transport_runtime,
+            &control_tx,
+        );
     }
+    let _ = shutdown_tx.send(true);
+    wait_for_connection_tasks(
+        &transport_runtime,
+        &mut connection_tasks,
+        &mut control_rx,
+        &mut daemon,
+        &mut control_state,
+        control_tx,
+    );
+    drain_terminal_host_work(&mut daemon, &mut control_state);
+    let status = daemon.stop();
+    #[cfg(test)]
+    if let Some(stopped) = stopped {
+        stopped();
+    }
+    cleanup_socket_path(&socket_path, socket_owner);
+    outcome.map(|()| status)
+}
+
+/// Ingress has stopped. Each original row keeps its charges until Host acknowledges disposal.
+fn drain_terminal_host_work(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    let Some(runtime) = daemon.runtime_mut() else {
+        return;
+    };
+    runtime.host_executor().bind_terminal_owner();
+    loop {
+        runtime.host_executor().take_completion_notification();
+        runtime.host_executor().take_capacity_notification();
+        if !state.terminal_lifecycle.ordinary_disposed
+            && dispose_terminal_host_slice(runtime, state)
+        {
+            state.terminal_lifecycle.ordinary_disposed = true;
+        }
+        if state.terminal_fault.is_none()
+            && state.terminal_lifecycle.ordinary_disposed
+            && state.terminal_lifecycle.dispose(runtime)
+        {
+            match runtime.host_executor().close_and_dispose_completions() {
+                Ok(()) => return,
+                Err(failure) => {
+                    state.terminal_fault = Some(TerminalDrainFault::MailboxClose(failure))
+                }
+            }
+        }
+        thread::park();
+    }
+}
+
+fn dispose_terminal_host_slice(
+    runtime: &crate::HubRuntime,
+    state: &mut DaemonControlState,
+) -> bool {
+    if state.terminal_fault.is_none() {
+        while let crate::host_executor::HostCompletionPoll::Ready(completion) =
+            runtime.host_executor().poll_completion()
+        {
+            if let Err(completion) =
+                crate::subscription::entity::route_terminal_host_completion(state, completion)
+            {
+                state.terminal_fault = Some(TerminalDrainFault::Receipt(completion));
+                break;
+            }
+        }
+    }
+    crate::daemon::control::pending::dispose_terminal_requests(runtime, state);
+    crate::daemon::control::host_work::dispose_terminal_recovery(runtime, state);
+    let publication = state
+        .publication_owner
+        .dispose_terminal(runtime, &mut state.budget);
+    let events = state
+        .event_owner
+        .dispose_terminal(runtime, &mut state.budget);
+    let entities = state
+        .plugin_entities
+        .dispose_terminal(runtime, &mut state.budget);
+    let resync = state.package_entity_resync_scan.dispose_terminal(runtime);
+    let clients = state
+        .client_events
+        .dispose_terminal(runtime, &state.event_plane);
+    let catalog = state
+        .session_type_catalog
+        .dispose_terminal(runtime.host_executor());
+    let obligations = publication
+        && events
+        && entities
+        && resync
+        && clients
+        && state.pending_requests.is_empty()
+        && state.host_recovery.is_empty()
+        && state
+            .budget
+            .dispose_terminal_obligations(runtime.host_executor());
+    publication
+        && events
+        && entities
+        && resync
+        && clients
+        && catalog
+        && obligations
+        && state.terminal_fault.is_none()
+        && state.pending_requests.is_empty()
+        && state.host_recovery.is_empty()
+        && state.host_completions.is_empty()
+        && runtime.host_executor().outstanding() == 0
 }
 
 pub(crate) fn record_egress_write_failure(
@@ -1470,7 +1599,87 @@ fn run_pump_observe_phase(
     }
 }
 
+enum TerminalDrainFault {
+    Receipt(crate::host_executor::HostCompletion),
+    MailboxClose(crate::host_executor::HostCompletionDisposalFailure),
+}
+
+struct TerminalLifecycle {
+    identity: crate::host_executor::HostJobIdentity,
+    ordinary_disposed: bool,
+    job: Option<crate::host_disposal::Job>,
+    stage: TerminalLifecycleStage,
+}
+
+enum TerminalLifecycleStage {
+    Engine,
+    Bridges,
+    Disposed,
+}
+
+impl TerminalLifecycle {
+    fn new(waiter: crate::owner_identity::WaiterId) -> Self {
+        Self {
+            identity: crate::host_executor::HostJobIdentity::first(waiter),
+            ordinary_disposed: false,
+            job: None,
+            stage: TerminalLifecycleStage::Engine,
+        }
+    }
+
+    fn dispose(&mut self, runtime: &mut crate::HubRuntime) -> bool {
+        if matches!(self.stage, TerminalLifecycleStage::Disposed) {
+            return true;
+        }
+        if self.job.is_none() {
+            let Some(permit) = runtime.host_executor().try_reserve() else {
+                return false;
+            };
+            let lifecycle = runtime
+                .take_plugin_lifecycle()
+                .expect("terminal disposal takes the lifecycle owner once");
+            self.job = Some(crate::host_disposal::Job::new(
+                crate::host_disposal::Parts {
+                    identity: self.identity,
+                    permit,
+                    payload: Box::new(lifecycle),
+                    model: None,
+                },
+            ));
+        }
+        if let crate::host_disposal::Poll::Disposed(permit) =
+            self.job.as_mut().expect("terminal lifecycle job").poll()
+        {
+            match self.stage {
+                TerminalLifecycleStage::Engine => {
+                    self.job = Some(crate::host_disposal::Job::new_plugin_bridges(
+                        crate::host_disposal::Parts {
+                            identity: self.identity,
+                            permit,
+                            payload: Box::new(()),
+                            model: None,
+                        },
+                        runtime.terminal_plugin_bridges(),
+                    ));
+                    self.stage = TerminalLifecycleStage::Bridges;
+                }
+                TerminalLifecycleStage::Bridges => {
+                    drop(permit);
+                    self.job = None;
+                    self.stage = TerminalLifecycleStage::Disposed;
+                }
+                TerminalLifecycleStage::Disposed => {
+                    unreachable!("a completed lifecycle has no disposal job")
+                }
+            }
+        }
+        matches!(self.stage, TerminalLifecycleStage::Disposed)
+    }
+}
+
 pub(crate) struct DaemonControlState {
+    terminal_fault: Option<TerminalDrainFault>,
+    terminal_lifecycle: TerminalLifecycle,
     pub(crate) event_owner: crate::daemon::event_owner::EventOwnerState,
     pub(crate) publication_owner: crate::daemon::publication_owner::PublicationOwnerState,
     pub(crate) logical_clock: u64,
@@ -1570,7 +1779,20 @@ impl fmt::Debug for DaemonControlState {
 
 impl Default for DaemonControlState {
     fn default() -> Self {
+        let waiter_ids = crate::owner_identity::WaiterIdSource::default();
+        let session_type_catalog = crate::subscription::entity::SessionTypeCatalogCache::for_owner(
+            waiter_ids
+                .next()
+                .expect("a fresh Owner identity source has capacity"),
+        );
+        let terminal_lifecycle = TerminalLifecycle::new(
+            waiter_ids
+                .next()
+                .expect("a fresh Owner identity source has capacity"),
+        );
         Self {
+            terminal_fault: None,
+            terminal_lifecycle,
             event_owner: crate::daemon::event_owner::EventOwnerState::default(),
             publication_owner: crate::daemon::publication_owner::PublicationOwnerState::default(),
             logical_clock: 1,
@@ -1589,7 +1811,7 @@ impl Default for DaemonControlState {
             attach_close: crate::subscription::closed_events::AttachCloseBookkeeping::default(),
             pending_hub_update_reply: None,
             pending_requests: BTreeMap::new(),
-            waiter_ids: crate::owner_identity::WaiterIdSource::default(),
+            waiter_ids,
             current_waiter_id: None,
             shutdown_waiter: None,
             owner_ready: crate::daemon::owner_schedule::ReadyQueues::new(),
@@ -1622,7 +1844,7 @@ impl Default for DaemonControlState {
             maintenance_reads: crate::daemon_maintenance::MaintenanceCoreReads::default(),
             close_event_decisions: crate::subscription::closed_events::CloseEventDecisions::default(
             ),
-            session_type_catalog: crate::subscription::entity::SessionTypeCatalogCache::default(),
+            session_type_catalog,
             reconcile_inventory: None,
             observe_resume: None,
             observe_read: None,
@@ -1777,6 +1999,491 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn terminal_serve_normal_and_error_exits_wait_for_all_host_disposal_receipts() {
+        struct ThreadProbe(mpsc::Sender<String>);
+        impl Drop for ThreadProbe {
+            fn drop(&mut self) {
+                self.0
+                    .send(thread::current().name().unwrap_or("unnamed").into())
+                    .unwrap();
+            }
+        }
+        struct PluginRuntimeProbe(mpsc::Sender<(&'static str, String)>);
+        impl botster_core::PluginRuntime for PluginRuntimeProbe {
+            fn invoke(
+                &self,
+                request: botster_core::PluginInvocationRequest,
+                _cancellation: botster_core::PluginCancellationToken,
+            ) -> botster_core::PluginInvocationResult {
+                botster_core::PluginInvocationResult::Completed(
+                    botster_core::PluginInvocationSuccess {
+                        request_id: request.request_id,
+                        handler: request.handler,
+                        payload: Some(botster_core::BoundaryJson(serde_json::json!({
+                            "retained": "x".repeat(16 * 1024),
+                        }))),
+                    },
+                )
+            }
+
+            fn stop(&self, _plugin_key: &botster_core::PluginKey) {
+                self.0
+                    .send(("stop", thread::current().name().unwrap_or("unnamed").into()))
+                    .unwrap();
+            }
+        }
+        impl Drop for PluginRuntimeProbe {
+            fn drop(&mut self) {
+                self.0
+                    .send(("drop", thread::current().name().unwrap_or("unnamed").into()))
+                    .unwrap();
+            }
+        }
+        struct Gate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Gate {
+            fn release(&self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+        struct Probe {
+            gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            entered: mpsc::Sender<String>,
+            disposed: mpsc::Sender<String>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let name = thread::current().name().unwrap_or("unnamed").to_string();
+                let _ = self.entered.send(name.clone());
+                let mut released = self.gate.0.lock().unwrap();
+                while !*released {
+                    released = self.gate.1.wait(released).unwrap();
+                }
+                let _ = self.disposed.send(name);
+            }
+        }
+        for error_exit in [false, true] {
+            let root = PathBuf::from("/private/tmp").join(format!(
+                "hub-exit-{}-{}",
+                std::process::id(),
+                error_exit
+            ));
+            let mut config = package_control_config(root.join("data"));
+            config.transports.local_socket = Some(crate::config::LocalSocketBinding {
+                path: root.join("hub.sock"),
+            });
+            let gate = Gate(Arc::new((
+                std::sync::Mutex::new(false),
+                std::sync::Condvar::new(),
+            )));
+            let host_gate = gate.0.clone();
+            let engine_gate = Gate(Arc::new((
+                std::sync::Mutex::new(false),
+                std::sync::Condvar::new(),
+            )));
+            let final_engine_gate = engine_gate.0.clone();
+            let (engine_entered_tx, engine_entered_rx) = mpsc::channel();
+            let (engine_disposed_tx, engine_disposed_rx) = mpsc::channel();
+            let (plugin_runtime_tx, plugin_runtime_rx) = mpsc::channel();
+            let publication_gate = Gate(Arc::new((
+                std::sync::Mutex::new(false),
+                std::sync::Condvar::new(),
+            )));
+            let queued_publication_gate = publication_gate.0.clone();
+            let (publication_entered_tx, publication_entered_rx) = mpsc::channel();
+            let (publication_disposed_tx, publication_disposed_rx) = mpsc::channel();
+            let (coordination_disposed_tx, coordination_disposed_rx) = mpsc::channel();
+            let (spawner_gate_tx, spawner_gate_rx) = mpsc::channel();
+            let (bridges_tx, bridges_rx) = mpsc::channel();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (disposed_tx, disposed_rx) = mpsc::channel();
+            let (inspect_tx, inspect_rx) =
+                mpsc::channel::<Box<dyn Fn() -> (usize, bool, bool) + Send>>();
+            let (stopped_tx, stopped_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let owner = thread::Builder::new()
+                .name("terminal-serve-owner".into())
+                .spawn(move || {
+                    let result = serve_daemon_inner(
+                        config,
+                        Some(ServeTerminalTest {
+                            start: Box::new(move |receiver, sender| {
+                                if error_exit {
+                                    receiver.close();
+                                } else {
+                                    let (reply_tx, _reply_rx) =
+                                        crate::daemon::control::message::control_reply_channel();
+                                    sender
+                                        .try_send(ControlMessage::Request {
+                                            request: Box::new(DaemonRequest::DaemonShutdown),
+                                            transport_request_id: None,
+                                            reply_tx,
+                                            response_delivery_rx: None,
+                                            grant_id: None,
+                                            client_id: None,
+                                            enqueued_at: Instant::now(),
+                                        })
+                                        .unwrap();
+                                }
+                            }),
+                            selected: Box::new(move |daemon, state, transport, sender| {
+                                assert_eq!(
+                                    daemon.runtime().unwrap().host_executor().outstanding(),
+                                    0
+                                );
+                                let lifecycle = daemon.runtime().unwrap().plugin_lifecycle_handle();
+                                let mut registry = crate::PackageRegistry::new(Default::default());
+                                registry
+                                    .install(
+                                        serde_json::from_value(serde_json::json!({
+                                            "name": "terminal-probe",
+                                            "version": "1.0.0",
+                                            "kind": "plugin",
+                                            "botster": ">=0.1.0",
+                                            "source": { "type": "path", "path": "." },
+                                            "capabilities": [],
+                                            "entrypoints": []
+                                        }))
+                                        .unwrap(),
+                                        crate::PackageProvenance {
+                                            source: "terminal-probe".into(),
+                                            checksum: None,
+                                        },
+                                        "install terminal fixture",
+                                    )
+                                    .unwrap();
+                                registry.enable("terminal-probe", "enable fixture").unwrap();
+                                let handler = botster_core::PluginHandlerRef {
+                                    plugin_key: botster_core::PluginKey("terminal-probe".into()),
+                                    kind: botster_core::PluginHandlerKind::Command,
+                                    handler_id: "retained".into(),
+                                };
+                                lifecycle
+                                    .load_package(
+                                        &registry,
+                                        "terminal-probe",
+                                        crate::HubPluginRuntimeBundle {
+                                            runtime: Arc::new(PluginRuntimeProbe(
+                                                plugin_runtime_tx,
+                                            )),
+                                            handlers: vec![
+                                                botster_core::PluginHandlerRegistration {
+                                                    handler: handler.clone(),
+                                                    required_capability: None,
+                                                },
+                                            ],
+                                            event_handlers: Vec::new(),
+                                            descriptors: Vec::new(),
+                                            resources: Vec::new(),
+                                            entrypoint: Some("terminal-probe".into()),
+                                            metadata: None,
+                                        },
+                                    )
+                                    .unwrap();
+                                let engine_probe = Probe {
+                                    gate: final_engine_gate,
+                                    entered: engine_entered_tx,
+                                    disposed: engine_disposed_tx,
+                                };
+                                lifecycle.install_completion_notifier(Arc::new(move || {
+                                    let _ = &engine_probe;
+                                }));
+                                assert!(matches!(
+                                    lifecycle.try_admit(
+                                        botster_core::PluginInvocationClass::RequestResponse,
+                                        botster_core::PluginInvocationRequest {
+                                            request_id: RequestId(
+                                                "undrained-terminal-result".into()
+                                            ),
+                                            handler,
+                                            timeout_ms: 1_000,
+                                            context: botster_core::PluginInvocationContext {
+                                                client_id: None,
+                                                session_id: None,
+                                                subscription_id: None,
+                                                surface_id: None,
+                                                origin: None,
+                                                metadata: None,
+                                            },
+                                            payload: botster_core::BoundaryJson(serde_json::json!(
+                                                {}
+                                            )),
+                                        },
+                                    ),
+                                    botster_core::PluginAdmissionResult::Queued { .. }
+                                ));
+                                let deadline = Instant::now() + Duration::from_secs(3);
+                                while lifecycle.debug_snapshot().undrained_completions != 1 {
+                                    assert!(
+                                        Instant::now() < deadline,
+                                        "the plugin publishes its result"
+                                    );
+                                    thread::yield_now();
+                                }
+                                // The fixture adds admitted work at the common exit boundary.
+                                for _ in 0..crate::host_executor::HOST_OPERATION_CAPACITY {
+                                    let (reply_tx, _reply_rx) =
+                                        crate::daemon::control::message::control_reply_channel();
+                                    assert!(!crate::daemon::control::request::handle(
+                                        daemon,
+                                        state,
+                                        transport.handle(),
+                                        sender.clone(),
+                                        ControlMessage::Request {
+                                            request: Box::new(DaemonRequest::Status),
+                                            transport_request_id: None,
+                                            reply_tx,
+                                            response_delivery_rx: None,
+                                            grant_id: None,
+                                            client_id: None,
+                                            enqueued_at: Instant::now(),
+                                        }
+                                    ));
+                                }
+                                for entry in state.pending_requests.values_mut() {
+                                    let probe = Probe {
+                                        gate: host_gate.clone(),
+                                        entered: entered_tx.clone(),
+                                        disposed: disposed_tx.clone(),
+                                    };
+                                    let lifecycle = lifecycle.clone();
+                                    entry.retire = Some(Box::new(move |_, _, _, _| {
+                                        drop((probe, lifecycle));
+                                    }));
+                                }
+                                let identity = state.terminal_lifecycle.identity;
+                                assert!(state.waiter_ids.next().unwrap().0 > identity.waiter_id.0);
+                                state.waiter_ids =
+                                    crate::owner_identity::WaiterIdSource::with_next(u64::MAX);
+                                assert!(state.waiter_ids.next().is_none());
+                                assert_eq!(state.terminal_lifecycle.identity, identity);
+                                let coordination = daemon.runtime().unwrap().coordination_bridge();
+                                let coordination_response = coordination.test_queue_pending(
+                                    crate::lua_runtime::PendingCoordinationOperation::Drain {
+                                        target: botster_core::EnvelopeTarget::Endpoint {
+                                            endpoint_id: botster_core::EndpointId(
+                                                "terminal-probe".into(),
+                                            ),
+                                        },
+                                        after: None,
+                                        limit: 1,
+                                    },
+                                );
+                                coordination.test_set_pending_drop_probe(ThreadProbe(
+                                    coordination_disposed_tx,
+                                ));
+                                let publication = daemon.runtime().unwrap().entity_publish_bridge();
+                                let publication_response = publication.test_queue_stale_publish(
+                                    botster_core::PluginKey("terminal-probe".into()),
+                                    serde_json::json!({
+                                        "type": "entity_patch",
+                                        "entity_type": "terminal-probe.items",
+                                        "snapshot_seq": 1,
+                                        "id": "item",
+                                        "patch": { "body": "x".repeat(16 * 1024) },
+                                    }),
+                                    None,
+                                );
+                                publication.test_set_pending_drop_probe(Probe {
+                                    gate: queued_publication_gate,
+                                    entered: publication_entered_tx,
+                                    disposed: publication_disposed_tx,
+                                });
+                                let spawner = daemon.runtime().unwrap().session_type_spawner();
+                                let spawner_drops =
+                                    spawner.test_seed_terminal_pending(Some(spawner_gate_rx));
+                                bridges_tx
+                                    .send((
+                                        coordination,
+                                        coordination_response,
+                                        publication,
+                                        publication_response,
+                                        spawner,
+                                        spawner_drops,
+                                    ))
+                                    .unwrap();
+                                assert_eq!(
+                                    state.pending_requests.len(),
+                                    crate::host_executor::HOST_OPERATION_CAPACITY
+                                );
+                                assert_eq!(
+                                    state.budget.outstanding(),
+                                    crate::host_executor::HOST_OPERATION_CAPACITY
+                                );
+                                inspect_tx
+                                    .send(Box::new(
+                                        daemon
+                                            .runtime()
+                                            .unwrap()
+                                            .host_executor()
+                                            .test_terminal_probe(),
+                                    ))
+                                    .unwrap();
+                            }),
+                            stopped: Box::new(move || {
+                                stopped_tx.send(()).unwrap();
+                            }),
+                        }),
+                    );
+                    finished_tx.send(result).unwrap();
+                })
+                .unwrap();
+            let inspect = inspect_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "serve reaches the selected exit: {error:?}; outcome: {:?}",
+                        finished_rx.recv_timeout(Duration::from_secs(1))
+                    )
+                });
+            let worker = entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("Host starts terminal disposal");
+            let (
+                coordination,
+                coordination_response,
+                publication,
+                publication_response,
+                spawner,
+                spawner_drops,
+            ) = bridges_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(worker.starts_with("botster-hub-host"), "{worker}");
+            assert_eq!(
+                inspect(),
+                (crate::host_executor::HOST_OPERATION_CAPACITY, true, false)
+            );
+            assert!(
+                stopped_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "daemon.stop must wait for disposal acknowledgement"
+            );
+            assert!(disposed_rx.try_recv().is_err());
+            assert!(engine_entered_rx.try_recv().is_err());
+            assert!(plugin_runtime_rx.try_recv().is_err());
+            assert_eq!(coordination.test_pending_count(), 1);
+            assert_eq!(publication.pending_publish_count(), 1);
+            let publication_charge = publication.retained_counts();
+            assert_eq!(publication_charge.0, 1);
+            assert!(publication_charge.1 > 16 * 1024);
+            assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, 1, true));
+            gate.release();
+            let engine_worker = engine_entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the final engine owner reaches destruction");
+            assert!(
+                engine_worker.starts_with("botster-hub-host"),
+                "{engine_worker}"
+            );
+            assert_eq!(inspect(), (1, true, false));
+            assert!(stopped_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            let runtime_events: Vec<_> = plugin_runtime_rx.try_iter().collect();
+            assert_eq!(runtime_events.len(), 2);
+            assert_eq!(runtime_events[0].0, "stop");
+            assert_eq!(runtime_events[1].0, "drop");
+            assert!(
+                runtime_events
+                    .iter()
+                    .all(|(_, name)| name.starts_with("botster-hub-host"))
+            );
+            assert_eq!(coordination.test_pending_count(), 1);
+            assert_eq!(publication.pending_publish_count(), 1);
+            assert_eq!(publication.retained_counts(), publication_charge);
+            assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, 1, true));
+            engine_gate.release();
+            let publication_worker = publication_entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("Host destroys the queued publication after engine disposal");
+            assert!(publication_worker.starts_with("botster-hub-host"));
+            assert_eq!(inspect(), (1, true, false));
+            assert!(stopped_rx.try_recv().is_err());
+            assert_eq!(coordination.test_pending_count(), 0);
+            assert!(
+                coordination_disposed_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .starts_with("botster-hub-host")
+            );
+            assert!(matches!(
+                coordination_response.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+            assert_eq!(publication.pending_publish_count(), 0);
+            assert_eq!(publication.retained_counts(), publication_charge);
+            assert!(matches!(
+                publication_response.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            publication_gate.release();
+            let first_spawner_drop = spawner_drops
+                .recv_timeout(Duration::from_secs(10))
+                .expect("Host destroys spawner payloads after publication disposal");
+            assert!(first_spawner_drop.0.starts_with("botster-hub-host"));
+            assert!(
+                first_spawner_drop.1,
+                "spawner queue locks are released before destruction"
+            );
+            assert_eq!(inspect(), (1, true, false));
+            assert!(stopped_rx.try_recv().is_err());
+            assert_eq!(publication.retained_counts(), (0, 0));
+            assert!(matches!(
+                publication_response.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+            assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, 0, true));
+            spawner_gate_tx.send(()).unwrap();
+            let result = finished_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("serve exits after Host disposal");
+            if error_exit {
+                assert!(matches!(
+                    result,
+                    Err(DaemonTransportError::ControlThreadStopped)
+                ));
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+            stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(inspect(), (0, false, true));
+            assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, 0, false));
+            let remaining_spawner_drops: Vec<_> = spawner_drops.try_iter().collect();
+            assert_eq!(remaining_spawner_drops.len(), 2);
+            assert!(
+                remaining_spawner_drops
+                    .iter()
+                    .all(|(name, unlocked)| name.starts_with("botster-hub-host") && *unlocked)
+            );
+            assert!(
+                publication_disposed_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .starts_with("botster-hub-host")
+            );
+            assert!(
+                engine_disposed_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .starts_with("botster-hub-host")
+            );
+            let disposed: Vec<_> = disposed_rx.try_iter().collect();
+            assert_eq!(
+                disposed.len(),
+                crate::host_executor::HOST_OPERATION_CAPACITY
+            );
+            assert!(
+                disposed
+                    .iter()
+                    .all(|name| name.starts_with("botster-hub-host"))
+            );
+            owner.join().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     fn admit_cleanup_test_subscription(daemon: &HubDaemon, state: &mut DaemonControlState) {
         use crate::package_event_router::{EmittedContract, EventAudience};
@@ -3626,9 +4333,9 @@ mod tests {
                 permit: Some(permit),
                 must_finish: true,
                 past_deadline: false,
-                continuation: Box::new(|_, _| {
-                    crate::daemon::control::pending::ControlPoll::Pending
-                }),
+                continuation: crate::daemon::control::pending::ControlContinuation::callback(
+                    |_, _| crate::daemon::control::pending::ControlPoll::Pending,
+                ),
                 retire: None,
             },
         );
@@ -5084,10 +5791,18 @@ mod tests {
         match handle_control_request(daemon, state, observability, control_tx, request) {
             crate::daemon::control::pending::ControlStep::Ready(response) => response,
             crate::daemon::control::pending::ControlStep::Pending(mut step) => loop {
-                match (step.continuation)(daemon, state) {
-                    crate::daemon::control::pending::ControlPoll::DeliverStatusResponse(_, _, _)
-                    | crate::daemon::control::pending::ControlPoll::StatusResponseDelivered { .. }
-                    | crate::daemon::control::pending::ControlPoll::StatusResponseRefused { .. } => {
+                match step.continuation.poll(daemon, state) {
+                    crate::daemon::control::pending::ControlPoll::DeliverStatusResponse(
+                        _,
+                        _,
+                        _,
+                    )
+                    | crate::daemon::control::pending::ControlPoll::StatusResponseDelivered {
+                        ..
+                    }
+                    | crate::daemon::control::pending::ControlPoll::StatusResponseRefused {
+                        ..
+                    } => {
                         panic!("package helper must not receive a status response")
                     }
                     crate::daemon::control::pending::ControlPoll::Again => continue,
@@ -8559,9 +9274,11 @@ return botster.register({
             if let Some(runtime) = daemon.runtime() {
                 runtime.reap_detached_core_operations();
             }
-            match (pending.continuation)(daemon, state) {
+            match pending.continuation.poll(daemon, state) {
                 crate::daemon::control::pending::ControlPoll::DeliverStatusResponse(_, _, _)
-                | crate::daemon::control::pending::ControlPoll::StatusResponseDelivered { .. }
+                | crate::daemon::control::pending::ControlPoll::StatusResponseDelivered {
+                    ..
+                }
                 | crate::daemon::control::pending::ControlPoll::StatusResponseRefused { .. } => {
                     panic!("attach helper must not receive a status response")
                 }
