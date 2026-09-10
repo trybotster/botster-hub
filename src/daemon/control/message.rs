@@ -47,8 +47,20 @@ impl ControlReplySender {
         Self(self.0.take())
     }
 
+    /// True when the receiver closed or the sender was transferred.
+    /// Use `is_receiver_closed` when transfer is not abandonment.
     pub(crate) fn is_closed(&self) -> bool {
         self.0.as_ref().is_none_or(oneshot::Sender::is_closed)
+    }
+
+    /// True only when this value still owns a sender whose receiver closed.
+    pub(crate) fn is_receiver_closed(&self) -> bool {
+        self.0.as_ref().is_some_and(oneshot::Sender::is_closed)
+    }
+
+    /// True when response delivery moved to another owner.
+    pub(crate) fn is_transferred(&self) -> bool {
+        self.0.is_none()
     }
 }
 

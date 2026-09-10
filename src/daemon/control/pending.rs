@@ -711,7 +711,7 @@ pub(crate) fn poll_ready_request_item(
         return false;
     };
     entry.ready_key = None;
-    if !entry.must_finish && entry.reply_tx.is_closed() {
+    if !entry.must_finish && entry.reply_tx.is_receiver_closed() {
         retire(daemon, state, entry, "reply_closed");
         return false;
     }
@@ -814,6 +814,10 @@ pub(crate) fn poll_ready_request_item(
     }
     if reasons.contains(READY_DEADLINE) {
         if entry.must_finish {
+            flag_past_deadline(state, &mut entry);
+        } else if entry.reply_tx.is_transferred() {
+            // A Host worker owns delivery. Keep the row until that worker
+            // returns its completion and original capacity.
             flag_past_deadline(state, &mut entry);
         } else {
             retire(daemon, state, entry, "deadline");

@@ -77,6 +77,21 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "OPERATOR_ERROR_TOO_MANY_REQUESTS",
         &format!("\"{}\"", crate::OPERATOR_ERROR_TOO_MANY_REQUESTS),
     );
+    emit_const(
+        &mut output,
+        "OPERATOR_ERROR_RUNTIME_REPLY_CLOSED",
+        &format!("\"{}\"", crate::OPERATOR_ERROR_RUNTIME_REPLY_CLOSED),
+    );
+    emit_const(
+        &mut output,
+        "OPERATOR_ERROR_RUNTIME_REQUEST_TIMED_OUT",
+        &format!("\"{}\"", crate::OPERATOR_ERROR_RUNTIME_REQUEST_TIMED_OUT),
+    );
+    emit_const(
+        &mut output,
+        "OPERATOR_ERROR_RUNTIME_REQUEST_FAILED",
+        &format!("\"{}\"", crate::OPERATOR_ERROR_RUNTIME_REQUEST_FAILED),
+    );
     line(&mut output, "");
     line(
         &mut output,
