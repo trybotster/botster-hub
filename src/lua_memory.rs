@@ -195,25 +195,6 @@ pub(crate) struct LuaCallbackCharge {
     bytes: usize,
 }
 
-impl LuaCallbackCharge {
-    /// Release admission for storage that was never allocated or is already freed.
-    pub(crate) fn shrink_to(&mut self, bytes: usize) -> Result<(), LuaMemoryCapacityError> {
-        let released = self
-            .bytes
-            .checked_sub(bytes)
-            .ok_or(LuaMemoryCapacityError {
-                class: LuaMemoryClass::Callback,
-                requested: bytes,
-                available: self.bytes,
-            })?;
-        self.account
-            .callback_bytes
-            .fetch_sub(released, Ordering::AcqRel);
-        self.bytes = bytes;
-        Ok(())
-    }
-}
-
 impl fmt::Debug for LuaCallbackCharge {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -290,23 +271,19 @@ mod tests {
     }
 
     #[test]
-    fn trimmed_callback_charges_retain_only_admitted_storage() {
+    fn sized_callback_charges_retain_more_items_than_full_allowances() {
         let account = account();
         let mut retained = Vec::new();
-        for _ in 0..4 {
-            let mut charge = account.reserve_callback().unwrap();
-            charge.shrink_to(1).unwrap();
-            retained.push(charge);
+        for _ in 0..6 {
+            retained.push(account.reserve_callback_bytes(1).unwrap());
         }
-        assert_eq!(account.usage(), (0, 4));
-        let mut last = account.reserve_callback_bytes(2).unwrap();
-        assert!(account.reserve_callback_bytes(1).is_err());
-        assert!(last.shrink_to(3).is_err());
+        assert!(
+            retained.len()
+                > account.limits().total_callback_bytes / account.limits().per_callback_bytes
+        );
         assert_eq!(account.usage(), (0, 6));
-        last.shrink_to(0).unwrap();
-        assert_eq!(account.usage(), (0, 4));
+        assert!(account.reserve_callback_bytes(1).is_err());
         drop(retained);
-        drop(last);
         assert_eq!(account.usage(), (0, 0));
     }
 
