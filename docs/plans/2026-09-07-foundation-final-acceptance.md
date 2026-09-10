@@ -534,6 +534,17 @@ Core drain removes selected envelopes and marks them Delivered before returning 
 Acknowledge changes a separate delivery-state record. Discarding an admitted drain result can therefore lose those envelopes; terminal disposal is not lossless delivery.
 The terminal test proves collection and disposal only. C1 preserves existing drain semantics and prohibits automatic replay; durable redelivery needs a separate contract decision.
 
+Review found that the draft holds shared Host permits while coordination waits for Core. Eight such calls can exhaust the eight shared Host slots.
+That design can refuse unrelated Host work and the shutdown response. Reserving disposal capacity before ingress was therefore too restrictive for C1.
+Root selected retained owner rows across Core waits, with Host reservation only when delivery or disposal is ready. No new capacity partition or policy value is selected.
+The existing bounded Host-capacity drain must resume waiting C1 rows by waiter identity. Terminal disposal retains its payload until Host capacity becomes available.
+A regression must hold eight coordination calls in Core and verify a Host-only sibling operation. The corrected lifecycle must pass review before functional execution.
+Root also selected retention of a consumed completion in its original row when C1 scheduling fails. A C1 fault must not suppress shared Core notifications.
+The first no-run library build exited 101 after 33.115 seconds, without a deadline expiry or test executable. No test ran.
+Four test callers still invoked the old boxed request directly; another test match omitted the new internal-completion variant.
+Root verified the raw errors and all 22 frozen source/config hashes in `/private/tmp/c1-consumer-build-20260910-1`.
+The implementer will correct those compile errors with the Host-capacity and scheduler changes. A second build requires review of the new handoff.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
