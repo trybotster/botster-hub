@@ -288,6 +288,21 @@ The integration test first failed setup because candidate paths were absent. Its
 The integration result covers the current in-process library, not a newly packaged cleanup binary. The compiled test tree also contained uncommitted diagnostic tests, which did not run.
 Evidence is `/private/tmp/callback-queued-read-cleanup-20260910-evidence.md`. The diagnostic edits remain outside the cleanup commit.
 
+### Completion registration ownership repair
+
+Root integrated the reviewed repair at `b1282e75497eb218ff3af60b24e46fc93d8ea360`.
+An unregistered `CoreDaemonHandle::submit` request no longer retires an owner registration when admission fails.
+The production change removes two retirement calls in `src/data_plane/driver.rs`. Registered submission paths remain unchanged.
+Three regression tests construct a colliding owner identity and exercise full, stopped, and disconnected admission.
+Before the repair, all three tests failed at the registration-survival assertion. An earlier compilation failure ran zero tests and remains separately preserved.
+After the repair, all three tests passed. The driver module passed all 19 tests, including those three; both runs exited with status 0.
+The passing tests cover both pending and published owner registrations, payload destruction, and result delivery.
+This evidence covers constructed collisions at unit level. It does not reproduce a production-path collision or establish broader identity uniqueness.
+The compiled test tree contained preserved Lua diagnostic edits, but no diagnostic ran. No packaged binary acceptance follows.
+The evidence manifest is `/private/tmp/core-submit-owner-20260910-evidence.md`.
+The independent review is `/private/tmp/claude-callback-review.OFb8pb/submit-retire-final-review.md`.
+Memory accounting and spawn lifecycle acceptance remain open.
+
 ## Verified starting points
 
 | Component | Revision | Evidence scope |
