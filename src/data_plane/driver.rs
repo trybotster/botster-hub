@@ -629,11 +629,9 @@ impl CoreDaemonHandle {
         match admit_request(&self.requests, &self.accepting, request) {
             CoreAdmission::Queued => {}
             CoreAdmission::Refused => {
-                self.completion_wake.retire(identity);
                 return CoreTicket::refused();
             }
             CoreAdmission::Stopped => {
-                self.completion_wake.retire(identity);
                 return CoreTicket::lost(identity);
             }
         }
@@ -1551,6 +1549,96 @@ mod tests {
         };
         drop(result);
         assert_eq!(drops.load(Ordering::Acquire), 2);
+    }
+
+    fn check_unregistered_submit_preserves_owner(full: bool, accepting: bool, connected: bool) {
+        for owner_ready in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "botster-unregistered-submit-{}-{full}-{accepting}-{connected}-{owner_ready}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("create Core submit test directory");
+            let mut daemon = CoreDaemon::new(CoreDaemonConfig::new(&root));
+            let (requests, receiver) = mpsc::sync_channel::<CoreRequest>(CORE_REQUEST_CAPACITY);
+            if full {
+                for _ in 0..CORE_REQUEST_CAPACITY {
+                    requests
+                        .try_send(noop_request())
+                        .expect("fill request queue");
+                }
+            }
+            let receiver = connected.then_some(receiver);
+            let wake = Arc::new(CoreCompletionWake::new());
+            let expected = identity(1, 1);
+            let (mut owner_ticket, owner_publisher) = owner_channel(expected, Arc::clone(&wake));
+            let mut owner_publisher = Some(owner_publisher);
+            if owner_ready {
+                owner_publisher.take().unwrap().publish(7_u8);
+            }
+            let handle = CoreDaemonHandle {
+                requests,
+                control: daemon.wake_pump_control(),
+                accepting: Arc::new(AtomicBool::new(accepting)),
+                admission: Arc::new(Mutex::new(())),
+                request_pending: Arc::new(AtomicBool::new(false)),
+                owner_waiting: Arc::new(AtomicBool::new(false)),
+                waiter_ids: Arc::new(WaiterIdSource::default()),
+                completion_wake: Arc::clone(&wake),
+            };
+            let drops = Arc::new(AtomicUsize::new(0));
+            let probe = DropProbe(Arc::clone(&drops));
+            let mut ticket = handle.submit::<(), _>(move |_| {
+                drop(probe);
+                panic!("an unadmitted request must not execute");
+            });
+            if accepting && connected {
+                assert!(matches!(ticket.poll(), CoreTicketPoll::Refused));
+            } else {
+                assert!(matches!(ticket.poll(), CoreTicketPoll::Lost));
+            }
+            drop(ticket);
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+            assert!(!handle.request_pending.load(Ordering::Acquire));
+            assert_eq!(
+                wake.live_identity_counts(),
+                (1, usize::from(owner_ready), 1)
+            );
+            assert!(matches!(owner_ticket.poll(), CoreTicketPoll::Pending));
+            assert_eq!(wake.take(), owner_ready);
+            if let Some(publisher) = owner_publisher {
+                publisher.publish(7_u8);
+                assert!(wake.take());
+            }
+            assert_eq!(handle.take_owner_completion_identities(1), vec![expected]);
+            assert!(matches!(owner_ticket.poll(), CoreTicketPoll::Ready(7)));
+            assert!(handle.take_owner_completion_identities(1).is_empty());
+            assert!(!wake.take());
+            assert_eq!(handle.retire_owner_waiter(expected.waiter_id), 0);
+            assert_eq!(wake.live_identity_counts(), (0, 0, 0));
+            if let Some(receiver) = receiver {
+                assert_eq!(
+                    receiver.try_iter().count(),
+                    if full { CORE_REQUEST_CAPACITY } else { 0 }
+                );
+            }
+            drop((owner_ticket, handle, daemon));
+            std::fs::remove_dir_all(root).expect("remove Core submit test directory");
+        }
+    }
+
+    #[test]
+    fn unregistered_submit_refusal_preserves_colliding_owner_identity() {
+        check_unregistered_submit_preserves_owner(true, true, true);
+    }
+
+    #[test]
+    fn unregistered_submit_stopped_admission_preserves_colliding_owner_identity() {
+        check_unregistered_submit_preserves_owner(false, false, true);
+    }
+
+    #[test]
+    fn unregistered_submit_disconnected_queue_preserves_colliding_owner_identity() {
+        check_unregistered_submit_preserves_owner(false, true, false);
     }
 
     #[test]
