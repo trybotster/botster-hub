@@ -1090,6 +1090,11 @@ impl PackageRegistry {
         self.records.values().collect()
     }
 
+    /// Borrow package records without allocating a reference vector.
+    pub(crate) fn package_records(&self) -> impl ExactSizeIterator<Item = &PackageRecord> {
+        self.records.values()
+    }
+
     /// Resolve one installed package through the core dependency and feature matrix.
     #[must_use]
     pub fn resolution_matrix_for(&self, record: &PackageRecord) -> PackageResolutionMatrix {
@@ -3581,6 +3586,29 @@ mod tests {
             last_audit_reason: "test fixture".to_string(),
             admitted_host_profile: None,
         }
+    }
+
+    #[test]
+    fn status_package_iterator_borrows_original_records_in_name_order() {
+        let mut registry = PackageRegistry::new(Default::default());
+        for name in ["z", "a"] {
+            registry.records.insert(
+                name.into(),
+                package_record(plugin_manifest(name, Vec::new()), PackageState::Disabled),
+            );
+        }
+        let mut records = registry.package_records();
+        assert_eq!(records.len(), 2);
+        assert!(std::ptr::eq(
+            records.next().unwrap(),
+            registry.package("a").unwrap()
+        ));
+        assert_eq!(records.len(), 1);
+        assert!(std::ptr::eq(
+            records.next().unwrap(),
+            registry.package("z").unwrap()
+        ));
+        assert!(records.next().is_none());
     }
 
     fn package_configuration_manifest() -> HubPackageManifest {

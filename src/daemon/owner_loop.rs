@@ -1870,6 +1870,43 @@ impl DaemonEgressDiagnostics {
         }
     }
 
+    /// Count the two possible rows before formatting either message.
+    pub(crate) fn diagnostics_bytes(&self, limit: usize) -> Option<usize> {
+        let mut bytes = std::mem::size_of::<Vec<DaemonDiagnostic>>();
+        if bytes > limit {
+            return None;
+        }
+        for (kind, failures) in [
+            (DaemonDeliveryKind::Terminal, self.terminal_write_failures),
+            (DaemonDeliveryKind::Control, self.control_write_failures),
+        ] {
+            if failures == 0 {
+                continue;
+            }
+            let digits = failures.ilog10() as usize + 1;
+            let message_bytes = "daemon client  egress observed  bounded write failure(s)"
+                .len()
+                .checked_add(kind.label().len())?
+                .checked_add(digits)?;
+            bytes = bytes
+                .checked_add(std::mem::size_of::<DaemonDiagnostic>())?
+                .checked_add("daemon_client_egress".len())?
+                .checked_add(message_bytes)?;
+            if bytes > limit {
+                return None;
+            }
+        }
+        Some(bytes)
+    }
+
+    pub(crate) fn bounded_diagnostics(
+        &self,
+        limit: usize,
+    ) -> Option<(Vec<DaemonDiagnostic>, usize)> {
+        let bytes = self.diagnostics_bytes(limit)?;
+        Some((self.diagnostics(), bytes))
+    }
+
     pub(crate) fn diagnostics(&self) -> Vec<DaemonDiagnostic> {
         let mut diagnostics = Vec::new();
         if self.terminal_write_failures > 0 {
@@ -5454,6 +5491,35 @@ mod tests {
         assert!(
             control_rx.try_recv().is_err(),
             "pre-bind OperatorError plus Status must not enqueue Detach cleanup"
+        );
+    }
+
+    #[test]
+    fn status_egress_preflight_counts_formatted_rows_and_rechecks_counter_growth() {
+        let mut diagnostics = DaemonEgressDiagnostics {
+            terminal_write_failures: 9,
+            control_write_failures: u64::MAX,
+        };
+        let bytes = diagnostics.diagnostics_bytes(usize::MAX).unwrap();
+        assert!(diagnostics.bounded_diagnostics(bytes - 1).is_none());
+        let (rows, charged) = diagnostics.bounded_diagnostics(bytes).unwrap();
+        let actual = std::mem::size_of_val(&rows)
+            + rows.len() * std::mem::size_of::<DaemonDiagnostic>()
+            + rows
+                .iter()
+                .map(|row| {
+                    row.operation.as_ref().unwrap().len() + row.message.as_ref().unwrap().len()
+                })
+                .sum::<usize>();
+        assert_eq!(actual, bytes);
+        assert_eq!(charged, bytes);
+        diagnostics.record_write_failure(DaemonDeliveryKind::Terminal);
+        assert!(diagnostics.bounded_diagnostics(bytes).is_none());
+        let empty = DaemonEgressDiagnostics::default();
+        assert!(
+            empty
+                .bounded_diagnostics(std::mem::size_of::<Vec<DaemonDiagnostic>>() - 1)
+                .is_none()
         );
     }
 
