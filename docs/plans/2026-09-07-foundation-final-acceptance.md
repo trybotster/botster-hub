@@ -484,6 +484,14 @@ Reserve before constructing retained Rust input. Preserve the charge through que
 The first handoff contains the exact source diff, allocation/lifetime evidence, and focused tests. Root approves the test command before execution.
 The daemon consumer and its output, wake, and disposal obligations remain C1 work. This approval does not select production memory limits or close M2.
 
+Root integrated the sized-charge API and acknowledge input together as `2d11f8a`, selecting `f48696c` and `e2b81c61aff228848b9414303162748148766b09`.
+The combined source omits `shrink_to` and the diagnostic edits. All five affected files match the reviewed implementation commit.
+Root verified eight input tests, five memory tests, and one exact integration test on main. Each command exited with zero.
+Logs: `/private/tmp/m1a-main-2d11f8a-{input,memory,integration}.log`. Filtered counts were 977, 980, and 47, respectively.
+The integration test exercises the in-process runtime and Core submission with the unbounded loader. Its old binary fixtures do not prove a matched packaged candidate.
+Input identifier ownership is the closed slice. Queue, channel, Core closure, retained result, state, and asynchronous consumer accounting remain open.
+Root selects C1 next, using revision 7's shared bridge contract and the existing owner rows and registered Core completion path.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
