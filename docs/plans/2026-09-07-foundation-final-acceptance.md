@@ -475,6 +475,15 @@ Root reran the same seven focused tests on main without F3 or diagnostic edits. 
 Raw log: `/private/tmp/i1-main-51aef9d-test.log`. The build reported 66 library warnings and 39 library-test warnings.
 This closes the tested registration boundary only. No publication, installation, full-foundation acceptance, or production-memory policy follows from this checkpoint.
 
+### Execution checkpoint: acknowledge input approval
+
+Jason approved validating only `target` and `envelope_id` for `coordination.acknowledge`, while ignoring unused fields.
+Unused fields may therefore contain values that whole-input validation previously rejected. Consumed-field validation and all seven target variants remain in scope.
+Root resumes A7's M1a implementation with A8 as independent reviewer. The held sized-charge API must gain its actual production caller.
+Reserve before constructing retained Rust input. Preserve the charge through queueing, Core ownership, refusal, timeout, and disposal.
+The first handoff contains the exact source diff, allocation/lifetime evidence, and focused tests. Root approves the test command before execution.
+The daemon consumer and its output, wake, and disposal obligations remain C1 work. This approval does not select production memory limits or close M2.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
