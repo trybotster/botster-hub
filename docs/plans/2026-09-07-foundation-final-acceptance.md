@@ -504,6 +504,15 @@ The charged stopped-admission path must return the original disconnected ticket,
 Root assigns A7 the finite test implementation and A8 its independent review. Execution follows review of isolation, allocation capture, exact types, and finite scenarios.
 The test must cover channel construction and both drop orders, refusal and loss, and the relevant registration allocation paths. No live Hub or Lua state participates.
 
+The isolated build and single measured run passed. Raw evidence is `/private/tmp/c1-allocation-oracle-20260910-run-1`.
+Root verified exit zero, no deadline expiry, all 19 scenarios, and no remaining captured allocations after thread exit.
+Claude accepted the evidence in `/private/tmp/claude-callback-review.OFb8pb/c1-oracle-results-review.md`.
+For the exact test-profile ticket type, the channel requests 816 bytes and its proposed lease requests 32 bytes. The combined reservation input is 848 bytes.
+The shared wake's fixed storage is 840 bytes including three empty roots. The measured node layouts are 192-byte leaves and 288-byte internal nodes.
+These are requested allocation sizes, not production budgets or observed-peak bounds. Release builds and changed concrete types need separate verification.
+Root resumed A7's C1 implementation and assigned A9 the bounded Core wake population/transient proof. A8 reviews the implementation and proof.
+The callback reply channel, executor-thread wait storage, changed queue slots, and Core lookup/result overlap remain explicit C1 obligations.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
