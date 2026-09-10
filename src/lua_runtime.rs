@@ -39,7 +39,9 @@ use crate::package_event_router::{CausalScopeTable, EventPlaneStatus, PackageEve
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
 
+mod acknowledge_input;
 mod sandbox;
+use acknowledge_input::AcknowledgeInput;
 
 thread_local! {
     static INVOCATION_CAUSAL_SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
@@ -109,13 +111,9 @@ impl HubCoordinationBridge {
 
     fn acknowledge(
         &self,
-        target: EnvelopeTarget,
-        envelope_id: EnvelopeId,
+        input: AcknowledgeInput,
     ) -> Result<RoutedEnvelopeDeliveryStateResult, String> {
-        let response = self.request(PendingCoordinationOperation::Acknowledge {
-            target,
-            envelope_id,
-        })?;
+        let response = self.request(PendingCoordinationOperation::Acknowledge { input })?;
         match response {
             HubCoordinationResponse::Acknowledge(outcome) => Ok(outcome),
             _ => Err("coordination acknowledge returned unexpected response".to_string()),
@@ -225,8 +223,7 @@ pub(crate) enum PendingCoordinationOperation {
         limit: usize,
     },
     Acknowledge {
-        target: EnvelopeTarget,
-        envelope_id: EnvelopeId,
+        input: AcknowledgeInput,
     },
 }
 
@@ -1075,7 +1072,12 @@ fn install_botster_api(
     botster.set("capabilities", capabilities_table)?;
     botster.set(
         "coordination",
-        coordination_table(lua, plugin_key.clone(), host_api.coordination)?,
+        coordination_table(
+            lua,
+            plugin_key.clone(),
+            host_api.coordination,
+            host_api.memory,
+        )?,
     )?;
     botster.set(
         "entity_publish",
@@ -1842,6 +1844,7 @@ fn coordination_table(
     lua: &Lua,
     plugin_key: PluginKey,
     coordination_bridge: HubCoordinationBridge,
+    memory: Option<Arc<LuaMemoryAccount>>,
 ) -> Result<Table, mlua::Error> {
     let coordination = lua.create_table()?;
 
@@ -1880,25 +1883,9 @@ fn coordination_table(
         })?,
     )?;
 
-    let ack_bridge = coordination_bridge;
     coordination.set(
         "acknowledge",
-        lua.create_function(move |lua, args: Value| {
-            let value = lua.from_value::<serde_json::Value>(args)?;
-            let target = target_from_json(value.get("target"))?;
-            let envelope_id = value
-                .get("envelope_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    mlua::Error::RuntimeError(
-                        "coordination.acknowledge requires envelope_id".to_string(),
-                    )
-                })?;
-            let outcome = ack_bridge
-                .acknowledge(target, EnvelopeId(envelope_id.to_string()))
-                .map_err(mlua::Error::RuntimeError)?;
-            lua.to_value(&outcome)
-        })?,
+        acknowledge_input::callback(lua, coordination_bridge, memory)?,
     )?;
 
     Ok(coordination)

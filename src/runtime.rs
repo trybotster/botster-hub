@@ -2269,18 +2269,14 @@ impl HubRuntime {
                         .map(HubCoordinationResponse::Drain)
                         .map_err(|error| error.to_string())
                 }),
-                PendingCoordinationOperation::Acknowledge {
-                    target,
-                    envelope_id,
-                } => self.core_daemon.submit(move |daemon| {
-                    daemon
-                        .acknowledge_routed_envelope(AcknowledgeRoutedEnvelopeRequest {
-                            target,
-                            envelope_id,
-                        })
-                        .map(HubCoordinationResponse::Acknowledge)
-                        .map_err(|error| error.to_string())
-                }),
+                PendingCoordinationOperation::Acknowledge { input } => {
+                    self.core_daemon.submit(move |daemon| {
+                        input
+                            .acknowledge(daemon)
+                            .map(HubCoordinationResponse::Acknowledge)
+                            .map_err(|error| error.to_string())
+                    })
+                }
             };
             if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
                 inflight.push(InflightPluginCore::Coordination {
