@@ -81,14 +81,30 @@ impl LuaMemoryAccount {
     pub(crate) fn reserve_callback(
         self: &Arc<Self>,
     ) -> Result<LuaCallbackCharge, LuaMemoryCapacityError> {
+        self.reserve_callback_bytes(self.limits.per_callback_bytes)
+    }
+
+    /// Reserve known Rust allocation requests before constructing their storage.
+    pub(crate) fn reserve_callback_bytes(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<LuaCallbackCharge, LuaMemoryCapacityError> {
+        if bytes > self.limits.per_callback_bytes {
+            return Err(LuaMemoryCapacityError {
+                class: LuaMemoryClass::Callback,
+                requested: bytes,
+                available: self.limits.per_callback_bytes,
+            });
+        }
         reserve(
             &self.callback_bytes,
-            self.limits.per_callback_bytes,
+            bytes,
             self.limits.total_callback_bytes,
             LuaMemoryClass::Callback,
         )?;
         Ok(LuaCallbackCharge {
             account: Arc::clone(self),
+            bytes,
         })
     }
 
@@ -176,12 +192,33 @@ impl Drop for LuaVmCharge {
 /// Lua results use the separate Lua-state allowance after Rust conversion ends.
 pub(crate) struct LuaCallbackCharge {
     account: Arc<LuaMemoryAccount>,
+    bytes: usize,
+}
+
+impl LuaCallbackCharge {
+    /// Release admission for storage that was never allocated or is already freed.
+    pub(crate) fn shrink_to(&mut self, bytes: usize) -> Result<(), LuaMemoryCapacityError> {
+        let released = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(LuaMemoryCapacityError {
+                class: LuaMemoryClass::Callback,
+                requested: bytes,
+                available: self.bytes,
+            })?;
+        self.account
+            .callback_bytes
+            .fetch_sub(released, Ordering::AcqRel);
+        self.bytes = bytes;
+        Ok(())
+    }
 }
 
 impl fmt::Debug for LuaCallbackCharge {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LuaCallbackCharge")
+            .field("bytes", &self.bytes)
             .finish_non_exhaustive()
     }
 }
@@ -190,7 +227,7 @@ impl Drop for LuaCallbackCharge {
     fn drop(&mut self) {
         self.account
             .callback_bytes
-            .fetch_sub(self.account.limits.per_callback_bytes, Ordering::AcqRel);
+            .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -232,6 +269,44 @@ mod tests {
         drop(second);
         assert_eq!(account.usage(), (0, 3));
         drop(moved);
+        assert_eq!(account.usage(), (0, 0));
+    }
+
+    #[test]
+    fn sized_callback_charges_refuse_at_the_exact_byte_boundary() {
+        let account = account();
+        assert!(account.reserve_callback_bytes(4).is_err());
+        assert_eq!(account.usage(), (0, 0));
+        let first = account.reserve_callback_bytes(2).unwrap();
+        let second = account.reserve_callback_bytes(3).unwrap();
+        let error = account.reserve_callback_bytes(2).unwrap_err();
+        assert_eq!(error.available, 1);
+        assert_eq!(account.usage(), (0, 5));
+        let last = account.reserve_callback_bytes(1).unwrap();
+        assert!(account.reserve_callback_bytes(1).is_err());
+        assert_eq!(account.usage(), (0, 6));
+        drop((first, second, last));
+        assert_eq!(account.usage(), (0, 0));
+    }
+
+    #[test]
+    fn trimmed_callback_charges_retain_only_admitted_storage() {
+        let account = account();
+        let mut retained = Vec::new();
+        for _ in 0..4 {
+            let mut charge = account.reserve_callback().unwrap();
+            charge.shrink_to(1).unwrap();
+            retained.push(charge);
+        }
+        assert_eq!(account.usage(), (0, 4));
+        let mut last = account.reserve_callback_bytes(2).unwrap();
+        assert!(account.reserve_callback_bytes(1).is_err());
+        assert!(last.shrink_to(3).is_err());
+        assert_eq!(account.usage(), (0, 6));
+        last.shrink_to(0).unwrap();
+        assert_eq!(account.usage(), (0, 4));
+        drop(retained);
+        drop(last);
         assert_eq!(account.usage(), (0, 0));
     }
 
