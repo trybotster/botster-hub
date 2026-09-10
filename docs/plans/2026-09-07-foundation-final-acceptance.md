@@ -530,6 +530,9 @@ The deterministic Core gate also blocks Status, because Status submits its own C
 The test will use ListPackages to check sibling progress during the gate and Status after release. Matched-artifact Status responsiveness remains a separate requirement.
 The regression will use real socket dispatch through `serve_daemon_inner`, beside the existing owner-loop tests. No helper may pump the tested coordination requests.
 The draft adds terminal-owner storage to the shared wake. The old fixed-size measurement does not apply to that changed type; the tree derivation remains conditional.
+Core drain removes selected envelopes and marks them Delivered before returning the result (`engine/routed_envelope.rs:126-171` at Core `b9e989b`).
+Acknowledge changes a separate delivery-state record. Discarding an admitted drain result can therefore lose those envelopes; terminal disposal is not lossless delivery.
+The terminal test proves collection and disposal only. C1 preserves existing drain semantics and prohibits automatic replay; durable redelivery needs a separate contract decision.
 
 ## Historical verified starting points
 
