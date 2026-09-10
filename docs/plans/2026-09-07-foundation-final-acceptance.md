@@ -492,6 +492,18 @@ The integration test exercises the in-process runtime and Core submission with t
 Input identifier ownership is the closed slice. Queue, channel, Core closure, retained result, state, and asynchronous consumer accounting remain open.
 Root selects C1 next, using revision 7's shared bridge contract and the existing owner rows and registered Core completion path.
 
+### Execution checkpoint: C1 allocation measurement approval
+
+Jason approved a counting allocator in one isolated test executable to establish allocation sizes for the pinned compiler and target.
+This exception does not permit a replacement allocator in the Hub library or production executable. It does not resume the stopped Lua diagnostics.
+Root accepts compiler-and-target-specific size constants when source review and the isolated evidence support them. Untested targets remain unverified.
+Measurements establish allocation sizes and exercised lifetimes, not production memory budgets or universal worst-case behavior.
+The reviewed request owner keeps the boxed operation before its charge and releases the charge after the boxed call returns.
+The reviewed channel owner keeps a private lease at each endpoint. The last lease releases its charge after both endpoints and the shared allocation are destroyed.
+The charged stopped-admission path must return the original disconnected ticket, without constructing a second channel.
+Root assigns A7 the finite test implementation and A8 its independent review. Execution follows review of isolation, allocation capture, exact types, and finite scenarios.
+The test must cover channel construction and both drop orders, refusal and loss, and the relevant registration allocation paths. No live Hub or Lua state participates.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
