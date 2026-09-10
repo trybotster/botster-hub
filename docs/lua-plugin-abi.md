@@ -357,6 +357,31 @@ primitive without embedding Project Pipelines policy in Rust:
 - `botster.coordination.acknowledge({ target = {...}, envelope_id = "..." })`:
   acknowledges one delivered target copy and returns its delivery state.
 
+`acknowledge` reads only raw `target` and `envelope_id` fields. The target accepts
+the seven Core variants: `endpoint`, `client`, `session`, `subscription`, `plugin`,
+`stream`, and `topic`. Each consumed identifier must be a UTF-8 string. Empty
+strings, whitespace, and embedded NUL bytes remain accepted. The wrapper does
+not invoke table metamethods. It validates the target before `envelope_id`.
+Array-encoded argument tables still have no target. Array-encoded target tables
+remain invalid, including tables with the protected mlua array metatable.
+
+The wrapper ignores unused fields, including nested target fields with functions,
+userdata, invalid UTF-8 strings, or cycles. The previous JSON conversion rejected
+these values. Validation errors now use Lua-owned strings that identify the
+invalid consumed field and its expected form. Their text no longer follows
+serde's diagnostic format. Errors from unused-field conversion no longer occur.
+
+When the host supplies a memory account, `acknowledge` reserves the target and
+envelope identifier bytes before it creates Rust strings. A request above the
+callback limit reports a quota error. An exhausted shared account reports a
+capacity error. The request owns its input charge through queueing, callback
+timeout, Core consumption, refusal, and terminal disposal.
+
+This input charge covers only the identifier string allocations. The bridge owns
+the pending queue capacity. The response sender and receiver share the channel
+storage. Core owns its submitted closure storage. Those allocations, result
+storage, and the coordination consumer require separate accounting and verification.
+
 These helpers submit to the hub owner thread and use CoreDaemon's
 routed-envelope APIs. They raise a Lua runtime error if the daemon rejects the
 request, including the stopped-daemon case; callers that need to recover should
