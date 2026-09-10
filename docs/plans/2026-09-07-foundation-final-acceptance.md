@@ -231,6 +231,63 @@ The first full library run lacked local socket access. The local-socket retry th
 Root preserved those failed runs. The final check used local socket access and `BOTSTER_ENV=test`; all 965 library tests passed with exit status 0.
 The final log is `/private/tmp/botster-main-checkpoint.UHBXZd/library-test-mode.log`. The full run took 46.97 seconds.
 
+### Agent startup and premise review
+
+Both agent pairs verified clean branches at published Hub `9e95ff8ee8013ee9cd77a70221e5d3b7ddbea823`.
+The callback pair uses `delivery/callback-accounting-20260910`. The spawn pair uses `delivery/spawn-lifecycle-20260910`.
+Codex owns implementation in each pair. Claude owns independent review. Spawn work remains read-only until the stated transfer gate.
+
+The callback investigation found a retained Rust error-print buffer in mlua 0.11.6.
+`error_tostring` grows that buffer before copying the result into Lua. Clearing the buffer retains its capacity.
+The current `events.on` path can propagate a variable-length error from a plugin-controlled table metamethod into this buffer.
+Root checked the source path. This evidence does not establish an unlimited size under a fixed Lua heap limit.
+The callback pair must establish allocation bounds and ownership before dependent implementation. No shared accounting interface is approved yet.
+
+The spawn review identified these blockers through source inspection. No new regression test has run yet.
+
+- Ordinary Lua spawn lacks a daemon consumer. The synchronous helper is not acceptance evidence.
+- Managed rollback can start before confirmed session cleanup. A successful response send does not prove Lua conversion.
+- Ordinary spawn can overwrite context keys before Core admission, then delete another session's context after refusal.
+- The Core tracker combines begin-stage and completion-stage loss. The replacement must preserve the stage and pending identity.
+- The rollback command inherits the admission deadline. An expired deadline leaves no useful time for a still-running rollback command.
+- Separate waiter sources may collide in the shared completion index. A focused saturation regression must establish this Hub defect.
+
+Root preserves caller-supplied session IDs pending a separate policy decision. The plan must prevent context overwrite and unrelated context removal.
+Jason approved a separate rollback deadline on September 10: a fresh 20-second total allowance starts when confirmed session cleanup or authoritative non-creation proof permits rollback.
+The allowance includes Host queue delay. It does not restart for each command or Host phase.
+The Lua coordination bridge also lacks a daemon consumer. Root classifies this as separate, in-scope non-spawn work.
+The callback pair records that consumer requirement without interrupting the current allocation investigation.
+The spawn pair must revise its plan before approval. The revision must define recovery ownership, terminal behavior, and the exact wake protocol.
+The pair withdrew its all-row disposition scan and its prescription to retain unresolved spawn rows indefinitely during shutdown.
+The replacement must use a reviewed wake mechanism. No indefinite shutdown or disposal-and-return policy is approved.
+Successful session contexts currently lack a retirement caller. Context-conflict refusal alone would therefore prevent later session-ID reuse.
+The pair must identify existing context consumers and authoritative lifecycle events before proposing context retirement or replacement.
+This approval closes the rollback timing decision only. Core settlement and terminal recovery behavior remain separate decisions.
+The callback review also found that Lua disables instruction hooks while it runs `__gc` finalizers.
+Root verified this source behavior in Lua 5.4.8. A non-terminating plugin finalizer can therefore bypass the current instruction budget.
+Root classifies this as a separate, in-scope execution and teardown isolation defect. No runtime experiment or compatibility change is approved.
+Any diagnostic must isolate the finalizer in a child process with an external bounded termination mechanism. The user's runtime remains out of scope.
+
+### Diagnostic evidence and independent cleanup
+
+The first reference-growth diagnostic ran two tests and exited with status 101: one passed and one failed during setup.
+The direct `Table::raw_get` test panicked when reference growth beyond 34 slots was required, with Lua usage and limit both equal to 16,941 bytes.
+This test-only Lua state had zero heap headroom.
+The unpressured control retained 128 references successfully. Releasing one reference permitted reuse under the same memory limit.
+The list/show wrapper test failed during setup at its first pressured case. The cause remains unattributed, and the test did not establish the wrapper panic path.
+The log is `/private/tmp/callback-reference-growth-20260910-attempt-1.log`. This evidence proves no repair or daemon-path acceptance.
+Root stopped the proposed second diagnostic after another safeguard notice. The test changes and first-run evidence remain preserved.
+The agent's tool batch started that second run before the agent read Root's stop message. The agent then interrupted it; exit status was 130.
+The stopped run has no acceptance claim. Its artifacts use the `callback-reference-growth-20260910-attempt-2` prefix in `/private/tmp`.
+Root assigned the callback pair an independent implementation slice: remove the obsolete queued list/show path and its test seams.
+That cleanup must preserve direct list/show behavior and the remaining spawn queues' disposal invariants. It does not close memory accounting.
+The cleanup is now integrated on `main` at `ef08c897bd4b09e6245f48620ec081616bc91aad` after Codex implementation and Claude review.
+The commit changes only `src/runtime.rs` and `src/daemon/owner_loop.rs`. It intentionally removes unused public Rust `HubSessionTypeSpawner::list/show` methods.
+Five focused tests passed: two queue-disposal tests, one owner-disposal test, one bounded direct-read test, and one in-process Lua integration test.
+The integration test first failed setup because candidate paths were absent. Its retry used the existing verified candidate set only for fixture validation.
+The integration result covers the current in-process library, not a newly packaged cleanup binary. The compiled test tree also contained uncommitted diagnostic tests, which did not run.
+Evidence is `/private/tmp/callback-queued-read-cleanup-20260910-evidence.md`. The diagnostic edits remain outside the cleanup commit.
+
 ## Verified starting points
 
 | Component | Revision | Evidence scope |
