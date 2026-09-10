@@ -1,0 +1,155 @@
+#!/usr/bin/env sh
+set -eu
+
+# These versions protect the JSON scratch bound: 3 * max(8, input bytes).
+# The audit is in docs/plans/2026-09-07-foundation-final-acceptance.md.
+# Re-audit allocation paths before changing either version or supported features.
+# Repeat this gate against real Cargo output after each toolchain change.
+required_rust=1.97.0
+required_serde_json=1.0.150
+required_serde=1.0.228
+required_mlua=0.11.6
+
+version_supported() {
+  [ "$1" = "$required_serde_json" ]
+}
+
+features_supported() {
+  old_ifs=$IFS
+  IFS=,
+  for feature in $1; do
+    case "$feature" in
+      default|raw_value|std) ;;
+      *) IFS=$old_ifs; return 1 ;;
+    esac
+  done
+  IFS=$old_ifs
+}
+
+# Negative controls prove this gate rejects the two contract changes it guards.
+if version_supported 1.0.151; then
+  echo "lua memory build-contract negative version control failed" >&2
+  exit 1
+fi
+if features_supported default,float_roundtrip,std; then
+  echo "lua memory build-contract negative feature control failed" >&2
+  exit 1
+fi
+
+toolchain_channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
+if [ "$toolchain_channel" != "$required_rust" ]; then
+  echo "rust-toolchain.toml must select Rust $required_rust" >&2
+  exit 1
+fi
+case "$(rustc --version)" in
+  "rustc $required_rust "*) ;;
+  *) echo "active rustc must be $required_rust" >&2; exit 1 ;;
+esac
+
+metadata_file=$(mktemp "${TMPDIR:-/tmp}/botster-cargo-metadata.XXXXXX")
+trap 'rm -f "$metadata_file"' EXIT HUP INT TERM
+if ! cargo metadata --locked --no-deps --format-version 1 >"$metadata_file"; then
+  echo "cargo metadata failed while checking the Lua memory build contract" >&2
+  exit 1
+fi
+node --input-type=module - "$metadata_file" "$required_serde_json" "$required_serde" "$required_mlua" <<'NODE'
+import { readFileSync } from "node:fs";
+const [metadataPath, requiredVersion, requiredSerde, requiredMlua] = process.argv.slice(2);
+try {
+const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
+const root = metadata.packages.find((pkg) => pkg.name === "botster-hub" && pkg.manifest_path.endsWith("/Cargo.toml"));
+if (!root) throw new Error("botster-hub package missing from cargo metadata");
+const dependencies = root.dependencies.filter((dependency) => dependency.name === "serde_json");
+if (dependencies.length !== 1) throw new Error(`expected one serde_json dependency, found ${dependencies.length}`);
+const dependency = dependencies[0];
+if (dependency.req !== `=${requiredVersion}`) throw new Error(`serde_json requirement must be =${requiredVersion}, got ${dependency.req}`);
+if (dependency.uses_default_features !== true || dependency.features.length !== 1 || dependency.features[0] !== "raw_value") {
+  throw new Error("botster-hub serde_json features must be default + raw_value");
+}
+const serde = root.dependencies.filter((dependency) => dependency.name === "serde");
+if (serde.length !== 1 || serde[0].req !== `=${requiredSerde}`) {
+  throw new Error(`serde requirement must be =${requiredSerde}`);
+}
+const mlua = root.dependencies.filter((dependency) => dependency.name === "mlua");
+if (mlua.length !== 1 || mlua[0].req !== `=${requiredMlua}`) {
+  throw new Error(`mlua requirement must be =${requiredMlua}`);
+}
+if (mlua[0].uses_default_features !== true || [...mlua[0].features].sort().join(",") !== "lua54,send,serialize,vendored") {
+  throw new Error("botster-hub mlua features must be lua54,send,serialize,vendored with defaults");
+}
+} catch (error) {
+  console.error(`Lua memory build contract: ${error.message}`);
+  process.exit(1);
+}
+NODE
+
+# The callback boundary depends on the exact single-Value conversion path.
+# This check does not certify mlua's state-owned Rust cache accounting.
+if ! mlua_graph=$(cargo tree --locked -e features -i "mlua@$required_mlua" --prefix none --format '{p}|{f}'); then
+  echo "cargo tree failed while checking resolved mlua features" >&2
+  exit 1
+fi
+mlua_lines=$(printf '%s\n' "$mlua_graph" | sed -n "s/^mlua v$required_mlua|//p")
+if [ -z "$mlua_lines" ]; then
+  echo "Cargo.lock does not resolve mlua $required_mlua" >&2
+  exit 1
+fi
+while IFS= read -r features; do
+  # Each mlua context must match the audited set. New contexts fail closed.
+  if [ "$features" != "error-send,lua54,send,serde,serialize,vendored" ]; then
+    echo "unsupported resolved mlua feature set: $features" >&2
+    exit 1
+  fi
+done <<EOF
+$mlua_lines
+EOF
+
+if ! feature_graph=$(cargo tree --locked -e features -i "serde_json@$required_serde_json" --prefix none --format '{p}|{f}'); then
+  echo "cargo tree failed while checking resolved serde_json features" >&2
+  exit 1
+fi
+package_lines=$(printf '%s\n' "$feature_graph" | sed -n "s/^serde_json v$required_serde_json|//p")
+if [ -z "$package_lines" ]; then
+  echo "Cargo.lock does not resolve serde_json $required_serde_json" >&2
+  exit 1
+fi
+target_has_raw_value=false
+while IFS= read -r features; do
+  if ! features_supported "$features"; then
+    echo "unsupported resolved serde_json feature set: $features" >&2
+    exit 1
+  fi
+  case ",$features," in
+    *,raw_value,*) target_has_raw_value=true ;;
+  esac
+done <<EOF
+$package_lines
+EOF
+if [ "$target_has_raw_value" != true ]; then
+  echo "resolved botster-hub serde_json graph must enable raw_value" >&2
+  exit 1
+fi
+
+# Serde owns String/Vec construction. Its derive code owns struct decoding.
+# Serde features do not change these visitors; the JSON feature checks do.
+if ! resolved=$(cargo tree --locked -p "serde@$required_serde" --depth 1 --prefix none --format '{p}'); then
+  echo "cargo tree failed while checking Serde dependency edges" >&2
+  exit 1
+fi
+for package in serde serde_core serde_derive; do
+  found=false
+  while IFS= read -r line; do
+    case "$line" in
+      "$package v$required_serde"|"$package v$required_serde (*)"|"$package v$required_serde (proc-macro)"|"$package v$required_serde (proc-macro) (*)") found=true ;;
+      "$package v"*) echo "unsupported resolved $package edge: $line" >&2; exit 1 ;;
+    esac
+  done <<EOF
+$resolved
+EOF
+  if [ "$found" != true ]; then
+    echo "Cargo.lock does not resolve $package $required_serde" >&2
+    exit 1
+  fi
+done
+
+printf '%s\n' "lua_memory_build_contract=rust-$required_rust serde_json-$required_serde_json serde-$required_serde"

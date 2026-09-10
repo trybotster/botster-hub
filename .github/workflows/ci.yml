@@ -63,6 +63,11 @@ jobs:
           rustup show active-toolchain
           zig version
 
+      - name: Check Lua memory build contract
+        run: |
+          node script/test-lua-memory-build-contract.mjs
+          script/check-lua-memory-build-contract
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

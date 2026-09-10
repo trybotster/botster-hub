@@ -1967,6 +1967,65 @@ fn assert_cross_package_session_type_is_listed(
 }
 
 #[test]
+fn real_lua_plugin_lists_and_shows_cross_package_session_types_without_spawning() {
+    let contributor_root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join("cross-package-inspection-contributor");
+    let _ = fs::remove_dir_all(&contributor_root);
+    write_cross_package_template_contributor(&contributor_root, "tgt_cross_package_inspect");
+    let registry = install_cross_package_managed_session_registry(
+        "cross-package-inspection-caller",
+        &contributor_root,
+        false,
+    );
+    let data_directory = unique_short_test_dir("cross-package-inspection");
+    let target_root = data_directory.join("repository");
+    fs::create_dir_all(&target_root).expect("create inspection target root");
+    let mut hub = explicit_runtime_in("cross-package-inspection", data_directory.clone());
+    let mut state = hub.state().as_ref().clone();
+    state.spawn_targets = vec![SpawnTarget {
+        target_id: "tgt_cross_package_inspect".to_string(),
+        label: "Cross-package inspection target".to_string(),
+        root: target_root,
+        enabled: true,
+        kind: "directory".to_string(),
+        base_ref: None,
+        metadata: BTreeMap::new(),
+    }];
+    hub.replace_state(state).expect("replacement state fits");
+    hub.load_lua_plugin_package(&registry, "managed-session-caller.plugin")
+        .expect("load cross-package inspection caller");
+
+    let inspected = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "cross_package.inspect".to_string(),
+            arguments: serde_json::json!({
+                "target_id": "tgt_cross_package_inspect",
+                "session_type_id": "managed-session-type.plugin/init"
+            }),
+        })
+        .expect("list and show cross-package template through real worker");
+    assert_cross_package_session_type_is_listed(
+        &inspected,
+        "managed-session-type.plugin/init",
+        "managed-session-type.plugin",
+    );
+    assert_eq!(
+        inspected["shown"]["session_type_id"],
+        "managed-session-type.plugin/init"
+    );
+    assert_eq!(
+        inspected["shown"]["source_name"],
+        "managed-session-type.plugin"
+    );
+
+    drop(hub);
+    let _ = fs::remove_dir_all(&data_directory);
+    let _ = fs::remove_dir_all(&contributor_root);
+}
+
+#[test]
 fn real_lua_plugin_cross_package_managed_session_type_spawning() {
     let contributor_root = PathBuf::from("target")
         .join("botster-hub-test-data")

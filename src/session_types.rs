@@ -20,6 +20,8 @@ use crate::packages::{PackageRecord, PackageState};
 use crate::persistence::HubState;
 use crate::spawn_targets::{SpawnTarget, list_spawn_targets};
 
+mod bounded_catalog;
+
 /// Package-, device-, or repo-provided session type definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageSessionType {
@@ -630,18 +632,7 @@ pub(crate) fn list_session_types_bounded(
     state: &HubState,
     logical_byte_limit: usize,
 ) -> SessionTypeResult<Option<(Vec<HubSessionType>, usize)>> {
-    let mut logical_bytes = 0;
-    let Some(sources) =
-        source_session_types_bounded(records, state, logical_byte_limit, &mut logical_bytes)?
-    else {
-        return Ok(None);
-    };
-    let Some(rows) =
-        effective_session_type_rows_bounded(sources, logical_byte_limit, &mut logical_bytes)?
-    else {
-        return Ok(None);
-    };
-    Ok(Some((rows, logical_bytes)))
+    bounded_catalog::list_all(records, state, logical_byte_limit)
 }
 
 /// Resolve and materialize the effective session_type into the generic core spawn contract.
@@ -934,6 +925,33 @@ pub fn list_session_types_for_target(
     Ok(rows)
 }
 
+/// Bounded form used by Lua callbacks. `None` means the complete projection
+/// would exceed the caller's already-reserved Rust callback allowance.
+pub(crate) fn list_session_types_for_target_bounded(
+    records: &[PackageRecord],
+    state: &HubState,
+    target_id: &str,
+    logical_byte_limit: usize,
+) -> SessionTypeResult<Option<Vec<HubSessionType>>> {
+    bounded_catalog::list(records, state, target_id, logical_byte_limit)
+}
+
+pub(crate) fn show_session_type_for_target_bounded(
+    records: &[PackageRecord],
+    state: &HubState,
+    target_id: &str,
+    session_type_id: &str,
+    logical_byte_limit: usize,
+) -> SessionTypeResult<Option<HubSessionType>> {
+    bounded_catalog::show(
+        records,
+        state,
+        target_id,
+        session_type_id,
+        logical_byte_limit,
+    )
+}
+
 /// Return one enabled effective session_type eligible at one admitted spawn point.
 pub fn show_session_type_for_target(
     records: &[&PackageRecord],
@@ -1062,38 +1080,6 @@ fn effective_session_type_rows(
         .collect()
 }
 
-fn effective_session_type_rows_bounded(
-    sources: Vec<SourceSessionType>,
-    limit: usize,
-    logical_bytes: &mut usize,
-) -> SessionTypeResult<Option<Vec<HubSessionType>>> {
-    let mut by_id = BTreeMap::<String, Vec<SourceSessionType>>::new();
-    for source in sources {
-        by_id
-            .entry(source.session_type.id.clone())
-            .or_default()
-            .push(source);
-    }
-
-    let mut rows = Vec::new();
-    for sources in by_id.into_values() {
-        let winner = choose_effective_session_type_ref(&sources)?;
-        let row = effective_session_type_row(winner, &sources);
-        let encoded_bytes = serde_json::to_vec(&row)
-            .map_err(|error| SessionTypeError::new("invalid_session_type", error.to_string()))?
-            .len();
-        let Some(next) = logical_bytes.checked_add(encoded_bytes) else {
-            return Ok(None);
-        };
-        if next > limit {
-            return Ok(None);
-        }
-        *logical_bytes = next;
-        rows.push(row);
-    }
-    Ok(Some(rows))
-}
-
 fn session_type_metadata(session_type: &HubSessionType) -> CoreSessionMetadata {
     let mut entries = BTreeMap::from([
         (
@@ -1147,6 +1133,27 @@ fn ensure_enabled_admitted_target(
 ) -> SessionTypeResult<SpawnTarget> {
     match list_spawn_targets(&state.spawn_targets)
         .into_iter()
+        .find(|target| target.target_id == target_id)
+    {
+        Some(target) if target.enabled => Ok(target),
+        Some(_) => Err(SessionTypeError::new(
+            "target_not_admitted",
+            "spawn target is not enabled",
+        )),
+        None => Err(SessionTypeError::new(
+            "target_not_found",
+            "spawn target was not found",
+        )),
+    }
+}
+
+fn ensure_enabled_admitted_target_borrowed<'a>(
+    state: &'a HubState,
+    target_id: &str,
+) -> SessionTypeResult<&'a SpawnTarget> {
+    match state
+        .spawn_targets
+        .iter()
         .find(|target| target.target_id == target_id)
     {
         Some(target) if target.enabled => Ok(target),
@@ -1455,7 +1462,7 @@ fn source_session_types_with_staged_repo(
         }
     }
 
-    for target in list_spawn_targets(&state.spawn_targets) {
+    for target in state.spawn_targets.iter().filter(|target| target.enabled) {
         if !target.enabled {
             continue;
         }
@@ -1480,116 +1487,11 @@ fn source_session_types_with_staged_repo(
     Ok(sources)
 }
 
-fn source_session_types_bounded(
-    records: &[&PackageRecord],
-    state: &HubState,
-    limit: usize,
-    logical_bytes: &mut usize,
-) -> SessionTypeResult<Option<Vec<SourceSessionType>>> {
-    let mut sources = Vec::new();
-    for record in records {
-        let root = package_root(record).ok();
-        for session_type in &record.session_types {
-            validate_session_type(session_type)?;
-            if let Some(root) = &root {
-                let source = SourceSessionType {
-                    rank: SessionTypeSourceRank::Package,
-                    source: PACKAGE_SESSION_TYPE_SOURCE.to_string(),
-                    source_name: record.manifest.name.clone(),
-                    root: root.clone(),
-                    session_type: session_type.clone(),
-                    available: record.state == PackageState::Enabled,
-                };
-                if !charge_source(&source, limit, logical_bytes)? {
-                    return Ok(None);
-                }
-                sources.push(source);
-            }
-        }
-    }
-
-    for device_source in &state.device_session_type_sources {
-        validate_session_types(&device_source.session_types)
-            .map_err(|message| SessionTypeError::new("invalid_device_session_types", message))?;
-        for session_type in &device_source.session_types {
-            let source = SourceSessionType {
-                rank: SessionTypeSourceRank::Device,
-                source: DEVICE_SESSION_TYPE_SOURCE.to_string(),
-                source_name: DEVICE_SESSION_TYPE_SOURCE.to_string(),
-                root: device_source.root.clone(),
-                session_type: session_type.clone(),
-                available: true,
-            };
-            if !charge_source(&source, limit, logical_bytes)? {
-                return Ok(None);
-            }
-            sources.push(source);
-        }
-    }
-
-    for target in list_spawn_targets(&state.spawn_targets) {
-        if !target.enabled {
-            continue;
-        }
-        let Some(repo_session_types) =
-            repo_session_types_bounded(&target.root, limit, logical_bytes)?
-        else {
-            return Ok(None);
-        };
-        validate_session_types(&repo_session_types)
-            .map_err(|message| SessionTypeError::new("invalid_repo_session_types", message))?;
-        for session_type in repo_session_types {
-            let source = SourceSessionType {
-                rank: SessionTypeSourceRank::Repo,
-                source: REPO_SESSION_TYPE_SOURCE.to_string(),
-                source_name: target.target_id.clone(),
-                root: target.root.clone(),
-                session_type,
-                available: true,
-            };
-            if !charge_source(&source, limit, logical_bytes)? {
-                return Ok(None);
-            }
-            sources.push(source);
-        }
-    }
-    Ok(Some(sources))
-}
-
-fn charge_source(
-    source: &SourceSessionType,
-    limit: usize,
-    logical_bytes: &mut usize,
-) -> SessionTypeResult<bool> {
-    let definition_bytes = serde_json::to_vec(&source.session_type)
-        .map_err(|error| SessionTypeError::new("invalid_session_type", error.to_string()))?
-        .len();
-    let Some(next) = logical_bytes
-        .checked_add(definition_bytes)
-        .and_then(|bytes| bytes.checked_add(source.source.len()))
-        .and_then(|bytes| bytes.checked_add(source.source_name.len()))
-        .and_then(|bytes| bytes.checked_add(source.root.as_os_str().as_encoded_bytes().len()))
-        .and_then(|bytes| bytes.checked_add(source.session_type.id.len()))
-    else {
-        return Ok(false);
-    };
-    if next > limit {
-        return Ok(false);
-    }
-    *logical_bytes = next;
-    Ok(true)
-}
-
-fn repo_session_types_bounded(
-    root: &Path,
-    limit: usize,
-    logical_bytes: &mut usize,
-) -> SessionTypeResult<Option<Vec<PackageSessionType>>> {
+fn repo_session_types(root: &Path) -> SessionTypeResult<Vec<PackageSessionType>> {
     let path = root.join(REPO_SESSION_TYPES_FILE);
-    let remaining = limit.saturating_sub(*logical_bytes);
-    let file = match File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(SessionTypeError::new(
                 "invalid_repo_session_types",
@@ -1597,48 +1499,22 @@ fn repo_session_types_bounded(
             ));
         }
     };
-    // Keep half of the remaining operation budget for the parsed rows that
-    // coexist with this raw buffer during deserialization.
-    let read_allowance = remaining / 2;
-    let read_limit = u64::try_from(read_allowance).unwrap_or(u64::MAX);
-    let mut bytes = Vec::with_capacity(read_allowance.min(64 * 1024));
-    file.take(read_limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            SessionTypeError::new(
-                "invalid_repo_session_types",
-                format!("repo-local session type file could not be read: {error}"),
-            )
-        })?;
-    if bytes.len() > read_allowance {
-        return Ok(None);
+    if bytes.len() > REPO_SESSION_TYPES_FILE_BYTE_CAPACITY {
+        return Err(SessionTypeError::new(
+            "repo_session_types_too_large",
+            format!(
+                "repo-local session type file exceeds {} bytes",
+                REPO_SESSION_TYPES_FILE_BYTE_CAPACITY
+            ),
+        ));
     }
-    *logical_bytes += bytes.len();
     let file: RepoSessionTypesFile = serde_json::from_slice(&bytes).map_err(|error| {
         SessionTypeError::new(
             "invalid_repo_session_types",
             format!("repo-local session type file is invalid: {error}"),
         )
     })?;
-    Ok(Some(file.session_types))
-}
-
-fn repo_session_types(root: &Path) -> SessionTypeResult<Vec<PackageSessionType>> {
-    let mut logical_bytes = 0;
-    match repo_session_types_bounded(
-        root,
-        REPO_SESSION_TYPES_FILE_BYTE_CAPACITY * 2,
-        &mut logical_bytes,
-    )? {
-        Some(session_types) => Ok(session_types),
-        None => Err(SessionTypeError::new(
-            "repo_session_types_too_large",
-            format!(
-                "repo-local session type file exceeds {} bytes",
-                REPO_SESSION_TYPES_FILE_BYTE_CAPACITY
-            ),
-        )),
-    }
+    Ok(file.session_types)
 }
 
 /// Validate repo-local `.botster/session-types.json` at `root` with the same
@@ -1696,7 +1572,11 @@ fn validate_session_type(session_type: &PackageSessionType) -> SessionTypeResult
             .traits
             .iter()
             .any(|value| !bounded_token(value, 128, false))
-        || session_type.traits.iter().collect::<BTreeSet<_>>().len() != session_type.traits.len()
+        || session_type
+            .traits
+            .iter()
+            .enumerate()
+            .any(|(index, value)| session_type.traits[..index].contains(value))
     {
         return Err(SessionTypeError::new(
             "invalid_session_type_traits",
@@ -1738,11 +1618,13 @@ fn bounded_token(value: &str, maximum: usize, require_namespace: bool) -> bool {
 }
 
 pub fn validate_session_types(session_types: &[PackageSessionType]) -> Result<(), String> {
-    let mut ids = BTreeSet::new();
-    for session_type in session_types {
+    for (index, session_type) in session_types.iter().enumerate() {
         validate_session_type(session_type).map_err(|error| error.message)?;
-        if !ids.insert(session_type.id.as_str()) {
-            return Err(format!("duplicate session type id {}", session_type.id));
+        if session_types[..index]
+            .iter()
+            .any(|existing| existing.id == session_type.id)
+        {
+            return Err("duplicate session type id".to_string());
         }
     }
     Ok(())
@@ -1826,7 +1708,7 @@ fn validate_environment_name(name: &str) -> SessionTypeResult<()> {
     } else {
         Err(SessionTypeError::new(
             "invalid_environment",
-            format!("invalid environment variable name: {name}"),
+            "invalid environment variable name",
         ))
     }
 }
@@ -1945,6 +1827,8 @@ fn package_target_id(package_name: &str) -> String {
 mod bounded_catalog_tests {
     use super::*;
     use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
+    use crate::packages::PackageRegistry;
+    use crate::persistence::DeviceSessionTypeSource;
 
     fn temporary_root(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -2020,5 +1904,110 @@ mod bounded_catalog_tests {
         assert!(result.is_none());
 
         fs::remove_dir_all(root).expect("remove bounded catalog test directory");
+    }
+
+    #[test]
+    fn bounded_show_preserves_not_eligible_for_a_qualified_hidden_source() {
+        let root = temporary_root("not-eligible");
+        fs::create_dir_all(&root).expect("create target root");
+        let config = HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(root.join("data")),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .expect("build test config");
+        let mut state = HubState::from_config(&config);
+        state.spawn_targets.push(SpawnTarget {
+            target_id: "requested-target".to_string(),
+            label: "Requested target".to_string(),
+            root: root.clone(),
+            enabled: true,
+            kind: "directory".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        });
+        state.device_session_type_sources = vec![DeviceSessionTypeSource {
+            root: root.clone(),
+            session_types: vec![PackageSessionType {
+                id: "hidden".to_string(),
+                label: "Hidden".to_string(),
+                description: None,
+                icon: None,
+                role: "botster.agent".to_string(),
+                interaction: "interactive".to_string(),
+                traits: Vec::new(),
+                lifecycle: "task".to_string(),
+                execution: PackageSessionTypeExecution::RelativeExecutable,
+                command: "bin/agent".to_string(),
+                args: Vec::new(),
+                working_directory: PackageSessionTypeWorkingDirectory::PackageRoot,
+                environment: BTreeMap::new(),
+                allowed_environment_overrides: Vec::new(),
+                context: Vec::new(),
+                target_id: Some("another-target".to_string()),
+            }],
+        }];
+
+        let error = show_session_type_for_target_bounded(
+            &[],
+            &state,
+            "requested-target",
+            "device/hidden",
+            64 * 1024,
+        )
+        .expect_err("qualified hidden source remains ineligible");
+        assert_eq!(error.kind, "session_type_not_eligible");
+        fs::remove_dir_all(root).expect("remove not-eligible test root");
+    }
+
+    #[test]
+    fn bounded_show_rejects_a_disabled_package_source_as_not_eligible() {
+        let root = temporary_root("disabled-package");
+        fs::create_dir_all(&root).expect("create package root");
+        fs::write(root.join("plugin.lua"), "return botster.register({})\n").expect("write plugin");
+        fs::write(
+            root.join("botster-package.json"),
+            r#"{
+              "name":"disabled.source","version":"1.0.0","kind":"plugin",
+              "botster":">=0.1.0","source":{"type":"path","path":"."},
+              "capabilities":[],"entrypoints":[{"runtime":"lua","path":"plugin.lua","bootstrap":false}],
+              "session_types":[{"id":"agent","label":"Agent","role":"botster.agent",
+                "interaction":"interactive","lifecycle":"task","command":"bin/agent"}]
+            }"#,
+        )
+        .expect("write manifest");
+        let mut registry = PackageRegistry::new(botster_core::CapabilitySet::new());
+        registry
+            .install_local_path(&root, "install disabled source")
+            .expect("install package without enabling it");
+        let records = registry.packages().into_iter().cloned().collect::<Vec<_>>();
+
+        let config = HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(root.join("data")),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .expect("build test config");
+        let mut state = HubState::from_config(&config);
+        state.spawn_targets.push(SpawnTarget {
+            target_id: "package:disabled.source".to_string(),
+            label: "Disabled package".to_string(),
+            root: root.clone(),
+            enabled: true,
+            kind: "directory".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        });
+
+        let error = show_session_type_for_target_bounded(
+            &records,
+            &state,
+            "package:disabled.source",
+            "disabled.source/agent",
+            64 * 1024,
+        )
+        .expect_err("disabled package row is unavailable");
+        assert_eq!(error.kind, "session_type_not_eligible");
+        fs::remove_dir_all(root).expect("remove disabled-package root");
     }
 }

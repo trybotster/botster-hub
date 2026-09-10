@@ -1,6 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
+node script/test-lua-memory-build-contract.mjs
+script/check-lua-memory-build-contract
+
 node packages/hub-test-support/scripts/sync-assets.mjs --check
 
 export CARGO_BUILD_JOBS=2

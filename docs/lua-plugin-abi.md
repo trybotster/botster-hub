@@ -243,6 +243,16 @@ The initial capability helper is:
   missing_required = {...}, diagnostics = {...} }`. Values use the package
   daemon DTO shape, including manifest defaults and operator-set non-secret
   values. Secret values are absent when unset and redacted when set.
+- `botster.capabilities.session_types.list({ target_id = "..." })` returns
+  the sanitized session-type catalog for an admitted target.
+- `botster.capabilities.session_types.show({ target_id = "...",
+  session_type_id = "..." })` returns one sanitized session-type definition.
+  Both read helpers require nonblank UTF-8 string identifiers. Hub-generated
+  read failures raise Lua strings. `pcall` returns `false, error_string` for
+  these failures, not Rust-backed error userdata. Catalog diagnostics retain
+  the operation, error kind, and message. Result allocation failures can use
+  a precreated message. Errors raised by plugin argument metamethods remain
+  plugin-owned errors. This contract does not change structured daemon failures.
 - `botster.capabilities.session_types.spawn({ session_type_id = "...",
   session_id = nil, target_id = nil, cwd = nil, environment = {...},
   context = {...} })`: requests a hub-owned session-type spawn for a

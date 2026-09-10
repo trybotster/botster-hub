@@ -1,0 +1,5 @@
+[toolchain]
+# Re-audit Lua allocation bounds before changing this toolchain.
+channel = "1.97.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
