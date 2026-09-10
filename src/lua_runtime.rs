@@ -39,6 +39,8 @@ use crate::package_event_router::{CausalScopeTable, EventPlaneStatus, PackageEve
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
 
+mod sandbox;
+
 thread_local! {
     static INVOCATION_CAUSAL_SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
 }
@@ -471,6 +473,7 @@ impl LuaPluginRuntime {
                 Ok(VmState::Continue)
             },
         )?;
+        sandbox::install(&lua)?;
         install_botster_api(&lua, plugin_key.clone(), host_api)?;
         let source_charge = memory
             .as_ref()
