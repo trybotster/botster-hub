@@ -68,6 +68,7 @@ pub(crate) mod host_disposal;
 pub(crate) mod host_executor;
 pub(crate) mod host_mutations;
 pub mod lifecycle;
+pub(crate) mod lua_memory;
 pub mod lua_runtime;
 pub mod maintenance;
 pub mod managed_git_worktrees;

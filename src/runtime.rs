@@ -172,7 +172,7 @@ struct PublishedHubState {
 pub struct HubStatePublication(RwLock<PublishedHubState>);
 
 impl HubStatePublication {
-    fn new(state: HubState) -> Result<Self, HubStateStoreError> {
+    pub(crate) fn new(state: HubState) -> Result<Self, HubStateStoreError> {
         let budget = SharedViewBudget::new();
         let logical_bytes = serde_json::to_vec_pretty(&state)
             .map_err(HubStateStoreError::Serialize)?
@@ -4088,7 +4088,7 @@ impl HubSessionTypeSpawner {
         )
     }
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
             reads: Mutex::new(VecDeque::new()),

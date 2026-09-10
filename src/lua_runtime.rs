@@ -7,6 +7,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -33,6 +34,7 @@ use crate::lifecycle::{
     HubPluginEventHandler, HubPluginRuntimeBundle, PACKAGE_EVENT_INVOCATION_ORIGIN,
     SESSION_FAMILY_INVOCATION_ORIGIN, package_entity_owner_token,
 };
+use crate::lua_memory::{LuaMemoryAccount, LuaVmCharge};
 use crate::package_event_router::{CausalScopeTable, EventPlaneStatus, PackageEventRouter};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
@@ -243,6 +245,7 @@ struct LuaHostApi {
     package_records: Vec<PackageRecord>,
     package_event_router: Arc<PackageEventRouter>,
     causal_scopes: Arc<CausalScopeTable>,
+    memory: Option<Arc<LuaMemoryAccount>>,
 }
 
 /// Test-only hold applied before package-event handler invocations, in
@@ -344,6 +347,8 @@ pub struct LuaPluginHostApi {
 pub struct LuaPluginRuntime {
     plugin_key: PluginKey,
     lua: Mutex<Lua>,
+    // Field order is intentional: Lua drops before its aggregate reservation.
+    _vm_charge: Option<LuaVmCharge>,
     instruction_budget: Arc<AtomicU64>,
     stopped: AtomicBool,
 }
@@ -372,8 +377,10 @@ impl LuaPluginRuntime {
             package_records,
             package_event_router: api.package_event_router,
             causal_scopes: api.causal_scopes,
+            memory: None,
         };
-        let loaded = LoadedLuaPlugin::load(plugin_key.clone(), selected_entrypoint_path, host_api)?;
+        let loaded =
+            LoadedLuaPlugin::load(plugin_key.clone(), selected_entrypoint_path, host_api, None)?;
         Ok(HubPluginRuntimeBundle {
             runtime: Arc::new(loaded.runtime),
             handlers: loaded.handlers,
@@ -388,15 +395,68 @@ impl LuaPluginRuntime {
         })
     }
 
+    /// Load through explicit Hub memory policy.
+    ///
+    /// Production construction must not call this until it has resolved real
+    /// policy values; there is deliberately no default account in this module.
+    pub(crate) fn load_prepared_bounded(
+        prepared: &PreparedLocalPackage,
+        configuration: PackageConfigurationView,
+        api: LuaPluginHostApi,
+        package_records: Vec<PackageRecord>,
+        memory: Arc<LuaMemoryAccount>,
+    ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
+        let plugin_key = PluginKey(prepared.package_name.clone());
+        let entrypoint = prepared.selected_entrypoint_path.as_ref().ok_or_else(|| {
+            LuaPluginRuntimeError::Load("local package has no lua entrypoint".to_string())
+        })?;
+        let host_api = LuaHostApi {
+            configuration,
+            capabilities: api.capabilities,
+            coordination: api.coordination,
+            entity_publish: api.entity_publish,
+            session_types: api.session_types,
+            spawn_targets: api.spawn_targets,
+            worktrees: api.worktrees,
+            package_records,
+            package_event_router: api.package_event_router,
+            causal_scopes: api.causal_scopes,
+            memory: Some(Arc::clone(&memory)),
+        };
+        let loaded = LoadedLuaPlugin::load(plugin_key.clone(), entrypoint, host_api, Some(memory))?;
+        Ok(HubPluginRuntimeBundle {
+            runtime: Arc::new(loaded.runtime),
+            handlers: loaded.handlers,
+            event_handlers: loaded.event_handlers,
+            descriptors: loaded.descriptors,
+            resources: loaded.resources,
+            entrypoint: Some(entrypoint.to_string_lossy().into_owned()),
+            metadata: Some(BoundaryJson(json!({
+                "runtime": "lua",
+                "abi": "botster.lua.v1",
+            }))),
+        })
+    }
+
     fn new(
         plugin_key: PluginKey,
         entrypoint: &Path,
         host_api: LuaHostApi,
+        memory: Option<Arc<LuaMemoryAccount>>,
     ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
+        let vm_charge = memory
+            .as_ref()
+            .map(LuaMemoryAccount::reserve_vm)
+            .transpose()
+            .map_err(|error| LuaPluginRuntimeError::Load(error.to_string()))?;
         let lua = Lua::new_with(
             StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
             LuaOptions::default(),
         )?;
+        if let Some(memory) = memory.as_ref() {
+            lua.set_memory_limit(memory.limits().per_vm_bytes)
+                .map_err(LuaPluginRuntimeError::from)?;
+        }
         let budget = Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET));
         let hook_budget = budget.clone();
         lua.set_hook(
@@ -412,26 +472,75 @@ impl LuaPluginRuntime {
             },
         )?;
         install_botster_api(&lua, plugin_key.clone(), host_api)?;
-        let source = std::fs::read_to_string(entrypoint).map_err(|error| {
-            LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
-        })?;
+        let source_charge = memory
+            .as_ref()
+            .map(LuaMemoryAccount::reserve_callback)
+            .transpose()
+            .map_err(|error| LuaPluginRuntimeError::Load(error.to_string()))?;
+        let source = match memory.as_ref() {
+            Some(memory) => {
+                read_lua_source_bounded(entrypoint, memory.limits().per_callback_bytes)?
+            }
+            None => std::fs::read_to_string(entrypoint).map_err(|error| {
+                LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
+            })?,
+        };
         let value: Value = lua
             .load(&source)
             .set_name(entrypoint.to_string_lossy().as_ref())
             .eval()
             .map_err(LuaPluginRuntimeError::from)?;
         let registration = registration_from_value(&lua, value)?;
+        drop(source);
+        drop(source_charge);
 
         Ok((
             Self {
                 plugin_key,
                 lua: Mutex::new(lua),
+                _vm_charge: vm_charge,
                 instruction_budget: budget,
                 stopped: AtomicBool::new(false),
             },
             registration,
         ))
     }
+}
+
+fn read_lua_source_bounded(
+    entrypoint: &Path,
+    byte_limit: usize,
+) -> Result<String, LuaPluginRuntimeError> {
+    let mut file = std::fs::File::open(entrypoint).map_err(|error| {
+        LuaPluginRuntimeError::Load(format!("failed to open Lua entrypoint: {error}"))
+    })?;
+    // Allocate the complete charged ceiling once. A growing file cannot make
+    // Vec choose an uncharged capacity beyond it.
+    let mut bytes = vec![0_u8; byte_limit];
+    let mut filled = 0;
+    while filled < byte_limit {
+        let read = file.read(&mut bytes[filled..]).map_err(|error| {
+            LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    let mut extra = [0_u8; 1];
+    if filled == byte_limit
+        && file.read(&mut extra).map_err(|error| {
+            LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
+        })? != 0
+    {
+        return Err(LuaPluginRuntimeError::Load(format!(
+            "Lua entrypoint exceeds the {byte_limit} byte callback limit"
+        )));
+    }
+    bytes.truncate(filled);
+    String::from_utf8(bytes).map_err(|error| {
+        LuaPluginRuntimeError::Load(format!("Lua entrypoint is not UTF-8: {error}"))
+    })
 }
 
 impl PluginRuntime for LuaPluginRuntime {
@@ -583,9 +692,10 @@ impl LoadedLuaPlugin {
         plugin_key: PluginKey,
         entrypoint: &Path,
         host_api: LuaHostApi,
+        memory: Option<Arc<LuaMemoryAccount>>,
     ) -> Result<Self, LuaPluginRuntimeError> {
         let (runtime, registration) =
-            LuaPluginRuntime::new(plugin_key.clone(), entrypoint, host_api)?;
+            LuaPluginRuntime::new(plugin_key.clone(), entrypoint, host_api, memory)?;
         let mut handlers = Vec::new();
         let mut event_handlers = Vec::new();
         let mut descriptors = Vec::new();
@@ -945,7 +1055,9 @@ fn install_botster_api(
             lua,
             plugin_key.clone(),
             host_api.session_types,
+            host_api.spawn_targets.clone(),
             host_api.package_records,
+            host_api.memory.clone(),
         )?,
     )?;
     capabilities_table.set(
@@ -1125,43 +1237,206 @@ fn config_table(lua: &Lua, configuration: PackageConfigurationView) -> Result<Ta
     Ok(config)
 }
 
+/// These values live in Lua. Callback refusal does not construct a Rust error.
+struct SessionTypeReadErrors {
+    capacity: mlua::String,
+    quota: mlua::String,
+    target: mlua::String,
+    session_type: mlua::String,
+    state: mlua::String,
+    conversion: mlua::String,
+    marker: Table,
+}
+
+impl SessionTypeReadErrors {
+    fn finish<T: serde::Serialize>(
+        &self,
+        lua: &Lua,
+        result: Result<Option<T>, crate::session_types::SessionTypeError>,
+    ) -> Value {
+        match result {
+            Ok(Some(value)) => match lua.to_value(&value) {
+                Ok(value @ Value::Table(_)) => value,
+                _ => Value::String(self.conversion.clone()),
+            },
+            Ok(None) => Value::String(self.quota.clone()),
+            Err(error) => {
+                // The callback charge still covers the Rust message during this copy.
+                let converted = (|| -> mlua::Result<Table> {
+                    let value = lua.create_table_with_capacity(2, 0)?;
+                    value.raw_set(1, lua.create_string(error.kind)?)?;
+                    value.raw_set(2, lua.create_string(&error.message)?)?;
+                    value.set_metatable(Some(self.marker.clone()))?;
+                    Ok(value)
+                })();
+                match converted {
+                    Ok(value) => Value::Table(value),
+                    Err(_) => Value::String(self.conversion.clone()),
+                }
+            }
+        }
+    }
+}
+
+fn session_type_read_callback(
+    lua: &Lua,
+    show: bool,
+    state: SharedSpawnTargets,
+    records: Vec<PackageRecord>,
+    memory: Option<Arc<LuaMemoryAccount>>,
+) -> mlua::Result<mlua::Function> {
+    let operation = if show {
+        "session_types.show"
+    } else {
+        "session_types.list"
+    };
+    let errors = SessionTypeReadErrors {
+        capacity: lua.create_string("Lua callback memory capacity exhausted")?,
+        quota: lua.create_string(format!(
+            "{operation} exceeded the Lua callback memory limit"
+        ))?,
+        target: lua.create_string(format!("{operation} requires a nonblank UTF-8 target_id"))?,
+        session_type: lua.create_string(format!(
+            "{operation} requires a nonblank UTF-8 session_type_id"
+        ))?,
+        state: lua.create_string("hub state lock poisoned")?,
+        conversion: lua.create_string(format!("{operation} could not allocate its Lua result"))?,
+        marker: lua.create_table()?,
+    };
+    let marker = errors.marker.clone();
+    let conversion_failure = errors.conversion.clone();
+
+    // Only the trusted wrapper can call this function. It supplies exactly two strings.
+    // Return one non-error Value so mlua cannot build a retained callback error.
+    let callback = lua.create_function(
+        move |lua, (target_id, session_type_id): (mlua::String, mlua::String)| {
+            // Keep this named guard until result conversion and Rust destruction finish.
+            let _callback_charge = match memory
+                .as_ref()
+                .map(LuaMemoryAccount::reserve_callback)
+                .transpose()
+            {
+                Ok(charge) => charge,
+                Err(_) => return Ok(Value::String(errors.capacity.clone())),
+            };
+            let target_bytes = target_id.as_bytes();
+            let target_id = match std::str::from_utf8(&target_bytes) {
+                Ok(value) if !value.trim().is_empty() => value,
+                _ => return Ok(Value::String(errors.target.clone())),
+            };
+            let session_type_bytes = session_type_id.as_bytes();
+            let session_type_id = match std::str::from_utf8(&session_type_bytes) {
+                Ok(value) if !show || !value.trim().is_empty() => value,
+                _ => return Ok(Value::String(errors.session_type.clone())),
+            };
+            let (_, state) = match state.try_snapshot() {
+                Ok(value) => value,
+                Err(()) => return Ok(Value::String(errors.state.clone())),
+            };
+            let limit = memory
+                .as_ref()
+                .map_or(usize::MAX, |account| account.limits().per_callback_bytes);
+            let result = if show {
+                let result = if memory.is_some() {
+                    crate::session_types::show_session_type_for_target_bounded(
+                        &records,
+                        &state,
+                        &target_id,
+                        &session_type_id,
+                        limit,
+                    )
+                } else {
+                    let records = records.iter().collect::<Vec<_>>();
+                    crate::session_types::show_session_type_for_target(
+                        &records,
+                        &state,
+                        &target_id,
+                        &session_type_id,
+                    )
+                    .map(Some)
+                };
+                errors.finish(lua, result)
+            } else {
+                let result = if memory.is_some() {
+                    crate::session_types::list_session_types_for_target_bounded(
+                        &records, &state, &target_id, limit,
+                    )
+                } else {
+                    let records = records.iter().collect::<Vec<_>>();
+                    crate::session_types::list_session_types_for_target(
+                        &records, &state, &target_id,
+                    )
+                    .map(Some)
+                };
+                errors.finish(lua, result)
+            };
+            Ok(result)
+        },
+    )?;
+    // Capture trusted functions before plugin code can change the global table.
+    lua.load(
+        r#"
+        local callback, marker, operation, show, conversion_failure = ...
+        local type, error, getmetatable, pcall = type, error, getmetatable, pcall
+        local argument_error = operation .. " requires an argument table"
+        local target_error = operation .. " requires target_id"
+        local session_type_error = operation .. " requires session_type_id"
+        local function catalog_error(result)
+            return operation .. " failed: " .. result[1] .. ": " .. result[2]
+        end
+        return function(args)
+            if type(args) ~= "table" then
+                error(argument_error, 0)
+            end
+            local target_id = args.target_id
+            if type(target_id) ~= "string" then
+                error(target_error, 0)
+            end
+            local session_type_id = ""
+            if show then
+                session_type_id = args.session_type_id
+                if type(session_type_id) ~= "string" then
+                    error(session_type_error, 0)
+                end
+            end
+            local result = callback(target_id, session_type_id)
+            if type(result) == "string" then
+                error(result, 0)
+            end
+            if getmetatable(result) == marker then
+                local ok, message = pcall(catalog_error, result)
+                error(ok and message or conversion_failure, 0)
+            end
+            return result
+        end
+        "#,
+    )
+    .set_name("@hub/session_type_read")
+    .call((callback, marker, operation, show, conversion_failure))
+}
+
 fn session_types_table(
     lua: &Lua,
     plugin_key: PluginKey,
     session_types: SharedSessionTypeSpawner,
+    state: SharedSpawnTargets,
     package_records: Vec<PackageRecord>,
+    memory: Option<Arc<LuaMemoryAccount>>,
 ) -> Result<Table, mlua::Error> {
     let table = lua.create_table()?;
-    let list_templates = session_types.clone();
-    let list_records = package_records.clone();
     table.set(
         "list",
-        lua.create_function(move |lua, args: Value| {
-            let value = lua.from_value::<serde_json::Value>(args)?;
-            let target_id = required_string(&value, "target_id", "session_types.list")?;
-            let templates = list_templates
-                .list(target_id, list_records.clone())
-                .map_err(|error| {
-                    mlua::Error::RuntimeError(format!("session_types.list failed: {error}"))
-                })?;
-            lua.to_value(&templates)
-        })?,
+        session_type_read_callback(
+            lua,
+            false,
+            state.clone(),
+            package_records.clone(),
+            memory.clone(),
+        )?,
     )?;
-    let show_templates = session_types.clone();
-    let show_records = package_records.clone();
     table.set(
         "show",
-        lua.create_function(move |lua, args: Value| {
-            let value = lua.from_value::<serde_json::Value>(args)?;
-            let target_id = required_string(&value, "target_id", "session_types.show")?;
-            let session_type_id = required_string(&value, "session_type_id", "session_types.show")?;
-            let template = show_templates
-                .show(target_id, session_type_id, show_records.clone())
-                .map_err(|error| {
-                    mlua::Error::RuntimeError(format!("session_types.show failed: {error}"))
-                })?;
-            lua.to_value(&template)
-        })?,
+        session_type_read_callback(lua, true, state, package_records.clone(), memory)?,
     )?;
     let spawn_templates = session_types.clone();
     let spawn_plugin_key = plugin_key.clone();
@@ -1786,6 +2061,307 @@ fn sanitize_lua_error(error: mlua::Error) -> String {
 }
 
 #[cfg(test)]
+mod bounded_session_type_tests {
+    use super::*;
+    use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
+    use crate::lua_memory::LuaMemoryLimits;
+    use crate::persistence::DeviceSessionTypeSource;
+    use crate::runtime::{HubSessionTypeSpawner, HubStatePublication};
+    use crate::session_types::{
+        PackageSessionType, PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory,
+    };
+    use crate::spawn_targets::SpawnTarget;
+    use std::collections::BTreeMap;
+
+    fn state() -> SharedSpawnTargets {
+        state_with_catalog(None, 1)
+    }
+
+    fn state_with_catalog(description: Option<String>, count: usize) -> SharedSpawnTargets {
+        let root = std::env::temp_dir().join("botster-bounded-session-type-lua-test");
+        let config = HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(root.clone()),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        let mut state = crate::persistence::HubState::from_config(&config);
+        state.spawn_targets.push(SpawnTarget {
+            target_id: "target".to_string(),
+            label: "Target".to_string(),
+            root: root.clone(),
+            enabled: true,
+            kind: "directory".to_string(),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        });
+        state
+            .device_session_type_sources
+            .push(DeviceSessionTypeSource {
+                root,
+                session_types: vec![PackageSessionType {
+                    id: "agent".to_string(),
+                    label: "Agent".to_string(),
+                    description,
+                    icon: None,
+                    role: "botster.agent".to_string(),
+                    interaction: "interactive".to_string(),
+                    traits: Vec::new(),
+                    lifecycle: "task".to_string(),
+                    execution: PackageSessionTypeExecution::RelativeExecutable,
+                    command: "bin/agent".to_string(),
+                    args: Vec::new(),
+                    working_directory: PackageSessionTypeWorkingDirectory::PackageRoot,
+                    environment: BTreeMap::new(),
+                    allowed_environment_overrides: Vec::new(),
+                    context: Vec::new(),
+                    target_id: None,
+                }],
+            });
+        let definitions = &mut state.device_session_type_sources[0].session_types;
+        for index in 1..count {
+            let mut definition = definitions[0].clone();
+            definition.id = format!("agent-{index}");
+            definitions.push(definition);
+        }
+        Arc::new(HubStatePublication::new(state).unwrap())
+    }
+
+    fn account(callback: usize) -> Arc<LuaMemoryAccount> {
+        LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 64 * 1024,
+            total_vm_bytes: 64 * 1024,
+            per_callback_bytes: callback,
+            total_callback_bytes: callback,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn session_type_errors_remain_lua_owned_after_callback_charge_releases() {
+        let lua = Lua::new();
+        lua.set_memory_limit(64 * 1024).unwrap();
+        let memory = account(1);
+        let table = session_types_table(
+            &lua,
+            PluginKey("test.plugin".to_string()),
+            Arc::new(HubSessionTypeSpawner::new()),
+            state(),
+            Vec::new(),
+            Some(Arc::clone(&memory)),
+        )
+        .unwrap();
+        lua.globals().set("session_types", table).unwrap();
+
+        // Retained errors must not contain Rust-backed callback failures.
+        let retained: usize = lua
+            .load(
+                r#"
+                retained_errors = {}
+                for index = 1, 64 do
+                    local ok, err = pcall(session_types.list, {target_id = "target"})
+                    assert(not ok)
+                    assert(type(err) == "string")
+                    assert(string.find(tostring(err), "exceeded the Lua callback memory limit", 1, true))
+                    retained_errors[index] = err
+                end
+                collectgarbage("collect")
+                return #retained_errors
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(retained, 64);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn session_type_read_wrapper_checks_arguments_before_rust_conversion() {
+        let lua = Lua::new();
+        let memory = account(64 * 1024);
+        let table = session_types_table(
+            &lua,
+            PluginKey("test.plugin".to_string()),
+            Arc::new(HubSessionTypeSpawner::new()),
+            state(),
+            Vec::new(),
+            Some(Arc::clone(&memory)),
+        )
+        .unwrap();
+        lua.globals().set("session_types", table).unwrap();
+        lua.globals()
+            .set(
+                "foreign_failure",
+                lua.create_function(|_, ()| -> mlua::Result<()> {
+                    Err(mlua::Error::RuntimeError("foreign failure".to_owned()))
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        lua.load(
+            r#"
+            local function fails(fn, args, expected)
+                local ok, err = pcall(fn, args)
+                assert(not ok)
+                assert(type(err) == "string")
+                assert(string.find(err, expected, 1, true), err)
+            end
+            fails(session_types.list, nil, "argument table")
+            fails(session_types.list, false, "argument table")
+            fails(session_types.list, {target_id = {}}, "requires target_id")
+            fails(session_types.list, {target_id = 42}, "requires target_id")
+            fails(session_types.list, {target_id = "\255"}, "UTF-8 target_id")
+            fails(session_types.list, {target_id = "   "}, "nonblank")
+            fails(session_types.show, {target_id = "target"}, "requires session_type_id")
+            fails(session_types.show, {target_id = "target", session_type_id = "\255"}, "UTF-8 session_type_id")
+            fails(session_types.list, {target_id = "missing"}, "session_types.list failed:")
+
+            local ok, foreign = pcall(foreign_failure)
+            assert(not ok)
+            assert(type(foreign) == "userdata")
+            fails(session_types.list, foreign, "argument table")
+            fails(session_types.list, {target_id = foreign}, "requires target_id")
+            fails(session_types.show, {target_id = "target", session_type_id = foreign}, "requires session_type_id")
+
+            local reads = 0
+            local args = setmetatable({}, {__index = function(_, key)
+                reads = reads + 1
+                assert(key == "target_id")
+                return "target"
+            end})
+            assert(#session_types.list(args, {}, {}, {}) == 1)
+            assert(reads == 1)
+
+            local saved_type, saved_error, saved_getmetatable, saved_pcall = type, error, getmetatable, pcall
+            type, error, getmetatable, pcall = false, false, false, false
+            local success, result = saved_pcall(session_types.list, {target_id = "target"})
+            local failed, message = saved_pcall(session_types.list, {target_id = "missing"})
+            type, error, getmetatable, pcall = saved_type, saved_error, saved_getmetatable, saved_pcall
+            assert(success and #result == 1)
+            assert(not failed and string.find(message, "session_types.list failed:", 1, true))
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn session_type_read_conversion_failure_returns_a_lua_string() {
+        let lua = Lua::new();
+        let memory = account(256 * 1024);
+        let table = session_types_table(
+            &lua,
+            PluginKey("test.plugin".to_string()),
+            Arc::new(HubSessionTypeSpawner::new()),
+            state_with_catalog(Some("x".repeat(1024)), 16),
+            Vec::new(),
+            Some(Arc::clone(&memory)),
+        )
+        .unwrap();
+        lua.globals().set("session_types", table).unwrap();
+        let call: mlua::Function = lua
+            .load(
+                r#"
+                local args = {target_id = "target"}
+                return function()
+                    local ok, result = pcall(session_types.list, args)
+                    return ok, type(result), result
+                end
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let (success, _, result): (bool, mlua::String, Value) = call.call(()).unwrap();
+        assert!(success, "warmup failed: {result:?}");
+        drop(result);
+        lua.gc_collect().unwrap();
+        // Permit wrapper execution, but not all 16 KiB of result descriptions.
+        lua.set_memory_limit(lua.used_memory() + 4 * 1024).unwrap();
+        let result = call.call::<(bool, mlua::String, mlua::String)>(());
+        lua.set_memory_limit(0).unwrap();
+        let (success, kind, message) = result.unwrap();
+        assert!(!success);
+        assert_eq!(kind.to_str().unwrap(), "string");
+        assert!(
+            message
+                .to_str()
+                .unwrap()
+                .contains("could not allocate its Lua result"),
+            "unexpected failure: {message:?}"
+        );
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn bounded_session_type_lua_callbacks_succeed_refuse_and_release_account() {
+        let lua = Lua::new();
+        let memory = account(64 * 1024);
+        let table = session_types_table(
+            &lua,
+            PluginKey("test.plugin".to_string()),
+            Arc::new(HubSessionTypeSpawner::new()),
+            state(),
+            Vec::new(),
+            Some(Arc::clone(&memory)),
+        )
+        .unwrap();
+        lua.globals().set("session_types", table).unwrap();
+        let value: serde_json::Value = lua
+            .from_value(
+                lua.load(
+                    r#"return {
+                      list = session_types.list({target_id = "target"}),
+                      shown = session_types.show({target_id = "target", session_type_id = "device/agent"})
+                    }"#,
+                )
+                .eval::<Value>()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(value["list"].as_array().unwrap().len(), 1);
+        assert_eq!(value["shown"]["session_type_id"], "device/agent");
+        assert_eq!(memory.usage().1, 0);
+
+        let held = memory.reserve_callback().unwrap();
+        let (success, message): (bool, mlua::String) = lua
+            .load(r#"return pcall(session_types.list, {target_id = "target"})"#)
+            .eval()
+            .unwrap();
+        assert!(!success);
+        assert_eq!(
+            message.to_str().unwrap(),
+            "Lua callback memory capacity exhausted"
+        );
+        assert_eq!(memory.usage().1, 64 * 1024);
+        drop(held);
+        assert_eq!(memory.usage().1, 0);
+
+        let refused = account(1);
+        let table = session_types_table(
+            &lua,
+            PluginKey("test.plugin".to_string()),
+            Arc::new(HubSessionTypeSpawner::new()),
+            state(),
+            Vec::new(),
+            Some(Arc::clone(&refused)),
+        )
+        .unwrap();
+        lua.globals().set("session_types", table).unwrap();
+        let error = lua
+            .load(r#"return session_types.list({target_id = "target"})"#)
+            .eval::<Value>()
+            .expect_err("one-byte callback projection must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded the Lua callback memory limit")
+        );
+        assert_eq!(refused.usage().1, 0);
+    }
+}
+
+#[cfg(test)]
 mod terminal_bridge_tests {
     use super::*;
     use crate::host_executor::{HostExecutor, HostJobIdentity};
@@ -1995,6 +2571,7 @@ mod completion_tests {
         let runtime = LuaPluginRuntime {
             plugin_key: plugin_key.clone(),
             lua: Mutex::new(lua),
+            _vm_charge: None,
             instruction_budget: Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET)),
             stopped: AtomicBool::new(false),
         };
