@@ -263,6 +263,15 @@ The replacement must use a reviewed wake mechanism. No indefinite shutdown or di
 Successful session contexts currently lack a retirement caller. Context-conflict refusal alone would therefore prevent later session-ID reuse.
 The pair must identify existing context consumers and authoritative lifecycle events before proposing context retirement or replacement.
 This approval closes the rollback timing decision only. Core settlement and terminal recovery behavior remain separate decisions.
+Jason subsequently approved terminal recovery behavior: Hub may finish shutdown with an explicit `recovery required` result when it cannot confirm session cleanup.
+Hub must preserve the unresolved session and worktree records for recovery at the next start.
+Hub must not delete the worktree or report successful cleanup without confirmation.
+This approval does not select a shutdown settlement duration or authorize forced termination.
+The spawn pair must define durable record ownership, write-failure behavior, and startup recovery before implementation approval.
+Jason subsequently requested an Astra audit of timer paths and event-driven alternatives.
+For the current spawn work, the pair must establish event-driven progress before proposing additional wait limits.
+The design must identify completion, capacity, and fault signals, their consumers, and any missing cleanup receipt.
+Timer expiration must not substitute for successful cleanup. Zero additional shutdown wait and operator record resolution remain unapproved.
 The callback review also found that Lua disables instruction hooks while it runs `__gc` finalizers.
 Root verified this source behavior in Lua 5.4.8. A non-terminating plugin finalizer can therefore bypass the current instruction budget.
 Root classifies this as a separate, in-scope execution and teardown isolation defect. No runtime experiment or compatibility change is approved.
@@ -303,7 +312,128 @@ The evidence manifest is `/private/tmp/core-submit-owner-20260910-evidence.md`.
 The independent review is `/private/tmp/claude-callback-review.OFb8pb/submit-retire-final-review.md`.
 Memory accounting and spawn lifecycle acceptance remain open.
 
-## Verified starting points
+## Consolidated remaining delivery plan — September 10
+
+Status: Root and Botster Claude agreed on this plan on September 10. Jason requested agreement before further implementation.
+Claude's final correction check is `/private/tmp/botster-consolidated-plan-claude-review-20260910.md`. It resolves R-1 through R-7 and N-1/N-2.
+This section supersedes the September 10 restart's blanket memory-before-all-spawn ordering. Historical evidence above remains valid at its stated scope.
+Root will report the reviewed plan to Jason. Review agreement does not authorize implementation, numerical policy, installation, or additional timer repairs.
+Jason subsequently approved execution of this plan through full implementation and testing.
+The code must remain modular, readable, and maintainable for humans and agents. Existing policy and external-action gates remain explicit below.
+
+### Outcome, scope, and current baseline
+
+Deliver usable Workspaces rendering with configured targets, working asynchronous coordination and spawn, responsive siblings, and accounted ownership through shutdown.
+Complete the remaining foundation behavior, accounting, and performance acceptance afterward. Do not redefine the work as timer removal alone.
+Core owns generic execution. Hub owns admission, correlation, recovery policy, and its persistence document. Host workers perform repository and filesystem work.
+Lua owns product composition. Web and TUI own their client behavior and presentation evidence.
+
+Hub `main` at `3edaa2b7ea2b89abf2bb9dc95399bedc61cf96f3` includes the reviewed queued-read removal and completion-registration repair.
+The latter passed 19 driver tests. These repairs do not close callback accounting or spawn acceptance.
+Earlier published multiline-paste and reconnect evidence remains closed at its recorded revisions. Recheck it only when a relevant change invalidates that evidence.
+No installed-runtime update follows from the source checkpoints. Preserve the user's running runtime and unrelated worktree changes.
+
+Use these existing inputs, not new competing plans:
+
+- This acceptance plan and the September 6 implementation contract define the complete delivery scope.
+- `/private/tmp/botster-spawn-lifecycle-plan.EE5C6d/plan.md`, revision 6, defines the reviewed recovery and event-driven drain direction.
+- `/private/tmp/botster-spawn-lifecycle-claude-premise-review-20260910.md`, through T4, records independent source review and unresolved technical gates.
+- `/private/tmp/callback-allocation-ledger-20260910.md` records the callback allocation findings. Its evidence does not establish a completed accounting contract.
+- `/private/tmp/botster-astra-timer-audit-nlgt8b64/timer-audit.md` inventories 42 Hub mechanisms, not the whole repository family.
+
+### Work packages and decisive checks
+
+| Package | Bounded deliverable and owner | Actual prerequisite | First decisive verification |
+| --- | --- | --- | --- |
+| M1: callback accounting boundary | Hub Codex implements reservations before construction, shared retained ownership, conversion overlap, and fixed/error storage coverage. Claude reviews the exact source contract. | Reuse the existing allocation evidence. Resolve only the unsafe allocation boundary that the next implementation would cross. Do not resume or reroute the stopped diagnostic. | Target the first still-unproved allocation or lifetime boundary, such as retained error-buffer storage. Reuse valid list/show success, refusal, conversion-failure, and retained-error tests. Then repeat one-target rendering through the real daemon with sibling status. |
+| M2: state accounting and production wiring | Hub Codex closes retained runtime caches, session-context storage charges, initialization/reload overlap, and bounded production loading. Root integrates approved limits. | M1's ownership interface; source-derived state charges; Jason's numerical limits before production activation. Context retention semantics remain subject to S1's compatibility requirement. | Initialization, overlapping reload, repeated callbacks, and unload remain within declared accounts. Retained contexts stay charged. The production loader has no unbounded fallback. |
+| C1: asynchronous coordination | Hub Codex adds the missing daemon consumer with existing owner rows, Core completion routing, and explicit cancellation/disposal ownership. | M1's minimal movable-charge interface and a callback-specific allocation proof. Complete state-cache accounting is not a blanket prerequisite. | A real asynchronous Lua tool coordinates twice and returns correlated results without the synchronous helper. Hold capacity and confirm wake-driven recovery, cancellation ownership, and responsive sibling status. |
+| S1: ordinary spawn lifecycle | Hub Codex implements Host resolution, ordinary daemon consumption, Core stage tracking, callback conversion acknowledgement, and context lifetime ownership as one lifecycle. | Minimal charge interface; session/context reservation proof; accounted wake storage and retirement. Integration requires operator resolution, retention, and recovery-capacity policy from R1, unless Jason explicitly accepts an unresolved limit. | A real daemon Lua tool spawns two explicit IDs. Verify command, environment, working directory, startup and retained context reads, result conversion, and responsive sibling operations. Then test abandonment at each effect boundary. |
+| S2: managed and direct spawn | Hub Codex moves full resolution off the owner and applies S1's ownership rules to managed and direct client entry points. Remove obsolete helper consumers only after callers migrate. | S1 interfaces and shared-artifact exclusion. Preserve current IDs, context reads, and managed reuse semantics except the approved exact-conflict exclusion. | Exercise new and reused worktrees, concurrent conflicting attempts, failed conversion, refused cleanup, and late completion. Shutdown proof must precede rollback; unrelated worktrees and contexts survive. |
+| R1: durable recovery and event-driven shutdown | Hub Codex adds write-ahead records, marker-safe mutation/removal, continued completion service during shutdown, and explicit recovery outcomes. | Reviewed drain design; record schema/accounting; operator resolution, retention, recovery-capacity policy, and the exceptional-stop decision. The abort keep/change decision precedes R1 acceptance, not all S1 implementation. | Interrupt each admitted phase in an isolated daemon. Verify no lost wake or obligation, persisted records across restart, and no rollback based only on timeout, channel send, join, or adoption. If the existing abort remains, prove durable-record survival and startup reporting across that abort. |
+| I1: finalizer isolation | Root and Claude select the smallest architecture boundary that prevents a plugin finalizer from bypassing execution/teardown isolation. Codex implements only after approval of any compatibility or process-boundary change. | Existing Lua source finding; exact boundary proposal. No shared-process nonterminating-finalizer experiment. | After authorization, an externally bounded child-process test proves sibling responsiveness and retained-resource ownership during failed teardown. |
+| A1: remaining foundation accounting | Root assigns Hub/Core/client findings to their owning repositories. Codex implements and Claude reviews each bounded finding. | Current source audit of still-open acceptance requirements, not a repeat of closed migration work. | Source-derived item/byte/work bounds plus production saturation, cancellation, loss, and disposal tests. Include pending payloads and retained results, not only queue entries. |
+| V1: matched behavior and delivery | Root coordinates clean builds and exact-artifact Web, TUI, plugin, and daemon checks. | Required repairs integrated; production policy approved; manifests identify the built source. | Render with configured targets, sibling isolation, ordinary/managed spawn, errors, shutdown/restart, and affected reconnect/input cases on the same artifact set. |
+| P1: optimized performance and presentation | Root coordinates the existing upstream harnesses and real clients. | Stable matched candidate and criteria fixed before measurement. | Direct-PTY control, throughput, latency distributions, CPU/RSS, and sibling pressure. Correlate output with software frame presentation in Web and the outer TUI terminal. |
+
+M1 and M2 are separate delivery requirements. A test-parameterized M1 interface can unblock C1 and S1 without claiming production accounting is finished.
+C1 is independent of spawn recovery policy, but not independent of its own allocation and disposal contract.
+Define one shared bridge protocol for ingress publication, wake ordering, capacity, completion, fault, and terminal binding across C1 and S1.
+Reuse that protocol where the actual producer/consumer contracts match. This does not prescribe one shared queue or wake instance.
+Coordination must preserve its own effect/result semantics; it does not inherit session cleanup or conversion acknowledgement merely because it shares the bridge protocol.
+S1, S2, and R1 have shared invariants. Implement their vertical slices together where needed; do not merge a success-only spawn path that loses failure ownership.
+I1 must not disappear behind the memory work. It remains an open execution-isolation gate, with separate authority for a changed runtime boundary.
+S1 must not claim complete callback-abandonment coverage while a nonterminating finalizer can prevent the guard from publishing. That acceptance depends on I1.
+
+Session contexts currently remain readable after session exit/removal. No successful-spawn context-retirement caller exists.
+S1 must define ownership across replacement, failed admission, rollback, and runtime disposal; M2/A1 must account for all retained context storage.
+Identify an authoritative release event for each actual release. Do not silently introduce context deletion on session exit.
+Any new context-retention or operator-deletion policy needs Jason's approval. Preserve current retained reads until that decision changes the contract.
+Continued creation of retained contexts can exhaust their account and refuse new spawns. Jason must consider that consequence when selecting a retention policy.
+
+Before removing helper consumers, C1/S2 must cover the in-process `HubClientApi` render/action callers of `invoke_plugin` and its public wrappers.
+Preserve their bridge behavior through a supported event-driven consumer, or obtain explicit approval to end that support. Daemon adoption alone is not a migration.
+Astra did not audit external users of the public wrappers. Missing caller evidence is not permission to remove the API.
+
+### First implementation sequence after Jason accepts this plan
+
+1. Root gives the callback pair one bounded decision pass using the existing ledger: identify the first unproved allocation boundary and a concrete safe implementation slice.
+2. The pair returns the exact API, owned files, preserved lifetimes, and first test. If no safe slice exists, it returns one architectural conflict instead of another open-ended audit.
+3. Root assigns the single Hub writer to M1. The spawn pair completes only the specific reservation and wake proofs that S1 requires, using the existing evidence.
+4. Once the minimal charge interface is reviewed, Root chooses C1 or the next M1/M2 slice based on which prerequisites are closed. Root does not wait for all state accounting by default.
+5. Root assigns S1/S2/R1 as complete effect-to-retirement slices when their exact gates close. Root obtains unresolved policy decisions before assigning dependent code.
+6. Root integrates each reviewed slice with its evidence. Then Root proceeds through the remaining accounting, matched behavior, and performance gates.
+
+One Hub source writer remains the default. This plan does not promise parallel Hub implementation across overlapping files.
+Read-only review, bounded proof work, and preparation in other repositories can proceed beside that writer.
+Root must give every active assignment a deliverable and stopping condition. An acknowledgment or idle prompt is not progress.
+Root checks the actual session and artifact before reporting work as active or complete.
+After one bounded investigation pass and its review, Root must select implementation, isolate the unresolved boundary, or return the exact decision to Jason.
+Root must not send the same open question through repeated planning rounds.
+
+The bounded S1 proof assignment must name these existing open items:
+
+- M3: identify the account that owns the wake instance's lifetime storage, separate from per-callback charges.
+- O2: approve the owed-removal / peek-mark-remove protocol, or a bounded alternative, before implementing its retirement path.
+- K7: bound the complete scheduler population, including reservation deadlines and non-permit client/background entries, before deriving tree height.
+- L1: keep byte figures conditional until the exact layout assumptions have authorized verification. A node count alone is not a byte bound.
+- D1(a): retain session-ID reservation ownership across no-owner client paths, run-one, and adoption. Match Core admission's live-and-pending predicate, not registry presence alone.
+
+### Timer audit disposition
+
+Astra found 19 polling/progress mechanisms, one watchdog, 20 deadlines, and two backoff/rate policies in its defined Hub scope.
+Five progress paths expose suitable events. Fifteen paths, including the watchdog, need missing event contracts. These counts are source findings, not tested repairs.
+
+| Audit group | Placement in this plan | Required boundary |
+| --- | --- | --- |
+| Missing coordination/spawn consumers and their wakes | Required C1/S1/S2/R1 work. | Completion, capacity, cancellation, and fault events must drive progress. A longer timeout cannot replace a consumer. |
+| Unix output P01/P02 | Proposed separate transport slice, relevant to the no-polling and performance gates. Root must confirm inclusion before assignment. | Select socket readiness, producer wakes, and shutdown while preserving partial writes, fairness, correlation, and charges. Test progress with the retry timer absent. |
+| Close-work watchdog W01 | Proposed separate ownership/wake slice, relevant to event-driven terminal progress. Root must confirm inclusion before assignment. | Publish after enqueue; continue bounded ready batches; wait for actual lifecycle/fault changes on unresolved work. Do not substitute a busy loop. |
+| Host process waits P03/P04/P10/P11 | Inspect only the portions touched by spawn/teardown. Broader replacement remains a separate proposal. | Child reap, output completion, and group absence are distinct. Existing child-exit events alone do not prove cleanup or justify deleting deadlines. |
+| Other directly supported paths P06/P12/P17 | Independent repair candidates, not blanket prerequisites for rendering or spawn. | Preserve diagnostics, shutdown task retirement, or absolute client wait semantics. Obtain scope approval before adding these repairs. |
+| Other polling paths and public helpers | Recorded backlog with explicit source scope. | No full-repository-family timer rewrite is approved. Do not restore synchronous helper pumping to daemon paths. |
+| Existing deadlines and backoff/rate policies | Preserve unless a separate decision changes their policy. | Events end normal waits. Expiry is an exceptional outcome, never a cleanup receipt. The audit does not validate numerical values. |
+
+### Decisions and permission gates
+
+- Approved: recovery-required shutdown may preserve unresolved session/worktree records for the next start, without deleting the worktree or claiming cleanup success.
+- Approved: D4 provides a fresh 20-second total rollback allowance after cleanup or authoritative non-creation proof, including Host queue delay.
+- Root's design direction: exclude conflicting use of the exact uncertain session/worktree identity. Alias, race, and live-reuser proofs remain required.
+- Unapproved: production memory numbers, zero additional shutdown wait, operator record-resolution command and retention policy, and a new exceptional shutdown boundary.
+- The current driver-stop timeout can abort Hub. Root must return the keep/change decision explicitly; a plan cannot guarantee a typed result on that path.
+- Unresolved records can exhaust the shared view budget. Recovery admission needs a reserved-capacity or separate-budget policy for resolution and unrelated required mutations.
+- Root must derive the capacity requirements and obtain Jason's approval for any new numerical allocation or retention limit. No silent eviction is allowed.
+- A changed finalizer isolation boundary or Host-worker loss policy requires explicit approval. Existing source findings do not supply that approval.
+- Jason approved implementation and testing after Root reported Claude's agreement. This approval does not select the unresolved policy values above.
+- Installation, runtime replacement, destructive recovery, and publication require their applicable authority. Preserve the user's runtime during all isolated verification.
+
+### Completion and review gate
+
+Claude reviews this section against the source findings and existing contracts, with special attention to false dependencies and omitted lifecycle work.
+Root resolves concrete review findings in this section and records the final verdict. Review must distinguish agreement on a plan from proof of an implementation.
+The final handoff names agreed work order, still-open product decisions, and the first bounded assignment. It does not claim foundation completion.
+
+## Historical verified starting points
 
 | Component | Revision | Evidence scope |
 | --- | --- | --- |
