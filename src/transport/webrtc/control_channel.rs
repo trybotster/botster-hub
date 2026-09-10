@@ -18,7 +18,9 @@ use botster_hub_client::{
     DaemonHello, DaemonHelloAck, DaemonLocalWebrtcDeliveryChunk, DaemonOperatorError,
     DaemonProtocolErrorCode, DaemonRequest, DaemonResponse, DaemonResponseKind,
     LOCAL_WEBRTC_MAX_FRAME_BYTES, MAX_CONTROL_REQUEST_BYTES, MAX_OUTSTANDING_REQUESTS,
-    OPERATOR_ERROR_TOO_MANY_REQUESTS, PROTOCOL, PROTOCOL_VERSION, ServerFrame, parse_request_id,
+    OPERATOR_ERROR_RUNTIME_REPLY_CLOSED, OPERATOR_ERROR_RUNTIME_REQUEST_FAILED,
+    OPERATOR_ERROR_RUNTIME_REQUEST_TIMED_OUT, OPERATOR_ERROR_TOO_MANY_REQUESTS, PROTOCOL,
+    PROTOCOL_VERSION, ServerFrame, parse_request_id,
 };
 use bytes::BytesMut;
 use tokio::sync::{mpsc as tokio_mpsc, watch};
@@ -430,6 +432,7 @@ where
         };
 
         peer_state.begin_request(&request);
+        let request_operation = control_request_operation_label(&request).to_string();
         let completion_projection = RequestCompletionProjection::from_request(request.as_ref());
         let daemon_shutdown = matches!(*request, DaemonRequest::DaemonShutdown);
         let (reply_tx, reply_rx) = control_reply_channel();
@@ -490,13 +493,19 @@ where
         use crate::daemon::control::reply::ControlReply;
         let reply = match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
             Ok(Ok(reply)) => reply,
-            Ok(Err(_)) => ControlReply::plain(Ok(response_with_diagnostic(
+            Ok(Err(_)) => ControlReply::plain(Ok(correlated_response_with_diagnostic(
+                &request_id,
+                &request_operation,
+                OPERATOR_ERROR_RUNTIME_REPLY_CLOSED,
                 DaemonDiagnostic::action_failure(
                     "local_webrtc_data_channel",
                     "runtime reply channel closed",
                 ),
             ))),
-            Err(_) => ControlReply::plain(Ok(response_with_diagnostic(
+            Err(_) => ControlReply::plain(Ok(correlated_response_with_diagnostic(
+                &request_id,
+                &request_operation,
+                OPERATOR_ERROR_RUNTIME_REQUEST_TIMED_OUT,
                 DaemonDiagnostic::action_failure(
                     "local_webrtc_data_channel",
                     "runtime request timed out",
@@ -517,10 +526,15 @@ where
             }
             ControlReply::Typed { response, charge } => {
                 let response = response.unwrap_or_else(|error| {
-                    response_with_diagnostic(DaemonDiagnostic::action_failure(
-                        "local_webrtc_data_channel",
-                        error.to_string(),
-                    ))
+                    correlated_response_with_diagnostic(
+                        &request_id,
+                        &request_operation,
+                        OPERATOR_ERROR_RUNTIME_REQUEST_FAILED,
+                        DaemonDiagnostic::action_failure(
+                            "local_webrtc_data_channel",
+                            error.to_string(),
+                        ),
+                    )
                 });
                 // Failed attaches create no subscription ownership.
                 peer_state.apply_subscription_change(
@@ -916,6 +930,27 @@ pub(crate) fn response_with_diagnostic(diagnostic: DaemonDiagnostic) -> DaemonRe
     response
 }
 
+fn correlated_response_with_diagnostic(
+    request_id: &str,
+    operation: &str,
+    code: &str,
+    diagnostic: DaemonDiagnostic,
+) -> DaemonResponse {
+    let message = diagnostic
+        .message
+        .clone()
+        .unwrap_or_else(|| "local WebRTC request failed".to_string());
+    let mut response = response_with_diagnostic(diagnostic.clone());
+    response.error = Some(DaemonOperatorError {
+        code: code.to_string(),
+        request_id: request_id.to_string(),
+        operation: operation.to_string(),
+        message,
+        diagnostics: vec![diagnostic],
+    });
+    response
+}
+
 /// Correlated rejection for a request past the outstanding limit.
 pub(crate) fn too_many_requests_response(request_id: &str, operation: &str) -> DaemonResponse {
     let mut response = daemon_response_base(DaemonResponseKind::OperatorError);
@@ -978,6 +1013,41 @@ mod tests {
         Receiver as AsyncReceiver, Sender as AsyncSender, channel as webrtc_channel,
         default_runtime, timeout,
     };
+
+    #[test]
+    fn correlated_runtime_failure_preserves_request_and_operation() {
+        let request = DaemonRequest::PluginSurfaceRender {
+            package_name: "workspaces".to_string(),
+            surface_id: "home".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let response = correlated_response_with_diagnostic(
+            "73",
+            control_request_operation_label(&request),
+            OPERATOR_ERROR_RUNTIME_REQUEST_TIMED_OUT,
+            DaemonDiagnostic::action_failure(
+                "local_webrtc_data_channel",
+                "runtime request timed out",
+            ),
+        );
+
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        assert_eq!(response.diagnostics.len(), 1);
+        let error = response.error.expect("correlated operator error");
+        assert_eq!(error.code, OPERATOR_ERROR_RUNTIME_REQUEST_TIMED_OUT);
+        assert_eq!(error.request_id, "73");
+        assert_eq!(error.operation, "plugin_surface_render");
+        assert_eq!(error.diagnostics, response.diagnostics);
+    }
+
+    #[test]
+    fn informational_diagnostic_does_not_invent_request_correlation() {
+        let response = response_with_diagnostic(DaemonDiagnostic::connected("hello"));
+
+        assert_eq!(response.kind, DaemonResponseKind::OperatorError);
+        assert!(response.error.is_none());
+        assert_eq!(response.diagnostics.len(), 1);
+    }
     fn run_idle_pressure_case(
         terminal_cause: Option<LocalWebrtcTerminalCause>,
     ) -> (FakeDataChannel, Option<LocalWebrtcSendFailure>) {

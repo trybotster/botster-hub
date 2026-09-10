@@ -80,6 +80,12 @@ pub const MAX_OPEN_CAPTURES_PER_CONNECTION: usize = 4;
 pub const SNAPSHOT_CAPTURE_TTL_SECONDS: u32 = 60;
 /// Operator error code for the 33rd outstanding request on one connection.
 pub const OPERATOR_ERROR_TOO_MANY_REQUESTS: &str = "too_many_requests";
+/// Operator error code when the daemon reply owner closes before delivery.
+pub const OPERATOR_ERROR_RUNTIME_REPLY_CLOSED: &str = "runtime_reply_closed";
+/// Operator error code when a daemon request exceeds its transport deadline.
+pub const OPERATOR_ERROR_RUNTIME_REQUEST_TIMED_OUT: &str = "runtime_request_timed_out";
+/// Operator error code when daemon request execution returns a transport failure.
+pub const OPERATOR_ERROR_RUNTIME_REQUEST_FAILED: &str = "runtime_request_failed";
 /// Bytes of the Unix frame length prefix.
 pub const UNIX_FRAME_LENGTH_PREFIX_BYTES: usize = 4;
 /// Unix container tag for UTF-8 JSON `ClientFrame` / `ServerFrame` payloads.
@@ -2044,6 +2050,91 @@ pub enum DaemonRequest {
         request: UiActionRequest,
     },
     DaemonShutdown,
+}
+
+impl DaemonRequest {
+    /// Stable operation label used in correlated operator errors.
+    #[must_use]
+    pub const fn operation_label(&self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::CheckHubUpdate => "check_hub_update",
+            Self::StartHubUpdate { .. } => "start_hub_update",
+            Self::GetHubUpdateExecution => "get_hub_update_execution",
+            Self::ListSessions => "list_sessions",
+            Self::SubscribeEntities { .. } => "subscribe_entities",
+            Self::UnsubscribeEntities { .. } => "unsubscribe_entities",
+            Self::SubscribeEvents { .. } => "subscribe_events",
+            Self::UnsubscribeEvents { .. } => "unsubscribe_events",
+            Self::RemoveSession { .. } => "remove_session",
+            Self::Whoami { .. } => "whoami",
+            Self::PostMessage { .. } => "post_message",
+            Self::ReceiveMessages { .. } => "receive_messages",
+            Self::AckMessage { .. } => "ack_message",
+            Self::NotifySession { .. } => "notify_session",
+            Self::Spawn { .. } => "spawn",
+            Self::Attach { .. } => "attach",
+            Self::Detach { .. } => "detach",
+            Self::ShutdownSession { .. } => "shutdown_session",
+            Self::ReadScreen { .. } => "read_screen",
+            Self::ReadModeFlags { .. } => "read_mode_flags",
+            Self::CaptureSnapshot { .. } => "capture_snapshot",
+            Self::ReadSnapshotPage { .. } => "read_snapshot_page",
+            Self::ListSessionTypes => "list_session_types",
+            Self::ListSessionTypesForTarget { .. } => "list_session_types_for_target",
+            Self::ShowSessionType { .. } => "show_session_type",
+            Self::ShowSessionTypeDefinition { .. } => "show_session_type_definition",
+            Self::CreateSessionType { .. } => "create_session_type",
+            Self::UpdateSessionType { .. } => "update_session_type",
+            Self::DeleteSessionType { .. } => "delete_session_type",
+            Self::ResolveSessionType { .. } => "resolve_session_type",
+            Self::SpawnSessionType { .. } => "spawn_session_type",
+            Self::ReadSessionContext { .. } => "read_session_context",
+            Self::ListSpawnTargets => "list_spawn_targets",
+            Self::ShowSpawnTarget { .. } => "show_spawn_target",
+            Self::CreateSpawnTarget { .. } => "create_spawn_target",
+            Self::UpdateSpawnTarget { .. } => "update_spawn_target",
+            Self::DeleteSpawnTarget { .. } => "delete_spawn_target",
+            Self::ValidateSpawnTarget { .. } => "validate_spawn_target",
+            Self::ListWorktrees => "list_worktrees",
+            Self::ShowWorktree { .. } => "show_worktree",
+            Self::CreateWorktree { .. } => "create_worktree",
+            Self::DeleteWorktree { .. } => "delete_worktree",
+            Self::ListApps => "list_apps",
+            Self::ResolveAppLaunch { .. } => "resolve_app_launch",
+            Self::ResolvePackageRoute { .. } => "resolve_package_route",
+            Self::ListPackageNavigation => "list_package_navigation",
+            Self::ListPackages => "list_packages",
+            Self::ListAvailablePackages { .. } => "list_available_packages",
+            Self::InspectAvailablePackage { .. } => "inspect_available_package",
+            Self::PreviewPackageInstall { .. } => "preview_package_install",
+            Self::InstallPackageRegistryEntry { .. } => "install_package_registry_entry",
+            Self::InstallPackageLocalPath { .. } => "install_package_local_path",
+            Self::CheckPackageUpdate { .. } => "check_package_update",
+            Self::PreviewPackageUpdate { .. } => "preview_package_update",
+            Self::ApplyPackageUpdate { .. } => "apply_package_update",
+            Self::ShowPackage { .. } => "show_package",
+            Self::SetPackageConfiguration { .. } => "set_package_configuration",
+            Self::ReloadPackage { .. } => "reload_package",
+            Self::RefreshLocalPackages => "refresh_local_packages",
+            Self::EnablePackageLocalPath { .. } => "enable_package_local_path",
+            Self::EnablePackage { .. } => "enable_package",
+            Self::DisablePackage { .. } => "disable_package",
+            Self::RemovePackage { .. } => "remove_package",
+            Self::StartPackageEntrypoint { .. } => "start_package_entrypoint",
+            Self::IssueLocalWebrtcBootstrap { .. } => "issue_local_webrtc_bootstrap",
+            Self::LocalWebrtcSignal { .. } => "local_webrtc_signal",
+            Self::StopPackageEntrypoint { .. } => "stop_package_entrypoint",
+            Self::RestartPackageEntrypoint { .. } => "restart_package_entrypoint",
+            Self::PackageEntrypointStatus { .. } => "package_entrypoint_status",
+            Self::PluginLifecycleStatus => "plugin_lifecycle_status",
+            Self::PluginMcpListTools => "plugin_mcp_list_tools",
+            Self::PluginMcpCallTool { .. } => "plugin_mcp_call_tool",
+            Self::PluginSurfaceRender { .. } => "plugin_surface_render",
+            Self::PluginSurfaceAction { .. } => "plugin_surface_action",
+            Self::DaemonShutdown => "daemon_shutdown",
+        }
+    }
 }
 
 /// Server response variants for one local daemon request.

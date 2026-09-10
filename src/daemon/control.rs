@@ -75,20 +75,7 @@ pub(crate) fn attach_bind_operator_error(code: &'static str, message: &str) -> D
 }
 
 pub(crate) fn control_request_operation_label(request: &DaemonRequest) -> &'static str {
-    match request {
-        DaemonRequest::Status => "status",
-        DaemonRequest::ListSessions => "list_sessions",
-        DaemonRequest::Spawn { .. } => "spawn",
-        DaemonRequest::Attach { .. } => "attach",
-        DaemonRequest::Detach { .. } => "detach",
-        DaemonRequest::ShutdownSession { .. } => "shutdown_session",
-        DaemonRequest::RemoveSession { .. } => "remove_session",
-        DaemonRequest::DaemonShutdown => "daemon_shutdown",
-        DaemonRequest::CheckHubUpdate => "check_hub_update",
-        DaemonRequest::StartHubUpdate { .. } => "start_hub_update",
-        DaemonRequest::GetHubUpdateExecution => "get_hub_update_execution",
-        _ => "request",
-    }
+    request.operation_label()
 }
 
 pub(crate) fn dispatch_control_message(

@@ -609,6 +609,138 @@ mod tests {
     use crate::host_executor::{HOST_OPERATION_CAPACITY, HOST_PREPARED_BYTE_CAPACITY};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn transferred_status_delivery_survives_deadline_until_host_completion() {
+        let (mut daemon, directory) = test_daemon("status-transferred-deadline");
+        let mut state = DaemonControlState::default();
+        let executor = daemon.runtime().unwrap().host_executor();
+        let gates = [
+            std::sync::Arc::new(crate::host_executor::TestHostGate::default()),
+            std::sync::Arc::new(crate::host_executor::TestHostGate::default()),
+        ];
+        for (index, gate) in gates.iter().enumerate() {
+            let identity =
+                HostJobIdentity::first(crate::owner_identity::WaiterId(100 + index as u64));
+            executor
+                .submit(
+                    identity,
+                    HostCommand::Wait {
+                        generation: index as u64,
+                        gate: gate.clone(),
+                    },
+                    executor.try_reserve().expect("reserve blocking Host work"),
+                )
+                .expect("submit blocking Host work");
+        }
+        let start_deadline = Instant::now() + Duration::from_secs(5);
+        while gates.iter().any(|gate| !gate.has_started()) {
+            assert!(Instant::now() < start_deadline, "both Host workers start");
+            std::thread::yield_now();
+        }
+
+        let waiter_id = crate::owner_identity::WaiterId(1);
+        let owner_permit = state.budget.reserve().expect("reserve owner row");
+        let (reply_tx, reply_rx) = control_reply_channel();
+        let mut entry = PendingControlRequest {
+            waiter_id,
+            ready_class: crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+            ready_key: None,
+            deadline_key: None,
+            last_core_phase: 0,
+            last_host_phase: 0,
+            completion: super::super::pending::OwnerRequestCompletion::default(),
+            reply_tx,
+            response_delivery_rx: None,
+            grant_id: None,
+            client: None,
+            permit: Some(owner_permit),
+            must_finish: false,
+            past_deadline: false,
+            continuation: super::super::pending::ControlContinuation::Status(Box::new(
+                StatusContinuation {
+                    waiter_id,
+                    shutdown: false,
+                    policy: daemon.runtime().unwrap().retention_policy(),
+                    ticket: None,
+                    input: None,
+                    permit: None,
+                    prepared: None,
+                    phase: 1,
+                    entity_cancel_after: None,
+                    delivery: None,
+                },
+            )),
+            retire: None,
+        };
+        let delivery_permit = executor.try_reserve().expect("reserve delivery work");
+        assert!(!submit_delivery(
+            &daemon,
+            &mut state,
+            &mut entry,
+            PreparedStatusResponse {
+                dispose_probe: None,
+                kind: botster_hub_client::DaemonResponseKind::Status,
+                encoded_frame: Some(vec![1]),
+                shutdown: false,
+            },
+            delivery_permit,
+            1,
+        ));
+        assert!(entry.reply_tx.is_transferred());
+        let arm = state
+            .deadlines
+            .arm(waiter_id, Instant::now(), Instant::now())
+            .expect("arm due deadline");
+        entry.deadline_key = Some(arm.key());
+        state.pending_requests.insert(waiter_id, entry);
+        assert!(super::super::pending::mark_owner_ready(
+            &mut state,
+            waiter_id,
+            crate::daemon::owner_schedule::ReadyClass::Deadline,
+            super::super::pending::READY_DEADLINE,
+        ));
+        let item = state.owner_ready.pop_next().expect("due status row");
+        assert!(!super::super::pending::poll_ready_request_item(
+            &mut daemon,
+            &mut state,
+            item,
+            &mut |_, _, _, _| panic!("waiting delivery must not finish directly"),
+        ));
+        assert!(state.pending_requests.contains_key(&waiter_id));
+        assert_eq!(state.budget.counters.retired_abandoned, 0);
+        assert_eq!(state.budget.counters.requests_past_deadline, 1);
+        assert_eq!(
+            state
+                .lifecycle_counters
+                .cleanup_by_reason
+                .get("request_past_deadline"),
+            Some(&1)
+        );
+
+        for gate in &gates {
+            gate.release();
+        }
+        let completion_deadline = Instant::now() + Duration::from_secs(10);
+        while state.pending_requests.contains_key(&waiter_id) {
+            crate::daemon::owner_loop::publish_completion_wakes(&mut daemon, &mut state);
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            assert!(
+                Instant::now() < completion_deadline,
+                "transferred delivery completion retires the row"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(state.budget.outstanding(), 0);
+        assert_eq!(state.budget.counters.retired_abandoned, 0);
+        assert_eq!(state.budget.counters.requests_past_deadline, 1);
+        let reply = reply_rx
+            .blocking_recv()
+            .expect("Host delivered the response");
+        drop(reply);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn test_daemon(name: &str) -> (HubDaemon, PathBuf) {
         let directory = std::env::temp_dir().join(format!(
             "botster-{name}-{}-{}",
