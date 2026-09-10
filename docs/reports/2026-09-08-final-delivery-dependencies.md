@@ -10,8 +10,69 @@ This report records dependency checks and chronological checkpoints. It does not
 - Root verified both remote refs after the push. Core publication is no longer blocked.
 - Root reran Restty's three visible-screen-text tests; all passed. Root pushed consumed commit `71fbfeb9cbd356b112c922d101a94bab7413675d` to Restty `main` and verified the remote ref.
 - Restty's dirty Ghostty patch matches its tracked build patch. Root preserved that working state and unrelated environment files without staging them.
-- Main is integrating the published Core revision, combined allowance patch, provider error mapping, and inventory callers into Hub.
-- Hub, Web, and TUI publication still require candidate integration and verification. Push authority does not establish final acceptance.
+- Main committed the published Core revision, combined allowance patch, provider error mapping, and inventory callers as Hub `b60ca68dcae7c8025d69784c9f77efdb9ea5a827`.
+- Core, Restty, Hub, Web, and TUI are published on `main`. Source publication does not establish full foundation acceptance.
+- The Core-pinned Hub check passed. All 130 focused tests passed against the new worker.
+- The first broad library run had 926 passes and 18 failures. The serial rerun had three passes and 15 failures; concurrency does not explain all failures.
+- Read-only review identified obsolete router, listener, and detach source guards. It also identified pressure fixtures that did not enqueue Core output or tracked future events incorrectly.
+- Main and 0098 corrected test setup and lifecycle assertions under separate file ownership. Independent review found no production changes in these repairs.
+- Root checked `hub-core-b9-repairs-final.log`: all 19 selected tests passed in 4.40 seconds, with 926 filtered tests.
+- Shutdown now checks the exact cancelled Host job while workers are blocked. Required model cleanup can precede payload disposal.
+- Root checked `hub-core-b9-library-final.log`: all 945 library tests passed in 43.98 seconds, with no ignored or filtered tests.
+- Main confirmed exit status 0. Root verified a clean worktree and the exact 34 source files plus two authorized delivery documents.
+- Root verified the candidate manifest against Hub `b60ca68` and Core `b9e989b`. All three binary sizes and SHA256 hashes match.
+- The matched runtime inventory test passed: one test, zero failures, seven filtered, 5.47 seconds. Main confirmed exit status 0.
+- Root pushed Hub `b60ca68dcae7c8025d69784c9f77efdb9ea5a827` to `main` without force and verified the remote ref.
+- Web completed static checks against the committed exports. Root independently verified two codecs and 16 support files against committed source and recorded hashes.
+- Web passed W-S1 through W-S5 against the matched artifacts. The run includes multiline-paste consent and in-page reconnect with new input and output.
+- The Web negative control passed W-S1 through W-S4. Suppressing the channel close caused the exact expected W-S5 observer deadline failure.
+- Both Web commands exited 0 and stopped their Hub processes. Root accepted the raw logs and authorized the exact nine-file source commit.
+- Root verified Web commit `3072a2421db9e13f5636ef3f2c6764b465a46b97` and its unchanged accepted diff hash.
+- Root pushed that exact Web commit to `main` without force and verified the remote ref. Recovery evidence remains untracked and excluded.
+- TUI resolved all seven changed Git dependencies from canonical Hub and Core sources. No temporary local source remains in its manifest or lockfile.
+- Root checked the TUI workspace log: 163 unit tests and two integration tests passed. The five live tests were ignored in that command.
+- TUI's first live command failed during Hub startup with `Operation not permitted`, before it reached a client assertion.
+- An unchanged retry received explicit escalation approval. All five exact live cases passed, but that runner used the default Rust 1.92 toolchain.
+- A separate run selected Rust 1.97 explicitly and passed all five cases. The original failure and both passing logs remain preserved.
+- Root checked the live log. The cases cover attach, reattach, paste consent, resize, and reconnect to fresh sessions after a Hub restart.
+- TUI confirmed exit status 0 and froze its files. Root found no remaining matched candidate or live-test processes.
+- Root updated the README checkpoint and committed the exact six files as `305399e5154b52293c81c8d7564cebff6f62581c`.
+- Root verified a clean TUI worktree, pushed that exact commit to `main` without force, and verified the remote ref.
+- Raw failing logs remain preserved as `hub-core-b9-library.log` and `hub-core-b9-failures-serial.log` in `/private/tmp`.
+
+## Matched artifact and evidence record
+
+The candidate directory is `/private/tmp/hub-core-b9-candidate-b60ca68`.
+Its manifest records Hub `b60ca68dcae7c8025d69784c9f77efdb9ea5a827` and Core `b9e989be3232c72e966ce3fdb63878c82b70d94d`.
+The final Hub documentation update does not change these tested source revisions or require client repins.
+
+| Artifact | Bytes | SHA256 |
+| --- | ---: | --- |
+| `botster-hub` | 110910224 | `9923aefc3e5aa74fcc667ed1cbe92b07fd7af1bece1fa0cedf72571f2d2a15c1` |
+| `botster-session-worker` | 5335960 | `97408440b5e3f71be34d9ade473e93d76d33d4bf006f30e78b11ca280b72dc0b` |
+| `harness_control` | 12909808 | `12ed1c332411e02cbd51ae534529572a103e8931f9c674adc4f147b000381041` |
+
+The manifest SHA256 is `7c08bce2895efc81f7c8d591eea13e94ff357085c118209503b90afaa6b6ba20`.
+Root verified all three artifacts, including the optional adapter that the default two-binary verifier does not check.
+
+Final Hub logs are in `/private/tmp`: `hub-core-b9-library-final.log`, `hub-core-b9-candidate-b60ca68-build.log`, and `hub-core-b9-matched-inventory.log`.
+Final Web logs are in its recovery worktree under `recovery-evidence/final-b60ca68-static/`.
+The Web directory contains static command results, `smoke-positive.log`, and `smoke-negative.log`. It remains excluded from publication.
+Final TUI logs are `/private/tmp/tui-final-workspace-b60ca68-b9.log` and `/private/tmp/tui-final-live-b60ca68-b9-rust197.log`.
+The latter SHA256 is `3e33d494eb31c7896a60173c620400a3de5f0645eec8f9a9c14e9bc4375d08e5`.
+The tested TUI binary SHA256 is `cbdb60dcddbd099229ce622b7a38d5b88372ce03e2490234d946148a42118a17`.
+
+Web's source lint passed with five warnings after the command excluded preserved browser evidence.
+Plain lint traversed that evidence and failed. Root did not add a source configuration change to hide that failure.
+Other test and build warnings remain in the raw logs.
+
+This checkpoint does not establish complete owner work or memory accounting, optimized performance, software frame presentation, or the unresolved Host-worker loss policy.
+Root did not update or restart the user's installed runtime.
+
+## Earlier integration checkpoints
+
+The entries below preserve intermediate states. They do not override the current delivery state above.
+
 - Status work now shares the Hub integration worktree above `effa6b8`. Three writers own separate files; no Status build has run yet.
 - Main completed borrowed-source preflight helpers for reconciliation, peer records, egress diagnostics, package iteration, and installation HOME.
 - Status uses HOME captured at daemon startup. It does not reread HOME for each request. Missing, empty, and native paths retain distinct input states.

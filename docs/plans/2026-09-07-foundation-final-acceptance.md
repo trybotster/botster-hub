@@ -1,10 +1,35 @@
 # Foundation integration and final acceptance
 
-Status: active root coordination plan, 2026-09-07.
+Status: source publication complete on September 9, 2026. Full foundation acceptance remains open.
 
 The user authorized orchestration through integrated, proven software that meets the north star.
 This plan continues the canonical September 6 implementation contract.
 It does not reopen superseded migration plans or certify the whole architecture as complete.
+
+## Source publication checkpoint
+
+Root pushed these reviewed revisions to each repository's `main` branch and verified the remote refs.
+
+| Repository | Published implementation revision |
+| --- | --- |
+| Core | `b9e989be3232c72e966ce3fdb63878c82b70d94d` |
+| Hub | `b60ca68dcae7c8025d69784c9f77efdb9ea5a827` |
+| Web | `3072a2421db9e13f5636ef3f2c6764b465a46b97` |
+| TUI | `305399e5154b52293c81c8d7564cebff6f62581c` |
+| Restty | `71fbfeb9cbd356b112c922d101a94bab7413675d` |
+
+The consumed Kit revision remains `7940306b0d7461a12575b3856a96c0fbb23784f3`.
+Hub's later documentation-only checkpoint does not change the tested implementation or require client repins.
+
+Hub passed 945 library tests and the matched runtime inventory test.
+Web passed W-S1 through W-S5 and the reconnect negative control against the same Hub and Core artifacts.
+TUI passed 165 non-live tests and all five live cases with Rust 1.97 against those artifacts.
+The Web and TUI cases include explicit multiline-paste consent and their distinct reconnect paths.
+These results supersede the corresponding intermediate limits in the starting-point section below.
+
+Full owner work and memory accounting, optimized performance, software frame presentation, and the Host-worker loss policy remain open.
+The user has not received an installed-runtime update through this publication step.
+See `docs/reports/2026-09-08-final-delivery-dependencies.md` for exact artifacts, raw evidence paths, and preserved failed runs.
 
 ## Ownership and working rules
 
