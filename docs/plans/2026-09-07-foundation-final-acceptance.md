@@ -513,6 +513,17 @@ These are requested allocation sizes, not production budgets or observed-peak bo
 Root resumed A7's C1 implementation and assigned A9 the bounded Core wake population/transient proof. A8 reviews the implementation and proof.
 The callback reply channel, executor-thread wait storage, changed queue slots, and Core lookup/result overlap remain explicit C1 obligations.
 
+Root accepted the shared wake derivation with an explicit condition: all retained phase-map keys must belong to at most 2,112 live waiters.
+The retained bound is 608,808 requested bytes for the measured test-profile layouts. This is not an unconditional bound on the current shared instance.
+The proof is `/private/tmp/botster-spawn-lifecycle-plan.EE5C6d/c1-o1-tree-proof.md`; Claude checked its arithmetic and lifecycle conditions.
+The bound includes the fixed storage and three trees. It excludes channels, closures, result payloads, temporary vectors, and allocator overhead.
+The pinned iterator dispatch proves that taking k ready identities allocates exactly 16*k bytes. Production takes at most one identity per activation.
+Retiring a waiter with one or two registered phases can allocate a separate 64-byte vector. The take vector and retirement vector can overlap.
+Root selected conditional accounting, not a new refusal rule for every registrant. C1 must enforce its own final waiter retirement through a guard.
+The guard must retire phase history before the owner permit is released. It must not release charges for payloads that Core still owns.
+The owner must restore an unconsumed completion batch before new registrations use that capacity. All wake clones must retain the shared wake charge.
+These requirements do not certify non-C1 callers, production memory policy, release-profile layouts, or the full scheduler accounting gate.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
