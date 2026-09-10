@@ -433,6 +433,48 @@ Claude reviews this section against the source findings and existing contracts, 
 Root resolves concrete review findings in this section and records the final verdict. Review must distinguish agreement on a plan from proof of an implementation.
 The final handoff names agreed work order, still-open product decisions, and the first bounded assignment. It does not claim foundation completion.
 
+### Execution checkpoint: first accounting slice
+
+Root selected M1a after the callback pair's bounded decision and review. The dependency-change conclusion was premature; supported callback boundaries remain available.
+M1a adds sized/trimmed charges and budgeted `coordination.acknowledge` input through its actual request lifetime.
+The callback Codex agent owns the scoped Hub edits and focused compiler window. Claude reviews the boundary, final diff, and raw evidence.
+The slice must preserve input ownership through queueing, Core consumption, refusal, timeout, and disposal. It must not stage or run the stopped diagnostic edits.
+Output allocation, other coordination operations, full state accounting, and the asynchronous consumer remain separate requirements.
+The spawn pair prepares only the existing bridge/reservation gates. Astra prepares the finalizer-isolation proposal without runtime experiments.
+
+The sized-charge API is local commit `f48696c50de56ae1afb889c3469febdd30355601`, based on `b3f0fd1`. Main integration remains held.
+Root inspected the patch, raw log, and exit file. Five focused tests passed; 967 tests were filtered out; the command exited with zero.
+Evidence: `/private/tmp/m1a-sized-charge-20260910-evidence.md`. The build included preserved diagnostic source, but the test filter did not execute those diagnostics.
+The API has no production caller yet. Its new `shrink_to` dead-code warning must disappear through the caller implementation before integration.
+The acknowledge-input change waits for Jason's decision on ignoring unused fields that currently fail whole-input validation. No input-accounting claim is closed.
+The bridge readiness artifact is revision 7, confirmed by Claude in U6. C1 does not require the complete K7 scheduler census.
+Root selected the generic Core prelaunch-reservation direction. Its concrete operation contract and source assignment remain open; Hub-only ID narrowing is not approved.
+
+The I1 proposal recommends one Lua process per package generation: `/private/tmp/botster-i1-lua-isolation-proposal.md`.
+Claude's source review confirms the finalizer defect but identifies a smaller compatibility change: prohibit plugin registration of `__gc` finalizers.
+Review: `/private/tmp/botster-i1-isolation-claude-review-20260910.md`. Root requested a precise stop/cancellation contract and coverage of mlua's protected array metatable.
+The searched first-party Lua sources contain no literal `__gc` references. This does not prove external-plugin compatibility or exclude dynamically constructed keys.
+Jason approved prohibiting plugin `__gc` registration after the reviewed compatibility question. The process boundary remains unapproved.
+Native-stall containment remains a separate scope decision; no I1 runtime experiment ran.
+Claude added the protected array-metatable source and separated nonblocking stop from cancellation checks.
+Root does not accept a one-hook-interval invocation-completion guarantee: a cancellation error check does not prove termination through plugin protected calls.
+The narrow user decision is whether plugins may lose `__gc` registration. That decision does not close general cancellation or native-stall containment.
+Jason's approval resolves that narrow decision. Root assigned A7 the sandbox boundary before entrypoint execution, with A8 as independent reviewer.
+The first checkpoint is a source diff and finite registration tests. Builds and commits wait for Root's approval; stopped diagnostics remain excluded.
+This assignment excludes F4 stop/cancellation changes. The separate acknowledge-input compatibility decision remains open.
+I1's corrected focused run passed all seven tests, with 972 filtered tests and exit zero. Root inspected the raw log and evidence manifest.
+Evidence: `/private/tmp/i1-finalizer-boundary-20260910-evidence.md`. The initial six-pass, one-failure run remains preserved.
+The corrected test requires the exact Hub location prefix and preserves complete error-body comparisons. Production code did not change between runs.
+Claude approved patch `08fc481d7d35f6565e5e5db48be9195121dc2b3d078f9f78bee05fe9deaad8e7` for a scoped commit.
+Root approved that commit and selected I1-only integration. The independent F3 checkpoint remains held; no accounting acceptance follows from I1.
+The tests cover finite controls and the actual runtime constructor and invocation. They do not establish full reload, prompt cancellation, or native-stall containment.
+Root integrated only I1 as `51aef9d030fc341ca69ec3057c271c7701f48155`, selecting source commit `28732ddc61b2790bac0e6711062a40d47fa9db52`.
+The canonical commit diff has SHA256 `4ef40f5074395f6c33c16b39b0c7e5eb1b039f1355be853902221bcbba311c41`.
+Its file order and index headers differ from the reviewed patch; both have stable patch ID `db833c401686ef354fe2b3c82baf3c2155badbbe`.
+Root reran the same seven focused tests on main without F3 or diagnostic edits. All seven passed, with 968 filtered tests and exit zero.
+Raw log: `/private/tmp/i1-main-51aef9d-test.log`. The build reported 66 library warnings and 39 library-test warnings.
+This closes the tested registration boundary only. No publication, installation, full-foundation acceptance, or production-memory policy follows from this checkpoint.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
