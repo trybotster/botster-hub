@@ -21,6 +21,7 @@ struct Recovery {
 
 #[derive(Default)]
 pub(crate) struct PublicationOwnerState {
+    terminal: Option<crate::host_disposal::Job>,
     pending: Option<Pending>,
     completion: Option<HostCompletion>,
     permit: Option<HostWorkPermit>,
@@ -35,6 +36,52 @@ pub(crate) struct PublicationOwnerState {
 }
 
 impl PublicationOwnerState {
+    pub(crate) fn dispose_terminal(
+        &mut self,
+        runtime: &HubRuntime,
+        budget: &mut crate::daemon::owner_budget::OwnerBudget,
+    ) -> bool {
+        if let Some(job) = self.terminal.as_mut() {
+            if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
+                if let Some(work) = self.work.take() {
+                    assert!(runtime.retire_terminal_entity_model(&work));
+                }
+                if let Some(pending) = self.pending.take() {
+                    budget.release(pending.owner_permit);
+                }
+                drop(permit);
+                self.terminal.take();
+                return true;
+            }
+            return false;
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return true;
+        };
+        let mut payload: Option<Box<dyn Send>> = None;
+        let (identity, permit) = if let Some(permit) = self.permit.take() {
+            (pending.identity, permit)
+        } else if let Some(completion) = self.completion.take() {
+            let (identity, result, permit) = completion.into_parts();
+            payload = Some(Box::new(result));
+            (identity, permit)
+        } else if let Some(recovery) = self.recovery.take() {
+            payload = Some(Box::new(recovery._failure.command));
+            (recovery._failure.identity, recovery._failure.permit)
+        } else {
+            return false;
+        };
+        self.terminal = Some(crate::host_disposal::Job::new(
+            crate::host_disposal::Parts {
+                identity,
+                permit,
+                model: self.work.clone(),
+                payload: Box::new((self.operation.take(), payload)),
+            },
+        ));
+        false
+    }
+
     pub(crate) fn accepts(&self, identity: HostJobIdentity) -> bool {
         self.pending
             .as_ref()

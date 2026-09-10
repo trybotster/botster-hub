@@ -27,6 +27,7 @@ enum Recovery {
 }
 
 struct Connection {
+    terminal: Option<crate::host_disposal::Job>,
     record: Arc<ClientEventConnection>,
     identity: HostJobIdentity,
     submitted: bool,
@@ -45,6 +46,77 @@ pub(crate) struct ClientEvents {
 }
 
 impl ClientEvents {
+    pub(crate) fn dispose_terminal(
+        &mut self,
+        runtime: &crate::HubRuntime,
+        plane: &crate::subscription::package_events::ClientEventPlane,
+    ) -> bool {
+        self.connections.retain(|_, connection| {
+            if let Some(job) = connection.terminal.as_mut() {
+                if connection.completion.is_some() || connection.recovery.is_some() {
+                    return true;
+                }
+                if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
+                    assert!(connection.record.fully_reclaimed());
+                    self.by_connection
+                        .remove(connection.record.identity.as_ref());
+                    drop(permit);
+                    return false;
+                }
+                return true;
+            }
+            let mut payload: Option<Box<dyn Send>> = None;
+            let (identity, permit) = if let Some(completion) = connection.completion.take() {
+                let (identity, result, permit) = completion.into_parts();
+                payload = Some(Box::new(result));
+                (identity, permit)
+            } else if let Some(recovery) = connection.recovery.take() {
+                match recovery {
+                    Recovery::Completion(completion) => {
+                        let (identity, result, permit) = completion.into_parts();
+                        payload = Some(Box::new(result));
+                        (identity, permit)
+                    }
+                    Recovery::Submission(failure) => {
+                        payload = Some(Box::new(failure.command));
+                        (failure.identity, failure.permit)
+                    }
+                    recovery @ Recovery::UnexpectedCompletion { .. } => {
+                        connection.recovery = Some(recovery);
+                        return true;
+                    }
+                    Recovery::ReadyExhausted => {
+                        let Some(permit) = runtime.host_executor().try_reserve() else {
+                            connection.recovery = Some(Recovery::ReadyExhausted);
+                            return true;
+                        };
+                        (connection.identity, permit)
+                    }
+                }
+            } else if connection.submitted {
+                return true;
+            } else {
+                let Some(permit) = runtime.host_executor().try_reserve() else {
+                    return true;
+                };
+                (connection.identity, permit)
+            };
+            connection.record.close();
+            connection.terminal = Some(crate::host_disposal::Job::new_client(
+                crate::host_disposal::Parts {
+                    identity,
+                    permit,
+                    payload: Box::new(payload),
+                    model: None,
+                },
+                Arc::clone(runtime.package_event_router()),
+                ClientCleanupWork::new(plane.clone(), Arc::clone(&connection.record)),
+            ));
+            true
+        });
+        self.connections.is_empty()
+    }
+
     pub(crate) fn owns_waiter(&self, waiter: WaiterId) -> bool {
         self.connections.contains_key(&waiter)
     }
@@ -56,6 +128,7 @@ impl ClientEvents {
             .get_mut(&waiter)
             .expect("the client owns this waiter");
         if connection.identity != completion.identity
+            || connection.terminal.is_some()
             || !connection.submitted
             || connection.recovery.is_some()
             || connection.completion.is_some()
@@ -130,6 +203,7 @@ pub(crate) fn admit_connection(
     state.client_events.connections.insert(
         waiter_id,
         Connection {
+            terminal: None,
             record,
             identity: HostJobIdentity {
                 waiter_id,
@@ -320,4 +394,209 @@ pub(crate) fn drive_ready(
         mark_ready(state, waiter);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_executor::{
+        HOST_OPERATION_CAPACITY, HOST_PREPARED_BYTE_CAPACITY, TestDisposalProbe,
+    };
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn terminal_client_duplicate_prevents_row_retirement_after_shared_cleanup() {
+        let root = std::path::PathBuf::from("/private/tmp")
+            .join(format!("hub-terminal-client-{}", std::process::id()));
+        let config = crate::HubStartupOptions {
+            data_directory: crate::DataDirectoryOption::Explicit(root.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        let mut daemon = HubDaemon::start(config).unwrap();
+        let runtime = daemon.runtime().unwrap();
+        let mut state = DaemonControlState::default();
+        admit_connection(&mut state, "terminal-client").unwrap();
+        let waiter = state.client_events.by_connection["terminal-client"];
+        let connection = state.client_events.connections.get_mut(&waiter).unwrap();
+        connection.identity.phase = 1;
+        connection.submitted = true;
+        let record = Arc::clone(&connection.record);
+        let identity = connection.identity;
+        let executor = runtime.host_executor();
+        assert_eq!(executor.outstanding(), 0);
+        let original_permit = executor.try_reserve().unwrap();
+        let additional_permit = executor.try_reserve().unwrap();
+        let other_permits: Vec<_> = (2..HOST_OPERATION_CAPACITY)
+            .map(|_| executor.try_reserve().unwrap())
+            .collect();
+        assert!(executor.try_reserve().is_none());
+        let (original_dropped, original_drop_rx) = mpsc::channel();
+        let (additional_dropped, additional_drop_rx) = mpsc::channel();
+        let receipt = |bytes: &[u8], dropped| {
+            HostResult::StatusResponsePrepared(crate::status_response::PreparedStatusResponse {
+                kind: botster_hub_client::DaemonResponseKind::Status,
+                encoded_frame: Some(bytes.to_vec()),
+                shutdown: false,
+                dispose_probe: Some(TestDisposalProbe {
+                    dropped,
+                    executed: Arc::new(AtomicBool::new(false)),
+                }),
+            })
+        };
+        state
+            .client_events
+            .retain_completion(HostCompletion::for_test(
+                identity,
+                receipt(b"original receipt", original_dropped),
+                original_permit,
+            ));
+        assert!(
+            state.client_events.connections[&waiter]
+                .completion
+                .is_some()
+        );
+        assert!(
+            !state
+                .client_events
+                .dispose_terminal(runtime, &state.event_plane)
+        );
+        let connection = &state.client_events.connections[&waiter];
+        assert!(connection.submitted && !connection.closed);
+        assert!(connection.completion.is_none() && connection.recovery.is_none());
+        assert!(connection.terminal.is_some());
+        let additional = receipt(b"additional receipt", additional_dropped);
+        let HostResult::StatusResponsePrepared(prepared) = &additional else {
+            unreachable!();
+        };
+        let additional_allocation = prepared.encoded_frame.as_ref().unwrap().as_ptr();
+        // The terminal job is the only rejection condition for this matching receipt.
+        state
+            .client_events
+            .retain_completion(HostCompletion::for_test(
+                identity,
+                additional,
+                additional_permit,
+            ));
+        assert!(
+            original_drop_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .starts_with("botster-hub-host-")
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.client_events.connections[&waiter]
+            .terminal
+            .as_ref()
+            .unwrap()
+            .test_disposed()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "shared cleanup must finish on Host"
+            );
+            std::thread::yield_now();
+        }
+        assert!(record.fully_reclaimed());
+        assert!(
+            state
+                .event_plane
+                .test_residency("terminal-client")
+                .is_none()
+        );
+        for _ in 0..3 {
+            assert!(
+                !state
+                    .client_events
+                    .dispose_terminal(runtime, &state.event_plane)
+            );
+            assert_eq!(state.client_events.by_connection["terminal-client"], waiter);
+            assert_eq!(state.client_events.connections.len(), 1);
+            let connection = &state.client_events.connections[&waiter];
+            assert!(Arc::ptr_eq(&connection.record, &record));
+            assert_eq!(connection.identity, identity);
+            assert!(connection.completion.is_none());
+            assert!(connection.terminal.as_ref().unwrap().test_disposed());
+            let Some(Recovery::UnexpectedCompletion {
+                _previous: None,
+                _expected: None,
+                _received: additional,
+            }) = connection.recovery.as_ref()
+            else {
+                panic!("the exact additional receipt must remain in terminal recovery");
+            };
+            assert_eq!(additional.identity, identity);
+            let HostResult::StatusResponsePrepared(prepared) = &additional.result else {
+                panic!("the additional receipt must retain its payload");
+            };
+            let bytes = prepared.encoded_frame.as_ref().unwrap();
+            assert_eq!(bytes.as_slice(), b"additional receipt");
+            assert_eq!(bytes.as_ptr(), additional_allocation);
+            assert!(matches!(
+                additional_drop_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(executor.outstanding(), HOST_OPERATION_CAPACITY);
+            assert_eq!(
+                executor.prepared_bytes(),
+                HOST_OPERATION_CAPACITY * HOST_PREPARED_BYTE_CAPACITY
+            );
+        }
+        drop(other_permits);
+        assert_eq!(executor.outstanding(), 2);
+        assert_eq!(executor.prepared_bytes(), 2 * HOST_PREPARED_BYTE_CAPACITY);
+
+        // Test cleanup transfers the extra payload through its original Host permit.
+        let Some(Recovery::UnexpectedCompletion {
+            _previous: None,
+            _expected: None,
+            _received: additional,
+        }) = state
+            .client_events
+            .connections
+            .get_mut(&waiter)
+            .unwrap()
+            .recovery
+            .take()
+        else {
+            unreachable!();
+        };
+        let (returned_identity, result, permit) = additional.into_parts();
+        assert_eq!(returned_identity, identity);
+        assert_eq!(
+            permit.reserved_prepared_bytes(),
+            HOST_PREPARED_BYTE_CAPACITY
+        );
+        permit
+            .dispose(
+                returned_identity,
+                HostCommand::DiscardCompletion(Box::new(result)),
+            )
+            .unwrap();
+        assert!(
+            additional_drop_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .starts_with("botster-hub-host-")
+        );
+        assert!(
+            state
+                .client_events
+                .dispose_terminal(runtime, &state.event_plane)
+        );
+        assert!(state.client_events.by_connection.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while executor.outstanding() != 0 || executor.prepared_bytes() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "test cleanup must release both permits"
+            );
+            std::thread::yield_now();
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

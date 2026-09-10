@@ -28,6 +28,9 @@ enum Recovery {
 
 #[derive(Default)]
 pub(crate) struct EventOwnerState {
+    terminal: Option<crate::host_disposal::Job>,
+    terminal_owner: Option<OwnerPermit>,
+    terminal_retirement_fault: Option<HostWorkPermit>,
     pending: Option<Pending>,
     completion: Option<HostCompletion>,
     recovery: Option<Recovery>,
@@ -36,6 +39,81 @@ pub(crate) struct EventOwnerState {
 }
 
 impl EventOwnerState {
+    pub(crate) fn dispose_terminal(
+        &mut self,
+        runtime: &crate::HubRuntime,
+        budget: &mut crate::daemon::owner_budget::OwnerBudget,
+    ) -> bool {
+        if self.terminal_retirement_fault.is_some() {
+            return false;
+        }
+        if let Some(job) = self.terminal.as_mut() {
+            if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
+                if let Some(pending) = self.pending.take() {
+                    let Some(retired) =
+                        runtime.retire_terminal_event_plane_owner_op(&pending.event_identity)
+                    else {
+                        self.pending = Some(pending);
+                        self.terminal_retirement_fault = Some(permit);
+                        return false;
+                    };
+                    self.terminal_owner = Some(pending.owner_permit);
+                    self.terminal = Some(crate::host_disposal::Job::new(
+                        crate::host_disposal::Parts {
+                            identity: pending.identity,
+                            permit,
+                            model: None,
+                            payload: Box::new((retired, pending.event_identity)),
+                        },
+                    ));
+                    return false;
+                }
+                if let Some(owner) = self.terminal_owner.take() {
+                    budget.release(owner);
+                }
+                drop(permit);
+                self.terminal.take();
+                return true;
+            }
+            return false;
+        }
+        let (identity, permit, payload): (_, _, Box<dyn Send>) =
+            if let Some(completion) = self.completion.take() {
+                let (identity, result, permit) = completion.into_parts();
+                (identity, permit, Box::new(result))
+            } else if let Some(recovery) = self.recovery.take() {
+                match recovery {
+                    Recovery::Completion {
+                        _pending,
+                        _completion,
+                    } => {
+                        self.pending = Some(_pending);
+                        let (identity, result, permit) = _completion.into_parts();
+                        (identity, permit, Box::new(result))
+                    }
+                    Recovery::Submission { _pending, _failure } => {
+                        self.pending = Some(_pending);
+                        (
+                            _failure.identity,
+                            _failure.permit,
+                            Box::new(_failure.command),
+                        )
+                    }
+                }
+            } else {
+                return self.pending.is_none();
+            };
+        self.terminal = Some(crate::host_disposal::Job::new(
+            crate::host_disposal::Parts {
+                identity,
+                permit,
+                model: None,
+                payload,
+            },
+        ));
+        false
+    }
+
     pub(crate) fn accepts(&self, identity: HostJobIdentity) -> bool {
         self.pending
             .as_ref()

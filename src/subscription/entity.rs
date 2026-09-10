@@ -412,6 +412,9 @@ enum DeliveryPhase {
 /// applies the catalog on a later turn.
 #[derive(Default)]
 pub(crate) struct SessionTypeCatalogCache {
+    terminal: Option<crate::host_disposal::Job>,
+    /// Construction assigns this cache an Owner identity. Each admitted build records its exact Host identity.
+    last_identity: Option<HostJobIdentity>,
     generation: Option<u64>,
     entities: BTreeMap<String, Value>,
     /// Logical encoded bytes retained by `entities` after its host permit releases.
@@ -436,6 +439,64 @@ enum SessionTypeCatalogRefresh<'a> {
 }
 
 impl SessionTypeCatalogCache {
+    pub(crate) fn for_owner(waiter: crate::owner_identity::WaiterId) -> Self {
+        Self {
+            last_identity: Some(HostJobIdentity::first(waiter)),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn dispose_terminal(&mut self, executor: &HostExecutor) -> bool {
+        if let Some(job) = self.terminal.as_mut() {
+            if let crate::host_disposal::Poll::Disposed(permit) = job.poll() {
+                drop(permit);
+                self.terminal.take();
+                self.pending = None;
+                self.logical_bytes = 0;
+                return true;
+            }
+            return false;
+        }
+        let mut payload: Option<Box<dyn Send>> = None;
+        let (identity, permit) = if let Some(completion) = self.completion.take() {
+            let (identity, result, permit) = completion.into_parts();
+            payload = Some(Box::new(result));
+            (identity, permit)
+        } else if let Some((identity, reclamation, permit)) = self.retained_reclamation.take() {
+            payload = Some(Box::new(reclamation));
+            (identity, permit)
+        } else if self.pending.is_some() {
+            return false;
+        } else if self.entities.is_empty()
+            && self.prepared_charge.is_none()
+            && self.failure.is_none()
+        {
+            return true;
+        } else {
+            let Some(identity) = self.last_identity else {
+                return false;
+            };
+            let Some(permit) = executor.try_reserve() else {
+                return false;
+            };
+            (identity, permit)
+        };
+        self.terminal = Some(crate::host_disposal::Job::new(
+            crate::host_disposal::Parts {
+                identity,
+                permit,
+                model: None,
+                payload: Box::new((
+                    std::mem::take(&mut self.entities),
+                    self.prepared_charge.take(),
+                    self.failure.take(),
+                    payload,
+                )),
+            },
+        ));
+        false
+    }
+
     fn accepts(&self, identity: HostJobIdentity) -> bool {
         self.pending
             .is_some_and(|(expected, _)| expected == identity)
@@ -505,6 +566,7 @@ impl SessionTypeCatalogCache {
         };
         // The owner registers the identity before the job can publish completion.
         self.pending = Some((identity, generation));
+        self.last_identity = Some(identity);
         self.waiting_for_capacity = false;
         // These Arcs retain existing shared allocations. The job does not clone
         // the registry or state payload, so it adds no logical input bytes.
@@ -1307,6 +1369,31 @@ pub(crate) fn absorb_session_type_catalog_completions(
 
 /// Route by the original waiter before each family validates its exact phase and receipt.
 pub(crate) fn route_host_completion(state: &mut DaemonControlState, completion: HostCompletion) {
+    route_host_completion_mode(state, completion, false);
+}
+
+pub(crate) fn route_terminal_host_completion(
+    state: &mut DaemonControlState,
+    completion: HostCompletion,
+) -> Result<(), HostCompletion> {
+    if state
+        .host_completions
+        .contains_key(&completion.identity.waiter_id)
+        || (state.session_type_catalog.accepts(completion.identity)
+            && (state.session_type_catalog.completion.is_some()
+                || state.session_type_catalog.terminal.is_some()))
+    {
+        return Err(completion);
+    }
+    route_host_completion_mode(state, completion, true);
+    Ok(())
+}
+
+fn route_host_completion_mode(
+    state: &mut DaemonControlState,
+    completion: HostCompletion,
+    terminal: bool,
+) {
     if state
         .client_events
         .owns_waiter(completion.identity.waiter_id)
@@ -1353,6 +1440,9 @@ pub(crate) fn route_host_completion(state: &mut DaemonControlState, completion: 
             crate::daemon::owner_schedule::ReadyClass::HostCompletion,
             crate::daemon::control::pending::READY_HOST_COMPLETION,
         );
+    } else if terminal {
+        let waiter = completion.identity.waiter_id;
+        state.host_completions.insert(waiter, completion);
     } else {
         crate::daemon::control::pending::absorb_host_completion(state, completion);
     }
@@ -2230,6 +2320,185 @@ mod tests {
     use crate::HubDaemon;
     use crate::daemon::owner_loop::DaemonControlState;
     use crate::owner_identity::WaiterIdSource;
+
+    #[test]
+    fn terminal_catalog_keeps_its_own_identity_after_waiter_exhaustion() {
+        let executor = HostExecutor::new();
+        let mut state = DaemonControlState::default();
+        let identity = state
+            .session_type_catalog
+            .last_identity
+            .expect("construction assigns the catalog's identity");
+        assert_eq!(
+            state.waiter_ids.next().unwrap().0,
+            identity.waiter_id.0 + 2,
+            "the state allocates the lifecycle identity after the cache identity"
+        );
+        state.waiter_ids = WaiterIdSource::with_next(u64::MAX);
+        assert!(state.waiter_ids.next().is_none());
+        assert!(state.session_type_catalog.pending.is_none());
+        state.session_type_catalog.failure = Some((
+            1,
+            HostError::new(
+                "host_waiter_id_exhausted",
+                "catalog could not admit a build",
+            ),
+        ));
+        let mut slots: Vec<_> = (0..crate::host_executor::HOST_OPERATION_CAPACITY)
+            .map(|_| executor.try_reserve().unwrap())
+            .collect();
+        assert!(!state.session_type_catalog.dispose_terminal(&executor));
+        assert!(state.session_type_catalog.failure.is_some());
+        assert_eq!(state.session_type_catalog.last_identity, Some(identity));
+        drop(slots.pop());
+        assert!(!state.session_type_catalog.dispose_terminal(&executor));
+        assert_eq!(state.session_type_catalog.last_identity, Some(identity));
+        assert!(state.waiter_ids.next().is_none());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !state.session_type_catalog.dispose_terminal(&executor) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(executor.outstanding(), slots.len());
+        assert!(state.session_type_catalog.failure.is_none());
+        drop(slots);
+        assert_eq!(executor.outstanding(), 0);
+        assert_eq!(executor.prepared_bytes(), 0);
+    }
+
+    #[test]
+    fn terminal_catalog_cache_waits_for_capacity_in_the_original_host_pool() {
+        let executor = HostExecutor::new();
+        let identity = HostJobIdentity::first(crate::owner_identity::WaiterId(73));
+        let (result, charge) = HostCompletion::for_test(
+            identity,
+            HostResult::SessionTypeCatalogReady {
+                generation: 1,
+                entities: BTreeMap::from([("type".into(), serde_json::json!({"id": "retained"}))]),
+                logical_bytes: 20,
+            },
+            executor.try_reserve().unwrap(),
+        )
+        .release();
+        let HostResult::SessionTypeCatalogReady {
+            entities,
+            logical_bytes,
+            ..
+        } = result
+        else {
+            unreachable!()
+        };
+        let mut cache = SessionTypeCatalogCache {
+            last_identity: Some(identity),
+            entities,
+            logical_bytes,
+            prepared_charge: Some(charge),
+            ..Default::default()
+        };
+        let mut slots = Vec::new();
+        while let Some(permit) = executor.try_reserve() {
+            slots.push(permit);
+        }
+        assert!(!slots.is_empty());
+        // The settled cache charge also consumes the existing prepared-byte budget.
+        assert!(slots.len() < crate::host_executor::HOST_OPERATION_CAPACITY);
+        let bytes = executor.prepared_bytes();
+        assert!(!cache.dispose_terminal(&executor));
+        assert_eq!(cache.entities.len(), 1);
+        assert!(cache.prepared_charge.is_some());
+        assert_eq!(executor.prepared_bytes(), bytes);
+        drop(slots.pop());
+        assert!(!cache.dispose_terminal(&executor));
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !cache.terminal.as_ref().unwrap().test_disposed() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(executor.outstanding(), slots.len() + 1);
+        assert!(cache.dispose_terminal(&executor));
+        assert_eq!(executor.outstanding(), slots.len());
+        drop(slots);
+        assert_eq!(executor.prepared_bytes(), 0);
+    }
+
+    #[test]
+    fn terminal_catalog_without_an_existing_identity_retains_its_failure() {
+        let executor = HostExecutor::new();
+        let mut cache = SessionTypeCatalogCache {
+            failure: Some((
+                1,
+                HostError::new(
+                    "host_waiter_id_exhausted",
+                    "catalog has no admitted identity",
+                ),
+            )),
+            ..Default::default()
+        };
+        assert!(!cache.dispose_terminal(&executor));
+        assert!(cache.failure.is_some());
+        assert_eq!(executor.outstanding(), 0);
+    }
+
+    #[test]
+    fn terminal_catalog_duplicate_returns_the_whole_receipt_and_retains_both_slots() {
+        let executor = HostExecutor::new();
+        let mut state = DaemonControlState::default();
+        let identity = HostJobIdentity::first(state.waiter_ids.next().unwrap());
+        state.session_type_catalog.pending = Some((identity, 1));
+        let result = |value: &str| HostResult::SessionTypeCatalogReady {
+            generation: 1,
+            entities: BTreeMap::from([("type".into(), serde_json::json!({"id": value}))]),
+            logical_bytes: 20,
+        };
+        let original =
+            HostCompletion::for_test(identity, result("first"), executor.try_reserve().unwrap());
+        let duplicate =
+            HostCompletion::for_test(identity, result("second"), executor.try_reserve().unwrap());
+        route_terminal_host_completion(&mut state, original).unwrap();
+        let duplicate = route_terminal_host_completion(&mut state, duplicate)
+            .expect_err("terminal routing must return the duplicate receipt");
+        assert_eq!(executor.outstanding(), 2);
+        let HostResult::SessionTypeCatalogReady { entities, .. } = &state
+            .session_type_catalog
+            .completion
+            .as_ref()
+            .unwrap()
+            .result
+        else {
+            panic!("the original catalog result remains");
+        };
+        assert_eq!(entities["type"]["id"], "first");
+        let HostResult::SessionTypeCatalogReady { entities, .. } = &duplicate.result else {
+            panic!("the duplicate catalog result remains");
+        };
+        assert_eq!(entities["type"]["id"], "second");
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !state.session_type_catalog.dispose_terminal(&executor) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            executor.outstanding(),
+            1,
+            "the rejected receipt still retains its original slot"
+        );
+        let (identity, result, permit) = duplicate.into_parts();
+        let mut disposal = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+            identity,
+            permit,
+            payload: Box::new(result),
+            model: None,
+        });
+        loop {
+            if let crate::host_disposal::Poll::Disposed(permit) = disposal.poll() {
+                drop(permit);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(executor.outstanding(), 0);
+    }
 
     #[test]
     fn replacement_subscription_rejects_the_previous_publication() {

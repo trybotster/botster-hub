@@ -44,6 +44,59 @@ pub(crate) struct FamilyWork {
 }
 
 impl FamilyWork {
+    pub(crate) fn take_terminal_parts(
+        &mut self,
+        fallback_identity: HostJobIdentity,
+    ) -> Option<crate::host_disposal::Parts> {
+        let mut result = None;
+        let mut command = None;
+        let (identity, permit) = if let Some(permit) = self.permit.take() {
+            (self.identity.unwrap_or(fallback_identity), permit)
+        } else if let Some(completion) = self.completion.take() {
+            let (identity, value, permit) = completion.into_parts();
+            result = Some(value);
+            (identity, permit)
+        } else if let Some(submission) = self.submission.take() {
+            command = Some(submission.command);
+            (submission.identity, submission.permit)
+        } else {
+            return None;
+        };
+        Some(crate::host_disposal::Parts {
+            identity,
+            permit,
+            model: self.handle.as_ref().map(|handle| handle.work().clone()),
+            payload: Box::new((
+                self.result.take(),
+                self.operation.take(),
+                self.completion.take(),
+                self.submission.take(),
+                self.generation_fault.take(),
+                result,
+                command,
+            )),
+        })
+    }
+
+    pub(crate) fn retain_terminal_completion(&mut self, completion: &mut Option<HostCompletion>) {
+        if self.completion.is_none() && self.permit.is_none() && self.submission.is_none() {
+            self.completion = completion.take();
+        }
+    }
+
+    pub(crate) fn retire_terminal(&mut self, runtime: &crate::HubRuntime) -> bool {
+        if let Some(handle) = self.handle.as_ref() {
+            if !handle.work().terminal_disposed() {
+                return false;
+            }
+            if let Handle::Live(work) = handle {
+                runtime.retire_terminal_entity_model(work);
+            }
+        }
+        self.handle.take();
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn test_retained_release(&self) -> bool {
         self.completion.is_some()

@@ -29,6 +29,17 @@ pub(crate) struct Cursor {
 }
 
 impl Cursor {
+    pub(super) fn take_terminal_release(
+        &mut self,
+    ) -> Option<(u64, Option<crate::lua_runtime::EntityPublishPermit>)> {
+        self.release.take()
+    }
+    pub(crate) fn terminal_admission(&self) -> Option<crate::lua_runtime::EntityPublishPermit> {
+        self.release
+            .as_ref()
+            .and_then(|(_, admission)| admission.clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn test_release(&self) -> Option<u64> {
         self.release.as_ref().map(|(scope, _)| *scope)

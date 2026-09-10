@@ -82,6 +82,9 @@ struct Queue {
 }
 
 pub(crate) struct PendingEntityPublishRequest {
+    // Drop before mutation/admission so terminal tests can pause real payload destruction.
+    #[cfg(test)]
+    terminal_drop_probe: Option<Box<dyn Send>>,
     pub(crate) token: u64,
     pub(crate) registration: crate::lifecycle::EntityProviderRegistration,
     pub(crate) mutation: PackageEntityMutation,
@@ -218,6 +221,44 @@ impl HubEntityPublishBridge {
         )
     }
 
+    /// Called on Host only after the engine receipt seals all scoped producers.
+    /// Terminal extraction recovers a poisoned container's actual owned entries;
+    /// it does not repair ordinary operation or clear its fault latch. Descendant
+    /// publication charges are never reset: queued mutations release their own
+    /// original charge only as the payloads are destroyed after the queue unlocks.
+    pub(crate) fn dispose_terminal_pending(&self) -> bool {
+        let pending = {
+            let mut queue = match self.shared.queue.lock() {
+                Ok(queue) => queue,
+                Err(poison) => {
+                    self.shared.faulted.store(true, Ordering::SeqCst);
+                    poison.into_inner()
+                }
+            };
+            let pending = std::mem::take(&mut queue.pending);
+            self.shared.count.store(0, Ordering::SeqCst);
+            self.shared.blocked.store(false, Ordering::SeqCst);
+            self.shared.interest.store(false, Ordering::SeqCst);
+            pending
+        };
+        // A destructor panic propagates to the enclosing Host disposal receipt;
+        // it cannot report successful clearing or release the original Host slot.
+        drop(pending);
+        self.shared.progress.store(false, Ordering::SeqCst);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_pending_drop_probe(&self, probe: impl Send + 'static) {
+        let mut queue = self.shared.queue.lock().unwrap();
+        let head = queue
+            .pending
+            .front_mut()
+            .expect("a real pending publication");
+        assert!(head.terminal_drop_probe.is_none());
+        head.terminal_drop_probe = Some(Box::new(probe));
+    }
+
     pub(crate) fn prepare_registration(
         &self,
         package: &str,
@@ -323,6 +364,8 @@ impl HubEntityPublishBridge {
             bytes: request_bytes,
         }))));
         queue.pending.push_back(PendingEntityPublishRequest {
+            #[cfg(test)]
+            terminal_drop_probe: None,
             token,
             registration,
             mutation,
@@ -459,6 +502,116 @@ mod tests {
     fn publish_frame(bytes: usize) -> serde_json::Value {
         serde_json::json!({"type": "entity_patch", "entity_type": "p.item", "snapshot_seq": 1,
             "id": "item", "patch": {"body": "x".repeat(bytes)}})
+    }
+
+    #[test]
+    fn terminal_entity_pending_clears_on_host_and_preserves_independent_descendant_charges() {
+        use super::super::terminal_bridge_tests::{
+            finish_host_clear, host_clear, pending_drop_gate,
+        };
+
+        // Both an ordinary-operation fault latch and mutex poison are reachable
+        // recovery states. Terminal extraction must dispose actual retained rows.
+        for fault in ["none", "latched", "poisoned"] {
+            let bridge = HubEntityPublishBridge::for_test("p", "p.item");
+            let _selected_response =
+                bridge.test_queue_publish(PluginKey("p".into()), publish_frame(17), Some(41));
+            let (selected, ()) = bridge.take_if(|_| Some(())).unwrap();
+            let selected_charge = bridge.retained_counts();
+            let responses: Vec<_> = (0..2)
+                .map(|index| {
+                    bridge.test_queue_publish(
+                        PluginKey("p".into()),
+                        publish_frame(4096 + index),
+                        Some(42 + index as u64),
+                    )
+                })
+                .collect();
+            let original_charge = bridge.retained_counts();
+            assert_eq!(original_charge.0, 3);
+            assert!(original_charge.1 > selected_charge.1);
+            let next_token = bridge.shared.queue.lock().unwrap().next_token;
+            let shared = bridge.shared.clone();
+            let (gate, probe) = pending_drop_gate(move || {
+                !matches!(shared.queue.try_lock(), Err(TryLockError::WouldBlock))
+            });
+            bridge.test_set_pending_drop_probe(probe);
+            match fault {
+                "latched" => bridge.retain_faulted(),
+                "poisoned" => {
+                    assert!(
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _guard = bridge.shared.queue.lock().unwrap();
+                            panic!("retained entity publication queue poison");
+                        }))
+                        .is_err()
+                    );
+                }
+                _ => {}
+            }
+            bridge.shared.blocked.store(true, Ordering::SeqCst);
+            bridge.shared.interest.store(true, Ordering::SeqCst);
+            let worker_bridge = bridge.clone();
+            let (executor, mut job, finished) =
+                host_clear(move || worker_bridge.dispose_terminal_pending());
+            gate.wait();
+            assert!(matches!(job.poll(), crate::host_disposal::Poll::Pending));
+            assert!(matches!(
+                finished.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(executor.outstanding(), 1);
+            assert_eq!(bridge.pending_publish_count(), 0);
+            assert!(!bridge.ready());
+            assert!(!bridge.shared.blocked.load(Ordering::SeqCst));
+            assert!(!bridge.shared.interest.load(Ordering::SeqCst));
+            assert_eq!(
+                bridge.retained_counts(),
+                original_charge,
+                "queue extraction does not release original publication count or bytes before payload destruction"
+            );
+            for response in &responses {
+                assert!(matches!(
+                    response.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+            }
+            gate.release();
+            assert!(finished.recv_timeout(Duration::from_secs(5)).unwrap());
+            finish_host_clear(&executor, &mut job);
+            assert_eq!(bridge.pending_publish_count(), 0);
+            assert!(!bridge.ready());
+            assert!(!bridge.take_progress_notification());
+            assert_eq!(
+                bridge.is_faulted(),
+                fault != "none",
+                "terminal cleanup does not clear an ordinary-operation fault"
+            );
+            assert_eq!(
+                bridge.retained_counts(),
+                selected_charge,
+                "bridge clearing must not release a selected model/domain mutation charge"
+            );
+            for response in responses {
+                assert!(matches!(
+                    response.try_recv(),
+                    Err(mpsc::TryRecvError::Disconnected)
+                ));
+            }
+            let queue = bridge
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(queue.pending.is_empty());
+            assert_eq!(
+                queue.next_token, next_token,
+                "terminal clearing does not restart publication identity allocation"
+            );
+            drop(queue);
+            drop(selected);
+            assert_eq!(bridge.retained_counts(), (0, 0));
+        }
     }
 
     #[test]

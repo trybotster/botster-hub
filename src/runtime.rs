@@ -110,7 +110,7 @@ pub struct HubRuntime {
     close_work: crate::data_plane::CloseWorkSource,
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
-    plugin_lifecycle: HubPluginLifecycle,
+    plugin_lifecycle: Option<HubPluginLifecycle>,
     capability_runtime: SharedHubCapabilityRuntime,
     session_type_spawner: SharedSessionTypeSpawner,
     host_executor: crate::host_executor::HostExecutor,
@@ -267,7 +267,64 @@ pub struct HubSessionTypeSpawner {
     managed_owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
 }
 
+/// These handles permit explicit queue cleanup after the engine disposal receipt.
+pub(crate) struct TerminalPluginBridges {
+    coordination: HubCoordinationBridge,
+    entity_publish: HubEntityPublishBridge,
+    spawner: SharedSessionTypeSpawner,
+}
+
+impl TerminalPluginBridges {
+    /// Host clears actual queue contents after all scoped producers stop.
+    pub(crate) fn dispose(&self) -> bool {
+        self.coordination.dispose_terminal_pending()
+            && self.entity_publish.dispose_terminal_pending()
+            && self.spawner.dispose_terminal_pending()
+    }
+}
+
+#[cfg(test)]
+struct TerminalSpawnerProbe {
+    spawner: std::sync::Weak<HubSessionTypeSpawner>,
+    dropped: mpsc::Sender<(String, bool)>,
+    gate: Option<mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl Drop for TerminalSpawnerProbe {
+    fn drop(&mut self) {
+        let spawner = self
+            .spawner
+            .upgrade()
+            .expect("the test retains the spawner");
+        let locks_released = !matches!(
+            spawner.pending.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) && !matches!(
+            spawner.reads.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) && !matches!(
+            spawner.managed.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        let _ = self.dropped.send((
+            thread::current().name().unwrap_or("unnamed").to_string(),
+            locks_released,
+        ));
+        if let Some(gate) = self.gate.take()
+            && matches!(
+                gate.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            )
+        {
+            panic!("the test must release the payload destructor");
+        }
+    }
+}
+
 struct PendingSessionTypeSpawn {
+    #[cfg(test)]
+    _dispose_probe: Option<TerminalSpawnerProbe>,
     plugin_key: PluginKey,
     session_type_id: String,
     request: SessionTypeRequest,
@@ -281,6 +338,8 @@ enum SessionTypeRead {
 }
 
 struct PendingSessionTypeRead {
+    #[cfg(test)]
+    _dispose_probe: Option<TerminalSpawnerProbe>,
     target_id: String,
     operation: SessionTypeRead,
     package_records: Vec<PackageRecord>,
@@ -288,6 +347,8 @@ struct PendingSessionTypeRead {
 }
 
 pub(crate) struct PendingManagedSessionSpawn {
+    #[cfg(test)]
+    _dispose_probe: Option<TerminalSpawnerProbe>,
     pub(crate) plugin_key: PluginKey,
     pub(crate) target_id: String,
     pub(crate) branch: String,
@@ -379,7 +440,7 @@ impl HubRuntime {
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
-            plugin_lifecycle,
+            plugin_lifecycle: Some(plugin_lifecycle),
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
@@ -482,7 +543,7 @@ impl HubRuntime {
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
-            plugin_lifecycle,
+            plugin_lifecycle: Some(plugin_lifecycle),
             last_capability_cleanup: None,
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
@@ -714,6 +775,15 @@ impl HubRuntime {
         identity: &crate::package_event_router::EventOwnerWorkId,
     ) -> Option<crate::package_event_router::EventOwnerWork> {
         self.event_plane_owner_ops.borrow_mut().restart(identity)
+    }
+
+    pub(crate) fn retire_terminal_event_plane_owner_op(
+        &self,
+        identity: &crate::package_event_router::EventOwnerWorkId,
+    ) -> Option<crate::package_event_router::OwnerOp> {
+        self.event_plane_owner_ops
+            .borrow_mut()
+            .retire_terminal(identity)
     }
 
     pub(crate) fn apply_causal_owner_ops(&self) {
@@ -1009,7 +1079,7 @@ impl HubRuntime {
 
     /// Capture shared runtime handles for one admitted host operation.
     pub(crate) fn host_package_runtime(&self) -> HostPackageRuntime {
-        HostPackageRuntime::new(self.plugin_lifecycle.clone(), self.lua_plugin_host_api())
+        HostPackageRuntime::new(self.plugin_lifecycle().clone(), self.lua_plugin_host_api())
     }
 
     /// Apply cleanup identities after host execution completes.
@@ -1141,7 +1211,7 @@ impl HubRuntime {
         let request_id = request.request_id.clone();
         let handler = request.handler.clone();
         let timeout_ms = request.timeout_ms;
-        let lifecycle = self.plugin_lifecycle.clone();
+        let lifecycle = self.plugin_lifecycle().clone();
         let (outcome_sender, outcome_receiver) = mpsc::channel();
         let spawn_result = std::thread::Builder::new()
             .name("botster-plugin-invocation".to_string())
@@ -1290,17 +1360,42 @@ impl HubRuntime {
     /// Return loaded plugin MCP tool descriptors.
     #[must_use]
     pub fn list_plugin_mcp_tools(&self) -> Vec<crate::McpToolDescriptor> {
-        self.plugin_lifecycle
+        self.plugin_lifecycle()
             .mcp_tool_descriptors()
             .into_iter()
             .filter_map(crate::mcp::mcp_descriptor_from_plugin)
             .collect()
     }
 
+    /// Return the lifecycle before the daemon transfers its terminal ownership.
+    fn plugin_lifecycle(&self) -> &HubPluginLifecycle {
+        self.plugin_lifecycle
+            .as_ref()
+            .expect("plugin lifecycle was taken for terminal disposal")
+    }
+
+    /// Move the actual lifecycle owner to terminal disposal.
+    ///
+    /// The daemon must drain ordinary owners before this transfer.
+    /// Normal lifecycle methods must not run after this transfer.
+    #[must_use]
+    pub(crate) fn take_plugin_lifecycle(&mut self) -> Option<HubPluginLifecycle> {
+        self.plugin_lifecycle.take()
+    }
+
+    /// Capture queue handles without accessing the transferred lifecycle.
+    pub(crate) fn terminal_plugin_bridges(&self) -> TerminalPluginBridges {
+        TerminalPluginBridges {
+            coordination: self.coordination_bridge.clone(),
+            entity_publish: self.entity_publish_bridge.clone(),
+            spawner: Arc::clone(&self.session_type_spawner),
+        }
+    }
+
     /// Return a cheap handle to the shared plugin lifecycle state.
     #[must_use]
     pub(crate) fn plugin_lifecycle_handle(&self) -> HubPluginLifecycle {
-        self.plugin_lifecycle.clone()
+        self.plugin_lifecycle().clone()
     }
 
     /// Invoke a loaded plugin MCP tool through the core worker path.
@@ -1321,7 +1416,7 @@ impl HubRuntime {
         client_id: Option<ClientId>,
     ) -> Result<PluginInvocationRequest, crate::McpToolError> {
         let descriptor = self
-            .plugin_lifecycle
+            .plugin_lifecycle()
             .mcp_tool_descriptors()
             .into_iter()
             .find(|descriptor| {
@@ -2341,7 +2436,7 @@ impl HubRuntime {
         client_id: Option<ClientId>,
     ) -> Result<PluginInvocationRequest, crate::McpToolError> {
         let descriptor = self
-            .plugin_lifecycle
+            .plugin_lifecycle()
             .surface_route_descriptors()
             .into_iter()
             .find(|descriptor| {
@@ -2379,7 +2474,7 @@ impl HubRuntime {
         package_name: &str,
         result: PluginInvocationResult,
     ) -> Result<UiNode, crate::McpToolError> {
-        complete_plugin_surface_render_with_lifecycle(&self.plugin_lifecycle, package_name, result)
+        complete_plugin_surface_render_with_lifecycle(self.plugin_lifecycle(), package_name, result)
     }
 
     /// Dispatch a plugin-owned semantic UI action through the plugin worker path.
@@ -2415,7 +2510,7 @@ impl HubRuntime {
         let surface_id = &request.surface_id.0;
         let action_id = &request.action_id.0;
         let descriptor = self
-            .plugin_lifecycle
+            .plugin_lifecycle()
             .ui_action_descriptors()
             .into_iter()
             .find(|descriptor| {
@@ -2463,7 +2558,7 @@ impl HubRuntime {
         result: PluginInvocationResult,
     ) -> Result<UiActionResult, crate::McpToolError> {
         complete_plugin_surface_action_with_lifecycle(
-            &self.plugin_lifecycle,
+            self.plugin_lifecycle(),
             package_name,
             request,
             result,
@@ -2473,14 +2568,14 @@ impl HubRuntime {
     /// Return exact entity families currently provided by one loaded package.
     #[must_use]
     pub fn plugin_entity_provider_families(&self, package_name: &str) -> BTreeSet<String> {
-        self.plugin_lifecycle
+        self.plugin_lifecycle()
             .entity_provider_families_for(package_name)
     }
 
     /// Return whether an exact mapped family still has a loaded provider.
     #[must_use]
     pub fn has_plugin_entity_provider_family(&self, entity_type: &str) -> bool {
-        self.plugin_lifecycle
+        self.plugin_lifecycle()
             .has_entity_provider_family(entity_type)
     }
 
@@ -2522,7 +2617,7 @@ impl HubRuntime {
     ) -> Result<(PluginInvocationRequest, PluginEntitySnapshotInvocation), crate::McpToolError>
     {
         let mut plan = ProviderRequestPlan::prepare(
-            &self.plugin_lifecycle,
+            self.plugin_lifecycle(),
             &self.shared_view_budget(),
             entity_type,
             subscription_id,
@@ -2712,7 +2807,7 @@ impl HubRuntime {
         &self,
         registry: &PackageRegistry,
     ) -> Vec<HubPluginLifecycleStatus> {
-        self.plugin_lifecycle.status(registry)
+        self.plugin_lifecycle().status(registry)
     }
 
     /// Record one package-scoped startup load failure without loading the package.
@@ -2721,7 +2816,7 @@ impl HubRuntime {
         package_name: &str,
         error: &HubLuaPluginLoadError,
     ) {
-        self.plugin_lifecycle.record_load_failure(
+        self.plugin_lifecycle().record_load_failure(
             package_name,
             HubPluginLoadFailure {
                 code: error.code().to_string(),
@@ -2733,7 +2828,7 @@ impl HubRuntime {
     /// Return Core's authoritative read-only plugin worker snapshot.
     #[must_use]
     pub fn plugin_worker_debug_snapshot(&self) -> PluginWorkerDebugSnapshot {
-        self.plugin_lifecycle.debug_snapshot()
+        self.plugin_lifecycle().debug_snapshot()
     }
 
     /// Return the sanitized count of active Hub-owned timer resources.
@@ -2909,7 +3004,7 @@ impl HubRuntime {
                     continue;
                 }
 
-                let outcome = self.plugin_lifecycle.invoke(PluginInvocationRequest {
+                let outcome = self.plugin_lifecycle().invoke(PluginInvocationRequest {
                     request_id,
                     handler: handler.handler,
                     timeout_ms: 1_000,
@@ -3034,7 +3129,7 @@ impl HubRuntime {
         event_name: &str,
         handler_id: &str,
     ) -> Option<crate::lifecycle::HubPluginEventHandler> {
-        self.plugin_lifecycle
+        self.plugin_lifecycle()
             .event_handler_for(plugin_key, owner, event_name, handler_id)
     }
 
@@ -3057,12 +3152,12 @@ impl HubRuntime {
                 backpressure: None,
             };
         }
-        self.plugin_lifecycle.try_admit(class, request)
+        self.plugin_lifecycle().try_admit(class, request)
     }
 
     pub(crate) fn plugin_provider_admission(&self) -> (HubPluginLifecycle, Arc<AtomicBool>) {
         (
-            self.plugin_lifecycle.clone(),
+            self.plugin_lifecycle().clone(),
             Arc::clone(&self.force_plugin_admit_backpressure),
         )
     }
@@ -3104,7 +3199,7 @@ impl HubRuntime {
         max_items: usize,
         max_bytes: usize,
     ) -> PluginCompletionDrain {
-        self.plugin_lifecycle
+        self.plugin_lifecycle()
             .drain_completions(max_items, max_bytes)
     }
 
@@ -3113,7 +3208,8 @@ impl HubRuntime {
         &self,
         notifier: botster_core::PluginCompletionNotifier,
     ) {
-        self.plugin_lifecycle.install_completion_notifier(notifier);
+        self.plugin_lifecycle()
+            .install_completion_notifier(notifier);
     }
 
     /// Event handlers subscribed to the Hub-owned `/session` family.
@@ -3134,13 +3230,16 @@ impl HubRuntime {
         usize,
         bool,
     ) {
-        self.plugin_lifecycle
-            .event_handlers_for_page("session_family", after_plugin_key, max_items)
+        self.plugin_lifecycle().event_handlers_for_page(
+            "session_family",
+            after_plugin_key,
+            max_items,
+        )
     }
 
     #[cfg(test)]
     pub fn insert_test_event_handler(&self, plugin_key: &str, event_name: &str) {
-        self.plugin_lifecycle
+        self.plugin_lifecycle()
             .insert_test_event_handler(plugin_key, event_name);
     }
 
@@ -3863,6 +3962,115 @@ impl HubRuntime {
 }
 
 impl HubSessionTypeSpawner {
+    /// Host destroys queued payloads after all scoped producers stop.
+    pub(crate) fn dispose_terminal_pending(&self) -> bool {
+        let queues = {
+            // Poison does not remove entries from these sealed queue containers.
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reads = self
+                .reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut managed = self
+                .managed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                std::mem::take(&mut *pending),
+                std::mem::take(&mut *reads),
+                std::mem::take(&mut *managed),
+            )
+        };
+        // Payload destructors run after every queue lock is released.
+        drop(queues);
+        self.managed_pending.store(false, Ordering::Release);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_seed_terminal_pending(
+        self: &Arc<Self>,
+        gate: Option<mpsc::Receiver<()>>,
+    ) -> mpsc::Receiver<(String, bool)> {
+        assert_eq!(self.test_terminal_pending_counts(), (0, 0, 0, false));
+        let (dropped, observed) = mpsc::channel();
+        let probe = |gate| TerminalSpawnerProbe {
+            spawner: Arc::downgrade(self),
+            dropped: dropped.clone(),
+            gate,
+        };
+        let (response, _) = mpsc::channel();
+        self.pending
+            .lock()
+            .unwrap()
+            .push_back(PendingSessionTypeSpawn {
+                plugin_key: PluginKey("terminal-spawner".into()),
+                session_type_id: "plain".into(),
+                request: SessionTypeRequest {
+                    environment: BTreeMap::from([("PAYLOAD".into(), "spawn payload".repeat(128))]),
+                    ..SessionTypeRequest::default()
+                },
+                package_records: Vec::new(),
+                response,
+                _dispose_probe: Some(probe(gate)),
+            });
+        let (response, _) = mpsc::channel();
+        self.reads
+            .lock()
+            .unwrap()
+            .push_back(PendingSessionTypeRead {
+                target_id: "terminal-target".into(),
+                operation: SessionTypeRead::Show {
+                    session_type_id: "read payload".repeat(128),
+                },
+                package_records: Vec::new(),
+                response,
+                _dispose_probe: Some(probe(None)),
+            });
+        let (response, _) = mpsc::channel();
+        self.managed
+            .lock()
+            .unwrap()
+            .push_back(PendingManagedSessionSpawn {
+                plugin_key: PluginKey("terminal-spawner".into()),
+                target_id: "terminal-target".into(),
+                branch: "terminal-branch".into(),
+                session_type_id: "managed".into(),
+                request: ManagedSessionTypeRequest {
+                    prompt: Some("managed payload".repeat(128)),
+                    ..ManagedSessionTypeRequest::default()
+                },
+                package_records: Vec::new(),
+                accepted_at: Instant::now(),
+                response,
+                _dispose_probe: Some(probe(None)),
+            });
+        self.managed_pending.store(true, Ordering::Release);
+        observed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_terminal_pending_counts(&self) -> (usize, usize, usize, bool) {
+        (
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            self.reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            self.managed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            self.managed_pending.load(Ordering::Acquire),
+        )
+    }
+
     fn new() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
@@ -3922,6 +4130,8 @@ impl HubSessionTypeSpawner {
                 request,
                 package_records,
                 response,
+                #[cfg(test)]
+                _dispose_probe: None,
             });
         }
 
@@ -3980,6 +4190,8 @@ impl HubSessionTypeSpawner {
                 operation,
                 package_records,
                 response,
+                #[cfg(test)]
+                _dispose_probe: None,
             });
         receiver
             .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
@@ -4024,6 +4236,8 @@ impl HubSessionTypeSpawner {
             package_records,
             accepted_at: Instant::now(),
             response,
+            #[cfg(test)]
+            _dispose_probe: None,
         });
         drop(managed);
         self.publish_managed_spawn();
@@ -4460,6 +4674,14 @@ impl TakenPackageEntityMutation {
 pub struct PackageEntityFanoutFinish {
     lease: Option<EntityMutationLease>,
     pub scheduled_resync: bool,
+}
+
+impl PackageEntityFanoutFinish {
+    pub(crate) fn take_terminal_family(&mut self) -> Option<String> {
+        self.lease
+            .as_mut()
+            .map(|lease| std::mem::take(&mut lease.family))
+    }
 }
 
 fn settle_entity_publish_op(
@@ -5270,6 +5492,137 @@ pub(crate) mod tests {
         HubRuntime::new(config).unwrap()
     }
 
+    fn check_terminal_spawner_disposal(poison: bool) {
+        use crate::host_disposal::{Job, Parts, Poll};
+        use crate::host_executor::{
+            HOST_OPERATION_CAPACITY, HOST_PREPARED_BYTE_CAPACITY, HostJobIdentity,
+        };
+
+        let name = if poison {
+            "terminal-spawner-poison"
+        } else {
+            "terminal-spawner"
+        };
+        let mut runtime = family_runtime(name);
+        let spawner = runtime.session_type_spawner();
+        let (release, gate) = mpsc::channel();
+        let observed = spawner.test_seed_terminal_pending(Some(gate));
+        if poison {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _pending = spawner.pending.lock().unwrap();
+                let _reads = spawner.reads.lock().unwrap();
+                let _managed = spawner.managed.lock().unwrap();
+                panic!("poison the nonempty spawner queues");
+            }));
+            assert!(result.is_err());
+            assert!(spawner.pending.is_poisoned());
+            assert!(spawner.reads.is_poisoned());
+            assert!(spawner.managed.is_poisoned());
+        }
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        let spare_permits = (1..HOST_OPERATION_CAPACITY)
+            .map(|_| runtime.host_executor().try_reserve().unwrap())
+            .collect::<Vec<_>>();
+        assert!(runtime.host_executor().try_reserve().is_none());
+        let identity = HostJobIdentity::first(crate::owner_identity::WaiterId(71));
+        let lifecycle = runtime.take_plugin_lifecycle().unwrap();
+        let mut engine_job = Job::new(Parts {
+            identity,
+            permit,
+            payload: Box::new(lifecycle),
+            model: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let permit = loop {
+            match engine_job.poll() {
+                Poll::Disposed(permit) => break permit,
+                Poll::Pending => assert!(Instant::now() < deadline),
+                _ => panic!("engine disposal must return its original permit"),
+            }
+            thread::yield_now();
+        };
+        assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, 1, true));
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let mut bridge_job = Job::new_plugin_bridges(
+            Parts {
+                identity,
+                permit,
+                payload: Box::new(()),
+                model: None,
+            },
+            runtime.terminal_plugin_bridges(),
+        );
+        let (thread_name, locks_released) = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(thread_name.starts_with("botster-hub-host"));
+        assert!(locks_released);
+        assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, 0, true));
+        assert!(matches!(bridge_job.poll(), Poll::Pending));
+        assert_eq!(
+            runtime.host_executor().outstanding(),
+            HOST_OPERATION_CAPACITY
+        );
+        assert_eq!(
+            runtime.host_executor().prepared_bytes(),
+            HOST_OPERATION_CAPACITY * HOST_PREPARED_BYTE_CAPACITY
+        );
+        assert!(runtime.host_executor().try_reserve().is_none());
+        release.send(()).unwrap();
+        for _ in 0..2 {
+            let (thread_name, locks_released) =
+                observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(thread_name.starts_with("botster-hub-host"));
+            assert!(locks_released);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let permit = loop {
+            match bridge_job.poll() {
+                Poll::Disposed(permit) => break permit,
+                Poll::Pending => assert!(Instant::now() < deadline),
+                _ => {
+                    panic!("bridge disposal must return the same permit after payload destruction")
+                }
+            }
+            thread::yield_now();
+        };
+        assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, 0, false));
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(
+            runtime.host_executor().outstanding(),
+            HOST_OPERATION_CAPACITY
+        );
+        drop(spare_permits);
+        assert_eq!(runtime.host_executor().outstanding(), 1);
+        assert_eq!(
+            runtime.host_executor().prepared_bytes(),
+            HOST_PREPARED_BYTE_CAPACITY
+        );
+        drop(permit);
+        assert_eq!(runtime.host_executor().outstanding(), 0);
+        assert_eq!(runtime.host_executor().prepared_bytes(), 0);
+        runtime.release_for_restart();
+        drop(runtime);
+        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_spawner_queues_clear_on_host_before_the_original_slot_returns() {
+        check_terminal_spawner_disposal(false);
+    }
+
+    #[test]
+    fn terminal_spawner_poisoned_queues_clear_on_host_before_the_original_slot_returns() {
+        check_terminal_spawner_disposal(true);
+    }
+
     #[test]
     fn causal_fifo_preserves_transfer_before_release_at_capacity() {
         let runtime = family_runtime("causal-finish-fifo");
@@ -5521,7 +5874,7 @@ pub(crate) mod tests {
                     .unwrap();
             } else {
                 let _ = runtime
-                    .plugin_lifecycle
+                    .plugin_lifecycle()
                     .unload_package(RequestId("registration-unload".into()), "producer");
             }
             runtime.test_fulfill_pending_publishes();
@@ -5911,7 +6264,7 @@ pub(crate) mod tests {
         let full = budget.reserve(4096).unwrap();
         let prepare = || {
             ProviderRequestPlan::prepare(
-                &runtime.plugin_lifecycle,
+                runtime.plugin_lifecycle(),
                 &budget,
                 "producer.item",
                 "sub",

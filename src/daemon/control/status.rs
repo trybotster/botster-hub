@@ -37,7 +37,7 @@ pub(crate) fn handle(
     };
     let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
     let policy = runtime.retention_policy();
-    let mut ticket = runtime.submit_core_for_owner(waiter_id, move |core| {
+    let ticket = runtime.submit_core_for_owner(waiter_id, move |core| {
         (
             core.retention_accounting(),
             (!shutdown).then(|| core.list_terminal_subscriptions()),
@@ -45,17 +45,117 @@ pub(crate) fn handle(
     });
     let initial_count = state.maintenance.projection.rows.len();
     let counters = runtime.event_plane_counters().clone();
-    let mut seed = Some((daemon.status(), observability));
-    let mut permit = Some(permit);
-    let mut prepared: Option<PreparedStatusResponse> = None;
-    let mut phase = 0;
-    let mut entity_cancel_after = None;
     if shutdown {
         state.shutdown_waiter = Some(waiter_id);
     }
-    ControlStep::pending(move |daemon, state| {
-        if phase == 0 {
-            let (accounting, inventory) = match ticket.poll() {
+    ControlStep::Pending(super::pending::PendingStep {
+        continuation: super::pending::ControlContinuation::Status(Box::new(StatusContinuation {
+            waiter_id,
+            shutdown,
+            policy,
+            ticket: Some(ticket),
+            initial_count,
+            counters,
+            seed: Some((daemon.status(), observability)),
+            permit: Some(permit),
+            prepared: None,
+            phase: 0,
+            entity_cancel_after: None,
+            delivery: None,
+        })),
+        retire: None,
+        ready_class: crate::daemon::owner_schedule::ReadyClass::CoreCompletion,
+    })
+}
+
+pub(crate) struct StatusContinuation {
+    waiter_id: crate::owner_identity::WaiterId,
+    shutdown: bool,
+    policy: botster_core_daemon::RetentionPolicy,
+    ticket: Option<
+        crate::data_plane::driver::CoreTicket<(
+            botster_core_daemon::RetentionAccounting,
+            Option<Vec<botster_core::TerminalSubscriptionRecord>>,
+        )>,
+    >,
+    initial_count: usize,
+    counters: std::sync::Arc<crate::event_plane_counters::EventPlaneCounters>,
+    seed: Option<(crate::HubDaemonStatus, DaemonObservability)>,
+    permit: Option<HostWorkPermit>,
+    prepared: Option<PreparedStatusResponse>,
+    phase: u64,
+    entity_cancel_after: Option<crate::owner_identity::WaiterId>,
+    delivery: Option<Delivery>,
+}
+
+#[derive(Clone, Copy)]
+enum Delivery {
+    Waiting(HostJobIdentity),
+    Refused,
+}
+
+impl StatusContinuation {
+    pub(crate) fn take_terminal_parts(
+        &mut self,
+        identity: HostJobIdentity,
+        completion: &mut Option<crate::host_executor::HostCompletion>,
+    ) -> Option<crate::host_disposal::Parts> {
+        let mut result = None;
+        let (identity, permit) = if let Some(permit) = self.permit.take() {
+            (identity, permit)
+        } else {
+            let (identity, value, permit) = completion.take()?.into_parts();
+            result = Some(value);
+            (identity, permit)
+        };
+        Some(crate::host_disposal::Parts {
+            identity,
+            permit,
+            model: None,
+            payload: Box::new((
+                self.seed.take(),
+                self.prepared.take(),
+                self.ticket.take(),
+                result,
+                completion.take(),
+            )),
+        })
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+    ) -> ControlPoll {
+        let Self {
+            waiter_id,
+            shutdown,
+            policy,
+            ticket,
+            initial_count,
+            counters,
+            seed,
+            permit,
+            prepared,
+            phase,
+            entity_cancel_after,
+            delivery,
+        } = self;
+        let waiter_id = *waiter_id;
+        let shutdown = *shutdown;
+        let initial_count = *initial_count;
+        if let Some(delivery) = delivery {
+            return match *delivery {
+                Delivery::Waiting(identity) => poll_delivery(state, identity),
+                Delivery::Refused => ControlPoll::StatusResponseRefused { shutdown },
+            };
+        }
+        if *phase == 0 {
+            let (accounting, inventory) = match ticket
+                .as_mut()
+                .expect("Status retains its Core ticket")
+                .poll()
+            {
                 CoreTicketPoll::Pending => return ControlPoll::Pending,
                 CoreTicketPoll::Ready((accounting, inventory)) => (Some(accounting), inventory),
                 CoreTicketPoll::Lost | CoreTicketPoll::Refused if shutdown => (None, None),
@@ -122,24 +222,32 @@ pub(crate) fn handle(
                 shutdown,
                 initial_count,
             );
-            phase = 1;
+            *phase = 1;
             return submit(
                 daemon,
                 state,
-                HostJobIdentity { waiter_id, phase },
+                HostJobIdentity {
+                    waiter_id,
+                    phase: *phase,
+                },
                 HostCommand::PrepareStatusResponse(input),
                 permit.take().expect("status retains its slot"),
             );
         }
         if let Some(completion) = state.host_completions.remove(&waiter_id) {
-            if completion.identity != (HostJobIdentity { waiter_id, phase }) {
+            if completion.identity
+                != (HostJobIdentity {
+                    waiter_id,
+                    phase: *phase,
+                })
+            {
                 return retain_completion(state, completion);
             }
             let (_, result, returned_permit) = completion.into_parts();
             match result {
                 HostResult::StatusResponsePrepared(response) => {
-                    prepared = Some(response);
-                    permit = Some(returned_permit);
+                    *prepared = Some(response);
+                    *permit = Some(returned_permit);
                 }
                 HostResult::Failed { error, .. } => {
                     drop(returned_permit);
@@ -155,7 +263,10 @@ pub(crate) fn handle(
                     return retain_completion(
                         state,
                         crate::host_executor::HostCompletion::from_parts(
-                            HostJobIdentity { waiter_id, phase },
+                            HostJobIdentity {
+                                waiter_id,
+                                phase: *phase,
+                            },
                             result,
                             returned_permit,
                         ),
@@ -166,11 +277,8 @@ pub(crate) fn handle(
         if prepared.is_none() {
             return ControlPoll::Pending;
         }
-        if shutdown && phase == 1 {
-            if super::entities::cancel_next_plugin_entity_for_shutdown(
-                state,
-                &mut entity_cancel_after,
-            ) {
+        if shutdown && *phase == 1 {
+            if super::entities::cancel_next_plugin_entity_for_shutdown(state, entity_cancel_after) {
                 return ControlPoll::Again;
             }
             let Some(runtime) = daemon.runtime() else {
@@ -184,11 +292,14 @@ pub(crate) fn handle(
             {
                 return ControlPoll::Pending;
             }
-            phase = 2;
+            *phase = 2;
             return submit(
                 daemon,
                 state,
-                HostJobIdentity { waiter_id, phase },
+                HostJobIdentity {
+                    waiter_id,
+                    phase: *phase,
+                },
                 HostCommand::StopForStatus(prepared.take().expect("snapshot was encoded")),
                 permit.take().expect("shutdown retains its original slot"),
             );
@@ -196,9 +307,9 @@ pub(crate) fn handle(
         ControlPoll::DeliverStatusResponse(
             prepared.take().expect("snapshot was encoded"),
             permit.take().expect("response retains its original slot"),
-            phase + 1,
+            *phase + 1,
         )
-    })
+    }
 }
 
 fn capture_input(
@@ -340,29 +451,38 @@ pub(crate) fn submit_delivery(
                 managed_worktree: None,
             },
         );
-        entry.continuation = Box::new(move |_, _| ControlPoll::StatusResponseRefused { shutdown });
+        let super::pending::ControlContinuation::Status(continuation) = &mut entry.continuation
+        else {
+            unreachable!("Status delivery retains its typed continuation");
+        };
+        continuation.delivery = Some(Delivery::Refused);
         return true;
     }
-    entry.continuation = Box::new(move |_, state| {
-        let Some(completion) = state.host_completions.remove(&identity.waiter_id) else {
-            return ControlPoll::Pending;
-        };
-        if completion.identity != identity {
-            return retain_completion(state, completion);
-        }
-        let (_, result, permit) = completion.into_parts();
-        match result {
-            HostResult::StatusResponseDelivered { shutdown, received } => {
-                drop(permit);
-                ControlPoll::StatusResponseDelivered { shutdown, received }
-            }
-            result => retain_completion(
-                state,
-                crate::host_executor::HostCompletion::from_parts(identity, result, permit),
-            ),
-        }
-    });
+    let super::pending::ControlContinuation::Status(continuation) = &mut entry.continuation else {
+        unreachable!("Status delivery retains its typed continuation");
+    };
+    continuation.delivery = Some(Delivery::Waiting(identity));
     false
+}
+
+fn poll_delivery(state: &mut DaemonControlState, identity: HostJobIdentity) -> ControlPoll {
+    let Some(completion) = state.host_completions.remove(&identity.waiter_id) else {
+        return ControlPoll::Pending;
+    };
+    if completion.identity != identity {
+        return retain_completion(state, completion);
+    }
+    let (_, result, permit) = completion.into_parts();
+    match result {
+        HostResult::StatusResponseDelivered { shutdown, received } => {
+            drop(permit);
+            ControlPoll::StatusResponseDelivered { shutdown, received }
+        }
+        result => retain_completion(
+            state,
+            crate::host_executor::HostCompletion::from_parts(identity, result, permit),
+        ),
+    }
 }
 
 #[cfg(test)]

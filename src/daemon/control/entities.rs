@@ -36,6 +36,7 @@ struct PendingEntitySubscribe {
 }
 
 enum PendingPluginEntityKind {
+    Disposing,
     Subscribe(PendingEntitySubscribe),
     Resync {
         entity_type: std::sync::Arc<String>,
@@ -47,6 +48,7 @@ enum PendingPluginEntityKind {
 }
 
 struct PendingPluginEntity {
+    terminal: Option<TerminalEntity>,
     request_id: String,
     waiter_id: crate::owner_identity::WaiterId,
     ready_key: Option<crate::daemon::owner_schedule::ReadyKey>,
@@ -56,6 +58,17 @@ struct PendingPluginEntity {
     kind: PendingPluginEntityKind,
     result: Option<RoutedPluginEntityCompletion>,
     work: worker::EntityWork,
+}
+
+struct TerminalEntity {
+    job: crate::host_disposal::Job,
+    permit: OwnerPermit,
+    _invocation: Option<(
+        u64,
+        Option<(u64, u64)>,
+        bool,
+        Option<crate::lua_runtime::EntityPublishPermit>,
+    )>,
 }
 
 enum RoutedPluginEntityCompletion {
@@ -99,6 +112,73 @@ impl std::fmt::Debug for PluginEntityState {
 }
 
 impl PluginEntityState {
+    pub(crate) fn dispose_terminal(
+        &mut self,
+        runtime: &crate::HubRuntime,
+        budget: &mut crate::daemon::owner_budget::OwnerBudget,
+    ) -> bool {
+        self.pending.retain(|_, entry| {
+            if let Some(terminal) = entry.terminal.as_mut() {
+                if let crate::host_disposal::Poll::Disposed(permit) = terminal.job.poll() {
+                    entry.work.retire_terminal(runtime);
+                    let terminal = entry
+                        .terminal
+                        .take()
+                        .expect("terminal entity retains its charge");
+                    budget.release(terminal.permit);
+                    drop(terminal._invocation);
+                    drop(permit);
+                    self.by_waiter.remove(&entry.waiter_id);
+                    return false;
+                }
+                return true;
+            }
+            let Some(parts) = entry
+                .work
+                .take_terminal_parts(runtime.host_executor(), entry.waiter_id)
+            else {
+                return true;
+            };
+            let (permit, request): (_, Option<Box<dyn Send>>) =
+                match std::mem::replace(&mut entry.kind, PendingPluginEntityKind::Disposing) {
+                    PendingPluginEntityKind::Subscribe(subscribe) => {
+                        (subscribe.permit, Some(Box::new(subscribe.request)))
+                    }
+                    PendingPluginEntityKind::Resync {
+                        entity_type,
+                        permit,
+                    } => (permit, Some(Box::new(entity_type))),
+                    PendingPluginEntityKind::Fanout { permit } => (permit, None),
+                    PendingPluginEntityKind::Disposing => {
+                        unreachable!("terminal entity already owns its disposal")
+                    }
+                };
+            let mut expectation = None;
+            let invocation = entry.invocation.take().map(|invocation| {
+                expectation = Some(invocation.expected);
+                (
+                    invocation.family_generation,
+                    invocation.causal_lease,
+                    invocation.lease_acquired,
+                    invocation.admission,
+                )
+            });
+            entry.terminal = Some(TerminalEntity {
+                job: crate::host_disposal::Job::new(parts.with_payload((
+                    request,
+                    expectation,
+                    entry.identity.take(),
+                    entry.result.take(),
+                    std::mem::take(&mut entry.request_id),
+                ))),
+                permit,
+                _invocation: invocation,
+            });
+            true
+        });
+        self.pending.is_empty()
+    }
+
     pub(crate) fn has_waiter(&self, waiter: crate::owner_identity::WaiterId) -> bool {
         self.by_waiter.contains_key(&waiter)
     }
@@ -147,6 +227,7 @@ impl PluginEntityState {
         self.pending.insert(
             request_id.clone(),
             PendingPluginEntity {
+                terminal: None,
                 request_id,
                 waiter_id,
                 ready_key: None,
@@ -720,6 +801,7 @@ pub(crate) fn begin_package_entity_fanout(daemon: &HubDaemon, state: &mut Daemon
     work.snapshot = false;
     work.stage = worker::Stage::Begin;
     state.plugin_entities.restore(PendingPluginEntity {
+        terminal: None,
         request_id: request_id.0,
         waiter_id,
         ready_key: None,
@@ -783,6 +865,9 @@ pub(crate) fn drive_plugin_entity_ready_item(
                     .mark(crate::daemon_maintenance::MaintenanceSliceKind::ProviderResync);
             }
             let permit = match entry.kind {
+                PendingPluginEntityKind::Disposing => {
+                    unreachable!("terminal entities do not resume normal work")
+                }
                 PendingPluginEntityKind::Subscribe(subscribe) => subscribe.permit,
                 PendingPluginEntityKind::Resync { permit, .. }
                 | PendingPluginEntityKind::Fanout { permit } => permit,

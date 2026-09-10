@@ -97,6 +97,90 @@ pub(super) enum Advance {
 }
 
 impl EntityWork {
+    pub(super) fn take_terminal_parts(
+        &mut self,
+        executor: &HostExecutor,
+        waiter: WaiterId,
+    ) -> Option<crate::host_disposal::Parts> {
+        if matches!(self.phase, Phase::Running(_)) {
+            return None;
+        }
+        if let Phase::Unreserved(next) = self.phase {
+            self.phase = Phase::Ready {
+                identity: next.unwrap_or_else(|| HostJobIdentity::first(waiter)),
+                permit: executor.try_reserve()?,
+            };
+        }
+        if matches!(self.phase, Phase::Terminal) {
+            self.phase = Phase::Ready {
+                identity: HostJobIdentity::first(waiter),
+                permit: executor.try_reserve()?,
+            };
+        }
+        let mut result: Option<Box<dyn Send>> = None;
+        let (identity, permit) = match std::mem::replace(&mut self.phase, Phase::Terminal) {
+            Phase::Ready { identity, permit } => (identity, permit),
+            Phase::Completed(completion)
+            | Phase::Exhausted {
+                _completion: completion,
+            }
+            | Phase::Faulted {
+                _completion: completion,
+            } => {
+                let (identity, payload, permit) = completion.into_parts();
+                result = Some(Box::new(payload));
+                (identity, permit)
+            }
+            Phase::Rejected(failure) => {
+                result = Some(Box::new(failure.command));
+                (failure.identity, failure.permit)
+            }
+            _ => unreachable!("terminal disposal waits for the original Host receipt"),
+        };
+        self.cancel();
+        Some(crate::host_disposal::Parts {
+            identity,
+            permit,
+            model: self.model.clone(),
+            payload: Box::new((
+                (
+                    self.target.take(),
+                    self.payload.take(),
+                    self.family.take(),
+                    self.registration.take(),
+                    self.reservation_identity.take(),
+                ),
+                (
+                    self.cursor.take(),
+                    self.delivery_target.take(),
+                    self.publication.take(),
+                    self.reply_live.clone(),
+                ),
+                (
+                    self.provider_input.take(),
+                    self.provider_plan.take(),
+                    self.provider_refusal.take(),
+                ),
+                (
+                    self.model_operation.take(),
+                    self.model_mutation.take(),
+                    self.deferred_completion.take(),
+                ),
+                self.finish
+                    .as_mut()
+                    .and_then(crate::runtime::PackageEntityFanoutFinish::take_terminal_family),
+                result,
+            )),
+        })
+    }
+
+    pub(super) fn retire_terminal(&mut self, runtime: &crate::HubRuntime) {
+        if let Some(model) = self.model.take() {
+            assert!(runtime.retire_terminal_entity_model(&model));
+        }
+        self.finish.take();
+    }
+
     pub(super) fn new(target: Option<Arc<Target>>) -> Self {
         Self {
             target,
@@ -610,6 +694,7 @@ mod tests {
         ));
         (
             super::super::PendingPluginEntity {
+                terminal: None,
                 request_id: "retained-fanout".into(),
                 waiter_id,
                 ready_key: None,
