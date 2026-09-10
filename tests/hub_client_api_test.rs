@@ -184,9 +184,11 @@ fn hub_client_api_attach_fail_closes_without_unbound_inventory() {
     ));
     assert!(
         runtime
-            .list_terminal_subscriptions()
+            .list_terminal_subscriptions(botster_hub_client::MAX_CONTROL_RESPONSE_BYTES)
             .wait(std::time::Duration::from_secs(30))
             .expect("core inventory")
+            .expect("inventory fits the test allowance")
+            .records
             .is_empty(),
         "fail-closed Attach must not leave an unbound inventory row"
     );
@@ -3148,9 +3150,11 @@ fn late_attach_receives_opaque_history_before_later_live_output() {
     );
     assert!(
         runtime
-            .list_terminal_subscriptions()
+            .list_terminal_subscriptions(botster_hub_client::MAX_CONTROL_RESPONSE_BYTES)
             .wait(std::time::Duration::from_secs(30))
             .expect("core inventory")
+            .expect("inventory fits the test allowance")
+            .records
             .iter()
             .any(|row| row.subscription_id == late_subscription && row.adapter_bound),
         "late attach must be adapter-bound"
@@ -3242,9 +3246,11 @@ fn late_attach_without_prior_output_does_not_fabricate_history() {
     );
     assert!(
         runtime
-            .list_terminal_subscriptions()
+            .list_terminal_subscriptions(botster_hub_client::MAX_CONTROL_RESPONSE_BYTES)
             .wait(std::time::Duration::from_secs(30))
             .expect("core inventory")
+            .expect("inventory fits the test allowance")
+            .records
             .iter()
             .any(|row| row.subscription_id == late_subscription && row.adapter_bound),
         "no-history late attach must be adapter-bound"
@@ -3369,9 +3375,11 @@ fn local_client_api_exercises_status_spawn_attach_detach_shutdown_and_events() {
     );
     assert!(
         runtime
-            .list_terminal_subscriptions()
+            .list_terminal_subscriptions(botster_hub_client::MAX_CONTROL_RESPONSE_BYTES)
             .wait(std::time::Duration::from_secs(30))
             .expect("core inventory")
+            .expect("inventory fits the test allowance")
+            .records
             .iter()
             .filter(|row| row.adapter_bound)
             .count()

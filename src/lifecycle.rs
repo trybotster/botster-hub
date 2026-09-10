@@ -25,6 +25,9 @@ use crate::packages::{PackageClassification, PackageRecord, PackageRegistry, Pac
 pub(crate) const PACKAGE_EVENT_INVOCATION_ORIGIN: &str = "package-event";
 pub(crate) const SESSION_FAMILY_INVOCATION_ORIGIN: &str = "session-family";
 
+pub(crate) const REQUEST_RESPONSE_COMPLETION_ALLOWANCE: usize = 1024 * 1024;
+pub(crate) const BACKGROUND_COMPLETION_ALLOWANCE: usize = 4 * 1024;
+
 const PACKAGE_ENTITY_NAMESPACE_V1_MARKER: &str = "bns1_";
 
 /// Map an exact package id to its canonical single-segment entity owner token.
@@ -177,7 +180,19 @@ impl HubPluginLifecycle {
         class: PluginInvocationClass,
         request: PluginInvocationRequest,
     ) -> PluginAdmissionResult {
-        self.engine.try_admit(class, request)
+        let allowance = match class {
+            PluginInvocationClass::RequestResponse => REQUEST_RESPONSE_COMPLETION_ALLOWANCE,
+            PluginInvocationClass::Background => BACKGROUND_COMPLETION_ALLOWANCE,
+            _ => {
+                return PluginAdmissionResult::RejectedBudget {
+                    request_id: request.request_id,
+                    class,
+                    queue_bytes: None,
+                    reason: "Hub does not support this invocation class".to_string(),
+                };
+            }
+        };
+        self.engine.try_admit(class, request, allowance)
     }
 
     /// Drain previously published async completions without waiting.
@@ -642,5 +657,388 @@ mod namespace_tests {
                 "{token}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use botster_core::{
+        PluginCancellationToken, PluginHandlerKind, PluginHandlerRef, PluginInvocationContext,
+        PluginInvocationFailureKind, PluginInvocationResult, PluginInvocationSuccess,
+    };
+    use std::time::{Duration, Instant};
+
+    struct ResultRuntime(usize);
+
+    impl PluginRuntime for ResultRuntime {
+        fn invoke(
+            &self,
+            request: PluginInvocationRequest,
+            _cancellation: PluginCancellationToken,
+        ) -> PluginInvocationResult {
+            PluginInvocationResult::Completed(PluginInvocationSuccess {
+                request_id: request.request_id,
+                handler: request.handler,
+                payload: Some(BoundaryJson(serde_json::json!("x".repeat(self.0)))),
+            })
+        }
+    }
+
+    fn lifecycle(result_bytes: usize) -> HubPluginLifecycle {
+        let lifecycle = HubPluginLifecycle::with_config(
+            crate::config::CoreEngineOptions::default().plugin_worker_config(),
+        );
+        for name in ["first", "second"] {
+            let key = PluginKey(name.to_string());
+            lifecycle.engine.load_plugin(PluginWorkerRegistration {
+                load: PluginLoadSpec {
+                    plugin_key: key.clone(),
+                    package: name.to_string(),
+                    entrypoint: "plugin.lua".to_string(),
+                    descriptors: Vec::new(),
+                    metadata: None,
+                },
+                manifest: botster_core::PackageManifest {
+                    name: name.to_string(),
+                    version: "0.1.0".to_string(),
+                    kind: botster_core::ExtensionKind::Plugin,
+                    botster: ">=0.1.0".to_string(),
+                    source: None,
+                    capabilities: Vec::new(),
+                    entrypoints: Vec::new(),
+                    dependencies: Vec::new(),
+                    features: Vec::new(),
+                    host_profile: None,
+                    configuration: None,
+                    runnable_entrypoints: Vec::new(),
+                },
+                runtime: Arc::new(ResultRuntime(result_bytes)),
+                handlers: vec![PluginHandlerRegistration {
+                    handler: handler(name, "run"),
+                    required_capability: None,
+                }],
+                resources: Vec::new(),
+            });
+        }
+        lifecycle
+    }
+
+    fn handler(plugin: &str, name: &str) -> PluginHandlerRef {
+        PluginHandlerRef {
+            plugin_key: PluginKey(plugin.to_string()),
+            kind: PluginHandlerKind::Command,
+            handler_id: name.to_string(),
+        }
+    }
+
+    fn request(id: &str, handler: PluginHandlerRef, bytes: usize) -> PluginInvocationRequest {
+        PluginInvocationRequest {
+            request_id: RequestId(id.to_string()),
+            handler,
+            timeout_ms: 5_000,
+            context: PluginInvocationContext {
+                client_id: None,
+                session_id: None,
+                subscription_id: None,
+                surface_id: None,
+                origin: None,
+                metadata: None,
+            },
+            payload: BoundaryJson(serde_json::json!("x".repeat(bytes))),
+        }
+    }
+
+    fn admit(
+        lifecycle: &HubPluginLifecycle,
+        class: PluginInvocationClass,
+        request: PluginInvocationRequest,
+    ) -> PluginAdmissionResult {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = lifecycle.try_admit(class, request.clone());
+            if matches!(&result, PluginAdmissionResult::Backpressured { reason, .. }
+                if reason == "admission lock busy")
+            {
+                assert!(Instant::now() < deadline, "admission lock remained busy");
+                std::thread::yield_now();
+            } else {
+                if let PluginAdmissionResult::Queued {
+                    reservation_bytes, ..
+                } = &result
+                {
+                    let payload_bytes = reservation_bytes
+                        .checked_sub(PluginWorkerEngine::completion_reservation_metadata_bytes())
+                        .expect("Core charges metadata in every reservation");
+                    let config = crate::config::CoreEngineOptions::default().plugin_worker_config();
+                    assert!(payload_bytes <= config.completion_reservation_byte_capacity);
+                    assert!(
+                        payload_bytes
+                            <= crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY
+                    );
+                    assert!(*reservation_bytes <= config.completion_queue_byte_capacity);
+                }
+                return result;
+            }
+        }
+    }
+
+    fn drain(lifecycle: &HubPluginLifecycle) -> botster_core::PluginCompletion {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut drained = lifecycle.drain_completions(
+                1,
+                crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY,
+            );
+            if let Some(item) = drained.completions.pop() {
+                assert!(
+                    item.encoded_len
+                        <= crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY
+                );
+                return item.completion;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "completion did not fit Hub drain"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn completion_allowance_accepts_large_result_from_small_request() {
+        let lifecycle = lifecycle(900 * 1024);
+        assert!(matches!(
+            admit(
+                &lifecycle,
+                PluginInvocationClass::RequestResponse,
+                request("large-result", handler("first", "run"), 0)
+            ),
+            PluginAdmissionResult::Queued {
+                reservation_bytes,
+                ..
+            } if reservation_bytes == REQUEST_RESPONSE_COMPLETION_ALLOWANCE
+                + PluginWorkerEngine::completion_reservation_metadata_bytes()
+        ));
+        let PluginInvocationResult::Completed(result) = drain(&lifecycle).result else {
+            panic!("valid large result failed");
+        };
+        assert_eq!(
+            result.payload.unwrap().0.as_str().unwrap().len(),
+            900 * 1024
+        );
+    }
+
+    #[test]
+    fn completion_allowance_replaces_oversized_result() {
+        for (class, bytes) in [
+            (
+                PluginInvocationClass::RequestResponse,
+                REQUEST_RESPONSE_COMPLETION_ALLOWANCE,
+            ),
+            (
+                PluginInvocationClass::Background,
+                BACKGROUND_COMPLETION_ALLOWANCE,
+            ),
+        ] {
+            let lifecycle = lifecycle(bytes);
+            assert!(matches!(
+                admit(
+                    &lifecycle,
+                    class,
+                    request("oversized", handler("first", "run"), 0)
+                ),
+                PluginAdmissionResult::Queued { .. }
+            ));
+            assert!(
+                matches!(drain(&lifecycle).result, PluginInvocationResult::Failed(failure)
+                if failure.kind == PluginInvocationFailureKind::CompletionTooLarge)
+            );
+        }
+    }
+
+    #[test]
+    fn completion_allowance_accounts_for_large_background_input() {
+        let lifecycle = lifecycle(512 * 1024);
+        let input = request("large-input", handler("first", "run"), 900 * 1024);
+        let input_bytes = serde_json::to_vec(&input).unwrap().len();
+        assert!(
+            matches!(admit(&lifecycle, PluginInvocationClass::Background, input),
+            PluginAdmissionResult::Queued { reservation_bytes, .. }
+                if reservation_bytes.checked_sub(PluginWorkerEngine::completion_reservation_metadata_bytes())
+                    .expect("metadata charged") >= input_bytes)
+        );
+        assert!(matches!(
+            drain(&lifecycle).result,
+            PluginInvocationResult::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn completion_allowance_shares_pool_across_plugins_until_drain() {
+        let lifecycle = lifecycle(0);
+        let config = crate::config::CoreEngineOptions::default().plugin_worker_config();
+        let reservation = REQUEST_RESPONSE_COMPLETION_ALLOWANCE
+            + PluginWorkerEngine::completion_reservation_metadata_bytes();
+        let admitted = config.completion_queue_byte_capacity / reservation;
+        assert!(admitted >= 2, "the fixture exercises both plugins");
+        assert!(
+            admitted < config.completion_queue_capacity,
+            "bytes limit this fixture"
+        );
+        for index in 0..admitted {
+            let plugin = if index % 2 == 0 { "first" } else { "second" };
+            assert!(matches!(
+                admit(
+                    &lifecycle,
+                    PluginInvocationClass::RequestResponse,
+                    request(&index.to_string(), handler(plugin, "missing"), 0)
+                ),
+                PluginAdmissionResult::Queued { reservation_bytes, .. }
+                    if reservation_bytes == reservation
+            ));
+        }
+        assert!(matches!(
+            admit(
+                &lifecycle,
+                PluginInvocationClass::RequestResponse,
+                request("saturated", handler("first", "missing"), 0)
+            ),
+            PluginAdmissionResult::Backpressured { reason, .. }
+                if reason == "plugin completion reservation pool is at capacity"
+        ));
+        let snapshot = lifecycle.debug_snapshot();
+        assert_eq!(snapshot.reserved_completion_bytes, admitted * reservation);
+        assert_eq!(snapshot.reserved_completion_count, admitted);
+        assert!(
+            config.completion_queue_byte_capacity - snapshot.reserved_completion_bytes
+                < reservation
+        );
+        assert!(snapshot.reserved_completion_count < snapshot.configured_completion_queue_capacity);
+        drain(&lifecycle);
+        let released = lifecycle.debug_snapshot();
+        assert_eq!(released.reserved_completion_count, admitted - 1);
+        assert_eq!(
+            released.reserved_completion_bytes,
+            (admitted - 1) * reservation
+        );
+        assert!(matches!(
+            admit(
+                &lifecycle,
+                PluginInvocationClass::RequestResponse,
+                request("after-drain", handler("second", "missing"), 0)
+            ),
+            PluginAdmissionResult::Queued { reservation_bytes, .. }
+                if reservation_bytes == reservation
+        ));
+        let restored = lifecycle.debug_snapshot();
+        assert_eq!(restored.reserved_completion_count, admitted);
+        assert_eq!(restored.reserved_completion_bytes, admitted * reservation);
+    }
+
+    #[test]
+    fn completion_allowance_bounds_background_count_independently_of_bytes() {
+        let lifecycle = lifecycle(0);
+        let reservation = BACKGROUND_COMPLETION_ALLOWANCE
+            + PluginWorkerEngine::completion_reservation_metadata_bytes();
+        for index in 0..256 {
+            let plugin = if index % 2 == 0 { "first" } else { "second" };
+            assert!(matches!(
+                admit(
+                    &lifecycle,
+                    PluginInvocationClass::Background,
+                    request(&index.to_string(), handler(plugin, "missing"), 0)
+                ),
+                PluginAdmissionResult::Queued {
+                    reservation_bytes,
+                    ..
+                } if reservation_bytes == reservation
+            ));
+        }
+        assert!(matches!(
+            admit(
+                &lifecycle,
+                PluginInvocationClass::Background,
+                request("count-full", handler("first", "missing"), 0)
+            ),
+            PluginAdmissionResult::Backpressured { reason, .. }
+                if reason == "plugin completion reservation pool is at capacity"
+        ));
+        let snapshot = lifecycle.debug_snapshot();
+        assert_eq!(snapshot.reserved_completion_count, 256);
+        assert_eq!(snapshot.reserved_completion_bytes, 256 * reservation);
+        assert!(
+            snapshot.configured_completion_queue_byte_capacity - snapshot.reserved_completion_bytes
+                >= reservation,
+            "another whole reservation fits in bytes; count caused refusal"
+        );
+        drain(&lifecycle);
+        let released = lifecycle.debug_snapshot();
+        assert_eq!(released.reserved_completion_count, 255);
+        assert_eq!(released.reserved_completion_bytes, 255 * reservation);
+        assert!(matches!(
+            admit(
+                &lifecycle,
+                PluginInvocationClass::Background,
+                request("after-drain", handler("second", "missing"), 0)
+            ),
+            PluginAdmissionResult::Queued { reservation_bytes, .. }
+                if reservation_bytes == reservation
+        ));
+        let restored = lifecycle.debug_snapshot();
+        assert_eq!(restored.reserved_completion_count, 256);
+        assert_eq!(restored.reserved_completion_bytes, 256 * reservation);
+    }
+
+    #[test]
+    fn completion_allowance_includes_fallback_bytes_for_large_identity() {
+        let lifecycle = lifecycle(0);
+        let capacity = crate::config::CoreEngineOptions::default()
+            .plugin_worker_config()
+            .request_response_queue_byte_capacity;
+        let mut input = request("", handler("first", "missing"), 0);
+        let overhead = serde_json::to_vec(&input).unwrap().len();
+        input.request_id = RequestId("x".repeat(capacity - overhead));
+        assert_eq!(serde_json::to_vec(&input).unwrap().len(), capacity);
+        let PluginAdmissionResult::Queued {
+            queue_bytes,
+            reservation_bytes,
+            ..
+        } = admit(&lifecycle, PluginInvocationClass::RequestResponse, input)
+        else {
+            panic!("request at the class limit must be admitted");
+        };
+        // This proof requires the class limit and allowance to coincide.
+        // Redesign this test if either policy changes independently.
+        assert_eq!(queue_bytes, capacity);
+        assert_eq!(queue_bytes, REQUEST_RESPONSE_COMPLETION_ALLOWANCE);
+        // Core's current oversize error envelope adds seven bytes to this request.
+        let payload_bytes = reservation_bytes
+            .checked_sub(PluginWorkerEngine::completion_reservation_metadata_bytes())
+            .expect("metadata charged");
+        assert!(payload_bytes > queue_bytes);
+        assert!(
+            matches!(drain(&lifecycle).result, PluginInvocationResult::Failed(failure)
+            if failure.kind == PluginInvocationFailureKind::HandlerFailed)
+        );
+    }
+
+    #[test]
+    fn completion_allowance_rejects_unknown_handler_input_above_class_capacity() {
+        let lifecycle = lifecycle(0);
+        assert!(matches!(
+            admit(
+                &lifecycle,
+                PluginInvocationClass::RequestResponse,
+                request(
+                    "large-unknown",
+                    handler("first", "missing"),
+                    9 * 1024 * 1024
+                )
+            ),
+            PluginAdmissionResult::RejectedBudget { reason, .. }
+                if reason == "plugin invocation exceeds class byte capacity"
+        ));
+        assert_eq!(lifecycle.debug_snapshot().undrained_completions, 0);
     }
 }

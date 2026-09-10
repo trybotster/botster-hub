@@ -1558,7 +1558,9 @@ fn apply_plugin_completion(
                 PluginInvocationFailureKind::TimedOut => {
                     runtime.event_plane_counters().record_handler_timed_out();
                 }
-                PluginInvocationFailureKind::HandlerFailed => {
+                PluginInvocationFailureKind::HandlerFailed
+                | PluginInvocationFailureKind::CompletionTooLarge => {
+                    // Oversized results use the existing handler failure counter.
                     runtime.event_plane_counters().record_handler_failed();
                 }
                 PluginInvocationFailureKind::Cancelled => {
@@ -3250,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_apply_prefers_subscriber_delivery_after_applied_changes() {
+    fn projection_apply_wakes_subscribers_and_retained_family_fanout() {
         let mut state = sealed_maintenance(0, Some(1));
         for kind in MaintenanceSliceKind::ALL {
             let _ = state.wakes.take(kind);
@@ -3258,7 +3260,9 @@ mod tests {
         state.pending_changes.push_back(pending_upsert(1, "new"));
         run_projection_apply_slice(None, &mut state);
         assert!(state.wakes.take(MaintenanceSliceKind::SubscriberDelivery));
-        assert!(!state.wakes.has_any());
+        assert!(state.wakes.take(MaintenanceSliceKind::HostBridge));
+        assert_eq!(state.session_family.pending_fanout.len(), 1);
+        assert!(state.projection.rows.contains_key("new"));
     }
 
     #[test]
@@ -3688,6 +3692,15 @@ mod tests {
         }
         assert!(state.event_in_flight.is_empty());
         assert_eq!(runtime.package_event_router().test_outstanding_pulls(), 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.causal_operation_count() > 0 {
+            runtime.apply_causal_owner_ops();
+            assert!(
+                Instant::now() < deadline,
+                "the owner must apply admitted releases"
+            );
+            std::thread::yield_now();
+        }
         for scope_id in scopes {
             assert!(
                 !runtime.causal_scopes().is_live(scope_id),

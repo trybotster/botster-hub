@@ -997,6 +997,17 @@ mod tests {
             ingress_sessions: Vec::new(),
         };
 
+        assert!(
+            worker
+                .push_route_frame(
+                    &session_id,
+                    &subscription_id,
+                    botster_terminal_protocol::encode_output(b"held-by-core").unwrap(),
+                )
+                .expect("queue the exact route output")
+                .is_none()
+        );
+        assert!(worker.bound_owner_has_held_frames(&session_id, &subscription_id));
         let mut egress = vec![(
             client_id.clone(),
             TransportEgress::TerminalOutput {

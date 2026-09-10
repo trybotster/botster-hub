@@ -4729,6 +4729,21 @@ mod tests {
         assert_eq!(worker.matches("fn ").count(), 1);
         assert!(!worker.contains("Mutex::lock"));
         let owner_apis = format!("{}{}", &production[..run_start], &production[run_end..]);
+        let cleanup_start = owner_apis
+            .find("    pub(crate) fn cleanup_client_holder(")
+            .expect("Host cleanup method");
+        let cleanup_end = owner_apis[cleanup_start..]
+            .find("\n    pub fn try_ingress(")
+            .map(|end| cleanup_start + end)
+            .expect("Host cleanup ends before ingress");
+        let cleanup = &owner_apis[cleanup_start..cleanup_end];
+        assert_eq!(cleanup.matches(".lock()").count(), 1);
+        assert_eq!(cleanup.matches("fn ").count(), 1);
+        let owner_apis = format!(
+            "{}{}",
+            &owner_apis[..cleanup_start],
+            &owner_apis[cleanup_end..]
+        );
         let without_try = owner_apis.replace("try_lock", "TRY");
         assert!(
             !without_try.contains("Mutex::lock"),

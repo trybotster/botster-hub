@@ -15,7 +15,7 @@ use botster_core::{
     PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
     RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
     SessionSpawnRequest, SubscriptionId, TerminalCapabilitySet, TerminalColorProfile,
-    TerminalSubscriptionGeneration, TerminalSubscriptionRecord,
+    TerminalSubscriptionGeneration,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureId, CaptureOwner, CaptureSnapshotRequest,
@@ -2730,6 +2730,14 @@ impl HubRuntime {
         expected_entity_kind: &EntityKind,
         result: PluginInvocationResult,
     ) -> Result<(u64, Vec<serde_json::Value>), crate::McpToolError> {
+        if let PluginInvocationResult::Failed(failure) = &result {
+            if failure.kind == PluginInvocationFailureKind::CompletionTooLarge {
+                return Err(crate::McpToolError::new(
+                    "entity_provider_frame_too_large",
+                    &failure.reason,
+                ));
+            }
+        }
         let value = completed_plugin_payload(result, "plugin entity provider")?;
         let value = coerce_entity_frame_empty_items(value);
         let frame: EntityFrame = serde_json::from_value(value).map_err(|error| {
@@ -3515,11 +3523,20 @@ impl HubRuntime {
             .is_some_and(crate::data_plane::driver::DataPlaneDriver::progress_pending)
     }
 
-    /// Control-plane terminal subscription inventory. No terminal bodies.
+    /// Return complete inventory within the caller's retained logical byte allowance.
+    /// The caller must retain the allowance until it drops the inventory.
     #[must_use]
-    pub fn list_terminal_subscriptions(&self) -> CoreTicket<Vec<TerminalSubscriptionRecord>> {
+    pub fn list_terminal_subscriptions(
+        &self,
+        max_logical_bytes: usize,
+    ) -> CoreTicket<
+        Result<
+            botster_core::TerminalSubscriptionInventory,
+            botster_core::TerminalSubscriptionInventoryError,
+        >,
+    > {
         self.core_daemon
-            .submit(|daemon| daemon.list_terminal_subscriptions())
+            .submit(move |daemon| daemon.list_terminal_subscriptions(max_logical_bytes))
     }
 
     /// Return exact terminal generations and publish the owner identity.
@@ -4974,14 +4991,9 @@ pub(crate) fn attach_route_on_core(
     now_seconds: u64,
 ) -> Result<TerminalSubscriptionGeneration, AttachBindFailure> {
     let previous = daemon
-        .list_terminal_subscriptions()
-        .into_iter()
-        .find(|row| {
-            row.client_id == client_id
-                && row.session_id == session_id
-                && row.subscription_id == subscription_id
-        })
-        .map(|row| row.generation);
+        .terminal_subscription_owner(&session_id, &subscription_id)
+        .filter(|(owner, _)| *owner == &client_id)
+        .map(|(_, generation)| generation);
     if let Some(generation) = previous {
         let _ = daemon.detach_terminal_subscription(
             client_id.clone(),
@@ -5177,10 +5189,14 @@ impl HubRuntime {
     }
 
     /// Test helper: current Core terminal subscription inventory.
-    pub(crate) fn list_terminal_subscriptions_for_test(&self) -> Vec<TerminalSubscriptionRecord> {
-        self.list_terminal_subscriptions()
+    pub(crate) fn list_terminal_subscriptions_for_test(
+        &self,
+    ) -> Vec<botster_core::TerminalSubscriptionRecord> {
+        self.list_terminal_subscriptions(crate::host_executor::HOST_PREPARED_BYTE_CAPACITY)
             .wait(STARTUP_CORE_WAIT)
             .expect("Core inventory")
+            .expect("inventory fits the test allowance")
+            .records
     }
 
     /// Test helper: mark one session stale and wait for Core.
@@ -5469,6 +5485,8 @@ pub(crate) mod tests {
     };
 
     pub(super) fn family_runtime(name: &str) -> HubRuntime {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let directory_id = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let config = HubStartupOptions {
             host: HostIdentityOptions {
                 id: name.to_string(),
@@ -5476,7 +5494,7 @@ pub(crate) mod tests {
                 fingerprint: None,
             },
             data_directory: DataDirectoryOption::Explicit(
-                std::env::temp_dir().join(format!("{name}-{}", std::process::id())),
+                std::env::temp_dir().join(format!("{name}-{}-{directory_id}", std::process::id())),
             ),
             session_defaults: SessionDefaults {
                 shell: "/bin/sh".to_string(),

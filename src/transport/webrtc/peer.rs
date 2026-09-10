@@ -2198,9 +2198,11 @@ mod tests {
             .daemon
             .runtime_mut()
             .expect("runtime")
-            .list_terminal_subscriptions()
+            .list_terminal_subscriptions(crate::host_executor::HOST_PREPARED_BYTE_CAPACITY)
             .wait(Duration::from_secs(5))
-            .expect("inventory");
+            .expect("inventory")
+            .expect("inventory fits the test allowance")
+            .records;
         assert!(
             inventory.iter().all(|row| {
                 row.session_id.0 != session_id || row.subscription_id.0 != subscription_id
@@ -2333,9 +2335,11 @@ mod tests {
             .daemon
             .runtime_mut()
             .expect("runtime")
-            .list_terminal_subscriptions()
+            .list_terminal_subscriptions(crate::host_executor::HOST_PREPARED_BYTE_CAPACITY)
             .wait(Duration::from_secs(5))
-            .expect("inventory");
+            .expect("inventory")
+            .expect("inventory fits the test allowance")
+            .records;
         assert!(
             inventory.is_empty(),
             "fail-closed must leave zero Core inventory rows before session shutdown: {inventory:?}"
@@ -3276,9 +3280,11 @@ mod tests {
             .daemon
             .runtime_mut()
             .expect("runtime")
-            .list_terminal_subscriptions()
+            .list_terminal_subscriptions(crate::host_executor::HOST_PREPARED_BYTE_CAPACITY)
             .wait(Duration::from_secs(5))
-            .expect("inventory");
+            .expect("inventory")
+            .expect("inventory fits the test allowance")
+            .records;
         assert!(
             inventory.is_empty(),
             "timeout fail-closed must leave zero Core inventory rows: {inventory:?}"

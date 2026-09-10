@@ -1,6 +1,6 @@
 //! Status and Shutdown preparation through the existing Host executor.
 //!
-//! All Hub copies share the admitted Host allowance. Core inventory preallocation remains open.
+//! Hub copies and Core inventory share the admitted Host allowance.
 //! Terminal teardown must transfer retained commands before dropping the control state.
 
 use botster_hub_client::{DaemonDiagnostic, DaemonLifecycleCounters, DaemonRetentionAccounting};
@@ -24,7 +24,7 @@ use crate::status_response::{
 #[cfg(test)]
 thread_local! {
     static TEST_STATUS_CORE_RESULT_GATE: std::cell::RefCell<Option<(
-        std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<()>,
     )>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -49,28 +49,39 @@ pub(crate) fn handle(
     };
     let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
     let policy = runtime.retention_policy();
-    let input = capture_seed(
+    let mut input = capture_seed(
         daemon,
         state,
         observability.transport_request_id.unwrap_or_default(),
         shutdown,
         permit.reserved_prepared_bytes(),
     );
-    let ticket = (!input.rejected).then(|| {
+    let core_limit = (!input.rejected)
+        .then(|| core_inventory_allowance(&input, permit.reserved_prepared_bytes()))
+        .flatten();
+    if core_limit.is_none() {
+        input.rejected = true;
+    }
+    let ticket = core_limit.map(|max_logical_bytes| {
         let reservation = permit.retain_prepared_reservation();
         #[cfg(test)]
         let result_gate = TEST_STATUS_CORE_RESULT_GATE.with(|slot| slot.borrow_mut().take());
         runtime.submit_core_for_owner(waiter_id, move |core| {
-            // This revision cannot preflight Core inventory allocation.
+            // Core preflights all inventory storage before allocation or cloning.
             // The closure and its returned value retain the original reservation.
             let snapshot = StatusCoreSnapshot::new(
                 core.retention_accounting(),
-                (!shutdown).then(|| core.list_terminal_subscriptions()),
+                if shutdown {
+                    Ok(None)
+                } else {
+                    core.list_terminal_subscriptions(max_logical_bytes)
+                        .map(Some)
+                },
                 reservation,
             );
             #[cfg(test)]
             if let Some((entered, release)) = result_gate {
-                let _ = entered.send(());
+                let _ = entered.send(snapshot.inventory.is_err());
                 let _ = release.recv_timeout(std::time::Duration::from_secs(5));
             }
             snapshot
@@ -192,6 +203,7 @@ impl StatusContinuation {
                             sessions: u32::try_from(accounting.sessions).unwrap_or(u32::MAX),
                             evictions: accounting.evictions,
                         });
+                        retained.rejected = core.inventory.is_err();
                         retained.core = Some(core);
                     }
                     CoreTicketPoll::Lost | CoreTicketPoll::Refused if shutdown => {}
@@ -348,6 +360,14 @@ fn seed_preflight(
     Some((status, egress, lifecycle, home))
 }
 
+/// Reserve distinct producer and keyed-result storage before Core allocates inventory.
+fn core_inventory_allowance(input: &StatusResponseInput, limit: usize) -> Option<usize> {
+    limit
+        .checked_sub(input.logical_bytes(limit)?)?
+        .checked_sub(size_of::<StatusCoreSnapshot>())?
+        .checked_sub(size_of::<crate::owner_identity::OwnerWorkIdentity>())
+}
+
 fn capture_seed(
     daemon: &HubDaemon,
     state: &DaemonControlState,
@@ -417,7 +437,14 @@ fn capture_current_sources(
     if input.shutdown {
         return Some(());
     }
-    let inventory = input.core.as_ref()?.inventory.as_deref()?;
+    let inventory = &input
+        .core
+        .as_ref()?
+        .inventory
+        .as_ref()
+        .ok()?
+        .as_ref()?
+        .records;
     let remaining = limit.checked_sub(live)?;
     let occupancy_bound = crate::subscription::attach_routes::live_attach_occupancy_prepared_bytes(
         &state.pending_runtime.live_attach_routes,
@@ -629,6 +656,134 @@ mod tests {
         reply_rx
     }
 
+    fn fill_seed_for_core_allowance(
+        daemon: &HubDaemon,
+        state: &mut DaemonControlState,
+        core_allowance: usize,
+    ) {
+        assert!(state.lifecycle_counters.cleanup_by_reason.is_empty());
+        let input = capture_seed(
+            daemon,
+            state,
+            "41".into(),
+            false,
+            HOST_PREPARED_BYTE_CAPACITY,
+        );
+        let remaining = core_inventory_allowance(&input, HOST_PREPARED_BYTE_CAPACITY).unwrap();
+        let key_bytes = remaining
+            .checked_sub(size_of::<(String, u64)>())
+            .unwrap()
+            .checked_sub(core_allowance)
+            .unwrap();
+        state
+            .lifecycle_counters
+            .cleanup_by_reason
+            .insert("r".repeat(key_bytes), 1);
+    }
+
+    #[test]
+    fn status_core_allowance_counts_retained_input_and_distinct_result_wrappers() {
+        let (mut daemon, directory) = test_daemon("status-core-allowance");
+        let state = DaemonControlState::default();
+        let input = capture_seed(&daemon, &state, "41".into(), false, usize::MAX);
+        let retained = input.logical_bytes(usize::MAX).unwrap();
+        let wrappers =
+            size_of::<StatusCoreSnapshot>() + size_of::<crate::owner_identity::OwnerWorkIdentity>();
+        let inventory = size_of::<botster_core::TerminalSubscriptionInventory>();
+        let exact = retained + wrappers + inventory;
+        assert_eq!(core_inventory_allowance(&input, exact), Some(inventory));
+        assert_eq!(
+            core_inventory_allowance(&input, exact - 1),
+            Some(inventory - 1)
+        );
+        assert_eq!(
+            core_inventory_allowance(&input, retained + wrappers),
+            Some(0)
+        );
+        assert_eq!(
+            core_inventory_allowance(&input, retained + wrappers - 1),
+            None
+        );
+        assert_eq!(core_inventory_allowance(&input, retained - 1), None);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn status_dispatch_core_preallocation_uses_aggregate_exact_fit_and_one_byte_short() {
+        for refuse_inventory in [false, true] {
+            let (mut daemon, directory) = test_daemon("status-core-preallocation");
+            let mut state = DaemonControlState::default();
+            let allowance = size_of::<botster_core::TerminalSubscriptionInventory>()
+                - usize::from(refuse_inventory);
+            fill_seed_for_core_allowance(&daemon, &mut state, allowance);
+            let reply = dispatch_status_for_test(&mut daemon, &mut state);
+            let (observed, observation) = std::sync::mpsc::channel();
+            let entry = state.pending_requests.values_mut().next().unwrap();
+            let super::super::pending::ControlContinuation::Status(continuation) =
+                &mut entry.continuation
+            else {
+                panic!("Status continuation");
+            };
+            assert!(continuation.ticket.is_some());
+            let input = continuation.input.as_mut().unwrap();
+            assert!(!input.rejected);
+            assert!(input.seed.is_some());
+            input.capture_observer = Some(observed);
+            let original = continuation
+                .permit
+                .as_ref()
+                .unwrap()
+                .reserved_prepared_bytes();
+            assert_eq!(original, HOST_PREPARED_BYTE_CAPACITY);
+            assert_eq!(core_inventory_allowance(input, original), Some(allowance));
+            assert_eq!(
+                input.logical_bytes(original).unwrap()
+                    + size_of::<StatusCoreSnapshot>()
+                    + size_of::<crate::owner_identity::OwnerWorkIdentity>()
+                    + allowance,
+                original,
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !state.pending_requests.is_empty() {
+                assert!(!crate::daemon::owner_loop::drive_ready_test_turn(
+                    &mut daemon,
+                    &mut state,
+                ));
+                assert!(
+                    Instant::now() < deadline,
+                    "Status must finish after Core preallocation"
+                );
+                std::thread::yield_now();
+            }
+            let (_, occupancy, terminals, core_retained, core_refused) =
+                observation.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!((occupancy, terminals, core_retained), (0, 0, true));
+            assert_eq!(core_refused, refuse_inventory);
+            let (_, charge, encoded) = reply.blocking_recv().unwrap().into_parts();
+            let botster_hub_client::ServerFrame::Response {
+                request_id,
+                response,
+            } = serde_json::from_slice(encoded.as_ref().unwrap()).unwrap()
+            else {
+                panic!("response frame");
+            };
+            assert_eq!(request_id, "41");
+            // The near-full seed leaves no allowance for Host response preparation.
+            let error = response.error.unwrap();
+            assert_eq!(error.code, "host_result_too_large");
+            assert_eq!(error.request_id, request_id);
+            assert_eq!(error.operation, "status");
+            drop(charge);
+            assert_eq!(
+                daemon.runtime().unwrap().host_executor().prepared_bytes(),
+                0
+            );
+            daemon.stop();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     #[test]
     fn status_dispatch_rechecks_grown_sources_after_core_before_aggregate_copy() {
         use crate::transport::webrtc::peer::{
@@ -729,7 +884,7 @@ mod tests {
         assert!(matches!(blocker.poll(), CoreTicketPoll::Ready(())));
         assert_eq!(
             observation.recv_timeout(Duration::from_secs(5)).unwrap(),
-            (true, 0, 0, true)
+            (true, 0, 0, true, false)
         );
         let (_, charge, encoded) = reply.blocking_recv().unwrap().into_parts();
         let botster_hub_client::ServerFrame::Response {
@@ -755,17 +910,29 @@ mod tests {
 
     #[test]
     fn status_core_result_retains_original_reservation_after_ticket_and_permit_disposal() {
-        check_status_core_retention(true);
+        check_status_core_retention(true, false);
     }
 
     #[test]
     fn status_core_queue_retains_original_reservation_after_ticket_and_permit_disposal() {
-        check_status_core_retention(false);
+        check_status_core_retention(false, false);
     }
 
-    fn check_status_core_retention(hold_result: bool) {
+    #[test]
+    fn status_core_refusal_retains_original_reservation_after_ticket_and_permit_disposal() {
+        check_status_core_retention(true, true);
+    }
+
+    fn check_status_core_retention(hold_result: bool, refuse_inventory: bool) {
         let (mut daemon, directory) = test_daemon("status-core-result-retention");
         let mut state = DaemonControlState::default();
+        if refuse_inventory {
+            fill_seed_for_core_allowance(
+                &daemon,
+                &mut state,
+                size_of::<botster_core::TerminalSubscriptionInventory>() - 1,
+            );
+        }
         let (entered, ready) = std::sync::mpsc::channel();
         let (release, gate) = std::sync::mpsc::channel();
         let mut blocker = if hold_result {
@@ -775,7 +942,7 @@ mod tests {
             None
         } else {
             let blocker = daemon.runtime().unwrap().submit_core(move |_| {
-                let _ = entered.send(());
+                let _ = entered.send(false);
                 let _ = gate.recv_timeout(Duration::from_secs(5));
             });
             ready.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -783,7 +950,10 @@ mod tests {
         };
         let reply = dispatch_status_for_test(&mut daemon, &mut state);
         if hold_result {
-            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                ready.recv_timeout(Duration::from_secs(5)).unwrap(),
+                refuse_inventory
+            );
         }
         let waiter = *state.pending_requests.keys().next().unwrap();
         let mut entry = state.pending_requests.remove(&waiter).unwrap();
@@ -882,14 +1052,21 @@ mod tests {
             .unwrap();
         input.core = Some(StatusCoreSnapshot::new(
             Default::default(),
-            Some(vec![botster_core::TerminalSubscriptionRecord {
-                client_id: botster_core::ClientId("client".into()),
-                session_id: botster_core::SessionId("session".into()),
-                subscription_id: botster_core::SubscriptionId("subscription".into()),
-                generation: botster_core::TerminalSubscriptionGeneration(1),
-                adapter_bound: false,
-                capabilities: None,
-            }]),
+            Ok(Some(botster_core::TerminalSubscriptionInventory {
+                logical_bytes: size_of::<botster_core::TerminalSubscriptionInventory>()
+                    + size_of::<botster_core::TerminalSubscriptionRecord>()
+                    + "client".len()
+                    + "session".len()
+                    + "subscription".len(),
+                records: vec![botster_core::TerminalSubscriptionRecord {
+                    client_id: botster_core::ClientId("client".into()),
+                    session_id: botster_core::SessionId("session".into()),
+                    subscription_id: botster_core::SubscriptionId("subscription".into()),
+                    generation: botster_core::TerminalSubscriptionGeneration(1),
+                    adapter_bound: false,
+                    capabilities: None,
+                }],
+            })),
             permit.retain_prepared_reservation(),
         ));
         state
@@ -897,7 +1074,16 @@ mod tests {
             .live_attach_routes
             .insert(("session".into(), "subscription".into()));
         let live = input.logical_bytes(usize::MAX).unwrap();
-        let inventory = input.core.as_ref().unwrap().inventory.as_ref().unwrap();
+        let inventory = &input
+            .core
+            .as_ref()
+            .unwrap()
+            .inventory
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .records;
         let occupancy = crate::subscription::attach_routes::live_attach_occupancy_prepared_bytes(
             &state.pending_runtime.live_attach_routes,
             inventory,

@@ -4282,12 +4282,7 @@ fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
                 arguments: serde_json::json!({
                     "target_id": "tgt_live_managed",
                     "branch": "feature/live-restart",
-                    "session_type_id": "managed-git.live-plugin/init",
-                    "context": {
-                        "metadata": {
-                            "completion_reservation_padding": "x".repeat(512)
-                        }
-                    }
+                    "session_type_id": "managed-git.live-plugin/init"
                 }),
             },
         )

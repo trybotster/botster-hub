@@ -216,6 +216,17 @@ impl EntityWork {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn test_cancelled_host_identity(&self) -> Option<HostJobIdentity> {
+        if !self.cancelled {
+            return None;
+        }
+        match self.phase {
+            Phase::Running(identity) => Some(identity),
+            _ => None,
+        }
+    }
+
     pub(super) fn cancel(&mut self) {
         self.cancelled = true;
         self.reply_live.store(false, Ordering::Release);

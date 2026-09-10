@@ -602,6 +602,122 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn provider_preparation_maps_oversized_completion_and_releases_result_charge() {
+        use crate::daemon::control::reply::RetainedPluginResultBudget;
+        use crate::runtime::provider::ProviderExpectation;
+        use crate::shared_view::SharedView;
+        use botster_core::{
+            EntityKind, PluginHandlerKind, PluginHandlerRef, PluginInvocationFailure,
+            PluginInvocationFailureKind, PluginKey, RequestId,
+        };
+
+        for (kind, inconsistent, expected_code) in [
+            (
+                PluginInvocationFailureKind::CompletionTooLarge,
+                false,
+                "entity_provider_frame_too_large",
+            ),
+            (
+                PluginInvocationFailureKind::HandlerFailed,
+                false,
+                "plugin_invocation_failed",
+            ),
+            (
+                PluginInvocationFailureKind::CompletionTooLarge,
+                true,
+                "plugin_completion_inconsistent",
+            ),
+        ] {
+            let executor = HostExecutor::new();
+            let budget = RetainedPluginResultBudget::new();
+            let metadata_budget = SharedViewBudget::new();
+            let handler = PluginHandlerRef {
+                plugin_key: PluginKey("p".into()),
+                kind: PluginHandlerKind::Command,
+                handler_id: "provider".into(),
+            };
+            let expectation = ProviderExpectation {
+                entity_kind: EntityKind("p.item".into()),
+                handler: handler.clone(),
+            };
+            let metadata_bytes = std::mem::size_of::<ProviderExpectation>()
+                + expectation.entity_kind.0.len()
+                + handler.plugin_key.0.len()
+                + handler.handler_id.len();
+            let expected =
+                SharedView::try_new(&metadata_budget, expectation, metadata_bytes).unwrap();
+            let bridge = crate::lua_runtime::HubEntityPublishBridge::for_test("p", "p.item");
+            let _reply = bridge.test_queue_publish(
+                PluginKey("p".into()),
+                serde_json::json!({
+                    "type": "entity_remove", "entity_type": "p.item",
+                    "snapshot_seq": 1, "id": "item",
+                }),
+                None,
+            );
+            let (request, ()) = bridge.take_if(|_| Some(())).expect("admitted publication");
+            let admission = request.mutation.admission().unwrap().clone();
+            let expected_admission = admission.clone();
+            drop(request);
+            let retained_publication = bridge.retained_counts();
+            assert_eq!(retained_publication.0, 1);
+            assert!(retained_publication.1 > 0);
+            let invocation = crate::runtime::PluginEntitySnapshotInvocation {
+                expected,
+                family_generation: 1,
+                causal_lease: None,
+                lease_acquired: false,
+                admission: Some(admission),
+            };
+            let result = PluginInvocationResult::Failed(PluginInvocationFailure {
+                request_id: RequestId("provider-request".into()),
+                handler,
+                kind,
+                timeout_ms: None,
+                reason: "provider completion failed".into(),
+            });
+            let bytes = crate::bounded_json::encoded_len(
+                &result,
+                crate::host_executor::HOST_PREPARED_BYTE_CAPACITY,
+            )
+            .unwrap();
+            let result = RetainedPluginResult::new(result, budget.try_reserve(bytes).unwrap());
+            assert_eq!(budget.retained_bytes(), bytes);
+            executor
+                .submit(
+                    OwnerWorkIdentity::first(WaiterId(904)),
+                    HostCommand::PluginEntity(Command::Prepare {
+                        invocation,
+                        result,
+                        inconsistent,
+                        target: None,
+                    }),
+                    executor.try_reserve().unwrap(),
+                )
+                .unwrap();
+            let (_, result, permit) = completion(&executor).into_parts();
+            let HostResult::PluginEntity(Completion::Prepared {
+                payload, family, ..
+            }) = result
+            else {
+                panic!("provider preparation must complete");
+            };
+            assert_eq!(family.as_str(), "p.item");
+            assert_eq!(payload.admission.as_ref(), Some(&expected_admission));
+            drop(expected_admission);
+            assert_eq!(bridge.retained_counts(), retained_publication);
+            let Body::Error(error) = &payload.body else {
+                panic!("provider failure must produce an error");
+            };
+            assert_eq!(error.code, expected_code);
+            assert_eq!(budget.retained_bytes(), 0);
+            drop(payload);
+            assert_eq!(bridge.retained_counts(), (0, 0));
+            drop(permit);
+        }
+    }
+
+    #[test]
     fn terminal_reply_moves_the_charge_and_preserves_request_correlation() {
         let executor = HostExecutor::new();
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
