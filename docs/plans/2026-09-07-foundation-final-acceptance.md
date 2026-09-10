@@ -524,6 +524,13 @@ The guard must retire phase history before the owner permit is released. It must
 The owner must restore an unconsumed completion batch before new registrations use that capacity. All wake clones must retain the shared wake charge.
 These requirements do not certify non-C1 callers, production memory policy, release-profile layouts, or the full scheduler accounting gate.
 
+Root selected the complete consumer lifecycle and its first real-daemon regression as the next bounded verification step.
+The test may precede full transport accounting. Its handoff must identify unwired accounting; functional success cannot close that requirement.
+The deterministic Core gate also blocks Status, because Status submits its own Core request. That test must not require Status completion while Core is held.
+The test will use ListPackages to check sibling progress during the gate and Status after release. Matched-artifact Status responsiveness remains a separate requirement.
+The regression will use real socket dispatch through `serve_daemon_inner`, beside the existing owner-loop tests. No helper may pump the tested coordination requests.
+The draft adds terminal-owner storage to the shared wake. The old fixed-size measurement does not apply to that changed type; the tree derivation remains conditional.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
