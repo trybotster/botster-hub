@@ -198,6 +198,16 @@ Lua has no ambient `os`, `io`, or `package` globals. Filesystem, network,
 process, and dynamic module loading are not available through the standard Lua
 environment.
 
+Plugins cannot register `__gc` finalizers. Before plugin entrypoints run, Hub
+installs a trusted `setmetatable` boundary. It rejects a metatable whose own
+`__gc` field contains any value other than `nil`, including `false`. The refusal
+is a Lua string error. This refusal takes precedence when the target table
+already has a protected metatable. Ordinary metatables, removal with `nil`,
+and mlua's protected array metatable remain supported. The `debug` library is
+unavailable. Errors forwarded from base `setmetatable` retain their message
+body but report `hub/sandbox:<line>:` instead of the caller location. Direct
+`pcall(setmetatable, ...)` calls previously reported no location.
+
 The initial capability helper is:
 
 - `botster.capabilities.timer_once(delay_ms)`: submits a timer capability
