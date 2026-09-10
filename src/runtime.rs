@@ -70,9 +70,8 @@ use crate::package_event_router::{
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
 use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
 use crate::session_types::{
-    EnsuredManagedWorktree, HubSessionContext, HubSessionType, ManagedSessionTypeRequest,
-    SessionTypeRequest, list_session_types_for_target, materialize_managed_session_type,
-    materialize_session_type, show_session_type_for_target,
+    EnsuredManagedWorktree, HubSessionContext, ManagedSessionTypeRequest, SessionTypeRequest,
+    materialize_managed_session_type, materialize_session_type, show_session_type_for_target,
 };
 use crate::shared_view::{SharedView, SharedViewBudget};
 
@@ -261,7 +260,6 @@ impl PluginEntitySnapshotInvocation {
 /// Hub-owned policy bridge for plugin-safe session-type spawns.
 pub struct HubSessionTypeSpawner {
     pending: Mutex<VecDeque<PendingSessionTypeSpawn>>,
-    reads: Mutex<VecDeque<PendingSessionTypeRead>>,
     managed: Mutex<VecDeque<PendingManagedSessionSpawn>>,
     managed_pending: AtomicBool,
     managed_owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
@@ -301,9 +299,6 @@ impl Drop for TerminalSpawnerProbe {
             spawner.pending.try_lock(),
             Err(std::sync::TryLockError::WouldBlock)
         ) && !matches!(
-            spawner.reads.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ) && !matches!(
             spawner.managed.try_lock(),
             Err(std::sync::TryLockError::WouldBlock)
         );
@@ -330,20 +325,6 @@ struct PendingSessionTypeSpawn {
     request: SessionTypeRequest,
     package_records: Vec<PackageRecord>,
     response: mpsc::Sender<Result<PluginSessionTypeSpawned, String>>,
-}
-
-enum SessionTypeRead {
-    List,
-    Show { session_type_id: String },
-}
-
-struct PendingSessionTypeRead {
-    #[cfg(test)]
-    _dispose_probe: Option<TerminalSpawnerProbe>,
-    target_id: String,
-    operation: SessionTypeRead,
-    package_records: Vec<PackageRecord>,
-    response: mpsc::Sender<Result<Vec<HubSessionType>, String>>,
 }
 
 pub(crate) struct PendingManagedSessionSpawn {
@@ -1541,27 +1522,6 @@ impl HubRuntime {
         *inflight = retained;
     }
 
-    fn fulfill_pending_session_type_reads(&self) {
-        while let Some(pending) = self.session_type_spawner.take_read() {
-            let records = pending.package_records.iter().collect::<Vec<_>>();
-            let state = self.state();
-            let result = match pending.operation {
-                SessionTypeRead::List => {
-                    list_session_types_for_target(&records, &state, &pending.target_id)
-                }
-                SessionTypeRead::Show { session_type_id } => show_session_type_for_target(
-                    &records,
-                    &state,
-                    &pending.target_id,
-                    &session_type_id,
-                )
-                .map(|template| vec![template]),
-            }
-            .map_err(|error| format!("{}: {}", error.kind, error.message));
-            let _ = pending.response.send(result);
-        }
-    }
-
     pub(crate) fn validate_managed_git_request(
         &self,
         pending: &PendingManagedSessionSpawn,
@@ -1692,7 +1652,6 @@ impl HubRuntime {
         self.apply_causal_owner_ops();
         self.fulfill_pending_coordination_requests();
         self.fulfill_pending_entity_publish_requests();
-        self.fulfill_pending_session_type_reads();
         self.fulfill_pending_session_type_spawns();
     }
 
@@ -3987,19 +3946,11 @@ impl HubSessionTypeSpawner {
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut reads = self
-                .reads
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut managed = self
                 .managed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                std::mem::take(&mut *pending),
-                std::mem::take(&mut *reads),
-                std::mem::take(&mut *managed),
-            )
+            (std::mem::take(&mut *pending), std::mem::take(&mut *managed))
         };
         // Payload destructors run after every queue lock is released.
         drop(queues);
@@ -4012,7 +3963,7 @@ impl HubSessionTypeSpawner {
         self: &Arc<Self>,
         gate: Option<mpsc::Receiver<()>>,
     ) -> mpsc::Receiver<(String, bool)> {
-        assert_eq!(self.test_terminal_pending_counts(), (0, 0, 0, false));
+        assert_eq!(self.test_terminal_pending_counts(), (0, 0, false));
         let (dropped, observed) = mpsc::channel();
         let probe = |gate| TerminalSpawnerProbe {
             spawner: Arc::downgrade(self),
@@ -4033,19 +3984,6 @@ impl HubSessionTypeSpawner {
                 package_records: Vec::new(),
                 response,
                 _dispose_probe: Some(probe(gate)),
-            });
-        let (response, _) = mpsc::channel();
-        self.reads
-            .lock()
-            .unwrap()
-            .push_back(PendingSessionTypeRead {
-                target_id: "terminal-target".into(),
-                operation: SessionTypeRead::Show {
-                    session_type_id: "read payload".repeat(128),
-                },
-                package_records: Vec::new(),
-                response,
-                _dispose_probe: Some(probe(None)),
             });
         let (response, _) = mpsc::channel();
         self.managed
@@ -4070,13 +4008,9 @@ impl HubSessionTypeSpawner {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_terminal_pending_counts(&self) -> (usize, usize, usize, bool) {
+    pub(crate) fn test_terminal_pending_counts(&self) -> (usize, usize, bool) {
         (
             self.pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            self.reads
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
@@ -4091,7 +4025,6 @@ impl HubSessionTypeSpawner {
     pub(crate) fn new() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
-            reads: Mutex::new(VecDeque::new()),
             managed: Mutex::new(VecDeque::new()),
             managed_pending: AtomicBool::new(false),
             managed_owner: Mutex::new(None),
@@ -4164,57 +4097,6 @@ impl HubSessionTypeSpawner {
             .pop_front()
     }
 
-    /// List enabled effective templates admitted for one target.
-    pub fn list(
-        &self,
-        target_id: &str,
-        package_records: Vec<PackageRecord>,
-    ) -> Result<Vec<HubSessionType>, String> {
-        self.read(target_id, SessionTypeRead::List, package_records)
-    }
-
-    /// Show one enabled effective template admitted for one target.
-    pub fn show(
-        &self,
-        target_id: &str,
-        session_type_id: &str,
-        package_records: Vec<PackageRecord>,
-    ) -> Result<HubSessionType, String> {
-        self.read(
-            target_id,
-            SessionTypeRead::Show {
-                session_type_id: session_type_id.to_string(),
-            },
-            package_records,
-        )?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "session type was not found".to_string())
-    }
-
-    fn read(
-        &self,
-        target_id: &str,
-        operation: SessionTypeRead,
-        package_records: Vec<PackageRecord>,
-    ) -> Result<Vec<HubSessionType>, String> {
-        let (response, receiver) = mpsc::channel();
-        self.reads
-            .lock()
-            .map_err(|_| "session-type read queue lock poisoned".to_string())?
-            .push_back(PendingSessionTypeRead {
-                target_id: target_id.to_string(),
-                operation,
-                package_records,
-                response,
-                #[cfg(test)]
-                _dispose_probe: None,
-            });
-        receiver
-            .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
-            .map_err(|_| "session-type read did not complete before timeout".to_string())?
-    }
-
     /// Queue the one atomic managed-worktree/session spawn operation.
     pub fn ensure_worktree_and_spawn(
         &self,
@@ -4266,13 +4148,6 @@ impl HubSessionTypeSpawner {
                     "managed session spawn did not complete before timeout",
                 )
             })?
-    }
-
-    fn take_read(&self) -> Option<PendingSessionTypeRead> {
-        self.reads
-            .lock()
-            .expect("session-type read queue lock")
-            .pop_front()
     }
 
     fn take_managed(&self) -> Option<PendingManagedSessionSpawn> {
@@ -5528,13 +5403,11 @@ pub(crate) mod tests {
         if poison {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _pending = spawner.pending.lock().unwrap();
-                let _reads = spawner.reads.lock().unwrap();
                 let _managed = spawner.managed.lock().unwrap();
                 panic!("poison the nonempty spawner queues");
             }));
             assert!(result.is_err());
             assert!(spawner.pending.is_poisoned());
-            assert!(spawner.reads.is_poisoned());
             assert!(spawner.managed.is_poisoned());
         }
         let permit = runtime.host_executor().try_reserve().unwrap();
@@ -5559,7 +5432,7 @@ pub(crate) mod tests {
             }
             thread::yield_now();
         };
-        assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, 1, true));
+        assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, true));
         assert!(matches!(
             observed.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -5576,7 +5449,7 @@ pub(crate) mod tests {
         let (thread_name, locks_released) = observed.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(thread_name.starts_with("botster-hub-host"));
         assert!(locks_released);
-        assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, 0, true));
+        assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, true));
         assert!(matches!(bridge_job.poll(), Poll::Pending));
         assert_eq!(
             runtime.host_executor().outstanding(),
@@ -5588,12 +5461,9 @@ pub(crate) mod tests {
         );
         assert!(runtime.host_executor().try_reserve().is_none());
         release.send(()).unwrap();
-        for _ in 0..2 {
-            let (thread_name, locks_released) =
-                observed.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert!(thread_name.starts_with("botster-hub-host"));
-            assert!(locks_released);
-        }
+        let (thread_name, locks_released) = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(thread_name.starts_with("botster-hub-host"));
+        assert!(locks_released);
         let deadline = Instant::now() + Duration::from_secs(5);
         let permit = loop {
             match bridge_job.poll() {
@@ -5605,7 +5475,7 @@ pub(crate) mod tests {
             }
             thread::yield_now();
         };
-        assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, 0, false));
+        assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, false));
         assert!(matches!(
             observed.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)

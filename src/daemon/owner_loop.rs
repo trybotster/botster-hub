@@ -2408,7 +2408,7 @@ mod tests {
             let publication_charge = publication.retained_counts();
             assert_eq!(publication_charge.0, 1);
             assert!(publication_charge.1 > 16 * 1024);
-            assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, 1, true));
+            assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, true));
             gate.release();
             let engine_worker = engine_entered_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -2431,7 +2431,7 @@ mod tests {
             assert_eq!(coordination.test_pending_count(), 1);
             assert_eq!(publication.pending_publish_count(), 1);
             assert_eq!(publication.retained_counts(), publication_charge);
-            assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, 1, true));
+            assert_eq!(spawner.test_terminal_pending_counts(), (1, 1, true));
             engine_gate.release();
             let publication_worker = publication_entered_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -2472,7 +2472,7 @@ mod tests {
                 publication_response.try_recv(),
                 Err(mpsc::TryRecvError::Disconnected)
             ));
-            assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, 0, true));
+            assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, true));
             spawner_gate_tx.send(()).unwrap();
             let result = finished_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -2487,9 +2487,9 @@ mod tests {
             }
             stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             assert_eq!(inspect(), (0, false, true));
-            assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, 0, false));
+            assert_eq!(spawner.test_terminal_pending_counts(), (0, 0, false));
             let remaining_spawner_drops: Vec<_> = spawner_drops.try_iter().collect();
-            assert_eq!(remaining_spawner_drops.len(), 2);
+            assert_eq!(remaining_spawner_drops.len(), 1);
             assert!(
                 remaining_spawner_drops
                     .iter()
