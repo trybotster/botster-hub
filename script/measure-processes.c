@@ -1,4 +1,4 @@
-/* Darwin raw process evidence. This program does not calculate tree totals. */
+/* Darwin raw evidence and optional totals for a verified fixed baseline. */
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/proc_info.h>
 #include <sys/resource.h>
 #include <time.h>
@@ -427,6 +428,367 @@ static bool observe(Sampler *s, Row *rows, size_t count) {
     return true;
 }
 
+typedef struct {
+    Row identity;
+    uint64_t attempt;
+} ProcessWatch;
+
+typedef struct {
+    Sampler *sampler;
+    int queue;
+    ProcessWatch *watches;
+    size_t watch_count;
+    uint64_t attempt;
+    bool started, failed, dirty, already_watched;
+} StableBaseline;
+
+typedef struct {
+    uint64_t begin, end, rss;
+} StableSample;
+
+static void stable_error(StableBaseline *stable, pid_t pid, const char *operation, int code) {
+    error_event(stable->sampler, pid, operation, code);
+    stable->dirty = true;
+    if (stable->started) stable->failed = true;
+}
+
+/* A zero-time call that returns no events establishes the end of each drain. */
+static bool stable_drain(StableBaseline *stable) {
+    const struct timespec zero = {0};
+    struct kevent batch[32];
+    for (;;) {
+        int count = kevent(stable->queue, NULL, 0, batch, 32, &zero);
+        if (count < 0) {
+            stable_error(stable, 0, "lifecycle_event_drain", errno);
+            return false;
+        }
+        if (!count) return true;
+        for (int i = 0; i < count; ++i) {
+            const struct kevent *item = &batch[i];
+            stable->dirty = true;
+            if (stable->started) stable->failed = true;
+            event(stable->sampler, "lifecycle_event");
+            printf(",\"pid\":%" PRIuPTR ",\"filter\":%d,\"flags\":%u,\"fflags\":%u,"
+                   "\"data\":%" PRIdPTR ",\"read_ticks\":%" PRIu64 ",\"baseline_active\":%s}\n",
+                   item->ident, item->filter, item->flags, item->fflags, item->data,
+                   mach_absolute_time(), stable->started ? "true" : "false");
+        }
+    }
+}
+
+static bool stable_watch(StableBaseline *stable, Row *row) {
+    Sampler *s = stable->sampler;
+    if (row->usage.ri_proc_exit_abstime) {
+        stable_error(stable, row->pid, "participant_not_live", 0);
+        return false;
+    }
+    for (size_t i = 0; i < stable->watch_count; ++i) {
+        ProcessWatch *watch = &stable->watches[i];
+        if (!same_process(row, &watch->identity)) continue;
+        if (watch->attempt >= stable->attempt) stable->already_watched = false;
+        return true;
+    }
+    if (stable->started) {
+        stable_error(stable, row->pid, "unwatched_baseline_participant", 0);
+        return false;
+    }
+    stable->already_watched = false;
+    struct kevent change, receipt;
+    const struct timespec zero = {0};
+    EV_SET(&change, (uintptr_t)row->pid, EVFILT_PROC,
+           EV_ADD | EV_ENABLE | EV_CLEAR | EV_RECEIPT,
+           NOTE_FORK | NOTE_EXEC | NOTE_EXIT, 0, NULL);
+    memset(&receipt, 0, sizeof(receipt));
+    int count = kevent(stable->queue, &change, 1, &receipt, 1, &zero);
+    int registration_error = errno;
+    bool registered = count == 1 && receipt.ident == (uintptr_t)row->pid &&
+                      receipt.filter == EVFILT_PROC && (receipt.flags & EV_ERROR) &&
+                      receipt.data == 0;
+    event(s, "watch_registration");
+    identity_fields(row);
+    printf(",\"attempt\":%" PRIu64 ",\"receipt_count\":%d,\"receipt_flags\":%u,"
+           "\"receipt_data\":%" PRIdPTR ",\"registered\":%s}\n",
+           stable->attempt, count, receipt.flags, receipt.data, registered ? "true" : "false");
+    if (!registered) {
+        stable_error(stable, row->pid, "watch_registration", count < 0 ? registration_error : (int)receipt.data);
+        return false;
+    }
+    Row after = {0};
+    if (!read_row(s, row->pid, &after)) return false;
+    if (!same_process(row, &after)) {
+        identity_error(s, row, &after);
+        return false;
+    }
+    ProcessWatch *next = resize(s, stable->watches, stable->watch_count + 1, sizeof(*next));
+    stable->watches = next;
+    if (!next) { stable->watch_count = 0; return false; }
+    next[stable->watch_count++] = (ProcessWatch){.identity = after, .attempt = stable->attempt};
+    return true;
+}
+
+static bool stable_append(StableBaseline *stable, Row **rows, size_t *count, Row row) {
+    if (!stable_watch(stable, &row)) return false;
+    return append_row(stable->sampler, rows, count, row);
+}
+
+static bool stable_discover(StableBaseline *stable, Row **rows, size_t *count) {
+    Sampler *s = stable->sampler;
+    *rows = NULL;
+    *count = 0;
+    for (size_t root = 0; root < s->root_count; ++root) {
+        Row row = {0};
+        if (!read_row(s, s->roots[root].pid, &row)) return false;
+        if (!s->roots[root].start) s->roots[root].start = row.usage.ri_proc_start_abstime;
+        if (s->roots[root].start != row.usage.ri_proc_start_abstime) {
+            stable_error(stable, row.pid, "root_identity_changed", 0);
+            return false;
+        }
+        row.root = root;
+        if (!stable_append(stable, rows, count, row)) return false;
+    }
+    for (size_t index = 0; index < *count; ++index) {
+        Row parent = (*rows)[index], before = {0}, after = {0};
+        if (!read_row(s, parent.pid, &before)) return false;
+        if (!same_process(&parent, &before)) {
+            identity_error(s, &parent, &before);
+            return false;
+        }
+        pid_t *pids = NULL;
+        size_t child_count = 0;
+        if (!list_children(s, parent.pid, &pids, &child_count)) return false;
+        Row *children = NULL;
+        if (child_count) {
+            children = resize(s, NULL, child_count, sizeof(*children));
+            if (!children) { free(pids); return false; }
+        }
+        bool valid = true;
+        for (size_t i = 0; i < child_count; ++i) {
+            children[i] = (Row){0};
+            if (pids[i] <= 0 || !read_row(s, pids[i], &children[i])) { valid = false; break; }
+            if (children[i].bsd.pbi_ppid != (uint32_t)parent.pid ||
+                children[i].usage.ri_proc_start_abstime < before.usage.ri_proc_start_abstime) {
+                stable_error(stable, children[i].pid, "candidate_ancestry_changed", 0);
+                valid = false;
+                break;
+            }
+            children[i].root = parent.root;
+        }
+        free(pids);
+        if (valid && !read_row(s, parent.pid, &after)) valid = false;
+        if (valid && !same_process(&parent, &after)) {
+            identity_error(s, &parent, &after);
+            valid = false;
+        }
+        if (!valid) { free(children); return false; }
+        after.root = parent.root;
+        after.selected = true;
+        (*rows)[index] = after;
+        for (size_t i = 0; i < child_count; ++i) {
+            if (!stable_append(stable, rows, count, children[i])) { free(children); return false; }
+        }
+        free(children);
+    }
+    return !s->invalid;
+}
+
+static bool reaped_equal(const struct rusage_info_v2 *a, const struct rusage_info_v2 *b) {
+    return a->ri_child_user_time == b->ri_child_user_time &&
+           a->ri_child_system_time == b->ri_child_system_time &&
+           a->ri_child_pkg_idle_wkups == b->ri_child_pkg_idle_wkups &&
+           a->ri_child_interrupt_wkups == b->ri_child_interrupt_wkups &&
+           a->ri_child_pageins == b->ri_child_pageins &&
+           a->ri_child_elapsed_abstime == b->ri_child_elapsed_abstime;
+}
+
+static bool stable_same_set(StableBaseline *stable, const Row *expected, size_t expected_count,
+                            const Row *actual, size_t actual_count) {
+    if (expected_count != actual_count) {
+        stable_error(stable, 0, "participant_set_changed", 0);
+        return false;
+    }
+    for (size_t i = 0; i < expected_count; ++i) {
+        const Row *match = NULL;
+        for (size_t j = 0; j < actual_count; ++j)
+            if (same_process(&expected[i], &actual[j])) match = &actual[j];
+        if (!match || match->bsd.pbi_ppid != expected[i].bsd.pbi_ppid ||
+            match->usage.ri_proc_exit_abstime || !reaped_equal(&expected[i].usage, &match->usage)) {
+            stable_error(stable, expected[i].pid, "participant_endpoint_changed", 0);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool stable_rss(Sampler *s, const Row *rows, size_t count, uint64_t *sum) {
+    *sum = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (rows[i].usage.ri_resident_size > UINT64_MAX - *sum) {
+            error_event(s, rows[i].pid, "rss_sum_overflow", EOVERFLOW);
+            return false;
+        }
+        *sum += rows[i].usage.ri_resident_size;
+    }
+    return true;
+}
+
+static bool stable_cpu(Sampler *s, const Row *first, const Row *last, size_t count,
+                       uint64_t *sum_ticks, uint64_t *sum_ns, bool emit) {
+    *sum_ticks = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const Row *end = NULL;
+        for (size_t j = 0; j < count; ++j)
+            if (same_process(&first[i], &last[j])) end = &last[j];
+        if (!end || end->usage.ri_user_time < first[i].usage.ri_user_time ||
+            end->usage.ri_system_time < first[i].usage.ri_system_time) {
+            error_event(s, first[i].pid, "own_cpu_counter_decreased", 0);
+            return false;
+        }
+        uint64_t user = end->usage.ri_user_time - first[i].usage.ri_user_time;
+        uint64_t system = end->usage.ri_system_time - first[i].usage.ri_system_time;
+        uint64_t ns;
+        if (user > UINT64_MAX - system || user + system > UINT64_MAX - *sum_ticks ||
+            !ticks_ns(user + system, s->timebase, &ns)) {
+            error_event(s, first[i].pid, "own_cpu_delta_overflow", EOVERFLOW);
+            return false;
+        }
+        *sum_ticks += user + system;
+        if (emit) {
+            event(s, "stable_own_cpu_delta");
+            identity_fields(&first[i]);
+            printf(",\"own_user_delta_ticks\":%" PRIu64 ",\"own_system_delta_ticks\":%" PRIu64
+                   ",\"own_cpu_delta_ns\":%" PRIu64 ",\"baseline_read_begin_ticks\":%" PRIu64
+                   ",\"baseline_read_end_ticks\":%" PRIu64 ",\"final_read_begin_ticks\":%" PRIu64
+                   ",\"final_read_end_ticks\":%" PRIu64 "}\n",
+                   user, system, ns, first[i].read_begin, first[i].read_end,
+                   end->read_begin, end->read_end);
+        }
+    }
+    if (!ticks_ns(*sum_ticks, s->timebase, sum_ns)) {
+        error_event(s, 0, "own_cpu_total_overflow", EOVERFLOW);
+        return false;
+    }
+    return true;
+}
+
+static int run_stable(Sampler *s, uint64_t samples, uint64_t setup_attempts) {
+    StableBaseline stable = {.sampler = s, .queue = -1};
+    Row *participants = NULL, *first = NULL, *last = NULL;
+    size_t participant_count = 0, first_count = 0, last_count = 0;
+    StableSample *measurements = NULL;
+    uint64_t completed = 0, cpu_ticks = 0, cpu_ns = 0, final_drain_ticks = 0;
+    bool ready = false;
+    event(s, "configuration");
+    printf(",\"mode\":\"stable_baseline\",\"timebase_numer\":%u,\"timebase_denom\":%u,"
+           "\"interval_ns\":%" PRIu64 ",\"requested_samples\":%" PRIu64
+           ",\"max_setup_attempts\":%" PRIu64 ",\"cpu_raw_unit\":\"mach_ticks\","
+           "\"coverage\":\"current_rooted_baseline_set\",\"historical_descendants_complete\":false,"
+           "\"known_orphans_require_explicit_roots\":true,\"setup_passes_establish_historical_completeness\":false,"
+           "\"snapshot_atomic\":false,\"rss_peak\":false,\"roots\":[",
+           s->timebase.numer, s->timebase.denom, s->interval_ns, samples, setup_attempts);
+    for (size_t i = 0; i < s->root_count; ++i) {
+        if (i) putchar(',');
+        printf("{\"pid\":%d,\"role\":", s->roots[i].pid);
+        json_string(s->roots[i].role);
+        putchar('}');
+    }
+    puts("]}");
+    stable.queue = kqueue();
+    if (stable.queue < 0) { stable_error(&stable, 0, "kqueue_create", errno); goto finish; }
+    for (stable.attempt = 1; stable.attempt <= setup_attempts; ++stable.attempt) {
+        if (!stable_drain(&stable)) goto finish;
+        stable.dirty = false;
+        stable.already_watched = true;
+        s->invalid = s->discovery_incomplete = false;
+        free(participants);
+        participants = NULL;
+        bool complete = stable_discover(&stable, &participants, &participant_count);
+        bool drained = stable_drain(&stable);
+        ready = complete && drained && !stable.dirty && !s->invalid && stable.already_watched;
+        event(s, "stable_setup_attempt");
+        printf(",\"attempt\":%" PRIu64 ",\"participants\":%zu,\"already_watched\":%s,"
+               "\"quiet_complete_pass\":%s}\n", stable.attempt, participant_count,
+               stable.already_watched ? "true" : "false", ready ? "true" : "false");
+        if (ready) break;
+        if (!drained) goto finish;
+        if (stable.attempt == setup_attempts) break;
+    }
+    if (!ready) { stable_error(&stable, 0, "unable_to_stabilize", 0); goto finish; }
+    if (samples > SIZE_MAX / sizeof(*measurements)) {
+        stable_error(&stable, 0, "sample_storage_overflow", EOVERFLOW);
+        goto finish;
+    }
+    measurements = resize(s, NULL, (size_t)samples, sizeof(*measurements));
+    if (!measurements) goto finish;
+    stable.started = true;
+    for (s->sample = 0; s->sample < samples; ++s->sample) {
+        if (!stable_drain(&stable)) break;
+        Row *rows = NULL;
+        size_t count = 0;
+        StableSample measurement = {.begin = mach_absolute_time()};
+        bool complete = stable_discover(&stable, &rows, &count);
+        measurement.end = mach_absolute_time();
+        bool same = complete && stable_same_set(&stable, participants, participant_count, rows, count);
+        if (!same || !stable_rss(s, rows, count, &measurement.rss) || s->invalid) stable.failed = true;
+        measurements[completed++] = measurement;
+        for (size_t i = 0; i < count; ++i) emit_row(s, &rows[i]);
+        if (s->sample == 0) { first = rows; first_count = count; }
+        else { free(last); last = rows; last_count = count; }
+        event(s, "stable_sample_complete");
+        printf(",\"read_begin_ticks\":%" PRIu64 ",\"read_end_ticks\":%" PRIu64
+               ",\"participants\":%zu,\"interval_verified\":false}\n",
+               measurement.begin, measurement.end, count);
+        if (fflush(stdout) || ferror(stdout)) { stable.failed = true; break; }
+        if (!complete || s->sample == samples - 1) break;
+        struct timespec delay = {(time_t)(s->interval_ns / 1000000000),
+                                 (long)(s->interval_ns % 1000000000)};
+        while (nanosleep(&delay, &delay) < 0) {
+            if (errno != EINTR) { stable_error(&stable, 0, "nanosleep", errno); break; }
+        }
+    }
+    if (completed != samples || first_count != participant_count || last_count != participant_count)
+        stable.failed = true;
+    if (!stable.failed && !stable_cpu(s, first, last, participant_count, &cpu_ticks, &cpu_ns, false))
+        stable.failed = true;
+    /* No counter, identity, parent, or enumeration read follows this final drain. */
+    if (!stable_drain(&stable)) stable.failed = true;
+    final_drain_ticks = mach_absolute_time();
+    if (s->invalid) stable.failed = true;
+    if (!stable.failed) {
+        stable_cpu(s, first, last, participant_count, &cpu_ticks, &cpu_ns, true);
+        for (uint64_t i = 0; i < completed; ++i) {
+            event(s, "stable_rss_sample");
+            printf(",\"sample_index\":%" PRIu64 ",\"read_begin_ticks\":%" PRIu64
+                   ",\"read_end_ticks\":%" PRIu64 ",\"rss_sum_bytes\":%" PRIu64
+                   ",\"atomic\":false,\"peak\":false}\n",
+                   i, measurements[i].begin, measurements[i].end, measurements[i].rss);
+        }
+    }
+finish:
+    event(s, "stable_summary");
+    bool valid = ready && stable.started && !stable.failed && !s->invalid && completed == samples;
+    printf(",\"interval_valid\":%s,\"participants\":%zu,\"completed_samples\":%" PRIu64
+           ",\"final_drain_ticks\":%" PRIu64 ",\"own_cpu_delta_ticks\":",
+           valid ? "true" : "false", participant_count, completed, final_drain_ticks);
+    if (valid) printf("%" PRIu64, cpu_ticks); else printf("null");
+    printf(",\"own_cpu_delta_ns\":");
+    if (valid) printf("%" PRIu64, cpu_ns); else printf("null");
+    if (valid) printf(",\"baseline_collection_begin_ticks\":%" PRIu64
+                      ",\"baseline_collection_end_ticks\":%" PRIu64
+                      ",\"final_collection_begin_ticks\":%" PRIu64
+                      ",\"final_collection_end_ticks\":%" PRIu64,
+                      measurements[0].begin, measurements[0].end,
+                      measurements[completed - 1].begin, measurements[completed - 1].end);
+    puts(",\"atomic_interval\":false,\"rss_peak\":false,\"historical_descendants_complete\":false}");
+    if (stable.queue >= 0) close(stable.queue);
+    free(stable.watches);
+    free(participants);
+    free(first);
+    free(last);
+    free(measurements);
+    free(s->roots);
+    return (!valid || fflush(stdout) || ferror(stdout)) ? 2 : 0;
+}
+
 static bool number(const char *text, uint64_t *value, const char **end) {
     if (*text < '0' || *text > '9') return false;
     char *tail;
@@ -441,10 +803,13 @@ static bool number(const char *text, uint64_t *value, const char **end) {
 int main(int argc, char **argv) {
     Sampler s = {0};
     uint64_t samples = 0;
+    uint64_t setup_attempts = 8;
+    bool stable_mode = false, setup_option = false;
     s.roots = calloc((size_t)argc, sizeof(*s.roots));
     if (!s.roots) return 2;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--physical-footprint")) { s.footprint = true; continue; }
+        if (!strcmp(argv[i], "--stable-baseline")) { stable_mode = true; continue; }
         if (i + 1 >= argc) goto usage;
         const char *option = argv[i++], *end;
         uint64_t value;
@@ -458,18 +823,23 @@ int main(int argc, char **argv) {
             for (size_t j = 0; j < s.root_count; ++j)
                 if (s.roots[j].pid == (pid_t)value) goto usage;
             s.roots[s.root_count++] = (Root){.pid = (pid_t)value, .role = end + 1};
+        } else if (!strcmp(option, "--setup-attempts") && !*end) {
+            setup_attempts = value;
+            setup_option = true;
         } else if (!strcmp(option, "--samples") && !*end) samples = value;
         else if (!strcmp(option, "--interval-ms") && !*end && value <= UINT64_MAX / 1000000)
             s.interval_ns = value * 1000000;
         else goto usage;
     }
     if (!s.root_count || !samples || !s.interval_ns) goto usage;
+    if ((setup_option && !stable_mode) || (stable_mode && samples < 2)) goto usage;
     if (mach_timebase_info(&s.timebase) != KERN_SUCCESS ||
         !s.timebase.numer || !s.timebase.denom) {
         error_event(&s, 0, "mach_timebase", 0);
         free(s.roots);
         return 2;
     }
+    if (stable_mode) return run_stable(&s, samples, setup_attempts);
     event(&s, "configuration");
     printf(",\"timebase_numer\":%u,\"timebase_denom\":%u,\"interval_ns\":%" PRIu64
            ",\"requested_samples\":%" PRIu64
@@ -515,7 +885,8 @@ int main(int argc, char **argv) {
     return (s.invalid || fflush(stdout) || ferror(stdout)) ? 2 : 0;
 usage:
     fputs("Usage: measure-processes --owned-root PID:ROLE [--owned-root PID:ROLE ...] "
-          "--interval-ms N --samples N [--physical-footprint]\n", stderr);
+          "--interval-ms N --samples N [--physical-footprint] "
+          "[--stable-baseline [--setup-attempts N]]\n", stderr);
     free(s.roots);
     return 2;
 }

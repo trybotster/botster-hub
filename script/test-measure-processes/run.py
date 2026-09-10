@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 
+import stable_checks
+
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 
@@ -34,9 +36,13 @@ def main():
         binary = str(pathlib.Path(directory) / "measure-processes")
         unit = str(pathlib.Path(directory) / "unit")
         native = str(pathlib.Path(directory) / "native")
+        stable_unit = str(pathlib.Path(directory) / "stable-unit")
+        stable_fixture = str(pathlib.Path(directory) / "stable-fixture")
         flags = ["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1", "-lproc"]
         for source, output in [(ROOT / "measure-processes.c", binary),
-                               (HERE / "unit.c", unit), (HERE / "native.c", native)]:
+                               (HERE / "unit.c", unit), (HERE / "native.c", native),
+                               (HERE / "stable-unit.c", stable_unit),
+                               (HERE / "stable-fixture.c", stable_fixture)]:
             compiled = subprocess.run([*flags, str(source), "-o", output],
                                       capture_output=True, text=True, timeout=30)
             (evidence / f"{source.stem}-compile.log").write_text(compiled.stdout + compiled.stderr)
@@ -58,6 +64,10 @@ def main():
         (evidence / "native-cpu.stderr").write_text(native_result.stderr)
         native_result.check_returncode()
         assert records(native_result)[0]["event"] == "native_cpu_units"
+        stable_result = subprocess.run([stable_unit], capture_output=True, text=True, timeout=10)
+        (evidence / "stable-unit.jsonl").write_text(stable_result.stdout)
+        (evidence / "stable-unit.stderr").write_text(stable_result.stderr)
+        stable_result.check_returncode()
         for arguments in [[], ["--owned-root", "0:bad"],
                           ["--owned-root", "1:bad", "--interval-ms", "-1", "--samples", "1"]]:
             invalid = subprocess.run([binary, *arguments], capture_output=True, timeout=10)
@@ -113,6 +123,7 @@ child.wait(timeout=10)
             owned.stdin.close()
             owned.wait(timeout=15)
             owned.stdout.close()
+        stable_checks.run(binary, stable_fixture, evidence)
     print("All sampler checks passed. No benchmark ran.")
 
 
