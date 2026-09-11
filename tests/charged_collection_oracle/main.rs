@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use botster_hub::test_internals::charged_collection::{InflightQueue, PendingQueue};
+use botster_hub::test_internals::lua_json;
 
 struct Recorder;
 
@@ -232,14 +233,73 @@ fn main() -> ExitCode {
         InflightQueue::type_align()
     );
     LIVE.store(0, Ordering::Release);
-    match grow_queue("pending", PendingQueue::new()).and_then(|_| {
-        LIVE.store(0, Ordering::Release);
-        grow_queue("inflight", InflightQueue::new())
-    }) {
+    match grow_queue("pending", PendingQueue::new())
+        .and_then(|_| {
+            LIVE.store(0, Ordering::Release);
+            grow_queue("inflight", InflightQueue::new())
+        })
+        .and_then(|_| measure_lua_json())
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn measure_lua_json() -> Result<(), String> {
+    for (label, source) in [
+        (
+            "wide-object",
+            r#"
+            local t = {}
+            for i = 1, 32 do
+                t['k' .. i] = 'v' .. i
+            end
+            return t
+            "#,
+        ),
+        (
+            "nested-depth-limit",
+            r#"
+            local t = 'leaf'
+            for _ = 1, 128 do
+                t = { n = t }
+            end
+            return t
+            "#,
+        ),
+        (
+            "array-heavy",
+            r#"
+            local t = {}
+            for i = 1, 64 do
+                t[i] = 'item' .. i
+            end
+            return t
+            "#,
+        ),
+    ] {
+        let prepared = lua_json::prepare(source);
+        let admitted = lua_json::admitted(&prepared);
+        LIVE.store(0, Ordering::Release);
+        begin_record();
+        let built = lua_json::build(&prepared);
+        end_record();
+        let peak = PEAK.load(Ordering::Acquire);
+        let ratio = if admitted == 0 {
+            0.0
+        } else {
+            peak as f64 / admitted as f64
+        };
+        println!("{label} admitted={admitted} peak={peak} ratio={ratio:.6}");
+        if peak > admitted {
+            return Err(format!(
+                "{label}: counted peak {peak} > admitted {admitted}"
+            ));
+        }
+        let _ = built;
+    }
+    Ok(())
 }

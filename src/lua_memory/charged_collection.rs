@@ -233,6 +233,27 @@ impl<T> ChargedVec<T> {
         Ok(())
     }
 
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        let item = self.buf.pop();
+        #[cfg(test)]
+        if self.release_capacity_on_pop {
+            self.capacity_charge = None;
+        }
+        item
+    }
+
+    pub(crate) fn last_mut(&mut self) -> Option<&mut T> {
+        self.buf.last_mut()
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&T> {
+        self.buf.get(index)
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.buf.iter()
+    }
+
     pub(crate) fn swap_remove(&mut self, index: usize) -> T {
         let item = self.buf.swap_remove(index);
         #[cfg(test)]
@@ -749,6 +770,10 @@ mod tests {
         assert_eq!(
             env!("BOTSTER_RUSTC_VERSION"),
             "rustc 1.97.0 (2d8144b78 2026-07-07)"
+        );
+        assert_eq!(
+            crate::lua_memory::layout::btree_internal_size::<String, String>(),
+            640
         );
     }
 

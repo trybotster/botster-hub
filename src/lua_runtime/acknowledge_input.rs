@@ -773,8 +773,13 @@ mod tests {
         let value = lua
             .from_value::<serde_json::Value>(value)
             .map_err(|e| e.to_string())?;
-        let target =
-            super::super::target_from_json(value.get("target")).map_err(|e| e.to_string())?;
+        let target = serde_json::from_value(
+            value
+                .get("target")
+                .cloned()
+                .ok_or_else(|| "coordination target is required".to_owned())?,
+        )
+        .map_err(|error| format!("invalid coordination target: {error}"))?;
         let envelope_id = value
             .get("envelope_id")
             .and_then(serde_json::Value::as_str)

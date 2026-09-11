@@ -162,6 +162,7 @@ impl Drop for CoordinationCallerGuard {
 
 mod callback;
 mod entity_publish;
+pub(crate) mod lua_json;
 #[cfg(test)]
 mod registration_tests;
 mod session_type_spawn;
@@ -232,33 +233,6 @@ impl HubCoordinationBridge {
         Self::new(
             crate::lua_memory::LuaMemoryAccount::new(crate::config::lua_memory_limits()).unwrap(),
         )
-    }
-
-    #[allow(dead_code)]
-    fn publish(&self, envelope: RoutedEnvelope) -> Result<RoutedEnvelopePublishOutcome, String> {
-        let response = self.request(PendingCoordinationOperation::Publish { envelope })?;
-        match response {
-            HubCoordinationResponse::Publish(outcome) => Ok(outcome),
-            _ => Err("coordination publish returned unexpected response".to_string()),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn drain(
-        &self,
-        target: EnvelopeTarget,
-        after: Option<EnvelopeCursor>,
-        limit: usize,
-    ) -> Result<RoutedEnvelopeDrainOutcome, String> {
-        let response = self.request(PendingCoordinationOperation::Drain {
-            target,
-            after,
-            limit,
-        })?;
-        match response {
-            HubCoordinationResponse::Drain(outcome) => Ok(outcome),
-            _ => Err("coordination drain returned unexpected response".to_string()),
-        }
     }
 
     fn acknowledge(
@@ -668,39 +642,12 @@ fn routed_envelope_bytes(envelope: &RoutedEnvelope) -> Option<usize> {
                 .checked_mul(std::mem::size_of::<EnvelopeTarget>())?,
         )?;
     if let Some(extension) = &envelope.payload.extension {
-        bytes = bytes.checked_add(json_retained_bytes(&extension.0)?)?;
+        bytes = bytes.checked_add(lua_json::retained_bytes(&extension.0)?)?;
     }
     for target in &envelope.targets {
         bytes = bytes.checked_add(envelope_target_heap_bytes(target)?)?;
     }
     Some(bytes)
-}
-
-fn json_retained_bytes(value: &serde_json::Value) -> Option<usize> {
-    match value {
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            Some(0)
-        }
-        serde_json::Value::String(text) => Some(text.capacity()),
-        serde_json::Value::Array(items) => {
-            let mut bytes = items
-                .capacity()
-                .checked_mul(std::mem::size_of::<serde_json::Value>())?;
-            for item in items {
-                bytes = bytes.checked_add(json_retained_bytes(item)?)?;
-            }
-            Some(bytes)
-        }
-        serde_json::Value::Object(map) => {
-            let mut bytes = 0usize;
-            for (key, item) in map {
-                bytes = bytes
-                    .checked_add(key.capacity())?
-                    .checked_add(json_retained_bytes(item)?)?;
-            }
-            Some(bytes)
-        }
-    }
 }
 
 struct LuaHostApi {
@@ -2670,7 +2617,8 @@ fn coordination_table(
     Ok(coordination)
 }
 
-enum AdmissionError {
+#[derive(Debug)]
+pub(crate) enum AdmissionError {
     Capacity,
     Runtime(mlua::Error),
 }
@@ -2694,9 +2642,7 @@ fn lua_string_bytes(table: &Table, key: &str) -> Result<Option<mlua::String>, ml
     match table.raw_get::<Value>(key)? {
         Value::Nil => Ok(None),
         Value::String(text) => Ok(Some(text)),
-        _ => Err(mlua::Error::RuntimeError(format!(
-            "coordination field {key} must be a string"
-        ))),
+        _ => Ok(None),
     }
 }
 
@@ -2719,20 +2665,42 @@ fn admit_callback_bytes(
 fn admit_publish_operation(
     memory: &Arc<LuaMemoryAccount>,
     plugin_key: &PluginKey,
-    _lua: &Lua,
+    lua: &Lua,
     args: Value,
 ) -> Result<(PendingCoordinationOperation, LuaCallbackCharge), AdmissionError> {
     let table = lua_table(args)?;
     let id = lua_string_bytes(&table, "id")?
         .ok_or_else(|| mlua::Error::RuntimeError("coordination.publish requires id".into()))?;
     let id_bytes = id.as_bytes();
-    let content_type = lua_string_bytes(&table, "content_type")?;
+    let id_text = utf8_slice(&id_bytes)?;
+    let content_type_lua = lua_string_bytes(&table, "content_type")?;
+    let content_type_bytes = content_type_lua.as_ref().map(mlua::String::as_bytes);
+    let content_type = match &content_type_bytes {
+        Some(bytes) => Some(utf8_slice(bytes)?),
+        None => None,
+    };
     let content_bytes = content_type
-        .as_ref()
-        .map(|text| text.as_bytes().len())
+        .map(str::len)
         .unwrap_or("application/json".len());
-    let body = lua_string_bytes(&table, "body")?;
-    let body_len = body.as_ref().map(|text| text.as_bytes().len()).unwrap_or(0);
+    let body_lua = lua_string_bytes(&table, "body")?;
+    let body_bytes = body_lua.as_ref().map(mlua::String::as_bytes);
+    let body = match &body_bytes {
+        Some(bytes) => Some(utf8_slice(bytes)?),
+        None => None,
+    };
+    let body_len = body.map(str::len).unwrap_or(0);
+    let extension = table.raw_get::<Value>("extension")?;
+    let extension_bytes = match &extension {
+        Value::Nil => 0,
+        value => {
+            let admission = lua_json::value_size(memory, lua, value)?;
+            admission
+                .json_bytes
+                .checked_add(admission.scratch_peak)
+                .ok_or(AdmissionError::Capacity)?
+        }
+    };
+    let created_at = lua_u64(table.raw_get::<Value>("created_at")?).unwrap_or(0);
     let target_table = match table.raw_get::<Value>("target")? {
         Value::Table(target) => target,
         _ => {
@@ -2742,51 +2710,94 @@ fn admit_publish_operation(
         }
     };
     let (target_kind, first, second) = lua_target_strings(&target_table)?;
+    let first_bytes = first.as_bytes();
+    let first_text = utf8_slice(&first_bytes)?;
+    let second_bytes = second.as_ref().map(mlua::String::as_bytes);
+    let second_text = match &second_bytes {
+        Some(bytes) => Some(utf8_slice(bytes)?),
+        None => None,
+    };
     let source_len = "plugin:"
         .len()
         .checked_add(plugin_key.0.len())
         .ok_or(AdmissionError::Capacity)?;
-    let payload = id_bytes
+    let payload = id_text
         .len()
         .checked_add(source_len)
         .and_then(|bytes| bytes.checked_add(content_bytes))
         .and_then(|bytes| bytes.checked_add(body_len))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<EnvelopeTarget>()))
-        .and_then(|bytes| bytes.checked_add(first.as_bytes().len()))
-        .and_then(|bytes| {
-            bytes.checked_add(
-                second
-                    .as_ref()
-                    .map(|text| text.as_bytes().len())
-                    .unwrap_or(0),
-            )
-        })
+        .and_then(|bytes| bytes.checked_add(first_text.len()))
+        .and_then(|bytes| bytes.checked_add(second_text.map(str::len).unwrap_or(0)))
+        .and_then(|bytes| bytes.checked_add(extension_bytes))
         .ok_or(AdmissionError::Capacity)?;
     let entry = admit_callback_bytes(memory, payload)?;
-    let target = envelope_target_from_parts(&target_kind, &first, second.as_ref())?;
-    let content_type = content_type
-        .as_ref()
-        .map(|text| String::from_utf8_lossy(&text.as_bytes()).into_owned())
-        .unwrap_or_else(|| "application/json".to_string());
-    let body = body
-        .map(|text| text.as_bytes().as_ref().to_vec())
-        .unwrap_or_default();
+    let target = envelope_target_from_parts(target_kind, first_text, second_text)?;
+    let content_type = match content_type {
+        Some(text) => exact_string(text),
+        None => exact_string("application/json"),
+    };
+    let body = match body {
+        Some(text) => exact_bytes(text),
+        None => Vec::new(),
+    };
+    let extension = match extension {
+        Value::Nil => None,
+        value => Some(BoundaryJson(lua_json::value_build(memory, lua, &value)?)),
+    };
+    let mut targets = Vec::with_capacity(1);
+    targets.push(target);
+    debug_assert_eq!(targets.len(), targets.capacity());
     Ok((
         PendingCoordinationOperation::Publish {
             envelope: RoutedEnvelope::new(
-                EnvelopeId(String::from_utf8_lossy(&id_bytes).into_owned()),
-                EndpointId(format!("plugin:{}", plugin_key.0)),
-                vec![target],
+                EnvelopeId(exact_string(id_text)),
+                EndpointId(plugin_source(&plugin_key.0)),
+                targets,
                 RoutedEnvelopePayload {
                     content_type,
                     body,
-                    extension: None,
+                    extension,
                 },
-                0,
+                created_at,
             ),
         },
         entry,
     ))
+}
+
+fn plugin_source(plugin_key: &str) -> String {
+    let mut source = String::with_capacity("plugin:".len() + plugin_key.len());
+    source.push_str("plugin:");
+    source.push_str(plugin_key);
+    source
+}
+
+fn exact_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    out.push_str(text);
+    out
+}
+
+fn exact_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+fn utf8_slice(bytes: &[u8]) -> Result<&str, mlua::Error> {
+    std::str::from_utf8(bytes)
+        .map_err(|_| mlua::Error::RuntimeError("coordination requires UTF-8 strings".into()))
+}
+
+fn lua_u64(value: Value) -> Option<u64> {
+    match value {
+        Value::Integer(value) if value >= 0 => Some(value as u64),
+        Value::Number(value) if value.is_finite() && value >= 0.0 && value.fract() == 0.0 => {
+            Some(value as u64)
+        }
+        _ => None,
+    }
 }
 
 fn admit_drain_operation(
@@ -2804,38 +2815,27 @@ fn admit_drain_operation(
         }
     };
     let (target_kind, first, second) = lua_target_strings(&target_table)?;
-    let after = match table.raw_get::<Value>("after")? {
-        Value::Nil => None,
-        Value::Integer(value) if value >= 0 => Some(EnvelopeCursor(value as u64)),
-        Value::Number(value) if value >= 0.0 => Some(EnvelopeCursor(value as u64)),
-        _ => {
-            return Err(mlua::Error::RuntimeError(
-                "coordination.drain after must be a non-negative integer".into(),
-            )
-            .into());
-        }
+    let first_bytes = first.as_bytes();
+    let first_text = utf8_slice(&first_bytes)?;
+    let second_bytes = second.as_ref().map(mlua::String::as_bytes);
+    let second_text = match &second_bytes {
+        Some(bytes) => Some(utf8_slice(bytes)?),
+        None => None,
     };
-    let limit = match table.raw_get::<Value>("limit")? {
-        Value::Nil => 16,
-        Value::Integer(value) if value > 0 => value as usize,
-        Value::Number(value) if value > 0.0 => value as usize,
-        _ => 16,
+    let after = lua_u64(table.raw_get::<Value>("after")?).map(EnvelopeCursor);
+    let limit = match lua_u64(table.raw_get::<Value>("limit")?) {
+        Some(value) => usize::try_from(value).unwrap_or(16),
+        None => 16,
     };
-    let payload = first
-        .as_bytes()
+    let payload = first_text
         .len()
-        .checked_add(
-            second
-                .as_ref()
-                .map(|text| text.as_bytes().len())
-                .unwrap_or(0),
-        )
+        .checked_add(second_text.map(str::len).unwrap_or(0))
         .and_then(|bytes| {
             bytes.checked_add(after.map_or(0, |_| std::mem::size_of::<EnvelopeCursor>()))
         })
         .ok_or(AdmissionError::Capacity)?;
     let entry = admit_callback_bytes(memory, payload)?;
-    let target = envelope_target_from_parts(&target_kind, &first, second.as_ref())?;
+    let target = envelope_target_from_parts(target_kind, first_text, second_text)?;
     Ok((
         PendingCoordinationOperation::Drain {
             target,
@@ -2846,20 +2846,36 @@ fn admit_drain_operation(
     ))
 }
 
+#[derive(Clone, Copy)]
+enum TargetKind {
+    Endpoint,
+    Client,
+    Session,
+    Subscription,
+    Plugin,
+    Stream,
+    Topic,
+}
+
 fn lua_target_strings(
     table: &Table,
-) -> Result<(String, mlua::String, Option<mlua::String>), mlua::Error> {
+) -> Result<(TargetKind, mlua::String, Option<mlua::String>), mlua::Error> {
     let kind = lua_string_bytes(table, "type")?
         .ok_or_else(|| mlua::Error::RuntimeError("coordination target.type is required".into()))?;
-    let kind = String::from_utf8_lossy(&kind.as_bytes()).into_owned();
-    let (first_key, second_key) = match kind.as_str() {
-        "endpoint" => ("endpoint_id", None),
-        "client" => ("client_id", None),
-        "session" => ("session_id", None),
-        "subscription" => ("session_id", Some("subscription_id")),
-        "plugin" => ("plugin_key", None),
-        "stream" => ("stream", None),
-        "topic" => ("topic", None),
+    let kind_bytes = kind.as_bytes();
+    let kind = utf8_slice(&kind_bytes)?;
+    let (target_kind, first_key, second_key) = match kind {
+        "endpoint" => (TargetKind::Endpoint, "endpoint_id", None),
+        "client" => (TargetKind::Client, "client_id", None),
+        "session" => (TargetKind::Session, "session_id", None),
+        "subscription" => (
+            TargetKind::Subscription,
+            "session_id",
+            Some("subscription_id"),
+        ),
+        "plugin" => (TargetKind::Plugin, "plugin_key", None),
+        "stream" => (TargetKind::Stream, "stream", None),
+        "topic" => (TargetKind::Topic, "topic", None),
         _ => {
             return Err(mlua::Error::RuntimeError(
                 "coordination target.type is not recognized".into(),
@@ -2875,87 +2891,44 @@ fn lua_target_strings(
         })?),
         None => None,
     };
-    Ok((kind, first, second))
+    Ok((target_kind, first, second))
 }
 
 fn envelope_target_from_parts(
-    kind: &str,
-    first: &mlua::String,
-    second: Option<&mlua::String>,
+    kind: TargetKind,
+    first: &str,
+    second: Option<&str>,
 ) -> Result<EnvelopeTarget, mlua::Error> {
-    let first = String::from_utf8_lossy(&first.as_bytes()).into_owned();
     Ok(match kind {
-        "endpoint" => EnvelopeTarget::Endpoint {
-            endpoint_id: EndpointId(first),
+        TargetKind::Endpoint => EnvelopeTarget::Endpoint {
+            endpoint_id: EndpointId(exact_string(first)),
         },
-        "client" => EnvelopeTarget::Client {
-            client_id: botster_core::ClientId(first),
+        TargetKind::Client => EnvelopeTarget::Client {
+            client_id: botster_core::ClientId(exact_string(first)),
         },
-        "session" => EnvelopeTarget::Session {
-            session_id: botster_core::SessionId(first),
+        TargetKind::Session => EnvelopeTarget::Session {
+            session_id: botster_core::SessionId(exact_string(first)),
         },
-        "subscription" => EnvelopeTarget::Subscription {
-            session_id: botster_core::SessionId(first),
-            subscription_id: botster_core::SubscriptionId(
-                String::from_utf8_lossy(&second.expect("subscription id").as_bytes()).into_owned(),
-            ),
+        TargetKind::Subscription => EnvelopeTarget::Subscription {
+            session_id: botster_core::SessionId(exact_string(first)),
+            subscription_id: botster_core::SubscriptionId(exact_string(second.ok_or_else(
+                || {
+                    mlua::Error::RuntimeError(
+                        "coordination target.subscription_id is required".into(),
+                    )
+                },
+            )?)),
         },
-        "plugin" => EnvelopeTarget::Plugin {
-            plugin_key: PluginKey(first),
+        TargetKind::Plugin => EnvelopeTarget::Plugin {
+            plugin_key: PluginKey(exact_string(first)),
         },
-        "stream" => EnvelopeTarget::Stream { stream: first },
-        "topic" => EnvelopeTarget::Topic { topic: first },
-        _ => {
-            return Err(mlua::Error::RuntimeError(
-                "coordination target.type is not recognized".into(),
-            ));
-        }
+        TargetKind::Stream => EnvelopeTarget::Stream {
+            stream: exact_string(first),
+        },
+        TargetKind::Topic => EnvelopeTarget::Topic {
+            topic: exact_string(first),
+        },
     })
-}
-
-fn routed_envelope_from_lua(
-    lua: &Lua,
-    plugin_key: PluginKey,
-    args: Value,
-) -> Result<RoutedEnvelope, mlua::Error> {
-    let value = lua.from_value::<serde_json::Value>(args)?;
-    let id = value
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| mlua::Error::RuntimeError("coordination.publish requires id".to_string()))?;
-    let target = target_from_json(value.get("target"))?;
-    let body = value
-        .get("body")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .as_bytes()
-        .to_vec();
-    Ok(RoutedEnvelope::new(
-        EnvelopeId(id.to_string()),
-        EndpointId(format!("plugin:{}", plugin_key.0)),
-        vec![target],
-        RoutedEnvelopePayload {
-            content_type: value
-                .get("content_type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("application/json")
-                .to_string(),
-            body,
-            extension: value.get("extension").cloned().map(BoundaryJson),
-        },
-        value
-            .get("created_at")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-    ))
-}
-
-fn target_from_json(value: Option<&serde_json::Value>) -> Result<EnvelopeTarget, mlua::Error> {
-    let value = value
-        .cloned()
-        .ok_or_else(|| mlua::Error::RuntimeError("coordination target is required".to_string()))?;
-    serde_json::from_value(value)
-        .map_err(|error| mlua::Error::RuntimeError(format!("invalid coordination target: {error}")))
 }
 
 fn registration_from_value(

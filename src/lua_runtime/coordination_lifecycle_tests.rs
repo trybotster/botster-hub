@@ -126,6 +126,42 @@ fn assert_retired(
 }
 
 #[test]
+fn entry_charge_survives_owner_accept_until_reply_retirement() {
+    let (mut daemon, mut state, root) = fixture("entry-lifetime");
+    let runtime = daemon.runtime().unwrap();
+    let memory = runtime.test_lua_memory();
+    let before = memory.usage().1;
+    let bridge = runtime.coordination_bridge();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let caller = request(bridge.clone());
+    drive_until(&mut daemon, &mut state, deadline, |_| {
+        bridge.test_pending_count() == 1
+    });
+    let queued = memory.usage().1;
+    assert!(queued > before);
+    drive_until(&mut daemon, &mut state, deadline, |state| {
+        !bridge.test_admitted_waiters().is_empty() && state.pending_requests.len() == 1
+    });
+    assert_eq!(memory.usage().1, queued);
+    assert_eq!(bridge.test_pending_count(), 0);
+    drive_until(&mut daemon, &mut state, deadline, |state| {
+        !bridge.test_admitted_waiters().is_empty() && state.pending_requests.is_empty()
+    });
+    assert!(matches!(
+        caller.join().unwrap(),
+        Ok(HubCoordinationResponse::Drain(_))
+    ));
+    assert_retired(&daemon, &state, &bridge);
+    assert_eq!(
+        memory.usage().1,
+        before + std::mem::size_of::<PendingCoordinationRequest>(),
+        "entry drops at reply retirement; pending collection capacity remains"
+    );
+    daemon.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn coordination_owner_capacity_wake_resumes_retained_ingress() {
     let (mut daemon, mut state, root) = fixture("owner-capacity");
     let bridge = daemon.runtime().unwrap().coordination_bridge();
@@ -587,7 +623,12 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
     }
     crate::daemon::control::coordination::accept_one(&mut daemon, &mut state);
     assert_eq!(bridge.test_admitted_waiters().len(), 1);
-    assert_eq!(usage(), admitted);
+    let slot = std::mem::size_of::<PendingCoordinationRequest>();
+    assert_eq!(
+        usage(),
+        admitted + slot,
+        "pending collection capacity stays charged after owner accept"
+    );
     gate.release();
     let deadline = Instant::now() + Duration::from_secs(5);
     let disposal = crate::daemon::control::coordination::disposal_bytes().unwrap();
@@ -617,14 +658,14 @@ fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
         "dispose_terminal_requests must place the acknowledged row in Terminal with its lease"
     );
     let _ = caller.join();
-    while usage() != 0 {
+    while usage() != slot {
         assert!(
             Instant::now() < deadline,
             "the last lease endpoint must release after Host disposal"
         );
         thread::yield_now();
     }
-    assert_eq!(usage(), 0);
+    assert_eq!(usage(), slot);
     assert_eq!(state.budget.outstanding(), 0);
     assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
     daemon.stop();
