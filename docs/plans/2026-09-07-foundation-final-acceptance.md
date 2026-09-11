@@ -41,7 +41,10 @@ The Hub writer will next propose the actual shared response and Host command rep
 That assignment permits planning only. Source changes, builds, measurements, and production activation remain separately gated.
 The replacement plan is `/private/tmp/c1-acknowledgement-replacement-plan-20260910-1/plan.md`.
 Root verified its first blocker: production `load_prepared` supplies `memory: None`, so required charged results cannot replace the live path yet.
-Jason must approve the production memory policy before that funding boundary changes. The source remains frozen pending this decision.
+Jason approved production policy wiring on September 10: 16 MiB per Lua state, 128 MiB across states, 8 MiB per Rust callback, and 64 MiB across callbacks.
+This approval permits implementation. It does not permit publication or installation.
+The Hub writer resumes a bounded configuration and account-propagation slice through both production load paths, preserving refusal before replacement.
+The reviewer will separately trace acknowledgement conversion allocations in pinned source. No build, test, or measurement execution is authorized yet.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 Policy approval will not resolve exact allocation sizes, final connected layouts, or their verification.
@@ -66,7 +69,7 @@ Production package loading still uses the unbounded loader. Account construction
 Every charge must survive its allocation through completion, abandonment, failure, and actual destruction.
 The implementation must remain event driven, without a new Owner wait, timer, or polling path.
 The decisive check will exercise acknowledgement through the daemon and verify retained charges before disposal and release after disposal.
-Production limit values, publication, and installation still require their separate approvals.
+Production limit values are approved above. Publication and installation still require their separate approvals.
 
 This is not the final repair phase. Other callback and spawn obligations, matched-client checks, and delivery remain open below.
 The broader foundation accounting and performance requirements also remain separate acceptance gates.
