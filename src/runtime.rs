@@ -355,6 +355,7 @@ pub(crate) struct ManagedSessionSpawnStart {
     spawn: SpawnSessionRequest,
     spawn_error: Option<CoreDaemonError>,
     reserve_operation_id: Option<PendingOperationId>,
+    context_published: bool,
 }
 
 /// Structured Lua-facing session-type spawn response.
@@ -1663,13 +1664,6 @@ impl HubRuntime {
         drop(state);
         let context = materialized.context.clone();
         let metadata = session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
-        {
-            let mut contexts = self.session_contexts.lock().map_err(|_| {
-                ManagedGitError::new("spawn_failed", "session context state is unavailable")
-            })?;
-            contexts.insert(context.context_id.clone(), context.clone());
-            contexts.insert(context.session_id.0.clone(), context.clone());
-        }
         let spawn = SpawnSessionRequest {
             request: materialized.spawn_request,
             metadata,
@@ -1685,6 +1679,7 @@ impl HubRuntime {
             spawn,
             spawn_error: None,
             reserve_operation_id: None,
+            context_published: false,
         })
     }
 
@@ -1693,18 +1688,17 @@ impl HubRuntime {
         &self,
         start: &ManagedSessionSpawnStart,
         prepared: &PreparedManagedWorktree,
-        result: Result<CoreSession, CoreDaemonError>,
+        result: Result<CoreSession, PluginSpawnFailure>,
     ) -> Result<PluginManagedSessionSpawned, ManagedGitError> {
         let context = &start.context;
-        let outcome = result.map_err(|error| {
+        let outcome = result.map_err(|failure| {
             eprintln!(
                 "managed_session_spawn_failed session_id={} core_error={}",
                 context.session_id.0,
-                managed_session_core_error_class(&error)
+                managed_session_core_error_class(&failure.error)
             );
-            if let Ok(mut contexts) = self.session_contexts.lock() {
-                contexts.remove(&context.context_id);
-                contexts.remove(&context.session_id.0);
+            if start.context_published {
+                self.retract_spawn_context(context);
             }
             ManagedGitError::new("spawn_failed", "configured session could not be spawned")
         })?;
@@ -2435,28 +2429,32 @@ impl HubRuntime {
         drop(state);
         let context = materialized.context.clone();
         let metadata = session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
-        {
-            let mut contexts = self
-                .session_contexts
-                .lock()
-                .map_err(|_| "session context lock poisoned".to_string())?;
-            contexts.insert(context.context_id.clone(), context.clone());
-            contexts.insert(context.session_id.0.clone(), context.clone());
-        }
-
         let spawn = SpawnSessionRequest {
             request: materialized.spawn_request,
             metadata,
         };
         let session_id = spawn.request.session_id.clone();
-        let tracker = self.begin_reserve_session(session_id);
+        let retry_tokens = self.take_retained_reservations();
+        let stage = if retry_tokens.is_empty() {
+            PluginSpawnStage::Reserve
+        } else {
+            PluginSpawnStage::RetryRetained
+        };
+        let tracker = if matches!(stage, PluginSpawnStage::Reserve) {
+            self.begin_reserve_session(session_id)
+        } else {
+            self.begin_release_session_reservation(retry_tokens[0].clone())
+        };
         Ok(SessionTypeSpawnStart {
             tracker,
-            stage: PluginSpawnStage::Reserve,
+            stage,
             reservation: None,
             spawn,
             spawn_error: None,
             reserve_operation_id: None,
+            retry_tokens,
+            retry_keep: Vec::new(),
+            context_published: false,
             context,
             session_type_id: materialized.resolved.session_type.session_type_id,
             context_id: materialized.resolved.context_id,
@@ -2467,20 +2465,14 @@ impl HubRuntime {
     fn finish_session_type_spawn(
         &self,
         start: &SessionTypeSpawnStart,
-        result: Result<CoreSession, CoreDaemonError>,
+        result: Result<CoreSession, PluginSpawnFailure>,
     ) -> Result<PluginSessionTypeSpawned, String> {
         let context = &start.context;
-        let outcome = result.map_err(|error| match self.session_contexts.lock() {
-            Ok(mut contexts) => {
-                contexts.remove(&context.context_id);
-                contexts.remove(&context.session_id.0);
-                format!("session type spawn failed: {error}")
+        let outcome = result.map_err(|failure| {
+            if start.context_published {
+                self.retract_spawn_context(context);
             }
-            Err(_) => {
-                format!(
-                    "session type spawn failed: {error}; session context rollback lock poisoned"
-                )
-            }
+            format!("session type spawn failed: {}", failure.error)
         })?;
         Ok(PluginSessionTypeSpawned {
             session_id: outcome.session_id.0,
@@ -3400,6 +3392,62 @@ impl HubRuntime {
             session_id,
             reserve_operation_id,
         }))
+    }
+
+    pub(crate) fn take_retained_reservations(&self) -> Vec<SessionReservation> {
+        self.retained_plugin_reservations
+            .lock()
+            .map(|mut held| std::mem::take(&mut *held))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn store_retained_reservations(&self, tokens: Vec<SessionReservation>) {
+        if let Ok(mut held) = self.retained_plugin_reservations.lock() {
+            *held = tokens;
+        }
+    }
+
+    pub(crate) fn retain_reservation(&self, reservation: SessionReservation) {
+        if let Ok(mut held) = self.retained_plugin_reservations.lock()
+            && !held.iter().any(|existing| existing == &reservation)
+        {
+            held.push(reservation);
+        }
+    }
+
+    pub(crate) fn retained_reservations(&self) -> Vec<SessionReservation> {
+        self.retained_plugin_reservations
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default()
+    }
+
+    fn publish_spawn_context(&self, context: &HubSessionContext) -> Result<(), String> {
+        let mut contexts = self
+            .session_contexts
+            .lock()
+            .map_err(|_| "session context lock poisoned".to_string())?;
+        contexts.insert(context.context_id.clone(), context.clone());
+        contexts.insert(context.session_id.0.clone(), context.clone());
+        Ok(())
+    }
+
+    fn retract_spawn_context(&self, context: &HubSessionContext) {
+        let Ok(mut contexts) = self.session_contexts.lock() else {
+            return;
+        };
+        if contexts
+            .get(&context.context_id)
+            .is_some_and(|stored| stored.context_id == context.context_id)
+        {
+            contexts.remove(&context.context_id);
+        }
+        if contexts
+            .get(&context.session_id.0)
+            .is_some_and(|stored| stored.context_id == context.context_id)
+        {
+            contexts.remove(&context.session_id.0);
+        }
     }
 
     pub(crate) fn begin_spawn_for_owner(
@@ -5033,15 +5081,21 @@ enum InflightPluginCore {
 }
 
 enum PluginSpawnStage {
+    RetryRetained,
     Reserve,
     Lookup,
     SpawnReserved,
     Release,
 }
 
+pub(crate) struct PluginSpawnFailure {
+    pub error: CoreDaemonError,
+    pub disposition: Option<SessionReservationRelease>,
+}
+
 pub(crate) enum PluginSpawnPoll {
     Pending,
-    Ready(Result<CoreSession, CoreDaemonError>),
+    Ready(Result<CoreSession, PluginSpawnFailure>),
 }
 
 /// One session-type spawn in flight on the Core owner thread.
@@ -5052,10 +5106,20 @@ struct SessionTypeSpawnStart {
     spawn: SpawnSessionRequest,
     spawn_error: Option<CoreDaemonError>,
     reserve_operation_id: Option<PendingOperationId>,
+    retry_tokens: Vec<SessionReservation>,
+    retry_keep: Vec<SessionReservation>,
+    context_published: bool,
     context: HubSessionContext,
     session_type_id: String,
     context_id: String,
     context_keys: Vec<String>,
+}
+
+fn spawn_fail(
+    error: CoreDaemonError,
+    disposition: Option<SessionReservationRelease>,
+) -> PluginSpawnPoll {
+    PluginSpawnPoll::Ready(Err(PluginSpawnFailure { error, disposition }))
 }
 
 impl SessionTypeSpawnStart {
@@ -5067,16 +5131,39 @@ impl SessionTypeSpawnStart {
                 self.reserve_operation_id = Some(pending_id);
             }
             match self.stage {
+                PluginSpawnStage::RetryRetained => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused
+                    | CoreTicketPoll::Lost
+                    | CoreTicketPoll::Ready(Err(_)) => {
+                        if !self.retry_tokens.is_empty() {
+                            self.retry_keep.push(self.retry_tokens.remove(0));
+                        }
+                        self.continue_retry_or_reserve(runtime);
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                        result,
+                        ..
+                    })) => {
+                        let held = self.retry_tokens.remove(0);
+                        match result {
+                            Ok(SessionReservationRelease::Released) => {}
+                            Ok(_) | Err(_) => self.retry_keep.push(held),
+                        }
+                        self.continue_retry_or_reserve(runtime);
+                    }
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
                 PluginSpawnStage::Reserve => match self.tracker.poll(runtime) {
                     CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
                     CoreTicketPoll::Refused => {
-                        return PluginSpawnPoll::Ready(Err(core_bridge_error(
-                            CoreTicketError::Overloaded,
-                        )));
+                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
                     }
                     CoreTicketPoll::Lost => {
                         let Some(reserve_id) = self.reserve_operation_id else {
-                            return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
                         };
                         self.tracker = runtime.begin_lookup_session_reservation(
                             self.spawn.request.session_id.clone(),
@@ -5085,32 +5172,34 @@ impl SessionTypeSpawnStart {
                         self.stage = PluginSpawnStage::Lookup;
                     }
                     CoreTicketPoll::Ready(Err(error)) => {
-                        return PluginSpawnPoll::Ready(Err(error));
+                        return spawn_fail(error, None);
                     }
                     CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession { result, .. })) => {
                         match result {
                             Ok(reserved) => {
+                                if runtime.publish_spawn_context(&self.context).is_err() {
+                                    return spawn_fail(CoreDaemonError::Shutdown, None);
+                                }
+                                self.context_published = true;
                                 self.reservation = Some(reserved.clone());
                                 self.tracker = runtime
                                     .begin_spawn_reserved(reserved, self.spawn.clone());
                                 self.stage = PluginSpawnStage::SpawnReserved;
                             }
-                            Err(error) => return PluginSpawnPoll::Ready(Err(error)),
+                            Err(error) => return spawn_fail(error, None),
                         }
                     }
                     CoreTicketPoll::Ready(Ok(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                 },
                 PluginSpawnStage::Lookup => match self.tracker.poll(runtime) {
                     CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
                     CoreTicketPoll::Refused => {
-                        return PluginSpawnPoll::Ready(Err(core_bridge_error(
-                            CoreTicketError::Overloaded,
-                        )));
+                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
                     }
                     CoreTicketPoll::Lost | CoreTicketPoll::Ready(Err(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                     CoreTicketPoll::Ready(Ok(CoreCompletion::LookupSessionReservation {
                         result,
@@ -5124,12 +5213,12 @@ impl SessionTypeSpawnStart {
                             self.stage = PluginSpawnStage::Release;
                         }
                         Ok(None) => {
-                            return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
                         }
-                        Err(error) => return PluginSpawnPoll::Ready(Err(error)),
+                        Err(error) => return spawn_fail(error, None),
                     },
                     CoreTicketPoll::Ready(Ok(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                 },
                 PluginSpawnStage::SpawnReserved => match self.tracker.poll(runtime) {
@@ -5164,7 +5253,7 @@ impl SessionTypeSpawnStart {
                         self.release_or_retain(runtime);
                     }
                     CoreTicketPoll::Ready(Ok(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                 },
                 PluginSpawnStage::Release => match self.tracker.poll(runtime) {
@@ -5173,10 +5262,10 @@ impl SessionTypeSpawnStart {
                     | CoreTicketPoll::Lost
                     | CoreTicketPoll::Ready(Err(_)) => {
                         self.keep_reservation(runtime);
-                        return PluginSpawnPoll::Ready(Err(self
-                            .spawn_error
-                            .take()
-                            .unwrap_or(CoreDaemonError::Shutdown)));
+                        return spawn_fail(
+                            self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown),
+                            Some(SessionReservationRelease::RetainedUnconfirmed),
+                        );
                     }
                     CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
                         result,
@@ -5188,16 +5277,26 @@ impl SessionTypeSpawnStart {
                             .unwrap_or(CoreDaemonError::Shutdown);
                         match result {
                             Ok(SessionReservationRelease::Released) => {
-                                return PluginSpawnPoll::Ready(Err(error));
+                                return spawn_fail(
+                                    error,
+                                    Some(SessionReservationRelease::Released),
+                                );
                             }
-                            Ok(_) | Err(_) => {
+                            Ok(disposition) => {
                                 self.keep_reservation(runtime);
-                                return PluginSpawnPoll::Ready(Err(error));
+                                return spawn_fail(error, Some(disposition));
+                            }
+                            Err(_) => {
+                                self.keep_reservation(runtime);
+                                return spawn_fail(
+                                    error,
+                                    Some(SessionReservationRelease::RetainedUnconfirmed),
+                                );
                             }
                         }
                     }
                     CoreTicketPoll::Ready(Ok(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                 },
             }
@@ -5212,11 +5311,20 @@ impl SessionTypeSpawnStart {
     }
 
     fn keep_reservation(&mut self, runtime: &HubRuntime) {
-        if let Some(held) = self.reservation.take()
-            && let Ok(mut retained) = runtime.retained_plugin_reservations.lock()
-            && !retained.iter().any(|existing| existing == &held)
-        {
-            retained.push(held);
+        if let Some(held) = self.reservation.take() {
+            runtime.retain_reservation(held);
+        }
+    }
+
+    fn continue_retry_or_reserve(&mut self, runtime: &HubRuntime) {
+        if self.retry_tokens.is_empty() {
+            runtime.store_retained_reservations(std::mem::take(&mut self.retry_keep));
+            self.tracker =
+                runtime.begin_reserve_session(self.spawn.request.session_id.clone());
+            self.stage = PluginSpawnStage::Reserve;
+        } else {
+            self.tracker =
+                runtime.begin_release_session_reservation(self.retry_tokens[0].clone());
         }
     }
 }
@@ -5230,16 +5338,17 @@ impl ManagedSessionSpawnStart {
                 self.reserve_operation_id = Some(pending_id);
             }
             match self.stage {
+                PluginSpawnStage::RetryRetained => {
+                    return spawn_fail(CoreDaemonError::Shutdown, None);
+                }
                 PluginSpawnStage::Reserve => match self.tracker.poll(runtime) {
                     CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
                     CoreTicketPoll::Refused => {
-                        return PluginSpawnPoll::Ready(Err(core_bridge_error(
-                            CoreTicketError::Overloaded,
-                        )));
+                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
                     }
                     CoreTicketPoll::Lost => {
                         let Some(reserve_id) = self.reserve_operation_id else {
-                            return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
                         };
                         self.tracker = runtime.begin_lookup_session_reservation_for_owner(
                             self.waiter_id,
@@ -5249,11 +5358,15 @@ impl ManagedSessionSpawnStart {
                         self.stage = PluginSpawnStage::Lookup;
                     }
                     CoreTicketPoll::Ready(Err(error)) => {
-                        return PluginSpawnPoll::Ready(Err(error));
+                        return spawn_fail(error, None);
                     }
                     CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession { result, .. })) => {
                         match result {
                             Ok(reserved) => {
+                                if runtime.publish_spawn_context(&self.context).is_err() {
+                                    return spawn_fail(CoreDaemonError::Shutdown, None);
+                                }
+                                self.context_published = true;
                                 self.reservation = Some(reserved.clone());
                                 self.tracker = runtime.begin_spawn_reserved_for_owner(
                                     self.waiter_id,
@@ -5262,22 +5375,20 @@ impl ManagedSessionSpawnStart {
                                 );
                                 self.stage = PluginSpawnStage::SpawnReserved;
                             }
-                            Err(error) => return PluginSpawnPoll::Ready(Err(error)),
+                            Err(error) => return spawn_fail(error, None),
                         }
                     }
                     CoreTicketPoll::Ready(Ok(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                 },
                 PluginSpawnStage::Lookup => match self.tracker.poll(runtime) {
                     CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
                     CoreTicketPoll::Refused => {
-                        return PluginSpawnPoll::Ready(Err(core_bridge_error(
-                            CoreTicketError::Overloaded,
-                        )));
+                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
                     }
                     CoreTicketPoll::Lost | CoreTicketPoll::Ready(Err(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                     CoreTicketPoll::Ready(Ok(CoreCompletion::LookupSessionReservation {
                         result,
@@ -5293,12 +5404,12 @@ impl ManagedSessionSpawnStart {
                             self.stage = PluginSpawnStage::Release;
                         }
                         Ok(None) => {
-                            return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
                         }
-                        Err(error) => return PluginSpawnPoll::Ready(Err(error)),
+                        Err(error) => return spawn_fail(error, None),
                     },
                     CoreTicketPoll::Ready(Ok(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                 },
                 PluginSpawnStage::SpawnReserved => match self.tracker.poll(runtime) {
@@ -5333,7 +5444,7 @@ impl ManagedSessionSpawnStart {
                         self.release_or_retain(runtime);
                     }
                     CoreTicketPoll::Ready(Ok(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                 },
                 PluginSpawnStage::Release => match self.tracker.poll(runtime) {
@@ -5341,10 +5452,10 @@ impl ManagedSessionSpawnStart {
                     CoreTicketPoll::Refused
                     | CoreTicketPoll::Lost
                     | CoreTicketPoll::Ready(Err(_)) => {
-                        return PluginSpawnPoll::Ready(Err(self
-                            .spawn_error
-                            .take()
-                            .unwrap_or(CoreDaemonError::Shutdown)));
+                        return spawn_fail(
+                            self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown),
+                            Some(SessionReservationRelease::RetainedUnconfirmed),
+                        );
                     }
                     CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
                         result,
@@ -5354,11 +5465,11 @@ impl ManagedSessionSpawnStart {
                             .spawn_error
                             .take()
                             .unwrap_or(CoreDaemonError::Shutdown);
-                        let _ = result;
-                        return PluginSpawnPoll::Ready(Err(error));
+                        let disposition = result.ok();
+                        return spawn_fail(error, disposition);
                     }
                     CoreTicketPoll::Ready(Ok(_)) => {
-                        return PluginSpawnPoll::Ready(Err(CoreDaemonError::Shutdown));
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                 },
             }

@@ -481,6 +481,7 @@ impl ManagedSpawnOperation {
             crate::runtime::PluginSpawnPoll::Pending => return ControlPoll::Pending,
             crate::runtime::PluginSpawnPoll::Ready(result) => result,
         };
+        let disposition = completion.as_ref().err().and_then(|failure| failure.disposition);
         let result = runtime.finish_managed_session_spawn(
             self.spawn.as_ref().expect("managed Core spawn exists"),
             self.prepared.as_ref().expect("managed worktree exists"),
@@ -503,17 +504,21 @@ impl ManagedSpawnOperation {
                         "ensure_timed_out",
                         "the managed session caller left before delivery",
                     ));
-                    self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
+                    self.finish_deferred_error()
                 }
             }
             Ok(spawned) => {
                 runtime.cleanup_managed_session(&spawned);
                 self.deferred_error = Some(timeout_error());
-                self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
+                self.finish_deferred_error()
             }
             Err(error) => {
                 self.deferred_error = Some(error);
-                self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
+                match disposition {
+                    Some(botster_core::SessionReservationRelease::Released) | None => self
+                        .submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None),
+                    Some(_) => self.finish_deferred_error(),
+                }
             }
         }
     }
