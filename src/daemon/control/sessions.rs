@@ -300,23 +300,21 @@ fn handle_daemon_spawn(
                         stage = Stage::Reserve;
                         continue;
                     }
-                    match poll_spawn_ticket(&mut tracker, daemon) {
-                        CoreTicketPoll::Pending => {
-                            #[cfg(test)]
-                            if let Some(runtime) = daemon.runtime() {
-                                if runtime.test_retry_retained_again_on_pending() {
-                                    return ControlPoll::Again;
-                                }
-                                if runtime.test_resubmit_release_on_pending() {
-                                    if let Some(next) =
-                                        submit_release(daemon, waiter_id, retry_tokens[0].clone())
-                                    {
-                                        tracker = next;
-                                    }
-                                }
-                            }
-                            return ControlPoll::Pending;
+                    #[cfg(test)]
+                    if let Some(runtime) = daemon.runtime() {
+                        if runtime.test_retry_retained_again_on_pending() {
+                            return ControlPoll::Again;
                         }
+                        if runtime.test_resubmit_release_on_pending() {
+                            if let Some(next) =
+                                submit_release(daemon, waiter_id, retry_tokens[0].clone())
+                            {
+                                tracker = next;
+                            }
+                        }
+                    }
+                    match poll_spawn_ticket(&mut tracker, daemon) {
+                        CoreTicketPoll::Pending => return ControlPoll::Pending,
                         CoreTicketPoll::Refused
                         | CoreTicketPoll::Lost
                         | CoreTicketPoll::Ready(Err(_)) => {
