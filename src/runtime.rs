@@ -126,9 +126,8 @@ pub struct HubRuntime {
     state: SharedHubState,
     core_daemon: SharedCoreDaemon,
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
-    inflight_plugin_core: std::sync::Arc<
+    inflight_plugin_core:
         Mutex<crate::lua_memory::charged_collection::ChargedVec<InflightPluginCore>>,
-    >,
     retained_plugin_reservations: Mutex<Vec<SessionReservation>>,
     created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
     confirmed_worktree_rollbacks: Mutex<Vec<crate::managed_git_worktrees::PreparedManagedWorktree>>,
@@ -502,9 +501,9 @@ impl HubRuntime {
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
-            inflight_plugin_core: std::sync::Arc::new(Mutex::new(
+            inflight_plugin_core: Mutex::new(
                 crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
-            )),
+            ),
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
@@ -636,9 +635,9 @@ impl HubRuntime {
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
-            inflight_plugin_core: std::sync::Arc::new(Mutex::new(
+            inflight_plugin_core: Mutex::new(
                 crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
-            )),
+            ),
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
@@ -1647,7 +1646,7 @@ impl HubRuntime {
         }
         while let Some(pending) = self.session_type_spawner.take_pending() {
             let slot = match crate::lua_memory::charged_collection::SlotReservation::try_reserve(
-                self.inflight_plugin_core.as_ref(),
+                &self.inflight_plugin_core,
             ) {
                 Ok(slot) => slot,
                 Err(_) => {
@@ -2921,7 +2920,6 @@ impl HubRuntime {
         &self,
     ) -> impl Fn() -> Vec<(String, usize)> + Send + 'static {
         let pending = self.coordination_bridge();
-        let inflight = std::sync::Arc::clone(&self.inflight_plugin_core);
         let runtimes = std::sync::Arc::clone(&self.lua_plugin_runtimes);
         move || {
             let mut owners = Vec::new();
@@ -2932,17 +2930,6 @@ impl HubRuntime {
                 ),
                 pending.test_pending_charge_bytes(),
             ));
-            let inflight_guard = inflight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            owners.push((
-                format!(
-                    "inflight charge_bytes capacity={}",
-                    inflight_guard.capacity()
-                ),
-                inflight_guard.charge_bytes(),
-            ));
-            drop(inflight_guard);
             let runtimes = runtimes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2990,7 +2977,7 @@ impl HubRuntime {
     fn fulfill_pending_coordination_requests(&self) {
         while let Some(pending) = self.coordination_bridge.take_pending() {
             let slot = match crate::lua_memory::charged_collection::SlotReservation::try_reserve(
-                self.inflight_plugin_core.as_ref(),
+                &self.inflight_plugin_core,
             ) {
                 Ok(slot) => slot,
                 Err(_) => {
