@@ -16,15 +16,15 @@ use crate::config::{
 };
 use crate::credentials::{CredentialKeyPurpose, CredentialProviderKind};
 use crate::packages::{
-    HubEmittedEvent, HubPackageEvents, HubPackageManifest,
-    PackageClassification, PackageCompatibility, PackageConfigurationState, PackagePin,
-    PackageProvenance, PackageRecord, PackageRegistrySnapshot, PackageRunnableEntrypoint,
-    PackageSourceMetadata, PackageState, PackageTrust, PackageUpdatePolicy,
+    HubEmittedEvent, HubPackageEvents, HubPackageManifest, PackageClassification,
+    PackageCompatibility, PackageConfigurationState, PackagePin, PackageProvenance, PackageRecord,
+    PackageRegistrySnapshot, PackageRunnableEntrypoint, PackageSourceMetadata, PackageState,
+    PackageTrust, PackageUpdatePolicy,
 };
 use crate::persistence::{
     BootstrapGrantRecord, CapabilityGrantRecord, CredentialKeyReference, DeviceSessionTypeSource,
-    PackageAdmissionDecision,
-    HubAuditEntry, HubState, LocalRuntimeSettings, SchemaMetadata, TrustedBrowserIdentity,
+    HubAuditEntry, HubState, LocalRuntimeSettings, PackageAdmissionDecision, SchemaMetadata,
+    TrustedBrowserIdentity,
 };
 use crate::session_types::PackageSessionType;
 use crate::spawn_targets::SpawnTarget;
@@ -327,7 +327,10 @@ impl HeapSize for HubAuditEntry {
 
 impl HeapSize for DeviceSessionTypeSource {
     fn add_to(&self, walk: &mut HeapWalk) {
-        let Self { root, session_types } = self;
+        let Self {
+            root,
+            session_types,
+        } = self;
         root.add_to(walk);
         session_types.add_to(walk);
     }
@@ -766,7 +769,10 @@ impl HeapSize for botster_core::PackageConfigurationValue {
             | Self::Path { value }
             | Self::Url { value }
             | Self::MultilineText { value } => value.add_to(walk),
-            Self::Number { .. } | Self::Integer { .. } | Self::Boolean { .. } | Self::Secret { .. } => {}
+            Self::Number { .. }
+            | Self::Integer { .. }
+            | Self::Boolean { .. }
+            | Self::Secret { .. } => {}
         }
     }
 }
@@ -1291,8 +1297,8 @@ pub fn admitted_pretty(state: &HubState) -> Result<usize, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HubStartupOptions;
     use crate::RuntimeEnvironment;
+    use crate::config::HubStartupOptions;
 
     #[test]
     fn string_value_internal_node_is_larger_than_string_string() {
@@ -1338,9 +1344,9 @@ mod tests {
     #[test]
     fn empty_hub_state_walk_does_not_select_a_budget() {
         let config = HubStartupOptions {
-            data_directory: crate::config::DataDirectoryOption::Explicit(
-                std::path::PathBuf::from("/private/tmp/hub-state-heap-walk"),
-            ),
+            data_directory: crate::config::DataDirectoryOption::Explicit(std::path::PathBuf::from(
+                "/private/tmp/hub-state-heap-walk",
+            )),
             ..HubStartupOptions::default()
         }
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))

@@ -419,10 +419,7 @@ fn abandonment(admitted: bool) {
     assert!(
         matches!(caller.join().unwrap(), Err(ref message) if message == "coordination request did not complete before timeout")
     );
-    assert_eq!(
-        caller_state.test_bits(),
-        if admitted { 3 } else { 2 }
-    );
+    assert_eq!(caller_state.test_bits(), if admitted { 3 } else { 2 });
     if !admitted {
         crate::daemon::control::coordination::accept_one(&mut daemon, &mut state);
     }

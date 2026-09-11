@@ -55,9 +55,9 @@ pub(crate) const fn continuation_bytes() -> usize {
 }
 
 pub(crate) fn disposal_bytes() -> Option<usize> {
-    crate::daemon::control::pending::terminal_storage_bytes(
-        std::mem::size_of::<CoordinationTerminalPayload>(),
-    )
+    crate::daemon::control::pending::terminal_storage_bytes(std::mem::size_of::<
+        CoordinationTerminalPayload,
+    >())
 }
 
 pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
@@ -87,12 +87,20 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         }
     };
     let (core_storage, continuation_charge, disposal) = match pending.storage {
-        Some(storage) => (Some(storage.core), Some(storage.continuation), Some(storage.disposal)),
+        Some(storage) => (
+            Some(storage.core),
+            Some(storage.continuation),
+            Some(storage.disposal),
+        ),
         None => (None, None, None),
     };
     let retirement = runtime.coordination_retirement(waiter_id);
-    let submission =
-        runtime.submit_coordination_for_owner(&retirement, pending.operation, pending.caller, core_storage);
+    let submission = runtime.submit_coordination_for_owner(
+        &retirement,
+        pending.operation,
+        pending.caller,
+        core_storage,
+    );
     #[cfg(test)]
     if submission.rejected.is_none() {
         runtime
@@ -117,17 +125,20 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             permit: Some(permit),
             must_finish: true,
             past_deadline: false,
-            continuation: ControlContinuation::Coordination(Box::new(CoordinationContinuation {
-                waiter_id,
-                ticket: Some(submission.ticket),
-                response: Some(pending.response),
-                completed: None,
-                rejected: submission.rejected,
-                delivery_failure: None,
-                #[cfg(test)]
-                terminal_drop_probe: pending.terminal_drop_probe,
-                disposal,
-            }), continuation_charge),
+            continuation: ControlContinuation::Coordination(
+                Box::new(CoordinationContinuation {
+                    waiter_id,
+                    ticket: Some(submission.ticket),
+                    response: Some(pending.response),
+                    completed: None,
+                    rejected: submission.rejected,
+                    delivery_failure: None,
+                    #[cfg(test)]
+                    terminal_drop_probe: pending.terminal_drop_probe,
+                    disposal,
+                }),
+                continuation_charge,
+            ),
             retire: None,
         },
     );
@@ -246,7 +257,10 @@ impl CoordinationContinuation {
             retained_completion = Some(result);
             (identity, permit)
         };
-        let storage = self.disposal.take().map(crate::lua_memory::LuaCallbackStorageLease::new);
+        let storage = self
+            .disposal
+            .take()
+            .map(crate::lua_memory::LuaCallbackStorageLease::new);
         Some(crate::host_disposal::Parts {
             storage,
             identity,

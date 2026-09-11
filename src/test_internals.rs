@@ -12,7 +12,7 @@ pub mod allocation_oracle {
 
 #[cfg(feature = "allocation-oracle")]
 pub mod hub_state_heap {
-    pub use crate::hub_state_heap::{admitted_pretty, walk_hub_state, HeapWalk};
+    pub use crate::hub_state_heap::{HeapWalk, admitted_pretty, walk_hub_state};
 }
 
 use botster_core::contract::terminal_wake::WakingTerminalAdapter;

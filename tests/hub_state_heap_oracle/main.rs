@@ -5,8 +5,8 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use botster_hub::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
-use botster_hub::test_internals::hub_state_heap::walk_hub_state;
 use botster_hub::persistence::HubState;
+use botster_hub::test_internals::hub_state_heap::walk_hub_state;
 
 struct Counter;
 
@@ -79,9 +79,9 @@ fn nested_schema(depth: u8) -> serde_json::Value {
 
 fn main() -> ExitCode {
     let config = HubStartupOptions {
-        data_directory: DataDirectoryOption::Explicit(
-            std::path::PathBuf::from("/private/tmp/hub-state-heap-oracle"),
-        ),
+        data_directory: DataDirectoryOption::Explicit(std::path::PathBuf::from(
+            "/private/tmp/hub-state-heap-oracle",
+        )),
         ..HubStartupOptions::default()
     }
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
@@ -92,15 +92,17 @@ fn main() -> ExitCode {
         errors.push(error);
     }
 
-    empty.spawn_targets.push(botster_hub::spawn_targets::SpawnTarget {
-        target_id: "t1".into(),
-        label: "t".into(),
-        root: std::path::PathBuf::from("/tmp/t"),
-        enabled: true,
-        kind: "git".into(),
-        base_ref: Some("main".into()),
-        metadata: [("k".into(), "v".into())].into(),
-    });
+    empty
+        .spawn_targets
+        .push(botster_hub::spawn_targets::SpawnTarget {
+            target_id: "t1".into(),
+            label: "t".into(),
+            root: std::path::PathBuf::from("/tmp/t"),
+            enabled: true,
+            kind: "git".into(),
+            base_ref: Some("main".into()),
+            metadata: [("k".into(), "v".into())].into(),
+        });
     empty.worktrees.push(botster_hub::worktrees::Worktree {
         worktree_id: "w1".into(),
         target_id: "t1".into(),
@@ -116,28 +118,29 @@ fn main() -> ExitCode {
     }
 
     let mut schema_state = HubState::from_config(&config);
-    let schema_record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
-        "manifest": {
-            "name": "oracle.plugin",
-            "version": "1.0.0",
-            "kind": "plugin",
-            "botster": ">=0.1.0",
-            "capabilities": [],
-            "entrypoints": [],
-            "events": { "emitted": [{
-                "name": "e",
-                "payload_schema": nested_schema(8),
-                "audience": ["plugins"]
-            }]}
-        },
-        "state": "enabled",
-        "classification": "plugin",
-        "trust": { "classification": "first_party", "first_party": true },
-        "provenance": { "source": "oracle", "checksum": null },
-        "update_policy": "manual",
-        "last_audit_reason": "oracle"
-    }))
-    .expect("schema record");
+    let schema_record: botster_hub::packages::PackageRecord =
+        serde_json::from_value(serde_json::json!({
+            "manifest": {
+                "name": "oracle.plugin",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "capabilities": [],
+                "entrypoints": [],
+                "events": { "emitted": [{
+                    "name": "e",
+                    "payload_schema": nested_schema(8),
+                    "audience": ["plugins"]
+                }]}
+            },
+            "state": "enabled",
+            "classification": "plugin",
+            "trust": { "classification": "first_party", "first_party": true },
+            "provenance": { "source": "oracle", "checksum": null },
+            "update_policy": "manual",
+            "last_audit_reason": "oracle"
+        }))
+        .expect("schema record");
     schema_state.package_registry.records.push(schema_record);
     if let Err(error) = measure("schema-heavy", &schema_state) {
         errors.push(error);
@@ -151,28 +154,29 @@ fn main() -> ExitCode {
         "type": "object",
         "properties": wide_properties
     });
-    let wide_record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
-        "manifest": {
-            "name": "wide.plugin",
-            "version": "1.0.0",
-            "kind": "plugin",
-            "botster": ">=0.1.0",
-            "capabilities": [],
-            "entrypoints": [],
-            "events": { "emitted": [{
-                "name": "wide",
-                "payload_schema": wide_schema,
-                "audience": ["plugins"]
-            }]}
-        },
-        "state": "enabled",
-        "classification": "plugin",
-        "trust": { "classification": "first_party", "first_party": true },
-        "provenance": { "source": "oracle", "checksum": null },
-        "update_policy": "manual",
-        "last_audit_reason": "wide"
-    }))
-    .expect("wide record");
+    let wide_record: botster_hub::packages::PackageRecord =
+        serde_json::from_value(serde_json::json!({
+            "manifest": {
+                "name": "wide.plugin",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "capabilities": [],
+                "entrypoints": [],
+                "events": { "emitted": [{
+                    "name": "wide",
+                    "payload_schema": wide_schema,
+                    "audience": ["plugins"]
+                }]}
+            },
+            "state": "enabled",
+            "classification": "plugin",
+            "trust": { "classification": "first_party", "first_party": true },
+            "provenance": { "source": "oracle", "checksum": null },
+            "update_policy": "manual",
+            "last_audit_reason": "wide"
+        }))
+        .expect("wide record");
     let mut wide_state = HubState::from_config(&config);
     wide_state.package_registry.records.push(wide_record);
     if let Err(error) = measure("wide-properties", &wide_state) {
@@ -181,10 +185,7 @@ fn main() -> ExitCode {
 
     let mut leaf_properties = serde_json::Map::new();
     for name in "abcdefghijklmnopqrstuvwxyz012345".chars() {
-        leaf_properties.insert(
-            name.to_string(),
-            serde_json::json!({ "type": "string" }),
-        );
+        leaf_properties.insert(name.to_string(), serde_json::json!({ "type": "string" }));
     }
     let shallow_wide = serde_json::json!({
         "type": "object",
@@ -206,47 +207,49 @@ fn main() -> ExitCode {
     }
     let mut shallow_state = HubState::from_config(&config);
     for record_index in 0..4 {
-        let record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
-            "manifest": {
-                "name": format!("shallow{record_index}.plugin"),
-                "version": "1.0.0",
-                "kind": "plugin",
-                "botster": ">=0.1.0",
-                "capabilities": [],
-                "entrypoints": [],
-                "events": { "emitted": emitted }
-            },
-            "state": "enabled",
-            "classification": "plugin",
-            "trust": { "classification": "first_party", "first_party": true },
-            "provenance": { "source": "oracle", "checksum": null },
-            "update_policy": "manual",
-            "last_audit_reason": "shallow"
-        }))
-        .expect("shallow record");
+        let record: botster_hub::packages::PackageRecord =
+            serde_json::from_value(serde_json::json!({
+                "manifest": {
+                    "name": format!("shallow{record_index}.plugin"),
+                    "version": "1.0.0",
+                    "kind": "plugin",
+                    "botster": ">=0.1.0",
+                    "capabilities": [],
+                    "entrypoints": [],
+                    "events": { "emitted": emitted }
+                },
+                "state": "enabled",
+                "classification": "plugin",
+                "trust": { "classification": "first_party", "first_party": true },
+                "provenance": { "source": "oracle", "checksum": null },
+                "update_policy": "manual",
+                "last_audit_reason": "shallow"
+            }))
+            .expect("shallow record");
         shallow_state.package_registry.records.push(record);
     }
     if let Err(error) = measure("shallow-wide-32", &shallow_state) {
         errors.push(error);
     }
 
-    let skipped_record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
-        "manifest": {
-            "name": "skip.plugin",
-            "version": "0.0.1",
-            "kind": "plugin",
-            "botster": ">=0.1.0",
-            "capabilities": [],
-            "entrypoints": []
-        },
-        "state": "disabled",
-        "classification": "plugin",
-        "trust": { "classification": "third_party", "first_party": false },
-        "provenance": { "source": "s", "checksum": null },
-        "update_policy": "manual",
-        "last_audit_reason": "skip"
-    }))
-    .expect("skipped record");
+    let skipped_record: botster_hub::packages::PackageRecord =
+        serde_json::from_value(serde_json::json!({
+            "manifest": {
+                "name": "skip.plugin",
+                "version": "0.0.1",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "capabilities": [],
+                "entrypoints": []
+            },
+            "state": "disabled",
+            "classification": "plugin",
+            "trust": { "classification": "third_party", "first_party": false },
+            "provenance": { "source": "s", "checksum": null },
+            "update_policy": "manual",
+            "last_audit_reason": "skip"
+        }))
+        .expect("skipped record");
     let mut skipped = HubState::from_config(&config);
     skipped.package_registry.records.push(skipped_record);
     if let Err(error) = measure("skipped-options", &skipped) {
