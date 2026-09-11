@@ -62,6 +62,9 @@ Root authorized only that assertion correction, pinned formatting, and one ident
 The reviewer then found that the fixture has no event contract or subscription, so its generation stays zero even during replacement.
 Root paused any rebuild not yet started and required one real event fixture before accepting the generation-preservation test.
 This corrects coverage of an existing acceptance requirement. It does not add a production mechanism or weaken the requirement to source-only evidence.
+Build 2 had already started and passed for revision 5. No tests ran against its incomplete fixture.
+Revision 7 installs a real event subscription and checks nonzero generation, unchanged generation and subscription after both refusals, and replacement on retry.
+Root verified the six frozen source hashes and authorized one identical bounded build for revision 7. Test execution remains separately gated.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
