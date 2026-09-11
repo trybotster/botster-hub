@@ -53,6 +53,10 @@ These caller changes must preserve reload assertions, request identity, and oper
 The reviewer will separately trace acknowledgement conversion allocations in pinned source. No build, test, or measurement execution is authorized yet.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
+The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
+It identifies fixed Rust reference-handle overlap while payload-dependent string bytes use Lua allocation. The full conversion allowance remains unaccepted.
+The returned reference survives serialization. The reviewer must trace its final release through the actual callback return.
+State-owned reference-cache growth, the known reference-stack panic, and the finalizer exclusion remain separate unresolved obligations.
 Policy approval will not resolve exact allocation sizes, final connected layouts, or their verification.
 Connection must fund producer-side errors and must not convert impossible shared reply variants into uncharged acknowledgement errors.
 Continuation and disposal layouts still depend on the actual Host command change. This slice does not duplicate that command.
