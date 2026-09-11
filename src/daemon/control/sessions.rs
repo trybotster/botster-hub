@@ -2492,4 +2492,38 @@ sys.exit(0)
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn occupied_reserve_fails_without_clearing_the_installed_session() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("occupied", Some(worker));
+        let first = spawn_until_ready(
+            &mut daemon,
+            &mut state,
+            "s1-occupied",
+            "true",
+        );
+        assert!(first.error.is_none(), "{first:?}");
+        assert_eq!(first.kind, DaemonResponseKind::Spawned);
+        let second = spawn_until_ready(
+            &mut daemon,
+            &mut state,
+            "s1-occupied",
+            "true",
+        );
+        assert!(second.error.is_some(), "{second:?}");
+        let message = second
+            .error
+            .as_ref()
+            .map(|error| error.message.to_ascii_lowercase())
+            .unwrap_or_default();
+        assert!(
+            message.contains("occupied"),
+            "second Spawn must refuse Occupied: {second:?}"
+        );
+        assert!(daemon.runtime().unwrap().retained_reservations().is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
