@@ -1738,7 +1738,8 @@ fn handle_shutdown_session(
 mod tests {
     use super::*;
     use crate::daemon::control::DaemonObservability;
-    use crate::daemon::owner_loop::drive_ready_test_turn;
+    use crate::daemon::control::managed_git::accept_one;
+    use crate::daemon::owner_loop::{drive_ready_test_turn, publish_completion_wakes};
     use crate::host_executor::TestHostGate;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -3533,6 +3534,74 @@ sys.exit(0)
             body.contains("begin_release_session_reservation"),
             "explicit-event retry must issue a new release"
         );
+    }
+
+    #[test]
+    fn accept_confirmed_rollback_waits_for_owner_capacity() {
+        let (mut daemon, mut state, root) = spawn_fixture("s2-capacity-wait");
+        let mut held = Vec::new();
+        while let Some(permit) = state.budget.reserve() {
+            held.push(permit);
+        }
+        let prepared = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: root.clone(),
+            common_dir: root.clone(),
+            branch: "topic".into(),
+            path: root.join("missing-capacity-worktree"),
+            worktree_id: "wt-capacity".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: false,
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .defer_confirmed_worktree_rollback(prepared);
+        assert!(
+            !daemon
+                .runtime()
+                .unwrap()
+                .take_managed_spawn_notification(),
+            "capacity defer must not self-wake"
+        );
+        accept_one(&mut daemon, &mut state);
+        assert!(state.managed_spawn_waiting_for_owner);
+        assert_eq!(
+            daemon.runtime().unwrap().test_managed_accept_ones(),
+            1
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            1
+        );
+        for _ in 0..8 {
+            publish_completion_wakes(&daemon, &mut state);
+            drive_ready_test_turn(&mut daemon, &mut state);
+        }
+        assert_eq!(
+            daemon.runtime().unwrap().test_managed_accept_ones(),
+            1,
+            "accept_one must stay bounded while owner capacity is exhausted"
+        );
+        state.budget.release(held.pop().expect("held permit"));
+        publish_completion_wakes(&daemon, &mut state);
+        drive_ready_test_turn(&mut daemon, &mut state);
+        assert!(
+            daemon.runtime().unwrap().test_managed_accept_ones() >= 2,
+            "budget release must wake the waiting rollback"
+        );
+        assert!(!state.managed_spawn_waiting_for_owner);
+        for permit in held {
+            state.budget.release(permit);
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
