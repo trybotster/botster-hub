@@ -61,6 +61,12 @@ path = "tests/core_ticket_allocations/main.rs"
 harness = false
 required-features = ["allocation-oracle"]
 
+[[test]]
+name = "hub_state_heap_oracle"
+path = "tests/hub_state_heap_oracle/main.rs"
+harness = false
+required-features = ["allocation-oracle"]
+
 [dev-dependencies]
 botster-hub = { path = ".", features = ["test-internals"] }
 botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "053148f6e8e63c3c38b2cbabd54a6e4e8211143c", features = ["ghostty-terminal"] }
