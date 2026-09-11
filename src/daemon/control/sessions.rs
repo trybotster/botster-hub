@@ -3238,9 +3238,13 @@ sys.exit(0)
             if !walkdir_exists(&managed) {
                 break;
             }
+            let runtime = daemon.runtime().unwrap();
             assert!(
                 Instant::now() < gone,
-                "created worktree must roll back after shutdown confirmation"
+                "created worktree must roll back after Released then Host FinalizeRollback; cleanups={} confirmed={} releases={}",
+                runtime.test_created_worktree_cleanup_count(),
+                runtime.test_confirmed_worktree_rollback_count(),
+                runtime.test_release_session_reservation_begins()
             );
             std::thread::yield_now();
         }
@@ -3302,6 +3306,85 @@ sys.exit(0)
                 .test_session_context(&format!("ctx-{}", first.session_id))
                 .map(|context| context.session_id.0),
             Some(first.session_id.clone())
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_reuse_after_undelivered_keeps_the_created_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-reuse-late", Some(worker));
+        let second_record = record.clone();
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_enqueue_managed_disconnected(
+                botster_core::PluginKey("p1.plugin".into()),
+                "t1".into(),
+                "topic".into(),
+                "agent".into(),
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            );
+        let managed = root.join("managed-worktrees");
+        let queued = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if walkdir_exists(&managed)
+                && daemon
+                    .runtime()
+                    .unwrap()
+                    .session_type_spawner()
+                    .test_managed_queue_len()
+                    == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < queued,
+                "undelivered created worktree must queue identity-matched cleanup"
+            );
+            std::thread::yield_now();
+        }
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let handle = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![second_record],
+            )
+        });
+        let second = pump_until_join(&mut daemon, &mut state, handle).unwrap_or_else(|error| {
+            panic!("reuse spawn: {}: {}", error.kind, error.message);
+        });
+        assert!(second.reused_worktree);
+        assert!(!second.created_worktree);
+        assert!(
+            std::path::Path::new(&second.worktree_path).exists(),
+            "reused worktree must exist: {}",
+            second.worktree_path
+        );
+        let hold = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < hold {
+            pump_core(&mut daemon, &mut state);
+            assert!(
+                std::path::Path::new(&second.worktree_path).exists(),
+                "Released after reuse must not roll back the surviving worktree"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            0,
+            "reuse must drain identity-matched rollback before Host FinalizeRollback"
         );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);

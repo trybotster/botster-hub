@@ -14,7 +14,8 @@ use botster_core::{
     PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
     PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
     RoutedEnvelopePublishOutcome, ReservedSessionSpawnError, SessionId, SessionLifecycleState,
-    SessionReservation, SessionReservationRefusal, SessionReservationRelease, SessionRuntimeErrorKind,
+    SessionReservation, SessionReservationRefusal, SessionReservationRelease,
+    SessionReservationState, SessionRuntimeErrorKind,
     SessionSpawnRequest,
     SubscriptionId, TerminalCapabilitySet, TerminalColorProfile, TerminalSubscriptionGeneration,
 };
@@ -101,8 +102,15 @@ pub type HubStateView = SharedView<HubState>;
 /// generic `DefaultEngineCommand` router; hub callers use explicit methods so
 /// admission and policy boundaries remain visible at the hub layer.
 struct CreatedWorktreeCleanup {
-    shutdown: CoreOperationTracker,
+    worktree_id: String,
+    session_id: SessionId,
     prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+    reservation: SessionReservation,
+    shutdown: Option<CoreOperationTracker>,
+    remove: Option<CoreOperationTracker>,
+    removed: bool,
+    release: Option<CoreOperationTracker>,
+    release_attempted: bool,
 }
 
 pub struct HubRuntime {
@@ -115,8 +123,9 @@ pub struct HubRuntime {
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
     inflight_plugin_core: Mutex<Vec<InflightPluginCore>>,
     retained_plugin_reservations: Mutex<Vec<SessionReservation>>,
-    created_worktrees: Mutex<std::collections::HashMap<String, crate::managed_git_worktrees::PreparedManagedWorktree>>,
     created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
+    confirmed_worktree_rollbacks: Mutex<Vec<crate::managed_git_worktrees::PreparedManagedWorktree>>,
+    suppressed_created_worktree_rollbacks: Arc<Mutex<BTreeSet<String>>>,
     close_work: crate::data_plane::CloseWorkSource,
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
@@ -383,7 +392,7 @@ pub(crate) struct ManagedSessionSpawnStart {
     pub(crate) context: HubSessionContext,
     waiter_id: crate::owner_identity::WaiterId,
     stage: PluginSpawnStage,
-    reservation: Option<SessionReservation>,
+    pub(crate) reservation: Option<SessionReservation>,
     spawn: SpawnSessionRequest,
     spawn_error: Option<CoreDaemonError>,
     reserve_operation_id: Option<PendingOperationId>,
@@ -472,8 +481,9 @@ impl HubRuntime {
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(Vec::new()),
             retained_plugin_reservations: Mutex::new(Vec::new()),
-            created_worktrees: Mutex::new(std::collections::HashMap::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
+            confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
+            suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -587,8 +597,9 @@ impl HubRuntime {
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(Vec::new()),
             retained_plugin_reservations: Mutex::new(Vec::new()),
-            created_worktrees: Mutex::new(std::collections::HashMap::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
+            confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
+            suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -1541,32 +1552,13 @@ impl HubRuntime {
 
     fn fulfill_pending_session_type_spawns(&self) {
         for session_id in self.session_type_spawner.take_abandoned() {
-            let created = self
-                .created_worktrees
-                .lock()
-                .map(|held| held.contains_key(&session_id))
-                .unwrap_or(false);
-            self.cleanup_managed_session(&PluginManagedSessionSpawned {
+            self.cleanup_undelivered_session_type_spawn(&PluginSessionTypeSpawned {
                 session_id: session_id.clone(),
-                target_id: String::new(),
-                branch: String::new(),
-                worktree_id: String::new(),
-                worktree_path: String::new(),
-                base_ref: String::new(),
-                base_commit: String::new(),
-                created_worktree: created,
-                created_branch: false,
-                reused_worktree: false,
+                lifecycle: String::new(),
+                session_type_id: String::new(),
+                context_id: format!("ctx-{session_id}"),
+                context_keys: Vec::new(),
             });
-            if !created {
-                self.cleanup_undelivered_session_type_spawn(&PluginSessionTypeSpawned {
-                    session_id: session_id.clone(),
-                    lifecycle: String::new(),
-                    session_type_id: String::new(),
-                    context_id: format!("ctx-{session_id}"),
-                    context_keys: Vec::new(),
-                });
-            }
         }
         while let Some(pending) = self.session_type_spawner.take_pending() {
             match self.fulfill_session_type_spawn(&pending) {
@@ -1717,6 +1709,10 @@ impl HubRuntime {
         )
         .map_err(|error| ManagedGitError::new(error.kind, error.message))?;
         drop(state);
+        if !prepared.created_worktree {
+            self.cancel_created_worktree_cleanup(&prepared.worktree_id);
+        }
+        self.retry_created_worktree_releases();
         let context = materialized.context.clone();
         let metadata = session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
         let spawn = SpawnSessionRequest {
@@ -1757,7 +1753,6 @@ impl HubRuntime {
             }
             ManagedGitError::new("spawn_failed", "configured session could not be spawned")
         })?;
-        self.remember_created_worktree(&outcome.session_id.0, prepared);
         Ok(PluginManagedSessionSpawned {
             session_id: outcome.session_id.0,
             target_id: prepared.target_id.clone(),
@@ -1774,20 +1769,14 @@ impl HubRuntime {
 
     pub(crate) fn cleanup_managed_session(&self, spawned: &PluginManagedSessionSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
-        let prepared = self
-            .created_worktrees
+        let tracked = self
+            .created_worktree_cleanups
             .lock()
             .ok()
-            .and_then(|mut held| held.remove(&session_id.0));
-        if let Some(prepared) = prepared.filter(|prepared| prepared.created_worktree) {
-            let shutdown = self.begin_shutdown_session(session_id.clone());
-            if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
-                cleanups.push(CreatedWorktreeCleanup {
-                    shutdown,
-                    prepared,
-                });
-            }
-        } else {
+            .is_some_and(|held| {
+                held.iter().any(|cleanup| cleanup.session_id == session_id)
+            });
+        if !tracked {
             self.shutdown_session_detached(session_id.clone());
         }
         if let Ok(mut contexts) = self.session_contexts.lock() {
@@ -1796,16 +1785,111 @@ impl HubRuntime {
         }
     }
 
-    fn remember_created_worktree(
+    pub(crate) fn queue_created_worktree_cleanup(
         &self,
-        session_id: &str,
-        prepared: &crate::managed_git_worktrees::PreparedManagedWorktree,
+        session_id: SessionId,
+        prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+        reservation: SessionReservation,
     ) {
         if !prepared.created_worktree {
             return;
         }
-        if let Ok(mut held) = self.created_worktrees.lock() {
-            held.insert(session_id.to_string(), prepared.clone());
+        if let Ok(mut suppressed) = self.suppressed_created_worktree_rollbacks.lock() {
+            suppressed.remove(&prepared.worktree_id);
+        }
+        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
+            if !cleanups
+                .iter()
+                .any(|cleanup| cleanup.worktree_id == prepared.worktree_id)
+            {
+                let shutdown = self.begin_shutdown_session(session_id.clone());
+                cleanups.push(CreatedWorktreeCleanup {
+                    worktree_id: prepared.worktree_id.clone(),
+                    session_id,
+                    prepared,
+                    reservation,
+                    shutdown: Some(shutdown),
+                    remove: None,
+                    removed: false,
+                    release: None,
+                    release_attempted: false,
+                });
+            }
+        }
+        self.retry_created_worktree_releases();
+    }
+
+    pub(crate) fn cancel_created_worktree_cleanup(&self, worktree_id: &str) {
+        let mut detached = Vec::new();
+        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
+            let mut keep = Vec::new();
+            for mut cleanup in cleanups.drain(..) {
+                if cleanup.worktree_id != worktree_id {
+                    keep.push(cleanup);
+                    continue;
+                }
+                if let Some(tracker) = cleanup.shutdown.take() {
+                    detached.push(tracker);
+                }
+                if let Some(tracker) = cleanup.remove.take() {
+                    detached.push(tracker);
+                }
+                let tracker = cleanup.release.take().unwrap_or_else(|| {
+                    self.begin_release_session_reservation(cleanup.reservation.clone())
+                });
+                detached.push(tracker);
+            }
+            *cleanups = keep;
+        }
+        if let Ok(mut confirmed) = self.confirmed_worktree_rollbacks.lock() {
+            confirmed.retain(|prepared| prepared.worktree_id != worktree_id);
+        }
+        if let Ok(mut suppressed) = self.suppressed_created_worktree_rollbacks.lock() {
+            suppressed.insert(worktree_id.to_string());
+        }
+        if let Ok(mut held) = self.detached_operations.lock() {
+            held.extend(detached);
+        }
+    }
+
+    pub(crate) fn created_worktree_rollback_suppressed(&self, worktree_id: &str) -> bool {
+        self.suppressed_created_worktree_rollbacks
+            .lock()
+            .ok()
+            .is_some_and(|held| held.contains(worktree_id))
+    }
+
+    pub(crate) fn created_worktree_rollback_suppressions(
+        &self,
+    ) -> Arc<Mutex<BTreeSet<String>>> {
+        Arc::clone(&self.suppressed_created_worktree_rollbacks)
+    }
+
+    pub(crate) fn retry_created_worktree_releases(&self) {
+        let Ok(mut cleanups) = self.created_worktree_cleanups.lock() else {
+            return;
+        };
+        for cleanup in cleanups.iter_mut() {
+            if cleanup.shutdown.is_some() || cleanup.remove.is_some() || cleanup.release.is_some()
+            {
+                continue;
+            }
+            if !cleanup.removed {
+                cleanup.remove = Some(self.begin_remove_session(&cleanup.session_id));
+                continue;
+            }
+            let ready = matches!(
+                cleanup.reservation.state(),
+                SessionReservationState::Ended
+                    | SessionReservationState::Reserved
+                    | SessionReservationState::Released
+            );
+            if !cleanup.release_attempted || ready {
+                cleanup.release = Some(
+                    self.begin_release_session_reservation(cleanup.reservation.clone()),
+                );
+                cleanup.release_attempted = true;
+            }
         }
     }
 
@@ -1814,25 +1898,117 @@ impl HubRuntime {
             return;
         };
         let mut keep = Vec::new();
+        let mut confirmed = Vec::new();
         for mut cleanup in cleanups.drain(..) {
-            match cleanup.shutdown.poll(self) {
-                CoreTicketPoll::Ready(Ok(CoreCompletion::ShutdownSession {
-                    result: Ok(()),
+            if let Some(tracker) = cleanup.shutdown.as_mut() {
+                match tracker.poll(self) {
+                    CoreTicketPoll::Pending => {
+                        keep.push(cleanup);
+                        continue;
+                    }
+                    CoreTicketPoll::Ready(_)
+                    | CoreTicketPoll::Lost
+                    | CoreTicketPoll::Refused => {
+                        cleanup.shutdown = None;
+                    }
+                }
+            }
+            if let Some(tracker) = cleanup.remove.as_mut() {
+                match tracker.poll(self) {
+                    CoreTicketPoll::Pending => {
+                        keep.push(cleanup);
+                        continue;
+                    }
+                    CoreTicketPoll::Ready(_)
+                    | CoreTicketPoll::Lost
+                    | CoreTicketPoll::Refused => {
+                        cleanup.remove = None;
+                        cleanup.removed = true;
+                    }
+                }
+            }
+            let Some(tracker) = cleanup.release.as_mut() else {
+                keep.push(cleanup);
+                continue;
+            };
+            match tracker.poll(self) {
+                CoreTicketPoll::Pending => keep.push(cleanup),
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                    result: Ok(SessionReservationRelease::Released),
                     ..
                 })) => {
-                    let _ = crate::managed_git_worktrees::finalize_managed_worktree(
-                        &cleanup.prepared,
-                        crate::managed_git_worktrees::ManagedWorktreeDecision::Rollback,
-                        Instant::now() + Duration::from_secs(15),
-                    );
+                    confirmed.push(cleanup.prepared);
                 }
-                CoreTicketPoll::Pending => keep.push(cleanup),
                 CoreTicketPoll::Ready(_)
                 | CoreTicketPoll::Lost
-                | CoreTicketPoll::Refused => keep.push(cleanup),
+                | CoreTicketPoll::Refused => {
+                    cleanup.release = None;
+                    keep.push(cleanup);
+                }
             }
         }
         *cleanups = keep;
+        drop(cleanups);
+        self.retry_created_worktree_releases();
+        if confirmed.is_empty() {
+            return;
+        }
+        if let Ok(mut held) = self.confirmed_worktree_rollbacks.lock() {
+            held.extend(confirmed);
+        }
+        self.session_type_spawner.publish_managed_spawn();
+    }
+
+    pub(crate) fn defer_confirmed_worktree_rollback(
+        &self,
+        prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+    ) {
+        if let Ok(mut held) = self.confirmed_worktree_rollbacks.lock() {
+            held.push(prepared);
+        }
+        self.session_type_spawner.publish_managed_spawn();
+    }
+
+    pub(crate) fn take_one_confirmed_worktree_rollback(
+        &self,
+    ) -> Option<crate::managed_git_worktrees::PreparedManagedWorktree> {
+        self.confirmed_worktree_rollbacks
+            .lock()
+            .ok()
+            .and_then(|mut held| {
+                if held.is_empty() {
+                    None
+                } else {
+                    Some(held.remove(0))
+                }
+            })
+    }
+
+    pub(crate) fn wake_remaining_confirmed_worktree_rollbacks(&self) {
+        let has_confirmed = self
+            .confirmed_worktree_rollbacks
+            .lock()
+            .ok()
+            .is_some_and(|held| !held.is_empty());
+        if has_confirmed {
+            self.session_type_spawner.publish_managed_spawn();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_created_worktree_cleanup_count(&self) -> usize {
+        self.created_worktree_cleanups
+            .lock()
+            .map(|held| held.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_confirmed_worktree_rollback_count(&self) -> usize {
+        self.confirmed_worktree_rollbacks
+            .lock()
+            .map(|held| held.len())
+            .unwrap_or(0)
     }
 
     fn fulfill_pending_plugin_requests(&self) {
