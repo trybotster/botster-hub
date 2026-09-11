@@ -86,6 +86,11 @@ Independent review accepted the proposed owner and acknowledgement partition, bu
 The Hub writer will trace those ownership edges. The reviewer will inventory argument, return, and re-entry handles across installed callback families.
 The acknowledgement handle count alone cannot size the whole state. The inventory must distinguish fixed counts from payload-dependent counts.
 Any later nesting formula must include the pinned overflow path recorded by Q4, not only its normal-depth limit.
+The ownership trace found no production strong Lua escape. Temporary byte borrows and weak-handle upgrades remain enclosed by synchronous runtime use.
+It found a constructor gap: mlua can panic during partial initialization before creating its owning RawLua Arc, while an ordinary earlier charge releases.
+The trace is `/private/tmp/c1-lua-owner-edge-review-20260910-1/trace.md`. This is source-path evidence, not an executed failure.
+The writer will specify a private owner active before construction, with release after confirmed cleanup and retention when cleanup completion is uncertain.
+That contract must protect the existing VM charge as well as future Rust-state funding. Normal-path policy tests remain valid; unwind accounting is not closed.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
