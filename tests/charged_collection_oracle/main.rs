@@ -1,7 +1,9 @@
 //! Layout.size() versus charged collection capacity on rustc 1.97.0.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::os::raw::c_int;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use botster_hub::test_internals::charged_collection::{InflightQueue, PendingQueue};
@@ -19,22 +21,39 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 static EV_N: AtomicUsize = AtomicUsize::new(0);
 static EV_KIND: [AtomicU8; MAX_EVENTS] = [const { AtomicU8::new(0) }; MAX_EVENTS];
 static EV_SIZE: [AtomicUsize; MAX_EVENTS] = [const { AtomicUsize::new(0) }; MAX_EVENTS];
+static EV_ALIGN: [AtomicUsize; MAX_EVENTS] = [const { AtomicUsize::new(0) }; MAX_EVENTS];
+static XRC_SIZE: AtomicUsize = AtomicUsize::new(0);
+static XRC_ALIGN: AtomicUsize = AtomicUsize::new(0);
+static XRC_LIVE: AtomicUsize = AtomicUsize::new(0);
+static XRC_PEAK: AtomicUsize = AtomicUsize::new(0);
 
-fn record_event(kind: u8, size: usize) {
+fn record_event(kind: u8, layout: Layout) {
     if !RECORD.load(Ordering::Acquire) {
         return;
     }
     let index = EV_N.fetch_add(1, Ordering::AcqRel);
     if index < MAX_EVENTS {
         EV_KIND[index].store(kind, Ordering::Release);
-        EV_SIZE[index].store(size, Ordering::Release);
+        EV_SIZE[index].store(layout.size(), Ordering::Release);
+        EV_ALIGN[index].store(layout.align(), Ordering::Release);
+    }
+    if layout.size() == XRC_SIZE.load(Ordering::Acquire)
+        && layout.align() == XRC_ALIGN.load(Ordering::Acquire)
+        && XRC_SIZE.load(Ordering::Acquire) != 0
+    {
+        if kind == KIND_ALLOC {
+            let live = XRC_LIVE.fetch_add(1, Ordering::AcqRel) + 1;
+            XRC_PEAK.fetch_max(live, Ordering::AcqRel);
+        } else {
+            XRC_LIVE.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
 unsafe impl GlobalAlloc for Recorder {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if RECORD.load(Ordering::Acquire) {
-            record_event(KIND_ALLOC, layout.size());
+            record_event(KIND_ALLOC, layout);
             let live = LIVE.fetch_add(layout.size(), Ordering::AcqRel) + layout.size();
             PEAK.fetch_max(live, Ordering::AcqRel);
         }
@@ -43,7 +62,7 @@ unsafe impl GlobalAlloc for Recorder {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if RECORD.load(Ordering::Acquire) {
-            record_event(KIND_DEALLOC, layout.size());
+            record_event(KIND_DEALLOC, layout);
             LIVE.fetch_sub(layout.size(), Ordering::AcqRel);
         }
         unsafe { System.dealloc(ptr, layout) }
@@ -51,8 +70,11 @@ unsafe impl GlobalAlloc for Recorder {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if RECORD.load(Ordering::Acquire) {
-            record_event(KIND_DEALLOC, layout.size());
-            record_event(KIND_ALLOC, new_size);
+            record_event(KIND_DEALLOC, layout);
+            record_event(
+                KIND_ALLOC,
+                Layout::from_size_align(new_size, layout.align()).unwrap_or(layout),
+            );
             let live = LIVE.load(Ordering::Acquire);
             PEAK.fetch_max(live.saturating_add(new_size), Ordering::AcqRel);
             LIVE.store(
@@ -82,7 +104,21 @@ fn events() -> Vec<(u8, usize)> {
 fn begin_record() {
     EV_N.store(0, Ordering::Release);
     PEAK.store(LIVE.load(Ordering::Acquire), Ordering::Release);
+    XRC_LIVE.store(0, Ordering::Release);
+    XRC_PEAK.store(0, Ordering::Release);
     RECORD.store(true, Ordering::Release);
+}
+
+fn capture_xrc_layout() -> Layout {
+    begin_record();
+    let probe = Arc::new(0 as c_int);
+    end_record();
+    let size = EV_SIZE[0].load(Ordering::Acquire);
+    let align = EV_ALIGN[0].load(Ordering::Acquire);
+    drop(probe);
+    XRC_SIZE.store(size, Ordering::Release);
+    XRC_ALIGN.store(align, Ordering::Release);
+    Layout::from_size_align(size, align).expect("ArcInner<c_int> layout")
 }
 
 fn end_record() {
@@ -232,6 +268,12 @@ fn main() -> ExitCode {
         InflightQueue::type_size(),
         InflightQueue::type_align()
     );
+    let xrc = capture_xrc_layout();
+    println!(
+        "xrc_layout size={} align={} (from Arc::<c_int>, not a hard-coded 24)",
+        xrc.size(),
+        xrc.align()
+    );
     LIVE.store(0, Ordering::Release);
     match grow_queue("pending", PendingQueue::new())
         .and_then(|_| {
@@ -271,10 +313,30 @@ fn measure_lua_json() -> Result<(), String> {
             "#,
         ),
         (
+            "wide-object-tables-8",
+            r#"
+            local t = {}
+            for i = 1, 8 do
+                t['k' .. i] = {}
+            end
+            return t
+            "#,
+        ),
+        (
             "wide-object-tables",
             r#"
             local t = {}
             for i = 1, 32 do
+                t['k' .. i] = {}
+            end
+            return t
+            "#,
+        ),
+        (
+            "wide-object-tables-64",
+            r#"
+            local t = {}
+            for i = 1, 64 do
                 t['k' .. i] = {}
             end
             return t
@@ -312,24 +374,30 @@ fn measure_lua_json() -> Result<(), String> {
         ),
     ] {
         let prepared = lua_json::prepare(source);
+        let model = lua_json::live_refs_peak(&prepared);
         let admitted = lua_json::admitted(&prepared);
         LIVE.store(0, Ordering::Release);
         begin_record();
         let built = lua_json::build(&prepared);
         end_record();
         let peak = PEAK.load(Ordering::Acquire);
+        let measured = XRC_PEAK.load(Ordering::Acquire);
         let ratio = if admitted == 0 {
             0.0
         } else {
             peak as f64 / admitted as f64
         };
-        let live_refs = lua_json::live_refs_peak(&prepared);
         println!(
-            "{label} admitted={admitted} peak={peak} ratio={ratio:.6} live_refs_peak={live_refs}"
+            "{label} admitted={admitted} peak={peak} ratio={ratio:.6} live_refs_peak_model={model} measured_xrc_peak={measured}"
         );
         if peak > admitted {
             return Err(format!(
                 "{label}: counted peak {peak} > admitted {admitted}"
+            ));
+        }
+        if measured > model {
+            return Err(format!(
+                "{label}: measured XRc peak {measured} > model live_refs_peak {model}"
             ));
         }
         let _ = built;
