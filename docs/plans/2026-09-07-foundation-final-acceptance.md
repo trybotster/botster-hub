@@ -65,6 +65,11 @@ This corrects coverage of an existing acceptance requirement. It does not add a 
 Build 2 had already started and passed for revision 5. No tests ran against its incomplete fixture.
 Revision 7 installs a real event subscription and checks nonzero generation, unchanged generation and subscription after both refusals, and replacement on retry.
 Root verified the six frozen source hashes and authorized one identical bounded build for revision 7. Test execution remains separately gated.
+Build 3 passed in 51.994 seconds with no deadline expiry. Root and the reviewer independently verified 990 source inputs and four executable hashes.
+The library test executable SHA256 is `18d5c251ffbd4d646e4bcad03c3fc74bfe493d0ede35671ec0e9832770cdda2d`.
+The JSON stream reports 153 warning events and no errors. Evidence is `/private/tmp/c1-lua-policy-account-build-20260910-3`.
+Root authorized eleven exact tests, once each: six new unit tests, four external configuration tests, and the existing external Lua reload test.
+Each test has a 60-second deadline. Execution must stop at the first failure or identity change; these tests do not certify full callback accounting.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
