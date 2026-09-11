@@ -594,6 +594,11 @@ All five exact interface tests passed, each with one executed test, 1,008 filter
 Evidence is `/private/tmp/c1-charge-transfer-build-20260910-1` and `/private/tmp/c1-charge-transfer-tests-20260910-1`.
 These tests use synthetic charge amounts. They do not establish allocation sizes, callback storage coverage, or production budgets.
 The worker-retention policy request remains unanswered. The interface does not implement or authorize the proposed Core attachment.
+Jason subsequently approved the Core interface and retention policy, provided the design remains event driven.
+Core may release a worker reservation after that worker's join returns. A lost join handle retains its reservation until process exit.
+The implementation must not add polling, periodic scans, timers, or an Owner-thread wait. Existing Host-side joins supply the completion receipt.
+Hub supplies opaque pre-funded reservations. Core owns their worker attachment and release ordering, without Lua policy or production budget values.
+Root will assign one Core writer and preserve the existing Hub writer. Publication, installation, and numerical limits remain outside this approval.
 
 ## Historical verified starting points
 
