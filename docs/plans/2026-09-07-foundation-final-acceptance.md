@@ -95,6 +95,10 @@ The callback inventory found `events.emit` copies its Rust String argument befor
 That argument path needs separate bounded admission with preserved coercion and error behavior; no change to it is authorized in the state-owner contract task.
 Approximate re-entry handle counts are not sizing inputs. The reviewer will refine those counts and the outer Rust-to-Lua entry frames.
 Instruction-hook error allocation remains an open, separate input. The inventory is `/private/tmp/claude-callback-review.OFb8pb/c1-f1-callback-frame-inventory.md`.
+The concrete owner contract is `/private/tmp/c1-lua-state-owner-contract-20260910-1/contract.md`.
+It arms a private charge guard before `Lua::new_with`, transfers Lua into that owner, and releases only after confirmed destruction.
+Its VM-only slice can address the existing unwind gap without selecting Rust-state bytes. Future Rust funding must extend the same owner with a mandatory charge.
+Root checked the pinned constructor's returned-error boundary. Independent contract review precedes source changes; F1 work remains preserved.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
