@@ -22,6 +22,13 @@ Every executor handle will use `Arc::into_inner`; no raw Arc or Weak handle may 
 The final handle must destroy covered owners before explicitly releasing metadata. Failed owner cleanup retains the metadata charge.
 A valid batch may release metadata after destroying its vector, even when allocation unwinds. Allocation failure alone does not require retention.
 The Core writer may implement this contract and focused test source in the same three files. Execution and integration remain separately gated.
+The Core implementation subsequently passed source review, formatting review, its build, and all 21 exact resource tests.
+The tests preserve nine worker-lifetime assertions and add twelve metadata ownership cases, including surviving clones, concurrent release, cleanup panic, and mutex poison.
+Each run executed one test with 124 filtered tests, exit zero, and no deadline expiry. Root verified all 360 source hashes.
+The executable SHA256 is `b725109e6f9982d22fe9b63bcfce2ea1346f10c9eada18c146049780551d4c75`.
+Evidence is `/private/tmp/core-worker-metadata-build-20260910-1` and `/private/tmp/core-worker-metadata-tests-20260910-1`.
+Payload probes establish ownership and destruction behavior. Exact source establishes the reviewed deallocation ordering; no allocation size was measured in this gate.
+Hub integration, final layout sizing, and production policy remain open. No publication or installation occurred.
 The Hub writer will separately prove each affected container's population bound, including retained failures and stale identities.
 Root and the reviewer accepted those element-count proofs: pending requests and coordination capacity waiters are each bounded by Owner capacity.
 Host completions are bounded by the runtime's eight Host permits, including unmatched terminal completions. Pending-row membership is not required for that bound.
