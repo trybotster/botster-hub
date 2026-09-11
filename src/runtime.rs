@@ -3401,9 +3401,13 @@ impl HubRuntime {
             .unwrap_or_default()
     }
 
-    pub(crate) fn store_retained_reservations(&self, tokens: Vec<SessionReservation>) {
+    pub(crate) fn merge_retained_reservations(&self, tokens: Vec<SessionReservation>) {
         if let Ok(mut held) = self.retained_plugin_reservations.lock() {
-            *held = tokens;
+            for token in tokens {
+                if !held.iter().any(|existing| existing == &token) {
+                    held.push(token);
+                }
+            }
         }
     }
 
@@ -3422,7 +3426,16 @@ impl HubRuntime {
             .unwrap_or_default()
     }
 
-    fn publish_spawn_context(&self, context: &HubSessionContext) -> Result<(), String> {
+    #[cfg(test)]
+    pub(crate) fn test_session_context(&self, key: &str) -> Option<crate::session_types::HubSessionContext> {
+        self.session_contexts
+            .lock()
+            .ok()?
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn publish_spawn_context(&self, context: &HubSessionContext) -> Result<(), String> {
         let mut contexts = self
             .session_contexts
             .lock()
@@ -3432,7 +3445,7 @@ impl HubRuntime {
         Ok(())
     }
 
-    fn retract_spawn_context(&self, context: &HubSessionContext) {
+    pub(crate) fn retract_spawn_context(&self, context: &HubSessionContext) {
         let Ok(mut contexts) = self.session_contexts.lock() else {
             return;
         };
@@ -5177,11 +5190,13 @@ impl SessionTypeSpawnStart {
                     CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession { result, .. })) => {
                         match result {
                             Ok(reserved) => {
+                                self.reservation = Some(reserved.clone());
                                 if runtime.publish_spawn_context(&self.context).is_err() {
-                                    return spawn_fail(CoreDaemonError::Shutdown, None);
+                                    self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                    self.release_or_retain(runtime);
+                                    continue;
                                 }
                                 self.context_published = true;
-                                self.reservation = Some(reserved.clone());
                                 self.tracker = runtime
                                     .begin_spawn_reserved(reserved, self.spawn.clone());
                                 self.stage = PluginSpawnStage::SpawnReserved;
@@ -5318,7 +5333,7 @@ impl SessionTypeSpawnStart {
 
     fn continue_retry_or_reserve(&mut self, runtime: &HubRuntime) {
         if self.retry_tokens.is_empty() {
-            runtime.store_retained_reservations(std::mem::take(&mut self.retry_keep));
+            runtime.merge_retained_reservations(std::mem::take(&mut self.retry_keep));
             self.tracker =
                 runtime.begin_reserve_session(self.spawn.request.session_id.clone());
             self.stage = PluginSpawnStage::Reserve;
@@ -5363,11 +5378,13 @@ impl ManagedSessionSpawnStart {
                     CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession { result, .. })) => {
                         match result {
                             Ok(reserved) => {
+                                self.reservation = Some(reserved.clone());
                                 if runtime.publish_spawn_context(&self.context).is_err() {
-                                    return spawn_fail(CoreDaemonError::Shutdown, None);
+                                    self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                    self.release_or_retain(runtime);
+                                    continue;
                                 }
                                 self.context_published = true;
-                                self.reservation = Some(reserved.clone());
                                 self.tracker = runtime.begin_spawn_reserved_for_owner(
                                     self.waiter_id,
                                     reserved,

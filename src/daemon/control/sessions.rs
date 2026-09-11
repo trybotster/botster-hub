@@ -172,16 +172,20 @@ fn retain_explicit_reservation(
     reservation: SessionReservation,
 ) {
     if let Some(runtime) = daemon.runtime() {
-        runtime.retain_reservation(reservation.clone());
+        runtime.retain_reservation(reservation);
+        state.retained_explicit_reservations = runtime.retained_reservations();
     }
-    if state
-        .retained_explicit_reservations
-        .iter()
-        .any(|held| held == &reservation)
-    {
-        return;
+}
+
+fn merge_retry_keep(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    retry_keep: &mut Vec<SessionReservation>,
+) {
+    if let Some(runtime) = daemon.runtime() {
+        runtime.merge_retained_reservations(std::mem::take(retry_keep));
+        state.retained_explicit_reservations = runtime.retained_reservations();
     }
-    state.retained_explicit_reservations.push(reservation);
 }
 
 fn poll_spawn_ticket(
@@ -260,7 +264,7 @@ fn handle_daemon_spawn(
         Release,
     }
     let mut retry_tokens = runtime.take_retained_reservations();
-    retry_tokens.append(&mut std::mem::take(&mut state.retained_explicit_reservations));
+    state.retained_explicit_reservations.clear();
     let mut retry_keep = Vec::new();
     let mut stage = if retry_tokens.is_empty() {
         Stage::Reserve
@@ -284,12 +288,7 @@ fn handle_daemon_spawn(
         match stage {
             Stage::RetryRetained => {
                 if retry_tokens.is_empty() {
-                    state.retained_explicit_reservations.append(&mut retry_keep);
-                    if let Some(runtime) = daemon.runtime() {
-                        runtime.store_retained_reservations(
-                            state.retained_explicit_reservations.clone(),
-                        );
-                    }
+                    merge_retry_keep(daemon, state, &mut retry_keep);
                     let Some(runtime) = daemon.runtime() else {
                         return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
                     };
@@ -316,12 +315,7 @@ fn handle_daemon_spawn(
                             }
                             None => {
                                 retry_keep.append(&mut retry_tokens);
-                                state.retained_explicit_reservations.append(&mut retry_keep);
-                    if let Some(runtime) = daemon.runtime() {
-                        runtime.store_retained_reservations(
-                            state.retained_explicit_reservations.clone(),
-                        );
-                    }
+                                merge_retry_keep(daemon, state, &mut retry_keep);
                                 return ControlPoll::Ready(Err(
                                     DaemonTransportError::DaemonNotRunning,
                                 ));
@@ -340,12 +334,7 @@ fn handle_daemon_spawn(
                             Some(next) => tracker = next,
                             None => {
                                 retry_keep.append(&mut retry_tokens);
-                                state.retained_explicit_reservations.append(&mut retry_keep);
-                    if let Some(runtime) = daemon.runtime() {
-                        runtime.store_retained_reservations(
-                            state.retained_explicit_reservations.clone(),
-                        );
-                    }
+                                merge_retry_keep(daemon, state, &mut retry_keep);
                                 return ControlPoll::Ready(Err(
                                     DaemonTransportError::DaemonNotRunning,
                                 ));
@@ -361,12 +350,7 @@ fn handle_daemon_spawn(
                             Some(next) => tracker = next,
                             None => {
                                 retry_keep.append(&mut retry_tokens);
-                                state.retained_explicit_reservations.append(&mut retry_keep);
-                    if let Some(runtime) = daemon.runtime() {
-                        runtime.store_retained_reservations(
-                            state.retained_explicit_reservations.clone(),
-                        );
-                    }
+                                merge_retry_keep(daemon, state, &mut retry_keep);
                                 return ControlPoll::Ready(Err(
                                     DaemonTransportError::DaemonNotRunning,
                                 ));
@@ -1982,6 +1966,59 @@ mod tests {
     }
 
     #[test]
+    fn merge_retained_keeps_token_pushed_during_take() {
+        let (mut daemon, mut state, root) = spawn_fixture("merge-keep");
+        let waiter = state.current_waiter_id.unwrap();
+        let mut first = daemon.runtime().unwrap().begin_reserve_session_for_owner(
+            waiter,
+            SessionId("s1-merge-a".into()),
+        );
+        let a = wait_reservation(&mut daemon, &mut state, &mut first);
+        let mut second = daemon.runtime().unwrap().begin_reserve_session_for_owner(
+            waiter,
+            SessionId("s1-merge-b".into()),
+        );
+        let b = wait_reservation(&mut daemon, &mut state, &mut second);
+        let runtime = daemon.runtime().unwrap();
+        runtime.retain_reservation(a.clone());
+        let taken = runtime.take_retained_reservations();
+        runtime.retain_reservation(b.clone());
+        runtime.merge_retained_reservations(taken);
+        let held = runtime.retained_reservations();
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().any(|token| token == &a));
+        assert!(held.iter().any(|token| token == &b));
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retract_spawn_context_keeps_unrelated_identity() {
+        let (mut daemon, _state, root) = spawn_fixture("retract-ctx");
+        let runtime = daemon.runtime().unwrap();
+        let live = crate::session_types::HubSessionContext {
+            context_id: "live-ctx".into(),
+            session_id: SessionId("s1-live".into()),
+            values: Default::default(),
+        };
+        let other = crate::session_types::HubSessionContext {
+            context_id: "other-ctx".into(),
+            session_id: SessionId("s1-live".into()),
+            values: Default::default(),
+        };
+        runtime.publish_spawn_context(&live).unwrap();
+        runtime.retract_spawn_context(&other);
+        assert_eq!(
+            runtime
+                .test_session_context("s1-live")
+                .map(|context| context.context_id),
+            Some("live-ctx".into())
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn retry_retained_full_queue_keeps_both_tokens_and_finishes() {
         let (mut daemon, mut state, root) = spawn_fixture("retry-two");
         let waiter = state.current_waiter_id.unwrap();
@@ -1995,8 +2032,8 @@ mod tests {
             SessionId("s1-retry-b".into()),
         );
         let b = wait_reservation(&mut daemon, &mut state, &mut second);
-        state.retained_explicit_reservations.push(a);
-        state.retained_explicit_reservations.push(b);
+        daemon.runtime().unwrap().retain_reservation(a);
+        daemon.runtime().unwrap().retain_reservation(b);
         daemon
             .runtime()
             .unwrap()
@@ -2045,7 +2082,7 @@ mod tests {
             SessionId("s1-concurrent-held".into()),
         );
         let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
-        state.retained_explicit_reservations.push(held);
+        daemon.runtime().unwrap().retain_reservation(held);
         daemon
             .runtime()
             .unwrap()
@@ -2116,7 +2153,7 @@ mod tests {
             SessionId("s1-accept-held".into()),
         );
         let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
-        state.retained_explicit_reservations.push(held);
+        daemon.runtime().unwrap().retain_reservation(held);
         let ControlStep::Pending(mut pending) = handle_runtime(
             &mut daemon,
             &mut state,
