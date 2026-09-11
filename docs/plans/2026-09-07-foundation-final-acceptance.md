@@ -55,8 +55,10 @@ Independent review accepted the plan with one correction: conversion storage is 
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
 It identifies fixed Rust reference-handle overlap while payload-dependent string bytes use Lua allocation. The full conversion allowance remains unaccepted.
-The returned reference survives serialization. The reviewer must trace its final release through the actual callback return.
-State-owned reference-cache growth, the known reference-stack panic, and the finalizer exclusion remain separate unresolved obligations.
+The return trace found four argument handles allocated before body admission. The returned handle releases after body-local charges drop.
+A result record's conversion charge therefore cannot cover the entire callback frame. This reopens that ownership premise, not the policy/account slice.
+Root selected longer-lived state or worker funding for design review. No hidden unsafe return wrapper or numeric allowance is approved.
+State-owned reference-cache and failure-pool growth, the known reference-stack panic, and allocations in Host finalizers remain unresolved obligations.
 Policy approval will not resolve exact allocation sizes, final connected layouts, or their verification.
 Connection must fund producer-side errors and must not convert impossible shared reply variants into uncharged acknowledgement errors.
 Continuation and disposal layouts still depend on the actual Host command change. This slice does not duplicate that command.
