@@ -654,7 +654,7 @@ impl HeapSize for PackageTrust {
             classification,
             first_party,
         } = self;
-        let _ = classification;
+        classification.add_to(walk);
         first_party.add_to(walk);
     }
 }
@@ -678,9 +678,9 @@ impl HeapSize for PackageSourceMetadata {
             git_repo,
         } = self;
         registry_id.add_to(walk);
-        let _copy_registry_kind = registry_kind;
+        registry_kind.add_to(walk);
         entry_id.add_to(walk);
-        let _copy_source_kind = source_kind;
+        source_kind.add_to(walk);
         source_label.add_to(walk);
         git_repo.add_to(walk);
     }
@@ -715,7 +715,7 @@ impl HeapSize for PackageCompatibility {
         } = self;
         botster_requirement.add_to(walk);
         hub_version.add_to(walk);
-        let _copy_result = result;
+        result.add_to(walk);
         diagnostics.add_to(walk);
     }
 }
@@ -737,15 +737,15 @@ impl HeapSize for PackageRunnableEntrypoint {
             process,
         } = self;
         id.add_to(walk);
-        let _ = kind;
-        let _ = launch_mode;
+        kind.add_to(walk);
+        launch_mode.add_to(walk);
         command.add_to(walk);
         args.add_to(walk);
         working_directory.add_to(walk);
-        walk.add(0, 0, injections.len().saturating_mul(size_of::<botster_core::RunnableEntrypointInjection>()));
+        injections.add_to(walk);
         environment.add_to(walk);
         capabilities.add_to(walk);
-        let _ = readiness;
+        readiness.add_to(walk);
         may_supervise.add_to(walk);
         process.add_to(walk);
     }
@@ -850,11 +850,8 @@ impl HeapSize for crate::packages::PackageEnvironmentRequirement {
 impl HeapSize for crate::packages::PackageRunnableProcess {
     fn add_to(&self, walk: &mut HeapWalk) {
         let Self { state, diagnostics } = self;
-        let _ = state;
-        walk.add(0, 0, diagnostics.len().saturating_mul(size_of::<crate::packages::PackageRunnableDiagnostic>()));
-        for diagnostic in diagnostics {
-            diagnostic.add_to(walk);
-        }
+        state.add_to(walk);
+        diagnostics.add_to(walk);
     }
 }
 
@@ -889,7 +886,7 @@ impl HeapSize for botster_core::ExtensionEntrypoint {
             path,
             bootstrap,
         } = self;
-        let _ = runtime;
+        runtime.add_to(walk);
         path.add_to(walk);
         bootstrap.add_to(walk);
     }
@@ -906,7 +903,7 @@ impl HeapSize for botster_core::PackageDependency {
         } = self;
         id.add_to(walk);
         package.add_to(walk);
-        let _ = kind;
+        kind.add_to(walk);
         feature.add_to(walk);
         requirements.add_to(walk);
     }
@@ -951,10 +948,10 @@ impl HeapSize for botster_core::HostProfileMetadata {
         } = self;
         profile_id.add_to(walk);
         compatibility.add_to(walk);
-        let _ = precedence;
+        precedence.add_to(walk);
         required_providers.add_to(walk);
         required_capabilities.add_to(walk);
-        walk.add(0, 0, policy_sections.len().saturating_mul(size_of::<botster_core::HostProfilePolicySection>()));
+        policy_sections.add_to(walk);
     }
 }
 
@@ -990,7 +987,7 @@ impl HeapSize for botster_core::PackageConfigurationGroup {
         id.add_to(walk);
         label.add_to(walk);
         description.add_to(walk);
-        let _ = order;
+        order.add_to(walk);
     }
 }
 
@@ -1009,14 +1006,14 @@ impl HeapSize for botster_core::PackageConfigurationField {
             options,
         } = self;
         key.add_to(walk);
-        let _ = field_type;
+        field_type.add_to(walk);
         label.add_to(walk);
         description.add_to(walk);
         required.add_to(walk);
         default.add_to(walk);
         validation.add_to(walk);
         group.add_to(walk);
-        let _ = order;
+        order.add_to(walk);
         options.add_to(walk);
     }
 }
@@ -1044,11 +1041,11 @@ impl HeapSize for botster_core::PackageConfigurationValidationHints {
             max,
             allowed_extensions,
         } = self;
-        let _ = min_length;
-        let _ = max_length;
+        min_length.add_to(walk);
+        max_length.add_to(walk);
         pattern.add_to(walk);
-        let _ = min;
-        let _ = max;
+        min.add_to(walk);
+        max.add_to(walk);
         allowed_extensions.add_to(walk);
     }
 }
@@ -1067,14 +1064,14 @@ impl HeapSize for botster_core::RunnableEntrypoint {
             readiness,
         } = self;
         id.add_to(walk);
-        let _ = kind;
-        let _ = launch_mode;
+        kind.add_to(walk);
+        launch_mode.add_to(walk);
         command.add_to(walk);
         args.add_to(walk);
-        let _ = working_directory;
-        walk.add(0, 0, injections.len().saturating_mul(size_of::<botster_core::RunnableEntrypointInjection>()));
-        walk.add(0, 0, environment.len().saturating_mul(size_of::<botster_core::RunnableEntrypointEnvironmentRequirement>()));
-        let _ = readiness;
+        working_directory.add_to(walk);
+        injections.add_to(walk);
+        environment.add_to(walk);
+        readiness.add_to(walk);
     }
 }
 
@@ -1091,13 +1088,13 @@ impl HeapSize for botster_ui_contract::PackageSurfaceDescriptor {
             supports,
         } = self;
         id.add_to(walk);
-        let _ = kind;
+        kind.add_to(walk);
         title.add_to(walk);
         description.add_to(walk);
         icon.add_to(walk);
-        let _ = order;
+        order.add_to(walk);
         category.add_to(walk);
-        walk.add(0, 0, supports.len().saturating_mul(size_of::<botster_ui_contract::PackageSurfaceOperation>()));
+        supports.add_to(walk);
     }
 }
 
@@ -1138,10 +1135,10 @@ impl HeapSize for botster_ui_contract::PackageNoticeReactionDeclaration {
         } = self;
         owner.add_to(walk);
         name.add_to(walk);
-        let _ = subject_scope;
+        subject_scope.add_to(walk);
         text_pointer.add_to(walk);
-        let _ = ttl_ms;
-        let _ = severity;
+        ttl_ms.add_to(walk);
+        severity.add_to(walk);
     }
 }
 
@@ -1151,6 +1148,132 @@ impl HeapSize for crate::packages::PackageRunnableDiagnostic {
         kind.add_to(walk);
         message.add_to(walk);
     }
+}
+
+impl HeapSize for u32 {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for crate::packages::PackageTrustClassification {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for crate::packages::PackageRegistrySourceKind {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for crate::packages::PackageRegistryEntrySourceKind {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for crate::packages::PackageCompatibilityResult {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for crate::packages::PackageRunnableProcessState {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::ExtensionRuntime {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::PackageDependencyKind {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::HostProfilePolicySection {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::PackageConfigurationFieldType {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::RunnableEntrypointKind {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::RunnableEntrypointLaunchMode {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::RunnableEntrypointWorkingDirectory {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        match self {
+            Self::PackageRoot | Self::EntrypointDir => {}
+            Self::Relative { path } => path.add_to(walk),
+        }
+    }
+}
+
+impl HeapSize for botster_core::RunnableEntrypointInjection {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            kind,
+            target,
+            required,
+            description,
+        } = self;
+        kind.add_to(walk);
+        target.add_to(walk);
+        required.add_to(walk);
+        description.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::RunnableEntrypointInjectionKind {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::RunnableEntrypointInjectionTarget {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        match self {
+            Self::Environment { name } | Self::Argument { value: name } => name.add_to(walk),
+        }
+    }
+}
+
+impl HeapSize for botster_core::RunnableEntrypointEnvironmentRequirement {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            name,
+            required,
+            default,
+            description,
+        } = self;
+        name.add_to(walk);
+        required.add_to(walk);
+        default.add_to(walk);
+        description.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::RunnableEntrypointReadiness {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self { result_fields } = self;
+        result_fields.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::RunnableEntrypointResultField {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_ui_contract::PackageSurfaceKind {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_ui_contract::PackageSurfaceOperation {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_ui_contract::PackageNoticeSubjectScope {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_ui_contract::PackageNoticeSeverity {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
 }
 
 #[must_use]
