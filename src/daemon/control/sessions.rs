@@ -281,10 +281,10 @@ fn handle_daemon_spawn(
     let mut reserve_operation_id: Option<PendingOperationId> = None;
     ControlStep::pending(move |daemon, state| {
         loop {
-            if let Some(pending_id) = tracker.pending_id() {
-                if matches!(stage, Stage::Reserve) {
-                    reserve_operation_id = Some(pending_id);
-                }
+            if let Some(pending_id) = tracker.pending_id()
+                && matches!(stage, Stage::Reserve)
+            {
+                reserve_operation_id = Some(pending_id);
             }
             match stage {
                 Stage::RetryRetained => {
@@ -2195,27 +2195,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn accepting_queue_releases_a_retained_token_once() {
-        let (mut daemon, mut state, root) = spawn_fixture("accept-release");
-        let waiter = state.current_waiter_id.unwrap();
-        let mut reserve = daemon
-            .runtime()
-            .unwrap()
-            .begin_reserve_session_for_owner(waiter, SessionId("s1-accept-held".into()));
-        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
-        daemon.runtime().unwrap().retain_reservation(held);
-        let ControlStep::Pending(mut pending) = handle_runtime(
-            &mut daemon,
-            &mut state,
-            observability(),
-            DaemonRequest::Spawn {
-                session_id: "s1-accept-next".into(),
-                command: "true".into(),
-            },
-        ) else {
-            panic!("spawn must defer");
-        };
+    fn drive_accepting_queue(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        pending: &mut crate::daemon::control::pending::PendingStep,
+    ) -> botster_hub_client::DaemonResponse {
         assert!(state.retained_explicit_reservations.is_empty());
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut loops = 0_u32;
@@ -2235,7 +2219,7 @@ mod tests {
                 Instant::now() < deadline,
                 "accepting-queue hang loops={loops} again={again} begins={begins} refusals={refusals}"
             );
-            pump_core(&mut daemon, &mut state);
+            pump_core(daemon, state);
             if !armed
                 && daemon
                     .runtime()
@@ -2246,7 +2230,7 @@ mod tests {
                 daemon.runtime().unwrap().test_refuse_next_owner_begins(8);
                 armed = true;
             }
-            match pending.continuation.poll(&mut daemon, &mut state) {
+            match pending.continuation.poll(daemon, state) {
                 ControlPoll::Pending => std::thread::yield_now(),
                 ControlPoll::Again => {
                     again += 1;
@@ -2289,76 +2273,76 @@ mod tests {
         );
         assert!(state.retained_explicit_reservations.is_empty());
         assert!(response.error.is_some());
-        daemon.stop();
-        let _ = std::fs::remove_dir_all(root);
+        response
     }
 
-    #[test]
-    fn accepting_queue_fails_when_retry_returns_again() {
-        let (mut daemon, mut state, root) = spawn_fixture("accept-again");
-        daemon
-            .runtime()
-            .unwrap()
-            .test_set_retry_retained_again_on_pending(true);
+    fn start_accepting_queue(
+        label: &str,
+        held_id: &str,
+        next_id: &str,
+    ) -> (
+        crate::HubDaemon,
+        DaemonControlState,
+        std::path::PathBuf,
+        crate::daemon::control::pending::PendingStep,
+    ) {
+        let (mut daemon, mut state, root) = spawn_fixture(label);
         let waiter = state.current_waiter_id.unwrap();
         let mut reserve = daemon
             .runtime()
             .unwrap()
-            .begin_reserve_session_for_owner(waiter, SessionId("s1-accept-again-held".into()));
+            .begin_reserve_session_for_owner(waiter, SessionId(held_id.into()));
         let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
         daemon.runtime().unwrap().retain_reservation(held);
-        let ControlStep::Pending(mut pending) = handle_runtime(
+        let ControlStep::Pending(pending) = handle_runtime(
             &mut daemon,
             &mut state,
             observability(),
             DaemonRequest::Spawn {
-                session_id: "s1-accept-again-next".into(),
+                session_id: next_id.into(),
                 command: "true".into(),
             },
         ) else {
             panic!("spawn must defer");
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut loops = 0_u32;
-        let mut again = 0_u32;
+        (daemon, state, root, pending)
+    }
+
+    #[test]
+    fn accepting_queue_releases_a_retained_token_once() {
+        let (mut daemon, mut state, root, mut pending) =
+            start_accepting_queue("accept-release", "s1-accept-held", "s1-accept-next");
+        let _response = drive_accepting_queue(&mut daemon, &mut state, &mut pending);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("panic message")
+    }
+
+    #[test]
+    fn accepting_queue_fails_when_retry_returns_again() {
+        let (mut daemon, mut state, root, mut pending) = start_accepting_queue(
+            "accept-again",
+            "s1-accept-again-held",
+            "s1-accept-again-next",
+        );
+        daemon
+            .runtime()
+            .unwrap()
+            .test_set_retry_retained_again_on_pending(true);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            loop {
-                loops += 1;
-                let begins = daemon
-                    .runtime()
-                    .unwrap()
-                    .test_release_session_reservation_begins();
-                let refusals = daemon
-                    .runtime()
-                    .unwrap()
-                    .test_refuse_next_owner_begins_remaining();
-                assert!(
-                    Instant::now() < deadline,
-                    "accepting-again hang loops={loops} again={again} begins={begins} refusals={refusals}"
-                );
-                pump_core(&mut daemon, &mut state);
-                match pending.continuation.poll(&mut daemon, &mut state) {
-                    ControlPoll::Pending => std::thread::yield_now(),
-                    ControlPoll::Again => {
-                        again += 1;
-                        panic!(
-                            "accepting-queue Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
-                        );
-                    }
-                    ControlPoll::Ready(Ok(_)) => panic!("spawn completed under Again ablation"),
-                    ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
-                    _ => std::thread::yield_now(),
-                }
-            }
+            drive_accepting_queue(&mut daemon, &mut state, &mut pending);
         }));
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
         let message = match result {
-            Err(payload) => payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                .expect("Again ablation panic message"),
+            Err(payload) => panic_message(payload),
             Ok(()) => panic!("Again ablation must fail"),
         };
         assert!(
@@ -2370,93 +2354,22 @@ mod tests {
 
     #[test]
     fn accepting_queue_fails_when_release_is_resubmitted() {
-        let (mut daemon, mut state, root) = spawn_fixture("accept-resubmit");
+        let (mut daemon, mut state, root, mut pending) = start_accepting_queue(
+            "accept-resubmit",
+            "s1-accept-resubmit-held",
+            "s1-accept-resubmit-next",
+        );
         daemon
             .runtime()
             .unwrap()
             .test_set_resubmit_release_on_pending(true);
-        let waiter = state.current_waiter_id.unwrap();
-        let mut reserve = daemon
-            .runtime()
-            .unwrap()
-            .begin_reserve_session_for_owner(waiter, SessionId("s1-accept-resubmit-held".into()));
-        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
-        daemon.runtime().unwrap().retain_reservation(held);
-        let ControlStep::Pending(mut pending) = handle_runtime(
-            &mut daemon,
-            &mut state,
-            observability(),
-            DaemonRequest::Spawn {
-                session_id: "s1-accept-resubmit-next".into(),
-                command: "true".into(),
-            },
-        ) else {
-            panic!("spawn must defer");
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut loops = 0_u32;
-        let mut again = 0_u32;
-        let mut armed = false;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            loop {
-                loops += 1;
-                let begins = daemon
-                    .runtime()
-                    .unwrap()
-                    .test_release_session_reservation_begins();
-                let refusals = daemon
-                    .runtime()
-                    .unwrap()
-                    .test_refuse_next_owner_begins_remaining();
-                assert!(
-                    Instant::now() < deadline,
-                    "accepting-resubmit hang loops={loops} again={again} begins={begins} refusals={refusals}"
-                );
-                pump_core(&mut daemon, &mut state);
-                if !armed && begins >= 1 {
-                    daemon.runtime().unwrap().test_refuse_next_owner_begins(8);
-                    armed = true;
-                }
-                match pending.continuation.poll(&mut daemon, &mut state) {
-                    ControlPoll::Pending => std::thread::yield_now(),
-                    ControlPoll::Again => {
-                        again += 1;
-                        panic!(
-                            "accepting-queue Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
-                        );
-                    }
-                    ControlPoll::Ready(Ok(_)) => {
-                        let begins = daemon
-                            .runtime()
-                            .unwrap()
-                            .test_release_session_reservation_begins();
-                        let refusals = daemon
-                            .runtime()
-                            .unwrap()
-                            .test_refuse_next_owner_begins_remaining();
-                        assert_eq!(
-                            begins, 1,
-                            "accepting-queue release begins loops={loops} again={again} begins={begins} refusals={refusals}"
-                        );
-                        assert_eq!(
-                            refusals, 7,
-                            "accepting-queue consumed one refused begin loops={loops} again={again} begins={begins} refusals={refusals}"
-                        );
-                        return;
-                    }
-                    ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
-                    _ => std::thread::yield_now(),
-                }
-            }
+            drive_accepting_queue(&mut daemon, &mut state, &mut pending);
         }));
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
         let message = match result {
-            Err(payload) => payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                .expect("resubmit ablation panic message"),
+            Err(payload) => panic_message(payload),
             Ok(()) => panic!("resubmit ablation must fail"),
         };
         assert!(

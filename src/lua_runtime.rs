@@ -87,6 +87,7 @@ struct CoordinationProgress {
     admitted: Mutex<Vec<crate::owner_identity::WaiterId>>,
 }
 
+#[allow(clippy::large_enum_variant)] // transient owner poll return; Ready moves the queued request out by value
 pub(crate) enum CoordinationIngressPoll {
     Ready(PendingCoordinationRequest),
     Empty,
