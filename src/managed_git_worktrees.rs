@@ -301,6 +301,10 @@ pub fn prepare_managed_worktree(
         ]);
     }
     if let Err(failure) = git_status(Some(&repository_root), &args, deadline, "worktree_conflict") {
+        // Exact-conflict: do not compensate a path already listed as a worktree.
+        // Residue from a partial add that registered, or from `worktree add -b`
+        // that created a branch then failed, is left rather than destroyed.
+        // That unowned artifact is an R1 managed marker, not silent cleanup.
         if path.exists() {
             let listed = list_worktrees(&repository_root, deadline)?;
             if listed.iter().any(|worktree| {

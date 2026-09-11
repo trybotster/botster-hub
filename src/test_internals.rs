@@ -10,6 +10,11 @@ pub mod allocation_oracle {
     pub use crate::data_plane::driver::allocation_oracle::{Phase, Scenario, run, type_layouts};
 }
 
+#[cfg(feature = "allocation-oracle")]
+pub mod hub_state_heap {
+    pub use crate::hub_state_heap::{admitted_pretty, walk_hub_state, HeapWalk};
+}
+
 use botster_core::contract::terminal_wake::WakingTerminalAdapter;
 use botster_core::{
     ClientId, SessionId, SubscriptionId, TerminalCapabilitySet, TerminalSubscriptionGeneration,
