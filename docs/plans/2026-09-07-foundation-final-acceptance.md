@@ -91,6 +91,10 @@ It found a constructor gap: mlua can panic during partial initialization before 
 The trace is `/private/tmp/c1-lua-owner-edge-review-20260910-1/trace.md`. This is source-path evidence, not an executed failure.
 The writer will specify a private owner active before construction, with release after confirmed cleanup and retention when cleanup completion is uncertain.
 That contract must protect the existing VM charge as well as future Rust-state funding. Normal-path policy tests remain valid; unwind accounting is not closed.
+The callback inventory found `events.emit` copies its Rust String argument before body admission. A fixed handle allowance cannot cover those plugin-selected bytes.
+That argument path needs separate bounded admission with preserved coercion and error behavior; no change to it is authorized in the state-owner contract task.
+Approximate re-entry handle counts are not sizing inputs. The reviewer will refine those counts and the outer Rust-to-Lua entry frames.
+Instruction-hook error allocation remains an open, separate input. The inventory is `/private/tmp/claude-callback-review.OFb8pb/c1-f1-callback-frame-inventory.md`.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
