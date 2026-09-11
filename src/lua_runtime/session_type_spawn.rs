@@ -95,3 +95,76 @@ fn convert_json<T: serde::Serialize>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+    use crate::runtime::{HubSessionTypeSpawner, PluginManagedSessionSpawned};
+
+    fn spawned() -> PluginManagedSessionSpawned {
+        PluginManagedSessionSpawned {
+            session_id: "s1-abandon".into(),
+            target_id: "t1".into(),
+            branch: "topic".into(),
+            worktree_id: "wt".into(),
+            worktree_path: "/tmp/wt".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: false,
+            reused_worktree: false,
+        }
+    }
+
+    #[test]
+    fn managed_conversion_quota_abandons_the_session() {
+        let lua = Lua::new();
+        let account = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1024,
+            total_vm_bytes: 1024,
+            per_callback_bytes: 1,
+            total_callback_bytes: 1,
+        })
+        .expect("tiny callback account");
+        let spawner = std::sync::Arc::new(HubSessionTypeSpawner::new());
+        let failure = lua.create_string("conversion failed").unwrap();
+        let value = convert_managed_spawned(
+            &lua,
+            Some(&account),
+            &spawner,
+            &spawned(),
+            &failure,
+        )
+        .unwrap();
+        assert!(matches!(value, Value::String(_)));
+        assert_eq!(
+            spawner.test_take_abandoned(),
+            vec!["s1-abandon".to_string()]
+        );
+    }
+
+    #[test]
+    fn managed_conversion_success_does_not_abandon() {
+        let lua = Lua::new();
+        let account = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 64 * 1024,
+            total_vm_bytes: 64 * 1024,
+            per_callback_bytes: 64 * 1024,
+            total_callback_bytes: 64 * 1024,
+        })
+        .expect("callback account");
+        let spawner = std::sync::Arc::new(HubSessionTypeSpawner::new());
+        let failure = lua.create_string("conversion failed").unwrap();
+        let value = convert_managed_spawned(
+            &lua,
+            Some(&account),
+            &spawner,
+            &spawned(),
+            &failure,
+        )
+        .unwrap();
+        assert!(!matches!(value, Value::String(ref s) if s == &failure));
+        assert!(spawner.test_take_abandoned().is_empty());
+    }
+}
