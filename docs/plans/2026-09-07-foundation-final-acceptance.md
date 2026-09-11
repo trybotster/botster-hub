@@ -4,6 +4,30 @@ Status: source publication complete on September 9, 2026. Full foundation accept
 
 ## Active repair: plugin rendering on September 9
 
+### Current phase: connect acknowledgement accounting
+
+Jason authorized this phase after the local Core worker-resource checkpoint `abee4bb` passed nine focused tests.
+The outcome is accounted acknowledgement execution through the actual daemon, including refusal, timeout, result conversion, and disposal.
+Core owns generic attachment lifetimes. Hub owns admission, byte policy, and charge transfer. Lua retains plugin behavior.
+Root coordinates the existing writers and reviewer. No new agent is required.
+
+The first gate resolves attachment metadata ownership and fixes the exact Hub implementation boundary.
+The Core writer will propose ownership for the input vector, resource Box, join-record vector, and executor Arc.
+The Hub writer will map account construction, both production load paths, and the acknowledgement storage owners to concrete changes.
+The reviewer will check those premises before Root authorizes source changes or new measurement execution.
+Both assignments reuse the verified worker-lifetime, shared-admission, charge-split, and consumer evidence.
+
+Admission must precede allocation. Capacity refusal must preserve the old registration during reload.
+Every charge must survive its allocation through completion, abandonment, failure, and actual destruction.
+The implementation must remain event driven, without a new Owner wait, timer, or polling path.
+The decisive check will exercise acknowledgement through the daemon and verify retained charges before disposal and release after disposal.
+Production limit values, publication, and installation still require their separate approvals.
+
+This is not the final repair phase. Other callback and spawn obligations, matched-client checks, and delivery remain open below.
+The broader foundation accounting and performance requirements also remain separate acceptance gates.
+
+### Repair contract and evidence
+
 Jason requested orchestration of the Workspaces render failure under the existing north star.
 The required outcome is a usable plugin surface with configured spawn targets and responsive sibling operations.
 Jason explicitly included both the stall repair and callback memory accounting in this delivery.
