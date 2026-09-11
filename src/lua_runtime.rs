@@ -864,8 +864,6 @@ struct LuaState {
 struct LuaStateCharges {
     // None means completed cleanup disarmed this mandatory reservation.
     vm: Option<LuaVmCharge>,
-    // The hook owns Rust strings until Lua collects its error userdata.
-    hook_errors: Option<LuaCallbackCharge>,
     instruction_error: Option<LuaCallbackCharge>,
 }
 
@@ -873,14 +871,12 @@ impl LuaStateCharges {
     fn new(vm: LuaVmCharge) -> Self {
         Self {
             vm: Some(vm),
-            hook_errors: None,
             instruction_error: None,
         }
     }
 
     fn release(&mut self) {
         drop(self.instruction_error.take());
-        drop(self.hook_errors.take());
         drop(self.vm.take());
     }
 }
@@ -889,9 +885,6 @@ impl Drop for LuaStateCharges {
     fn drop(&mut self) {
         if let Some(instruction_error) = self.instruction_error.take() {
             std::mem::forget(instruction_error);
-        }
-        if let Some(hook_errors) = self.hook_errors.take() {
-            std::mem::forget(hook_errors);
         }
         if let Some(vm) = self.vm.take() {
             std::mem::forget(vm);
@@ -913,28 +906,6 @@ enum LuaStateDropPhase {
 }
 
 impl LuaState {
-    #[cfg(test)]
-    fn admit_hook_errors(
-        &mut self,
-        memory: &Arc<LuaMemoryAccount>,
-    ) -> Result<(), LuaPluginRuntimeError> {
-        assert!(self.charges.hook_errors.is_none());
-        // WrappedFailure contains an Error. Its Lua allocation is at least this size.
-        // Excluding Lua's userdata header makes this count conservative on every target.
-        let count = memory.limits().per_vm_bytes / std::mem::size_of::<mlua::Error>();
-        let bytes = count
-            .checked_mul(INSTRUCTION_BUDGET_ERROR.len())
-            .ok_or_else(|| {
-                LuaPluginRuntimeError::Load("Lua hook error allowance overflow".into())
-            })?;
-        self.charges.hook_errors = Some(
-            memory
-                .reserve_shared_callback_storage(bytes)
-                .map_err(|error| LuaPluginRuntimeError::Load(error.to_string()))?,
-        );
-        Ok(())
-    }
-
     fn new(vm: LuaVmCharge) -> mlua::Result<Self> {
         Self::construct(
             vm,
@@ -1005,6 +976,75 @@ impl Drop for LuaState {
     }
 }
 
+#[cfg(feature = "allocation-oracle")]
+pub struct HookRaiseStorm {
+    state: LuaState,
+    budget: Arc<AtomicU64>,
+}
+
+#[cfg(feature = "allocation-oracle")]
+pub fn prepare_hook_raise_storm() -> Result<HookRaiseStorm, String> {
+    let memory = LuaMemoryAccount::new(crate::config::lua_memory_limits())
+        .map_err(|error| format!("{error:?}"))?;
+    let mut state = LuaState::new(memory.reserve_vm().map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let shared: Arc<dyn Error + Send + Sync> = Arc::new(InstructionBudgetExceeded);
+    let charge = memory
+        .reserve_shared_callback_storage(crate::lua_memory::layout::arc_bytes::<
+            InstructionBudgetExceeded,
+        >())
+        .map_err(|error| error.to_string())?;
+    state.hold_instruction_error(charge);
+    let lua = state.lua();
+    lua.set_memory_limit(memory.limits().per_vm_bytes)
+        .map_err(|error| error.to_string())?;
+    let budget = Arc::new(AtomicU64::new(1_000));
+    let hook_budget = Arc::clone(&budget);
+    let hook_error = Arc::clone(&shared);
+    lua.set_hook(
+        HookTriggers::new().every_nth_instruction(1_000),
+        move |_lua, _debug| {
+            let previous = hook_budget.fetch_sub(1_000, Ordering::Relaxed);
+            if previous <= 1_000 {
+                return Err(mlua::Error::ExternalError(Arc::clone(&hook_error)));
+            }
+            Ok(VmState::Continue)
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    lua.load("kept = {}; for i = 1, 32 do kept[i] = false end")
+        .exec()
+        .map_err(|error| error.to_string())?;
+    Ok(HookRaiseStorm { state, budget })
+}
+
+#[cfg(feature = "allocation-oracle")]
+impl HookRaiseStorm {
+    pub fn used_memory(&self) -> usize {
+        self.state.lua().used_memory()
+    }
+
+    pub fn retain_errors(&self, n: u32) -> Result<(), String> {
+        for index in 1..=n {
+            self.budget.store(1_000, Ordering::Relaxed);
+            self.state
+                .lua()
+                .load(&format!(
+                    r#"
+                    local ok, err = pcall(function()
+                        for j = 1, 100000 do end
+                    end)
+                    assert(not ok, tostring(err))
+                    kept[{index}] = err
+                    "#
+                ))
+                .exec()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod state_owner_tests {
     use super::*;
@@ -1069,35 +1109,6 @@ mod state_owner_tests {
             kept.push(error);
         }
         assert!(Arc::strong_count(&arc) > base);
-    }
-
-    #[test]
-    fn hook_error_storage_stays_reserved_through_lua_destruction() {
-        let memory = memory();
-        let bytes = memory.limits().per_vm_bytes / std::mem::size_of::<mlua::Error>()
-            * INSTRUCTION_BUDGET_ERROR.len();
-        let mut state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
-        state.admit_hook_errors(&memory).unwrap();
-        let observed = Arc::clone(&memory);
-        state.drop_hook = Some(Box::new(move |_| assert_eq!(observed.usage().1, bytes)));
-        assert_eq!(memory.usage().1, bytes);
-        drop(state);
-        assert_eq!(memory.usage(), (0, 0));
-    }
-
-    #[test]
-    fn hook_error_storage_refusal_releases_the_unmodified_state() {
-        let memory = memory();
-        let held = memory
-            .reserve_shared_callback_storage(memory.limits().total_callback_bytes)
-            .unwrap();
-        let mut state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
-        assert!(state.admit_hook_errors(&memory).is_err());
-        assert!(state.charges.hook_errors.is_none());
-        drop(state);
-        assert_eq!(memory.usage(), (0, memory.limits().total_callback_bytes));
-        drop(held);
-        assert_eq!(memory.usage(), (0, 0));
     }
 
     fn runtime(memory: &Arc<LuaMemoryAccount>) -> Arc<LuaPluginRuntime> {
@@ -2638,16 +2649,14 @@ pub(crate) fn coordination_table(
     let publish_plugin_key = plugin_key.clone();
     let publish_memory = Arc::clone(&memory);
     let capacity_xrc = memory
-        .reserve_shared_callback_storage(crate::lua_memory::layout::lua_reference_bytes())
+        .reserve_shared_callback_storage(2 * crate::lua_memory::layout::lua_reference_bytes())
         .map_err(|_| mlua::Error::RuntimeError("Lua callback memory capacity exhausted".into()))?;
-    let capacity = Arc::new((
-        lua.create_string(LUA_CALLBACK_CAPACITY_EXHAUSTED)?,
-        capacity_xrc,
-    ));
-    let publish_capacity = Arc::clone(&capacity);
+    let publish_capacity = lua.create_string(LUA_CALLBACK_CAPACITY_EXHAUSTED)?;
+    let drain_capacity = publish_capacity.clone();
     coordination.set(
         "publish",
         callback::create(lua, move |lua, args: Value| {
+            let _xrc = &capacity_xrc;
             match admit_publish_operation(&publish_memory, &publish_plugin_key, lua, args) {
                 Ok((operation, entry)) => {
                     let outcome = match publish_bridge.submit_admitted(operation, entry) {
@@ -2659,9 +2668,7 @@ pub(crate) fn coordination_table(
                             .into());
                         }
                         Err(CoordinationRequestError::Local(CoordinationLocalError::Capacity)) => {
-                            return Err(callback::CallbackFailure::Raise(
-                                publish_capacity.0.clone(),
-                            ));
+                            return Err(callback::CallbackFailure::Raise(publish_capacity.clone()));
                         }
                         Err(error) => {
                             return Err(mlua::Error::RuntimeError(error.as_str().to_owned()).into());
@@ -2670,16 +2677,14 @@ pub(crate) fn coordination_table(
                     lua.to_value(&outcome).map_err(Into::into)
                 }
                 Err(AdmissionError::Capacity) => {
-                    Err(callback::CallbackFailure::Raise(publish_capacity.0.clone()))
+                    Err(callback::CallbackFailure::Raise(publish_capacity.clone()))
                 }
                 Err(AdmissionError::Runtime(error)) => Err(error.into()),
             }
         })?,
     )?;
-
     let drain_bridge = coordination_bridge.clone();
     let drain_memory = Arc::clone(&memory);
-    let drain_capacity = capacity;
     coordination.set(
         "drain",
         callback::create(lua, move |lua, args: Value| {
@@ -2694,7 +2699,7 @@ pub(crate) fn coordination_table(
                             .into());
                         }
                         Err(CoordinationRequestError::Local(CoordinationLocalError::Capacity)) => {
-                            return Err(callback::CallbackFailure::Raise(drain_capacity.0.clone()));
+                            return Err(callback::CallbackFailure::Raise(drain_capacity.clone()));
                         }
                         Err(error) => {
                             return Err(mlua::Error::RuntimeError(error.as_str().to_owned()).into());
@@ -2703,7 +2708,7 @@ pub(crate) fn coordination_table(
                     lua.to_value(&outcome).map_err(Into::into)
                 }
                 Err(AdmissionError::Capacity) => {
-                    Err(callback::CallbackFailure::Raise(drain_capacity.0.clone()))
+                    Err(callback::CallbackFailure::Raise(drain_capacity.clone()))
                 }
                 Err(AdmissionError::Runtime(error)) => Err(error.into()),
             }
@@ -3234,7 +3239,6 @@ mod bounded_session_type_tests {
         })
         .unwrap()
     }
-
 
     #[test]
     fn session_type_errors_remain_lua_owned_after_callback_charge_releases() {

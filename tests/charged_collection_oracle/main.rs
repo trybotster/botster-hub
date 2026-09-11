@@ -27,8 +27,14 @@ static XRC_ALIGN: AtomicUsize = AtomicUsize::new(0);
 static XRC_LIVE: AtomicUsize = AtomicUsize::new(0);
 static XRC_PEAK: AtomicUsize = AtomicUsize::new(0);
 static XRC_OVERFLOW: AtomicBool = AtomicBool::new(false);
+static ALLOC_SUM: AtomicUsize = AtomicUsize::new(0);
+static DEALLOC_SUM: AtomicUsize = AtomicUsize::new(0);
 const MAX_XRC: usize = 512;
 static XRC_PTRS: [AtomicUsize; MAX_XRC] = [const { AtomicUsize::new(0) }; MAX_XRC];
+const MAX_LIVE: usize = 4096;
+static LIVE_PTR: [AtomicUsize; MAX_LIVE] = [const { AtomicUsize::new(0) }; MAX_LIVE];
+static LIVE_SZ: [AtomicUsize; MAX_LIVE] = [const { AtomicUsize::new(0) }; MAX_LIVE];
+static WINDOW_OVERFLOW: AtomicBool = AtomicBool::new(false);
 
 fn record_event(kind: u8, layout: Layout) {
     if !RECORD.load(Ordering::Acquire) {
@@ -65,6 +71,41 @@ fn xrc_note_alloc(ptr: *mut u8) {
     XRC_OVERFLOW.store(true, Ordering::Release);
 }
 
+fn window_alloc(ptr: *mut u8, size: usize) {
+    let addr = ptr as usize;
+    if addr == 0 {
+        return;
+    }
+    for (slot, bytes) in LIVE_PTR.iter().zip(LIVE_SZ.iter()) {
+        if slot
+            .compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            bytes.store(size, Ordering::Release);
+            ALLOC_SUM.fetch_add(size, Ordering::AcqRel);
+            return;
+        }
+    }
+    WINDOW_OVERFLOW.store(true, Ordering::Release);
+}
+
+fn window_dealloc(ptr: *mut u8) {
+    let addr = ptr as usize;
+    if addr == 0 {
+        return;
+    }
+    for (slot, bytes) in LIVE_PTR.iter().zip(LIVE_SZ.iter()) {
+        if slot
+            .compare_exchange(addr, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let size = bytes.swap(0, Ordering::AcqRel);
+            DEALLOC_SUM.fetch_add(size, Ordering::AcqRel);
+            return;
+        }
+    }
+}
+
 fn xrc_note_dealloc(ptr: *mut u8) {
     let addr = ptr as usize;
     if addr == 0 {
@@ -86,11 +127,12 @@ unsafe impl GlobalAlloc for Recorder {
         let ptr = unsafe { System.alloc(layout) };
         if RECORD.load(Ordering::Acquire) {
             record_event(KIND_ALLOC, layout);
-            let live = LIVE
-                .load(Ordering::Acquire)
-                .saturating_add(layout.size());
+            let live = LIVE.load(Ordering::Acquire).saturating_add(layout.size());
             LIVE.store(live, Ordering::Release);
             PEAK.fetch_max(live, Ordering::AcqRel);
+            if !ptr.is_null() {
+                window_alloc(ptr, layout.size());
+            }
             if !ptr.is_null() && is_xrc_layout(layout) {
                 xrc_note_alloc(ptr);
             }
@@ -101,10 +143,9 @@ unsafe impl GlobalAlloc for Recorder {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if RECORD.load(Ordering::Acquire) {
             record_event(KIND_DEALLOC, layout);
-            let live = LIVE
-                .load(Ordering::Acquire)
-                .saturating_sub(layout.size());
+            let live = LIVE.load(Ordering::Acquire).saturating_sub(layout.size());
             LIVE.store(live, Ordering::Release);
+            window_dealloc(ptr);
             if is_xrc_layout(layout) {
                 xrc_note_dealloc(ptr);
             }
@@ -127,6 +168,10 @@ unsafe impl GlobalAlloc for Recorder {
                 live.saturating_sub(layout.size()).saturating_add(new_size),
                 Ordering::Release,
             );
+            window_dealloc(ptr);
+            if !new_ptr.is_null() {
+                window_alloc(new_ptr, new_size);
+            }
             if !new_ptr.is_null() && is_xrc_layout(new_layout) {
                 xrc_note_alloc(new_ptr);
             }
@@ -156,9 +201,16 @@ fn begin_record() {
     for slot in &XRC_PTRS {
         slot.store(0, Ordering::Release);
     }
+    for (slot, bytes) in LIVE_PTR.iter().zip(LIVE_SZ.iter()) {
+        slot.store(0, Ordering::Release);
+        bytes.store(0, Ordering::Release);
+    }
+    WINDOW_OVERFLOW.store(false, Ordering::Release);
     XRC_LIVE.store(0, Ordering::Release);
     XRC_PEAK.store(0, Ordering::Release);
     XRC_OVERFLOW.store(false, Ordering::Release);
+    ALLOC_SUM.store(0, Ordering::Release);
+    DEALLOC_SUM.store(0, Ordering::Release);
     RECORD.store(true, Ordering::Release);
 }
 
@@ -460,19 +512,58 @@ fn measure_lua_json() -> Result<(), String> {
         }
         let _ = built;
     }
+    measure_raise_storm("publish-capacity-raises", 1000, |storm| {
+        storm.retain_publish_errors(1000)
+    })?;
+    measure_raise_storm("drain-capacity-raises", 1000, |storm| {
+        storm.retain_drain_errors(1000)
+    })?;
+    measure_hook_storm()?;
+    Ok(())
+}
+
+fn measure_raise_storm(
+    label: &str,
+    n: u32,
+    run: impl FnOnce(&botster_hub::test_internals::CapacityRaiseStorm) -> Result<(), String>,
+) -> Result<(), String> {
     let storm = botster_hub::test_internals::prepare_capacity_raise_storm();
+    let lua_before = storm.used_memory();
+    LIVE.store(0, Ordering::Release);
+    begin_record();
+    run(&storm).map_err(|error| format!("{label}: {error}"))?;
+    end_record();
+    reconcile(label, n, lua_before, storm.used_memory())
+}
+
+fn measure_hook_storm() -> Result<(), String> {
+    let storm = botster_hub::test_internals::prepare_hook_raise_storm()?;
+    let lua_before = storm.used_memory();
     LIVE.store(0, Ordering::Release);
     begin_record();
     storm
-        .retain_publish_errors(1000)
-        .map_err(|error| format!("publish capacity raises: {error}"))?;
+        .retain_errors(32)
+        .map_err(|error| format!("hook-budget-raises: {error}"))?;
     end_record();
-    let peak = PEAK.load(Ordering::Acquire);
-    println!("publish-capacity-raises n=1000 rust_peak={peak}");
-    if peak != 0 {
-        println!(
-            "publish-capacity-raises: non-zero peak includes Lua pcall internals on the Rust allocator; Raise path does not to_string"
-        );
+    reconcile("hook-budget-raises", 32, lua_before, storm.used_memory())
+}
+
+fn reconcile(label: &str, n: u32, lua_before: usize, lua_after: usize) -> Result<(), String> {
+    let alloc = ALLOC_SUM.load(Ordering::Acquire);
+    let dealloc = DEALLOC_SUM.load(Ordering::Acquire);
+    let net = alloc as i128 - dealloc as i128;
+    let lua_delta = lua_after as i128 - lua_before as i128;
+    let rust_only = net as i128 - lua_delta;
+    let per_raise = if n == 0 {
+        0.0
+    } else {
+        rust_only as f64 / n as f64
+    };
+    println!(
+        "{label} n={n} alloc_sum={alloc} dealloc_sum={dealloc} net={net} lua_delta={lua_delta} rust_only={rust_only} rust_only_per_raise={per_raise:.4}"
+    );
+    if WINDOW_OVERFLOW.load(Ordering::Acquire) {
+        return Err(format!("{label}: live-pointer table overflowed"));
     }
     Ok(())
 }

@@ -392,7 +392,7 @@ fn bind_coordination(memory: Arc<LuaMemoryAccount>) -> mlua::Lua {
 
 #[test]
 fn publish_and_drain_capacity_raise_precreated_lua_string() {
-    let memory = account(crate::lua_memory::layout::lua_reference_bytes());
+    let memory = account(2 * crate::lua_memory::layout::lua_reference_bytes());
     let lua = bind_coordination(Arc::clone(&memory));
     let before = memory.usage().1;
     for call in [
