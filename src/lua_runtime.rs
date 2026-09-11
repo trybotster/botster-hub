@@ -1010,7 +1010,8 @@ impl Drop for LuaState {
 #[cfg(feature = "allocation-oracle")]
 pub struct HookRaiseStorm {
     state: LuaState,
-    budget: Arc<AtomicU64>,
+    storm_hook: mlua::Function,
+    inner: mlua::Function,
 }
 
 #[cfg(feature = "allocation-oracle")]
@@ -1029,24 +1030,53 @@ pub fn prepare_hook_raise_storm() -> Result<HookRaiseStorm, String> {
     let lua = state.lua();
     lua.set_memory_limit(memory.limits().per_vm_bytes)
         .map_err(|error| error.to_string())?;
-    let budget = Arc::new(AtomicU64::new(1_000));
+    lua.load("kept = {}; for i = 1, 128 do kept[i] = false end")
+        .exec()
+        .map_err(|error| error.to_string())?;
+    let inner = lua
+        .load("while true do end")
+        .into_function()
+        .map_err(|error| error.to_string())?;
+    lua.globals()
+        .set("storm_inner", inner.clone())
+        .map_err(|error| error.to_string())?;
+    lua.load(
+        r#"
+        function storm_hook(n)
+            for i = 1, n do
+                local ok, err = pcall(storm_inner)
+                assert(not ok, tostring(err))
+                kept[i] = err
+            end
+            for i = 2, n do
+                assert(rawequal(kept[1], kept[i]))
+            end
+        end
+        "#,
+    )
+    .exec()
+    .map_err(|error| error.to_string())?;
+    let storm_hook = lua
+        .globals()
+        .get("storm_hook")
+        .map_err(|error| error.to_string())?;
+    let budget = Arc::new(AtomicU64::new(1));
     let hook_budget = Arc::clone(&budget);
     let hook_error = Arc::clone(&shared);
     lua.set_hook(
-        HookTriggers::new().every_nth_instruction(1_000),
+        HookTriggers::new().every_nth_instruction(1),
         move |_lua, _debug| {
-            let previous = hook_budget.fetch_sub(1_000, Ordering::Relaxed);
-            if previous <= 1_000 {
-                return Err(mlua::Error::ExternalError(Arc::clone(&hook_error)));
-            }
-            Ok(VmState::Continue)
+            hook_budget.store(1, Ordering::Relaxed);
+            Err(mlua::Error::ExternalError(Arc::clone(&hook_error)))
         },
     )
     .map_err(|error| error.to_string())?;
-    lua.load("kept = {}; for i = 1, 32 do kept[i] = false end")
-        .exec()
-        .map_err(|error| error.to_string())?;
-    Ok(HookRaiseStorm { state, budget })
+    let _ = budget;
+    Ok(HookRaiseStorm {
+        state,
+        storm_hook,
+        inner,
+    })
 }
 
 #[cfg(feature = "allocation-oracle")]
@@ -1057,21 +1087,16 @@ impl HookRaiseStorm {
 
     pub fn retain_errors(&self, n: u32) -> Result<(), String> {
         for index in 1..=n {
-            self.budget.store(1_000, Ordering::Relaxed);
-            self.state
-                .lua()
-                .load(&format!(
-                    r#"
-                    local ok, err = pcall(function()
-                        for j = 1, 100000 do end
-                    end)
-                    assert(not ok, tostring(err))
-                    kept[{index}] = err
-                    "#
-                ))
-                .exec()
-                .map_err(|error| error.to_string())?;
+            match self.inner.call::<()>(()) {
+                Err(_) => {}
+                Ok(()) => {
+                    return Err(format!(
+                        "precompiled hook inner returned at raise {index}"
+                    ));
+                }
+            }
         }
+        let _ = &self.storm_hook;
         Ok(())
     }
 }

@@ -54,7 +54,7 @@ pub fn prepare_capacity_raise_storm() -> CapacityRaiseStorm {
         .expect("set coordination");
     lua.load(
         r#"
-        kept = {}; for i = 1, 1000 do kept[i] = false end
+        kept = {}; for i = 1, 4000 do kept[i] = false end
         function storm_publish(n)
             for i = 1, n do
                 local ok, err = pcall(coordination.publish, { id = 'e1', target = { type = 'topic', topic = 't' } })
