@@ -139,6 +139,7 @@ impl EntityWork {
         };
         self.cancel();
         Some(crate::host_disposal::Parts {
+            storage: None,
             identity,
             permit,
             model: self.model.clone(),

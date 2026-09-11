@@ -73,6 +73,7 @@ impl PublicationOwnerState {
         };
         self.terminal = Some(crate::host_disposal::Job::new(
             crate::host_disposal::Parts {
+                storage: None,
                 identity,
                 permit,
                 model: self.work.clone(),

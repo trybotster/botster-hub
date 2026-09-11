@@ -100,6 +100,7 @@ pub type HubStateView = SharedView<HubState>;
 /// admission and policy boundaries remain visible at the hub layer.
 pub struct HubRuntime {
     config: HubConfig,
+    lua_memory: Arc<crate::lua_memory::LuaMemoryAccount>,
     // Readers clone the current Arc under this short lock. Publication swaps
     // one Arc, so the owner never clones a durable state collection.
     state: SharedHubState,
@@ -386,8 +387,16 @@ impl HubRuntime {
     /// Build a hub runtime from explicit, already-validated hub config.
     ///
     /// # Errors
-    /// Returns an error when the plugin database cannot be opened.
+    /// Returns an error when memory policy is invalid or the plugin database cannot be opened.
     pub fn new(config: HubConfig) -> HubRuntimeResult<Self> {
+        let lua_memory = crate::lua_memory::LuaMemoryAccount::new(
+            crate::config::lua_memory_limits(),
+        )
+        .map_err(|_| {
+            HubRuntimeError::Config(crate::config::HubConfigError::InvalidCapacity {
+                field: "lua_memory",
+            })
+        })?;
         let state = HubState::from_config(&config);
         let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
@@ -414,6 +423,7 @@ impl HubRuntime {
             next_provider_token: Cell::new(1),
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
+            lua_memory,
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
@@ -492,6 +502,14 @@ impl HubRuntime {
     }
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
+        let lua_memory = crate::lua_memory::LuaMemoryAccount::new(
+            crate::config::lua_memory_limits(),
+        )
+        .map_err(|_| {
+            HubRuntimeError::Config(crate::config::HubConfigError::InvalidCapacity {
+                field: "lua_memory",
+            })
+        })?;
         let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
@@ -517,6 +535,7 @@ impl HubRuntime {
             next_provider_token: Cell::new(1),
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
+            lua_memory,
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
@@ -631,8 +650,11 @@ impl HubRuntime {
         Arc::clone(&self.state)
     }
 
-    fn lua_plugin_host_api(&self) -> LuaPluginHostApi {
+    /// Return Host primitives that retain this Hub's shared Lua memory account.
+    #[must_use]
+    pub fn lua_plugin_host_api(&self) -> LuaPluginHostApi {
         LuaPluginHostApi {
+            memory: Arc::clone(&self.lua_memory),
             capabilities: self.capability_runtime.clone(),
             coordination: self.coordination_bridge(),
             entity_publish: self.entity_publish_bridge(),
@@ -885,6 +907,11 @@ impl HubRuntime {
             .families
             .get(family)
             .map(|state| state.generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stop_core_driver(&mut self) {
+        self.stop_data_plane_with_release(false);
     }
 
     #[cfg(test)]
@@ -1475,7 +1502,11 @@ impl HubRuntime {
         let mut retained = Vec::with_capacity(inflight.len());
         for mut entry in inflight.drain(..) {
             match &mut entry {
-                InflightPluginCore::Coordination { ticket, .. } => match ticket.poll() {
+                InflightPluginCore::Coordination { ticket, rejected, .. } => match if rejected.is_some() {
+                    CoreTicketPoll::Refused
+                } else {
+                    ticket.poll()
+                } {
                     CoreTicketPoll::Pending => retained.push(entry),
                     CoreTicketPoll::Ready(result) => {
                         if let InflightPluginCore::Coordination { response, .. } = entry {
@@ -1484,12 +1515,22 @@ impl HubRuntime {
                     }
                     CoreTicketPoll::Lost => {
                         if let InflightPluginCore::Coordination { response, .. } = entry {
-                            let _ = response.send(Err(CoreTicketError::DriverStopped.to_string()));
+                            let _ = response.send(crate::lua_runtime::CoordinationDelivery::Refused(
+                                crate::lua_runtime::CoordinationRefusal::HelperStopped,
+                            ));
                         }
                     }
                     CoreTicketPoll::Refused => {
-                        if let InflightPluginCore::Coordination { response, .. } = entry {
-                            let _ = response.send(Err(CoreTicketError::Overloaded.to_string()));
+                        if let InflightPluginCore::Coordination { response, rejected, .. } = entry {
+                            let refusal = if rejected.as_ref().is_some_and(|rejected|
+                                rejected.reason == crate::data_plane::driver::CoreRefusal::Stopped
+                            ) {
+                                crate::lua_runtime::CoordinationRefusal::HelperStopped
+                            } else {
+                                crate::lua_runtime::CoordinationRefusal::HelperFull
+                            };
+                            drop(rejected);
+                            let _ = response.send(crate::lua_runtime::CoordinationDelivery::Refused(refusal));
                         }
                     }
                 },
@@ -2244,44 +2285,62 @@ impl HubRuntime {
             .is_some_and(|family| family.resync.degraded)
     }
 
+    pub(crate) fn coordination_retirement(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> crate::data_plane::driver::CoreWaiterRetirement {
+        self.core_daemon.waiter_retirement(waiter_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_core_waiter_probe(
+        &self,
+    ) -> impl Fn(crate::owner_identity::WaiterId) -> bool + Send + 'static {
+        let core = self.core_daemon.clone();
+        move |waiter_id| core.test_retains_waiter(waiter_id)
+    }
+
+    pub(crate) fn bind_terminal_core_owner(&self) {
+        self.core_daemon.bind_terminal_owner();
+    }
+
+    pub(crate) fn take_terminal_coordination_completion(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) {
+        self.core_daemon.take_terminal_completion(waiter_id);
+    }
+
+    pub(crate) fn submit_coordination_for_owner(
+        &self,
+        retirement: &crate::data_plane::driver::CoreWaiterRetirement,
+        operation: PendingCoordinationOperation,
+        caller: crate::lua_runtime::CoordinationCaller,
+        storage: Option<crate::data_plane::driver::CoreSubmissionStorage>,
+    ) -> crate::data_plane::driver::CoreSubmission<crate::lua_runtime::CoordinationReply> {
+        self.core_daemon.submit_retained_for_owner(
+            retirement,
+            move |daemon| operation.execute(daemon),
+            move || caller.claim(),
+            storage,
+        )
+    }
+
     fn fulfill_pending_coordination_requests(&self) {
         while let Some(pending) = self.coordination_bridge.take_pending() {
-            let ticket = match pending.operation {
-                PendingCoordinationOperation::Publish { envelope } => {
-                    self.core_daemon.submit(move |daemon| {
-                        daemon
-                            .publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
-                            .map(HubCoordinationResponse::Publish)
-                            .map_err(|error| error.to_string())
-                    })
-                }
-                PendingCoordinationOperation::Drain {
-                    target,
-                    after,
-                    limit,
-                } => self.core_daemon.submit(move |daemon| {
-                    daemon
-                        .drain_routed_envelopes(DrainRoutedEnvelopesRequest {
-                            target,
-                            after,
-                            limit,
-                        })
-                        .map(HubCoordinationResponse::Drain)
-                        .map_err(|error| error.to_string())
-                }),
-                PendingCoordinationOperation::Acknowledge { input } => {
-                    self.core_daemon.submit(move |daemon| {
-                        input
-                            .acknowledge(daemon)
-                            .map(HubCoordinationResponse::Acknowledge)
-                            .map_err(|error| error.to_string())
-                    })
-                }
+            let (core_storage, storage) = match pending.storage {
+                Some(storage) => (Some(storage.core), Some((storage.continuation, storage.disposal))),
+                None => (None, None),
             };
+            let submission = self
+                .core_daemon
+                .submit_retained(move |daemon| pending.operation.execute(daemon), || true, core_storage);
             if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
                 inflight.push(InflightPluginCore::Coordination {
-                    ticket,
+                    ticket: submission.ticket,
                     response: pending.response,
+                    rejected: submission.rejected,
+                    storage,
                 });
             }
         }
@@ -3393,6 +3452,7 @@ impl HubRuntime {
         &self,
         sender: crate::daemon::control::message::ControlSender,
     ) {
+        self.coordination_bridge.bind_owner_wake(sender.clone());
         if let Some(driver) = self.data_plane.as_ref() {
             driver.bind_owner_wake(sender);
         }
@@ -4388,6 +4448,8 @@ pub type HubRuntimeOutput = BotsterEngineOutput;
 /// Error emitted by the daemon-backed hub runtime.
 #[derive(Debug)]
 pub enum HubRuntimeError {
+    /// Explicit Hub memory policy failed validation.
+    Config(crate::config::HubConfigError),
     /// Core daemon operation failed.
     CoreDaemon(CoreDaemonError),
     /// The Hub capability runtime could not open its plugin database.
@@ -4404,6 +4466,7 @@ pub enum HubRuntimeError {
 impl fmt::Display for HubRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config(error) => write!(formatter, "{error}"),
             Self::CoreDaemon(error) => write!(formatter, "{error}"),
             Self::Capability(error) => write!(formatter, "{error}"),
             Self::IncompatibleWorkers { sessions } => write!(
@@ -4420,6 +4483,7 @@ impl fmt::Display for HubRuntimeError {
 impl Error for HubRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Config(error) => Some(error),
             Self::CoreDaemon(error) => Some(error),
             Self::Capability(error) => Some(error),
             Self::IncompatibleWorkers { .. } => None,
@@ -4764,8 +4828,10 @@ impl CoreOperationTracker {
 /// Plugin-facing Core work the owner polls between plugin invocations.
 enum InflightPluginCore {
     Coordination {
-        ticket: CoreTicket<Result<HubCoordinationResponse, String>>,
-        response: mpsc::Sender<Result<HubCoordinationResponse, String>>,
+        ticket: crate::data_plane::driver::ChargedCoreTicket<crate::lua_runtime::CoordinationReply>,
+        response: crate::lua_runtime::CoordinationReplySender,
+        rejected: Option<crate::data_plane::driver::CoreRejectedRequest>,
+        storage: Option<(crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge)>,
     },
     SessionTypeSpawn {
         start: SessionTypeSpawnStart,
@@ -5381,6 +5447,36 @@ pub(crate) mod tests {
         HubRuntime::new(config).unwrap()
     }
 
+    #[test]
+    fn lua_host_api_clones_share_the_runtime_memory_account() {
+        let runtime = family_runtime("lua-memory-new");
+        let api = runtime.lua_plugin_host_api();
+        let cloned_api = api.clone();
+        assert!(Arc::ptr_eq(&runtime.lua_memory, &api.memory));
+        assert!(Arc::ptr_eq(&api.memory, &cloned_api.memory));
+        let charge = api.memory.reserve_vm().unwrap();
+        assert_eq!(
+            cloned_api.memory.usage().0,
+            crate::config::lua_memory_limits().per_vm_bytes
+        );
+        drop(charge);
+        assert_eq!(runtime.lua_memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn restored_runtime_shares_its_own_lua_memory_account() {
+        let first = family_runtime("lua-memory-restored");
+        let config = first.config().clone();
+        let first_account = Arc::clone(&first.lua_memory);
+        drop(first);
+        let state = HubState::from_config(&config);
+        let restored = HubRuntime::from_validated_state(config, state).unwrap();
+        let api = restored.lua_plugin_host_api();
+        assert!(!Arc::ptr_eq(&first_account, &restored.lua_memory));
+        assert!(Arc::ptr_eq(&restored.lua_memory, &api.memory));
+        assert_eq!(api.memory.limits(), crate::config::lua_memory_limits());
+    }
+
     fn check_terminal_spawner_disposal(poison: bool) {
         use crate::host_disposal::{Job, Parts, Poll};
         use crate::host_executor::{
@@ -5414,6 +5510,7 @@ pub(crate) mod tests {
         let identity = HostJobIdentity::first(crate::owner_identity::WaiterId(71));
         let lifecycle = runtime.take_plugin_lifecycle().unwrap();
         let mut engine_job = Job::new(Parts {
+            storage: None,
             identity,
             permit,
             payload: Box::new(lifecycle),
@@ -5435,6 +5532,7 @@ pub(crate) mod tests {
         ));
         let mut bridge_job = Job::new_plugin_bridges(
             Parts {
+                storage: None,
                 identity,
                 permit,
                 payload: Box::new(()),
@@ -5723,6 +5821,160 @@ pub(crate) mod tests {
             .load_lua_plugin_package(policy.registry(), "producer")
             .unwrap();
         (runtime, root)
+    }
+
+    #[test]
+    fn lua_load_and_reload_refuse_before_replacing_live_state() {
+        use botster_core::{
+            CapabilityOperation, CapabilityOperationId, CapabilityRuntimeEvent,
+            CapabilityRuntimeRequest, TimerCapabilityRequest,
+        };
+
+        let (mut runtime, root) = publication_provider_runtime("lua-memory-refusal");
+        let entrypoint = root.join("plugin.lua");
+        let source = std::fs::read_to_string(&entrypoint).unwrap();
+        std::fs::write(
+            &entrypoint,
+            format!(
+                "events.on('hub', 'worktree_created', function(event) return {{ received = event.event }} end)\n{source}"
+            ),
+        )
+        .unwrap();
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install memory test provider")
+            .unwrap();
+        policy
+            .enable("producer", "enable memory test provider")
+            .unwrap();
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        let memory = Arc::clone(&runtime.lua_memory);
+        let limits = memory.limits();
+        assert_eq!(memory.usage(), (limits.per_vm_bytes, 0));
+        let registration = runtime
+            .plugin_lifecycle()
+            .entity_provider_registrations()
+            .select("producer", "producer.item")
+            .unwrap();
+        let generation = runtime
+            .package_event_router
+            .current_package_generation("producer");
+        assert!(registration.is_live());
+        assert!(matches!(generation, Ok(value) if value > 0));
+        assert_eq!(
+            runtime
+                .package_event_router
+                .test_subscription_count("producer"),
+            1
+        );
+        assert!(runtime.last_capability_cleanup().is_none());
+        let plugin_key = PluginKey("producer".into());
+        let timer = runtime
+            .submit_capability_request(CapabilityRuntimeRequest {
+                plugin_key: plugin_key.clone(),
+                operation_id: CapabilityOperationId("lua-memory-surviving-timer".into()),
+                operation: CapabilityOperation::Timer(TimerCapabilityRequest::Interval {
+                    interval_ms: 5,
+                }),
+                timeout_ms: 1_000,
+                callback: None,
+            })
+            .unwrap()
+            .resource
+            .expect("the interval timer must have a resource");
+        assert_eq!(timer.plugin_key, plugin_key);
+        assert_eq!(runtime.active_plugin_timer_resources(), 1);
+        let held: Vec<_> = (1..limits.total_vm_bytes / limits.per_vm_bytes)
+            .map(|_| memory.reserve_vm().unwrap())
+            .collect();
+        assert_eq!(memory.usage().0, limits.total_vm_bytes);
+        for (reload, now_ms, sequence) in [(false, 5, 1), (true, 10, 2)] {
+            let error = if reload {
+                runtime
+                    .reload_lua_plugin_package(
+                        RequestId("lua-memory-refusal".into()),
+                        policy.registry(),
+                        "producer",
+                    )
+                    .unwrap_err()
+            } else {
+                runtime
+                    .load_lua_plugin_package(policy.registry(), "producer")
+                    .unwrap_err()
+            };
+            match error {
+                HubLuaPluginLoadError::Lua(crate::lua_runtime::LuaPluginRuntimeError::Load(
+                    message,
+                )) => {
+                    assert_eq!(
+                        message,
+                        format!(
+                            "Lua VM memory capacity exhausted: requested {} bytes, 0 available",
+                            limits.per_vm_bytes,
+                        )
+                    );
+                }
+                other => panic!("expected the VM capacity refusal, got {other:?}"),
+            }
+            assert!(registration.is_live());
+            assert_eq!(
+                runtime
+                    .package_event_router
+                    .current_package_generation("producer"),
+                generation
+            );
+            assert_eq!(
+                runtime
+                    .package_event_router
+                    .test_subscription_count("producer"),
+                1
+            );
+            assert!(runtime.last_capability_cleanup().is_none());
+            assert_eq!(memory.usage(), (limits.total_vm_bytes, 0));
+            let events = runtime
+                .drain_capability_events_at(&plugin_key, now_ms)
+                .unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                CapabilityRuntimeEvent::TimerFired(event)
+                    if event.resource == timer && event.sequence == sequence
+            )));
+            assert_eq!(runtime.active_plugin_timer_resources(), 1);
+        }
+        drop(held);
+        runtime
+            .reload_lua_plugin_package(
+                RequestId("lua-memory-retry".into()),
+                policy.registry(),
+                "producer",
+            )
+            .unwrap();
+        assert!(!registration.is_live());
+        let replaced_generation = runtime
+            .package_event_router
+            .current_package_generation("producer")
+            .unwrap();
+        assert!(replaced_generation > generation.unwrap());
+        assert_eq!(
+            runtime
+                .package_event_router
+                .test_subscription_count("producer"),
+            1
+        );
+        assert_eq!(runtime.active_plugin_timer_resources(), 0);
+        assert!(
+            runtime
+                .last_capability_cleanup()
+                .unwrap()
+                .removed_resources
+                .contains(&timer)
+        );
+        assert_eq!(memory.usage(), (limits.per_vm_bytes, 0));
+        drop(runtime);
+        assert_eq!(memory.usage(), (0, 0));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

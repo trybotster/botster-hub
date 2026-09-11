@@ -119,6 +119,7 @@ impl PluginControlState {
         self.capacity_waiters.remove(&waiter);
         self.ready_waiters.remove(&waiter);
         Some(crate::host_disposal::Parts {
+            storage: None,
             identity,
             permit,
             payload: Box::new((payload, index, row)),

@@ -34,14 +34,18 @@ use crate::lifecycle::{
     HubPluginEventHandler, HubPluginRuntimeBundle, PACKAGE_EVENT_INVOCATION_ORIGIN,
     SESSION_FAMILY_INVOCATION_ORIGIN, package_entity_owner_token,
 };
-use crate::lua_memory::{LuaMemoryAccount, LuaVmCharge};
+use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount, LuaVmCharge};
 use crate::package_event_router::{CausalScopeTable, EventPlaneStatus, PackageEventRouter};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
 
 mod acknowledge_input;
 mod sandbox;
-use acknowledge_input::AcknowledgeInput;
+use acknowledge_input::{AcknowledgeInput, AcknowledgeOperation};
+pub(crate) use acknowledge_input::ownership::{
+    CoordinationDelivery, CoordinationFailure, CoordinationOutcome as HubCoordinationResponse,
+    CoordinationRefusal, CoordinationReply, CoordinationReplySender, CoordinationStorage,
+};
 
 thread_local! {
     static INVOCATION_CAUSAL_SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
@@ -59,6 +63,7 @@ use crate::session_types::{
 };
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
+const INSTRUCTION_BUDGET_ERROR: &str = "lua instruction budget exceeded";
 const COORDINATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
 const ENTITY_PUBLISH_REQUEST_TIMEOUT_MS: u64 = 1_000;
 /// Shared host capability runtime used by Lua capability helpers.
@@ -69,18 +74,109 @@ pub type SharedHubCapabilityRuntime = Arc<Mutex<HubCapabilityRuntime>>;
 pub struct HubCoordinationBridge {
     owner_thread: thread::ThreadId,
     pending: Arc<Mutex<VecDeque<PendingCoordinationRequest>>>,
+    progress: Arc<CoordinationProgress>,
 }
 
+struct CoordinationProgress {
+    pending: AtomicBool,
+    sealed: AtomicBool,
+    owner: std::sync::OnceLock<crate::daemon::control::message::ControlSender>,
+    #[cfg(test)]
+    admitted: Mutex<Vec<crate::owner_identity::WaiterId>>,
+}
+
+pub(crate) enum CoordinationIngressPoll {
+    Ready(PendingCoordinationRequest),
+    Empty,
+    Contended,
+    Poisoned,
+}
+
+impl CoordinationProgress {
+    fn publish(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel)
+            && let Some(owner) = self.owner.get()
+        {
+            let _ = owner
+                .try_send(crate::daemon::control::message::ControlMessage::CoordinationProgress);
+        }
+    }
+}
+
+struct CoordinationUnlock<'a>(&'a CoordinationProgress);
+
+impl Drop for CoordinationUnlock<'_> {
+    fn drop(&mut self) {
+        self.0.publish();
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum CoordinationCaller {
+    NonAcknowledge(Arc<std::sync::atomic::AtomicU8>),
+    Acknowledge(acknowledge_input::ownership::AcknowledgeCaller),
+}
+
+impl CoordinationCaller {
+    fn new() -> Self {
+        Self::NonAcknowledge(Arc::new(std::sync::atomic::AtomicU8::new(0)))
+    }
+
+    pub(crate) fn claim(&self) -> bool {
+        match self {
+            Self::NonAcknowledge(state) => state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok(),
+            Self::Acknowledge(caller) => caller.claim(),
+        }
+    }
+}
+
+struct CoordinationCallerGuard(CoordinationCaller);
+
+impl Drop for CoordinationCallerGuard {
+    fn drop(&mut self) {
+        match &self.0 {
+            CoordinationCaller::NonAcknowledge(state) => { state.fetch_or(2, Ordering::AcqRel); }
+            CoordinationCaller::Acknowledge(caller) => caller.finish(),
+        }
+    }
+}
+
+mod callback;
 mod entity_publish;
+#[cfg(test)]
+mod registration_tests;
 use entity_publish::EntityPublishError;
 pub(crate) use entity_publish::PendingEntityPublishRequest;
 pub use entity_publish::{EntityPublishPermit, HubEntityPublishBridge};
+
+#[derive(Debug)]
+enum CoordinationRequestError {
+    Local(&'static str),
+    Response(CoordinationFailure),
+}
+
+impl CoordinationRequestError {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Local(message) => message,
+            Self::Response(failure) => failure.message(),
+        }
+    }
+}
 
 impl HubCoordinationBridge {
     pub(crate) fn new() -> Self {
         Self {
             owner_thread: thread::current().id(),
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            progress: Arc::new(CoordinationProgress {
+                pending: AtomicBool::new(false),
+                sealed: AtomicBool::new(false),
+                owner: std::sync::OnceLock::new(),
+                #[cfg(test)]
+                admitted: Mutex::new(Vec::new()),
+            }),
         }
     }
 
@@ -112,11 +208,41 @@ impl HubCoordinationBridge {
     fn acknowledge(
         &self,
         input: AcknowledgeInput,
-    ) -> Result<RoutedEnvelopeDeliveryStateResult, String> {
-        let response = self.request(PendingCoordinationOperation::Acknowledge { input })?;
+    ) -> Result<acknowledge_input::ownership::AcknowledgeOutcome, CoordinationRequestError> {
+        if thread::current().id() == self.owner_thread {
+            return Err(CoordinationRequestError::Local(
+                "botster.coordination is only available during handler invocation, not at plugin load",
+            ));
+        }
+        let AcknowledgeInput { input, transport } = input;
+        let (sender, receiver) = acknowledge_input::ownership::reply_channel(transport.reply);
+        let caller = CoordinationCaller::Acknowledge(
+            acknowledge_input::ownership::AcknowledgeCaller::new(transport.caller),
+        );
+        let _caller = CoordinationCallerGuard(caller.clone());
+        self.enqueue(PendingCoordinationRequest {
+            #[cfg(test)]
+            terminal_drop_probe: None,
+            operation: PendingCoordinationOperation::Acknowledge { input },
+            response: CoordinationReplySender::Acknowledge {
+                sender,
+                error: transport.error,
+                conversion: transport.conversion,
+            },
+            caller,
+            storage: Some(transport.work),
+        })?;
+        let response = receiver
+            .recv_timeout(Duration::from_millis(COORDINATION_REQUEST_TIMEOUT_MS))
+            .map_err(|_| CoordinationRequestError::Local(
+                "coordination request did not complete before timeout",
+            ))?
+            .map_err(CoordinationRequestError::Response)?;
         match response {
             HubCoordinationResponse::Acknowledge(outcome) => Ok(outcome),
-            _ => Err("coordination acknowledge returned unexpected response".to_string()),
+            _ => Err(CoordinationRequestError::Local(
+                "coordination acknowledge returned unexpected response",
+            )),
         }
     }
 
@@ -124,33 +250,98 @@ impl HubCoordinationBridge {
         &self,
         operation: PendingCoordinationOperation,
     ) -> Result<HubCoordinationResponse, String> {
+        self.request_typed(operation).map_err(|error| match error {
+            CoordinationRequestError::Local(message) => message.to_owned(),
+            CoordinationRequestError::Response(CoordinationFailure::NonAcknowledge(message)) => message,
+            CoordinationRequestError::Response(CoordinationFailure::Acknowledge(_)) =>
+                CoordinationRefusal::Unexpected.message().to_owned(),
+        })
+    }
+
+    fn request_typed(
+        &self,
+        operation: PendingCoordinationOperation,
+    ) -> Result<HubCoordinationResponse, CoordinationRequestError> {
         if thread::current().id() == self.owner_thread {
-            return Err(
-                "botster.coordination is only available during handler invocation, not at plugin load"
-                    .to_string(),
-            );
+            return Err(CoordinationRequestError::Local(
+                "botster.coordination is only available during handler invocation, not at plugin load",
+            ));
         }
 
+        let caller = CoordinationCaller::new();
+        let _caller = CoordinationCallerGuard(caller.clone());
         let (response, receiver) = mpsc::channel();
-        self.pending
-            .lock()
-            .map_err(|_| "coordination queue lock poisoned".to_string())?
-            .push_back(PendingCoordinationRequest {
+        self.enqueue(PendingCoordinationRequest {
                 #[cfg(test)]
                 terminal_drop_probe: None,
                 operation,
-                response,
-            });
+                response: CoordinationReplySender::NonAcknowledge(response),
+                caller,
+                storage: None,
+            })?;
         receiver
             .recv_timeout(Duration::from_millis(COORDINATION_REQUEST_TIMEOUT_MS))
-            .map_err(|_| "coordination request did not complete before timeout".to_string())?
+            .map_err(|_| {
+                CoordinationRequestError::Local(
+                    "coordination request did not complete before timeout",
+                )
+            })?
+            .map_err(CoordinationRequestError::Response)
+    }
+
+    fn enqueue(&self, request: PendingCoordinationRequest) -> Result<(), CoordinationRequestError> {
+        let _unlock = CoordinationUnlock(&self.progress);
+        let mut pending = self.pending.lock()
+            .map_err(|_| CoordinationRequestError::Local("coordination queue lock poisoned"))?;
+        if self.progress.sealed.load(Ordering::Acquire) {
+            return Err(CoordinationRequestError::Local("coordination ingress is sealed"));
+        }
+        pending.push_back(request);
+        Ok(())
     }
 
     pub(crate) fn take_pending(&self) -> Option<PendingCoordinationRequest> {
+        if self.progress.owner.get().is_some() {
+            return None;
+        }
         self.pending
             .lock()
             .expect("coordination queue lock")
             .pop_front()
+    }
+
+    pub(crate) fn bind_owner_wake(&self, owner: crate::daemon::control::message::ControlSender) {
+        if let Err(owner) = self.progress.owner.set(owner) {
+            assert!(self.progress.owner.get().unwrap().same_channel(&owner));
+        }
+        if self.progress.pending.load(Ordering::Acquire) {
+            let _ =
+                self.progress.owner.get().unwrap().try_send(
+                    crate::daemon::control::message::ControlMessage::CoordinationProgress,
+                );
+        }
+    }
+
+    pub(crate) fn take_progress_notification(&self) -> bool {
+        self.progress.pending.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_pending_for_owner(&self) -> CoordinationIngressPoll {
+        let mut pending = match self.pending.try_lock() {
+            Ok(pending) => pending,
+            Err(std::sync::TryLockError::WouldBlock) => return CoordinationIngressPoll::Contended,
+            Err(std::sync::TryLockError::Poisoned(_)) => return CoordinationIngressPoll::Poisoned,
+        };
+        let request = pending.pop_front();
+        let remaining = !pending.is_empty();
+        drop(pending);
+        if remaining {
+            self.progress.publish();
+        }
+        request.map_or(
+            CoordinationIngressPoll::Empty,
+            CoordinationIngressPoll::Ready,
+        )
     }
 
     /// Host-only terminal cleanup, after the engine receipt seals all producers.
@@ -163,6 +354,7 @@ impl HubCoordinationBridge {
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.progress.sealed.store(true, Ordering::Release);
             std::mem::take(&mut *queue)
         };
         drop(pending);
@@ -173,7 +365,7 @@ impl HubCoordinationBridge {
     pub(crate) fn test_queue_pending(
         &self,
         operation: PendingCoordinationOperation,
-    ) -> mpsc::Receiver<Result<HubCoordinationResponse, String>> {
+    ) -> mpsc::Receiver<CoordinationReply> {
         let (response, receiver) = mpsc::channel();
         self.pending
             .lock()
@@ -181,7 +373,9 @@ impl HubCoordinationBridge {
             .push_back(PendingCoordinationRequest {
                 terminal_drop_probe: None,
                 operation,
-                response,
+                response: CoordinationReplySender::NonAcknowledge(response),
+                caller: CoordinationCaller::new(),
+                storage: None,
             });
         receiver
     }
@@ -192,6 +386,16 @@ impl HubCoordinationBridge {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_note_core_admission(&self, waiter_id: crate::owner_identity::WaiterId) {
+        self.progress.admitted.lock().unwrap().push(waiter_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_admitted_waiters(&self) -> Vec<crate::owner_identity::WaiterId> {
+        self.progress.admitted.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -208,12 +412,20 @@ impl HubCoordinationBridge {
 pub(crate) struct PendingCoordinationRequest {
     // Drop before actual payload fields so terminal tests can pause destruction.
     #[cfg(test)]
-    terminal_drop_probe: Option<Box<dyn Send>>,
+    pub(crate) terminal_drop_probe: Option<Box<dyn Send>>,
     pub(crate) operation: PendingCoordinationOperation,
-    pub(crate) response: mpsc::Sender<Result<HubCoordinationResponse, String>>,
+    pub(crate) response: CoordinationReplySender,
+    pub(crate) caller: CoordinationCaller,
+    pub(crate) storage: Option<CoordinationStorage>,
 }
 
 pub(crate) enum PendingCoordinationOperation {
+    #[cfg(test)]
+    Tracked {
+        operation: Box<PendingCoordinationOperation>,
+        probe: Box<dyn Send>,
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+    },
     Publish {
         envelope: RoutedEnvelope,
     },
@@ -223,14 +435,51 @@ pub(crate) enum PendingCoordinationOperation {
         limit: usize,
     },
     Acknowledge {
-        input: AcknowledgeInput,
+        input: AcknowledgeOperation,
     },
 }
 
-pub(crate) enum HubCoordinationResponse {
-    Publish(RoutedEnvelopePublishOutcome),
-    Drain(RoutedEnvelopeDrainOutcome),
-    Acknowledge(RoutedEnvelopeDeliveryStateResult),
+impl PendingCoordinationOperation {
+    pub(crate) fn execute(
+        self,
+        daemon: &mut botster_core_daemon::CoreDaemon,
+    ) -> CoordinationReply {
+        match self {
+            #[cfg(test)]
+            Self::Tracked {
+                operation,
+                probe,
+                executions,
+            } => {
+                executions.fetch_add(1, Ordering::AcqRel);
+                let result = operation.execute(daemon);
+                drop(probe);
+                return result;
+            }
+            Self::Publish { envelope } => daemon
+                .publish_routed_envelope(botster_core_daemon::PublishRoutedEnvelopeRequest {
+                    envelope,
+                })
+                .map(HubCoordinationResponse::Publish)
+                .map_err(|error| CoordinationFailure::NonAcknowledge(error.to_string())),
+            Self::Drain {
+                target,
+                after,
+                limit,
+            } => daemon
+                .drain_routed_envelopes(botster_core_daemon::DrainRoutedEnvelopesRequest {
+                    target,
+                    after,
+                    limit,
+                })
+                .map(HubCoordinationResponse::Drain)
+                .map_err(|error| CoordinationFailure::NonAcknowledge(error.to_string())),
+            Self::Acknowledge { input } => input
+                .acknowledge(daemon)
+                .map(HubCoordinationResponse::Acknowledge)
+                .map_err(CoordinationFailure::Acknowledge),
+        }
+    }
 }
 
 struct LuaHostApi {
@@ -244,7 +493,77 @@ struct LuaHostApi {
     package_records: Vec<PackageRecord>,
     package_event_router: Arc<PackageEventRouter>,
     causal_scopes: Arc<CausalScopeTable>,
-    memory: Option<Arc<LuaMemoryAccount>>,
+    memory: Arc<LuaMemoryAccount>,
+}
+
+/// Validate the event name before the body without copying its Rust bytes.
+struct EventName(mlua::String);
+
+impl mlua::FromLua for EventName {
+    fn from_lua(value: Value, lua: &Lua) -> mlua::Result<Self> {
+        let from = value.type_name();
+        let name =
+            lua.coerce_string(value)?
+                .ok_or_else(|| mlua::Error::FromLuaConversionError {
+                    from,
+                    to: "String".to_owned(),
+                    message: Some("expected string or number".to_owned()),
+                })?;
+        std::str::from_utf8(&name.as_bytes()).map_err(|error| {
+            mlua::Error::FromLuaConversionError {
+                from: "string",
+                to: "String".to_owned(),
+                message: Some(error.to_string()),
+            }
+        })?;
+        Ok(Self(name))
+    }
+}
+
+#[cfg(test)]
+mod event_name_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_event_names_preserve_argument_conversion() {
+        let lua = Lua::new();
+        let old = lua.create_function(|_, _: String| Ok(())).unwrap();
+        let borrowed = lua.create_function(|_, _: EventName| Ok(())).unwrap();
+        for source in [
+            "'event'",
+            "''",
+            "42",
+            "1.25",
+            "true",
+            "nil",
+            "{}",
+            "function() end",
+            "string.char(255)",
+        ] {
+            let value: Value = lua.load(format!("return {source}")).eval().unwrap();
+            let previous = old.call::<()>(value.clone());
+            let current = borrowed.call::<()>(value);
+            match (previous, current) {
+                (Ok(()), Ok(())) => {}
+                (Err(previous), Err(current)) => {
+                    assert_eq!(previous.to_string(), current.to_string(), "{source}");
+                }
+                _ => panic!("event name conversion changed for {source}"),
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_event_name_keeps_the_original_lua_string() {
+        use mlua::FromLua;
+
+        let lua = Lua::new();
+        let value = lua.create_string("event\0name").unwrap();
+        let pointer = value.to_pointer();
+        let name = EventName::from_lua(Value::String(value), &lua).unwrap();
+        assert_eq!(name.0.to_pointer(), pointer);
+        assert_eq!(&*name.0.to_str().unwrap(), "event\0name");
+    }
 }
 
 /// Test-only hold applied before package-event handler invocations, in
@@ -330,8 +649,10 @@ fn hold_controlled_test_plugin_invocation(request: &PluginInvocationRequest) -> 
 }
 
 /// Shared hub-owned primitives exposed to one Lua plugin runtime.
+/// Construct this API through `HubRuntime::lua_plugin_host_api` to retain its account.
 #[derive(Clone)]
 pub struct LuaPluginHostApi {
+    pub(crate) memory: Arc<LuaMemoryAccount>,
     pub capabilities: SharedHubCapabilityRuntime,
     pub coordination: HubCoordinationBridge,
     pub entity_publish: HubEntityPublishBridge,
@@ -345,66 +666,351 @@ pub struct LuaPluginHostApi {
 /// Real Lua runtime for one loaded plugin package.
 pub struct LuaPluginRuntime {
     plugin_key: PluginKey,
-    lua: Mutex<Lua>,
-    // Field order is intentional: Lua drops before its aggregate reservation.
-    _vm_charge: Option<LuaVmCharge>,
+    lua: Mutex<LuaState>,
     instruction_budget: Arc<AtomicU64>,
     stopped: AtomicBool,
 }
 
+/// This private owner covers construction, synchronous use, and Lua destruction.
+/// No strong Lua owner may escape its borrowed API. Such an escape requires a new proof.
+struct LuaState {
+    lua: Option<Lua>,
+    charges: LuaStateCharges,
+    #[cfg(test)]
+    drop_hook: Option<Box<dyn FnMut(LuaStateDropPhase) + Send>>,
+}
+
+/// An armed charge remains reserved if covered cleanup does not return.
+struct LuaStateCharges {
+    // None means completed cleanup disarmed this mandatory reservation.
+    vm: Option<LuaVmCharge>,
+    // The hook owns Rust strings until Lua collects its error userdata.
+    hook_errors: Option<LuaCallbackCharge>,
+}
+
+impl LuaStateCharges {
+    fn new(vm: LuaVmCharge) -> Self {
+        Self {
+            vm: Some(vm),
+            hook_errors: None,
+        }
+    }
+
+    fn release(&mut self) {
+        drop(self.hook_errors.take());
+        drop(self.vm.take());
+    }
+}
+
+impl Drop for LuaStateCharges {
+    fn drop(&mut self) {
+        if let Some(hook_errors) = self.hook_errors.take() {
+            std::mem::forget(hook_errors);
+        }
+        if let Some(vm) = self.vm.take() {
+            std::mem::forget(vm);
+        }
+    }
+}
+
+#[cfg(test)]
+enum LuaStateConstructionTest {
+    RejectLibrary,
+    PanicBeforeCreation,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LuaStateDropPhase {
+    BeforeLua,
+    AfterLua,
+}
+
+impl LuaState {
+    fn admit_hook_errors(
+        &mut self,
+        memory: &Arc<LuaMemoryAccount>,
+    ) -> Result<(), LuaPluginRuntimeError> {
+        assert!(self.charges.hook_errors.is_none());
+        // WrappedFailure contains an Error. Its Lua allocation is at least this size.
+        // Excluding Lua's userdata header makes this count conservative on every target.
+        let count = memory.limits().per_vm_bytes / std::mem::size_of::<mlua::Error>();
+        let bytes = count
+            .checked_mul(INSTRUCTION_BUDGET_ERROR.len())
+            .ok_or_else(|| LuaPluginRuntimeError::Load("Lua hook error allowance overflow".into()))?;
+        self.charges.hook_errors = Some(
+            memory
+                .reserve_shared_callback_storage(bytes)
+                .map_err(|error| LuaPluginRuntimeError::Load(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    fn new(vm: LuaVmCharge) -> mlua::Result<Self> {
+        Self::construct(
+            vm,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn construct(
+        vm: LuaVmCharge,
+        #[cfg(test)] test: Option<LuaStateConstructionTest>,
+    ) -> mlua::Result<Self> {
+        let mut state = Self {
+            lua: None,
+            charges: LuaStateCharges::new(vm),
+            #[cfg(test)]
+            drop_hook: None,
+        };
+        let libraries = StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
+        #[cfg(test)]
+        let libraries = match test {
+            Some(LuaStateConstructionTest::RejectLibrary) => StdLib::DEBUG,
+            Some(LuaStateConstructionTest::PanicBeforeCreation) => {
+                panic!("test constructor panic after VM admission")
+            }
+            None => libraries,
+        };
+        match Lua::new_with(libraries, LuaOptions::default()) {
+            Ok(lua) => state.lua = Some(lua),
+            Err(error) => {
+                // Pinned mlua 0.11.6 returns Err only before state allocation.
+                // Internal construction failures panic and retain the armed charge.
+                state.charges.release();
+                return Err(error);
+            }
+        }
+        Ok(state)
+    }
+
+    fn lua(&self) -> &Lua {
+        self.lua.as_ref().expect("constructed Lua state")
+    }
+}
+
+impl Drop for LuaState {
+    fn drop(&mut self) {
+        if let Some(lua) = self.lua.take() {
+            #[cfg(test)]
+            if let Some(hook) = self.drop_hook.as_mut() {
+                hook(LuaStateDropPhase::BeforeLua);
+            }
+            // Current callbacks keep temporary strong owners inside synchronous calls.
+            // Thus this drop completes the last strong owner's destruction.
+            drop(lua);
+            #[cfg(test)]
+            if let Some(hook) = self.drop_hook.as_mut() {
+                hook(LuaStateDropPhase::AfterLua);
+            }
+            self.charges.release();
+        }
+        // A single cleanup panic skips release and the charge guard retains funding.
+        // A second panic during unwind aborts; it is not a guard-drop path.
+    }
+}
+
+#[cfg(test)]
+mod state_owner_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn memory() -> Arc<LuaMemoryAccount> {
+        LuaMemoryAccount::new(crate::config::lua_memory_limits()).unwrap()
+    }
+
+    #[test]
+    fn hook_error_storage_stays_reserved_through_lua_destruction() {
+        let memory = memory();
+        let bytes = memory.limits().per_vm_bytes / std::mem::size_of::<mlua::Error>()
+            * INSTRUCTION_BUDGET_ERROR.len();
+        let mut state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
+        state.admit_hook_errors(&memory).unwrap();
+        let observed = Arc::clone(&memory);
+        state.drop_hook = Some(Box::new(move |_| assert_eq!(observed.usage().1, bytes)));
+        assert_eq!(memory.usage().1, bytes);
+        drop(state);
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn hook_error_storage_refusal_releases_the_unmodified_state() {
+        let memory = memory();
+        let held = memory
+            .reserve_shared_callback_storage(memory.limits().total_callback_bytes)
+            .unwrap();
+        let mut state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
+        assert!(state.admit_hook_errors(&memory).is_err());
+        assert!(state.charges.hook_errors.is_none());
+        drop(state);
+        assert_eq!(memory.usage(), (0, memory.limits().total_callback_bytes));
+        drop(held);
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    fn runtime(memory: &Arc<LuaMemoryAccount>) -> Arc<LuaPluginRuntime> {
+        let state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
+        Arc::new(LuaPluginRuntime {
+            plugin_key: PluginKey("state-owner-test".into()),
+            lua: Mutex::new(state),
+            instruction_budget: Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET)),
+            stopped: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn normal_transfer_releases_after_lua_destruction() {
+        let memory = memory();
+        let mut state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&phases);
+        let charged = Arc::clone(&memory);
+        state.drop_hook = Some(Box::new(move |phase| {
+            assert_eq!(charged.usage().0, charged.limits().per_vm_bytes);
+            observed.lock().unwrap().push(phase);
+        }));
+        {
+            // Current callers end temporary strong string borrows inside state use.
+            let string = state.lua().create_string("owned-state").unwrap();
+            let bytes = string.as_bytes();
+            assert_eq!(&*bytes, b"owned-state");
+        }
+        let state = Mutex::new(state);
+        assert_eq!(memory.usage().0, memory.limits().per_vm_bytes);
+        drop(state);
+        assert_eq!(
+            *phases.lock().unwrap(),
+            vec![LuaStateDropPhase::BeforeLua, LuaStateDropPhase::AfterLua,]
+        );
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn returned_constructor_error_releases_vm_charge() {
+        let memory = memory();
+        let result = LuaState::construct(
+            memory.reserve_vm().unwrap(),
+            Some(LuaStateConstructionTest::RejectLibrary),
+        );
+        assert!(matches!(result, Err(mlua::Error::SafetyError(_))));
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn constructor_panic_retains_vm_charge() {
+        let memory = memory();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // This seam proves owner retention, not mlua partial-state cleanup.
+            let _state = LuaState::construct(
+                memory.reserve_vm().unwrap(),
+                Some(LuaStateConstructionTest::PanicBeforeCreation),
+            )
+            .unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(memory.usage(), (memory.limits().per_vm_bytes, 0));
+    }
+
+    #[test]
+    fn setup_error_releases_after_clean_state_destruction() {
+        let memory = memory();
+        let setup = || -> mlua::Result<()> {
+            let state = LuaState::new(memory.reserve_vm().unwrap())?;
+            state
+                .lua()
+                .load("error('state owner setup failure')")
+                .exec()?;
+            Ok(())
+        };
+        let error = setup().unwrap_err();
+        assert!(error.to_string().contains("state owner setup failure"));
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn unrelated_unwind_releases_after_clean_state_destruction() {
+        let memory = memory();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
+            state.lua().load("return 1").exec().unwrap();
+            panic!("test unrelated setup unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn cleanup_hook_panic_retains_vm_charge() {
+        let memory = memory();
+        let mut state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
+        let charged = Arc::clone(&memory);
+        state.drop_hook = Some(Box::new(move |phase| {
+            assert_eq!(phase, LuaStateDropPhase::BeforeLua);
+            assert_eq!(charged.usage().0, charged.limits().per_vm_bytes);
+            // This proves owner ordering, not a real mlua finalizer panic.
+            panic!("test cleanup panic before completion");
+        }));
+        let result = catch_unwind(AssertUnwindSafe(|| drop(state)));
+        assert!(result.is_err());
+        assert_eq!(memory.usage(), (memory.limits().per_vm_bytes, 0));
+    }
+
+    #[test]
+    fn poisoned_runtime_keeps_charge_until_last_clone_drops() {
+        let memory = memory();
+        let runtime = runtime(&memory);
+        let surviving = Arc::clone(&runtime);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _state = runtime.lua.lock().unwrap();
+            panic!("test poisoned state mutex");
+        }));
+        assert!(result.is_err());
+        assert!(runtime.lua.is_poisoned());
+        drop(runtime);
+        assert_eq!(memory.usage(), (memory.limits().per_vm_bytes, 0));
+        drop(surviving);
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn poisoned_mutex_extraction_keeps_charge_until_state_drops() {
+        let memory = memory();
+        let mutex = Mutex::new(LuaState::new(memory.reserve_vm().unwrap()).unwrap());
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _state = mutex.lock().unwrap();
+            panic!("test poisoned extraction");
+        }));
+        assert!(result.is_err());
+        let state = match mutex.into_inner() {
+            Ok(_) => panic!("the mutex must be poisoned"),
+            Err(poison) => poison.into_inner(),
+        };
+        assert_eq!(memory.usage(), (memory.limits().per_vm_bytes, 0));
+        drop(state);
+        assert_eq!(memory.usage(), (0, 0));
+    }
+}
+
 impl LuaPluginRuntime {
-    /// Load a prepared local Lua package and return the core worker bundle.
+    /// Load a prepared Lua package with the supplied Hub account.
     pub fn load_prepared(
         prepared: &PreparedLocalPackage,
         configuration: PackageConfigurationView,
         api: LuaPluginHostApi,
         package_records: Vec<PackageRecord>,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
-        let plugin_key = PluginKey(prepared.package_name.clone());
-        let selected_entrypoint_path =
-            prepared.selected_entrypoint_path.as_ref().ok_or_else(|| {
-                LuaPluginRuntimeError::Load("local package has no lua entrypoint".to_string())
-            })?;
-        let host_api = LuaHostApi {
-            configuration,
-            capabilities: api.capabilities,
-            coordination: api.coordination,
-            entity_publish: api.entity_publish,
-            session_types: api.session_types,
-            spawn_targets: api.spawn_targets,
-            worktrees: api.worktrees,
-            package_records,
-            package_event_router: api.package_event_router,
-            causal_scopes: api.causal_scopes,
-            memory: None,
-        };
-        let loaded =
-            LoadedLuaPlugin::load(plugin_key.clone(), selected_entrypoint_path, host_api, None)?;
-        Ok(HubPluginRuntimeBundle {
-            runtime: Arc::new(loaded.runtime),
-            handlers: loaded.handlers,
-            event_handlers: loaded.event_handlers,
-            descriptors: loaded.descriptors,
-            resources: loaded.resources,
-            entrypoint: Some(selected_entrypoint_path.to_string_lossy().into_owned()),
-            metadata: Some(BoundaryJson(json!({
-                "runtime": "lua",
-                "abi": "botster.lua.v1",
-            }))),
-        })
+        Self::load_prepared_bounded(prepared, configuration, api, package_records)
     }
 
-    /// Load through explicit Hub memory policy.
-    ///
-    /// Production construction must not call this until it has resolved real
-    /// policy values; there is deliberately no default account in this module.
+    /// Load with the shared account retained by the supplied Host API.
     pub(crate) fn load_prepared_bounded(
         prepared: &PreparedLocalPackage,
         configuration: PackageConfigurationView,
         api: LuaPluginHostApi,
         package_records: Vec<PackageRecord>,
-        memory: Arc<LuaMemoryAccount>,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
+        let memory = api.memory;
         let plugin_key = PluginKey(prepared.package_name.clone());
         let entrypoint = prepared.selected_entrypoint_path.as_ref().ok_or_else(|| {
             LuaPluginRuntimeError::Load("local package has no lua entrypoint".to_string())
@@ -420,9 +1026,9 @@ impl LuaPluginRuntime {
             package_records,
             package_event_router: api.package_event_router,
             causal_scopes: api.causal_scopes,
-            memory: Some(Arc::clone(&memory)),
+            memory: Arc::clone(&memory),
         };
-        let loaded = LoadedLuaPlugin::load(plugin_key.clone(), entrypoint, host_api, Some(memory))?;
+        let loaded = LoadedLuaPlugin::load(plugin_key.clone(), entrypoint, host_api, memory)?;
         Ok(HubPluginRuntimeBundle {
             runtime: Arc::new(loaded.runtime),
             handlers: loaded.handlers,
@@ -441,21 +1047,15 @@ impl LuaPluginRuntime {
         plugin_key: PluginKey,
         entrypoint: &Path,
         host_api: LuaHostApi,
-        memory: Option<Arc<LuaMemoryAccount>>,
+        memory: Arc<LuaMemoryAccount>,
     ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
         let vm_charge = memory
-            .as_ref()
-            .map(LuaMemoryAccount::reserve_vm)
-            .transpose()
+            .reserve_vm()
             .map_err(|error| LuaPluginRuntimeError::Load(error.to_string()))?;
-        let lua = Lua::new_with(
-            StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
-            LuaOptions::default(),
-        )?;
-        if let Some(memory) = memory.as_ref() {
-            lua.set_memory_limit(memory.limits().per_vm_bytes)
-                .map_err(LuaPluginRuntimeError::from)?;
-        }
+        let state = LuaState::new(vm_charge)?;
+        let lua = state.lua();
+        lua.set_memory_limit(memory.limits().per_vm_bytes)
+            .map_err(LuaPluginRuntimeError::from)?;
         let budget = Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET));
         let hook_budget = budget.clone();
         lua.set_hook(
@@ -464,41 +1064,31 @@ impl LuaPluginRuntime {
                 let previous = hook_budget.fetch_sub(1_000, Ordering::Relaxed);
                 if previous <= 1_000 {
                     return Err(mlua::Error::RuntimeError(
-                        "lua instruction budget exceeded".to_string(),
+                        INSTRUCTION_BUDGET_ERROR.to_string(),
                     ));
                 }
                 Ok(VmState::Continue)
             },
         )?;
-        sandbox::install(&lua)?;
-        install_botster_api(&lua, plugin_key.clone(), host_api)?;
+        sandbox::install(lua)?;
+        install_botster_api(lua, plugin_key.clone(), host_api)?;
         let source_charge = memory
-            .as_ref()
-            .map(LuaMemoryAccount::reserve_callback)
-            .transpose()
+            .reserve_callback()
             .map_err(|error| LuaPluginRuntimeError::Load(error.to_string()))?;
-        let source = match memory.as_ref() {
-            Some(memory) => {
-                read_lua_source_bounded(entrypoint, memory.limits().per_callback_bytes)?
-            }
-            None => std::fs::read_to_string(entrypoint).map_err(|error| {
-                LuaPluginRuntimeError::Load(format!("failed to read Lua entrypoint: {error}"))
-            })?,
-        };
+        let source = read_lua_source_bounded(entrypoint, memory.limits().per_callback_bytes)?;
         let value: Value = lua
             .load(&source)
             .set_name(entrypoint.to_string_lossy().as_ref())
             .eval()
             .map_err(LuaPluginRuntimeError::from)?;
-        let registration = registration_from_value(&lua, value)?;
+        let registration = registration_from_value(lua, value)?;
         drop(source);
         drop(source_charge);
 
         Ok((
             Self {
                 plugin_key,
-                lua: Mutex::new(lua),
-                _vm_charge: vm_charge,
+                lua: Mutex::new(state),
                 instruction_budget: budget,
                 stopped: AtomicBool::new(false),
             },
@@ -587,7 +1177,8 @@ impl PluginRuntime for LuaPluginRuntime {
                 thread::sleep(Duration::from_millis(hold_ms));
             }
         }
-        let lua = self.lua.lock().expect("lua runtime mutex");
+        let state = self.lua.lock().expect("lua runtime mutex");
+        let lua = state.lua();
         self.instruction_budget
             .store(DEFAULT_INSTRUCTION_BUDGET, Ordering::Relaxed);
         let handlers = match lua.globals().get::<Table>("__botster_handlers") {
@@ -671,10 +1262,10 @@ impl PluginRuntime for LuaPluginRuntime {
 
     fn stop(&self, _plugin_key: &PluginKey) {
         self.stopped.store(true, Ordering::SeqCst);
-        if let Ok(lua) = self.lua.lock()
-            && let Ok(handlers) = lua.create_table()
+        if let Ok(state) = self.lua.lock()
+            && let Ok(handlers) = state.lua().create_table()
         {
-            let _ = lua.globals().set("__botster_handlers", handlers);
+            let _ = state.lua().globals().set("__botster_handlers", handlers);
         }
     }
 }
@@ -692,7 +1283,7 @@ impl LoadedLuaPlugin {
         plugin_key: PluginKey,
         entrypoint: &Path,
         host_api: LuaHostApi,
-        memory: Option<Arc<LuaMemoryAccount>>,
+        memory: Arc<LuaMemoryAccount>,
     ) -> Result<Self, LuaPluginRuntimeError> {
         let (runtime, registration) =
             LuaPluginRuntime::new(plugin_key.clone(), entrypoint, host_api, memory)?;
@@ -899,59 +1490,17 @@ fn install_botster_api(
     globals.set("io", Value::Nil)?;
     globals.set("package", Value::Nil)?;
 
+    let (event_on, register): (Function, Function) = lua
+        .load(include_str!("lua_runtime/registration.lua"))
+        .call((lua.globals(), lua.null()))?;
     let events = lua.create_table()?;
-    events.set(
-        "on",
-        lua.create_function(
-            move |lua, (owner, name, handler): (Value, Value, Option<Value>)| {
-                let (Value::String(owner), Value::String(name), Some(Value::Function(handler))) =
-                    (owner, name, handler)
-                else {
-                    return Err(mlua::Error::RuntimeError(
-                        EventPlaneStatus::RejectedInvalid.as_str().to_string(),
-                    ));
-                };
-                let owner = owner.to_str()?.to_string();
-                let name = name.to_str()?.to_string();
-                if owner.trim().is_empty()
-                    || name.trim().is_empty()
-                    || owner.contains('*')
-                    || name.contains('*')
-                    || owner.contains('?')
-                    || name.contains('?')
-                {
-                    return Err(mlua::Error::RuntimeError(
-                        EventPlaneStatus::RejectedWildcard.as_str().to_string(),
-                    ));
-                }
-                let registration = lua.globals().get::<Table>("__botster_registration")?;
-                let handler_table: Table = match registration.get("handlers") {
-                    Ok(handler_table) => handler_table,
-                    Err(_) => {
-                        let handler_table = lua.create_table()?;
-                        registration.set("handlers", handler_table.clone())?;
-                        handler_table
-                    }
-                };
-                let handler_id = format!("event:{owner}:{name}:{}", handler_table.raw_len() + 1);
-                let handlers = lua.globals().get::<Table>("__botster_handlers")?;
-                handlers.set(handler_id.clone(), handler)?;
-                let entry = lua.create_table()?;
-                entry.set("id", handler_id)?;
-                entry.set("kind", "event")?;
-                entry.set("event_owner", owner)?;
-                entry.set("event", name)?;
-                handler_table.set(handler_table.raw_len() + 1, entry)?;
-                Ok(())
-            },
-        )?,
-    )?;
+    events.set("on", event_on)?;
     let emit_router = host_api.package_event_router.clone();
     let emit_plugin = plugin_key.clone();
     let emit_scopes = host_api.causal_scopes.clone();
     events.set(
         "emit",
-        lua.create_function(move |lua, (name, payload): (String, Value)| {
+        callback::create(lua, move |lua, (name, payload): (EventName, Value)| {
             if let Some(scope_id) = current_causal_scope()
                 && emit_scopes.is_live(scope_id)
             {
@@ -959,6 +1508,7 @@ fn install_botster_api(
                     "status": EventPlaneStatus::RejectedCausalScope.as_str(),
                 }));
             }
+            let name = name.0.to_str()?;
             let payload = lua.from_value::<serde_json::Value>(payload)?;
             let status = emit_router.try_ingress(&emit_plugin.0, &name, &payload, Instant::now());
             lua.to_value(&json!({ "status": status.as_str() }))
@@ -968,51 +1518,6 @@ fn install_botster_api(
     globals.set("events", events)?;
 
     let botster = lua.create_table()?;
-    let register = lua.create_function(|lua, registration: Table| {
-        let handlers = lua.globals().get::<Table>("__botster_handlers")?;
-        let pending_registration = lua.globals().get::<Table>("__botster_registration")?;
-        if let Ok(pending_handlers) = pending_registration.get::<Table>("handlers") {
-            let custom_handlers: Table = match registration.get("handlers") {
-                Ok(custom_handlers) => custom_handlers,
-                Err(_) => {
-                    let custom_handlers = lua.create_table()?;
-                    registration.set("handlers", custom_handlers.clone())?;
-                    custom_handlers
-                }
-            };
-            let mut index = custom_handlers.raw_len();
-            for pending_handler in pending_handlers.sequence_values::<Table>() {
-                index += 1;
-                custom_handlers.set(index, pending_handler?)?;
-            }
-        }
-        if let Ok(tools) = registration.get::<Table>("tools") {
-            for tool in tools.sequence_values::<Table>() {
-                let tool = tool?;
-                let handler_id: String = tool.get("handler")?;
-                let handler: Function = tool.get("call")?;
-                handlers.set(handler_id, handler)?;
-            }
-        }
-        if let Ok(custom_handlers) = registration.get::<Table>("handlers") {
-            for custom_handler in custom_handlers.sequence_values::<Table>() {
-                let custom_handler = custom_handler?;
-                let handler_id: String = custom_handler.get("id")?;
-                if let Ok(handler) = custom_handler.get::<Function>("call") {
-                    handlers.set(handler_id, handler)?;
-                } else if custom_handler.get::<String>("kind").ok().as_deref()
-                    == Some("entity_provider")
-                {
-                    return Err(mlua::Error::RuntimeError(
-                        "entity provider declarations require a call handler".to_string(),
-                    ));
-                }
-            }
-        }
-        lua.globals()
-            .set("__botster_registration", registration.clone())?;
-        Ok(registration)
-    })?;
     botster.set("register", register)?;
 
     let capabilities_table = lua.create_table()?;
@@ -1020,7 +1525,7 @@ fn install_botster_api(
     let timer_plugin_key = plugin_key.clone();
     capabilities_table.set(
         "timer_once",
-        lua.create_function(move |lua, delay_ms: u64| {
+        callback::create(lua, move |lua, delay_ms: u64| {
             let operation_id = CapabilityOperationId(format!("lua-timer-{delay_ms}"));
             let request = CapabilityRuntimeRequest {
                 plugin_key: timer_plugin_key.clone(),
@@ -1057,7 +1562,7 @@ fn install_botster_api(
             host_api.session_types,
             host_api.spawn_targets.clone(),
             host_api.package_records,
-            host_api.memory.clone(),
+            Some(host_api.memory.clone()),
         )?,
     )?;
     capabilities_table.set(
@@ -1092,7 +1597,7 @@ fn entity_publish_function(
     plugin_key: PluginKey,
     bridge: HubEntityPublishBridge,
 ) -> Result<Function, mlua::Error> {
-    lua.create_function(move |lua, args: Value| {
+    callback::create(lua, move |lua, args: Value| {
         let value = lua.from_value::<serde_json::Value>(args)?;
         let scope_id = current_causal_scope();
         let result = match bridge.publish(plugin_key.clone(), value, scope_id) {
@@ -1125,7 +1630,7 @@ fn spawn_targets_table(lua: &Lua, spawn_targets: SharedSpawnTargets) -> Result<T
     let list_targets = spawn_targets.clone();
     table.set(
         "list",
-        lua.create_function(move |lua, ()| {
+        callback::create(lua, move |lua, ()| {
             let (_, state) = list_targets
                 .try_snapshot()
                 .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
@@ -1136,7 +1641,7 @@ fn spawn_targets_table(lua: &Lua, spawn_targets: SharedSpawnTargets) -> Result<T
     )?;
     table.set(
         "validate",
-        lua.create_function(move |lua, args: Value| {
+        callback::create(lua, move |lua, args: Value| {
             let value = lua.from_value::<serde_json::Value>(args)?;
             let target_id = value
                 .get("target_id")
@@ -1169,7 +1674,7 @@ fn worktrees_table(
     let list_targets = spawn_targets.clone();
     table.set(
         "list",
-        lua.create_function(move |lua, ()| {
+        callback::create(lua, move |lua, ()| {
             let (_, state) = list_targets
                 .try_snapshot()
                 .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
@@ -1182,7 +1687,7 @@ fn worktrees_table(
     )?;
     table.set(
         "show",
-        lua.create_function(move |lua, args: Value| {
+        callback::create(lua, move |lua, args: Value| {
             let value = lua.from_value::<serde_json::Value>(args)?;
             let worktree_id = value
                 .get("worktree_id")
@@ -1229,7 +1734,7 @@ fn config_table(lua: &Lua, configuration: PackageConfigurationView) -> Result<Ta
     });
     config.set(
         "get",
-        lua.create_function(move |lua, package_name: Value| {
+        callback::create(lua, move |lua, package_name: Value| {
             if !matches!(package_name, Value::Nil) {
                 return Err(mlua::Error::RuntimeError(
                     "config.get reads only the loaded plugin configuration and accepts no package name"
@@ -1448,7 +1953,7 @@ fn session_types_table(
     let spawn_records = package_records.clone();
     table.set(
         "spawn",
-        lua.create_function(move |lua, args: Value| {
+        callback::create(lua, move |lua, args: Value| {
             let value = lua.from_value::<serde_json::Value>(args)?;
             let session_type_id = value
                 .get("session_type_id")
@@ -1475,7 +1980,7 @@ fn session_types_table(
     )?;
     table.set(
         "ensure_worktree_and_spawn",
-        lua.create_function(move |lua, args: Value| {
+        callback::create(lua, move |lua, args: Value| {
             let value = lua.from_value::<serde_json::Value>(args)?;
             reject_trusted_managed_fields(&value)?;
             let target_id = required_string(
@@ -1658,7 +2163,7 @@ fn plugin_db_table(
         let key = plugin_key.clone();
         plugin_db.set(
             name,
-            lua.create_function(move |lua, args: Value| {
+            callback::create(lua, move |lua, args: Value| {
                 let operation = plugin_store_operation_from_lua(lua, action, args)?;
                 execute_plugin_store_for_lua(lua, runtime.clone(), key.clone(), operation, action)
             })?,
@@ -1668,7 +2173,7 @@ fn plugin_db_table(
     let batch_plugin_key = plugin_key.clone();
     plugin_db.set(
         "batch",
-        lua.create_function(move |lua, args: Value| {
+        callback::create(lua, move |lua, args: Value| {
             execute_plugin_store_batch_for_lua(
                 lua,
                 batch_runtime.clone(),
@@ -1844,7 +2349,7 @@ fn coordination_table(
     lua: &Lua,
     plugin_key: PluginKey,
     coordination_bridge: HubCoordinationBridge,
-    memory: Option<Arc<LuaMemoryAccount>>,
+    memory: Arc<LuaMemoryAccount>,
 ) -> Result<Table, mlua::Error> {
     let coordination = lua.create_table()?;
 
@@ -1852,7 +2357,7 @@ fn coordination_table(
     let publish_plugin_key = plugin_key.clone();
     coordination.set(
         "publish",
-        lua.create_function(move |lua, args: Value| {
+        callback::create(lua, move |lua, args: Value| {
             let envelope = routed_envelope_from_lua(lua, publish_plugin_key.clone(), args)?;
             let outcome = publish_bridge
                 .publish(envelope)
@@ -1864,7 +2369,7 @@ fn coordination_table(
     let drain_bridge = coordination_bridge.clone();
     coordination.set(
         "drain",
-        lua.create_function(move |lua, args: Value| {
+        callback::create(lua, move |lua, args: Value| {
             let value = lua.from_value::<serde_json::Value>(args)?;
             let target = target_from_json(value.get("target"))?;
             let after = value
@@ -2441,6 +2946,7 @@ mod terminal_bridge_tests {
         let executor = HostExecutor::new();
         let (finished, receiver) = mpsc::channel();
         let job = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+            storage: None,
             identity: HostJobIdentity::first(WaiterId(31)),
             permit: executor.try_reserve().unwrap(),
             model: None,
@@ -2547,7 +3053,20 @@ mod completion_tests {
     };
 
     fn invoke_lua(source: &str, origin: &str, kind: PluginHandlerKind) -> PluginInvocationResult {
-        let lua = Lua::new();
+        invoke_lua_with_setup(source, origin, kind, |_| {})
+    }
+
+    fn invoke_lua_with_setup(
+        source: &str,
+        origin: &str,
+        kind: PluginHandlerKind,
+        setup: impl FnOnce(&Lua),
+    ) -> PluginInvocationResult {
+        let memory = LuaMemoryAccount::new(crate::config::lua_memory_limits()).unwrap();
+        let state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
+        let lua = state.lua();
+        lua.set_memory_limit(memory.limits().per_vm_bytes).unwrap();
+        setup(lua);
         let handlers = lua.create_table().expect("create handler registry");
         let handler = lua
             .load(source)
@@ -2560,8 +3079,7 @@ mod completion_tests {
         let plugin_key = PluginKey("completion-test".to_string());
         let runtime = LuaPluginRuntime {
             plugin_key: plugin_key.clone(),
-            lua: Mutex::new(lua),
-            _vm_charge: None,
+            lua: Mutex::new(state),
             instruction_budget: Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET)),
             stopped: AtomicBool::new(false),
         };
@@ -2586,6 +3104,40 @@ mod completion_tests {
             },
             PluginCancellationToken::new(),
         )
+    }
+
+    #[test]
+    fn callback_errors_preserve_root_messages_and_request_identity() {
+        for message in ["host callback failure", "runtime error: actual plugin text"] {
+            let mut failures = Vec::new();
+            for previous in [true, false] {
+                let result = invoke_lua_with_setup(
+                    "return function() callback() end",
+                    "request-response",
+                    PluginHandlerKind::McpTool,
+                    |lua| {
+                        let function = move |_: &Lua, ()| -> mlua::Result<Value> {
+                            Err(mlua::Error::RuntimeError(message.to_owned()))
+                        };
+                        let callback = if previous {
+                            lua.create_function(function).unwrap()
+                        } else {
+                            callback::create(lua, function).unwrap()
+                        };
+                        lua.globals().set("callback", callback).unwrap();
+                    },
+                );
+                let PluginInvocationResult::Failed(failure) = result else {
+                    panic!("callback failure must reach the invocation result");
+                };
+                assert_eq!(failure.kind, PluginInvocationFailureKind::HandlerFailed);
+                assert_eq!(failure.request_id.0, "completion-test-request");
+                assert_eq!(failure.handler.handler_id, "run");
+                assert_eq!(failure.reason, format!("runtime error: {message}"));
+                failures.push(failure.reason);
+            }
+            assert_eq!(failures[0], failures[1]);
+        }
     }
 
     #[test]
@@ -2657,3 +3209,6 @@ mod completion_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod coordination_lifecycle_tests;

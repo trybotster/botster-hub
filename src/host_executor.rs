@@ -46,6 +46,11 @@ impl HostError {
 }
 
 pub(crate) enum HostCommand {
+    DeliverCoordinationResponse {
+        response: crate::lua_runtime::CoordinationReplySender,
+        result: crate::lua_runtime::CoordinationDelivery,
+        discard: Option<crate::data_plane::driver::CoreRejectedRequest>,
+    },
     ClientEventCleanup {
         router: Arc<crate::package_event_router::PackageEventRouter>,
         work: crate::subscription::package_events::ClientCleanupWork,
@@ -108,6 +113,7 @@ pub(crate) enum HostCommand {
 impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
+            Self::DeliverCoordinationResponse { .. } => 0,
             #[cfg(test)]
             Self::DisposalProbe(_) => 0,
             Self::Dispose(_) | Self::TerminalDispose(_) | Self::DiscardCompletion(_) => 0,
@@ -132,6 +138,9 @@ impl HostCommand {
 impl std::fmt::Debug for HostCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::DeliverCoordinationResponse { .. } => {
+                formatter.write_str("DeliverCoordinationResponse")
+            }
             Self::ClientEventCleanup { .. } => formatter.write_str("ClientEventCleanup"),
             #[cfg(test)]
             Self::DisposalProbe(_) => formatter.write_str("DisposalProbe"),
@@ -195,6 +204,9 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
+    CoordinationResponseDelivered {
+        received: bool,
+    },
     ClientEventCleanup(
         Result<
             crate::subscription::package_events::ClientCleanupCompletion,
@@ -241,6 +253,7 @@ pub(crate) enum HostResult {
 impl HostResult {
     fn generation(&self) -> u64 {
         match self {
+            Self::CoordinationResponseDelivered { .. } => 0,
             Self::EntityModelComplete(_) => 0,
             Self::EventOwner(_) | Self::ClientEventCleanup(_) => 0,
             Self::StatusResponsePrepared(_) | Self::StatusResponseDelivered { .. } => 0,
@@ -338,6 +351,7 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
+        HostResult::CoordinationResponseDelivered { .. } => 0,
         HostResult::StatusResponsePrepared(prepared) => prepared.logical_bytes(),
         HostResult::StatusResponseDelivered { .. } => 0,
         HostResult::EntityModelComplete(_) => 0,
@@ -1096,6 +1110,21 @@ fn execute(
     permit: &mut HostWorkPermit,
 ) -> HostResult {
     match command {
+        HostCommand::DeliverCoordinationResponse {
+            response,
+            result,
+            discard,
+        } => {
+            drop(discard);
+            let received = match response.send(result) {
+                Ok(()) => true,
+                Err(result) => {
+                    drop(result);
+                    false
+                }
+            };
+            HostResult::CoordinationResponseDelivered { received }
+        }
         #[cfg(test)]
         HostCommand::DisposalProbe(probe) => {
             probe.executed.store(true, Ordering::Release);
@@ -1389,6 +1418,7 @@ mod tests {
         let identity = HostJobIdentity::first(WaiterId(89));
         let (dropped, receiver) = mpsc::channel();
         let mut job = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+            storage: None,
             identity,
             permit,
             payload: Box::new(TestDisposalProbe {

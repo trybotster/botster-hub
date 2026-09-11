@@ -76,6 +76,7 @@ impl ManagedGitRecoveryRequired {
         (
             self.owner_permit,
             crate::host_disposal::Parts {
+                storage: None,
                 identity,
                 permit: self._permit,
                 model: None,
@@ -193,6 +194,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             response_delivery_rx: None,
             grant_id: None,
             client: None,
+            core_retirement: None,
             permit: Some(owner_permit),
             must_finish: true,
             past_deadline: false,
@@ -233,6 +235,7 @@ impl ManagedSpawnOperation {
             (identity, permit)
         };
         Some(crate::host_disposal::Parts {
+            storage: None,
             identity,
             permit,
             model: None,

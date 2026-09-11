@@ -1,6 +1,7 @@
 //! Control-plane dispatchers.
 
 pub(crate) mod connection;
+pub(crate) mod coordination;
 pub(crate) mod entities;
 pub(crate) mod events;
 pub(crate) mod host;
@@ -90,7 +91,7 @@ pub(crate) fn dispatch_control_message(
             record_data_plane_progress(daemon, state);
             false
         }
-        ControlMessage::CoreCompletionPublished => false,
+        ControlMessage::CoreCompletionPublished | ControlMessage::CoordinationProgress => false,
         message @ ControlMessage::AcceptedConnection { .. }
         | message @ ControlMessage::ConnectionCleanup(_)
         | message @ ControlMessage::RejectedConnection

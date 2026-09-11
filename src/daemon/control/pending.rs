@@ -32,6 +32,8 @@ pub(crate) const READY_BACKGROUND: ReadyReasons = ReadyReasons::from_bits(1 << 5
 
 /// Outcome of one continuation poll.
 pub(crate) enum ControlPoll {
+    /// An internal callback has completed its own response delivery.
+    FinishedInternal,
     DeliverStatusResponse(
         crate::status_response::PreparedStatusResponse,
         crate::host_executor::HostWorkPermit,
@@ -65,16 +67,36 @@ pub(crate) enum ControlPoll {
 
 /// Retained Host work has a typed owner so terminal disposal can extract its original permit.
 pub(crate) enum ControlContinuation {
+    Coordination(
+        Box<super::coordination::CoordinationContinuation>,
+        Option<crate::lua_memory::LuaCallbackCharge>,
+    ),
     Callback(Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>),
     HostMutation(Box<super::host_work::HostMutationContinuation>),
     Status(Box<super::status::StatusContinuation>),
     ManagedSpawn(Box<super::managed_git::ManagedSpawnOperation>),
-    Terminal(Box<TerminalContinuation>),
+    Terminal(Box<TerminalContinuation>, Option<crate::lua_memory::LuaCallbackStorageLease>),
 }
 
 pub(crate) struct TerminalContinuation {
     original: ControlContinuation,
     job: crate::host_disposal::Job,
+}
+
+struct TerminalOwnerPayload {
+    completion: OwnerRequestCompletion,
+    reply: ControlReplySender,
+    response_delivery: Option<mpsc::Receiver<()>>,
+    grant_id: Option<String>,
+    client: Option<String>,
+    retire: Option<RetireHook>,
+}
+
+pub(crate) fn terminal_storage_bytes(payload: usize) -> Option<usize> {
+    payload
+        .checked_add(std::mem::size_of::<(Box<dyn Send>, TerminalOwnerPayload)>())?
+        .checked_add(crate::host_disposal::boxed_payload_storage_bytes()?)?
+        .checked_add(std::mem::size_of::<TerminalContinuation>())
 }
 
 impl ControlContinuation {
@@ -90,29 +112,33 @@ impl ControlContinuation {
         state: &mut DaemonControlState,
     ) -> ControlPoll {
         match self {
+            Self::Coordination(work, _) => work.poll(daemon, state),
             Self::Callback(callback) => callback(daemon, state),
             Self::HostMutation(work) => work.poll(daemon, state),
             Self::Status(work) => work.poll(daemon, state),
             Self::ManagedSpawn(work) => work.poll(daemon, state),
-            Self::Terminal(_) => panic!("terminal requests cannot resume normal execution"),
+            Self::Terminal(..) => panic!("terminal requests cannot resume normal execution"),
         }
     }
 
     /// Keep the original request row until Host destroys its payload.
     fn take_terminal_parts(
         &mut self,
+        runtime: &crate::HubRuntime,
         identity: crate::host_executor::HostJobIdentity,
         completion: &mut Option<crate::host_executor::HostCompletion>,
     ) -> Option<crate::host_disposal::Parts> {
         match self {
+            Self::Coordination(work, _) => work.take_terminal_parts(runtime, identity, completion),
             Self::HostMutation(work) => work.take_terminal_parts(identity, completion),
             Self::Status(work) => work.take_terminal_parts(identity, completion),
             Self::ManagedSpawn(work) => work.take_terminal_parts(identity, completion),
-            Self::Callback(_) | Self::Terminal(_) => None,
+            Self::Callback(_) | Self::Terminal(..) => None,
         }
     }
 
     fn begin_terminal(&mut self, parts: crate::host_disposal::Parts) {
+        let storage = parts.storage.clone();
         let mut original = std::mem::replace(self, Self::callback(|_, _| ControlPoll::Pending));
         let parts = if matches!(original, Self::Callback(_)) {
             let Self::Callback(callback) =
@@ -127,11 +153,11 @@ impl ControlContinuation {
         *self = Self::Terminal(Box::new(TerminalContinuation {
             original,
             job: crate::host_disposal::Job::new(parts),
-        }));
+        }), storage);
     }
 
     pub(crate) fn poll_terminal(&mut self, runtime: &crate::HubRuntime) -> bool {
-        let Self::Terminal(terminal) = self else {
+        let Self::Terminal(terminal, _) = self else {
             return false;
         };
         match terminal.job.poll() {
@@ -154,7 +180,7 @@ impl ControlContinuation {
 }
 
 /// The terminal driver calls this only after it seals normal control ingress.
-/// Each request keeps its Owner permit until its original Host slot reports disposal.
+/// Each request keeps its Owner permit until Host reports disposal.
 pub(crate) fn dispose_terminal_requests(
     runtime: &crate::HubRuntime,
     state: &mut DaemonControlState,
@@ -175,6 +201,7 @@ pub(crate) fn dispose_terminal_requests(
             } else if let Some(completion) = completion.take() {
                 let (identity, result, permit) = completion.into_parts();
                 Some(crate::host_disposal::Parts {
+                    storage: None,
                     identity,
                     permit,
                     payload: Box::new(result),
@@ -185,6 +212,7 @@ pub(crate) fn dispose_terminal_requests(
                     .host_executor()
                     .try_reserve()
                     .map(|permit| crate::host_disposal::Parts {
+                        storage: None,
                         identity,
                         permit,
                         payload: Box::new(()),
@@ -194,17 +222,17 @@ pub(crate) fn dispose_terminal_requests(
         } else {
             entry
                 .continuation
-                .take_terminal_parts(identity, &mut completion)
+                .take_terminal_parts(runtime, identity, &mut completion)
         };
         if let Some(parts) = parts {
-            let parts = parts.with_payload((
-                std::mem::take(&mut entry.completion),
-                entry.reply_tx.take(),
-                entry.response_delivery_rx.take(),
-                entry.grant_id.take(),
-                entry.client.take(),
-                entry.retire.take(),
-            ));
+            let parts = parts.with_payload(TerminalOwnerPayload {
+                completion: std::mem::take(&mut entry.completion),
+                reply: entry.reply_tx.take(),
+                response_delivery: entry.response_delivery_rx.take(),
+                grant_id: entry.grant_id.take(),
+                client: entry.client.take(),
+                retire: entry.retire.take(),
+            });
             entry.continuation.begin_terminal(parts);
         }
         if let Some(completion) = completion {
@@ -213,6 +241,13 @@ pub(crate) fn dispose_terminal_requests(
         if !entry.continuation.poll_terminal(runtime) {
             return true;
         }
+        state.coordination_capacity_waiters.remove(waiter_id);
+        // Destroy the continuation before another request can use this Owner slot.
+        drop(std::mem::replace(
+            &mut entry.continuation,
+            ControlContinuation::callback(|_, _| ControlPoll::Pending),
+        ));
+        drop(entry.core_retirement.take());
         if let Some(permit) = entry.permit.take() {
             state.budget.release(permit);
         }
@@ -337,6 +372,7 @@ pub(crate) struct PendingControlRequest {
     pub(crate) response_delivery_rx: Option<mpsc::Receiver<()>>,
     pub(crate) grant_id: Option<String>,
     pub(crate) client: Option<String>,
+    pub(crate) core_retirement: Option<crate::data_plane::driver::CoreWaiterRetirement>,
     pub(crate) permit: Option<OwnerPermit>,
     pub(crate) must_finish: bool,
     pub(crate) past_deadline: bool,
@@ -526,13 +562,18 @@ pub(crate) fn absorb_core_completions(
         if identity.phase != expected {
             continue;
         }
+        let coordination = matches!(entry.continuation, ControlContinuation::Coordination(..));
         entry.last_core_phase = identity.phase;
-        mark_owner_ready(
+        if !mark_owner_ready(
             state,
             identity.waiter_id,
             ReadyClass::CoreCompletion,
             READY_CORE_COMPLETION,
-        );
+        ) && coordination
+        {
+            state.coordination_fault =
+                Some(super::coordination::CoordinationFault::SchedulerExhausted);
+        }
     }
     identities.len()
 }
@@ -551,16 +592,20 @@ pub(crate) fn absorb_host_completion(
     if identity.phase != expected || state.host_completions.contains_key(&identity.waiter_id) {
         return;
     }
+    let coordination = matches!(entry.continuation, ControlContinuation::Coordination(..));
     entry.last_host_phase = identity.phase;
     state
         .host_completions
         .insert(identity.waiter_id, completion);
-    mark_owner_ready(
+    if !mark_owner_ready(
         state,
         identity.waiter_id,
         ReadyClass::HostCompletion,
         READY_HOST_COMPLETION,
-    );
+    ) && coordination
+    {
+        state.coordination_fault = Some(super::coordination::CoordinationFault::SchedulerExhausted);
+    }
 }
 
 pub(crate) fn mark_due_owner_deadlines(
@@ -617,6 +662,7 @@ fn retire(
     state
         .blocked_session_type_roots
         .retain(|_, waiter_id| *waiter_id != entry.waiter_id);
+    drop(entry.core_retirement.take());
     match (entry.permit.take(), entry.retire.take()) {
         // The request owns Core work: the hook keeps the permit in an
         // obligation that cancels or releases it.
@@ -729,6 +775,21 @@ pub(crate) fn poll_ready_request_item(
         let poll = entry.continuation.poll(daemon, state);
         state.current_waiter_id = None;
         let reply = match poll {
+            ControlPoll::FinishedInternal => {
+                debug_assert!(entry.retire.is_none());
+                state.coordination_capacity_waiters.remove(&waiter_id);
+                state.deadlines.retire(waiter_id);
+                state.host_completions.remove(&waiter_id);
+                let retirement = entry.core_retirement.take();
+                let permit = entry.permit.take();
+                drop(entry);
+                drop(retirement);
+                if let Some(permit) = permit {
+                    state.budget.release(permit);
+                }
+                wake_shutdown_waiter(state);
+                return false;
+            }
             ControlPoll::StatusResponseRefused { shutdown } => {
                 if reasons.contains(READY_DEADLINE) && entry.must_finish {
                     flag_past_deadline(state, &mut entry);
@@ -1039,6 +1100,7 @@ mod tests {
                 response_delivery_rx: None,
                 grant_id: None,
                 client: None,
+                core_retirement: None,
                 permit: Some(permit),
                 must_finish,
                 past_deadline: false,
@@ -1154,6 +1216,7 @@ mod tests {
                 response_delivery_rx: None,
                 grant_id: None,
                 client: None,
+                core_retirement: None,
                 permit: Some(permit),
                 must_finish: true,
                 past_deadline: false,
