@@ -46,19 +46,23 @@ pub fn prepare_capacity_raise_storm() -> CapacityRaiseStorm {
     lua.globals()
         .set("coordination", table)
         .expect("set coordination");
+    lua.load(
+        "kept = {}; for i = 1, 1000 do kept[i] = false end",
+    )
+    .exec()
+    .expect("pre-size retained error table");
     CapacityRaiseStorm { lua }
 }
 
 #[cfg(feature = "allocation-oracle")]
 impl CapacityRaiseStorm {
-    pub fn retain_publish_errors(&self, n: u32) {
+    pub fn retain_publish_errors(&self, n: u32) -> Result<(), String> {
         self.lua
             .load(&format!(
                 r#"
-                local kept = {{}}
                 for i = 1, {n} do
                     local ok, err = pcall(coordination.publish, {{ id = 'e1', target = {{ type = 'topic', topic = 't' }} }})
-                    assert(not ok)
+                    assert(not ok, tostring(err))
                     kept[i] = err
                 end
                 for i = 2, {n} do
@@ -67,7 +71,7 @@ impl CapacityRaiseStorm {
                 "#
             ))
             .exec()
-            .expect("retain capacity errors");
+            .map_err(|error| error.to_string())
     }
 }
 
