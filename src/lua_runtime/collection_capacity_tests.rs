@@ -208,17 +208,37 @@ fn refused_enqueue_destroys_request_and_restores_usage() {
 }
 
 #[test]
-fn request_typed_entry_charge_restores_on_collection_refusal() {
+fn request_typed_entry_admission_refuses_when_entry_does_not_fit() {
     let memory = account(slot());
     let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
     enqueue(&bridge).unwrap();
     let before = memory.usage().1;
-    let error = request_typed_from_worker(bridge.clone()).expect_err("collection full");
+    let error = request_typed_from_worker(bridge.clone()).expect_err("entry cannot fit");
     assert!(matches!(
         error,
         CoordinationRequestError::Local(CoordinationLocalError::Capacity)
     ));
     assert_eq!(memory.usage().1, before);
+}
+
+#[test]
+fn request_typed_admitted_entry_destroyed_on_collection_refusal() {
+    let entry_bytes = super::nonacknowledge_entry_bytes(&drain_op()).unwrap();
+    let memory = account(slot() + entry_bytes);
+    let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
+    enqueue(&bridge).unwrap();
+    let before = memory.usage().1;
+    assert_eq!(before, slot());
+    let remaining = memory.limits().total_callback_bytes - before;
+    assert!(remaining >= entry_bytes);
+    let error =
+        request_typed_from_worker(bridge.clone()).expect_err("collection growth must refuse");
+    assert!(matches!(
+        error,
+        CoordinationRequestError::Local(CoordinationLocalError::Capacity)
+    ));
+    assert_eq!(memory.usage().1, before);
+    assert_eq!(bridge.test_pending_count(), 1);
 }
 
 #[test]

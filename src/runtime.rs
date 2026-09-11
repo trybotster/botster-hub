@@ -2854,6 +2854,16 @@ impl HubRuntime {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_inflight_reserved(&self) -> usize {
+        self.inflight_plugin_core.lock().unwrap().reserved()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_inflight_capacity(&self) -> usize {
+        self.inflight_plugin_core.lock().unwrap().capacity()
+    }
+
     pub(crate) fn bind_terminal_core_owner(&self) {
         self.core_daemon.bind_terminal_owner();
     }
@@ -6828,6 +6838,31 @@ pub(crate) mod tests {
             .expect_err("capacity must refuse before reserve");
         assert_eq!(error, crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED);
         assert_eq!(runtime.test_retained_reservation_takes(), takes_before);
+    }
+
+    #[test]
+    fn inflight_spawn_cancels_reserved_slot_on_fulfill_err() {
+        let runtime = family_runtime("inflight-spawn-cancel");
+        let request = crate::session_types::SessionTypeRequest {
+            target_id: None,
+            session_id: None,
+            cwd: None,
+            environment: BTreeMap::new(),
+            context: crate::session_types::SessionTypeContextInput::default(),
+        };
+        let error = runtime
+            .test_plugin_spawn("test.plugin", "agent", request.clone(), Vec::new())
+            .expect_err("missing session_type_spawn capability");
+        assert!(error.contains("session_type_spawn"));
+        assert_eq!(runtime.test_inflight_reserved(), 0);
+        let cap = runtime.test_inflight_capacity();
+        assert!(cap >= 1);
+        let error = runtime
+            .test_plugin_spawn("test.plugin", "agent", request, Vec::new())
+            .expect_err("second missing capability reuses the slot");
+        assert!(error.contains("session_type_spawn"));
+        assert_eq!(runtime.test_inflight_reserved(), 0);
+        assert_eq!(runtime.test_inflight_capacity(), cap);
     }
 
     #[test]
