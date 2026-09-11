@@ -224,7 +224,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     println!(
-        "pending size={} align={} inflight size={} align={}",
+        "commit={} pending size={} align={} inflight size={} align={}",
+        option_env!("BOTSTER_EMBEDDED_BUILD_REVISION").unwrap_or("unspecified"),
         PendingQueue::type_size(),
         PendingQueue::type_align(),
         InflightQueue::type_size(),

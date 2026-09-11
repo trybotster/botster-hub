@@ -37,6 +37,7 @@ pub(crate) struct CoordinationContinuation {
     #[cfg(test)]
     terminal_drop_probe: Option<Box<dyn Send>>,
     disposal: Option<crate::lua_memory::LuaCallbackCharge>,
+    entry: Option<crate::lua_memory::LuaCallbackCharge>,
 }
 
 #[allow(dead_code)] // payload owners drop here; the lease outlives this box
@@ -48,6 +49,7 @@ struct CoordinationTerminalPayload {
     command: Option<HostCommand>,
     #[cfg(test)]
     terminal_drop_probe: Option<Box<dyn Send>>,
+    entry: Option<crate::lua_memory::LuaCallbackCharge>,
 }
 
 pub(crate) const fn continuation_bytes() -> usize {
@@ -136,6 +138,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
                     #[cfg(test)]
                     terminal_drop_probe: pending.terminal_drop_probe,
                     disposal,
+                    entry: pending.entry,
                 }),
                 continuation_charge,
             ),
@@ -274,6 +277,7 @@ impl CoordinationContinuation {
                 command: retained_command,
                 #[cfg(test)]
                 terminal_drop_probe: self.terminal_drop_probe.take(),
+                entry: self.entry.take(),
             }),
         })
     }

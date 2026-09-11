@@ -289,7 +289,7 @@ pub(crate) mod ownership {
 
     /// The acknowledgement endpoint requires its admitted error and channel storage.
     pub(crate) enum CoordinationReplySender {
-        NonAcknowledge(mpsc::Sender<CoordinationReply>),
+        NonAcknowledge(mpsc::SyncSender<CoordinationReply>),
         Acknowledge {
             sender: AcknowledgeReplySender,
             error: LuaCallbackCharge,

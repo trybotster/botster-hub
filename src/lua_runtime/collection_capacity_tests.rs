@@ -3,6 +3,7 @@ use crate::data_plane::driver::CoreSubmissionStorage;
 use crate::lua_memory::LuaMemoryLimits;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 fn slot() -> usize {
     size_of::<PendingCoordinationRequest>()
@@ -32,7 +33,7 @@ fn pending_request() -> (
     PendingCoordinationRequest,
     mpsc::Receiver<CoordinationReply>,
 ) {
-    let (response, receiver) = mpsc::channel();
+    let (response, receiver) = mpsc::sync_channel(1);
     (
         PendingCoordinationRequest {
             terminal_drop_probe: None,
@@ -161,7 +162,7 @@ fn assert_refused_enqueue_destroys(bridge: &HubCoordinationBridge, memory: &Arc<
     enqueue(bridge).unwrap();
     let before = memory.usage().1;
     let dropped = Arc::new(AtomicBool::new(false));
-    let (response, _receiver) = mpsc::channel();
+    let (response, _receiver) = mpsc::sync_channel(1);
     let entry = memory.reserve_shared_callback_storage(8).unwrap();
     let continuation = memory.reserve_shared_callback_storage(8).unwrap();
     let disposal = memory.reserve_shared_callback_storage(8).unwrap();
@@ -222,22 +223,46 @@ fn request_typed_entry_admission_refuses_when_entry_does_not_fit() {
 }
 
 #[test]
-fn request_typed_admitted_entry_destroyed_on_collection_refusal() {
-    let entry_bytes = super::nonacknowledge_entry_bytes(&drain_op()).unwrap();
-    let memory = account(slot() + entry_bytes);
+fn request_typed_entry_then_collection_growth_boundaries() {
+    let e = super::nonacknowledge_entry_bytes(&drain_op()).unwrap();
+    assert!(e > 0);
+    let slot = slot();
+    let funded = 3 * slot + e;
+    let memory = account(funded);
     let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
     enqueue(&bridge).unwrap();
-    let before = memory.usage().1;
-    assert_eq!(before, slot());
-    let remaining = memory.limits().total_callback_bytes - before;
-    assert!(remaining >= entry_bytes);
-    let error =
-        request_typed_from_worker(bridge.clone()).expect_err("collection growth must refuse");
-    assert!(matches!(
-        error,
-        CoordinationRequestError::Local(CoordinationLocalError::Capacity)
-    ));
-    assert_eq!(memory.usage().1, before);
+    let baseline = memory.usage().1;
+    assert_eq!(baseline, slot);
+    let producer = bridge.clone();
+    let worker = thread::spawn(move || producer.request_typed(drain_op()));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while bridge.test_pending_count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "3*slot+e must admit entry and grow the collection"
+        );
+        thread::yield_now();
+    }
+    assert_eq!(bridge.test_pending_charge_bytes(), 2 * slot);
+    drop(bridge.take_pending());
+    drop(bridge.take_pending());
+    let _ = worker.join();
+
+    let memory = account(funded - 1);
+    let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
+    enqueue(&bridge).unwrap();
+    let baseline = memory.usage().1;
+    let error = request_typed_from_worker(bridge.clone());
+    assert!(
+        matches!(
+            error,
+            Err(CoordinationRequestError::Local(
+                CoordinationLocalError::Capacity
+            ))
+        ),
+        "3*slot+e-1 must refuse growth after admitting entry"
+    );
+    assert_eq!(memory.usage().1, baseline);
     assert_eq!(bridge.test_pending_count(), 1);
 }
 
