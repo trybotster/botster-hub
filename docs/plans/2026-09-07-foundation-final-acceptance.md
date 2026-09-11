@@ -99,6 +99,10 @@ The concrete owner contract is `/private/tmp/c1-lua-state-owner-contract-2026091
 It arms a private charge guard before `Lua::new_with`, transfers Lua into that owner, and releases only after confirmed destruction.
 Its VM-only slice can address the existing unwind gap without selecting Rust-state bytes. Future Rust funding must extend the same owner with a mandatory charge.
 Root checked the pinned constructor's returned-error boundary. Independent contract review precedes source changes; F1 work remains preserved.
+Independent review accepted the VM-only contract. Root authorized implementation in `src/lua_runtime.rs` and its direct sandbox fixtures, with focused test source only.
+The suggested weak-upgrade check was withdrawn: a failed upgrade does not prove that another thread's destructor has completed.
+The implementation must preserve the traced private ownership boundary. A future escaping strong Lua owner must reopen that proof.
+Single-panic retention and double-panic process abort remain distinct. No formatting, build, or test execution is authorized for this new slice yet.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
