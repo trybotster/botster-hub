@@ -2688,7 +2688,7 @@ sys.exit(0)
             std::process::id()
         ));
         let worker = write_frame_exit_worker(&worker_root);
-        let (mut daemon, mut state, root) =
+        let (mut daemon, _state, root) =
             spawn_fixture_with_worker("plugin-retry", Some(worker));
         let package_root = root.join("p1-plugin");
         let record = plugin_spawn_package(&package_root);
