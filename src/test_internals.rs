@@ -16,6 +16,62 @@ pub mod hub_state_heap {
 }
 
 #[cfg(feature = "allocation-oracle")]
+pub struct CapacityRaiseStorm {
+    lua: mlua::Lua,
+}
+
+#[cfg(feature = "allocation-oracle")]
+pub fn prepare_capacity_raise_storm() -> CapacityRaiseStorm {
+    use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+    use crate::lua_runtime::HubCoordinationBridge;
+    use botster_core::PluginKey;
+    use std::sync::Arc;
+
+    let xrc = crate::lua_memory::layout::lua_reference_bytes();
+    let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+        per_vm_bytes: 1024 * 1024,
+        total_vm_bytes: 1024 * 1024,
+        per_callback_bytes: xrc,
+        total_callback_bytes: xrc,
+    })
+    .expect("capacity raise account");
+    let lua = mlua::Lua::new();
+    let table = crate::lua_runtime::coordination_table(
+        &lua,
+        PluginKey("oracle.plugin".into()),
+        HubCoordinationBridge::new(Arc::clone(&memory)),
+        memory,
+    )
+    .expect("coordination table");
+    lua.globals()
+        .set("coordination", table)
+        .expect("set coordination");
+    CapacityRaiseStorm { lua }
+}
+
+#[cfg(feature = "allocation-oracle")]
+impl CapacityRaiseStorm {
+    pub fn retain_publish_errors(&self, n: u32) {
+        self.lua
+            .load(&format!(
+                r#"
+                local kept = {{}}
+                for i = 1, {n} do
+                    local ok, err = pcall(coordination.publish, {{ id = 'e1', target = {{ type = 'topic', topic = 't' }} }})
+                    assert(not ok)
+                    kept[i] = err
+                end
+                for i = 2, {n} do
+                    assert(rawequal(kept[1], kept[i]))
+                end
+                "#
+            ))
+            .exec()
+            .expect("retain capacity errors");
+    }
+}
+
+#[cfg(feature = "allocation-oracle")]
 pub mod lua_json {
     use mlua::{Lua, Value};
 

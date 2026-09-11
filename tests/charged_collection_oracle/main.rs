@@ -454,5 +454,17 @@ fn measure_lua_json() -> Result<(), String> {
         }
         let _ = built;
     }
+    let storm = botster_hub::test_internals::prepare_capacity_raise_storm();
+    LIVE.store(0, Ordering::Release);
+    begin_record();
+    storm.retain_publish_errors(1000);
+    end_record();
+    let peak = PEAK.load(Ordering::Acquire);
+    println!("publish-capacity-raises n=1000 rust_peak={peak}");
+    if peak != 0 {
+        return Err(format!(
+            "publish capacity raises allocated {peak} Rust bytes"
+        ));
+    }
     Ok(())
 }

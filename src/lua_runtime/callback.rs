@@ -1,4 +1,7 @@
 //! Host callbacks return errors as Lua strings before the Lua wrapper raises them.
+//!
+//! Capacity refusals use [`CallbackFailure::Raise`] so a precreated Lua string is
+//! returned as `(false, Value::String(clone))` without `to_string`.
 
 use std::sync::Arc;
 
@@ -67,6 +70,17 @@ impl<A: FromLua, B: FromLua, C: FromLua> Arguments for (A, B, C) {
     }
 }
 
+pub(super) enum CallbackFailure {
+    Raise(mlua::String),
+    Error(mlua::Error),
+}
+
+impl From<mlua::Error> for CallbackFailure {
+    fn from(error: mlua::Error) -> Self {
+        Self::Error(error)
+    }
+}
+
 pub(super) trait ReturnValue {
     const HAS_VALUE: bool;
 
@@ -98,23 +112,29 @@ impl ReturnValue for () {
 }
 
 /// Keep argument and body errors out of mlua's retained Rust error userdata.
-pub(super) fn create<A, R, F>(lua: &Lua, function: F) -> mlua::Result<Function>
+pub(super) fn create<A, R, F, E>(lua: &Lua, function: F) -> mlua::Result<Function>
 where
     A: Arguments,
     R: ReturnValue,
-    F: Fn(&Lua, A) -> mlua::Result<R> + Send + 'static,
+    E: Into<CallbackFailure>,
+    F: Fn(&Lua, A) -> Result<R, E> + Send + 'static,
 {
     let fallback = lua.create_string("Lua callback could not allocate its error")?;
     let callback = lua.create_function(move |lua, raw: A::Raw| {
-        let result = A::convert(raw, lua)
-            .and_then(|args| function(lua, args))
-            .and_then(|value| match value.into_value() {
-                Value::Error(error) => Err(*error),
-                value => Ok(value),
-            });
+        let result = match A::convert(raw, lua) {
+            Err(error) => Err(CallbackFailure::Error(error)),
+            Ok(args) => match function(lua, args).map_err(Into::into) {
+                Ok(value) => match value.into_value() {
+                    Value::Error(error) => Err(CallbackFailure::Error(*error)),
+                    value => Ok(value),
+                },
+                Err(failure) => Err(failure),
+            },
+        };
         let reply = match result {
             Ok(value) => (true, value),
-            Err(error) => {
+            Err(CallbackFailure::Raise(string)) => (false, Value::String(string)),
+            Err(CallbackFailure::Error(error)) => {
                 let message = match error {
                     mlua::Error::RuntimeError(message) => message,
                     error => error.to_string(),
@@ -187,12 +207,15 @@ mod tests {
     fn callback_results_preserve_arity_and_values() {
         let lua = Lua::new();
         lua.globals()
-            .set("empty", create(&lua, |_, ()| Ok(())).unwrap())
+            .set(
+                "empty",
+                create(&lua, |_, ()| Ok::<_, mlua::Error>(())).unwrap(),
+            )
             .unwrap();
         lua.globals()
             .set(
                 "identity",
-                create(&lua, |_, value: Value| Ok(value)).unwrap(),
+                create(&lua, |_, value: Value| Ok::<_, mlua::Error>(value)).unwrap(),
             )
             .unwrap();
         lua.load(
@@ -213,7 +236,10 @@ mod tests {
     fn wrapper_uses_the_original_error_function() {
         let lua = Lua::new();
         lua.globals()
-            .set("callback", create(&lua, |_, _: Table| Ok(())).unwrap())
+            .set(
+                "callback",
+                create(&lua, |_, _: Table| Ok::<_, mlua::Error>(())).unwrap(),
+            )
             .unwrap();
         lua.load(
             r#"
@@ -234,7 +260,7 @@ mod tests {
         let called = Arc::clone(&reached);
         let callback = create(&lua, move |_, value: Value| {
             called.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(value)
+            Ok::<_, mlua::Error>(value)
         })
         .unwrap();
         lua.globals().set("callback", callback).unwrap();
