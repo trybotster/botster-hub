@@ -467,6 +467,7 @@ pub(crate) struct CoreWaiterRetirement {
 }
 
 impl CoreWaiterRetirement {
+    #[allow(dead_code)] // owner rows identify retirement by the held waiter
     pub(crate) fn waiter_id(&self) -> WaiterId {
         self.waiter_id
     }
@@ -491,6 +492,7 @@ pub(crate) fn retained_reply_bytes<T>() -> Option<usize> {
 }
 
 pub(crate) struct CoreRejectedRequest {
+    #[allow(dead_code)] // rejected request payload retained until the refusal drops
     request: CoreRequest,
     pub(crate) reason: CoreRefusal,
 }
@@ -522,6 +524,7 @@ enum CoreTicketSlot<T> {
         identity: OwnerWorkIdentity,
         receiver: Receiver<CoreTicketResult<T>>,
         owner_wake: Option<Arc<CoreCompletionWake>>,
+        #[allow(dead_code)] // callback storage lease held until the queued ticket drops
         storage_lease: Option<crate::lua_memory::LuaCallbackStorageLease>,
     },
     /// Admission refused the operation; there is nothing to wait for.
@@ -540,6 +543,7 @@ struct CoreTicketPublisher<T> {
     sender: Option<SyncSender<CoreTicketResult<T>>>,
     wake: Arc<CoreCompletionWake>,
     notify_owner: bool,
+    #[allow(dead_code)] // callback storage lease held until the publisher drops
     storage_lease: Option<crate::lua_memory::LuaCallbackStorageLease>,
 }
 

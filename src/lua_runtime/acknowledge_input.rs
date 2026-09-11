@@ -400,8 +400,10 @@ pub(crate) mod ownership {
         }
     }
 
+    #[cfg(test)]
     pub(crate) struct AcknowledgeCallerGuard(AcknowledgeCaller);
 
+    #[cfg(test)]
     impl Drop for AcknowledgeCallerGuard {
         fn drop(&mut self) {
             self.0.finish();

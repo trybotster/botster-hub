@@ -208,6 +208,7 @@ pub(crate) struct HostJob {
 #[derive(Debug)]
 pub(crate) enum HostResult {
     CoordinationResponseDelivered {
+        #[allow(dead_code)] // delivery outcome retained for owner matchers
         received: bool,
     },
     ClientEventCleanup(
@@ -232,6 +233,7 @@ pub(crate) enum HostResult {
     StatusResponsePrepared(crate::status_response::PreparedStatusResponse),
     StatusResponseDelivered {
         shutdown: bool,
+        #[allow(dead_code)] // delivery outcome retained for owner matchers
         received: bool,
     },
     SessionTypeCatalogReady {
