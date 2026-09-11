@@ -29,7 +29,9 @@
 //! outside the memory-accounting guarantee. It is not funded. Do not add
 //! partial funding or a new limit to mask it. This conversion's live `ValueRef`
 //! count is O(depth) (`3 × depth + 2` scan transients + 1 `array_metatable`
-//! handle), which bounds how far `ref_free` can grow from this walk.
+//! handle), which bounds the number of `ref_free` entries this walk adds. It
+//! does not bound capacity growth, which depends on the existing capacity;
+//! that growth is part of the approved exclusion.
 //!
 //! Still in scope: live XRc (`lua_reference_bytes()`), walk scratch, collection
 //! capacity, and Lua allocator storage under the VM charge.
