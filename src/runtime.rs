@@ -51,8 +51,8 @@ use crate::lifecycle::{
     HubPluginRuntimeBundle, package_entity_owner_token,
 };
 use crate::lua_runtime::{
-    HubCoordinationBridge, HubCoordinationResponse, HubEntityPublishBridge, LuaPluginHostApi,
-    LuaPluginRuntimeError, PendingCoordinationOperation, SharedHubCapabilityRuntime,
+    HubCoordinationBridge, HubEntityPublishBridge, LuaPluginHostApi, LuaPluginRuntimeError,
+    PendingCoordinationOperation, SharedHubCapabilityRuntime,
 };
 use crate::managed_git_worktrees::{
     ManagedGitError, ManagedGitRequest, PreparedManagedWorktree,
@@ -2300,6 +2300,19 @@ impl HubRuntime {
         move |waiter_id| core.test_retains_waiter(waiter_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_lua_callback_usage_probe(
+        &self,
+    ) -> impl Fn() -> usize + Send + 'static {
+        let memory = Arc::clone(&self.lua_memory);
+        move || memory.usage().1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lua_memory(&self) -> Arc<crate::lua_memory::LuaMemoryAccount> {
+        Arc::clone(&self.lua_memory)
+    }
+
     pub(crate) fn bind_terminal_core_owner(&self) {
         self.core_daemon.bind_terminal_owner();
     }
@@ -2332,15 +2345,18 @@ impl HubRuntime {
                 Some(storage) => (Some(storage.core), Some((storage.continuation, storage.disposal))),
                 None => (None, None),
             };
-            let submission = self
-                .core_daemon
-                .submit_retained(move |daemon| pending.operation.execute(daemon), || true, core_storage);
+            let caller = pending.caller;
+            let submission = self.core_daemon.submit_retained(
+                move |daemon| pending.operation.execute(daemon),
+                move || caller.claim(),
+                core_storage,
+            );
             if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
                 inflight.push(InflightPluginCore::Coordination {
                     ticket: submission.ticket,
                     response: pending.response,
                     rejected: submission.rejected,
-                    storage,
+                    _storage: storage,
                 });
             }
         }
@@ -4831,7 +4847,7 @@ enum InflightPluginCore {
         ticket: crate::data_plane::driver::ChargedCoreTicket<crate::lua_runtime::CoordinationReply>,
         response: crate::lua_runtime::CoordinationReplySender,
         rejected: Option<crate::data_plane::driver::CoreRejectedRequest>,
-        storage: Option<(crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge)>,
+        _storage: Option<(crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge)>,
     },
     SessionTypeSpawn {
         start: SessionTypeSpawnStart,

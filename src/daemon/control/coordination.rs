@@ -39,6 +39,7 @@ pub(crate) struct CoordinationContinuation {
     disposal: Option<crate::lua_memory::LuaCallbackCharge>,
 }
 
+#[allow(dead_code)] // payload owners drop here; the lease outlives this box
 struct CoordinationTerminalPayload {
     response: Option<CoordinationReplySender>,
     completed: Option<CoordinationDelivery>,

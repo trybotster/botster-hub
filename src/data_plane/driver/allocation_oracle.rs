@@ -5,14 +5,13 @@
 
 use super::*;
 use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
-use crate::lua_runtime::HubCoordinationResponse;
-use botster_core::{
-    EndpointId, EnvelopeCursor, EnvelopeDeliveryState, EnvelopeDeliveryStatus, EnvelopeId,
-    EnvelopeTarget,
+use crate::lua_runtime::{
+    AcknowledgeOutcome, CoordinationReply, HubCoordinationResponse, reply_channel,
 };
+use botster_core::RoutedEnvelopeDrainOutcome;
 use botster_core_daemon::RoutedEnvelopeDeliveryStateResult;
 
-type Reply = Result<HubCoordinationResponse, String>;
+type Reply = CoordinationReply;
 type Mark = fn(Phase, usize);
 
 #[derive(Debug, Clone, Copy)]
@@ -177,27 +176,14 @@ pub fn type_layouts() -> [(&'static str, usize, usize); 5] {
 
 fn reply(mark: Mark, index: usize) -> Reply {
     mark(Phase::PayloadConstruct, index);
-    Ok(HubCoordinationResponse::Acknowledge(
-        RoutedEnvelopeDeliveryStateResult {
-            state: Some(EnvelopeDeliveryState {
-                envelope_id: EnvelopeId("oracle-envelope".to_owned()),
-                target: EnvelopeTarget::Endpoint {
-                    endpoint_id: EndpointId("oracle-endpoint".to_owned()),
-                },
-                cursor: EnvelopeCursor(1),
-                status: EnvelopeDeliveryStatus::Acknowledged,
-            }),
-        },
+    // Core-ticket scenarios size CoordinationReply. Drain needs no callback charge.
+    Ok(HubCoordinationResponse::Drain(
+        RoutedEnvelopeDrainOutcome::default(),
     ))
 }
 
 fn assert_reply(value: Reply) {
-    assert!(matches!(
-        value,
-        Ok(HubCoordinationResponse::Acknowledge(
-            RoutedEnvelopeDeliveryStateResult { state: Some(_) }
-        ))
-    ));
+    assert!(matches!(value, Ok(HubCoordinationResponse::Drain(_))));
 }
 
 fn channel(scenario: Scenario, mark: Mark) {
@@ -336,8 +322,8 @@ fn admission(scenario: Scenario, mark: Mark) {
     let (mut ticket, publisher) = CoreTicket::<Reply>::channel(identity, Arc::clone(&wake), true);
     mark(Phase::ClosureConstruct, 0);
     let request = CoreRequest::new(move |_, _| {
-        publisher.publish(Ok(HubCoordinationResponse::Acknowledge(
-            RoutedEnvelopeDeliveryStateResult { state: None },
+        publisher.publish(Ok(HubCoordinationResponse::Drain(
+            RoutedEnvelopeDrainOutcome::default(),
         )))
     });
     let accepting = AtomicBool::new(matches!(scenario, Scenario::Refused));
@@ -521,9 +507,25 @@ fn lease(mark: Mark) {
 }
 
 fn callback_reply(wait: bool, mark: Mark) {
-    // This is the existing coordination reply channel type. No Lua callback runs.
+    // Production acknowledgements use reply_channel: sync_channel(1) plus a lease.
+    mark(Phase::AccountConstruct, 0);
+    let reply_bytes = crate::lua_memory::layout::single_reply_bytes::<Reply>(true)
+        .expect("callback reply layout");
+    let payload_bytes = 2;
+    let total = reply_bytes.checked_add(payload_bytes).expect("reply plus payload");
+    let account = LuaMemoryAccount::new(LuaMemoryLimits {
+        per_vm_bytes: 1,
+        total_vm_bytes: 1,
+        per_callback_bytes: total,
+        total_callback_bytes: total,
+    })
+    .unwrap();
+    let mut admitted = account.reserve_callback_total(total).unwrap();
+    let reply_charge = admitted.split(reply_bytes).expect("reply segment");
+    let result_charge = admitted.split(1).expect("result segment");
+    let conversion_charge = admitted;
     mark(Phase::ChannelConstruct, 0);
-    let (sender, receiver) = mpsc::channel::<Reply>();
+    let (sender, receiver) = reply_channel(reply_charge);
     if wait {
         mark(Phase::Wait, 0);
         assert!(matches!(
@@ -534,12 +536,17 @@ fn callback_reply(wait: bool, mark: Mark) {
         drop(receiver);
         mark(Phase::SenderDrop, 0);
         drop(sender);
+        drop((result_charge, conversion_charge));
     } else {
-        let value = reply(mark, 0);
+        mark(Phase::PayloadConstruct, 0);
+        let outcome = AcknowledgeOutcome::new(
+            RoutedEnvelopeDeliveryStateResult { state: None },
+            result_charge,
+            conversion_charge,
+        );
         mark(Phase::Send, 0);
-        assert!(sender.send(value).is_ok());
+        assert!(sender.send(Ok(outcome)).is_ok());
         mark(Phase::SenderDrop, 0);
-        drop(sender);
         mark(Phase::ReceiverDrop, 0);
         drop(receiver);
     }

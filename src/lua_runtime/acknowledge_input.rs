@@ -146,8 +146,8 @@ pub(crate) mod ownership {
     pub(crate) struct AcknowledgeOutcome {
         outcome: RoutedEnvelopeDeliveryStateResult,
         // Destroy the payload before releasing its allocation allowance.
-        charge: LuaCallbackCharge,
-        conversion_charge: LuaCallbackCharge,
+        _charge: LuaCallbackCharge,
+        _conversion_charge: LuaCallbackCharge,
     }
 
     impl AcknowledgeOutcome {
@@ -158,8 +158,8 @@ pub(crate) mod ownership {
         ) -> Self {
             Self {
                 outcome,
-                charge,
-                conversion_charge,
+                _charge: charge,
+                _conversion_charge: conversion_charge,
             }
         }
 
@@ -172,8 +172,8 @@ pub(crate) mod ownership {
     #[derive(Debug)]
     pub(crate) struct AcknowledgeFailure {
         message: String,
-        charge: LuaCallbackCharge,
-        conversion_charge: LuaCallbackCharge,
+        _charge: LuaCallbackCharge,
+        _conversion_charge: LuaCallbackCharge,
     }
 
     impl AcknowledgeFailure {
@@ -184,8 +184,8 @@ pub(crate) mod ownership {
         ) -> Self {
             Self {
                 message,
-                charge,
-                conversion_charge,
+                _charge: charge,
+                _conversion_charge: conversion_charge,
             }
         }
 
@@ -311,12 +311,12 @@ pub(crate) mod ownership {
     pub(crate) struct AcknowledgeReplySender {
         sender: mpsc::SyncSender<CoordinationReply>,
         // Free this endpoint before releasing its storage lease.
-        storage: LuaCallbackStorageLease,
+        _storage: LuaCallbackStorageLease,
     }
 
     pub(crate) struct AcknowledgeReplyReceiver {
         receiver: mpsc::Receiver<CoordinationReply>,
-        storage: LuaCallbackStorageLease,
+        _storage: LuaCallbackStorageLease,
     }
 
     /// The charge covers the channel, message storage, selector, and lease Arc.
@@ -329,9 +329,12 @@ pub(crate) mod ownership {
         (
             AcknowledgeReplySender {
                 sender,
-                storage: storage.clone(),
+                _storage: storage.clone(),
             },
-            AcknowledgeReplyReceiver { receiver, storage },
+            AcknowledgeReplyReceiver {
+                receiver,
+                _storage: storage,
+            },
         )
     }
 
@@ -362,7 +365,7 @@ pub(crate) mod ownership {
     #[derive(Clone)]
     pub(crate) struct AcknowledgeCaller {
         state: Arc<AtomicU8>,
-        storage: LuaCallbackStorageLease,
+        _storage: LuaCallbackStorageLease,
     }
 
     impl AcknowledgeCaller {
@@ -371,7 +374,7 @@ pub(crate) mod ownership {
             let storage = LuaCallbackStorageLease::new(charge);
             Self {
                 state: Arc::new(AtomicU8::new(0)),
-                storage,
+                _storage: storage,
             }
         }
 
@@ -381,12 +384,19 @@ pub(crate) mod ownership {
                 .is_ok()
         }
 
+        #[cfg(test)]
+        #[allow(dead_code)]
         pub(crate) fn guard(&self) -> AcknowledgeCallerGuard {
             AcknowledgeCallerGuard(self.clone())
         }
 
         pub(crate) fn finish(&self) {
             self.state.fetch_or(2, Ordering::AcqRel);
+        }
+
+        #[cfg(test)]
+        pub(crate) fn test_bits(&self) -> u8 {
+            self.state.load(Ordering::Acquire)
         }
     }
 
@@ -434,13 +444,13 @@ impl AcknowledgeOperation {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum AdmissionError {
+pub(crate) enum AdmissionError {
     Quota,
     Capacity,
     InvalidTarget,
 }
 
-fn admit(
+pub(crate) fn admit(
     memory: &Arc<LuaMemoryAccount>,
     kind: &str,
     first: &str,
@@ -531,6 +541,14 @@ pub(super) fn callback(
     let invalid_target =
         lua.create_string("coordination.acknowledge requires a recognized target.type")?;
     let invalid_utf8 = lua.create_string("coordination.acknowledge requires UTF-8 strings")?;
+    let owner_thread = lua.create_string(
+        "botster.coordination is only available during handler invocation, not at plugin load",
+    )?;
+    let queue_poisoned = lua.create_string("coordination queue lock poisoned")?;
+    let ingress_sealed = lua.create_string("coordination ingress is sealed")?;
+    let timeout = lua.create_string("coordination request did not complete before timeout")?;
+    let unexpected =
+        lua.create_string("coordination acknowledge returned unexpected response")?;
     // Only the trusted wrapper can call this function. Foreign values never enter Rust.
     let callback = lua.create_function(
         move |lua,
@@ -564,7 +582,16 @@ pub(super) fn callback(
             // Bridge storage and result storage have separate owners and accounting work.
             let result = match bridge.acknowledge(input) {
                 Ok(outcome) => lua.to_value(outcome.outcome()),
-                Err(error) => lua.create_string(error.as_str()).map(Value::String),
+                Err(error) => match error {
+                    super::CoordinationRequestError::Local(kind) => Ok(Value::String(match kind {
+                        super::CoordinationLocalError::OwnerThread => owner_thread.clone(),
+                        super::CoordinationLocalError::QueuePoisoned => queue_poisoned.clone(),
+                        super::CoordinationLocalError::IngressSealed => ingress_sealed.clone(),
+                        super::CoordinationLocalError::Timeout => timeout.clone(),
+                        super::CoordinationLocalError::Unexpected => unexpected.clone(),
+                    })),
+                    other => lua.create_string(other.as_str()).map(Value::String),
+                },
             };
             Ok(result.unwrap_or_else(|_| Value::String(conversion.clone())))
         },
@@ -629,7 +656,9 @@ fn wrap(lua: &Lua, callback: Function) -> mlua::Result<Function> {
 mod tests {
     use super::*;
     use crate::lua_memory::LuaMemoryLimits;
-    use crate::lua_runtime::{HubCoordinationResponse, PendingCoordinationOperation};
+    use crate::lua_runtime::{
+        HubCoordinationResponse, PendingCoordinationOperation, PendingCoordinationRequest,
+    };
     use std::time::{Duration, Instant};
 
     fn account(per: usize, total: usize) -> Arc<LuaMemoryAccount> {
@@ -642,9 +671,26 @@ mod tests {
         .unwrap()
     }
 
+    fn sizing_total(first: &str, second: &str, envelope_id: &str) -> usize {
+        ownership::AcknowledgeSizing::for_input(
+            first
+                .len()
+                .checked_add(second.len())
+                .and_then(|bytes| bytes.checked_add(envelope_id.len()))
+                .unwrap(),
+        )
+        .and_then(|sizing| sizing.total())
+        .unwrap()
+    }
+
+    fn ample_account() -> Arc<LuaMemoryAccount> {
+        let total = sizing_total("subscription", "session", "envelope").saturating_mul(4);
+        account(total, total.saturating_mul(8))
+    }
+
     fn validation_lua() -> Lua {
         let lua = Lua::new();
-        let memory = account(1024, 1024);
+        let memory = ample_account();
         let accept = lua
             .create_function(
                 move |lua,
@@ -662,7 +708,7 @@ mod tests {
                         &envelope_id.to_str()?,
                     )
                     .unwrap();
-                    lua.to_value(&input.request)
+                    lua.to_value(&input.input.request)
                 },
             )
             .unwrap();
@@ -866,30 +912,32 @@ mod tests {
 
     #[test]
     fn exact_input_charge_distinguishes_quota_and_capacity() {
-        let memory = account(6, 6);
+        let admitted = sizing_total("ab", "cd", "ef");
+        let memory = account(admitted, admitted);
         assert!(matches!(
             admit(&memory, "subscription", "ab", "cd", "efg"),
             Err(AdmissionError::Quota)
         ));
         assert_eq!(memory.usage().1, 0);
         let input = admit(&memory, "subscription", "ab", "cd", "ef").unwrap();
-        assert_eq!(memory.usage().1, 6);
+        assert_eq!(memory.usage().1, admitted);
         assert!(matches!(
             admit(&memory, "topic", "t", "", "e"),
             Err(AdmissionError::Capacity)
         ));
-        assert_eq!(memory.usage().1, 6);
-        assert_eq!(input.request.envelope_id.0, "ef");
+        assert_eq!(memory.usage().1, admitted);
+        assert_eq!(input.input.request.envelope_id.0, "ef");
         drop(input);
         assert_eq!(memory.usage().1, 0);
     }
 
     #[test]
     fn closure_disposal_and_owner_refusal_release_input() {
-        let memory = account(2, 2);
+        let admitted = sizing_total("t", "", "e");
+        let memory = account(admitted, admitted);
         let input = admit(&memory, "topic", "t", "", "e").unwrap();
         let operation = move || drop(input);
-        assert_eq!(memory.usage().1, 2);
+        assert_eq!(memory.usage().1, admitted);
         drop(operation);
         assert_eq!(memory.usage().1, 0);
         let bridge = HubCoordinationBridge::new();
@@ -906,7 +954,8 @@ mod tests {
 
     #[test]
     fn wrapper_refusals_return_lua_strings_without_retaining_input() {
-        let memory = account(2, 2);
+        let admitted = sizing_total("t", "", "e");
+        let memory = account(admitted, admitted);
         let lua = Lua::new();
         lua.globals()
             .set(
@@ -919,7 +968,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let held = memory.reserve_callback_bytes(2).unwrap();
+        let held = memory.reserve_callback_total(admitted).unwrap();
         lua.load(
             r#"
             local function fails(args, fragment)
@@ -933,14 +982,15 @@ mod tests {
         )
         .exec()
         .unwrap();
-        assert_eq!(memory.usage().1, 2);
+        assert_eq!(memory.usage().1, admitted);
         drop(held);
         assert_eq!(memory.usage().1, 0);
     }
 
     #[test]
     fn timeout_retains_input_until_terminal_disposal() {
-        let memory = account(2, 2);
+        let admitted = sizing_total("t", "", "e");
+        let memory = account(admitted, admitted);
         let bridge = HubCoordinationBridge::new();
         let input = admit(&memory, "topic", "t", "", "e").unwrap();
         let producer = bridge.clone();
@@ -954,14 +1004,15 @@ mod tests {
                 .contains("did not complete before timeout")
         );
         assert_eq!(bridge.test_pending_count(), 1);
-        assert_eq!(memory.usage().1, 2);
+        assert_eq!(memory.usage().1, admitted);
         assert!(bridge.dispose_terminal_pending());
         assert_eq!(memory.usage().1, 0);
     }
 
     #[test]
     fn real_wrapper_queues_charged_input_and_returns_delivery_state() {
-        let memory = account(2, 2);
+        let admitted = sizing_total("t", "", "e");
+        let memory = account(admitted, admitted);
         let bridge = HubCoordinationBridge::new();
         let producer = bridge.clone();
         let callback_memory = Arc::clone(&memory);
@@ -989,21 +1040,41 @@ mod tests {
             );
             std::thread::yield_now();
         };
-        assert_eq!(memory.usage().1, 2);
-        let PendingCoordinationOperation::Acknowledge { input } = pending.operation else {
+        assert_eq!(memory.usage().1, admitted);
+        let PendingCoordinationRequest {
+            operation,
+            response,
+            storage,
+            caller,
+            ..
+        } = pending;
+        assert!(storage.is_some());
+        let PendingCoordinationOperation::Acknowledge { input } = operation else {
             panic!("wrong operation")
         };
         assert_eq!(input.request.envelope_id.0, "e");
-        drop(input);
-        assert_eq!(memory.usage().1, 0);
+        let AcknowledgeOperation {
+            request,
+            charge,
+            lookup,
+            result,
+            error,
+            conversion,
+        } = input;
+        drop((request, charge, lookup, error));
         assert!(
-            pending
-                .response
+            response
                 .send(Ok(HubCoordinationResponse::Acknowledge(
-                    RoutedEnvelopeDeliveryStateResult { state: None },
+                    ownership::AcknowledgeOutcome::new(
+                        botster_core_daemon::RoutedEnvelopeDeliveryStateResult { state: None },
+                        result,
+                        conversion,
+                    ),
                 )))
                 .is_ok()
         );
         worker.join().unwrap();
+        drop((storage, caller));
+        assert_eq!(memory.usage().1, 0);
     }
 }
