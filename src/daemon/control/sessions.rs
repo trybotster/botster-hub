@@ -2752,4 +2752,102 @@ sys.exit(0)
         let _ = std::fs::remove_dir_all(package_root);
         let _ = std::fs::remove_dir_all(worker_root);
     }
+
+    #[test]
+    fn managed_retained_unconfirmed_keeps_a_created_worktree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let worker_root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-managed-retain-worker-{}-{stamp}",
+            std::process::id()
+        ));
+        let worker = write_frame_exit_worker(&worker_root);
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("managed-retain", Some(worker));
+        let worktree = root.join("created-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let marker = worktree.join("keep-me");
+        std::fs::write(&marker, b"present").unwrap();
+        let package_root = root.join("p1-plugin");
+        let mut record = plugin_spawn_package(&package_root);
+        record.manifest.capabilities.push(botster_core::Capability {
+            surface: botster_core::CapabilitySurface::SessionActions,
+            scope: Some("session_type_managed_git_spawn".into()),
+        });
+        record.session_types[0].target_id = Some("t1".into());
+        {
+            let runtime = daemon.runtime().unwrap();
+            let mut next = (*runtime.state()).clone();
+            next.spawn_targets.push(crate::spawn_targets::SpawnTarget {
+                target_id: "t1".into(),
+                label: "t1".into(),
+                root: worktree.clone(),
+                enabled: true,
+                kind: "directory".into(),
+                base_ref: None,
+                metadata: Default::default(),
+            });
+            runtime.replace_state(next).expect("admit spawn target");
+        }
+        let (response, receiver) = std::sync::mpsc::channel();
+        let pending = crate::runtime::PendingManagedSessionSpawn::test_new(
+            botster_core::PluginKey("p1.plugin".into()),
+            "t1".into(),
+            "topic".into(),
+            "agent".into(),
+            crate::session_types::ManagedSessionTypeRequest::default(),
+            vec![record],
+            response,
+        );
+        let prepared = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: worktree.clone(),
+            common_dir: worktree.clone(),
+            branch: "topic".into(),
+            path: worktree.clone(),
+            worktree_id: "wt-keep".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: false,
+        };
+        let waiter = state.current_waiter_id.unwrap();
+        let start = daemon
+            .runtime()
+            .unwrap()
+            .spawn_prepared_managed_session(&pending, &prepared, waiter)
+            .expect("start managed spawn");
+        let mut operation = crate::daemon::control::managed_git::ManagedSpawnOperation::test_spawn_phase(
+            waiter,
+            pending,
+            prepared,
+            start,
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(Instant::now() < deadline, "managed spawn hang");
+            pump_core(&mut daemon, &mut state);
+            match operation.test_poll_spawn(&mut daemon, &mut state) {
+                ControlPoll::Pending => std::thread::yield_now(),
+                ControlPoll::Ready(_) => break,
+                _ => std::thread::yield_now(),
+            }
+        }
+        let err = receiver
+            .try_recv()
+            .expect("managed spawn sent a result")
+            .expect_err("managed spawn must fail unconfirmed");
+        assert_eq!(err.kind, "spawn_failed");
+        assert!(
+            operation.test_skipped_rollback(),
+            "RetainedUnconfirmed must not start worktree rollback"
+        );
+        assert!(marker.exists(), "created worktree must remain");
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(worker_root);
+    }
 }

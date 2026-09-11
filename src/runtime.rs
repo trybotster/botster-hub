@@ -345,6 +345,31 @@ pub(crate) struct PendingManagedSessionSpawn {
     pub(crate) response: mpsc::Sender<Result<PluginManagedSessionSpawned, ManagedGitError>>,
 }
 
+impl PendingManagedSessionSpawn {
+    #[cfg(test)]
+    pub(crate) fn test_new(
+        plugin_key: PluginKey,
+        target_id: String,
+        branch: String,
+        session_type_id: String,
+        request: ManagedSessionTypeRequest,
+        package_records: Vec<PackageRecord>,
+        response: mpsc::Sender<Result<PluginManagedSessionSpawned, ManagedGitError>>,
+    ) -> Self {
+        Self {
+            plugin_key,
+            target_id,
+            branch,
+            session_type_id,
+            request,
+            package_records,
+            accepted_at: Instant::now(),
+            response,
+            _dispose_probe: None,
+        }
+    }
+}
+
 /// One managed session spawn in flight on the Core owner thread.
 pub(crate) struct ManagedSessionSpawnStart {
     pub(crate) tracker: CoreOperationTracker,
