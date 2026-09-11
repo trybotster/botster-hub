@@ -8160,6 +8160,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn multiplexer_reserved_spawn_classes_are_kind_based_and_path_neutral() {
+        let runtime = botster_core::SessionRuntimeError::new(
+            SessionRuntimeErrorKind::SpawnFailed,
+            "connect worker control socket failed: /private/raw/path",
+        );
+        let mapped = [
+            (
+                MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Refused(
+                    runtime.clone(),
+                )),
+                "engine.multiplexer.reserved_spawn.refused",
+            ),
+            (
+                MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Admitted(
+                    runtime,
+                )),
+                "engine.multiplexer.reserved_spawn.admitted",
+            ),
+            (
+                MultiplexerEngineError::InstallationAfterLaunch(Box::new(
+                    MultiplexerEngineError::MetadataTooLarge,
+                )),
+                "engine.multiplexer.installation_after_launch",
+            ),
+        ];
+        for (error, class) in mapped {
+            assert_eq!(
+                managed_session_core_error_class(&CoreDaemonError::Engine(
+                    ManagedSessionRuntimeError::Multiplexer(error)
+                )),
+                class
+            );
+            assert!(!class.contains('/'));
+        }
+    }
+
+    #[test]
     fn explicit_resize_busy_class_is_path_neutral_and_distinct_from_control_plane_failure() {
         let session_id = SessionId("/private/session/resize-busy".to_string());
         assert_eq!(
