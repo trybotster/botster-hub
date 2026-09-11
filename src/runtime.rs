@@ -13,9 +13,9 @@ use botster_core::{
     PluginHandlerKind, PluginInvocationClass, PluginInvocationFailure, PluginInvocationFailureKind,
     PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
     PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
-    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SubscriptionId, TerminalCapabilitySet, TerminalColorProfile,
-    TerminalSubscriptionGeneration,
+    RoutedEnvelopePublishOutcome, ReservedSessionSpawnError, SessionId, SessionLifecycleState,
+    SessionReservationRefusal, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
+    TerminalCapabilitySet, TerminalColorProfile, TerminalSubscriptionGeneration,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureId, CaptureOwner, CaptureSnapshotRequest,
@@ -4239,6 +4239,17 @@ impl HubSessionTypeSpawner {
 
 fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
     match error {
+        CoreDaemonError::SessionReservation(refusal) => match refusal {
+            SessionReservationRefusal::Occupied => "session_reservation.occupied",
+            SessionReservationRefusal::Busy => "session_reservation.busy",
+            SessionReservationRefusal::Unsupported => "session_reservation.unsupported",
+            SessionReservationRefusal::IdentityExhausted => {
+                "session_reservation.identity_exhausted"
+            }
+            SessionReservationRefusal::Unavailable => "session_reservation.unavailable",
+            SessionReservationRefusal::InvalidToken => "session_reservation.invalid_token",
+            SessionReservationRefusal::Capacity => "session_reservation.capacity",
+        },
         CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
             MultiplexerEngineError::Runtime(runtime_error),
         ))
@@ -4261,6 +4272,15 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
             MultiplexerEngineError::MetadataTooLarge,
         )) => "engine.multiplexer.metadata_too_large",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Refused(_)),
+        )) => "engine.multiplexer.reserved_spawn.refused",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Admitted(_)),
+        )) => "engine.multiplexer.reserved_spawn.admitted",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::InstallationAfterLaunch(_),
+        )) => "engine.multiplexer.installation_after_launch",
         CoreDaemonError::Engine(ManagedSessionRuntimeError::UnsupportedSessionRequest {
             ..
         }) => "engine.unsupported_session_request",
@@ -8062,6 +8082,44 @@ pub(crate) mod tests {
             managed_session_core_error_class(&generic),
             "runtime.spawn_failed"
         );
+    }
+
+    #[test]
+    fn session_reservation_refusal_classes_are_kind_based_and_path_neutral() {
+        let mapped = [
+            (
+                SessionReservationRefusal::Occupied,
+                "session_reservation.occupied",
+            ),
+            (SessionReservationRefusal::Busy, "session_reservation.busy"),
+            (
+                SessionReservationRefusal::Unsupported,
+                "session_reservation.unsupported",
+            ),
+            (
+                SessionReservationRefusal::IdentityExhausted,
+                "session_reservation.identity_exhausted",
+            ),
+            (
+                SessionReservationRefusal::Unavailable,
+                "session_reservation.unavailable",
+            ),
+            (
+                SessionReservationRefusal::InvalidToken,
+                "session_reservation.invalid_token",
+            ),
+            (
+                SessionReservationRefusal::Capacity,
+                "session_reservation.capacity",
+            ),
+        ];
+        for (refusal, class) in mapped {
+            assert_eq!(
+                managed_session_core_error_class(&CoreDaemonError::SessionReservation(refusal)),
+                class
+            );
+            assert!(!class.contains('/'));
+        }
     }
 
     #[test]
