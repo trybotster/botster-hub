@@ -3107,6 +3107,24 @@ sys.exit(0)
                 vec![record],
             )
         });
+        let overlap = Instant::now() + Duration::from_secs(5);
+        while daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_managed_queue_len()
+            < 2
+        {
+            assert!(Instant::now() < overlap, "both managed spawns must queue");
+            std::thread::yield_now();
+        }
+        pump_core(&mut daemon, &mut state);
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_publish_managed_spawn();
+        pump_core(&mut daemon, &mut state);
         let deadline = Instant::now() + Duration::from_secs(20);
         while !(a.is_finished() && b.is_finished()) {
             pump_core(&mut daemon, &mut state);
