@@ -51,6 +51,10 @@ The public prepared loader must use that account too; an unfunded compatibility 
 The writer may adapt `tests/hub_lua_runtime_test.rs` and map the new configuration failure to the existing Runtime client category in `src/client_api.rs`.
 These caller changes must preserve reload assertions, request identity, and operation identity. They add no client protocol category.
 The reviewer will separately trace acknowledgement conversion allocations in pinned source. No build, test, or measurement execution is authorized yet.
+The policy/account slice subsequently passed independent source review, including the corrected refusal test and pinned formatting.
+Its frozen source is `/private/tmp/c1-lua-policy-account-review-20260910-3`; the complete patch SHA256 is `a54c5ad32737cc70200a3e92a97f09191b4b8a1a0508f8e084e454b08858c8f9`.
+The aggregate limits apply per `HubRuntime`, not per process. Public Host API construction now uses the runtime factory; the runtime error enum gains Config.
+Root authorized one 300-second no-run build for library tests and the two affected external test targets. Test execution still requires artifact verification.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
