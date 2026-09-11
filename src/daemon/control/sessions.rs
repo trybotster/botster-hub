@@ -1739,9 +1739,21 @@ mod tests {
         spawn_fixture_with_worker(name, None)
     }
 
+    const MATCHED_WORKER: &str = "/tmp/core-d1a-candidate-20260911-5/botster-session-worker";
+    const MATCHED_WORKER_SHA256: &str =
+        "1dfdd4f300409bf00a6694d1979650799b6280972bd24dd6cb592b21c0382f73";
+
     fn spawn_fixture_with_worker(
         name: &str,
         worker: Option<std::path::PathBuf>,
+    ) -> (crate::HubDaemon, DaemonControlState, std::path::PathBuf) {
+        spawn_fixture_case(name, worker, None)
+    }
+
+    fn spawn_fixture_case(
+        name: &str,
+        worker: Option<std::path::PathBuf>,
+        shell: Option<String>,
     ) -> (crate::HubDaemon, DaemonControlState, std::path::PathBuf) {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1753,6 +1765,10 @@ mod tests {
         ));
         let mut core_engine = crate::config::CoreEngineOptions::default();
         core_engine.session_worker_path = worker;
+        let mut session_defaults = crate::config::SessionDefaults::default();
+        if let Some(shell) = shell {
+            session_defaults.shell = shell;
+        }
         let config = crate::HubStartupOptions {
             host: crate::HostIdentityOptions {
                 id: format!("s1-{name}"),
@@ -1760,6 +1776,7 @@ mod tests {
                 fingerprint: None,
             },
             data_directory: crate::DataDirectoryOption::Explicit(root.clone()),
+            session_defaults,
             core_engine,
             ..crate::HubStartupOptions::default()
         }
@@ -2127,12 +2144,30 @@ mod tests {
         path
     }
 
+    fn matched_worker_path() -> std::path::PathBuf {
+        let path = std::path::PathBuf::from(MATCHED_WORKER);
+        let hashed = std::process::Command::new("shasum")
+            .args(["-a", "256", MATCHED_WORKER])
+            .output()
+            .expect("hash matched worker");
+        let text = String::from_utf8(hashed.stdout).expect("hash utf8");
+        assert!(
+            text.starts_with(MATCHED_WORKER_SHA256),
+            "matched worker hash {text}"
+        );
+        path
+    }
+
+    fn spawn_error_code(response: &botster_hub_client::DaemonResponse) -> Option<&str> {
+        response.error.as_ref().map(|error| error.code.as_str())
+    }
+
     fn poll_spawn_until_ready(
         daemon: &mut crate::HubDaemon,
         state: &mut DaemonControlState,
         pending: &mut crate::daemon::control::pending::PendingStep,
     ) -> botster_hub_client::DaemonResponse {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             assert!(Instant::now() < deadline, "scripted-worker spawn hang");
             pump_core(daemon, state);
@@ -2145,24 +2180,46 @@ mod tests {
         }
     }
 
+    fn spawn_until_ready(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        session_id: &str,
+        command: &str,
+    ) -> botster_hub_client::DaemonResponse {
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            daemon,
+            state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: session_id.into(),
+                command: command.into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        poll_spawn_until_ready(daemon, state, &mut pending)
+    }
+
     #[test]
     fn missing_session_worker_reaches_a_terminal_spawn_outcome() {
         let worker = std::path::PathBuf::from("/no/such/botster-session-worker");
         let (mut daemon, mut state, root) =
             spawn_fixture_with_worker("missing-worker", Some(worker));
-        let ControlStep::Pending(mut pending) = handle_runtime(
+        let response = spawn_until_ready(
             &mut daemon,
             &mut state,
-            observability(),
-            DaemonRequest::Spawn {
-                session_id: "s1-missing-worker".into(),
-                command: "true".into(),
-            },
-        ) else {
-            panic!("spawn must defer");
-        };
-        let response = poll_spawn_until_ready(&mut daemon, &mut state, &mut pending);
-        assert!(response.error.is_some() || response.kind == DaemonResponseKind::Spawned);
+            "s1-missing-worker",
+            "true",
+        );
+        assert_eq!(spawn_error_code(&response), Some("core_error"));
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2177,31 +2234,193 @@ mod tests {
             "s1-spawn-exit-before-{}-{stamp}",
             std::process::id()
         ));
-        let worker = write_worker_script(&root, "#!/bin/sh\nexit 1\n");
+        let worker = write_worker_script(
+            &root,
+            "#!/bin/sh\nprintf 'botster-session-worker-ready %s\\n' \"$$\"\nexit 1\n",
+        );
         let (mut daemon, mut state, fixture_root) =
             spawn_fixture_with_worker("exit-before", Some(worker));
-        let ControlStep::Pending(mut pending) = handle_runtime(
+        let response = spawn_until_ready(
             &mut daemon,
             &mut state,
-            observability(),
-            DaemonRequest::Spawn {
-                session_id: "s1-exit-before".into(),
-                command: "true".into(),
-            },
-        ) else {
-            panic!("spawn must defer");
-        };
-        let response = poll_spawn_until_ready(&mut daemon, &mut state, &mut pending);
-        assert!(response.error.is_some());
-        assert!(
+            "s1-exit-before",
+            "true",
+        );
+        assert_eq!(spawn_error_code(&response), Some("core_error"));
+        assert_eq!(
             daemon
                 .runtime()
                 .unwrap()
-                .test_release_session_reservation_begins()
-                >= 1
+                .test_release_session_reservation_begins(),
+            1
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn worker_reads_spawn_frame_then_exits_retains_unconfirmed() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-spawn-frame-exit-{}-{stamp}",
+            std::process::id()
+        ));
+        let python = String::from_utf8(
+            std::process::Command::new("python3")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .expect("python3 executable")
+                .stdout,
+        )
+        .expect("python path utf8");
+        let worker = write_worker_script(
+            &root,
+            &format!(
+                r#"#!{python}
+import os, socket, sys
+path = None
+args = sys.argv
+for i, arg in enumerate(args):
+    if arg == "--control-socket" and i + 1 < len(args):
+        path = args[i + 1]
+        break
+if not path:
+    sys.exit(5)
+if os.path.exists(path):
+    os.unlink(path)
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path)
+srv.listen(1)
+sys.stdout.write("botster-session-worker-ready %s\n" % os.getpid())
+sys.stdout.flush()
+conn, _unused = srv.accept()
+hello = conn.recv(5, socket.MSG_WAITALL)
+if hello is None or len(hello) != 5:
+    sys.exit(2)
+n = conn.recv(4, socket.MSG_WAITALL)
+if n is None or len(n) != 4:
+    sys.exit(3)
+length = int.from_bytes(n, "little")
+body = b""
+while len(body) < length:
+    chunk = conn.recv(length - len(body))
+    if not chunk:
+        break
+    body += chunk
+if len(body) != length:
+    sys.exit(4)
+sys.exit(0)
+"#,
+                python = python.trim()
+            ),
+        );
+        let (mut daemon, mut state, fixture_root) =
+            spawn_fixture_with_worker("frame-exit", Some(worker));
+        let first = spawn_until_ready(
+            &mut daemon,
+            &mut state,
+            "s1-frame-exit",
+            "true",
+        );
+        assert_eq!(
+            spawn_error_code(&first),
+            Some("cleanup_unconfirmed"),
+            "{first:?}"
+        );
+        assert_eq!(state.retained_explicit_reservations.len(), 1);
+        let held = state.retained_explicit_reservations[0].clone();
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        let second = spawn_until_ready(
+            &mut daemon,
+            &mut state,
+            "s1-frame-exit-retry",
+            "true",
+        );
+        assert_eq!(spawn_error_code(&second), Some("cleanup_unconfirmed"));
+        assert!(
+            state
+                .retained_explicit_reservations
+                .iter()
+                .any(|token| token == &held),
+            "next Spawn must keep the unconfirmed token"
         );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn matched_worker_missing_session_executable_releases() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) = spawn_fixture_case(
+            "matched-missing",
+            Some(worker),
+            Some("/no/such/botster-session-executable".into()),
+        );
+        let response = spawn_until_ready(
+            &mut daemon,
+            &mut state,
+            "s1-matched-missing",
+            "true",
+        );
+        assert_eq!(spawn_error_code(&response), Some("core_error"));
+        let message = response
+            .error
+            .as_ref()
+            .map(|error| error.message.as_str())
+            .unwrap_or("");
+        assert!(
+            message.contains("worker startup failed"),
+            "SPF1 NotCreated must surface as worker startup failed: {message}"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matched_worker_real_command_installs() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("matched-install", Some(worker));
+        let response = spawn_until_ready(
+            &mut daemon,
+            &mut state,
+            "s1-matched-install",
+            "true",
+        );
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(response.kind, DaemonResponseKind::Spawned);
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            0
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
     }
 }
