@@ -550,10 +550,22 @@ impl ManagedSpawnOperation {
             }
             Err(error) => {
                 self.deferred_error = Some(error);
+                let created = self
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.created_worktree);
                 match disposition {
-                    Some(botster_core::SessionReservationRelease::Released) | None => self
-                        .submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None),
-                    Some(_) => self.finish_deferred_error(),
+                    Some(botster_core::SessionReservationRelease::Released) | None
+                        if created =>
+                    {
+                        self.submit_finalize(
+                            daemon,
+                            state,
+                            ManagedWorktreeDecision::Rollback,
+                            None,
+                        )
+                    }
+                    _ => self.finish_deferred_error(),
                 }
             }
         }
