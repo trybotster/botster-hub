@@ -38,7 +38,11 @@ pub(crate) fn boxed_payload_storage_bytes() -> Option<usize> {
 
 /// This handle stays in the original request or recovery row until disposal finishes.
 #[derive(Clone)]
-pub(crate) struct Work(Arc<Mutex<State>>, Option<LuaCallbackStorageLease>);
+pub(crate) struct Work(
+    Arc<Mutex<State>>,
+    #[allow(dead_code)] // storage lease retained until Host disposal work drops
+    Option<LuaCallbackStorageLease>,
+);
 
 impl std::fmt::Debug for Work {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -149,6 +153,7 @@ impl Parts {
 }
 
 impl Work {
+    #[allow(dead_code)] // constructs disposal work without a storage lease
     pub(crate) fn new(payload: impl Send + 'static, model: Option<ModelWork>) -> Self {
         Self::with_storage(payload, model, None)
     }

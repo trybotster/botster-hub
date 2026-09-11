@@ -69,13 +69,18 @@ pub(crate) enum ControlPoll {
 pub(crate) enum ControlContinuation {
     Coordination(
         Box<super::coordination::CoordinationContinuation>,
+        #[allow(dead_code)] // callback charge retained until the continuation drops
         Option<crate::lua_memory::LuaCallbackCharge>,
     ),
     Callback(Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>),
     HostMutation(Box<super::host_work::HostMutationContinuation>),
     Status(Box<super::status::StatusContinuation>),
     ManagedSpawn(Box<super::managed_git::ManagedSpawnOperation>),
-    Terminal(Box<TerminalContinuation>, Option<crate::lua_memory::LuaCallbackStorageLease>),
+    Terminal(
+        Box<TerminalContinuation>,
+        #[allow(dead_code)] // disposal lease retained until the terminal row drops
+        Option<crate::lua_memory::LuaCallbackStorageLease>,
+    ),
 }
 
 pub(crate) struct TerminalContinuation {
