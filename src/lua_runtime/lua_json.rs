@@ -219,12 +219,24 @@ impl Scratch {
     }
 }
 
+#[derive(Clone, Copy)]
+enum KeyFail {
+    Integer(i64),
+    Number(f64),
+    Boolean(bool),
+    Nil,
+    InvalidUtf8,
+    Seq,
+    Map,
+    Unsupported(&'static str),
+}
+
 enum CollectedKey {
     Utf8 {
         text: String,
         _charge: Option<LuaCallbackCharge>,
     },
-    Fail(mlua::Error),
+    Fail(KeyFail),
 }
 
 struct SizeFrame {
@@ -504,7 +516,7 @@ fn take_size_child(
             if *next > *len {
                 return Ok(Child::End);
             }
-            let item = frame.table.raw_get::<Value>(index_key(*next)?)?;
+            let item = frame.table.raw_get::<Value>(index_key(*next))?;
             *next += 1;
             Ok(child_from_value(item))
         }
@@ -513,8 +525,8 @@ fn take_size_child(
                 return Ok(Child::End);
             }
             match keys.get(*next).expect("key cursor") {
-                CollectedKey::Fail(error) => {
-                    return Err(super::AdmissionError::Runtime(clone_error(error)));
+                CollectedKey::Fail(fail) => {
+                    return Err(super::AdmissionError::Runtime(raise_key_fail(*fail)));
                 }
                 CollectedKey::Utf8 { text, .. } => {
                     let item = frame.table.raw_get::<Value>(text.as_str())?;
@@ -580,7 +592,7 @@ fn take_build_child(frame: &mut BuildFrame) -> Result<Child, mlua::Error> {
             if *next > *len {
                 return Ok(Child::End);
             }
-            let item = frame.table.raw_get::<Value>(index_key(*next)?)?;
+            let item = frame.table.raw_get::<Value>(index_key(*next))?;
             *next += 1;
             Ok(child_from_value(item))
         }
@@ -588,13 +600,10 @@ fn take_build_child(frame: &mut BuildFrame) -> Result<Child, mlua::Error> {
             if *next >= keys.len() {
                 return Ok(Child::End);
             }
-            let collected = std::mem::replace(
-                &mut keys[*next],
-                CollectedKey::Fail(mlua::Error::DeserializeError("empty key slot".into())),
-            );
+            let collected = std::mem::replace(&mut keys[*next], CollectedKey::Fail(KeyFail::Nil));
             *next += 1;
             match collected {
-                CollectedKey::Fail(error) => Err(error),
+                CollectedKey::Fail(fail) => Err(raise_key_fail(fail)),
                 CollectedKey::Utf8 { text, .. } => {
                     let item = frame.table.raw_get::<Value>(text.as_str())?;
                     frame.pending_key = Some(text);
@@ -746,38 +755,45 @@ fn collect_key_unfunded(key: &Value) -> Result<CollectedKey, mlua::Error> {
                     _charge: None,
                 })
             }
-            Err(_) => Ok(CollectedKey::Fail(map_key_error(key))),
+            Err(_) => Ok(CollectedKey::Fail(KeyFail::InvalidUtf8)),
         },
-        _ => Ok(CollectedKey::Fail(map_key_error(key))),
+        Value::Integer(value) => Ok(CollectedKey::Fail(KeyFail::Integer(*value))),
+        Value::Number(value) => Ok(CollectedKey::Fail(KeyFail::Number(*value))),
+        Value::Boolean(value) => Ok(CollectedKey::Fail(KeyFail::Boolean(*value))),
+        Value::Nil => Ok(CollectedKey::Fail(KeyFail::Nil)),
+        Value::Table(table) => Ok(CollectedKey::Fail(if table.raw_len() > 0 {
+            KeyFail::Seq
+        } else {
+            KeyFail::Map
+        })),
+        other => Ok(CollectedKey::Fail(KeyFail::Unsupported(other.type_name()))),
     }
 }
 
-fn map_key_error(key: &Value) -> mlua::Error {
-    let message = match key {
-        Value::Integer(value) => format!("invalid type: integer `{value}`, expected a string key"),
-        Value::Number(value) => {
+fn raise_key_fail(fail: KeyFail) -> mlua::Error {
+    let message = match fail {
+        KeyFail::Integer(value) => {
+            format!("invalid type: integer `{value}`, expected a string key")
+        }
+        KeyFail::Number(value) => {
             format!("invalid type: floating point `{value}`, expected a string key")
         }
-        Value::Boolean(value) => format!("invalid type: boolean `{value}`, expected a string key"),
-        Value::Nil => "invalid type: unit value, expected a string key".to_owned(),
-        Value::String(_) => "invalid type: byte array, expected a string key".to_owned(),
-        Value::Table(table) => {
-            if table.raw_len() > 0 {
-                "invalid type: seq, expected a string key".to_owned()
-            } else {
-                "invalid type: map, expected a string key".to_owned()
-            }
+        KeyFail::Boolean(value) => {
+            format!("invalid type: boolean `{value}`, expected a string key")
         }
-        other => format!("unsupported value type `{}`", other.type_name()),
+        KeyFail::Nil => "invalid type: unit value, expected a string key".to_owned(),
+        KeyFail::InvalidUtf8 => "invalid type: byte array, expected a string key".to_owned(),
+        KeyFail::Seq => "invalid type: sequence, expected a string key".to_owned(),
+        KeyFail::Map => "invalid type: map, expected a string key".to_owned(),
+        KeyFail::Unsupported(name) => {
+            let mut message = String::with_capacity(22 + name.len());
+            message.push_str("unsupported value type `");
+            message.push_str(name);
+            message.push('`');
+            message
+        }
     };
     mlua::Error::DeserializeError(message)
-}
-
-fn clone_error(error: &mlua::Error) -> mlua::Error {
-    match error {
-        mlua::Error::DeserializeError(message) => mlua::Error::DeserializeError(message.clone()),
-        other => mlua::Error::DeserializeError(other.to_string()),
-    }
 }
 
 fn leaf_size(value: &Value) -> Result<usize, super::AdmissionError> {
@@ -809,41 +825,30 @@ fn leaf_build(value: &Value) -> Result<serde_json::Value, mlua::Error> {
     }
 }
 
-fn index_key(index: usize) -> Result<i64, mlua::Error> {
-    i64::try_from(index)
-        .map_err(|_| mlua::Error::RuntimeError("coordination table is too large".into()))
+fn index_key(index: usize) -> i64 {
+    i64::try_from(index).expect("array raw_len already rejected lengths above i64::MAX")
 }
 
 fn utf8_len(text: &mlua::String) -> Result<usize, mlua::Error> {
     Ok(text
         .to_str()
         .map_err(|_| {
-            mlua::Error::DeserializeError("invalid type: byte array, expected a string".into())
+            mlua::Error::DeserializeError(
+                "invalid type: byte array, expected any valid JSON value".into(),
+            )
         })?
         .len())
 }
 
 fn utf8_string(text: &mlua::String) -> Result<String, mlua::Error> {
     let utf8 = text.to_str().map_err(|_| {
-        mlua::Error::DeserializeError("invalid type: byte array, expected a string".into())
+        mlua::Error::DeserializeError(
+            "invalid type: byte array, expected any valid JSON value".into(),
+        )
     })?;
     let mut out = String::with_capacity(utf8.len());
     out.push_str(&utf8);
     Ok(out)
-}
-
-fn map_key_len(key: &Value) -> Result<usize, super::AdmissionError> {
-    match key {
-        Value::String(text) => Ok(utf8_len(text)?),
-        _ => Err(super::AdmissionError::Runtime(map_key_error(key))),
-    }
-}
-
-fn map_key_string(key: &Value) -> Result<String, mlua::Error> {
-    match key {
-        Value::String(text) => utf8_string(text),
-        _ => Err(mlua::Error::RuntimeError("expected a string key".into())),
-    }
 }
 
 fn unsupported(value: &Value) -> super::AdmissionError {
@@ -980,22 +985,13 @@ mod tests {
         assert_eq!(built, serde_json::json!([1, 2, null, 4]));
     }
 
-    #[test]
-    fn invalid_utf8_string_is_rejected() {
-        let (lua, value) = eval("return string.char(255)");
+    fn assert_same_error(lua: &Lua, value: &Value) {
         let from = lua
             .from_value::<serde_json::Value>(value.clone())
-            .err()
-            .map(|error| error.to_string());
-        let ours = value_size(&memory(), &lua, &value)
-            .err()
-            .map(|error| format!("{error:?}"));
-        assert!(from.is_some() || ours.is_some());
-        println!(
-            "utf8 from_value={} ours={}",
-            from.unwrap_or_default(),
-            ours.unwrap_or_default()
-        );
+            .unwrap_err()
+            .to_string();
+        let ours = display_size_err(lua, value);
+        assert_eq!(ours, from);
     }
 
     #[test]
@@ -1032,9 +1028,7 @@ mod tests {
             Err(super::super::AdmissionError::Runtime(error)) => error.to_string(),
             other => panic!("{other:?}"),
         };
-        println!("cycle from_value={from} ours={ours}");
-        assert!(from.contains("recursive table detected"));
-        assert!(ours.contains("recursive table detected"));
+        assert_eq!(ours, from);
     }
 
     fn display_size_err(lua: &Lua, value: &Value) -> String {
@@ -1050,26 +1044,37 @@ mod tests {
             "return { fn = function() end }",
             "local t = {}; t.n = t; return t",
             "return {[2]=true}",
+            "return {[1.5]=true}",
+            "return {[true]=true}",
+            "return {[{}]=true}",
+            "return {[{1}]=true}",
+            "return {a = string.char(255)}",
+            "return {[string.char(255)] = 1}",
         ] {
             let (lua, value) = eval(source);
-            let from = lua
-                .from_value::<serde_json::Value>(value.clone())
-                .unwrap_err()
-                .to_string();
-            let ours = display_size_err(&lua, &value);
-            assert_eq!(ours, from, "{source}");
+            assert_same_error(&lua, &value);
         }
+        struct Marker;
+        impl UserData for Marker {}
+        let lua = Lua::new();
+        let value = Value::UserData(lua.create_userdata(Marker).unwrap());
+        assert_same_error(&lua, &value);
     }
 
     #[test]
     fn first_lua_next_error_wins() {
-        let (lua, value) = eval("local t = {}; t.later = 1; t.bad = function() end; return t");
-        let from = lua
-            .from_value::<serde_json::Value>(value.clone())
-            .unwrap_err()
-            .to_string();
-        let ours = display_size_err(&lua, &value);
-        assert_eq!(ours, from);
+        for source in [
+            "local t = {}; t[true] = 1; t.fn = function() end; return t",
+            "local t = {}; t.fn = function() end; t[true] = 1; return t",
+            "local t = {}; t.nested = { inner = function() end }; t.fn = function() end; return t",
+        ] {
+            let (lua, value) = eval(source);
+            assert_same_error(&lua, &value);
+        }
+        let (lua, value) = eval(
+            "local t = {}; t.ok = { inner = function() end }; t.bad = function() end; return t",
+        );
+        assert_same_error(&lua, &value);
     }
 
     #[test]
@@ -1099,31 +1104,29 @@ mod tests {
     }
 
     #[test]
-    fn function_error_texts_side_by_side() {
-        let (lua, value) = eval("return { fn = function() end }");
-        let from = lua
-            .from_value::<serde_json::Value>(value.clone())
-            .unwrap_err()
-            .to_string();
-        let ours = match value_size(&memory(), &lua, &value) {
-            Err(super::super::AdmissionError::Runtime(error)) => error.to_string(),
-            other => panic!("{other:?}"),
-        };
-        println!("function from_value={from} ours={ours}");
-        assert!(from.contains("unsupported") || from.contains("function"));
-        assert!(ours.contains("unsupported") || ours.contains("function"));
-    }
-
-    #[test]
-    fn userdata_error_texts_side_by_side() {
-        struct Marker;
-        impl UserData for Marker {}
-        let lua = Lua::new();
-        let value = Value::UserData(lua.create_userdata(Marker).unwrap());
-        let from = lua.from_value::<serde_json::Value>(value.clone());
-        let ours = value_size(&memory(), &lua, &value);
-        println!("userdata from_value={from:?} ours={ours:?}");
-        assert!(from.is_err() || ours.is_err());
+    fn wide_object_of_tables_live_refs_do_not_grow_with_width() {
+        let account = memory();
+        let mut peaks = Vec::new();
+        for width in [8usize, 32, 64] {
+            let lua = Lua::new();
+            lua.globals().set("width", width as i32).unwrap();
+            let value: Value = lua
+                .load(
+                    r#"
+                    local t = {}
+                    for i = 1, width do
+                        t['k' .. i] = {}
+                    end
+                    return t
+                    "#,
+                )
+                .eval()
+                .unwrap();
+            let admission = value_size(&account, &lua, &value).unwrap();
+            peaks.push(admission.live_refs_peak);
+        }
+        assert_eq!(peaks[0], peaks[1]);
+        assert_eq!(peaks[1], peaks[2]);
     }
 
     fn admit_publish(source: &str) -> crate::lua_runtime::PendingCoordinationOperation {
@@ -1214,5 +1217,56 @@ mod tests {
         };
         assert!(after.is_none());
         assert_eq!(limit, 16);
+    }
+
+    fn unused_field_cases() -> [&'static str; 3] {
+        [
+            r#"return { id = 'e1', target = { type = 'topic', topic = 't' }, unused = function() end }"#,
+            r#"local u = {}; u.n = u; return { id = 'e1', target = { type = 'topic', topic = 't' }, unused = u }"#,
+            r#"return { id = 'e1', target = { type = 'topic', topic = 't' }, unused = string.char(255) }"#,
+        ]
+    }
+
+    #[test]
+    fn publish_unused_fields_match_from_value() {
+        for source in unused_field_cases() {
+            let lua = Lua::new();
+            let args: Value = lua.load(source).eval().unwrap();
+            let from = lua
+                .from_value::<serde_json::Value>(args.clone())
+                .unwrap_err()
+                .to_string();
+            let ours = match super::super::admit_publish_operation(
+                &memory(),
+                &PluginKey("pk".into()),
+                &lua,
+                args,
+            ) {
+                Err(super::super::AdmissionError::Runtime(error)) => error.to_string(),
+                other => panic!("{source}: expected runtime error, got success or capacity"),
+            };
+            assert_eq!(ours, from, "{source}");
+        }
+    }
+
+    #[test]
+    fn drain_unused_fields_match_from_value() {
+        for source in [
+            r#"return { target = { type = 'topic', topic = 't' }, unused = function() end }"#,
+            r#"local u = {}; u.n = u; return { target = { type = 'topic', topic = 't' }, unused = u }"#,
+            r#"return { target = { type = 'topic', topic = 't' }, unused = string.char(255) }"#,
+        ] {
+            let lua = Lua::new();
+            let args: Value = lua.load(source).eval().unwrap();
+            let from = lua
+                .from_value::<serde_json::Value>(args.clone())
+                .unwrap_err()
+                .to_string();
+            let ours = match super::super::admit_drain_operation(&memory(), &lua, args) {
+                Err(super::super::AdmissionError::Runtime(error)) => error.to_string(),
+                other => panic!("{source}: expected runtime error, got success or capacity"),
+            };
+            assert_eq!(ours, from, "{source}");
+        }
     }
 }
