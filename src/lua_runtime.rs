@@ -326,9 +326,6 @@ impl HubCoordinationBridge {
             ));
         }
 
-        let caller = CoordinationCaller::new();
-        let _caller = CoordinationCallerGuard(caller.clone());
-        let (response, receiver) = mpsc::channel();
         let bytes = nonacknowledge_entry_bytes(&operation).ok_or(
             CoordinationRequestError::Local(CoordinationLocalError::Capacity),
         )?;
@@ -336,6 +333,9 @@ impl HubCoordinationBridge {
             .account
             .reserve_callback_total(bytes)
             .map_err(|_| CoordinationRequestError::Local(CoordinationLocalError::Capacity))?;
+        let caller = CoordinationCaller::new();
+        let _caller = CoordinationCallerGuard(caller.clone());
+        let (response, receiver) = mpsc::channel();
         self.enqueue(PendingCoordinationRequest {
             #[cfg(test)]
             terminal_drop_probe: None,
@@ -616,39 +616,76 @@ impl PendingCoordinationOperation {
 }
 
 fn drain_payload_bytes(target: &EnvelopeTarget, after: Option<&EnvelopeCursor>) -> Option<usize> {
-    envelope_target_bytes(target)?
+    envelope_target_heap_bytes(target)?
         .checked_add(after.map_or(0, |_| std::mem::size_of::<EnvelopeCursor>()))
 }
 
-fn envelope_target_bytes(target: &EnvelopeTarget) -> Option<usize> {
-    let heap = match target {
-        EnvelopeTarget::Endpoint { endpoint_id } => endpoint_id.0.len(),
-        EnvelopeTarget::Client { client_id } => client_id.0.len(),
-        EnvelopeTarget::Session { session_id } => session_id.0.len(),
+fn envelope_target_heap_bytes(target: &EnvelopeTarget) -> Option<usize> {
+    Some(match target {
+        EnvelopeTarget::Endpoint { endpoint_id } => endpoint_id.0.capacity(),
+        EnvelopeTarget::Client { client_id } => client_id.0.capacity(),
+        EnvelopeTarget::Session { session_id } => session_id.0.capacity(),
         EnvelopeTarget::Subscription {
             session_id,
             subscription_id,
-        } => session_id.0.len().checked_add(subscription_id.0.len())?,
-        EnvelopeTarget::Plugin { plugin_key } => plugin_key.0.len(),
-        EnvelopeTarget::Stream { stream } => stream.len(),
-        EnvelopeTarget::Topic { topic } => topic.len(),
-    };
-    std::mem::size_of::<EnvelopeTarget>().checked_add(heap)
+        } => session_id
+            .0
+            .capacity()
+            .checked_add(subscription_id.0.capacity())?,
+        EnvelopeTarget::Plugin { plugin_key } => plugin_key.0.capacity(),
+        EnvelopeTarget::Stream { stream } => stream.capacity(),
+        EnvelopeTarget::Topic { topic } => topic.capacity(),
+    })
 }
 
 fn routed_envelope_bytes(envelope: &RoutedEnvelope) -> Option<usize> {
-    let mut bytes = std::mem::size_of::<RoutedEnvelope>()
-        .checked_add(envelope.id.0.len())?
-        .checked_add(envelope.source.0.len())?
-        .checked_add(envelope.payload.content_type.len())?
-        .checked_add(envelope.payload.body.len())?;
+    let mut bytes = envelope
+        .id
+        .0
+        .capacity()
+        .checked_add(envelope.source.0.capacity())?
+        .checked_add(envelope.payload.content_type.capacity())?
+        .checked_add(envelope.payload.body.capacity())?
+        .checked_add(
+            envelope
+                .targets
+                .capacity()
+                .checked_mul(std::mem::size_of::<EnvelopeTarget>())?,
+        )?;
     if let Some(extension) = &envelope.payload.extension {
-        bytes = bytes.checked_add(serde_json::to_vec(extension).ok()?.len())?;
+        bytes = bytes.checked_add(json_retained_bytes(&extension.0)?)?;
     }
     for target in &envelope.targets {
-        bytes = bytes.checked_add(envelope_target_bytes(target)?)?;
+        bytes = bytes.checked_add(envelope_target_heap_bytes(target)?)?;
     }
     Some(bytes)
+}
+
+fn json_retained_bytes(value: &serde_json::Value) -> Option<usize> {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Some(0)
+        }
+        serde_json::Value::String(text) => Some(text.capacity()),
+        serde_json::Value::Array(items) => {
+            let mut bytes = items
+                .capacity()
+                .checked_mul(std::mem::size_of::<serde_json::Value>())?;
+            for item in items {
+                bytes = bytes.checked_add(json_retained_bytes(item)?)?;
+            }
+            Some(bytes)
+        }
+        serde_json::Value::Object(map) => {
+            let mut bytes = 0usize;
+            for (key, item) in map {
+                bytes = bytes
+                    .checked_add(key.capacity())?
+                    .checked_add(json_retained_bytes(item)?)?;
+            }
+            Some(bytes)
+        }
+    }
 }
 
 struct LuaHostApi {

@@ -47,12 +47,28 @@ pub mod charged_collection {
         pub fn new() -> Self {
             let slot = std::mem::size_of::<PendingCoordinationRequest>();
             Self {
-                inner: ChargedVecDeque::new(account(slot * 16)),
+                inner: ChargedVecDeque::new(account(slot * 32)),
             }
         }
 
         pub fn slot() -> usize {
             std::mem::size_of::<PendingCoordinationRequest>()
+        }
+
+        pub fn type_size() -> usize {
+            std::mem::size_of::<PendingCoordinationRequest>()
+        }
+
+        pub fn type_align() -> usize {
+            std::mem::align_of::<PendingCoordinationRequest>()
+        }
+
+        pub fn uninit_size() -> usize {
+            std::mem::size_of::<MaybeUninit<PendingCoordinationRequest>>()
+        }
+
+        pub fn uninit_align() -> usize {
+            std::mem::align_of::<MaybeUninit<PendingCoordinationRequest>>()
         }
 
         pub fn try_push_uninit(&mut self) -> Result<(), String> {
@@ -74,12 +90,28 @@ pub mod charged_collection {
         pub fn new() -> Self {
             let slot = std::mem::size_of::<InflightPluginCore>();
             Self {
-                inner: ChargedVec::new(account(slot * 16)),
+                inner: ChargedVec::new(account(slot * 32)),
             }
         }
 
         pub fn slot() -> usize {
             std::mem::size_of::<InflightPluginCore>()
+        }
+
+        pub fn type_size() -> usize {
+            std::mem::size_of::<InflightPluginCore>()
+        }
+
+        pub fn type_align() -> usize {
+            std::mem::align_of::<InflightPluginCore>()
+        }
+
+        pub fn uninit_size() -> usize {
+            std::mem::size_of::<MaybeUninit<InflightPluginCore>>()
+        }
+
+        pub fn uninit_align() -> usize {
+            std::mem::align_of::<MaybeUninit<InflightPluginCore>>()
         }
 
         pub fn try_push_uninit(&mut self) -> Result<(), String> {

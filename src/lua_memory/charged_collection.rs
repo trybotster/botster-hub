@@ -274,6 +274,7 @@ impl<T> ChargedVec<T> {
             return;
         }
         assert!(self.reserved > 0);
+        debug_assert!(self.buf.len() < self.buf.capacity());
         self.reserved -= 1;
         self.buf.push(item);
     }
