@@ -111,6 +111,10 @@ The VM-owner build passed in 65.410 seconds. Both constructor forms compiled; th
 Root verified 990 source inputs and four executable hashes in `/private/tmp/c1-lua-vm-owner-build-20260910-1`.
 Root authorized thirteen exact tests: eight owner tests, one sandbox test, three Lua completion tests, and the existing load/reload refusal test.
 Each test runs once with a 60-second deadline and stops the sequence on failure or identity change.
+All thirteen tests passed once each. Every process exited zero; no deadline fired.
+Root read all raw outputs and verified their hashes, 990 live source inputs, and four live executable hashes.
+The evidence is `/private/tmp/c1-lua-vm-owner-tests-20260910-1`. Five tests printed their expected injected panics without test failures.
+This verifies the exercised VM charge lifecycle and retained regressions. Complete Rust-state and callback accounting remain open; nothing was published or installed.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
