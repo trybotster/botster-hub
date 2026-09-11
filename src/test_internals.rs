@@ -16,8 +16,13 @@ pub mod hub_state_heap {
 }
 
 #[cfg(feature = "allocation-oracle")]
+pub use crate::lua_runtime::{HookRaiseStorm, prepare_hook_raise_storm};
+
+#[cfg(feature = "allocation-oracle")]
 pub struct CapacityRaiseStorm {
     lua: mlua::Lua,
+    publish: mlua::Function,
+    drain: mlua::Function,
 }
 
 #[cfg(feature = "allocation-oracle")]
@@ -27,7 +32,7 @@ pub fn prepare_capacity_raise_storm() -> CapacityRaiseStorm {
     use botster_core::PluginKey;
     use std::sync::Arc;
 
-    let xrc = crate::lua_memory::layout::lua_reference_bytes();
+    let xrc = 2 * crate::lua_memory::layout::lua_reference_bytes();
     let memory = LuaMemoryAccount::new(LuaMemoryLimits {
         per_vm_bytes: 1024 * 1024,
         total_vm_bytes: 1024 * 1024,
@@ -47,31 +52,56 @@ pub fn prepare_capacity_raise_storm() -> CapacityRaiseStorm {
         .set("coordination", table)
         .expect("set coordination");
     lua.load(
-        "kept = {}; for i = 1, 1000 do kept[i] = false end",
+        r#"
+        kept = {}; for i = 1, 1000 do kept[i] = false end
+        function storm_publish(n)
+            for i = 1, n do
+                local ok, err = pcall(coordination.publish, { id = 'e1', target = { type = 'topic', topic = 't' } })
+                assert(not ok, tostring(err))
+                kept[i] = err
+            end
+            for i = 2, n do
+                assert(rawequal(kept[1], kept[i]))
+            end
+        end
+        function storm_drain(n)
+            for i = 1, n do
+                local ok, err = pcall(coordination.drain, { target = { type = 'topic', topic = 't' } })
+                assert(not ok, tostring(err))
+                kept[i] = err
+            end
+            for i = 2, n do
+                assert(rawequal(kept[1], kept[i]))
+            end
+        end
+        "#,
     )
     .exec()
     .expect("pre-size retained error table");
-    CapacityRaiseStorm { lua }
+    let publish = lua.globals().get("storm_publish").expect("storm_publish");
+    let drain = lua.globals().get("storm_drain").expect("storm_drain");
+    CapacityRaiseStorm {
+        lua,
+        publish,
+        drain,
+    }
+}
+
+#[cfg(feature = "allocation-oracle")]
+impl CapacityRaiseStorm {
+    pub fn used_memory(&self) -> usize {
+        self.lua.used_memory()
+    }
+
+    pub fn retain_drain_errors(&self, n: u32) -> Result<(), String> {
+        self.drain.call(n).map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(feature = "allocation-oracle")]
 impl CapacityRaiseStorm {
     pub fn retain_publish_errors(&self, n: u32) -> Result<(), String> {
-        self.lua
-            .load(&format!(
-                r#"
-                for i = 1, {n} do
-                    local ok, err = pcall(coordination.publish, {{ id = 'e1', target = {{ type = 'topic', topic = 't' }} }})
-                    assert(not ok, tostring(err))
-                    kept[i] = err
-                end
-                for i = 2, {n} do
-                    assert(rawequal(kept[1], kept[i]))
-                end
-                "#
-            ))
-            .exec()
-            .map_err(|error| error.to_string())
+        self.publish.call(n).map_err(|error| error.to_string())
     }
 }
 
