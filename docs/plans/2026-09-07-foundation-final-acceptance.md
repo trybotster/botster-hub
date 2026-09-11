@@ -24,6 +24,14 @@ Review must evaluate the complete affected lifecycle. A passing helper test does
 Root connected the local Hub candidate to reviewed Core `6a9320393b6407a33230816508c9a7e700bfaee6` across all workspace manifests.
 The lockfile changes only six Core source identities. Local resolution does not prove publication or fresh remote resolution.
 The process correction is to assign complete requirements and retain valid evidence, instead of stopping after each mechanical verification step.
+The reviewer identified recursive Lua conversion as a separate depth and Rust-stack risk. Root requested a 128-container limit; Jason has not selected it yet.
+Independent implementation continues. Instruction-hook error storage will use source-derived, VM-proportional funding under the approved shared Rust account.
+Root approved moving event and handler table composition to trusted Lua, while preserving indexed-access behavior and protecting against global rebinding.
+Generic `Value` conversion can clone boxed Lua errors before callback admission. Trusted wrappers or pre-funded state storage must cover that path.
+The Core reservation implementation also covers built-in local-runtime clones. Its API must preserve external runtime compatibility and bounded reservation ownership.
+The first callback build stopped at a stale fixture revision guard that Root missed during dependency integration.
+Root updated the guard, fixture provenance constant, and exact test expectation to the selected Core pin. The Core fixture files are unchanged.
+Trusted argument validation must preserve the Lua null sentinel. Lua reports both full userdata and light userdata as `userdata`.
 
 ### Current phase: connect acknowledgement accounting
 
