@@ -29,6 +29,10 @@ The executable SHA256 is `b725109e6f9982d22fe9b63bcfce2ea1346f10c9eada18c1460497
 Evidence is `/private/tmp/core-worker-metadata-build-20260910-1` and `/private/tmp/core-worker-metadata-tests-20260910-1`.
 Payload probes establish ownership and destruction behavior. Exact source establishes the reviewed deallocation ordering; no allocation size was measured in this gate.
 Hub integration, final layout sizing, and production policy remain open. No publication or installation occurred.
+The Hub source pass stopped before connection because acknowledgement admission has no complete sizing input.
+The first unresolved inputs are Rust error/conversion storage and the final charged reply channel, including its lease allocation.
+The next bounded slice defines private storage owners with required pre-admitted charges and an explicit sizing contract, without defaults or placeholders.
+Those definitions will establish exact types for sizing before the live admission path changes. They do not establish connected accounting.
 The Hub writer will separately prove each affected container's population bound, including retained failures and stale identities.
 Root and the reviewer accepted those element-count proofs: pending requests and coordination capacity waiters are each bounded by Owner capacity.
 Host completions are bounded by the runtime's eight Host permits, including unmatched terminal completions. Pending-row membership is not required for that bound.
