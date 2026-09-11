@@ -464,6 +464,42 @@ impl ManagedSpawnOperation {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_spawn_phase(
+        waiter_id: WaiterId,
+        pending: PendingManagedSessionSpawn,
+        prepared: PreparedManagedWorktree,
+        start: crate::runtime::ManagedSessionSpawnStart,
+    ) -> Self {
+        Self {
+            waiter_id,
+            pending: Some(pending),
+            prepared: Some(prepared),
+            prepared_mutation: None,
+            spawn: Some(start),
+            permit: None,
+            phase: Phase::Spawn,
+            next_host_phase: 2,
+            record_committed: true,
+            deferred_error: None,
+            deadline: Instant::now() + std::time::Duration::from_secs(15),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_poll_spawn(
+        &mut self,
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+    ) -> ControlPoll {
+        self.poll_spawn(daemon, state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_skipped_rollback(&self) -> bool {
+        self.phase == Phase::Done
+    }
+
     fn poll_spawn(
         &mut self,
         daemon: &mut HubDaemon,
