@@ -776,6 +776,8 @@ pub(crate) struct CoreDaemonHandle {
     refuse_next_owner_begins: Arc<AtomicUsize>,
     #[cfg(test)]
     lose_next_owner_begins: Arc<AtomicUsize>,
+    #[cfg(test)]
+    release_session_reservation_begins: Arc<AtomicUsize>,
 }
 
 impl CoreDaemonHandle {
@@ -787,6 +789,12 @@ impl CoreDaemonHandle {
     #[cfg(test)]
     pub(crate) fn test_lose_next_owner_begins(&self, count: usize) {
         self.lose_next_owner_begins.store(count, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_release_session_reservation_begins(&self) -> usize {
+        self.release_session_reservation_begins
+            .load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -1096,6 +1104,11 @@ impl CoreDaemonHandle {
         if let Some(forced) = self.take_forced_owner_begin() {
             return forced;
         }
+        #[cfg(test)]
+        if matches!(operation, CoreOperation::ReleaseSessionReservation(_)) {
+            self.release_session_reservation_begins
+                .fetch_add(1, Ordering::AcqRel);
+        }
         let Some(identities) = self.completion_wake.register_phases(waiter_id, 2) else {
             return CoreOperationTicket {
                 begin: CoreTicket::refused(),
@@ -1232,6 +1245,8 @@ impl DataPlaneDriver {
             refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            release_session_reservation_begins: Arc::new(AtomicUsize::new(0)),
         };
         let driver = Self {
             core: core.clone(),
@@ -1857,6 +1872,8 @@ mod tests {
             refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            release_session_reservation_begins: Arc::new(AtomicUsize::new(0)),
         };
         let mut pending = PendingCoreOperations::new();
         let mut next_waiter = 1_u64;
@@ -2059,6 +2076,7 @@ mod tests {
                 completion_wake: Arc::clone(&wake),
                 refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
                 lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+                release_session_reservation_begins: Arc::new(AtomicUsize::new(0)),
             };
             let drops = Arc::new(AtomicUsize::new(0));
             let probe = DropProbe(Arc::clone(&drops));

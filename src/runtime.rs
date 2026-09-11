@@ -925,6 +925,11 @@ impl HubRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_release_session_reservation_begins(&self) -> usize {
+        self.core_daemon.test_release_session_reservation_begins()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_stop_host_submissions(&mut self) {
         self.host_executor.test_stop_submissions();
     }

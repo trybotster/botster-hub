@@ -1736,6 +1736,13 @@ mod tests {
     }
 
     fn spawn_fixture(name: &str) -> (crate::HubDaemon, DaemonControlState, std::path::PathBuf) {
+        spawn_fixture_with_worker(name, None)
+    }
+
+    fn spawn_fixture_with_worker(
+        name: &str,
+        worker: Option<std::path::PathBuf>,
+    ) -> (crate::HubDaemon, DaemonControlState, std::path::PathBuf) {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1744,6 +1751,8 @@ mod tests {
             "s1-spawn-{name}-{}-{stamp}",
             std::process::id()
         ));
+        let mut core_engine = crate::config::CoreEngineOptions::default();
+        core_engine.session_worker_path = worker;
         let config = crate::HubStartupOptions {
             host: crate::HostIdentityOptions {
                 id: format!("s1-{name}"),
@@ -1751,6 +1760,7 @@ mod tests {
                 fingerprint: None,
             },
             data_directory: crate::DataDirectoryOption::Explicit(root.clone()),
+            core_engine,
             ..crate::HubStartupOptions::default()
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
@@ -1764,6 +1774,22 @@ mod tests {
                 .expect("fresh owner identity source"),
         );
         (daemon, state, root)
+    }
+
+    fn pump_core(daemon: &mut crate::HubDaemon, state: &mut DaemonControlState) {
+        drive_ready_test_turn(daemon, state);
+        if let Some(runtime) = daemon.runtime() {
+            let identities = runtime.take_owner_core_completions(8);
+            if !identities.is_empty() {
+                let mut budget =
+                    crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                crate::daemon::control::pending::absorb_core_completions(
+                    state,
+                    &identities,
+                    &mut budget,
+                );
+            }
+        }
     }
 
     #[test]
@@ -1987,6 +2013,10 @@ mod tests {
         ) else {
             panic!("spawn a must defer");
         };
+        assert!(
+            state.retained_explicit_reservations.is_empty(),
+            "Spawn A must take retained tokens before Spawn B is created"
+        );
         state.current_waiter_id = Some(waiter_b);
         let ControlStep::Pending(mut pending_b) = handle_runtime(
             &mut daemon,
@@ -2026,5 +2056,152 @@ mod tests {
         assert_eq!(state.retained_explicit_reservations.len(), 1);
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepting_queue_releases_a_retained_token_once() {
+        let (mut daemon, mut state, root) = spawn_fixture("accept-release");
+        let waiter = state.current_waiter_id.unwrap();
+        let mut reserve = daemon.runtime().unwrap().begin_reserve_session_for_owner(
+            waiter,
+            SessionId("s1-accept-held".into()),
+        );
+        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        state.retained_explicit_reservations.push(held);
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-accept-next".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        assert!(state.retained_explicit_reservations.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut polls = 0_u32;
+        let mut armed = false;
+        let response = loop {
+            assert!(Instant::now() < deadline, "accepting-queue hang");
+            polls += 1;
+            assert!(polls < 64, "accepting-queue spun");
+            pump_core(&mut daemon, &mut state);
+            if !armed && daemon.runtime().unwrap().test_release_session_reservation_begins() >= 1 {
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .test_refuse_next_owner_begins(8);
+                armed = true;
+            }
+            match pending.continuation.poll(&mut daemon, &mut state) {
+                ControlPoll::Pending | ControlPoll::Again => std::thread::yield_now(),
+                ControlPoll::Ready(Ok(response)) => break response,
+                ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                _ => std::thread::yield_now(),
+            }
+        };
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        assert!(response.error.is_some());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn write_worker_script(root: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = root.join("scripted-worker");
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    }
+
+    fn poll_spawn_until_ready(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        pending: &mut crate::daemon::control::pending::PendingStep,
+    ) -> botster_hub_client::DaemonResponse {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "scripted-worker spawn hang");
+            pump_core(daemon, state);
+            match pending.continuation.poll(daemon, state) {
+                ControlPoll::Pending | ControlPoll::Again => std::thread::yield_now(),
+                ControlPoll::Ready(Ok(response)) => return response,
+                ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                _ => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_session_worker_reaches_a_terminal_spawn_outcome() {
+        let worker = std::path::PathBuf::from("/no/such/botster-session-worker");
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("missing-worker", Some(worker));
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-missing-worker".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let response = poll_spawn_until_ready(&mut daemon, &mut state, &mut pending);
+        assert!(response.error.is_some() || response.kind == DaemonResponseKind::Spawned);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_exit_before_connect_releases_the_reservation() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-spawn-exit-before-{}-{stamp}",
+            std::process::id()
+        ));
+        let worker = write_worker_script(&root, "#!/bin/sh\nexit 1\n");
+        let (mut daemon, mut state, fixture_root) =
+            spawn_fixture_with_worker("exit-before", Some(worker));
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-exit-before".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let response = poll_spawn_until_ready(&mut daemon, &mut state, &mut pending);
+        assert!(response.error.is_some());
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins()
+                >= 1
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(fixture_root);
     }
 }
