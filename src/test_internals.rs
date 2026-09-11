@@ -23,6 +23,7 @@ pub struct CapacityRaiseStorm {
     lua: mlua::Lua,
     publish: mlua::Function,
     drain: mlua::Function,
+    _capacity_string: crate::lua_memory::LuaCallbackCharge,
 }
 
 #[cfg(feature = "allocation-oracle")]
@@ -41,7 +42,7 @@ pub fn prepare_capacity_raise_storm() -> CapacityRaiseStorm {
     })
     .expect("capacity raise account");
     let lua = mlua::Lua::new();
-    let table = crate::lua_runtime::coordination_table(
+    let (table, capacity_string) = crate::lua_runtime::coordination_table(
         &lua,
         PluginKey("oracle.plugin".into()),
         HubCoordinationBridge::new(Arc::clone(&memory)),
@@ -84,6 +85,7 @@ pub fn prepare_capacity_raise_storm() -> CapacityRaiseStorm {
         lua,
         publish,
         drain,
+        _capacity_string: capacity_string,
     }
 }
 

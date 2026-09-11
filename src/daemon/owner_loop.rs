@@ -7765,11 +7765,15 @@ return botster.register({tools = {{
                                 Box::new(runtime.test_core_waiter_probe());
                             let callback_usage: Box<dyn Fn() -> usize + Send> =
                                 Box::new(runtime.test_lua_callback_usage_probe());
+                            let callback_owners: Box<
+                                dyn Fn() -> Vec<(String, usize)> + Send,
+                            > = Box::new(runtime.test_callback_charge_breakdown_probe());
                             started_tx
                                 .send((
                                     runtime.coordination_bridge(),
                                     probe,
                                     callback_usage,
+                                    callback_owners,
                                     sender.clone(),
                                 ))
                                 .unwrap();
@@ -7786,7 +7790,7 @@ return botster.register({tools = {{
                 )
             })
             .unwrap();
-        let (bridge, retains_waiter, callback_usage, control) =
+        let (bridge, retains_waiter, callback_usage, callback_owners, control) =
             started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let stop = StopServe(control);
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -7901,10 +7905,22 @@ return botster.register({tools = {{
             );
             thread::yield_now();
         }
+        let owners = callback_owners();
+        let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
+        eprintln!(
+            "callback charge owners before shutdown: {owners:?} sum={owner_sum} usage={}",
+            callback_usage()
+        );
+        assert_eq!(
+            owner_sum,
+            callback_usage(),
+            "callback owner sum must equal usage before shutdown owners={owners:?} usage={}",
+            callback_usage()
+        );
         assert_eq!(
             callback_usage(),
-            0,
-            "callback storage must release after conversion and disposal, before shutdown"
+            owner_sum,
+            "callback storage retained before shutdown must equal derived owner sum owners={owners:?}"
         );
         write_request(&mut client, status_id, DaemonRequest::Status);
         assert_eq!(
@@ -7918,6 +7934,11 @@ return botster.register({tools = {{
         assert!(waiters.iter().all(|waiter| !retains_waiter(*waiter)));
         drop(stop);
         drop(retains_waiter);
+        assert_eq!(
+            callback_usage(),
+            0,
+            "callback storage must release after daemon stop owners={owners:?}"
+        );
         drop(bridge);
         std::fs::remove_dir_all(root).unwrap();
     }

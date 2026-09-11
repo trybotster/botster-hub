@@ -377,9 +377,9 @@ fn seal_take_ablation_leaves_charge_on_source() {
     assert_eq!(memory.usage().1, 2 * slot());
 }
 
-fn bind_coordination(memory: Arc<LuaMemoryAccount>) -> mlua::Lua {
+fn bind_coordination(memory: Arc<LuaMemoryAccount>) -> (mlua::Lua, crate::lua_memory::LuaCallbackCharge) {
     let lua = mlua::Lua::new();
-    let table = super::coordination_table(
+    let (table, capacity_string) = super::coordination_table(
         &lua,
         PluginKey("capacity.plugin".into()),
         HubCoordinationBridge::new(Arc::clone(&memory)),
@@ -387,13 +387,13 @@ fn bind_coordination(memory: Arc<LuaMemoryAccount>) -> mlua::Lua {
     )
     .unwrap();
     lua.globals().set("coordination", table).unwrap();
-    lua
+    (lua, capacity_string)
 }
 
 #[test]
 fn publish_and_drain_capacity_raise_precreated_lua_string() {
     let memory = account(2 * crate::lua_memory::layout::lua_reference_bytes());
-    let lua = bind_coordination(Arc::clone(&memory));
+    let (lua, _capacity_string) = bind_coordination(Arc::clone(&memory));
     let before = memory.usage().1;
     for call in [
         "coordination.publish, { id = 'e1', target = { type = 'topic', topic = 't' } }",
