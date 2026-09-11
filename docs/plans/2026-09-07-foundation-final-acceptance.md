@@ -36,7 +36,9 @@ Those definitions will establish exact types for sizing before the live admissio
 The first definitions slice is frozen in `/private/tmp/c1-acknowledgement-ownership-review-20260910-1`.
 It requires separate result, error-string, and conversion charges, plus leased reply endpoints and caller handles.
 The shared candidate transport preserves Publish and Drain payloads. Its acknowledgement sender accepts only charged results and errors.
-Root checked the source and hashes. Independent review accepted the definitions; only pinned formatting is now authorized.
+Root checked the source and hashes. Independent review accepted the definitions. Pinned formatting then completed without changing either hash.
+The Hub writer will next propose the actual shared response and Host command replacement, including required sizing inputs and final dependent layouts.
+That assignment permits planning only. Source changes, builds, measurements, and production activation remain separately gated.
 Connection must fund producer-side errors and must not convert impossible shared reply variants into uncharged acknowledgement errors.
 Continuation and disposal layouts still depend on the actual Host command change. This slice does not duplicate that command.
 Earlier zero-warning reports were incorrect because compiler diagnostics were in JSON stdout, not stderr.
