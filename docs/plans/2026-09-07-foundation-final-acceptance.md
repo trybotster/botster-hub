@@ -42,7 +42,8 @@ That assignment permits planning only. Source changes, builds, measurements, and
 The replacement plan is `/private/tmp/c1-acknowledgement-replacement-plan-20260910-1/plan.md`.
 Root verified its first blocker: production `load_prepared` supplies `memory: None`, so required charged results cannot replace the live path yet.
 Jason must approve the production memory policy before that funding boundary changes. The source remains frozen pending this decision.
-The plan proposes eight fixed sizing inputs. Admission combines those inputs with borrowed input size B to construct all eleven per-call fields.
+Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
+Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 Policy approval will not resolve exact allocation sizes, final connected layouts, or their verification.
 Connection must fund producer-side errors and must not convert impossible shared reply variants into uncharged acknowledgement errors.
 Continuation and disposal layouts still depend on the actual Host command change. This slice does not duplicate that command.
