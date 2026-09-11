@@ -153,6 +153,7 @@ impl Drop for CoordinationCallerGuard {
 }
 
 mod callback;
+mod session_type_spawn;
 mod entity_publish;
 #[cfg(test)]
 mod registration_tests;
@@ -1976,11 +1977,14 @@ fn session_types_table(
     )?;
     table.set(
         "show",
-        session_type_read_callback(lua, true, state, package_records.clone(), memory)?,
+        session_type_read_callback(lua, true, state, package_records.clone(), memory.clone())?,
     )?;
     let spawn_templates = session_types.clone();
     let spawn_plugin_key = plugin_key.clone();
     let spawn_records = package_records.clone();
+    let spawn_memory = memory.clone();
+    let spawn_conversion = lua
+        .create_string("session_types.spawn could not allocate its Lua result")?;
     table.set(
         "spawn",
         callback::create(lua, move |lua, args: Value| {
@@ -2005,7 +2009,13 @@ fn session_types_table(
                 .map_err(|error| {
                     mlua::Error::RuntimeError(format!("session_types.spawn failed: {error}"))
                 })?;
-            lua.to_value(&result)
+            session_type_spawn::convert_session_type_spawned(
+                lua,
+                spawn_memory.as_ref(),
+                &spawn_templates,
+                result,
+                &spawn_conversion,
+            )
         })?,
     )?;
     table.set(
@@ -2034,7 +2044,17 @@ fn session_types_table(
                 request,
                 package_records.clone(),
             ) {
-                Ok(spawned) => lua.to_value(&json!({"ok": true, "result": spawned})),
+                Ok(spawned) => {
+                    let conversion = lua.create_string(
+                        "session_types.ensure_worktree_and_spawn could not allocate its Lua result",
+                    )?;
+                    session_type_spawn::convert_managed_spawned(
+                        lua,
+                        memory.as_ref(),
+                        &spawned,
+                        &conversion,
+                    )
+                }
                 Err(error) => lua.to_value(&json!({"ok": false, "error": error})),
             }
         })?,
