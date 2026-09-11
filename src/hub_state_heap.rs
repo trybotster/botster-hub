@@ -121,6 +121,14 @@ impl HeapSize for usize {
     fn add_to(&self, _walk: &mut HeapWalk) {}
 }
 
+impl HeapSize for i64 {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for serde_json::Number {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
 impl<T: HeapSize> HeapSize for Option<T> {
     fn add_to(&self, walk: &mut HeapWalk) {
         if let Some(value) = self {
@@ -552,7 +560,7 @@ impl HeapSize for PackageRecord {
         installed_at.add_to(walk);
         updated_at.add_to(walk);
         last_audit_reason.add_to(walk);
-        let _ = admitted_host_profile;
+        admitted_host_profile.add_to(walk);
     }
 }
 
@@ -577,33 +585,19 @@ impl HeapSize for HubPackageManifest {
         } = self;
         name.add_to(walk);
         version.add_to(walk);
-        let _ = kind;
+        kind.add_to(walk);
         botster.add_to(walk);
-        let _ = source;
+        source.add_to(walk);
         capabilities.add_to(walk);
-        walk.add(0, 0, entrypoints.len().saturating_mul(size_of_val_or_slot(entrypoints)));
-        walk.add(0, 0, dependencies.len().saturating_mul(size_of_val_or_slot(dependencies)));
-        walk.add(0, 0, features.len().saturating_mul(size_of_val_or_slot(features)));
-        let _ = host_profile;
-        let _ = configuration;
-        walk.add(
-            0,
-            0,
-            runnable_entrypoints
-                .len()
-                .saturating_mul(size_of_val_or_slot(runnable_entrypoints)),
-        );
-        walk.add(0, 0, surfaces.len().saturating_mul(size_of_val_or_slot(surfaces)));
-        walk.add(0, 0, navigation.len().saturating_mul(size_of_val_or_slot(navigation)));
+        entrypoints.add_to(walk);
+        dependencies.add_to(walk);
+        features.add_to(walk);
+        host_profile.add_to(walk);
+        configuration.add_to(walk);
+        runnable_entrypoints.add_to(walk);
+        surfaces.add_to(walk);
+        navigation.add_to(walk);
         events.add_to(walk);
-    }
-}
-
-fn size_of_val_or_slot<T>(items: &[T]) -> usize {
-    if items.is_empty() {
-        size_of::<T>()
-    } else {
-        size_of::<T>()
     }
 }
 
@@ -611,7 +605,7 @@ impl HeapSize for HubPackageEvents {
     fn add_to(&self, walk: &mut HeapWalk) {
         let Self { emitted, notices } = self;
         emitted.add_to(walk);
-        walk.add(0, 0, notices.len().saturating_mul(size_of_val_or_slot(notices)));
+        notices.add_to(walk);
     }
 }
 
@@ -667,36 +661,93 @@ impl HeapSize for PackageTrust {
 
 impl HeapSize for PackageProvenance {
     fn add_to(&self, walk: &mut HeapWalk) {
-        let _ = self;
-        walk.add(0, 0, 0);
+        let Self { source, checksum } = self;
+        source.add_to(walk);
+        checksum.add_to(walk);
     }
 }
 
 impl HeapSize for PackageSourceMetadata {
     fn add_to(&self, walk: &mut HeapWalk) {
-        let _ = self;
-        walk.add(0, 0, 0);
+        let Self {
+            registry_id,
+            registry_kind,
+            entry_id,
+            source_kind,
+            source_label,
+            git_repo,
+        } = self;
+        registry_id.add_to(walk);
+        let _copy_registry_kind = registry_kind;
+        entry_id.add_to(walk);
+        let _copy_source_kind = source_kind;
+        source_label.add_to(walk);
+        git_repo.add_to(walk);
     }
 }
 
 impl HeapSize for PackagePin {
     fn add_to(&self, walk: &mut HeapWalk) {
-        let _ = self;
-        walk.add(0, 0, 0);
+        let Self {
+            revision,
+            branch,
+            tag,
+            rev,
+            checksum,
+            update_policy,
+        } = self;
+        revision.add_to(walk);
+        branch.add_to(walk);
+        tag.add_to(walk);
+        rev.add_to(walk);
+        checksum.add_to(walk);
+        update_policy.add_to(walk);
     }
 }
 
 impl HeapSize for PackageCompatibility {
     fn add_to(&self, walk: &mut HeapWalk) {
-        let _ = self;
-        walk.add(0, 0, 0);
+        let Self {
+            botster_requirement,
+            hub_version,
+            result,
+            diagnostics,
+        } = self;
+        botster_requirement.add_to(walk);
+        hub_version.add_to(walk);
+        let _copy_result = result;
+        diagnostics.add_to(walk);
     }
 }
 
 impl HeapSize for PackageRunnableEntrypoint {
     fn add_to(&self, walk: &mut HeapWalk) {
-        let _ = self;
-        walk.add(0, 0, 0);
+        let Self {
+            id,
+            kind,
+            launch_mode,
+            command,
+            args,
+            working_directory,
+            injections,
+            environment,
+            capabilities,
+            readiness,
+            may_supervise,
+            process,
+        } = self;
+        id.add_to(walk);
+        let _ = kind;
+        let _ = launch_mode;
+        command.add_to(walk);
+        args.add_to(walk);
+        working_directory.add_to(walk);
+        walk.add(0, 0, injections.len().saturating_mul(size_of::<botster_core::RunnableEntrypointInjection>()));
+        environment.add_to(walk);
+        capabilities.add_to(walk);
+        let _ = readiness;
+        may_supervise.add_to(walk);
+        process.add_to(walk);
     }
 }
 
@@ -709,15 +760,101 @@ impl HeapSize for PackageConfigurationState {
 
 impl HeapSize for botster_core::PackageConfigurationValue {
     fn add_to(&self, walk: &mut HeapWalk) {
-        let _ = self;
-        walk.add(0, 0, 0);
+        match self {
+            Self::String { value }
+            | Self::Select { value }
+            | Self::Path { value }
+            | Self::Url { value }
+            | Self::MultilineText { value } => value.add_to(walk),
+            Self::Number { .. } | Self::Integer { .. } | Self::Boolean { .. } | Self::Secret { .. } => {}
+        }
     }
 }
 
 impl HeapSize for PackageSessionType {
     fn add_to(&self, walk: &mut HeapWalk) {
-        let _ = self;
-        walk.add(0, 0, 0);
+        let Self {
+            id,
+            label,
+            description,
+            icon,
+            role,
+            interaction,
+            traits,
+            lifecycle,
+            execution,
+            command,
+            args,
+            working_directory,
+            environment,
+            allowed_environment_overrides,
+            context,
+            target_id,
+        } = self;
+        id.add_to(walk);
+        label.add_to(walk);
+        description.add_to(walk);
+        icon.add_to(walk);
+        role.add_to(walk);
+        interaction.add_to(walk);
+        traits.add_to(walk);
+        lifecycle.add_to(walk);
+        execution.add_to(walk);
+        command.add_to(walk);
+        args.add_to(walk);
+        working_directory.add_to(walk);
+        environment.add_to(walk);
+        allowed_environment_overrides.add_to(walk);
+        context.add_to(walk);
+        target_id.add_to(walk);
+    }
+}
+
+impl HeapSize for crate::session_types::PackageSessionTypeExecution {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for crate::session_types::PackageSessionTypeWorkingDirectory {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        match self {
+            Self::PackageRoot => {}
+            Self::Relative { path } => path.add_to(walk),
+        }
+    }
+}
+
+impl HeapSize for crate::packages::PackageRunnableWorkingDirectory {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        match self {
+            Self::PackageRoot | Self::EntrypointDir => {}
+            Self::Relative { path } => path.add_to(walk),
+        }
+    }
+}
+
+impl HeapSize for crate::packages::PackageEnvironmentRequirement {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            name,
+            required,
+            default,
+            description,
+        } = self;
+        name.add_to(walk);
+        required.add_to(walk);
+        default.add_to(walk);
+        description.add_to(walk);
+    }
+}
+
+impl HeapSize for crate::packages::PackageRunnableProcess {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self { state, diagnostics } = self;
+        let _ = state;
+        walk.add(0, 0, diagnostics.len().saturating_mul(size_of::<crate::packages::PackageRunnableDiagnostic>()));
+        for diagnostic in diagnostics {
+            diagnostic.add_to(walk);
+        }
     }
 }
 
@@ -727,6 +864,293 @@ impl HeapSize for CredentialProviderKind {
 
 impl HeapSize for CredentialKeyPurpose {
     fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::ExtensionKind {
+    fn add_to(&self, _walk: &mut HeapWalk) {}
+}
+
+impl HeapSize for botster_core::PackageSource {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        match self {
+            Self::Git { repo, reference } => {
+                repo.add_to(walk);
+                reference.add_to(walk);
+            }
+            Self::Path { path } => path.add_to(walk),
+        }
+    }
+}
+
+impl HeapSize for botster_core::ExtensionEntrypoint {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            runtime,
+            path,
+            bootstrap,
+        } = self;
+        let _ = runtime;
+        path.add_to(walk);
+        bootstrap.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::PackageDependency {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            id,
+            package,
+            kind,
+            feature,
+            requirements,
+        } = self;
+        id.add_to(walk);
+        package.add_to(walk);
+        let _ = kind;
+        feature.add_to(walk);
+        requirements.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::PackageRequirement {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        match self {
+            Self::Provider { provider } => provider.add_to(walk),
+            Self::Capability { capability } => capability.add_to(walk),
+            Self::Auth { key } | Self::Config { key } => key.add_to(walk),
+        }
+    }
+}
+
+impl HeapSize for botster_core::PackageFeatureGate {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            id,
+            label,
+            description,
+            dependencies,
+            requirements,
+        } = self;
+        id.add_to(walk);
+        label.add_to(walk);
+        description.add_to(walk);
+        dependencies.add_to(walk);
+        requirements.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::HostProfileMetadata {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            profile_id,
+            compatibility,
+            precedence,
+            required_providers,
+            required_capabilities,
+            policy_sections,
+        } = self;
+        profile_id.add_to(walk);
+        compatibility.add_to(walk);
+        let _ = precedence;
+        required_providers.add_to(walk);
+        required_capabilities.add_to(walk);
+        walk.add(0, 0, policy_sections.len().saturating_mul(size_of::<botster_core::HostProfilePolicySection>()));
+    }
+}
+
+impl HeapSize for botster_core::AdmittedHostProfile {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            package_name,
+            package_version,
+            metadata,
+        } = self;
+        package_name.add_to(walk);
+        package_version.add_to(walk);
+        metadata.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::PackageConfigurationSchema {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self { groups, fields } = self;
+        groups.add_to(walk);
+        fields.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::PackageConfigurationGroup {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            id,
+            label,
+            description,
+            order,
+        } = self;
+        id.add_to(walk);
+        label.add_to(walk);
+        description.add_to(walk);
+        let _ = order;
+    }
+}
+
+impl HeapSize for botster_core::PackageConfigurationField {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            key,
+            field_type,
+            label,
+            description,
+            required,
+            default,
+            validation,
+            group,
+            order,
+            options,
+        } = self;
+        key.add_to(walk);
+        let _ = field_type;
+        label.add_to(walk);
+        description.add_to(walk);
+        required.add_to(walk);
+        default.add_to(walk);
+        validation.add_to(walk);
+        group.add_to(walk);
+        let _ = order;
+        options.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::PackageConfigurationOption {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            value,
+            label,
+            description,
+        } = self;
+        value.add_to(walk);
+        label.add_to(walk);
+        description.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::PackageConfigurationValidationHints {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            min_length,
+            max_length,
+            pattern,
+            min,
+            max,
+            allowed_extensions,
+        } = self;
+        let _ = min_length;
+        let _ = max_length;
+        pattern.add_to(walk);
+        let _ = min;
+        let _ = max;
+        allowed_extensions.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_core::RunnableEntrypoint {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            id,
+            kind,
+            launch_mode,
+            command,
+            args,
+            working_directory,
+            injections,
+            environment,
+            readiness,
+        } = self;
+        id.add_to(walk);
+        let _ = kind;
+        let _ = launch_mode;
+        command.add_to(walk);
+        args.add_to(walk);
+        let _ = working_directory;
+        walk.add(0, 0, injections.len().saturating_mul(size_of::<botster_core::RunnableEntrypointInjection>()));
+        walk.add(0, 0, environment.len().saturating_mul(size_of::<botster_core::RunnableEntrypointEnvironmentRequirement>()));
+        let _ = readiness;
+    }
+}
+
+impl HeapSize for botster_ui_contract::PackageSurfaceDescriptor {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            id,
+            kind,
+            title,
+            description,
+            icon,
+            order,
+            category,
+            supports,
+        } = self;
+        id.add_to(walk);
+        let _ = kind;
+        title.add_to(walk);
+        description.add_to(walk);
+        icon.add_to(walk);
+        let _ = order;
+        category.add_to(walk);
+        walk.add(0, 0, supports.len().saturating_mul(size_of::<botster_ui_contract::PackageSurfaceOperation>()));
+    }
+}
+
+impl HeapSize for botster_ui_contract::PackageNavigationEntry {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            id,
+            label,
+            icon,
+            description,
+            target,
+        } = self;
+        id.add_to(walk);
+        label.add_to(walk);
+        icon.add_to(walk);
+        description.add_to(walk);
+        target.add_to(walk);
+    }
+}
+
+impl HeapSize for botster_ui_contract::PackageNavigationTarget {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        match self {
+            Self::Surface { surface_id } => surface_id.add_to(walk),
+        }
+    }
+}
+
+impl HeapSize for botster_ui_contract::PackageNoticeReactionDeclaration {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            owner,
+            name,
+            subject_scope,
+            text_pointer,
+            ttl_ms,
+            severity,
+        } = self;
+        owner.add_to(walk);
+        name.add_to(walk);
+        let _ = subject_scope;
+        text_pointer.add_to(walk);
+        let _ = ttl_ms;
+        let _ = severity;
+    }
+}
+
+impl HeapSize for crate::packages::PackageRunnableDiagnostic {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self { kind, message } = self;
+        kind.add_to(walk);
+        message.add_to(walk);
+    }
 }
 
 #[must_use]
