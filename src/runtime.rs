@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -128,6 +128,8 @@ pub struct HubRuntime {
     submitted_created_worktree_rollbacks: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     rollback_git_hold: Mutex<Option<Arc<crate::host_executor::TestHostGate>>>,
+    #[cfg(test)]
+    managed_accept_ones: AtomicUsize,
     close_work: crate::data_plane::CloseWorkSource,
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
@@ -489,6 +491,8 @@ impl HubRuntime {
             submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             rollback_git_hold: Mutex::new(None),
+            #[cfg(test)]
+            managed_accept_ones: AtomicUsize::new(0),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -608,6 +612,8 @@ impl HubRuntime {
             submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             rollback_git_hold: Mutex::new(None),
+            #[cfg(test)]
+            managed_accept_ones: AtomicUsize::new(0),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -1880,10 +1886,14 @@ impl HubRuntime {
         }
     }
 
-    pub(crate) fn finish_submitted_worktree_rollback(&self, worktree_id: &str) {
+    pub(crate) fn clear_submitted_worktree_rollback(&self, worktree_id: &str) {
         if let Ok(mut held) = self.submitted_created_worktree_rollbacks.lock() {
             held.remove(worktree_id);
         }
+    }
+
+    pub(crate) fn finish_submitted_worktree_rollback(&self, worktree_id: &str) {
+        self.clear_submitted_worktree_rollback(worktree_id);
         self.session_type_spawner.publish_managed_spawn();
     }
 
@@ -1912,6 +1922,16 @@ impl HubRuntime {
             .lock()
             .ok()
             .and_then(|held| held.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_note_managed_accept_one(&self) {
+        self.managed_accept_ones.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_managed_accept_ones(&self) -> usize {
+        self.managed_accept_ones.load(Ordering::Acquire)
     }
 
     pub(crate) fn peek_pending_managed_worktree_id(&self) -> Option<String> {
@@ -2038,7 +2058,6 @@ impl HubRuntime {
         if let Ok(mut held) = self.confirmed_worktree_rollbacks.lock() {
             held.push(prepared);
         }
-        self.session_type_spawner.publish_managed_spawn();
     }
 
     pub(crate) fn take_one_confirmed_worktree_rollback(

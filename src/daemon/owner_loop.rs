@@ -374,6 +374,10 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
             mark_event_owner_ready(state);
         }
         state.publication_owner.waiting_for_owner = false;
+        if state.managed_spawn_waiting_for_owner {
+            state.managed_spawn_waiting_for_owner = false;
+            mark_background_ready(state, BackgroundWork::ManagedSpawn);
+        }
     }
     if let Some(runtime) = daemon.runtime() {
         if runtime.take_event_plane_owner_ops_notification() {
@@ -434,6 +438,10 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         state.host_capacity_wake_pending |= host_capacity;
         if state.host_completion_drain_pending || state.host_capacity_wake_pending {
             mark_host_drain_ready(state);
+        }
+        if host_capacity && state.managed_spawn_waiting_for_host {
+            state.managed_spawn_waiting_for_host = false;
+            mark_background_ready(state, BackgroundWork::ManagedSpawn);
         }
         if runtime.take_managed_spawn_notification() {
             mark_background_ready(state, BackgroundWork::ManagedSpawn);
@@ -1715,6 +1723,8 @@ pub(crate) struct DaemonControlState {
     pub(crate) coordination_fault: Option<crate::daemon::control::coordination::CoordinationFault>,
     pub(crate) coordination_waiting_for_owner: bool,
     pub(crate) coordination_capacity_waiters: BTreeSet<crate::owner_identity::WaiterId>,
+    pub(crate) managed_spawn_waiting_for_owner: bool,
+    pub(crate) managed_spawn_waiting_for_host: bool,
     terminal_fault: Option<TerminalDrainFault>,
     terminal_lifecycle: TerminalLifecycle,
     pub(crate) event_owner: crate::daemon::event_owner::EventOwnerState,
@@ -1835,6 +1845,8 @@ impl Default for DaemonControlState {
             coordination_fault: None,
             coordination_waiting_for_owner: false,
             coordination_capacity_waiters: BTreeSet::new(),
+            managed_spawn_waiting_for_owner: false,
+            managed_spawn_waiting_for_host: false,
             terminal_lifecycle,
             event_owner: crate::daemon::event_owner::EventOwnerState::default(),
             publication_owner: crate::daemon::publication_owner::PublicationOwnerState::default(),

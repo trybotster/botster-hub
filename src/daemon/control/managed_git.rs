@@ -99,43 +99,45 @@ fn accept_confirmed_rollback(
     }
     let Some(owner_permit) = state.budget.reserve() else {
         runtime.defer_confirmed_worktree_rollback(prepared);
+        state.managed_spawn_waiting_for_owner = true;
         return;
     };
     let Some(waiter_id) = state.waiter_ids.next() else {
         state.budget.release(owner_permit);
         runtime.defer_confirmed_worktree_rollback(prepared);
+        state.managed_spawn_waiting_for_owner = true;
         return;
     };
     let Some(host_permit) = runtime.host_executor().try_reserve() else {
         state.budget.release(owner_permit);
         runtime.defer_confirmed_worktree_rollback(prepared);
+        state.managed_spawn_waiting_for_host = true;
         return;
     };
     let deadline = Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT;
     runtime.begin_submitted_worktree_rollback(&prepared.worktree_id);
-    if runtime
-        .host_executor()
-        .submit(
-            HostJobIdentity {
-                waiter_id,
-                phase: 1,
-            },
-            HostCommand::FinalizeManagedWorktree {
-                prepared: prepared.clone(),
-                decision: ManagedWorktreeDecision::Rollback,
-                deadline,
-                discard: None,
-                suppress_rollback: runtime.created_worktree_rollback_suppressions(),
-                #[cfg(test)]
-                rollback_hold: runtime.test_rollback_git_hold(),
-            },
-            host_permit,
-        )
-        .is_err()
-    {
-        runtime.finish_submitted_worktree_rollback(&prepared.worktree_id);
+    if let Err(failure) = runtime.host_executor().submit(
+        HostJobIdentity {
+            waiter_id,
+            phase: 1,
+        },
+        HostCommand::FinalizeManagedWorktree {
+            prepared: prepared.clone(),
+            decision: ManagedWorktreeDecision::Rollback,
+            deadline,
+            discard: None,
+            suppress_rollback: runtime.created_worktree_rollback_suppressions(),
+            #[cfg(test)]
+            rollback_hold: runtime.test_rollback_git_hold(),
+        },
+        host_permit,
+    ) {
+        runtime.clear_submitted_worktree_rollback(&prepared.worktree_id);
         state.budget.release(owner_permit);
         runtime.defer_confirmed_worktree_rollback(prepared);
+        if matches!(failure.error, HostSubmitError::Full) {
+            state.managed_spawn_waiting_for_host = true;
+        }
         return;
     }
     let operation = ManagedSpawnOperation {
@@ -189,6 +191,10 @@ fn accept_confirmed_rollback(
 }
 
 pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    #[cfg(test)]
+    if let Some(runtime) = daemon.runtime() {
+        runtime.test_note_managed_accept_one();
+    }
     let Some(runtime) = daemon.runtime() else {
         return;
     };
@@ -971,7 +977,7 @@ impl ManagedSpawnOperation {
             && !matches!(poll, ControlPoll::Pending)
         {
             if let Some(runtime) = daemon.runtime() {
-                runtime.finish_submitted_worktree_rollback(&prepared.worktree_id);
+                runtime.clear_submitted_worktree_rollback(&prepared.worktree_id);
             }
         }
         poll
