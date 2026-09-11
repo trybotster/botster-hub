@@ -23,6 +23,12 @@ The final handle must destroy covered owners before explicitly releasing metadat
 A valid batch may release metadata after destroying its vector, even when allocation unwinds. Allocation failure alone does not require retention.
 The Core writer may implement this contract and focused test source in the same three files. Execution and integration remain separately gated.
 The Hub writer will separately prove each affected container's population bound, including retained failures and stale identities.
+Root and the reviewer accepted those element-count proofs: pending requests and coordination capacity waiters are each bounded by Owner capacity.
+Host completions are bounded by the runtime's eight Host permits, including unmatched terminal completions. Pending-row membership is not required for that bound.
+The proof is `/private/tmp/c1-owner-container-population-proof-20260910.md`. Changed node layouts and byte reservations remain unverified.
+The accepted pinned tree derivation gives at most `floor(n / 5) + 1` nodes for each proven population, including insertion peaks and retained empty roots.
+The Host completion map therefore has a conservative two-node ceiling. This does not establish either node's byte size.
+The reviewer also recorded an unverified shutdown hazard involving unmatched terminal completions. Reachability remains unresolved; this is not a demonstrated C1 defect.
 Core-private layout facts may support later sizing. They do not by themselves establish actual allocation requests or Arc header sizes.
 
 Admission must precede allocation. Capacity refusal must preserve the old registration during reload.
