@@ -99,6 +99,8 @@ pub(crate) enum HostCommand {
         deadline: Instant,
         discard: Option<Box<crate::host_mutations::PreparedMutation>>,
         suppress_rollback: Arc<Mutex<BTreeSet<String>>>,
+        #[cfg(test)]
+        rollback_hold: Option<Arc<TestHostGate>>,
     },
     #[cfg(test)]
     Panic {
@@ -1300,6 +1302,8 @@ fn execute(
             deadline,
             discard,
             suppress_rollback,
+            #[cfg(test)]
+            rollback_hold,
         } => {
             let suppressed = matches!(decision, ManagedWorktreeDecision::Rollback)
                 && suppress_rollback
@@ -1309,6 +1313,12 @@ fn execute(
             let result = if suppressed {
                 HostResult::ManagedWorktreeFinalized
             } else {
+                #[cfg(test)]
+                if matches!(decision, ManagedWorktreeDecision::Rollback) {
+                    if let Some(gate) = rollback_hold.as_ref() {
+                        gate.wait();
+                    }
+                }
                 match finalize_managed_worktree(
                     &prepared,
                     decision,
@@ -1349,7 +1359,7 @@ pub(crate) struct TestHostGate {
 
 #[cfg(test)]
 impl TestHostGate {
-    fn wait(&self) {
+    pub(crate) fn wait(&self) {
         self.started.store(true, Ordering::Release);
         let mut released = self
             .released
@@ -2470,6 +2480,7 @@ mod tests {
                     deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
                     discard: None,
                     suppress_rollback: Arc::new(Mutex::new(BTreeSet::new())),
+                    rollback_hold: None,
                 },
                 permit,
             )
@@ -2497,6 +2508,7 @@ mod tests {
                     deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
                     discard: None,
                     suppress_rollback: Arc::new(Mutex::new(BTreeSet::new())),
+                    rollback_hold: None,
                 },
                 permit,
             )

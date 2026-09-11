@@ -112,6 +112,7 @@ fn accept_confirmed_rollback(
         return;
     };
     let deadline = Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT;
+    runtime.begin_submitted_worktree_rollback(&prepared.worktree_id);
     if runtime
         .host_executor()
         .submit(
@@ -125,11 +126,14 @@ fn accept_confirmed_rollback(
                 deadline,
                 discard: None,
                 suppress_rollback: runtime.created_worktree_rollback_suppressions(),
+                #[cfg(test)]
+                rollback_hold: runtime.test_rollback_git_hold(),
             },
             host_permit,
         )
         .is_err()
     {
+        runtime.finish_submitted_worktree_rollback(&prepared.worktree_id);
         state.budget.release(owner_permit);
         runtime.defer_confirmed_worktree_rollback(prepared);
         return;
@@ -191,6 +195,14 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     runtime.retry_retained_reservation_releases();
     runtime.retry_created_worktree_releases();
     runtime.reap_detached_core_operations();
+    if let Some(worktree_id) = runtime.peek_pending_managed_worktree_id() {
+        if runtime.submitted_worktree_rollback(&worktree_id) {
+            if let Some(prepared) = runtime.take_one_confirmed_worktree_rollback() {
+                accept_confirmed_rollback(daemon, state, prepared);
+            }
+            return;
+        }
+    }
     let Some(pending) = runtime.take_pending_managed_spawn() else {
         if let Some(prepared) = runtime.take_one_confirmed_worktree_rollback() {
             accept_confirmed_rollback(daemon, state, prepared);
@@ -704,6 +716,15 @@ impl ManagedSpawnOperation {
         state: &mut DaemonControlState,
         result: HostResult,
     ) -> ControlPoll {
+        if let Some(worktree_id) = self
+            .prepared
+            .as_ref()
+            .map(|prepared| prepared.worktree_id.clone())
+        {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.finish_submitted_worktree_rollback(&worktree_id);
+            }
+        }
         match result {
             HostResult::ManagedWorktreeFinalized => {
                 let suppressed = self.prepared.as_ref().is_some_and(|prepared| {
@@ -920,12 +941,17 @@ impl ManagedSpawnOperation {
             .as_ref()
             .expect("managed worktree exists")
             .clone();
-        self.submit_host(
+        if matches!(decision, ManagedWorktreeDecision::Rollback) {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.begin_submitted_worktree_rollback(&prepared.worktree_id);
+            }
+        }
+        let poll = self.submit_host(
             daemon,
             state,
             phase,
             HostCommand::FinalizeManagedWorktree {
-                prepared,
+                prepared: prepared.clone(),
                 decision,
                 deadline: self.deadline,
                 discard,
@@ -935,8 +961,20 @@ impl ManagedSpawnOperation {
                     .unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(
                         std::collections::BTreeSet::new(),
                     ))),
+                #[cfg(test)]
+                rollback_hold: daemon
+                    .runtime()
+                    .and_then(|runtime| runtime.test_rollback_git_hold()),
             },
-        )
+        );
+        if matches!(decision, ManagedWorktreeDecision::Rollback)
+            && !matches!(poll, ControlPoll::Pending)
+        {
+            if let Some(runtime) = daemon.runtime() {
+                runtime.finish_submitted_worktree_rollback(&prepared.worktree_id);
+            }
+        }
+        poll
     }
 
     fn submit_host(
