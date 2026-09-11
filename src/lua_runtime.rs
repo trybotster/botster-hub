@@ -40,11 +40,11 @@ use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktre
 
 mod acknowledge_input;
 mod sandbox;
-use acknowledge_input::{AcknowledgeInput, AcknowledgeOperation};
 pub(crate) use acknowledge_input::ownership::{
     CoordinationDelivery, CoordinationFailure, CoordinationOutcome as HubCoordinationResponse,
     CoordinationRefusal, CoordinationReply, CoordinationReplySender, CoordinationStorage,
 };
+use acknowledge_input::{AcknowledgeInput, AcknowledgeOperation};
 
 #[cfg(feature = "allocation-oracle")]
 pub(crate) use acknowledge_input::ownership::{AcknowledgeOutcome, reply_channel};
@@ -127,7 +127,8 @@ impl CoordinationCaller {
     pub(crate) fn claim(&self) -> bool {
         match self {
             Self::NonAcknowledge(state) => state
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok(),
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
             Self::Acknowledge(caller) => caller.claim(),
         }
     }
@@ -146,17 +147,19 @@ struct CoordinationCallerGuard(CoordinationCaller);
 impl Drop for CoordinationCallerGuard {
     fn drop(&mut self) {
         match &self.0 {
-            CoordinationCaller::NonAcknowledge(state) => { state.fetch_or(2, Ordering::AcqRel); }
+            CoordinationCaller::NonAcknowledge(state) => {
+                state.fetch_or(2, Ordering::AcqRel);
+            }
             CoordinationCaller::Acknowledge(caller) => caller.finish(),
         }
     }
 }
 
 mod callback;
-mod session_type_spawn;
 mod entity_publish;
 #[cfg(test)]
 mod registration_tests;
+mod session_type_spawn;
 use entity_publish::EntityPublishError;
 pub(crate) use entity_publish::PendingEntityPublishRequest;
 pub use entity_publish::{EntityPublishPermit, HubEntityPublishBridge};
@@ -286,9 +289,12 @@ impl HubCoordinationBridge {
     ) -> Result<HubCoordinationResponse, String> {
         self.request_typed(operation).map_err(|error| match error {
             CoordinationRequestError::Local(error) => error.as_str().to_owned(),
-            CoordinationRequestError::Response(CoordinationFailure::NonAcknowledge(message)) => message,
-            CoordinationRequestError::Response(CoordinationFailure::Acknowledge(_)) =>
-                CoordinationRefusal::Unexpected.message().to_owned(),
+            CoordinationRequestError::Response(CoordinationFailure::NonAcknowledge(message)) => {
+                message
+            }
+            CoordinationRequestError::Response(CoordinationFailure::Acknowledge(_)) => {
+                CoordinationRefusal::Unexpected.message().to_owned()
+            }
         })
     }
 
@@ -306,13 +312,13 @@ impl HubCoordinationBridge {
         let _caller = CoordinationCallerGuard(caller.clone());
         let (response, receiver) = mpsc::channel();
         self.enqueue(PendingCoordinationRequest {
-                #[cfg(test)]
-                terminal_drop_probe: None,
-                operation,
-                response: CoordinationReplySender::NonAcknowledge(response),
-                caller,
-                storage: None,
-            })?;
+            #[cfg(test)]
+            terminal_drop_probe: None,
+            operation,
+            response: CoordinationReplySender::NonAcknowledge(response),
+            caller,
+            storage: None,
+        })?;
         receiver
             .recv_timeout(Duration::from_millis(COORDINATION_REQUEST_TIMEOUT_MS))
             .map_err(|_| CoordinationRequestError::Local(CoordinationLocalError::Timeout))?
@@ -321,10 +327,14 @@ impl HubCoordinationBridge {
 
     fn enqueue(&self, request: PendingCoordinationRequest) -> Result<(), CoordinationRequestError> {
         let _unlock = CoordinationUnlock(&self.progress);
-        let mut pending = self.pending.lock()
+        let mut pending = self
+            .pending
+            .lock()
             .map_err(|_| CoordinationRequestError::Local(CoordinationLocalError::QueuePoisoned))?;
         if self.progress.sealed.load(Ordering::Acquire) {
-            return Err(CoordinationRequestError::Local(CoordinationLocalError::IngressSealed));
+            return Err(CoordinationRequestError::Local(
+                CoordinationLocalError::IngressSealed,
+            ));
         }
         pending.push_back(request);
         Ok(())
@@ -470,10 +480,7 @@ pub(crate) enum PendingCoordinationOperation {
 }
 
 impl PendingCoordinationOperation {
-    pub(crate) fn execute(
-        self,
-        daemon: &mut botster_core_daemon::CoreDaemon,
-    ) -> CoordinationReply {
+    pub(crate) fn execute(self, daemon: &mut botster_core_daemon::CoreDaemon) -> CoordinationReply {
         match self {
             #[cfg(test)]
             Self::Tracked {
@@ -768,7 +775,9 @@ impl LuaState {
         let count = memory.limits().per_vm_bytes / std::mem::size_of::<mlua::Error>();
         let bytes = count
             .checked_mul(INSTRUCTION_BUDGET_ERROR.len())
-            .ok_or_else(|| LuaPluginRuntimeError::Load("Lua hook error allowance overflow".into()))?;
+            .ok_or_else(|| {
+                LuaPluginRuntimeError::Load("Lua hook error allowance overflow".into())
+            })?;
         self.charges.hook_errors = Some(
             memory
                 .reserve_shared_callback_storage(bytes)
@@ -1983,8 +1992,8 @@ fn session_types_table(
     let spawn_plugin_key = plugin_key.clone();
     let spawn_records = package_records.clone();
     let spawn_memory = memory.clone();
-    let spawn_conversion = lua
-        .create_string("session_types.spawn could not allocate its Lua result")?;
+    let spawn_conversion =
+        lua.create_string("session_types.spawn could not allocate its Lua result")?;
     table.set(
         "spawn",
         callback::create(lua, move |lua, args: Value| {

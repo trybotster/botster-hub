@@ -26,10 +26,39 @@ pub(crate) const fn lease_bytes() -> usize {
 }
 
 #[allow(dead_code)]
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64"), repr(align(128)))]
-#[cfg_attr(any(target_arch = "arm", target_arch = "mips", target_arch = "mips32r6", target_arch = "mips64", target_arch = "mips64r6"), repr(align(32)))]
+#[cfg_attr(
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64"
+    ),
+    repr(align(128))
+)]
+#[cfg_attr(
+    any(
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6"
+    ),
+    repr(align(32))
+)]
 #[cfg_attr(target_arch = "s390x", repr(align(256)))]
-#[cfg_attr(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64", target_arch = "arm", target_arch = "mips", target_arch = "mips32r6", target_arch = "mips64", target_arch = "mips64r6", target_arch = "s390x")), repr(align(64)))]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64",
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "s390x"
+    )),
+    repr(align(64))
+)]
 struct CachePadded<T> {
     value: T,
 }
@@ -83,16 +112,28 @@ struct Counter<C> {
 pub(crate) const fn lazy_mutex_bytes() -> usize {
     #[cfg(all(
         target_family = "unix",
-        not(any(target_os = "linux", target_os = "android", target_os = "freebsd",
-            target_os = "openbsd", target_os = "dragonfly", target_os = "fuchsia"))
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "fuchsia"
+        ))
     ))]
     {
         std::mem::size_of::<libc::pthread_mutex_t>()
     }
     #[cfg(not(all(
         target_family = "unix",
-        not(any(target_os = "linux", target_os = "android", target_os = "freebsd",
-            target_os = "openbsd", target_os = "dragonfly", target_os = "fuchsia"))
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "fuchsia"
+        ))
     )))]
     {
         0
@@ -108,7 +149,8 @@ pub(crate) fn single_reply_bytes<T>(receiver_waits: bool) -> Option<usize> {
     } else {
         0
     };
-    Layout::new::<Counter<ArrayChannel<T>>>().size()
+    Layout::new::<Counter<ArrayChannel<T>>>()
+        .size()
         .checked_add(Layout::new::<ArraySlot<T>>().size())?
         .checked_add(mutexes.checked_mul(lazy_mutex_bytes())?)?
         .checked_add(selectors)?

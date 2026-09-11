@@ -6,7 +6,9 @@ use std::sync::Arc;
 use mlua::{Lua, LuaSerdeExt, Value};
 
 use crate::lua_memory::{LuaCallbackAdmissionError, LuaMemoryAccount};
-use crate::runtime::{PluginManagedSessionSpawned, PluginSessionTypeSpawned, SharedSessionTypeSpawner};
+use crate::runtime::{
+    PluginManagedSessionSpawned, PluginSessionTypeSpawned, SharedSessionTypeSpawner,
+};
 
 pub(super) fn convert_session_type_spawned(
     lua: &Lua,
@@ -69,10 +71,9 @@ fn convert_json<T: serde::Serialize>(
     serde_json::to_writer(&mut sink, value).map_err(|error| {
         mlua::Error::RuntimeError(format!("session spawn result encoding failed: {error}"))
     })?;
-    let conversion = sink
-        .0
-        .checked_add(17)
-        .ok_or_else(|| mlua::Error::RuntimeError("session spawn conversion size overflow".into()))?;
+    let conversion = sink.0.checked_add(17).ok_or_else(|| {
+        mlua::Error::RuntimeError("session spawn conversion size overflow".into())
+    })?;
     let charge = match memory {
         Some(account) => match account.reserve_callback_total(conversion) {
             Ok(charge) => Some(charge),
@@ -129,14 +130,8 @@ mod tests {
         .expect("tiny callback account");
         let spawner = std::sync::Arc::new(HubSessionTypeSpawner::new());
         let failure = lua.create_string("conversion failed").unwrap();
-        let value = convert_managed_spawned(
-            &lua,
-            Some(&account),
-            &spawner,
-            &spawned(),
-            &failure,
-        )
-        .unwrap();
+        let value =
+            convert_managed_spawned(&lua, Some(&account), &spawner, &spawned(), &failure).unwrap();
         assert!(matches!(value, Value::String(_)));
         assert_eq!(
             spawner.test_take_abandoned(),
@@ -156,14 +151,8 @@ mod tests {
         .expect("callback account");
         let spawner = std::sync::Arc::new(HubSessionTypeSpawner::new());
         let failure = lua.create_string("conversion failed").unwrap();
-        let value = convert_managed_spawned(
-            &lua,
-            Some(&account),
-            &spawner,
-            &spawned(),
-            &failure,
-        )
-        .unwrap();
+        let value =
+            convert_managed_spawned(&lua, Some(&account), &spawner, &spawned(), &failure).unwrap();
         assert!(!matches!(value, Value::String(ref s) if s == &failure));
         assert!(spawner.test_take_abandoned().is_empty());
     }

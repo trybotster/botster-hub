@@ -512,7 +512,9 @@ fn callback_reply(wait: bool, mark: Mark) {
     let reply_bytes = crate::lua_memory::layout::single_reply_bytes::<Reply>(true)
         .expect("callback reply layout");
     let payload_bytes = 2;
-    let total = reply_bytes.checked_add(payload_bytes).expect("reply plus payload");
+    let total = reply_bytes
+        .checked_add(payload_bytes)
+        .expect("reply plus payload");
     let account = LuaMemoryAccount::new(LuaMemoryLimits {
         per_vm_bytes: 1,
         total_vm_bytes: 1,
