@@ -156,10 +156,13 @@ impl ControlContinuation {
         } else {
             parts
         };
-        *self = Self::Terminal(Box::new(TerminalContinuation {
-            original,
-            job: crate::host_disposal::Job::new(parts),
-        }), storage);
+        *self = Self::Terminal(
+            Box::new(TerminalContinuation {
+                original,
+                job: crate::host_disposal::Job::new(parts),
+            }),
+            storage,
+        );
     }
 
     pub(crate) fn poll_terminal(&mut self, runtime: &crate::HubRuntime) -> bool {

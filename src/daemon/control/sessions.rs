@@ -9,11 +9,11 @@ use botster_core::{
     ClientId, SessionId, SessionReservation, SessionReservationRelease, SubscriptionId,
     TerminalSubscriptionGeneration,
 };
+use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_core_daemon::{
     CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError, DetachTerminalSubscriptionResult,
     PendingOperationId, SpawnSessionRequest,
 };
-use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonDiagnostic, DaemonModeFlags, DaemonOperatorError,
     DaemonReadScreen, DaemonRequest, DaemonResponse, DaemonResponseKind, DaemonSession,
@@ -279,117 +279,123 @@ fn handle_daemon_spawn(
     let mut reservation: Option<SessionReservation> = None;
     let mut spawn_error: Option<CoreDaemonError> = None;
     let mut reserve_operation_id: Option<PendingOperationId> = None;
-    ControlStep::pending(move |daemon, state| loop {
-        if let Some(pending_id) = tracker.pending_id() {
-            if matches!(stage, Stage::Reserve) {
-                reserve_operation_id = Some(pending_id);
-            }
-        }
-        match stage {
-            Stage::RetryRetained => {
-                if retry_tokens.is_empty() {
-                    merge_retry_keep(daemon, state, &mut retry_keep);
-                    let Some(runtime) = daemon.runtime() else {
-                        return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
-                    };
-                    tracker = runtime.begin_reserve_session_for_owner(
-                        waiter_id,
-                        SessionId(session_id.clone()),
-                    );
-                    stage = Stage::Reserve;
-                    continue;
+    ControlStep::pending(move |daemon, state| {
+        loop {
+            if let Some(pending_id) = tracker.pending_id() {
+                if matches!(stage, Stage::Reserve) {
+                    reserve_operation_id = Some(pending_id);
                 }
-                match poll_spawn_ticket(&mut tracker, daemon) {
-                    CoreTicketPoll::Pending => return ControlPoll::Pending,
-                    CoreTicketPoll::Refused
-                    | CoreTicketPoll::Lost
-                    | CoreTicketPoll::Ready(Err(_)) => {
-                        retry_keep.push(retry_tokens.remove(0));
-                        if retry_tokens.is_empty() {
-                            continue;
-                        }
-                        match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
-                            Some(next) => {
-                                tracker = next;
+            }
+            match stage {
+                Stage::RetryRetained => {
+                    if retry_tokens.is_empty() {
+                        merge_retry_keep(daemon, state, &mut retry_keep);
+                        let Some(runtime) = daemon.runtime() else {
+                            return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
+                        };
+                        tracker = runtime.begin_reserve_session_for_owner(
+                            waiter_id,
+                            SessionId(session_id.clone()),
+                        );
+                        stage = Stage::Reserve;
+                        continue;
+                    }
+                    match poll_spawn_ticket(&mut tracker, daemon) {
+                        CoreTicketPoll::Pending => return ControlPoll::Pending,
+                        CoreTicketPoll::Refused
+                        | CoreTicketPoll::Lost
+                        | CoreTicketPoll::Ready(Err(_)) => {
+                            retry_keep.push(retry_tokens.remove(0));
+                            if retry_tokens.is_empty() {
                                 continue;
                             }
-                            None => {
-                                retry_keep.append(&mut retry_tokens);
-                                merge_retry_keep(daemon, state, &mut retry_keep);
-                                return ControlPoll::Ready(Err(
-                                    DaemonTransportError::DaemonNotRunning,
-                                ));
+                            match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
+                                Some(next) => {
+                                    tracker = next;
+                                    continue;
+                                }
+                                None => {
+                                    retry_keep.append(&mut retry_tokens);
+                                    merge_retry_keep(daemon, state, &mut retry_keep);
+                                    return ControlPoll::Ready(Err(
+                                        DaemonTransportError::DaemonNotRunning,
+                                    ));
+                                }
                             }
                         }
-                    }
-                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
-                        result: Ok(SessionReservationRelease::Released),
-                        ..
-                    })) => {
-                        retry_tokens.remove(0);
-                        if retry_tokens.is_empty() {
-                            continue;
-                        }
-                        match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
-                            Some(next) => tracker = next,
-                            None => {
-                                retry_keep.append(&mut retry_tokens);
-                                merge_retry_keep(daemon, state, &mut retry_keep);
-                                return ControlPoll::Ready(Err(
-                                    DaemonTransportError::DaemonNotRunning,
-                                ));
+                        CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                            result: Ok(SessionReservationRelease::Released),
+                            ..
+                        })) => {
+                            retry_tokens.remove(0);
+                            if retry_tokens.is_empty() {
+                                continue;
+                            }
+                            match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
+                                Some(next) => tracker = next,
+                                None => {
+                                    retry_keep.append(&mut retry_tokens);
+                                    merge_retry_keep(daemon, state, &mut retry_keep);
+                                    return ControlPoll::Ready(Err(
+                                        DaemonTransportError::DaemonNotRunning,
+                                    ));
+                                }
                             }
                         }
-                    }
-                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation { .. })) => {
-                        retry_keep.push(retry_tokens.remove(0));
-                        if retry_tokens.is_empty() {
-                            continue;
-                        }
-                        match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
-                            Some(next) => tracker = next,
-                            None => {
-                                retry_keep.append(&mut retry_tokens);
-                                merge_retry_keep(daemon, state, &mut retry_keep);
-                                return ControlPoll::Ready(Err(
-                                    DaemonTransportError::DaemonNotRunning,
-                                ));
+                        CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                            ..
+                        })) => {
+                            retry_keep.push(retry_tokens.remove(0));
+                            if retry_tokens.is_empty() {
+                                continue;
+                            }
+                            match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
+                                Some(next) => tracker = next,
+                                None => {
+                                    retry_keep.append(&mut retry_tokens);
+                                    merge_retry_keep(daemon, state, &mut retry_keep);
+                                    return ControlPoll::Ready(Err(
+                                        DaemonTransportError::DaemonNotRunning,
+                                    ));
+                                }
                             }
                         }
+                        CoreTicketPoll::Ready(Ok(_)) => {
+                            return ControlPoll::Ready(Err(
+                                DaemonTransportError::UnexpectedResponse,
+                            ));
+                        }
                     }
-                    CoreTicketPoll::Ready(Ok(_)) => {
-                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                }
+                Stage::Reserve => match poll_spawn_ticket(&mut tracker, daemon) {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return ControlPoll::Ready(Ok(overloaded_core("reserve_session", &id.0)));
                     }
-                }
-            }
-            Stage::Reserve => match poll_spawn_ticket(&mut tracker, daemon) {
-                CoreTicketPoll::Pending => return ControlPoll::Pending,
-                CoreTicketPoll::Refused => {
-                    return ControlPoll::Ready(Ok(overloaded_core("reserve_session", &id.0)));
-                }
-                CoreTicketPoll::Lost => {
-                    let Some(reserve_id) = reserve_operation_id else {
-                        return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
-                    };
-                    let Some(runtime) = daemon.runtime() else {
-                        return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
-                    };
-                    tracker = runtime.begin_lookup_session_reservation_for_owner(
-                        waiter_id,
-                        SessionId(session_id.clone()),
-                        reserve_id,
-                    );
-                    stage = Stage::Lookup;
-                }
-                CoreTicketPoll::Ready(Err(error)) => {
-                    return ControlPoll::Ready(Ok(core_operator_error(
-                        "reserve_session",
-                        &id.0,
-                        &error,
-                    )));
-                }
-                CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession { result, .. })) => {
-                    match result {
+                    CoreTicketPoll::Lost => {
+                        let Some(reserve_id) = reserve_operation_id else {
+                            return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
+                        };
+                        let Some(runtime) = daemon.runtime() else {
+                            return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
+                        };
+                        tracker = runtime.begin_lookup_session_reservation_for_owner(
+                            waiter_id,
+                            SessionId(session_id.clone()),
+                            reserve_id,
+                        );
+                        stage = Stage::Lookup;
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        return ControlPoll::Ready(Ok(core_operator_error(
+                            "reserve_session",
+                            &id.0,
+                            &error,
+                        )));
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                        result, ..
+                    })) => match result {
                         Ok(reserved) => {
                             reservation = Some(reserved.clone());
                             let Some(runtime) = daemon.runtime() else {
@@ -411,38 +417,130 @@ fn handle_daemon_spawn(
                                 &error,
                             )));
                         }
+                    },
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
                     }
-                }
-                CoreTicketPoll::Ready(Ok(_)) => {
-                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
-                }
-            },
-            Stage::Lookup => match poll_spawn_ticket(&mut tracker, daemon) {
-                CoreTicketPoll::Pending => return ControlPoll::Pending,
-                CoreTicketPoll::Refused => {
-                    return ControlPoll::Ready(Ok(overloaded_core(
-                        "lookup_session_reservation",
-                        &id.0,
-                    )));
-                }
-                CoreTicketPoll::Lost => {
-                    return ControlPoll::Ready(Ok(lost_core("lookup_session_reservation", &id.0)));
-                }
-                CoreTicketPoll::Ready(Err(error)) => {
-                    return ControlPoll::Ready(Ok(core_operator_error(
-                        "lookup_session_reservation",
-                        &id.0,
-                        &error,
-                    )));
-                }
-                CoreTicketPoll::Ready(Ok(CoreCompletion::LookupSessionReservation {
-                    result,
-                    ..
-                })) => match result {
-                    Ok(Some(reserved)) => {
-                        reservation = Some(reserved.clone());
-                        spawn_error = Some(CoreDaemonError::Shutdown);
-                        match submit_release(daemon, waiter_id, reserved) {
+                },
+                Stage::Lookup => match poll_spawn_ticket(&mut tracker, daemon) {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return ControlPoll::Ready(Ok(overloaded_core(
+                            "lookup_session_reservation",
+                            &id.0,
+                        )));
+                    }
+                    CoreTicketPoll::Lost => {
+                        return ControlPoll::Ready(Ok(lost_core(
+                            "lookup_session_reservation",
+                            &id.0,
+                        )));
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        return ControlPoll::Ready(Ok(core_operator_error(
+                            "lookup_session_reservation",
+                            &id.0,
+                            &error,
+                        )));
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::LookupSessionReservation {
+                        result,
+                        ..
+                    })) => match result {
+                        Ok(Some(reserved)) => {
+                            reservation = Some(reserved.clone());
+                            spawn_error = Some(CoreDaemonError::Shutdown);
+                            match submit_release(daemon, waiter_id, reserved) {
+                                Some(next) => {
+                                    tracker = next;
+                                    stage = Stage::Release;
+                                }
+                                None => {
+                                    return finish_held_reservation(
+                                        daemon,
+                                        state,
+                                        reservation.take().expect("looked-up reservation"),
+                                        &id.0,
+                                        "lookup_session_reservation",
+                                        CoreDaemonError::Shutdown,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
+                        }
+                        Err(error) => {
+                            return ControlPoll::Ready(Ok(core_operator_error(
+                                "lookup_session_reservation",
+                                &id.0,
+                                &error,
+                            )));
+                        }
+                    },
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                    }
+                },
+                Stage::SpawnReserved => match poll_spawn_ticket(&mut tracker, daemon) {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return finish_held_reservation(
+                            daemon,
+                            state,
+                            reservation.take().expect("reserved identity"),
+                            &id.0,
+                            "spawn_reserved",
+                            core_bridge_error(CoreTicketError::Overloaded),
+                        );
+                    }
+                    CoreTicketPoll::Lost => {
+                        return finish_held_reservation(
+                            daemon,
+                            state,
+                            reservation.take().expect("reserved identity"),
+                            &id.0,
+                            "spawn_reserved",
+                            CoreDaemonError::Shutdown,
+                        );
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        return finish_held_reservation(
+                            daemon,
+                            state,
+                            reservation.take().expect("reserved identity"),
+                            &id.0,
+                            "spawn_reserved",
+                            error,
+                        );
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Installed { session },
+                        ..
+                    })) => {
+                        let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
+                        state
+                            .drain_cursors
+                            .insert(session.session_id.0.clone(), now);
+                        return ControlPoll::Ready(Ok(daemon_spawned(
+                            DaemonSession {
+                                session_id: session.session_id.0,
+                                lifecycle: lifecycle_label(&session.lifecycle).to_string(),
+                            },
+                            Vec::new(),
+                        )));
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Refused { error },
+                        ..
+                    }))
+                    | CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::AdmittedFailure { error, .. },
+                        ..
+                    })) => {
+                        spawn_error = Some(error);
+                        let held = reservation.clone().expect("reserved identity");
+                        match submit_release(daemon, waiter_id, held) {
                             Some(next) => {
                                 tracker = next;
                                 stage = Stage::Release;
@@ -451,163 +549,76 @@ fn handle_daemon_spawn(
                                 return finish_held_reservation(
                                     daemon,
                                     state,
-                                    reservation.take().expect("looked-up reservation"),
+                                    reservation.take().expect("reserved identity"),
                                     &id.0,
-                                    "lookup_session_reservation",
-                                    CoreDaemonError::Shutdown,
+                                    "spawn_reserved",
+                                    spawn_error.take().unwrap(),
                                 );
                             }
                         }
                     }
-                    Ok(None) => {
-                        return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
-                    }
-                    Err(error) => {
-                        return ControlPoll::Ready(Ok(core_operator_error(
-                            "lookup_session_reservation",
-                            &id.0,
-                            &error,
-                        )));
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
                     }
                 },
-                CoreTicketPoll::Ready(Ok(_)) => {
-                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
-                }
-            },
-            Stage::SpawnReserved => match poll_spawn_ticket(&mut tracker, daemon) {
-                CoreTicketPoll::Pending => return ControlPoll::Pending,
-                CoreTicketPoll::Refused => {
-                    return finish_held_reservation(
-                        daemon,
-                        state,
-                        reservation.take().expect("reserved identity"),
-                        &id.0,
-                        "spawn_reserved",
-                        core_bridge_error(CoreTicketError::Overloaded),
-                    );
-                }
-                CoreTicketPoll::Lost => {
-                    return finish_held_reservation(
-                        daemon,
-                        state,
-                        reservation.take().expect("reserved identity"),
-                        &id.0,
-                        "spawn_reserved",
-                        CoreDaemonError::Shutdown,
-                    );
-                }
-                CoreTicketPoll::Ready(Err(error)) => {
-                    return finish_held_reservation(
-                        daemon,
-                        state,
-                        reservation.take().expect("reserved identity"),
-                        &id.0,
-                        "spawn_reserved",
-                        error,
-                    );
-                }
-                CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
-                    result: ReservedSpawnResult::Installed { session },
-                    ..
-                })) => {
-                    let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
-                    state
-                        .drain_cursors
-                        .insert(session.session_id.0.clone(), now);
-                    return ControlPoll::Ready(Ok(daemon_spawned(
-                        DaemonSession {
-                            session_id: session.session_id.0,
-                            lifecycle: lifecycle_label(&session.lifecycle).to_string(),
-                        },
-                        Vec::new(),
-                    )));
-                }
-                CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
-                    result: ReservedSpawnResult::Refused { error },
-                    ..
-                }))
-                | CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
-                    result: ReservedSpawnResult::AdmittedFailure { error, .. },
-                    ..
-                })) => {
-                    spawn_error = Some(error);
-                    let held = reservation.clone().expect("reserved identity");
-                    match submit_release(daemon, waiter_id, held) {
-                        Some(next) => {
-                            tracker = next;
-                            stage = Stage::Release;
-                        }
-                        None => {
-                            return finish_held_reservation(
-                                daemon,
-                                state,
-                                reservation.take().expect("reserved identity"),
-                                &id.0,
-                                "spawn_reserved",
-                                spawn_error.take().unwrap(),
-                            );
-                        }
+                Stage::Release => match poll_spawn_ticket(&mut tracker, daemon) {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Refused
+                    | CoreTicketPoll::Lost
+                    | CoreTicketPoll::Ready(Err(_)) => {
+                        let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
+                        return finish_held_reservation(
+                            daemon,
+                            state,
+                            reservation.take().expect("reserved identity"),
+                            &id.0,
+                            "release_session_reservation",
+                            error,
+                        );
                     }
-                }
-                CoreTicketPoll::Ready(Ok(_)) => {
-                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
-                }
-            },
-            Stage::Release => match poll_spawn_ticket(&mut tracker, daemon) {
-                CoreTicketPoll::Pending => return ControlPoll::Pending,
-                CoreTicketPoll::Refused | CoreTicketPoll::Lost | CoreTicketPoll::Ready(Err(_)) => {
-                    let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
-                    return finish_held_reservation(
-                        daemon,
-                        state,
-                        reservation.take().expect("reserved identity"),
-                        &id.0,
-                        "release_session_reservation",
-                        error,
-                    );
-                }
-                CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
-                    result,
-                    ..
-                })) => {
-                    let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
-                    return ControlPoll::Ready(Ok(match result {
-                        Ok(SessionReservationRelease::Released) => {
-                            core_operator_error("spawn_reserved", &id.0, &error)
-                        }
-                        Ok(release) => {
-                            if let Some(held) = reservation.take() {
-                                retain_explicit_reservation(daemon, state, held);
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                        result,
+                        ..
+                    })) => {
+                        let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
+                        return ControlPoll::Ready(Ok(match result {
+                            Ok(SessionReservationRelease::Released) => {
+                                core_operator_error("spawn_reserved", &id.0, &error)
                             }
-                            let mut response = core_operator_error(
-                                "release_session_reservation",
-                                &id.0,
-                                &error,
-                            );
-                            if let Some(operator) = response.error.as_mut() {
-                                operator.code = retained_release_code(release).to_string();
-                                operator.message = format!(
-                                    "spawn failed and Core retained reservation ownership ({release:?}): {error}"
+                            Ok(release) => {
+                                if let Some(held) = reservation.take() {
+                                    retain_explicit_reservation(daemon, state, held);
+                                }
+                                let mut response = core_operator_error(
+                                    "release_session_reservation",
+                                    &id.0,
+                                    &error,
                                 );
+                                if let Some(operator) = response.error.as_mut() {
+                                    operator.code = retained_release_code(release).to_string();
+                                    operator.message = format!(
+                                        "spawn failed and Core retained reservation ownership ({release:?}): {error}"
+                                    );
+                                }
+                                response
                             }
-                            response
-                        }
-                        Err(release_error) => {
-                            if let Some(held) = reservation.take() {
-                                retain_explicit_reservation(daemon, state, held);
+                            Err(release_error) => {
+                                if let Some(held) = reservation.take() {
+                                    retain_explicit_reservation(daemon, state, held);
+                                }
+                                core_operator_error(
+                                    "release_session_reservation",
+                                    &id.0,
+                                    &release_error,
+                                )
                             }
-                            core_operator_error(
-                                "release_session_reservation",
-                                &id.0,
-                                &release_error,
-                            )
-                        }
-                    }));
-                }
-                CoreTicketPoll::Ready(Ok(_)) => {
-                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
-                }
-            },
+                        }));
+                    }
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                    }
+                },
+            }
         }
     })
 }
@@ -1778,10 +1789,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::path::PathBuf::from("/private/tmp").join(format!(
-            "s1-spawn-{name}-{}-{stamp}",
-            std::process::id()
-        ));
+        let root = std::path::PathBuf::from("/private/tmp")
+            .join(format!("s1-spawn-{name}-{}-{stamp}", std::process::id()));
         let mut core_engine = crate::config::CoreEngineOptions::default();
         core_engine.session_worker_path = worker;
         let mut session_defaults = crate::config::SessionDefaults::default();
@@ -1818,8 +1827,7 @@ mod tests {
             runtime.reap_detached_core_operations();
             let identities = runtime.take_owner_core_completions(8);
             if !identities.is_empty() {
-                let mut budget =
-                    crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
                 crate::daemon::control::pending::absorb_core_completions(
                     state,
                     &identities,
@@ -1852,10 +1860,7 @@ mod tests {
     #[test]
     fn reserve_queue_full_retries_without_retaining_a_token() {
         let (mut daemon, mut state, root) = spawn_fixture("reserve-full");
-        daemon
-            .runtime()
-            .unwrap()
-            .test_refuse_next_owner_begins(1);
+        daemon.runtime().unwrap().test_refuse_next_owner_begins(1);
         let ControlStep::Pending(mut pending) = handle_runtime(
             &mut daemon,
             &mut state,
@@ -1867,8 +1872,7 @@ mod tests {
         ) else {
             panic!("spawn must defer");
         };
-        let ControlPoll::Ready(Ok(response)) =
-            pending.continuation.poll(&mut daemon, &mut state)
+        let ControlPoll::Ready(Ok(response)) = pending.continuation.poll(&mut daemon, &mut state)
         else {
             panic!("queue-full reserve must return immediately");
         };
@@ -1884,10 +1888,7 @@ mod tests {
     #[test]
     fn lost_reserve_without_an_id_does_not_retain_a_token() {
         let (mut daemon, mut state, root) = spawn_fixture("reserve-lost");
-        daemon
-            .runtime()
-            .unwrap()
-            .test_lose_next_owner_begins(1);
+        daemon.runtime().unwrap().test_lose_next_owner_begins(1);
         let ControlStep::Pending(mut pending) = handle_runtime(
             &mut daemon,
             &mut state,
@@ -1932,10 +1933,7 @@ mod tests {
             assert!(Instant::now() < deadline, "spawn lifecycle stalled");
             drive_ready_test_turn(&mut daemon, &mut state);
             if !armed {
-                daemon
-                    .runtime()
-                    .unwrap()
-                    .test_refuse_next_owner_begins(1);
+                daemon.runtime().unwrap().test_refuse_next_owner_begins(1);
                 armed = true;
             }
             match pending.continuation.poll(&mut daemon, &mut state) {
@@ -1973,15 +1971,15 @@ mod tests {
     fn merge_retained_keeps_token_pushed_during_take() {
         let (mut daemon, mut state, root) = spawn_fixture("merge-keep");
         let waiter = state.current_waiter_id.unwrap();
-        let mut first = daemon.runtime().unwrap().begin_reserve_session_for_owner(
-            waiter,
-            SessionId("s1-merge-a".into()),
-        );
+        let mut first = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-merge-a".into()));
         let a = wait_reservation(&mut daemon, &mut state, &mut first);
-        let mut second = daemon.runtime().unwrap().begin_reserve_session_for_owner(
-            waiter,
-            SessionId("s1-merge-b".into()),
-        );
+        let mut second = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-merge-b".into()));
         let b = wait_reservation(&mut daemon, &mut state, &mut second);
         let runtime = daemon.runtime().unwrap();
         runtime.retain_reservation(a.clone());
@@ -2026,22 +2024,19 @@ mod tests {
     fn retry_retained_full_queue_keeps_both_tokens_and_finishes() {
         let (mut daemon, mut state, root) = spawn_fixture("retry-two");
         let waiter = state.current_waiter_id.unwrap();
-        let mut first = daemon.runtime().unwrap().begin_reserve_session_for_owner(
-            waiter,
-            SessionId("s1-retry-a".into()),
-        );
+        let mut first = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-retry-a".into()));
         let a = wait_reservation(&mut daemon, &mut state, &mut first);
-        let mut second = daemon.runtime().unwrap().begin_reserve_session_for_owner(
-            waiter,
-            SessionId("s1-retry-b".into()),
-        );
+        let mut second = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-retry-b".into()));
         let b = wait_reservation(&mut daemon, &mut state, &mut second);
         daemon.runtime().unwrap().retain_reservation(a);
         daemon.runtime().unwrap().retain_reservation(b);
-        daemon
-            .runtime()
-            .unwrap()
-            .test_refuse_next_owner_begins(8);
+        daemon.runtime().unwrap().test_refuse_next_owner_begins(8);
         let ControlStep::Pending(mut pending) = handle_runtime(
             &mut daemon,
             &mut state,
@@ -2081,16 +2076,13 @@ mod tests {
         let (mut daemon, mut state, root) = spawn_fixture("concurrent");
         let waiter_a = state.current_waiter_id.unwrap();
         let waiter_b = state.waiter_ids.next().expect("second waiter");
-        let mut reserve = daemon.runtime().unwrap().begin_reserve_session_for_owner(
-            waiter_a,
-            SessionId("s1-concurrent-held".into()),
-        );
-        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
-        daemon.runtime().unwrap().retain_reservation(held);
-        daemon
+        let mut reserve = daemon
             .runtime()
             .unwrap()
-            .test_refuse_next_owner_begins(16);
+            .begin_reserve_session_for_owner(waiter_a, SessionId("s1-concurrent-held".into()));
+        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        daemon.runtime().unwrap().retain_reservation(held);
+        daemon.runtime().unwrap().test_refuse_next_owner_begins(16);
         state.current_waiter_id = Some(waiter_a);
         let ControlStep::Pending(mut pending_a) = handle_runtime(
             &mut daemon,
@@ -2152,10 +2144,10 @@ mod tests {
     fn accepting_queue_releases_a_retained_token_once() {
         let (mut daemon, mut state, root) = spawn_fixture("accept-release");
         let waiter = state.current_waiter_id.unwrap();
-        let mut reserve = daemon.runtime().unwrap().begin_reserve_session_for_owner(
-            waiter,
-            SessionId("s1-accept-held".into()),
-        );
+        let mut reserve = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-accept-held".into()));
         let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
         daemon.runtime().unwrap().retain_reservation(held);
         let ControlStep::Pending(mut pending) = handle_runtime(
@@ -2178,11 +2170,14 @@ mod tests {
             polls += 1;
             assert!(polls < 64, "accepting-queue spun");
             pump_core(&mut daemon, &mut state);
-            if !armed && daemon.runtime().unwrap().test_release_session_reservation_begins() >= 1 {
-                daemon
+            if !armed
+                && daemon
                     .runtime()
                     .unwrap()
-                    .test_refuse_next_owner_begins(8);
+                    .test_release_session_reservation_begins()
+                    >= 1
+            {
+                daemon.runtime().unwrap().test_refuse_next_owner_begins(8);
                 armed = true;
             }
             match pending.continuation.poll(&mut daemon, &mut state) {
@@ -2333,12 +2328,7 @@ sys.exit(0)
         let worker = std::path::PathBuf::from("/no/such/botster-session-worker");
         let (mut daemon, mut state, root) =
             spawn_fixture_with_worker("missing-worker", Some(worker));
-        let response = spawn_until_ready(
-            &mut daemon,
-            &mut state,
-            "s1-missing-worker",
-            "true",
-        );
+        let response = spawn_until_ready(&mut daemon, &mut state, "s1-missing-worker", "true");
         assert_eq!(spawn_error_code(&response), Some("core_error"));
         assert_eq!(
             daemon
@@ -2368,12 +2358,7 @@ sys.exit(0)
         );
         let (mut daemon, mut state, fixture_root) =
             spawn_fixture_with_worker("exit-before", Some(worker));
-        let response = spawn_until_ready(
-            &mut daemon,
-            &mut state,
-            "s1-exit-before",
-            "true",
-        );
+        let response = spawn_until_ready(&mut daemon, &mut state, "s1-exit-before", "true");
         assert_eq!(spawn_error_code(&response), Some("core_error"));
         assert_eq!(
             daemon
@@ -2452,12 +2437,7 @@ sys.exit(0)
         );
         let (mut daemon, mut state, fixture_root) =
             spawn_fixture_with_worker("frame-exit", Some(worker));
-        let first = spawn_until_ready(
-            &mut daemon,
-            &mut state,
-            "s1-frame-exit",
-            "true",
-        );
+        let first = spawn_until_ready(&mut daemon, &mut state, "s1-frame-exit", "true");
         assert_eq!(
             spawn_error_code(&first),
             Some("cleanup_unconfirmed"),
@@ -2472,12 +2452,7 @@ sys.exit(0)
                 .test_release_session_reservation_begins(),
             1
         );
-        let second = spawn_until_ready(
-            &mut daemon,
-            &mut state,
-            "s1-frame-exit-retry",
-            "true",
-        );
+        let second = spawn_until_ready(&mut daemon, &mut state, "s1-frame-exit-retry", "true");
         assert_eq!(spawn_error_code(&second), Some("cleanup_unconfirmed"));
         assert!(
             state
@@ -2499,12 +2474,7 @@ sys.exit(0)
             Some(worker),
             Some("/no/such/botster-session-executable".into()),
         );
-        let response = spawn_until_ready(
-            &mut daemon,
-            &mut state,
-            "s1-matched-missing",
-            "true",
-        );
+        let response = spawn_until_ready(&mut daemon, &mut state, "s1-matched-missing", "true");
         assert_eq!(spawn_error_code(&response), Some("core_error"));
         let message = response
             .error
@@ -2532,12 +2502,7 @@ sys.exit(0)
         let worker = matched_worker_path();
         let (mut daemon, mut state, root) =
             spawn_fixture_with_worker("matched-install", Some(worker));
-        let response = spawn_until_ready(
-            &mut daemon,
-            &mut state,
-            "s1-matched-install",
-            "true",
-        );
+        let response = spawn_until_ready(&mut daemon, &mut state, "s1-matched-install", "true");
         assert!(response.error.is_none(), "{response:?}");
         assert_eq!(response.kind, DaemonResponseKind::Spawned);
         assert_eq!(
@@ -2555,22 +2520,11 @@ sys.exit(0)
     #[test]
     fn occupied_reserve_fails_without_clearing_the_installed_session() {
         let worker = matched_worker_path();
-        let (mut daemon, mut state, root) =
-            spawn_fixture_with_worker("occupied", Some(worker));
-        let first = spawn_until_ready(
-            &mut daemon,
-            &mut state,
-            "s1-occupied",
-            "true",
-        );
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("occupied", Some(worker));
+        let first = spawn_until_ready(&mut daemon, &mut state, "s1-occupied", "true");
         assert!(first.error.is_none(), "{first:?}");
         assert_eq!(first.kind, DaemonResponseKind::Spawned);
-        let second = spawn_until_ready(
-            &mut daemon,
-            &mut state,
-            "s1-occupied",
-            "true",
-        );
+        let second = spawn_until_ready(&mut daemon, &mut state, "s1-occupied", "true");
         assert!(second.error.is_some(), "{second:?}");
         let message = second
             .error
@@ -2592,8 +2546,11 @@ sys.exit(0)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(root.join("bin/agent"), std::fs::Permissions::from_mode(0o700))
-                .unwrap();
+            std::fs::set_permissions(
+                root.join("bin/agent"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
         }
         serde_json::from_value(serde_json::json!({
             "manifest": {
@@ -2627,14 +2584,8 @@ sys.exit(0)
     #[test]
     fn plugin_occupied_spawn_leaves_live_session_context() {
         let worker = matched_worker_path();
-        let (mut daemon, mut state, root) =
-            spawn_fixture_with_worker("plugin-occ", Some(worker));
-        let installed = spawn_until_ready(
-            &mut daemon,
-            &mut state,
-            "s1-plugin-live",
-            "true",
-        );
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("plugin-occ", Some(worker));
+        let installed = spawn_until_ready(&mut daemon, &mut state, "s1-plugin-live", "true");
         assert!(installed.error.is_none(), "{installed:?}");
         let live = crate::session_types::HubSessionContext {
             context_id: "ctx-original".into(),
@@ -2692,8 +2643,7 @@ sys.exit(0)
             std::process::id()
         ));
         let worker = write_frame_exit_worker(&worker_root);
-        let (mut daemon, _state, root) =
-            spawn_fixture_with_worker("plugin-retry", Some(worker));
+        let (mut daemon, _state, root) = spawn_fixture_with_worker("plugin-retry", Some(worker));
         let package_root = root.join("p1-plugin");
         let record = plugin_spawn_package(&package_root);
         let first = daemon.runtime().unwrap().test_plugin_spawn(
@@ -2718,7 +2668,11 @@ sys.exit(0)
             1
         );
         let held = daemon.runtime().unwrap().retained_reservations();
-        assert_eq!(held.len(), 1, "plugin spawn must retain the unconfirmed token");
+        assert_eq!(
+            held.len(),
+            1,
+            "plugin spawn must retain the unconfirmed token"
+        );
         let token = held[0].clone();
         let second = daemon.runtime().unwrap().test_plugin_spawn(
             "p1.plugin",
@@ -2824,12 +2778,10 @@ sys.exit(0)
             .unwrap()
             .spawn_prepared_managed_session(&pending, &prepared, waiter)
             .expect("start managed spawn");
-        let mut operation = crate::daemon::control::managed_git::ManagedSpawnOperation::test_spawn_phase(
-            waiter,
-            pending,
-            prepared,
-            start,
-        );
+        let mut operation =
+            crate::daemon::control::managed_git::ManagedSpawnOperation::test_spawn_phase(
+                waiter, pending, prepared, start,
+            );
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             assert!(Instant::now() < deadline, "managed spawn hang");
@@ -2977,8 +2929,7 @@ sys.exit(0)
     #[test]
     fn ensure_worktree_and_spawn_creates_a_worktree() {
         let worker = matched_worker_path();
-        let (mut daemon, mut state, root) =
-            spawn_fixture_with_worker("s2-create", Some(worker));
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("s2-create", Some(worker));
         let repo = root.join("repo");
         init_git_repo(&repo);
         let package_root = root.join("p1-plugin");
@@ -3043,8 +2994,7 @@ sys.exit(0)
     #[test]
     fn ensure_worktree_and_spawn_reuses_an_existing_worktree() {
         let worker = matched_worker_path();
-        let (mut daemon, mut state, root) =
-            spawn_fixture_with_worker("s2-reuse", Some(worker));
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("s2-reuse", Some(worker));
         let repo = root.join("repo");
         init_git_repo(&repo);
         let package_root = root.join("p1-plugin");
@@ -3184,8 +3134,7 @@ sys.exit(0)
             std::process::id()
         ));
         let worker = write_frame_exit_worker(&worker_root);
-        let (mut daemon, mut state, root, record) =
-            s2_prepare("s2-unconfirmed", Some(worker));
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-unconfirmed", Some(worker));
         let spawner = daemon.runtime().unwrap().session_type_spawner();
         let handle = std::thread::spawn(move || {
             spawner.ensure_worktree_and_spawn(
@@ -3204,11 +3153,7 @@ sys.exit(0)
         let found = walkdir_exists(&managed);
         assert!(found, "created worktree must remain under {managed:?}");
         assert!(
-            !daemon
-                .runtime()
-                .unwrap()
-                .retained_reservations()
-                .is_empty(),
+            !daemon.runtime().unwrap().retained_reservations().is_empty(),
             "RetainedUnconfirmed must keep the reservation marker"
         );
         assert_eq!(
@@ -3248,14 +3193,18 @@ sys.exit(0)
     fn ensure_worktree_and_spawn_late_caller_does_not_rollback() {
         let worker = matched_worker_path();
         let (mut daemon, mut state, root, record) = s2_prepare("s2-late", Some(worker));
-        daemon.runtime().unwrap().session_type_spawner().test_enqueue_managed_disconnected(
-            botster_core::PluginKey("p1.plugin".into()),
-            "t1".into(),
-            "topic".into(),
-            "agent".into(),
-            crate::session_types::ManagedSessionTypeRequest::default(),
-            vec![record],
-        );
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_enqueue_managed_disconnected(
+                botster_core::PluginKey("p1.plugin".into()),
+                "t1".into(),
+                "topic".into(),
+                "agent".into(),
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            );
         let deadline = Instant::now() + Duration::from_secs(20);
         let managed = root.join("managed-worktrees");
         loop {
@@ -3563,8 +3512,7 @@ sys.exit(0)
             .unwrap()
             .as_nanos();
         let worker = matched_worker_path();
-        let (mut daemon, mut state, root) =
-            spawn_fixture_with_worker("s2-u1-live", Some(worker));
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("s2-u1-live", Some(worker));
         let waiter = state.current_waiter_id.unwrap();
         let session_id = SessionId(format!("s2-u1-live-{stamp}"));
         let mut reserve = daemon
@@ -3603,15 +3551,8 @@ sys.exit(0)
         daemon
             .runtime()
             .unwrap()
-            .test_queue_removed_created_worktree_cleanup(
-                session_id.clone(),
-                prepared,
-                reservation,
-            );
-        daemon
-            .runtime()
-            .unwrap()
-            .retry_created_worktree_releases();
+            .test_queue_removed_created_worktree_cleanup(session_id.clone(), prepared, reservation);
+        daemon.runtime().unwrap().retry_created_worktree_releases();
         let first = Instant::now() + Duration::from_secs(5);
         loop {
             pump_core(&mut daemon, &mut state);
@@ -3650,10 +3591,7 @@ sys.exit(0)
             0,
             "live session must not Host-rollback after RetainedSession"
         );
-        daemon
-            .runtime()
-            .unwrap()
-            .retry_created_worktree_releases();
+        daemon.runtime().unwrap().retry_created_worktree_releases();
         let second = Instant::now() + Duration::from_secs(5);
         loop {
             pump_core(&mut daemon, &mut state);
@@ -3665,7 +3603,10 @@ sys.exit(0)
             {
                 break;
             }
-            assert!(Instant::now() < second, "explicit event must issue a second release");
+            assert!(
+                Instant::now() < second,
+                "explicit event must issue a second release"
+            );
             std::thread::yield_now();
         }
         assert_eq!(
@@ -3691,9 +3632,7 @@ sys.exit(0)
             pump_core(&mut daemon, &mut state);
             match shutdown.poll(daemon.runtime().unwrap()) {
                 CoreTicketPoll::Pending => {}
-                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
-                    break
-                }
+                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => break,
             }
             assert!(Instant::now() < stop, "shutdown hang");
             std::thread::yield_now();
@@ -3703,17 +3642,12 @@ sys.exit(0)
             pump_core(&mut daemon, &mut state);
             match remove.poll(daemon.runtime().unwrap()) {
                 CoreTicketPoll::Pending => {}
-                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
-                    break
-                }
+                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => break,
             }
             assert!(Instant::now() < stop, "remove hang");
             std::thread::yield_now();
         }
-        daemon
-            .runtime()
-            .unwrap()
-            .retry_created_worktree_releases();
+        daemon.runtime().unwrap().retry_created_worktree_releases();
         let released = Instant::now() + Duration::from_secs(10);
         loop {
             pump_core(&mut daemon, &mut state);
@@ -3760,18 +3694,12 @@ sys.exit(0)
             .unwrap()
             .defer_confirmed_worktree_rollback(prepared);
         assert!(
-            !daemon
-                .runtime()
-                .unwrap()
-                .take_managed_spawn_notification(),
+            !daemon.runtime().unwrap().take_managed_spawn_notification(),
             "capacity defer must not self-wake"
         );
         accept_one(&mut daemon, &mut state);
         assert!(state.managed_spawn_waiting_for_owner);
-        assert_eq!(
-            daemon.runtime().unwrap().test_managed_accept_ones(),
-            1
-        );
+        assert_eq!(daemon.runtime().unwrap().test_managed_accept_ones(), 1);
         assert_eq!(
             daemon
                 .runtime()
@@ -3863,8 +3791,9 @@ sys.exit(0)
             std::thread::yield_now();
         }
         gate.release();
-        let second = pump_until_join(&mut daemon, &mut state, handle)
-            .unwrap_or_else(|error| panic!("reuse after rollback: {}: {}", error.kind, error.message));
+        let second = pump_until_join(&mut daemon, &mut state, handle).unwrap_or_else(|error| {
+            panic!("reuse after rollback: {}: {}", error.kind, error.message)
+        });
         assert!(
             second.created_worktree,
             "reuse after an in-flight rollback must create, not reuse a path being deleted"

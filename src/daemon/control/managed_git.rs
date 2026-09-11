@@ -215,10 +215,8 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         }
         return;
     };
-    runtime.cancel_created_worktree_cleanup(&managed_worktree_id(
-        &pending.target_id,
-        &pending.branch,
-    ));
+    runtime
+        .cancel_created_worktree_cleanup(&managed_worktree_id(&pending.target_id, &pending.branch));
     runtime.wake_remaining_confirmed_worktree_rollbacks();
     if let Some(detail) = state
         .host_recovery
@@ -644,7 +642,10 @@ impl ManagedSpawnOperation {
             crate::runtime::PluginSpawnPoll::Pending => return ControlPoll::Pending,
             crate::runtime::PluginSpawnPoll::Ready(result) => result,
         };
-        let disposition = completion.as_ref().err().and_then(|failure| failure.disposition);
+        let disposition = completion
+            .as_ref()
+            .err()
+            .and_then(|failure| failure.disposition);
         let result = runtime.finish_managed_session_spawn(
             self.spawn.as_ref().expect("managed Core spawn exists"),
             self.prepared.as_ref().expect("managed worktree exists"),
@@ -684,15 +685,8 @@ impl ManagedSpawnOperation {
                     .as_ref()
                     .is_some_and(|prepared| prepared.created_worktree);
                 match disposition {
-                    Some(botster_core::SessionReservationRelease::Released) | None
-                        if created =>
-                    {
-                        self.submit_finalize(
-                            daemon,
-                            state,
-                            ManagedWorktreeDecision::Rollback,
-                            None,
-                        )
+                    Some(botster_core::SessionReservationRelease::Released) | None if created => {
+                        self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
                     }
                     _ => self.finish_deferred_error(),
                 }
@@ -964,9 +958,11 @@ impl ManagedSpawnOperation {
                 suppress_rollback: daemon
                     .runtime()
                     .map(|runtime| runtime.created_worktree_rollback_suppressions())
-                    .unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(
-                        std::collections::BTreeSet::new(),
-                    ))),
+                    .unwrap_or_else(|| {
+                        std::sync::Arc::new(
+                            std::sync::Mutex::new(std::collections::BTreeSet::new()),
+                        )
+                    }),
                 #[cfg(test)]
                 rollback_hold: daemon
                     .runtime()

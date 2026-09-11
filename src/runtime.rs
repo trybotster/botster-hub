@@ -12,12 +12,13 @@ use botster_core::{
     PluginAdmissionResult, PluginCapabilityRuntime, PluginCleanupResult, PluginCompletionDrain,
     PluginHandlerKind, PluginInvocationClass, PluginInvocationFailure, PluginInvocationFailureKind,
     PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
-    PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
-    RoutedEnvelopePublishOutcome, ReservedSessionSpawnError, SessionId, SessionLifecycleState,
-    SessionReservation, SessionReservationRefusal, SessionReservationRelease, SessionRuntimeErrorKind,
-    SessionSpawnRequest,
-    SubscriptionId, TerminalCapabilitySet, TerminalColorProfile, TerminalSubscriptionGeneration,
+    PluginWorkerDebugSnapshot, RequestId, ReservedSessionSpawnError, Rgb, RoutedEnvelope,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
+    SessionReservation, SessionReservationRefusal, SessionReservationRelease,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, TerminalCapabilitySet,
+    TerminalColorProfile, TerminalSubscriptionGeneration,
 };
+use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureId, CaptureOwner, CaptureSnapshotRequest,
     CoreCompletion, CoreDaemonConfig, CoreDaemonError, CoreOperation, DaemonSession,
@@ -29,16 +30,15 @@ use botster_core_daemon::{
     SessionLifecycleBaselinePage, SessionLifecycleCursor, SessionLifecyclePage,
     SessionLifecyclePageError, SessionRegistryStateLookup, SnapshotPage, SpawnSessionRequest,
 };
-use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_ui_contract::{UiActionRequest, UiActionResult, UiNode};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1602,7 +1602,9 @@ impl HubRuntime {
         let mut retained = Vec::with_capacity(inflight.len());
         for mut entry in inflight.drain(..) {
             match &mut entry {
-                InflightPluginCore::Coordination { ticket, rejected, .. } => match if rejected.is_some() {
+                InflightPluginCore::Coordination {
+                    ticket, rejected, ..
+                } => match if rejected.is_some() {
                     CoreTicketPoll::Refused
                 } else {
                     ticket.poll()
@@ -1615,42 +1617,44 @@ impl HubRuntime {
                     }
                     CoreTicketPoll::Lost => {
                         if let InflightPluginCore::Coordination { response, .. } = entry {
-                            let _ = response.send(crate::lua_runtime::CoordinationDelivery::Refused(
-                                crate::lua_runtime::CoordinationRefusal::HelperStopped,
-                            ));
+                            let _ =
+                                response.send(crate::lua_runtime::CoordinationDelivery::Refused(
+                                    crate::lua_runtime::CoordinationRefusal::HelperStopped,
+                                ));
                         }
                     }
                     CoreTicketPoll::Refused => {
-                        if let InflightPluginCore::Coordination { response, rejected, .. } = entry {
-                            let refusal = if rejected.as_ref().is_some_and(|rejected|
+                        if let InflightPluginCore::Coordination {
+                            response, rejected, ..
+                        } = entry
+                        {
+                            let refusal = if rejected.as_ref().is_some_and(|rejected| {
                                 rejected.reason == crate::data_plane::driver::CoreRefusal::Stopped
-                            ) {
+                            }) {
                                 crate::lua_runtime::CoordinationRefusal::HelperStopped
                             } else {
                                 crate::lua_runtime::CoordinationRefusal::HelperFull
                             };
                             drop(rejected);
-                            let _ = response.send(crate::lua_runtime::CoordinationDelivery::Refused(refusal));
+                            let _ = response
+                                .send(crate::lua_runtime::CoordinationDelivery::Refused(refusal));
                         }
                     }
                 },
-                InflightPluginCore::SessionTypeSpawn { start, .. } => {
-                    match start.poll(self) {
-                        PluginSpawnPoll::Pending => retained.push(entry),
-                        PluginSpawnPoll::Ready(result) => {
-                            let InflightPluginCore::SessionTypeSpawn { start, response } = entry
-                            else {
-                                continue;
-                            };
-                            let result = self.finish_session_type_spawn(&start, result);
-                            if response.send(result.clone()).is_err()
-                                && let Ok(spawned) = result
-                            {
-                                self.cleanup_undelivered_session_type_spawn(&spawned);
-                            }
+                InflightPluginCore::SessionTypeSpawn { start, .. } => match start.poll(self) {
+                    PluginSpawnPoll::Pending => retained.push(entry),
+                    PluginSpawnPoll::Ready(result) => {
+                        let InflightPluginCore::SessionTypeSpawn { start, response } = entry else {
+                            continue;
+                        };
+                        let result = self.finish_session_type_spawn(&start, result);
+                        if response.send(result.clone()).is_err()
+                            && let Ok(spawned) = result
+                        {
+                            self.cleanup_undelivered_session_type_spawn(&spawned);
                         }
                     }
-                }
+                },
             }
         }
         *inflight = retained;
@@ -1790,9 +1794,7 @@ impl HubRuntime {
             .created_worktree_cleanups
             .lock()
             .ok()
-            .is_some_and(|held| {
-                held.iter().any(|cleanup| cleanup.session_id == session_id)
-            });
+            .is_some_and(|held| held.iter().any(|cleanup| cleanup.session_id == session_id));
         if !tracked {
             self.shutdown_session_detached(session_id.clone());
         }
@@ -1876,9 +1878,7 @@ impl HubRuntime {
             .is_some_and(|held| held.contains(worktree_id))
     }
 
-    pub(crate) fn created_worktree_rollback_suppressions(
-        &self,
-    ) -> Arc<Mutex<BTreeSet<String>>> {
+    pub(crate) fn created_worktree_rollback_suppressions(&self) -> Arc<Mutex<BTreeSet<String>>> {
         Arc::clone(&self.suppressed_created_worktree_rollbacks)
     }
 
@@ -1917,9 +1917,7 @@ impl HubRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_rollback_git_hold(
-        &self,
-    ) -> Option<Arc<crate::host_executor::TestHostGate>> {
+    pub(crate) fn test_rollback_git_hold(&self) -> Option<Arc<crate::host_executor::TestHostGate>> {
         self.rollback_git_hold
             .lock()
             .ok()
@@ -1949,8 +1947,7 @@ impl HubRuntime {
             return;
         };
         for cleanup in cleanups.iter_mut() {
-            if cleanup.shutdown.is_some() || cleanup.remove.is_some() || cleanup.release.is_some()
-            {
+            if cleanup.shutdown.is_some() || cleanup.remove.is_some() || cleanup.release.is_some() {
                 continue;
             }
             if !cleanup.removed {
@@ -1960,9 +1957,8 @@ impl HubRuntime {
             if cleanup.release_attempted {
                 continue;
             }
-            cleanup.release = Some(
-                self.begin_release_session_reservation(cleanup.reservation.clone()),
-            );
+            cleanup.release =
+                Some(self.begin_release_session_reservation(cleanup.reservation.clone()));
             cleanup.release_attempted = true;
         }
     }
@@ -1972,17 +1968,15 @@ impl HubRuntime {
             return;
         };
         for cleanup in cleanups.iter_mut() {
-            if cleanup.shutdown.is_some() || cleanup.remove.is_some() || cleanup.release.is_some()
-            {
+            if cleanup.shutdown.is_some() || cleanup.remove.is_some() || cleanup.release.is_some() {
                 continue;
             }
             if !cleanup.removed {
                 cleanup.remove = Some(self.begin_remove_session(&cleanup.session_id));
                 continue;
             }
-            cleanup.release = Some(
-                self.begin_release_session_reservation(cleanup.reservation.clone()),
-            );
+            cleanup.release =
+                Some(self.begin_release_session_reservation(cleanup.reservation.clone()));
             cleanup.release_attempted = true;
         }
     }
@@ -2000,9 +1994,7 @@ impl HubRuntime {
                         keep.push(cleanup);
                         continue;
                     }
-                    CoreTicketPoll::Ready(_)
-                    | CoreTicketPoll::Lost
-                    | CoreTicketPoll::Refused => {
+                    CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
                         cleanup.shutdown = None;
                     }
                 }
@@ -2013,9 +2005,7 @@ impl HubRuntime {
                         keep.push(cleanup);
                         continue;
                     }
-                    CoreTicketPoll::Ready(_)
-                    | CoreTicketPoll::Lost
-                    | CoreTicketPoll::Refused => {
+                    CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
                         cleanup.remove = None;
                         cleanup.removed = true;
                     }
@@ -2033,9 +2023,7 @@ impl HubRuntime {
                 })) => {
                     confirmed.push(cleanup.prepared);
                 }
-                CoreTicketPoll::Ready(_)
-                | CoreTicketPoll::Lost
-                | CoreTicketPoll::Refused => {
+                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
                     cleanup.release = None;
                     keep.push(cleanup);
                 }
@@ -2754,9 +2742,7 @@ impl HubRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_lua_callback_usage_probe(
-        &self,
-    ) -> impl Fn() -> usize + Send + 'static {
+    pub(crate) fn test_lua_callback_usage_probe(&self) -> impl Fn() -> usize + Send + 'static {
         let memory = Arc::clone(&self.lua_memory);
         move || memory.usage().1
     }
@@ -2795,7 +2781,10 @@ impl HubRuntime {
     fn fulfill_pending_coordination_requests(&self) {
         while let Some(pending) = self.coordination_bridge.take_pending() {
             let (core_storage, storage) = match pending.storage {
-                Some(storage) => (Some(storage.core), Some((storage.continuation, storage.disposal))),
+                Some(storage) => (
+                    Some(storage.core),
+                    Some((storage.continuation, storage.disposal)),
+                ),
                 None => (None, None),
             };
             let caller = pending.caller;
@@ -3781,7 +3770,10 @@ impl HubRuntime {
     }
 
     pub(crate) fn begin_reserve_session(&self, session_id: SessionId) -> CoreOperationTracker {
-        CoreOperationTracker::new(self.core_daemon.begin(CoreOperation::ReserveSession(session_id)))
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin(CoreOperation::ReserveSession(session_id)),
+        )
     }
 
     pub(crate) fn begin_spawn_reserved(
@@ -3810,10 +3802,13 @@ impl HubRuntime {
         session_id: SessionId,
         reserve_operation_id: PendingOperationId,
     ) -> CoreOperationTracker {
-        CoreOperationTracker::new(self.core_daemon.begin(CoreOperation::LookupSessionReservation {
-            session_id,
-            reserve_operation_id,
-        }))
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin(CoreOperation::LookupSessionReservation {
+                    session_id,
+                    reserve_operation_id,
+                }),
+        )
     }
 
     pub(crate) fn take_retained_reservations(&self) -> Vec<SessionReservation> {
@@ -3893,12 +3888,11 @@ impl HubRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_session_context(&self, key: &str) -> Option<crate::session_types::HubSessionContext> {
-        self.session_contexts
-            .lock()
-            .ok()?
-            .get(key)
-            .cloned()
+    pub(crate) fn test_session_context(
+        &self,
+        key: &str,
+    ) -> Option<crate::session_types::HubSessionContext> {
+        self.session_contexts.lock().ok()?.get(key).cloned()
     }
 
     pub(crate) fn publish_spawn_context(&self, context: &HubSessionContext) -> Result<(), String> {
@@ -4785,10 +4779,7 @@ impl HubSessionTypeSpawner {
 
     #[cfg(test)]
     pub(crate) fn test_managed_queue_len(&self) -> usize {
-        self.managed
-            .lock()
-            .map(|queue| queue.len())
-            .unwrap_or(0)
+        self.managed.lock().map(|queue| queue.len()).unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -5606,7 +5597,10 @@ enum InflightPluginCore {
         ticket: crate::data_plane::driver::ChargedCoreTicket<crate::lua_runtime::CoordinationReply>,
         response: crate::lua_runtime::CoordinationReplySender,
         rejected: Option<crate::data_plane::driver::CoreRejectedRequest>,
-        _storage: Option<(crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge)>,
+        _storage: Option<(
+            crate::lua_memory::LuaCallbackCharge,
+            crate::lua_memory::LuaCallbackCharge,
+        )>,
     },
     SessionTypeSpawn {
         start: SessionTypeSpawnStart,
@@ -5708,23 +5702,23 @@ impl SessionTypeSpawnStart {
                     CoreTicketPoll::Ready(Err(error)) => {
                         return spawn_fail(error, None);
                     }
-                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession { result, .. })) => {
-                        match result {
-                            Ok(reserved) => {
-                                self.reservation = Some(reserved.clone());
-                                if runtime.publish_spawn_context(&self.context).is_err() {
-                                    self.spawn_error = Some(CoreDaemonError::Shutdown);
-                                    self.release_or_retain(runtime);
-                                    continue;
-                                }
-                                self.context_published = true;
-                                self.tracker = runtime
-                                    .begin_spawn_reserved(reserved, self.spawn.clone());
-                                self.stage = PluginSpawnStage::SpawnReserved;
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                        result, ..
+                    })) => match result {
+                        Ok(reserved) => {
+                            self.reservation = Some(reserved.clone());
+                            if runtime.publish_spawn_context(&self.context).is_err() {
+                                self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                self.release_or_retain(runtime);
+                                continue;
                             }
-                            Err(error) => return spawn_fail(error, None),
+                            self.context_published = true;
+                            self.tracker =
+                                runtime.begin_spawn_reserved(reserved, self.spawn.clone());
+                            self.stage = PluginSpawnStage::SpawnReserved;
                         }
-                    }
+                        Err(error) => return spawn_fail(error, None),
+                    },
                     CoreTicketPoll::Ready(Ok(_)) => {
                         return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
@@ -5744,8 +5738,7 @@ impl SessionTypeSpawnStart {
                         Ok(Some(reserved)) => {
                             self.reservation = Some(reserved.clone());
                             self.spawn_error = Some(CoreDaemonError::Shutdown);
-                            self.tracker =
-                                runtime.begin_release_session_reservation(reserved);
+                            self.tracker = runtime.begin_release_session_reservation(reserved);
                             self.stage = PluginSpawnStage::Release;
                         }
                         Ok(None) => {
@@ -5807,10 +5800,7 @@ impl SessionTypeSpawnStart {
                         result,
                         ..
                     })) => {
-                        let error = self
-                            .spawn_error
-                            .take()
-                            .unwrap_or(CoreDaemonError::Shutdown);
+                        let error = self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
                         match result {
                             Ok(SessionReservationRelease::Released) => {
                                 return spawn_fail(
@@ -5855,12 +5845,10 @@ impl SessionTypeSpawnStart {
     fn continue_retry_or_reserve(&mut self, runtime: &HubRuntime) {
         if self.retry_tokens.is_empty() {
             runtime.merge_retained_reservations(std::mem::take(&mut self.retry_keep));
-            self.tracker =
-                runtime.begin_reserve_session(self.spawn.request.session_id.clone());
+            self.tracker = runtime.begin_reserve_session(self.spawn.request.session_id.clone());
             self.stage = PluginSpawnStage::Reserve;
         } else {
-            self.tracker =
-                runtime.begin_release_session_reservation(self.retry_tokens[0].clone());
+            self.tracker = runtime.begin_release_session_reservation(self.retry_tokens[0].clone());
         }
     }
 }
@@ -5896,26 +5884,26 @@ impl ManagedSessionSpawnStart {
                     CoreTicketPoll::Ready(Err(error)) => {
                         return spawn_fail(error, None);
                     }
-                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession { result, .. })) => {
-                        match result {
-                            Ok(reserved) => {
-                                self.reservation = Some(reserved.clone());
-                                if runtime.publish_spawn_context(&self.context).is_err() {
-                                    self.spawn_error = Some(CoreDaemonError::Shutdown);
-                                    self.release_or_retain(runtime);
-                                    continue;
-                                }
-                                self.context_published = true;
-                                self.tracker = runtime.begin_spawn_reserved_for_owner(
-                                    self.waiter_id,
-                                    reserved,
-                                    self.spawn.clone(),
-                                );
-                                self.stage = PluginSpawnStage::SpawnReserved;
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                        result, ..
+                    })) => match result {
+                        Ok(reserved) => {
+                            self.reservation = Some(reserved.clone());
+                            if runtime.publish_spawn_context(&self.context).is_err() {
+                                self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                self.release_or_retain(runtime);
+                                continue;
                             }
-                            Err(error) => return spawn_fail(error, None),
+                            self.context_published = true;
+                            self.tracker = runtime.begin_spawn_reserved_for_owner(
+                                self.waiter_id,
+                                reserved,
+                                self.spawn.clone(),
+                            );
+                            self.stage = PluginSpawnStage::SpawnReserved;
                         }
-                    }
+                        Err(error) => return spawn_fail(error, None),
+                    },
                     CoreTicketPoll::Ready(Ok(_)) => {
                         return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
@@ -6000,10 +5988,7 @@ impl ManagedSessionSpawnStart {
                         result,
                         ..
                     })) => {
-                        let error = self
-                            .spawn_error
-                            .take()
-                            .unwrap_or(CoreDaemonError::Shutdown);
+                        let error = self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
                         match result {
                             Ok(SessionReservationRelease::Released) => {
                                 return spawn_fail(
@@ -9300,9 +9285,7 @@ pub(crate) mod tests {
                 "engine.multiplexer.reserved_spawn.refused",
             ),
             (
-                MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Admitted(
-                    runtime,
-                )),
+                MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Admitted(runtime)),
                 "engine.multiplexer.reserved_spawn.admitted",
             ),
             (

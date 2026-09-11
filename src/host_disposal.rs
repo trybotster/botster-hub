@@ -163,14 +163,17 @@ impl Work {
         model: Option<ModelWork>,
         storage: Option<LuaCallbackStorageLease>,
     ) -> Self {
-        Self(Arc::new(Mutex::new(State {
-            payload: Some(Box::new(payload)),
-            model,
-            client_cleanup: None,
-            plugin_bridges: None,
-            permit: None,
-            outcome: Outcome::Pending,
-        })), storage)
+        Self(
+            Arc::new(Mutex::new(State {
+                payload: Some(Box::new(payload)),
+                model,
+                client_cleanup: None,
+                plugin_bridges: None,
+                permit: None,
+                outcome: Outcome::Pending,
+            })),
+            storage,
+        )
     }
 
     /// The existing worker calls this in disposal mode, including after normal execution stops.
