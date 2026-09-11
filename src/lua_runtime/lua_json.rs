@@ -1,16 +1,40 @@
 //! Iterative two-pass Lua → `serde_json::Value` conversion.
 //!
-//! No native-stack recursion and no depth cap. Cycles scan live frame
-//! pointers (`lua.from_value` `RecursionGuard`).
+//! # Live Lua `ValueRef` ownership (mlua 0.11.6)
 //!
-//! Object frames scan `pairs` once: leaves are handled with transient refs;
-//! only table children are deferred. Each deferred child charges
-//! `2 × lua_reference_bytes()` (key + table `ValueRef` / `ArcInner<c_int>`).
-//! Array/object frames also charge the table, the current element or key/value,
-//! and one `metatable()` probe.
+//! `lua_reference_bytes()` is `ArcInner<c_int>` (`value_ref.rs:25`), charged per
+//! live handle. Object keys are Rust `String`s plus a cursor; values are fetched
+//! with `raw_get(key)`. `pairs()` / `raw_get` are raw, so no Lua code runs
+//! between the key-collection pass and later `raw_get` of the same unique
+//! string key.
+//!
+//! Per frame, charged for the frame's lifetime:
+//! - array: table + 1 fetched value + 1 transient `metatable()` probe = 3
+//! - object: table + 1 fetched value + 1 `metatable()` probe = 3
+//! Key collection holds 2 extra transient pair refs for the scan, then drops
+//! them. A table-valued child reuses the fetched value as the child frame's
+//! table ref (not an extra width-proportional hold).
+//!
+//! Peak live refs ≈ `3 × depth + 2` (scan) + 1 walk-level `array_metatable`
+//! handle. Old `from_value`: per level the table, `TablePairs` `key:
+//! Option<Value>`, and the value (3), plus `RecursionGuard`'s `FxHashSet`
+//! (Rust heap). Equal peaks are not required; both are O(depth).
+//!
+//! # `ref_free` (OPEN for Root — do not add a VM host-heap limit)
+//!
+//! On drop, each `ValueRef` index is pushed onto `ExtraData.ref_free: Vec<c_int>`
+//! (`raw.rs:917`). Capacity is retained for the VM lifetime. Growth is Vec
+//! doubling: for peak simultaneous frees `P`, capacity ≤ next power of two of
+//! `P`, bytes `cap × 4`, overlap peak old+new during realloc. Nothing funds
+//! that retained capacity after the callback charge drops.
+//!
+//! # Ref-thread
+//!
+//! Registry/ref-thread slots go through the Lua allocator (VM charge). The
+//! high-water mark is retained for the state's life.
 //!
 //! Size-pass scratch is charged before growth (`ChargedVec` overlap). Build
-//! uses only a pre-admitted scratch reservation and never reserves again.
+//! consumes a pre-split reservation and never `reserve_*` again.
 
 use std::mem::size_of;
 use std::os::raw::c_void;
@@ -28,6 +52,7 @@ pub(crate) struct JsonAdmission {
     pub json_bytes: usize,
     pub scratch_peak: usize,
     pub stack_cap: usize,
+    pub live_refs_peak: usize,
 }
 
 pub(crate) struct PrepaidScratch {
@@ -84,6 +109,7 @@ pub(crate) fn value_size(
             json_bytes: leaf_size(other)?,
             scratch_peak: 0,
             stack_cap: 0,
+            live_refs_peak: 0,
         }),
     }
 }
@@ -127,17 +153,13 @@ pub(crate) fn retained_bytes(value: &serde_json::Value) -> Option<usize> {
     }
 }
 
-/// table + current element + `metatable()` probe.
-const fn array_ref_bytes() -> usize {
+/// table + 1 fetched value + `metatable()` probe.
+const fn frame_ref_bytes() -> usize {
     3 * lua_reference_bytes()
 }
 
-/// table + key + value + `metatable()` probe.
-const fn object_ref_bytes() -> usize {
-    4 * lua_reference_bytes()
-}
-
-const fn deferred_ref_bytes() -> usize {
+/// Transient `pairs()` key+value during key collection.
+const fn pair_scan_ref_bytes() -> usize {
     2 * lua_reference_bytes()
 }
 
@@ -145,6 +167,8 @@ struct Scratch {
     stack_slots: usize,
     deferred_slots: usize,
     live_refs: usize,
+    live_ref_count: usize,
+    live_ref_count_peak: usize,
     peak: usize,
     stack_cap: usize,
 }
@@ -154,6 +178,19 @@ impl Scratch {
         self.peak = self
             .peak
             .max(self.stack_slots + self.deferred_slots + self.live_refs);
+        self.live_ref_count_peak = self.live_ref_count_peak.max(self.live_ref_count);
+    }
+
+    fn add_refs(&mut self, bytes: usize, count: usize) {
+        self.live_refs += bytes;
+        self.live_ref_count += count;
+        self.note();
+    }
+
+    fn sub_refs(&mut self, bytes: usize, count: usize) {
+        self.live_refs = self.live_refs.saturating_sub(bytes);
+        self.live_ref_count = self.live_ref_count.saturating_sub(count);
+        self.note();
     }
 
     fn grow_stack(&mut self, old_cap: usize, new_cap: usize) {
@@ -169,8 +206,8 @@ impl Scratch {
         self.stack_cap = self.stack_cap.max(new_cap);
     }
 
-    fn grow_deferred(&mut self, rest: usize, old_cap: usize, new_cap: usize) {
-        let slot = size_of::<Deferred>();
+    fn grow_keys(&mut self, rest: usize, old_cap: usize, new_cap: usize) {
+        let slot = size_of::<CollectedKey>();
         self.peak = self.peak.max(
             self.stack_slots
                 + rest
@@ -182,10 +219,12 @@ impl Scratch {
     }
 }
 
-struct Deferred {
-    key: Value,
-    table: Table,
-    refs: LuaCallbackCharge,
+enum CollectedKey {
+    Utf8 {
+        text: String,
+        _charge: Option<LuaCallbackCharge>,
+    },
+    Fail(mlua::Error),
 }
 
 struct SizeFrame {
@@ -193,11 +232,11 @@ struct SizeFrame {
     ptr: *const c_void,
     refs: LuaCallbackCharge,
     kind: SizeKind,
-    pending_key: Option<Value>,
+    pending_key_len: Option<usize>,
     json: usize,
     count: usize,
-    deferred_slots: usize,
-    deferred_refs: usize,
+    key_slots: usize,
+    key_string_bytes: usize,
 }
 
 enum SizeKind {
@@ -206,7 +245,7 @@ enum SizeKind {
         len: usize,
     },
     Object {
-        deferred: ChargedVec<Deferred>,
+        keys: ChargedVec<CollectedKey>,
         next: usize,
         scanned: bool,
     },
@@ -216,7 +255,7 @@ struct BuildFrame {
     table: Table,
     ptr: *const c_void,
     kind: BuildKind,
-    pending_key: Option<Value>,
+    pending_key: Option<String>,
     array: Option<Vec<serde_json::Value>>,
     map: Option<Map<String, serde_json::Value>>,
 }
@@ -227,7 +266,7 @@ enum BuildKind {
         len: usize,
     },
     Object {
-        deferred: Vec<(Value, Table)>,
+        keys: Vec<CollectedKey>,
         next: usize,
         scanned: bool,
     },
@@ -248,14 +287,15 @@ fn walk_size(
         stack_slots: 0,
         deferred_slots: 0,
         live_refs: 0,
+        live_ref_count: 0,
+        live_ref_count_peak: 0,
         peak: 0,
         stack_cap: 0,
     };
     let mt_refs = memory
         .reserve_callback_bytes(lua_reference_bytes())
         .map_err(capacity)?;
-    scratch.live_refs += lua_reference_bytes();
-    scratch.note();
+    scratch.add_refs(lua_reference_bytes(), 1);
     let array_mt = lua.array_metatable().to_pointer();
     let mut stack = ChargedVec::new(Arc::clone(memory));
     push_size_frame(&mut stack, memory, table, array_mt, &mut scratch)?;
@@ -269,9 +309,9 @@ fn walk_size(
         match child {
             Child::Table(child) => {
                 if stack.iter().any(|frame| frame.ptr == child.to_pointer()) {
-                    return Err(super::AdmissionError::Runtime(mlua::Error::RuntimeError(
-                        "recursive table detected".into(),
-                    )));
+                    return Err(super::AdmissionError::Runtime(
+                        mlua::Error::DeserializeError("recursive table detected".into()),
+                    ));
                 }
                 push_size_frame(&mut stack, memory, child, array_mt, &mut scratch)?;
             }
@@ -285,8 +325,9 @@ fn walk_size(
                 let json = finish_size(&done)?;
                 scratch.live_refs = scratch
                     .live_refs
-                    .saturating_sub(done.refs.bytes() + done.deferred_refs);
-                scratch.deferred_slots = scratch.deferred_slots.saturating_sub(done.deferred_slots);
+                    .saturating_sub(done.refs.bytes() + done.key_string_bytes);
+                scratch.live_ref_count = scratch.live_ref_count.saturating_sub(3);
+                scratch.deferred_slots = scratch.deferred_slots.saturating_sub(done.key_slots);
                 drop(done);
                 scratch.note();
                 if stack.len() == 0 {
@@ -295,6 +336,7 @@ fn walk_size(
                         json_bytes: json,
                         scratch_peak: scratch.peak,
                         stack_cap: scratch.stack_cap.max(1),
+                        live_refs_peak: scratch.live_ref_count_peak,
                     });
                 }
                 let parent = stack.last_mut().expect("nested table has a parent");
@@ -321,7 +363,9 @@ fn walk_build(lua: &Lua, table: Table, stack_cap: usize) -> Result<serde_json::V
         match child {
             Child::Table(child) => {
                 if stack.iter().any(|frame| frame.ptr == child.to_pointer()) {
-                    return Err(mlua::Error::RuntimeError("recursive table detected".into()));
+                    return Err(mlua::Error::DeserializeError(
+                        "recursive table detected".into(),
+                    ));
                 }
                 debug_assert!(stack.len() < stack.capacity());
                 push_build_frame(&mut stack, child, array_mt)?;
@@ -364,7 +408,7 @@ fn push_size_frame(
         (
             SizeKind::Array { next: 1, len },
             memory
-                .reserve_callback_bytes(array_ref_bytes())
+                .reserve_callback_bytes(frame_ref_bytes())
                 .map_err(capacity)?,
             len.checked_mul(size_of::<serde_json::Value>())
                 .ok_or(super::AdmissionError::Capacity)?,
@@ -372,17 +416,17 @@ fn push_size_frame(
     } else {
         (
             SizeKind::Object {
-                deferred: ChargedVec::new(Arc::clone(memory)),
+                keys: ChargedVec::new(Arc::clone(memory)),
                 next: 0,
                 scanned: false,
             },
             memory
-                .reserve_callback_bytes(object_ref_bytes())
+                .reserve_callback_bytes(frame_ref_bytes())
                 .map_err(capacity)?,
             0,
         )
     };
-    scratch.live_refs += refs.bytes();
+    scratch.add_refs(refs.bytes(), 3);
     let old_cap = stack.capacity();
     stack
         .try_push(SizeFrame {
@@ -390,11 +434,11 @@ fn push_size_frame(
             ptr,
             refs,
             kind,
-            pending_key: None,
+            pending_key_len: None,
             json,
             count: 0,
-            deferred_slots: 0,
-            deferred_refs: 0,
+            key_slots: 0,
+            key_string_bytes: 0,
         })
         .map_err(capacity)?;
     let new_cap = stack.capacity();
@@ -423,7 +467,7 @@ fn push_build_frame(
     } else {
         (
             BuildKind::Object {
-                deferred: Vec::new(),
+                keys: Vec::new(),
                 next: 0,
                 scanned: false,
             },
@@ -450,7 +494,7 @@ fn take_size_child(
     scratch: &mut Scratch,
 ) -> Result<Child, super::AdmissionError> {
     if matches!(&frame.kind, SizeKind::Object { scanned: false, .. }) {
-        scan_size_object(frame, memory, scratch)?;
+        scan_size_keys(frame, memory, scratch)?;
         if let SizeKind::Object { scanned, .. } = &mut frame.kind {
             *scanned = true;
         }
@@ -464,68 +508,69 @@ fn take_size_child(
             *next += 1;
             Ok(child_from_value(item))
         }
-        SizeKind::Object { deferred, next, .. } => {
-            if *next >= deferred.len() {
+        SizeKind::Object { keys, next, .. } => {
+            if *next >= keys.len() {
                 return Ok(Child::End);
             }
-            let deferred_item = deferred.get(*next).expect("deferred cursor");
-            let table = deferred_item.table.clone();
-            let key = deferred_item.key.clone();
-            *next += 1;
-            frame.pending_key = Some(key);
-            Ok(Child::Table(table))
+            match keys.get(*next).expect("key cursor") {
+                CollectedKey::Fail(error) => {
+                    return Err(super::AdmissionError::Runtime(clone_error(error)));
+                }
+                CollectedKey::Utf8 { text, .. } => {
+                    let item = frame.table.raw_get::<Value>(text.as_str())?;
+                    frame.pending_key_len = Some(text.len());
+                    *next += 1;
+                    Ok(child_from_value(item))
+                }
+            }
         }
     }
 }
 
-fn scan_size_object(
+fn scan_size_keys(
     frame: &mut SizeFrame,
     memory: &Arc<LuaMemoryAccount>,
     scratch: &mut Scratch,
 ) -> Result<(), super::AdmissionError> {
     let table = frame.table.clone();
+    let pair_refs = memory
+        .reserve_callback_bytes(pair_scan_ref_bytes())
+        .map_err(capacity)?;
+    scratch.add_refs(pair_scan_ref_bytes(), 2);
     for pair in table.pairs::<Value, Value>() {
-        let (key, item) = pair?;
-        match item {
-            Value::Table(child) => {
-                let refs = memory
-                    .reserve_callback_bytes(deferred_ref_bytes())
-                    .map_err(capacity)?;
-                let (old_cap, new_cap) = {
-                    let SizeKind::Object { deferred, .. } = &mut frame.kind else {
-                        unreachable!("object scan");
-                    };
-                    let old_cap = deferred.capacity();
-                    deferred
-                        .try_push(Deferred {
-                            key,
-                            table: child,
-                            refs,
-                        })
-                        .map_err(capacity)?;
-                    (old_cap, deferred.capacity())
-                };
-                if new_cap > old_cap {
-                    let rest = scratch.deferred_slots.saturating_sub(frame.deferred_slots);
-                    scratch.grow_deferred(rest, old_cap, new_cap);
-                    frame.deferred_slots = new_cap.saturating_mul(size_of::<Deferred>());
-                }
-                scratch.live_refs += deferred_ref_bytes();
-                frame.deferred_refs += deferred_ref_bytes();
-                scratch.note();
-            }
-            leaf => {
-                let json = leaf_size(&leaf)?;
-                add_size_entry(frame, Some(key), json)?;
-            }
+        let (key, _item) = pair?;
+        let collected = collect_key(memory, &key)?;
+        if let CollectedKey::Utf8 { text, .. } = &collected {
+            let bytes = text.capacity();
+            frame.key_string_bytes = frame
+                .key_string_bytes
+                .checked_add(bytes)
+                .ok_or(super::AdmissionError::Capacity)?;
+            scratch.live_refs += bytes;
         }
+        let (old_cap, new_cap) = {
+            let SizeKind::Object { keys, .. } = &mut frame.kind else {
+                unreachable!("object scan");
+            };
+            let old_cap = keys.capacity();
+            keys.try_push(collected).map_err(capacity)?;
+            (old_cap, keys.capacity())
+        };
+        if new_cap > old_cap {
+            let rest = scratch.deferred_slots.saturating_sub(frame.key_slots);
+            scratch.grow_keys(rest, old_cap, new_cap);
+            frame.key_slots = new_cap.saturating_mul(size_of::<CollectedKey>());
+        }
+        scratch.note();
     }
+    drop(pair_refs);
+    scratch.sub_refs(pair_scan_ref_bytes(), 2);
     Ok(())
 }
 
 fn take_build_child(frame: &mut BuildFrame) -> Result<Child, mlua::Error> {
     if matches!(&frame.kind, BuildKind::Object { scanned: false, .. }) {
-        scan_build_object(frame)?;
+        scan_build_keys(frame)?;
         if let BuildKind::Object { scanned, .. } = &mut frame.kind {
             *scanned = true;
         }
@@ -539,34 +584,41 @@ fn take_build_child(frame: &mut BuildFrame) -> Result<Child, mlua::Error> {
             *next += 1;
             Ok(child_from_value(item))
         }
-        BuildKind::Object { deferred, next, .. } => {
-            if *next >= deferred.len() {
+        BuildKind::Object { keys, next, .. } => {
+            if *next >= keys.len() {
                 return Ok(Child::End);
             }
-            let (key, table) = deferred[*next].clone();
+            let collected = std::mem::replace(
+                &mut keys[*next],
+                CollectedKey::Fail(mlua::Error::DeserializeError("empty key slot".into())),
+            );
             *next += 1;
-            frame.pending_key = Some(key);
-            Ok(Child::Table(table))
+            match collected {
+                CollectedKey::Fail(error) => Err(error),
+                CollectedKey::Utf8 { text, .. } => {
+                    let item = frame.table.raw_get::<Value>(text.as_str())?;
+                    frame.pending_key = Some(text);
+                    Ok(child_from_value(item))
+                }
+            }
         }
     }
 }
 
-fn scan_build_object(frame: &mut BuildFrame) -> Result<(), mlua::Error> {
+fn scan_build_keys(frame: &mut BuildFrame) -> Result<(), mlua::Error> {
     let table = frame.table.clone();
+    let mut count = 0usize;
     for pair in table.pairs::<Value, Value>() {
-        let (key, item) = pair?;
-        match item {
-            Value::Table(child) => {
-                let BuildKind::Object { deferred, .. } = &mut frame.kind else {
-                    unreachable!("object scan");
-                };
-                deferred.push((key, child));
-            }
-            leaf => {
-                let json = leaf_build(&leaf)?;
-                add_build_entry(frame, Some(key), json)?;
-            }
-        }
+        pair?;
+        count += 1;
+    }
+    let BuildKind::Object { keys, .. } = &mut frame.kind else {
+        unreachable!("object scan");
+    };
+    keys.reserve_exact(count);
+    for pair in table.pairs::<Value, Value>() {
+        let (key, _item) = pair?;
+        keys.push(collect_key_unfunded(&key)?);
     }
     Ok(())
 }
@@ -579,15 +631,6 @@ fn child_from_value(value: Value) -> Child {
 }
 
 fn add_size(frame: &mut SizeFrame, json: usize) -> Result<(), super::AdmissionError> {
-    let key = frame.pending_key.take();
-    add_size_entry(frame, key, json)
-}
-
-fn add_size_entry(
-    frame: &mut SizeFrame,
-    key: Option<Value>,
-    json: usize,
-) -> Result<(), super::AdmissionError> {
     match &frame.kind {
         SizeKind::Array { .. } => {
             frame.json = frame
@@ -596,9 +639,10 @@ fn add_size_entry(
                 .ok_or(super::AdmissionError::Capacity)?;
         }
         SizeKind::Object { .. } => {
-            let key =
-                key.ok_or_else(|| mlua::Error::RuntimeError("object child missing key".into()))?;
-            let key_len = map_key_len(&key)?;
+            let key_len = frame
+                .pending_key_len
+                .take()
+                .ok_or_else(|| mlua::Error::DeserializeError("object child missing key".into()))?;
             frame.json = frame
                 .json
                 .checked_add(key_len)
@@ -614,15 +658,6 @@ fn add_size_entry(
 }
 
 fn add_build(frame: &mut BuildFrame, json: serde_json::Value) -> Result<(), mlua::Error> {
-    let key = frame.pending_key.take();
-    add_build_entry(frame, key, json)
-}
-
-fn add_build_entry(
-    frame: &mut BuildFrame,
-    key: Option<Value>,
-    json: serde_json::Value,
-) -> Result<(), mlua::Error> {
     match &frame.kind {
         BuildKind::Array { .. } => {
             frame
@@ -632,13 +667,15 @@ fn add_build_entry(
                 .push(json);
         }
         BuildKind::Object { .. } => {
-            let key =
-                key.ok_or_else(|| mlua::Error::RuntimeError("object child missing key".into()))?;
+            let key = frame
+                .pending_key
+                .take()
+                .ok_or_else(|| mlua::Error::DeserializeError("object child missing key".into()))?;
             frame
                 .map
                 .as_mut()
                 .expect("object build accumulator")
-                .insert(map_key_string(&key)?, json);
+                .insert(key, json);
         }
     }
     Ok(())
@@ -680,14 +717,77 @@ fn capacity(_: LuaMemoryCapacityError) -> super::AdmissionError {
     super::AdmissionError::Capacity
 }
 
+fn collect_key(
+    memory: &Arc<LuaMemoryAccount>,
+    key: &Value,
+) -> Result<CollectedKey, super::AdmissionError> {
+    match collect_key_unfunded(key)? {
+        CollectedKey::Utf8 { text, .. } => {
+            let charge = memory
+                .reserve_callback_bytes(text.capacity())
+                .map_err(capacity)?;
+            Ok(CollectedKey::Utf8 {
+                text,
+                _charge: Some(charge),
+            })
+        }
+        fail => Ok(fail),
+    }
+}
+
+fn collect_key_unfunded(key: &Value) -> Result<CollectedKey, mlua::Error> {
+    match key {
+        Value::String(text) => match text.to_str() {
+            Ok(utf8) => {
+                let mut out = String::with_capacity(utf8.len());
+                out.push_str(&utf8);
+                Ok(CollectedKey::Utf8 {
+                    text: out,
+                    _charge: None,
+                })
+            }
+            Err(_) => Ok(CollectedKey::Fail(map_key_error(key))),
+        },
+        _ => Ok(CollectedKey::Fail(map_key_error(key))),
+    }
+}
+
+fn map_key_error(key: &Value) -> mlua::Error {
+    let message = match key {
+        Value::Integer(value) => format!("invalid type: integer `{value}`, expected a string key"),
+        Value::Number(value) => {
+            format!("invalid type: floating point `{value}`, expected a string key")
+        }
+        Value::Boolean(value) => format!("invalid type: boolean `{value}`, expected a string key"),
+        Value::Nil => "invalid type: unit value, expected a string key".to_owned(),
+        Value::String(_) => "invalid type: byte array, expected a string key".to_owned(),
+        Value::Table(table) => {
+            if table.raw_len() > 0 {
+                "invalid type: seq, expected a string key".to_owned()
+            } else {
+                "invalid type: map, expected a string key".to_owned()
+            }
+        }
+        other => format!("unsupported value type `{}`", other.type_name()),
+    };
+    mlua::Error::DeserializeError(message)
+}
+
+fn clone_error(error: &mlua::Error) -> mlua::Error {
+    match error {
+        mlua::Error::DeserializeError(message) => mlua::Error::DeserializeError(message.clone()),
+        other => mlua::Error::DeserializeError(other.to_string()),
+    }
+}
+
 fn leaf_size(value: &Value) -> Result<usize, super::AdmissionError> {
     match value {
         Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Number(_) => Ok(0),
         Value::LightUserData(data) if data.0.is_null() => Ok(0),
         Value::String(text) => Ok(utf8_len(text)?),
-        Value::Table(_) => Err(super::AdmissionError::Runtime(mlua::Error::RuntimeError(
-            "table leaf reached the size walk".into(),
-        ))),
+        Value::Table(_) => Err(super::AdmissionError::Runtime(
+            mlua::Error::DeserializeError("table leaf reached the size walk".into()),
+        )),
         other => Err(unsupported(other)),
     }
 }
@@ -702,10 +802,10 @@ fn leaf_build(value: &Value) -> Result<serde_json::Value, mlua::Error> {
             .unwrap_or(serde_json::Value::Null)),
         Value::LightUserData(data) if data.0.is_null() => Ok(serde_json::Value::Null),
         Value::String(text) => Ok(serde_json::Value::String(utf8_string(text)?)),
-        Value::Table(_) => Err(mlua::Error::RuntimeError(
+        Value::Table(_) => Err(mlua::Error::DeserializeError(
             "table leaf reached the build walk".into(),
         )),
-        other => Err(mlua::Error::RuntimeError(unsupported_message(other))),
+        other => Err(mlua::Error::DeserializeError(unsupported_message(other))),
     }
 }
 
@@ -717,14 +817,16 @@ fn index_key(index: usize) -> Result<i64, mlua::Error> {
 fn utf8_len(text: &mlua::String) -> Result<usize, mlua::Error> {
     Ok(text
         .to_str()
-        .map_err(|_| mlua::Error::RuntimeError("coordination requires UTF-8 strings".into()))?
+        .map_err(|_| {
+            mlua::Error::DeserializeError("invalid type: byte array, expected a string".into())
+        })?
         .len())
 }
 
 fn utf8_string(text: &mlua::String) -> Result<String, mlua::Error> {
-    let utf8 = text
-        .to_str()
-        .map_err(|_| mlua::Error::RuntimeError("coordination requires UTF-8 strings".into()))?;
+    let utf8 = text.to_str().map_err(|_| {
+        mlua::Error::DeserializeError("invalid type: byte array, expected a string".into())
+    })?;
     let mut out = String::with_capacity(utf8.len());
     out.push_str(&utf8);
     Ok(out)
@@ -733,9 +835,7 @@ fn utf8_string(text: &mlua::String) -> Result<String, mlua::Error> {
 fn map_key_len(key: &Value) -> Result<usize, super::AdmissionError> {
     match key {
         Value::String(text) => Ok(utf8_len(text)?),
-        _ => Err(super::AdmissionError::Runtime(mlua::Error::RuntimeError(
-            "expected a string key".into(),
-        ))),
+        _ => Err(super::AdmissionError::Runtime(map_key_error(key))),
     }
 }
 
@@ -747,7 +847,7 @@ fn map_key_string(key: &Value) -> Result<String, mlua::Error> {
 }
 
 fn unsupported(value: &Value) -> super::AdmissionError {
-    super::AdmissionError::Runtime(mlua::Error::RuntimeError(unsupported_message(value)))
+    super::AdmissionError::Runtime(mlua::Error::DeserializeError(unsupported_message(value)))
 }
 
 fn unsupported_message(value: &Value) -> String {
@@ -935,6 +1035,67 @@ mod tests {
         println!("cycle from_value={from} ours={ours}");
         assert!(from.contains("recursive table detected"));
         assert!(ours.contains("recursive table detected"));
+    }
+
+    fn display_size_err(lua: &Lua, value: &Value) -> String {
+        match value_size(&memory(), lua, value) {
+            Err(super::super::AdmissionError::Runtime(error)) => error.to_string(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_texts_match_from_value_byte_for_byte() {
+        for source in [
+            "return { fn = function() end }",
+            "local t = {}; t.n = t; return t",
+            "return {[2]=true}",
+        ] {
+            let (lua, value) = eval(source);
+            let from = lua
+                .from_value::<serde_json::Value>(value.clone())
+                .unwrap_err()
+                .to_string();
+            let ours = display_size_err(&lua, &value);
+            assert_eq!(ours, from, "{source}");
+        }
+    }
+
+    #[test]
+    fn first_lua_next_error_wins() {
+        let (lua, value) = eval("local t = {}; t.later = 1; t.bad = function() end; return t");
+        let from = lua
+            .from_value::<serde_json::Value>(value.clone())
+            .unwrap_err()
+            .to_string();
+        let ours = display_size_err(&lua, &value);
+        assert_eq!(ours, from);
+    }
+
+    #[test]
+    fn wide_object_live_refs_do_not_grow_with_width() {
+        let account = memory();
+        let mut peaks = Vec::new();
+        for width in [8usize, 32, 64] {
+            let lua = Lua::new();
+            lua.globals().set("width", width as i32).unwrap();
+            let value: Value = lua
+                .load(
+                    r#"
+                    local t = {}
+                    for i = 1, width do
+                        t['k' .. i] = 'v' .. i
+                    end
+                    return t
+                    "#,
+                )
+                .eval()
+                .unwrap();
+            let admission = value_size(&account, &lua, &value).unwrap();
+            peaks.push(admission.live_refs_peak);
+        }
+        assert_eq!(peaks[0], peaks[1]);
+        assert_eq!(peaks[1], peaks[2]);
     }
 
     #[test]

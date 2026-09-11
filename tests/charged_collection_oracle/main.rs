@@ -251,10 +251,30 @@ fn main() -> ExitCode {
 fn measure_lua_json() -> Result<(), String> {
     for (label, source) in [
         (
+            "wide-object-8",
+            r#"
+            local t = {}
+            for i = 1, 8 do
+                t['k' .. i] = 'v' .. i
+            end
+            return t
+            "#,
+        ),
+        (
             "wide-object",
             r#"
             local t = {}
             for i = 1, 32 do
+                t['k' .. i] = 'v' .. i
+            end
+            return t
+            "#,
+        ),
+        (
+            "wide-object-64",
+            r#"
+            local t = {}
+            for i = 1, 64 do
                 t['k' .. i] = 'v' .. i
             end
             return t
@@ -293,7 +313,10 @@ fn measure_lua_json() -> Result<(), String> {
         } else {
             peak as f64 / admitted as f64
         };
-        println!("{label} admitted={admitted} peak={peak} ratio={ratio:.6}");
+        let live_refs = lua_json::live_refs_peak(&prepared);
+        println!(
+            "{label} admitted={admitted} peak={peak} ratio={ratio:.6} live_refs_peak={live_refs}"
+        );
         if peak > admitted {
             return Err(format!(
                 "{label}: counted peak {peak} > admitted {admitted}"

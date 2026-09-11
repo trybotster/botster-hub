@@ -2669,6 +2669,7 @@ fn admit_publish_operation(
     args: Value,
 ) -> Result<(PendingCoordinationOperation, LuaCallbackCharge), AdmissionError> {
     let table = lua_table(args)?;
+    lua_json::value_size(memory, lua, &Value::Table(table.clone()))?;
     let id = lua_string_bytes(&table, "id")?
         .ok_or_else(|| mlua::Error::RuntimeError("coordination.publish requires id".into()))?;
     let id_bytes = id.as_bytes();
@@ -2812,10 +2813,11 @@ fn lua_u64(value: Value) -> Option<u64> {
 
 fn admit_drain_operation(
     memory: &Arc<LuaMemoryAccount>,
-    _lua: &Lua,
+    lua: &Lua,
     args: Value,
 ) -> Result<(PendingCoordinationOperation, LuaCallbackCharge), AdmissionError> {
     let table = lua_table(args)?;
+    lua_json::value_size(memory, lua, &Value::Table(table.clone()))?;
     let target_table = match table.raw_get::<Value>("target")? {
         Value::Table(target) => target,
         _ => {
