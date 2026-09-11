@@ -3536,6 +3536,205 @@ sys.exit(0)
         );
     }
 
+    fn wait_spawn_installed(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        tracker: &mut crate::runtime::CoreOperationTracker,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "spawn reserved did not install");
+            pump_core(daemon, state);
+            match tracker.poll(daemon.runtime().unwrap()) {
+                CoreTicketPoll::Pending => std::thread::yield_now(),
+                CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                    result: ReservedSpawnResult::Installed { .. },
+                    ..
+                })) => return,
+                other => panic!("spawn reserved must install, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn created_worktree_cleanup_retries_release_on_a_live_session() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("s2-u1-live", Some(worker));
+        let waiter = state.current_waiter_id.unwrap();
+        let session_id = SessionId(format!("s2-u1-live-{stamp}"));
+        let mut reserve = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, session_id.clone());
+        let reservation = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        let spawn = SpawnSessionRequest {
+            request: crate::client_api::spawn_request(
+                daemon.runtime().unwrap(),
+                crate::daemon::control::request_id("s2-u1-live"),
+                session_id.clone(),
+                "sleep 30".into(),
+            ),
+            metadata: crate::client_api::client_session_metadata(),
+        };
+        let mut spawn = daemon.runtime().unwrap().begin_spawn_reserved_for_owner(
+            waiter,
+            reservation.clone(),
+            spawn,
+        );
+        wait_spawn_installed(&mut daemon, &mut state, &mut spawn);
+        let prepared = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: root.clone(),
+            common_dir: root.clone(),
+            branch: "topic".into(),
+            path: root.join("u1-live-worktree"),
+            worktree_id: "wt-u1-live".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: false,
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .test_queue_removed_created_worktree_cleanup(
+                session_id.clone(),
+                prepared,
+                reservation,
+            );
+        daemon
+            .runtime()
+            .unwrap()
+            .retry_created_worktree_releases();
+        let first = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins()
+                >= 1
+                && daemon
+                    .runtime()
+                    .unwrap()
+                    .test_created_worktree_cleanup_count()
+                    == 1
+                && daemon
+                    .runtime()
+                    .unwrap()
+                    .test_created_worktree_cleanup_release_idle()
+            {
+                break;
+            }
+            assert!(Instant::now() < first, "first live release must complete");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            0,
+            "live session must not Host-rollback after RetainedSession"
+        );
+        daemon
+            .runtime()
+            .unwrap()
+            .retry_created_worktree_releases();
+        let second = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins()
+                >= 2
+            {
+                break;
+            }
+            assert!(Instant::now() < second, "explicit event must issue a second release");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            2
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            0
+        );
+        let mut shutdown = daemon
+            .runtime()
+            .unwrap()
+            .begin_shutdown_session(session_id.clone());
+        let stop = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            match shutdown.poll(daemon.runtime().unwrap()) {
+                CoreTicketPoll::Pending => {}
+                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
+                    break
+                }
+            }
+            assert!(Instant::now() < stop, "shutdown hang");
+            std::thread::yield_now();
+        }
+        let mut remove = daemon.runtime().unwrap().begin_remove_session(&session_id);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            match remove.poll(daemon.runtime().unwrap()) {
+                CoreTicketPoll::Pending => {}
+                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
+                    break
+                }
+            }
+            assert!(Instant::now() < stop, "remove hang");
+            std::thread::yield_now();
+        }
+        daemon
+            .runtime()
+            .unwrap()
+            .retry_created_worktree_releases();
+        let released = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count()
+                >= 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < released,
+                "Released after shutdown must queue Host rollback"
+            );
+            std::thread::yield_now();
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn accept_confirmed_rollback_waits_for_owner_capacity() {
         let (mut daemon, mut state, root) = spawn_fixture("s2-capacity-wait");

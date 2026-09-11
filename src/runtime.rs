@@ -2087,6 +2087,43 @@ impl HubRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_queue_removed_created_worktree_cleanup(
+        &self,
+        session_id: SessionId,
+        prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+        reservation: SessionReservation,
+    ) {
+        let worktree_id = prepared.worktree_id.clone();
+        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
+            cleanups.push(CreatedWorktreeCleanup {
+                worktree_id,
+                session_id,
+                prepared,
+                reservation,
+                shutdown: None,
+                remove: None,
+                removed: true,
+                release: None,
+                release_attempted: false,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_created_worktree_cleanup_release_idle(&self) -> bool {
+        self.created_worktree_cleanups
+            .lock()
+            .ok()
+            .is_some_and(|held| {
+                held.iter().all(|cleanup| {
+                    cleanup.shutdown.is_none()
+                        && cleanup.remove.is_none()
+                        && cleanup.release.is_none()
+                })
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_created_worktree_cleanup_count(&self) -> usize {
         self.created_worktree_cleanups
             .lock()
