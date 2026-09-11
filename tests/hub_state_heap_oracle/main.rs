@@ -100,7 +100,7 @@ fn main() -> ExitCode {
     }
 
     let mut schema_state = HubState::from_config(&config);
-    let mut record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
+    let schema_record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
         "manifest": {
             "name": "oracle.plugin",
             "version": "1.0.0",
@@ -121,19 +121,106 @@ fn main() -> ExitCode {
         "update_policy": "manual",
         "last_audit_reason": "oracle"
     }))
-    .expect("package record");
-    schema_state.package_registry.records.push(record.clone());
+    .expect("schema record");
+    schema_state.package_registry.records.push(schema_record);
     if let Err(error) = measure("schema-heavy", &schema_state) {
         errors.push(error);
     }
 
-    record.installed_at = None;
-    record.updated_at = None;
-    record.pin = None;
-    record.source_metadata = None;
+    let skipped_record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
+        "manifest": {
+            "name": "skip.plugin",
+            "version": "0.0.1",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "capabilities": [],
+            "entrypoints": []
+        },
+        "state": "disabled",
+        "classification": "plugin",
+        "trust": { "classification": "third_party", "first_party": false },
+        "provenance": { "source": "s", "checksum": null },
+        "update_policy": "manual",
+        "last_audit_reason": "skip"
+    }))
+    .expect("skipped record");
     let mut skipped = HubState::from_config(&config);
-    skipped.package_registry.records.push(record);
+    skipped.package_registry.records.push(skipped_record);
     if let Err(error) = measure("skipped-options", &skipped) {
+        errors.push(error);
+    }
+
+    let full_record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
+        "manifest": {
+            "name": "full.plugin",
+            "version": "2.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": "/tmp/full" },
+            "capabilities": [{"surface": "session_actions", "scope": "session_type_spawn"}],
+            "entrypoints": [{"runtime": "lua", "path": "plugin.lua", "bootstrap": true}],
+            "dependencies": [{"id": "d1", "package": "other", "kind": "required", "requirements": []}],
+            "features": [{"id": "f1", "label": "F", "dependencies": ["d1"], "requirements": []}],
+            "runnable_entrypoints": [{
+                "id": "app",
+                "kind": "web_app",
+                "launch_mode": "background",
+                "command": "bin/app",
+                "args": ["--port"],
+                "working_directory": { "policy": "relative", "path": "run" },
+                "injections": [{"kind": "data_dir", "target": {"type": "environment", "name": "DATA"}, "required": true, "description": "data"}],
+                "environment": [{"name": "FOO", "required": false, "default": "bar", "description": "foo"}],
+                "readiness": { "result_fields": ["local_url"] }
+            }],
+            "surfaces": [{"id": "main", "kind": "app", "title": "Main", "description": "d", "icon": "i", "supports": ["render"]}],
+            "navigation": [{"id": "n1", "label": "Go", "target": {"kind": "surface", "surface_id": "main"}}],
+            "events": {
+                "emitted": [{"name": "e", "payload_schema": {"type": "object"}, "audience": ["clients"]}],
+                "notices": [{"name": "e", "subject_scope": "session", "text_pointer": "/text", "ttl_ms": 1000, "severity": "info"}]
+            }
+        },
+        "state": "enabled",
+        "classification": "plugin",
+        "trust": { "classification": "first_party", "first_party": true },
+        "provenance": { "source": "/tmp/full", "checksum": "abc" },
+        "source_metadata": {
+            "registry_id": "r",
+            "registry_kind": "local_path",
+            "entry_id": "e",
+            "source_kind": "local_path",
+            "source_label": "lab"
+        },
+        "pin": { "revision": "1", "update_policy": "manual" },
+        "update_policy": "manual",
+        "installed_at": "1",
+        "updated_at": "2",
+        "last_audit_reason": "full",
+        "session_types": [{
+            "id": "agent",
+            "label": "Agent",
+            "role": "botster.agent",
+            "interaction": "interactive",
+            "lifecycle": "task",
+            "command": "bin/agent"
+        }],
+        "runnable_entrypoints": [{
+            "id": "app",
+            "kind": "web_app",
+            "launch_mode": "background",
+            "command": "bin/app",
+            "args": ["--port"],
+            "working_directory": { "policy": "relative", "path": "run" },
+            "injections": [],
+            "environment": [{"name": "FOO", "required": false, "default": "bar"}],
+            "capabilities": [],
+            "may_supervise": false
+        }],
+        "configuration": { "values": { "k": { "type": "string", "value": "v" } } }
+    }))
+    .expect("full record");
+    let mut full = HubState::from_config(&config);
+    full.package_registry.records.push(full_record);
+    if let Err(error) = measure("fully-populated", &full) {
         errors.push(error);
     }
 
