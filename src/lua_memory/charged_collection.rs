@@ -4,16 +4,18 @@
 //! Growth charges the new capacity while the old charge is still held, then
 //! replaces it. Pop releases only the entry.
 
-use std::alloc::{Layout, alloc};
 use std::collections::VecDeque;
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::{LuaCallbackCharge, LuaMemoryAccount, LuaMemoryCapacityError, LuaMemoryClass};
 
+const PINNED_EXACT_GROWTH: &str =
+    "pinned rustc 1.97.0 (2d8144b78) exact-growth contract: capacity must equal requested new_cap";
+
 pub(crate) struct ChargedVecDeque<T> {
     buf: VecDeque<T>,
-    capacity_charges: Vec<LuaCallbackCharge>,
+    capacity_charge: Option<LuaCallbackCharge>,
     account: Arc<LuaMemoryAccount>,
     #[cfg(test)]
     charge_after_grow: bool,
@@ -29,9 +31,10 @@ pub(crate) struct ChargedVecDeque<T> {
 
 impl<T> ChargedVecDeque<T> {
     pub(crate) fn new(account: Arc<LuaMemoryAccount>) -> Self {
+        const { assert!(size_of::<T>() > 0) };
         Self {
             buf: VecDeque::new(),
-            capacity_charges: Vec::new(),
+            capacity_charge: None,
             account,
             #[cfg(test)]
             charge_after_grow: false,
@@ -81,25 +84,25 @@ impl<T> ChargedVecDeque<T> {
         let item = self.buf.pop_front();
         #[cfg(test)]
         if self.release_capacity_on_pop {
-            self.capacity_charges.clear();
+            self.capacity_charge = None;
         }
         item
     }
 
     pub(crate) fn take(&mut self) -> Self {
-        let capacity_charges = {
+        let capacity_charge = {
             #[cfg(test)]
             if self.take_without_charge {
-                Vec::new()
+                None
             } else {
-                std::mem::take(&mut self.capacity_charges)
+                self.capacity_charge.take()
             }
             #[cfg(not(test))]
-            std::mem::take(&mut self.capacity_charges)
+            self.capacity_charge.take()
         };
         Self {
             buf: std::mem::take(&mut self.buf),
-            capacity_charges,
+            capacity_charge,
             account: Arc::clone(&self.account),
             #[cfg(test)]
             charge_after_grow: self.charge_after_grow,
@@ -119,52 +122,32 @@ impl<T> ChargedVecDeque<T> {
         if self.always_grow {
             return self.grow();
         }
-        self.ensure_charged()?;
         if self.buf.len() < self.buf.capacity() {
             return Ok(());
         }
         self.grow()
     }
 
-    fn ensure_charged(&mut self) -> Result<(), LuaMemoryCapacityError> {
-        ensure_charges::<T>(
-            &self.account,
-            &mut self.capacity_charges,
-            self.buf.capacity(),
-        )
-    }
-
     fn grow(&mut self) -> Result<(), LuaMemoryCapacityError> {
-        let old_cap = self.buf.capacity();
-        let new_cap = next_capacity(old_cap);
-        let new_bytes = charged_bytes::<T>(new_cap)?;
-        #[cfg(test)]
-        let additional = new_cap.saturating_sub(self.buf.len());
-        #[cfg(test)]
-        if self.charge_after_grow {
-            self.buf
-                .try_reserve_exact(additional)
-                .map_err(|_| reserve_failed::<T>(new_cap))?;
-            return retain_grown_charges::<T>(
-                &self.account,
-                &mut self.capacity_charges,
-                self.account.reserve_shared_callback_storage(new_bytes)?,
-                new_cap,
-                self.buf.capacity(),
-            );
-        }
-        grow_exact(
+        grow_exact_std::<T, _>(
             &self.account,
-            &mut self.capacity_charges,
-            new_cap,
-            new_bytes,
-            || replace_deque_exact(&mut self.buf, new_cap),
+            &mut self.capacity_charge,
+            self.buf.len(),
+            self.buf.capacity(),
+            |additional| {
+                self.buf
+                    .try_reserve_exact(additional)
+                    .map(|_| self.buf.capacity())
+                    .map_err(|_| ())
+            },
+            #[cfg(test)]
+            self.charge_after_grow,
         )
     }
 
     #[cfg(any(test, feature = "allocation-oracle"))]
     pub(crate) fn charge_bytes(&self) -> usize {
-        charge_sum(&self.capacity_charges)
+        charge_bytes(self.capacity_charge.as_ref())
     }
 
     #[cfg(test)]
@@ -195,8 +178,9 @@ impl<T> ChargedVecDeque<T> {
 
 pub(crate) struct ChargedVec<T> {
     buf: Vec<T>,
-    capacity_charges: Vec<LuaCallbackCharge>,
+    capacity_charge: Option<LuaCallbackCharge>,
     account: Arc<LuaMemoryAccount>,
+    reserved: usize,
     #[cfg(test)]
     charge_after_grow: bool,
     #[cfg(test)]
@@ -205,14 +189,18 @@ pub(crate) struct ChargedVec<T> {
     skip_capacity_check: bool,
     #[cfg(test)]
     always_grow: bool,
+    #[cfg(test)]
+    skip_reserved: bool,
 }
 
 impl<T> ChargedVec<T> {
     pub(crate) fn new(account: Arc<LuaMemoryAccount>) -> Self {
+        const { assert!(size_of::<T>() > 0) };
         Self {
             buf: Vec::new(),
-            capacity_charges: Vec::new(),
+            capacity_charge: None,
             account,
+            reserved: 0,
             #[cfg(test)]
             charge_after_grow: false,
             #[cfg(test)]
@@ -221,6 +209,8 @@ impl<T> ChargedVec<T> {
             skip_capacity_check: false,
             #[cfg(test)]
             always_grow: false,
+            #[cfg(test)]
+            skip_reserved: false,
         }
     }
 
@@ -247,7 +237,7 @@ impl<T> ChargedVec<T> {
         let item = self.buf.swap_remove(index);
         #[cfg(test)]
         if self.release_capacity_on_pop {
-            self.capacity_charges.clear();
+            self.capacity_charge = None;
         }
         item
     }
@@ -261,52 +251,64 @@ impl<T> ChargedVec<T> {
         if self.always_grow {
             return self.grow();
         }
-        self.ensure_charged()?;
-        if self.buf.len() < self.buf.capacity() {
+        if self.buf.len() + self.reserved < self.buf.capacity() {
             return Ok(());
         }
         self.grow()
     }
 
-    fn ensure_charged(&mut self) -> Result<(), LuaMemoryCapacityError> {
-        ensure_charges::<T>(
-            &self.account,
-            &mut self.capacity_charges,
-            self.buf.capacity(),
-        )
+    pub(crate) fn reserve_slot(&mut self) -> Result<(), LuaMemoryCapacityError> {
+        self.prepare_push()?;
+        #[cfg(test)]
+        if self.skip_reserved {
+            return Ok(());
+        }
+        self.reserved += 1;
+        Ok(())
+    }
+
+    fn push_reserved(&mut self, item: T) {
+        #[cfg(test)]
+        if self.skip_reserved {
+            self.buf.push(item);
+            return;
+        }
+        assert!(self.reserved > 0);
+        self.reserved -= 1;
+        self.buf.push(item);
+    }
+
+    fn cancel_slot(&mut self) {
+        if self.reserved > 0 {
+            self.reserved -= 1;
+        }
     }
 
     fn grow(&mut self) -> Result<(), LuaMemoryCapacityError> {
-        let old_cap = self.buf.capacity();
-        let new_cap = next_capacity(old_cap);
-        let new_bytes = charged_bytes::<T>(new_cap)?;
-        #[cfg(test)]
-        let additional = new_cap.saturating_sub(self.buf.len());
-        #[cfg(test)]
-        if self.charge_after_grow {
-            self.buf
-                .try_reserve_exact(additional)
-                .map_err(|_| reserve_failed::<T>(new_cap))?;
-            return retain_grown_charges::<T>(
-                &self.account,
-                &mut self.capacity_charges,
-                self.account.reserve_shared_callback_storage(new_bytes)?,
-                new_cap,
-                self.buf.capacity(),
-            );
-        }
-        grow_exact(
+        grow_exact_std::<T, _>(
             &self.account,
-            &mut self.capacity_charges,
-            new_cap,
-            new_bytes,
-            || replace_vec_exact(&mut self.buf, new_cap),
+            &mut self.capacity_charge,
+            self.buf.len(),
+            self.buf.capacity(),
+            |additional| {
+                self.buf
+                    .try_reserve_exact(additional)
+                    .map(|_| self.buf.capacity())
+                    .map_err(|_| ())
+            },
+            #[cfg(test)]
+            self.charge_after_grow,
         )
     }
 
     #[cfg(any(test, feature = "allocation-oracle"))]
     pub(crate) fn charge_bytes(&self) -> usize {
-        charge_sum(&self.capacity_charges)
+        charge_bytes(self.capacity_charge.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserved(&self) -> usize {
+        self.reserved
     }
 
     #[cfg(test)]
@@ -328,6 +330,82 @@ impl<T> ChargedVec<T> {
     pub(crate) fn set_always_grow(&mut self, enabled: bool) {
         self.always_grow = enabled;
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_skip_reserved(&mut self, enabled: bool) {
+        self.skip_reserved = enabled;
+    }
+}
+
+pub(crate) struct SlotReservation<'a, T> {
+    collection: &'a Mutex<ChargedVec<T>>,
+    armed: bool,
+}
+
+impl<'a, T> SlotReservation<'a, T> {
+    pub(crate) fn try_reserve(
+        collection: &'a Mutex<ChargedVec<T>>,
+    ) -> Result<Self, LuaMemoryCapacityError> {
+        let mut guard = collection.lock().map_err(|_| reserve_failed::<T>(0))?;
+        guard.reserve_slot()?;
+        drop(guard);
+        Ok(Self {
+            collection,
+            armed: true,
+        })
+    }
+
+    pub(crate) fn insert(mut self, item: T) {
+        let mut guard = self
+            .collection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.push_reserved(item);
+        self.armed = false;
+    }
+}
+
+impl<T> Drop for SlotReservation<'_, T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut guard = self
+            .collection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.cancel_slot();
+        self.armed = false;
+    }
+}
+
+fn grow_exact_std<T, F>(
+    account: &Arc<LuaMemoryAccount>,
+    capacity_charge: &mut Option<LuaCallbackCharge>,
+    len: usize,
+    old_cap: usize,
+    reserve: F,
+    #[cfg(test)] charge_after_grow: bool,
+) -> Result<(), LuaMemoryCapacityError>
+where
+    F: FnOnce(usize) -> Result<usize, ()>,
+{
+    const { assert!(size_of::<T>() > 0) };
+    let new_cap = next_capacity(old_cap);
+    let additional = new_cap.saturating_sub(len);
+    let new_bytes = charged_bytes::<T>(new_cap)?;
+    #[cfg(test)]
+    if charge_after_grow {
+        let actual = reserve(additional).map_err(|_| reserve_failed::<T>(new_cap))?;
+        assert_eq!(actual, new_cap, "{PINNED_EXACT_GROWTH}");
+        *capacity_charge = Some(account.reserve_shared_callback_storage(new_bytes)?);
+        return Ok(());
+    }
+    let new_charge = account.reserve_shared_callback_storage(new_bytes)?;
+    let actual = reserve(additional).map_err(|_| reserve_failed::<T>(new_cap))?;
+    assert_eq!(actual, new_cap, "{PINNED_EXACT_GROWTH}");
+    *capacity_charge = Some(new_charge);
+    Ok(())
 }
 
 fn next_capacity(current: usize) -> usize {
@@ -338,99 +416,9 @@ fn next_capacity(current: usize) -> usize {
     }
 }
 
-fn charge_sum(charges: &[LuaCallbackCharge]) -> usize {
-    charges.iter().map(LuaCallbackCharge::bytes).sum()
-}
-
-fn ensure_charges<T>(
-    account: &Arc<LuaMemoryAccount>,
-    charges: &mut Vec<LuaCallbackCharge>,
-    actual_cap: usize,
-) -> Result<(), LuaMemoryCapacityError> {
-    let needed = charged_bytes::<T>(actual_cap)?;
-    let have = charge_sum(charges);
-    if needed <= have {
-        return Ok(());
-    }
-    charges.push(account.reserve_shared_callback_storage(needed - have)?);
-    Ok(())
-}
-
-fn grow_exact<F>(
-    account: &Arc<LuaMemoryAccount>,
-    charges: &mut Vec<LuaCallbackCharge>,
-    _new_cap: usize,
-    new_bytes: usize,
-    replace: F,
-) -> Result<(), LuaMemoryCapacityError>
-where
-    F: FnOnce() -> Result<(), LuaMemoryCapacityError>,
-{
-    let new_charge = account.reserve_shared_callback_storage(new_bytes)?;
-    replace()?;
-    *charges = vec![new_charge];
-    Ok(())
-}
-
-fn exact_vec<T>(cap: usize) -> Result<Vec<T>, LuaMemoryCapacityError> {
-    if cap == 0 {
-        return Ok(Vec::new());
-    }
-    if size_of::<T>() == 0 {
-        return Err(reserve_failed::<T>(cap));
-    }
-    let layout = Layout::array::<T>(cap).map_err(|_| reserve_failed::<T>(cap))?;
-    let ptr = unsafe { alloc(layout) };
-    if ptr.is_null() {
-        return Err(reserve_failed::<T>(cap));
-    }
-    Ok(unsafe { Vec::from_raw_parts(ptr.cast::<T>(), 0, cap) })
-}
-
-fn replace_vec_exact<T>(buf: &mut Vec<T>, new_cap: usize) -> Result<(), LuaMemoryCapacityError> {
-    let next = exact_vec::<T>(new_cap)?;
-    let mut old = std::mem::replace(buf, next);
-    buf.append(&mut old);
-    debug_assert_eq!(buf.capacity(), new_cap);
-    Ok(())
-}
-
-fn replace_deque_exact<T>(
-    buf: &mut VecDeque<T>,
-    new_cap: usize,
-) -> Result<(), LuaMemoryCapacityError> {
-    let mut next = exact_vec::<T>(new_cap)?;
-    next.extend(buf.drain(..));
-    let old = std::mem::replace(buf, VecDeque::from(next));
-    drop(old);
-    debug_assert_eq!(buf.capacity(), new_cap);
-    Ok(())
-}
-
-#[cfg(test)]
-fn retain_grown_charges<T>(
-    account: &Arc<LuaMemoryAccount>,
-    charges: &mut Vec<LuaCallbackCharge>,
-    new_charge: LuaCallbackCharge,
-    new_cap: usize,
-    actual: usize,
-) -> Result<(), LuaMemoryCapacityError> {
-    let mut next = vec![new_charge];
-    if actual > new_cap {
-        let extra = charged_bytes::<T>(actual - new_cap)?;
-        match account.reserve_shared_callback_storage(extra) {
-            Ok(charge) => next.push(charge),
-            Err(error) => {
-                *charges = next;
-                return Err(error);
-            }
-        }
-    } else if actual < new_cap {
-        *charges = next;
-        return Err(reserve_failed::<T>(new_cap));
-    }
-    *charges = next;
-    Ok(())
+#[cfg(any(test, feature = "allocation-oracle"))]
+fn charge_bytes(charge: Option<&LuaCallbackCharge>) -> usize {
+    charge.map(LuaCallbackCharge::bytes).unwrap_or(0)
 }
 
 fn charged_bytes<T>(capacity: usize) -> Result<usize, LuaMemoryCapacityError> {
@@ -753,5 +741,95 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v.charge_bytes(), 0);
         assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn exact_growth_contract_names_the_pinned_rustc() {
+        assert_eq!(
+            env!("BOTSTER_RUSTC_VERSION"),
+            "rustc 1.97.0 (2d8144b78 2026-07-07)"
+        );
+    }
+
+    #[test]
+    fn slot_reservation_cancels_without_growth() {
+        let memory = account(8 * slot());
+        let collection = Mutex::new(ChargedVec::<u8>::new(Arc::clone(&memory)));
+        {
+            let mut guard = collection.lock().unwrap();
+            guard.try_push(1).unwrap();
+            guard.try_push(2).unwrap();
+            guard.swap_remove(0);
+        }
+        let cap = collection.lock().unwrap().capacity();
+        let reserved = SlotReservation::try_reserve(&collection).unwrap();
+        assert_eq!(collection.lock().unwrap().reserved(), 1);
+        drop(reserved);
+        assert_eq!(collection.lock().unwrap().reserved(), 0);
+        let reserved = SlotReservation::try_reserve(&collection).unwrap();
+        assert_eq!(collection.lock().unwrap().capacity(), cap);
+        reserved.insert(3);
+        assert_eq!(collection.lock().unwrap().len(), 2);
+        assert_eq!(collection.lock().unwrap().reserved(), 0);
+    }
+
+    fn race_one_free_slot(collection: &Mutex<ChargedVec<u8>>) -> usize {
+        let accepted = std::sync::atomic::AtomicUsize::new(0);
+        let start = std::sync::Barrier::new(2);
+        let reserved = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    start.wait();
+                    let slot = SlotReservation::try_reserve(collection);
+                    reserved.wait();
+                    if let Ok(slot) = slot {
+                        accepted.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        slot.insert(9);
+                    }
+                });
+            }
+        });
+        accepted.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[test]
+    fn two_threads_one_free_slot_refuses_one_before_insert() {
+        let memory = account(3 * slot());
+        let collection = Mutex::new(ChargedVec::<u8>::new(Arc::clone(&memory)));
+        {
+            let mut guard = collection.lock().unwrap();
+            guard.try_push(1).unwrap();
+            guard.try_push(2).unwrap();
+            guard.swap_remove(0);
+        }
+        let leftover = memory.limits().total_callback_bytes - memory.usage().1;
+        let _hold = memory.reserve_shared_callback_storage(leftover).unwrap();
+        assert_eq!(race_one_free_slot(&collection), 1);
+        assert_eq!(collection.lock().unwrap().len(), 2);
+        assert_eq!(collection.lock().unwrap().reserved(), 0);
+    }
+
+    #[test]
+    fn two_threads_one_free_slot_ablation_skips_reserved() {
+        let memory = account(3 * slot());
+        let collection = Mutex::new(ChargedVec::<u8>::new(Arc::clone(&memory)));
+        {
+            let mut guard = collection.lock().unwrap();
+            guard.try_push(1).unwrap();
+            guard.try_push(2).unwrap();
+            guard.swap_remove(0);
+            guard.set_skip_reserved(true);
+        }
+        let leftover = memory.limits().total_callback_bytes - memory.usage().1;
+        let _hold = memory.reserve_shared_callback_storage(leftover).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(race_one_free_slot(&collection), 1);
+            assert_eq!(collection.lock().unwrap().len(), 2);
+        }));
+        assert!(
+            result.is_err(),
+            "skip-reserved ablation must fail the race helper"
+        );
     }
 }

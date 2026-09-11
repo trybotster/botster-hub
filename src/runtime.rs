@@ -1635,29 +1635,24 @@ impl HubRuntime {
             });
         }
         while let Some(pending) = self.session_type_spawner.take_pending() {
-            // Owner thread only: prepare_push, fulfill, and advance_inflight share
-            // this thread, so the reserved slot cannot be stolen before try_push.
-            if match self.inflight_plugin_core.lock() {
-                Ok(mut inflight) => inflight.prepare_push().is_err(),
-                Err(_) => true,
-            } {
-                let _ = pending.response.send(Err(std::borrow::Cow::Borrowed(
-                    crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
-                )));
-                continue;
-            }
-            match self.fulfill_session_type_spawn(&pending) {
-                Ok(start) => {
-                    if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
-                        inflight
-                            .try_push(InflightPluginCore::SessionTypeSpawn {
-                                start,
-                                response: pending.response,
-                            })
-                            .expect("capacity reserved");
-                    }
+            let slot = match crate::lua_memory::charged_collection::SlotReservation::try_reserve(
+                &self.inflight_plugin_core,
+            ) {
+                Ok(slot) => slot,
+                Err(_) => {
+                    let _ = pending.response.send(Err(std::borrow::Cow::Borrowed(
+                        crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+                    )));
+                    continue;
                 }
+            };
+            match self.fulfill_session_type_spawn(&pending) {
+                Ok(start) => slot.insert(InflightPluginCore::SessionTypeSpawn {
+                    start,
+                    response: pending.response,
+                }),
                 Err(error) => {
+                    drop(slot);
                     let _ = pending.response.send(Err(std::borrow::Cow::Owned(error)));
                 }
             }
@@ -2887,19 +2882,20 @@ impl HubRuntime {
 
     fn fulfill_pending_coordination_requests(&self) {
         while let Some(pending) = self.coordination_bridge.take_pending() {
-            // Owner thread only: prepare_push, submit_retained, and
-            // advance_inflight share this thread.
-            if match self.inflight_plugin_core.lock() {
-                Ok(mut inflight) => inflight.prepare_push().is_err(),
-                Err(_) => true,
-            } {
-                let _ = pending
-                    .response
-                    .send(crate::lua_runtime::CoordinationDelivery::Refused(
-                        crate::lua_runtime::CoordinationRefusal::CallbackCapacity,
-                    ));
-                continue;
-            }
+            let slot = match crate::lua_memory::charged_collection::SlotReservation::try_reserve(
+                &self.inflight_plugin_core,
+            ) {
+                Ok(slot) => slot,
+                Err(_) => {
+                    let _ =
+                        pending
+                            .response
+                            .send(crate::lua_runtime::CoordinationDelivery::Refused(
+                                crate::lua_runtime::CoordinationRefusal::CallbackCapacity,
+                            ));
+                    continue;
+                }
+            };
             let (core_storage, storage) = match pending.storage {
                 Some(storage) => (
                     Some(storage.core),
@@ -2916,16 +2912,12 @@ impl HubRuntime {
                 move || caller.claim(),
                 core_storage,
             );
-            if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
-                inflight
-                    .try_push(InflightPluginCore::Coordination {
-                        ticket: submission.ticket,
-                        response: pending.response,
-                        rejected: submission.rejected,
-                        _storage: storage,
-                    })
-                    .expect("capacity reserved");
-            }
+            slot.insert(InflightPluginCore::Coordination {
+                ticket: submission.ticket,
+                response: pending.response,
+                rejected: submission.rejected,
+                _storage: storage,
+            });
         }
         self.advance_inflight_plugin_core();
     }
