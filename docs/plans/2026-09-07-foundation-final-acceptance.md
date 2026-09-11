@@ -107,6 +107,10 @@ The VM-owner source and eight focused test bodies subsequently passed independen
 Root verified both changed files and five unchanged policy files in `/private/tmp/c1-lua-vm-owner-review-20260910-2`.
 Root authorized one 300-second no-run build of the library and two external test targets, covering production and test constructor forms.
 Test execution remains gated on artifact verification. The test hooks establish owner ordering, not cleanup of mlua's partial state or a real finalizer panic.
+The VM-owner build passed in 65.410 seconds. Both constructor forms compiled; the build reported 153 warning events and no errors.
+Root verified 990 source inputs and four executable hashes in `/private/tmp/c1-lua-vm-owner-build-20260910-1`.
+Root authorized thirteen exact tests: eight owner tests, one sandbox test, three Lua completion tests, and the existing load/reload refusal test.
+Each test runs once with a 60-second deadline and stops the sequence on failure or identity change.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
