@@ -132,6 +132,10 @@ pub struct HubRuntime {
     rollback_git_hold: Mutex<Option<Arc<crate::host_executor::TestHostGate>>>,
     #[cfg(test)]
     managed_accept_ones: AtomicUsize,
+    #[cfg(test)]
+    retry_retained_again_on_pending: AtomicBool,
+    #[cfg(test)]
+    resubmit_release_on_pending: AtomicBool,
     close_work: crate::data_plane::CloseWorkSource,
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
@@ -495,6 +499,10 @@ impl HubRuntime {
             rollback_git_hold: Mutex::new(None),
             #[cfg(test)]
             managed_accept_ones: AtomicUsize::new(0),
+            #[cfg(test)]
+            retry_retained_again_on_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            resubmit_release_on_pending: AtomicBool::new(false),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -616,6 +624,10 @@ impl HubRuntime {
             rollback_git_hold: Mutex::new(None),
             #[cfg(test)]
             managed_accept_ones: AtomicUsize::new(0),
+            #[cfg(test)]
+            retry_retained_again_on_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            resubmit_release_on_pending: AtomicBool::new(false),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -993,6 +1005,33 @@ impl HubRuntime {
     #[cfg(test)]
     pub(crate) fn test_refuse_next_owner_begins(&self, count: usize) {
         self.core_daemon.test_refuse_next_owner_begins(count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_refuse_next_owner_begins_remaining(&self) -> usize {
+        self.core_daemon.test_refuse_next_owner_begins_remaining()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_retry_retained_again_on_pending(&self, enabled: bool) {
+        self.retry_retained_again_on_pending
+            .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_retry_retained_again_on_pending(&self) -> bool {
+        self.retry_retained_again_on_pending.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_resubmit_release_on_pending(&self, enabled: bool) {
+        self.resubmit_release_on_pending
+            .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_resubmit_release_on_pending(&self) -> bool {
+        self.resubmit_release_on_pending.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
