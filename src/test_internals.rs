@@ -38,6 +38,12 @@ pub mod lua_json {
         Prepared { lua, value, memory }
     }
 
+    pub fn live_refs_peak(prepared: &Prepared) -> usize {
+        crate::lua_runtime::lua_json::value_size(&prepared.memory, &prepared.lua, &prepared.value)
+            .expect("lua json size")
+            .live_refs_peak
+    }
+
     pub fn admitted(prepared: &Prepared) -> usize {
         let admission = crate::lua_runtime::lua_json::value_size(
             &prepared.memory,
