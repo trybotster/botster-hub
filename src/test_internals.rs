@@ -52,7 +52,16 @@ pub mod lua_json {
     }
 
     pub fn build(prepared: &Prepared) -> serde_json::Value {
-        crate::lua_runtime::lua_json::value_build(&prepared.memory, &prepared.lua, &prepared.value)
+        let admission = crate::lua_runtime::lua_json::value_size(
+            &prepared.memory,
+            &prepared.lua,
+            &prepared.value,
+        )
+        .expect("lua json size");
+        let prepaid = admission
+            .prepaid(&prepared.memory)
+            .expect("lua json scratch");
+        crate::lua_runtime::lua_json::value_build(&prepared.lua, &prepared.value, prepaid)
             .expect("lua json build")
     }
 }

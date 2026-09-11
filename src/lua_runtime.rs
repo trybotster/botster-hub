@@ -2690,16 +2690,17 @@ fn admit_publish_operation(
     };
     let body_len = body.map(str::len).unwrap_or(0);
     let extension = table.raw_get::<Value>("extension")?;
-    let extension_bytes = match &extension {
-        Value::Nil => 0,
+    let (extension_bytes, extension_admission) = match &extension {
+        Value::Nil => (0, None),
         value => {
             let admission = lua_json::value_size(memory, lua, value)?;
-            admission
-                .json_bytes
-                .checked_add(admission.scratch_peak)
-                .ok_or(AdmissionError::Capacity)?
+            (admission.json_bytes, Some(admission))
         }
     };
+    let scratch_peak = extension_admission
+        .as_ref()
+        .map(|admission| admission.scratch_peak)
+        .unwrap_or(0);
     let created_at = lua_u64(table.raw_get::<Value>("created_at")?).unwrap_or(0);
     let target_table = match table.raw_get::<Value>("target")? {
         Value::Table(target) => target,
@@ -2730,8 +2731,13 @@ fn admit_publish_operation(
         .and_then(|bytes| bytes.checked_add(first_text.len()))
         .and_then(|bytes| bytes.checked_add(second_text.map(str::len).unwrap_or(0)))
         .and_then(|bytes| bytes.checked_add(extension_bytes))
+        .and_then(|bytes| bytes.checked_add(scratch_peak))
         .ok_or(AdmissionError::Capacity)?;
-    let entry = admit_callback_bytes(memory, payload)?;
+    let mut entry = admit_callback_bytes(memory, payload)?;
+    let extension_scratch = match &extension_admission {
+        Some(admission) => Some(admission.bind(&mut entry)?),
+        None => None,
+    };
     let target = envelope_target_from_parts(target_kind, first_text, second_text)?;
     let content_type = match content_type {
         Some(text) => exact_string(text),
@@ -2743,7 +2749,11 @@ fn admit_publish_operation(
     };
     let extension = match extension {
         Value::Nil => None,
-        value => Some(BoundaryJson(lua_json::value_build(memory, lua, &value)?)),
+        value => Some(BoundaryJson(lua_json::value_build(
+            lua,
+            &value,
+            extension_scratch.expect("sized extension has prepaid scratch"),
+        )?)),
     };
     let mut targets = Vec::with_capacity(1);
     targets.push(target);
