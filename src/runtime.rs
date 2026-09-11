@@ -4392,6 +4392,19 @@ impl HubSessionTypeSpawner {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_managed_queue_len(&self) -> usize {
+        self.managed
+            .lock()
+            .map(|queue| queue.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_publish_managed_spawn(&self) {
+        self.publish_managed_spawn();
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_enqueue_managed_disconnected(
         &self,
         plugin_key: PluginKey,

@@ -301,6 +301,14 @@ pub fn prepare_managed_worktree(
         ]);
     }
     if let Err(failure) = git_status(Some(&repository_root), &args, deadline, "worktree_conflict") {
+        if path.exists() {
+            let listed = list_worktrees(&repository_root, deadline)?;
+            if listed.iter().any(|worktree| {
+                canonical_or_original(&worktree.path) == canonical_or_original(&path)
+            }) {
+                return Err(failure);
+            }
+        }
         return compensate_failed_creation(&rollback, failure);
     }
     let reconciled = (|| {
