@@ -2213,6 +2213,61 @@ mod tests {
         path
     }
 
+    fn write_frame_exit_worker(root: &std::path::Path) -> std::path::PathBuf {
+        let python = String::from_utf8(
+            std::process::Command::new("python3")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .expect("python3 executable")
+                .stdout,
+        )
+        .expect("python path utf8");
+        write_worker_script(
+            root,
+            &format!(
+                r#"#!{python}
+import os, socket, sys
+path = None
+args = sys.argv
+for i, arg in enumerate(args):
+    if arg == "--control-socket" and i + 1 < len(args):
+        path = args[i + 1]
+        break
+if not path:
+    sys.exit(5)
+if os.path.exists(path):
+    os.unlink(path)
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path)
+srv.listen(1)
+sys.stdout.write("botster-session-worker-ready %s\n" % os.getpid())
+sys.stdout.flush()
+conn, _unused = srv.accept()
+hello = conn.recv(5, socket.MSG_WAITALL)
+if hello is None or len(hello) != 5:
+    sys.exit(2)
+n = conn.recv(4, socket.MSG_WAITALL)
+if n is None or len(n) != 4:
+    sys.exit(3)
+length = int.from_bytes(n, "little")
+body = b""
+while len(body) < length:
+    chunk = conn.recv(length - len(body))
+    if not chunk:
+        break
+    body += chunk
+if len(body) != length:
+    sys.exit(4)
+sys.exit(0)
+"#,
+                python = python.trim()
+            ),
+        )
+    }
+
     fn matched_worker_path() -> std::path::PathBuf {
         let path = std::path::PathBuf::from(MATCHED_WORKER);
         let hashed = std::process::Command::new("shasum")
@@ -2620,5 +2675,64 @@ sys.exit(0)
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(package_root);
+    }
+
+    #[test]
+    fn plugin_retained_token_is_retried_by_the_next_plugin_spawn() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let worker_root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-plugin-retry-worker-{}-{stamp}",
+            std::process::id()
+        ));
+        let worker = write_frame_exit_worker(&worker_root);
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("plugin-retry", Some(worker));
+        let package_root = root.join("p1-plugin");
+        let record = plugin_spawn_package(&package_root);
+        let first = daemon.runtime().unwrap().test_plugin_spawn(
+            "p1.plugin",
+            "agent",
+            crate::session_types::SessionTypeRequest {
+                session_id: Some(SessionId("s1-plugin-retry-a".into())),
+                ..crate::session_types::SessionTypeRequest::default()
+            },
+            vec![record.clone()],
+        );
+        let first = first.expect_err("first plugin spawn must retain unconfirmed");
+        assert!(
+            first.to_ascii_lowercase().contains("cleanup")
+                || first.to_ascii_lowercase().contains("unconfirmed")
+                || first.to_ascii_lowercase().contains("spawn"),
+            "first plugin spawn must fail after creation possible: {first}"
+        );
+        let held = daemon.runtime().unwrap().retained_reservations();
+        assert_eq!(held.len(), 1, "plugin spawn must retain the unconfirmed token");
+        let token = held[0].clone();
+        let second = daemon.runtime().unwrap().test_plugin_spawn(
+            "p1.plugin",
+            "agent",
+            crate::session_types::SessionTypeRequest {
+                session_id: Some(SessionId("s1-plugin-retry-b".into())),
+                ..crate::session_types::SessionTypeRequest::default()
+            },
+            vec![record],
+        );
+        assert!(second.is_err(), "{second:?}");
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .retained_reservations()
+                .iter()
+                .any(|kept| kept == &token),
+            "next plugin spawn must retry and keep the unconfirmed token"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(worker_root);
     }
 }
