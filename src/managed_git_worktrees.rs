@@ -383,10 +383,13 @@ pub(crate) fn finalize_managed_worktree(
     prepared: &PreparedManagedWorktree,
     decision: ManagedWorktreeDecision,
     deadline: Instant,
+    suppress_rollback: Option<&std::sync::Mutex<std::collections::BTreeSet<String>>>,
 ) -> Result<(), ManagedGitError> {
     match decision {
         ManagedWorktreeDecision::Commit => Ok(()),
-        ManagedWorktreeDecision::Rollback => rollback_prepared_worktree(prepared, deadline),
+        ManagedWorktreeDecision::Rollback => {
+            rollback_prepared_worktree_inner(prepared, deadline, suppress_rollback)
+        }
     }
 }
 
@@ -394,7 +397,26 @@ pub fn rollback_prepared_worktree(
     prepared: &PreparedManagedWorktree,
     deadline: Instant,
 ) -> Result<(), ManagedGitError> {
-    if !prepared.created_worktree {
+    rollback_prepared_worktree_inner(prepared, deadline, None)
+}
+
+fn rollback_suppressed(
+    prepared: &PreparedManagedWorktree,
+    suppress_rollback: Option<&std::sync::Mutex<std::collections::BTreeSet<String>>>,
+) -> bool {
+    suppress_rollback.is_some_and(|held| {
+        held.lock()
+            .ok()
+            .is_some_and(|ids| ids.contains(&prepared.worktree_id))
+    })
+}
+
+fn rollback_prepared_worktree_inner(
+    prepared: &PreparedManagedWorktree,
+    deadline: Instant,
+    suppress_rollback: Option<&std::sync::Mutex<std::collections::BTreeSet<String>>>,
+) -> Result<(), ManagedGitError> {
+    if !prepared.created_worktree || rollback_suppressed(prepared, suppress_rollback) {
         return Ok(());
     }
     if resolve_common_dir(&prepared.path, deadline)? != prepared.common_dir {
@@ -432,6 +454,9 @@ pub fn rollback_prepared_worktree(
             "rollback_identity_mismatch",
             "managed worktree has content changes and was preserved",
         ));
+    }
+    if rollback_suppressed(prepared, suppress_rollback) {
+        return Ok(());
     }
     git_status(
         Some(&prepared.repository_root),
@@ -1206,6 +1231,7 @@ mod tests {
             &committed,
             ManagedWorktreeDecision::Commit,
             Instant::now() + Duration::from_secs(5),
+            None,
         )
         .expect("commit worktree effect");
         assert!(committed.path.exists());
@@ -1219,6 +1245,7 @@ mod tests {
             &rolled_back,
             ManagedWorktreeDecision::Rollback,
             Instant::now() + Duration::from_secs(5),
+            None,
         )
         .expect("roll back worktree effect");
         assert!(!rolled_back.path.exists());

@@ -23,7 +23,7 @@ use crate::host_mutations::{
 };
 use crate::managed_git_worktrees::{
     MANAGED_GIT_OPERATION_TIMEOUT, ManagedGitError, ManagedWorktreeDecision,
-    PreparedManagedWorktree,
+    PreparedManagedWorktree, managed_worktree_id,
 };
 use crate::owner_identity::WaiterId;
 use crate::runtime::{ManagedSessionSpawnStart, PendingManagedSessionSpawn};
@@ -86,13 +86,121 @@ impl ManagedGitRecoveryRequired {
     }
 }
 
+fn accept_confirmed_rollback(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    if runtime.created_worktree_rollback_suppressed(&prepared.worktree_id) {
+        return;
+    }
+    let Some(owner_permit) = state.budget.reserve() else {
+        runtime.defer_confirmed_worktree_rollback(prepared);
+        return;
+    };
+    let Some(waiter_id) = state.waiter_ids.next() else {
+        state.budget.release(owner_permit);
+        runtime.defer_confirmed_worktree_rollback(prepared);
+        return;
+    };
+    let Some(host_permit) = runtime.host_executor().try_reserve() else {
+        state.budget.release(owner_permit);
+        runtime.defer_confirmed_worktree_rollback(prepared);
+        return;
+    };
+    let deadline = Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT;
+    if runtime
+        .host_executor()
+        .submit(
+            HostJobIdentity {
+                waiter_id,
+                phase: 1,
+            },
+            HostCommand::FinalizeManagedWorktree {
+                prepared: prepared.clone(),
+                decision: ManagedWorktreeDecision::Rollback,
+                deadline,
+                discard: None,
+                suppress_rollback: runtime.created_worktree_rollback_suppressions(),
+            },
+            host_permit,
+        )
+        .is_err()
+    {
+        state.budget.release(owner_permit);
+        runtime.defer_confirmed_worktree_rollback(prepared);
+        return;
+    }
+    let operation = ManagedSpawnOperation {
+        waiter_id,
+        pending: None,
+        prepared: Some(prepared),
+        prepared_mutation: None,
+        spawn: None,
+        permit: None,
+        phase: Phase::FinalizeRollback,
+        next_host_phase: 2,
+        record_committed: true,
+        deferred_error: None,
+        deadline,
+    };
+    let (reply_tx, _reply_rx) = crate::daemon::control::message::control_reply_channel();
+    state.pending_requests.insert(
+        waiter_id,
+        PendingControlRequest {
+            waiter_id,
+            ready_class: ReadyClass::HostCompletion,
+            ready_key: None,
+            deadline_key: None,
+            last_core_phase: 0,
+            last_host_phase: 0,
+            completion: crate::daemon::control::pending::OwnerRequestCompletion::default(),
+            reply_tx,
+            response_delivery_rx: None,
+            grant_id: None,
+            client: None,
+            core_retirement: None,
+            permit: Some(owner_permit),
+            must_finish: true,
+            past_deadline: false,
+            continuation: crate::daemon::control::pending::ControlContinuation::ManagedSpawn(
+                Box::new(operation),
+            ),
+            retire: None,
+        },
+    );
+    let arm = state
+        .deadlines
+        .arm(waiter_id, deadline, Instant::now())
+        .expect("a rollback deadline must make progress");
+    state
+        .pending_requests
+        .get_mut(&waiter_id)
+        .expect("the rollback waiter was inserted")
+        .deadline_key = Some(arm.key());
+    mark_owner_ready(state, waiter_id, ReadyClass::HostCompletion, READY_INITIAL);
+}
+
 pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     let Some(runtime) = daemon.runtime() else {
         return;
     };
+    runtime.retry_created_worktree_releases();
+    runtime.reap_detached_core_operations();
     let Some(pending) = runtime.take_pending_managed_spawn() else {
+        if let Some(prepared) = runtime.take_one_confirmed_worktree_rollback() {
+            accept_confirmed_rollback(daemon, state, prepared);
+        }
         return;
     };
+    runtime.cancel_created_worktree_cleanup(&managed_worktree_id(
+        &pending.target_id,
+        &pending.branch,
+    ));
+    runtime.wake_remaining_confirmed_worktree_rollbacks();
     if let Some(detail) = state
         .host_recovery
         .values()
@@ -535,6 +643,7 @@ impl ManagedSpawnOperation {
                 if delivered {
                     self.submit_finalize(daemon, state, ManagedWorktreeDecision::Commit, None)
                 } else {
+                    self.queue_undelivered_created_cleanup(runtime, &spawned);
                     runtime.cleanup_managed_session(&spawned);
                     self.deferred_error = Some(ManagedGitError::new(
                         "ensure_timed_out",
@@ -544,6 +653,7 @@ impl ManagedSpawnOperation {
                 }
             }
             Ok(spawned) => {
+                self.queue_undelivered_created_cleanup(runtime, &spawned);
                 runtime.cleanup_managed_session(&spawned);
                 self.deferred_error = Some(timeout_error());
                 self.finish_deferred_error()
@@ -595,7 +705,13 @@ impl ManagedSpawnOperation {
     ) -> ControlPoll {
         match result {
             HostResult::ManagedWorktreeFinalized => {
-                let remove_record = self.record_committed
+                let suppressed = self.prepared.as_ref().is_some_and(|prepared| {
+                    daemon.runtime().is_some_and(|runtime| {
+                        runtime.created_worktree_rollback_suppressed(&prepared.worktree_id)
+                    })
+                });
+                let remove_record = !suppressed
+                    && self.record_committed
                     && self
                         .prepared
                         .as_ref()
@@ -609,7 +725,14 @@ impl ManagedSpawnOperation {
             HostResult::ManagedWorktreeRecoveryRequired { prepared, error } => {
                 self.retain_recovery(state, prepared, error)
             }
-            HostResult::Failed { error, .. } => self.finish_error(managed_host_failure(error)),
+            HostResult::Failed { error, .. } => {
+                if self.pending.is_none() {
+                    if let Some(prepared) = self.prepared.clone() {
+                        return self.retain_recovery(state, prepared, error);
+                    }
+                }
+                self.finish_error(managed_host_failure(error))
+            }
             _ => {
                 self.finish_reconciliation("the host executor returned an invalid rollback result")
             }
@@ -805,6 +928,12 @@ impl ManagedSpawnOperation {
                 decision,
                 deadline: self.deadline,
                 discard,
+                suppress_rollback: daemon
+                    .runtime()
+                    .map(|runtime| runtime.created_worktree_rollback_suppressions())
+                    .unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(
+                        std::collections::BTreeSet::new(),
+                    ))),
             },
         )
     }
@@ -857,6 +986,28 @@ impl ManagedSpawnOperation {
                 self.finish_reconciliation(detail)
             }
         }
+    }
+
+    fn queue_undelivered_created_cleanup(
+        &self,
+        runtime: &crate::runtime::HubRuntime,
+        spawned: &crate::runtime::PluginManagedSessionSpawned,
+    ) {
+        let Some(prepared) = self.prepared.clone() else {
+            return;
+        };
+        let Some(reservation) = self
+            .spawn
+            .as_ref()
+            .and_then(|start| start.reservation.clone())
+        else {
+            return;
+        };
+        runtime.queue_created_worktree_cleanup(
+            botster_core::SessionId(spawned.session_id.clone()),
+            prepared,
+            reservation,
+        );
     }
 
     fn deadline_elapsed(&self) -> bool {

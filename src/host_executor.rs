@@ -1,6 +1,6 @@
 //! Fixed, bounded execution for Hub work that must not run on the owner thread.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
@@ -98,6 +98,7 @@ pub(crate) enum HostCommand {
         decision: ManagedWorktreeDecision,
         deadline: Instant,
         discard: Option<Box<crate::host_mutations::PreparedMutation>>,
+        suppress_rollback: Arc<Mutex<BTreeSet<String>>>,
     },
     #[cfg(test)]
     Panic {
@@ -1298,13 +1299,28 @@ fn execute(
             decision,
             deadline,
             discard,
+            suppress_rollback,
         } => {
-            let result = match finalize_managed_worktree(&prepared, decision, deadline) {
-                Ok(()) => HostResult::ManagedWorktreeFinalized,
-                Err(error) => HostResult::ManagedWorktreeRecoveryRequired {
-                    prepared,
-                    error: HostError::new(error.kind, error.message),
-                },
+            let suppressed = matches!(decision, ManagedWorktreeDecision::Rollback)
+                && suppress_rollback
+                    .lock()
+                    .ok()
+                    .is_some_and(|held| held.contains(&prepared.worktree_id));
+            let result = if suppressed {
+                HostResult::ManagedWorktreeFinalized
+            } else {
+                match finalize_managed_worktree(
+                    &prepared,
+                    decision,
+                    deadline,
+                    Some(&suppress_rollback),
+                ) {
+                    Ok(()) => HostResult::ManagedWorktreeFinalized,
+                    Err(error) => HostResult::ManagedWorktreeRecoveryRequired {
+                        prepared,
+                        error: HostError::new(error.kind, error.message),
+                    },
+                }
             };
             drop(discard);
             result
@@ -2453,6 +2469,7 @@ mod tests {
                     decision: ManagedWorktreeDecision::Rollback,
                     deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
                     discard: None,
+                    suppress_rollback: Arc::new(Mutex::new(BTreeSet::new())),
                 },
                 permit,
             )
@@ -2479,6 +2496,7 @@ mod tests {
                     decision: ManagedWorktreeDecision::Rollback,
                     deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
                     discard: None,
+                    suppress_rollback: Arc::new(Mutex::new(BTreeSet::new())),
                 },
                 permit,
             )
