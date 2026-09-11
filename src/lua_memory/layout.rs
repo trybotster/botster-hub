@@ -161,6 +161,8 @@ pub(crate) const fn lua_reference_bytes() -> usize {
     arc_bytes::<std::ffi::c_int>()
 }
 
+/// BTreeMap node occupancy from pinned rustc 1.97.0 (2d8144b78) `LeafNode` /
+/// `InternalNode`. Capacity 11, 12 edges, non-root minimum occupancy 5.
 const BTREE_CAPACITY: usize = 11;
 const BTREE_EDGES: usize = 12;
 const BTREE_MIN_OCCUPANCY: usize = 5;
@@ -184,11 +186,21 @@ pub(crate) fn btree_internal_size<K, V>() -> usize {
     std::mem::size_of::<BTreeInternalMirror<K, V>>()
 }
 
-pub(crate) fn btree_nodes<K, V>(len: usize) -> usize {
+/// Byte bound for a `BTreeMap<K, V>` built by repeated `insert`.
+///
+/// Root + `len × internal/5` from minimum occupancy of non-root nodes on
+/// pinned rustc 1.97.0 (2d8144b78). This is a byte size, not a node count.
+/// Construction peak equals the final node set because splits allocate and
+/// do not free. Returns `None` on overflow so admission can refuse.
+pub(crate) fn btree_nodes_checked<K, V>(len: usize) -> Option<usize> {
     if len == 0 {
-        0
-    } else {
-        let internal = btree_internal_size::<K, V>();
-        internal.saturating_add(len.saturating_mul(internal / BTREE_MIN_OCCUPANCY))
+        return Some(0);
     }
+    let internal = btree_internal_size::<K, V>();
+    let per = internal / BTREE_MIN_OCCUPANCY;
+    internal.checked_add(len.checked_mul(per)?)
+}
+
+pub(crate) fn btree_nodes<K, V>(len: usize) -> usize {
+    btree_nodes_checked::<K, V>(len).unwrap_or(usize::MAX)
 }

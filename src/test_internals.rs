@@ -16,6 +16,48 @@ pub mod hub_state_heap {
 }
 
 #[cfg(feature = "allocation-oracle")]
+pub mod lua_json {
+    use mlua::{Lua, Value};
+
+    pub struct Prepared {
+        lua: Lua,
+        value: Value,
+        memory: std::sync::Arc<crate::lua_memory::LuaMemoryAccount>,
+    }
+
+    pub fn prepare(source: &str) -> Prepared {
+        let lua = Lua::new();
+        let value: Value = lua.load(source).eval().expect("lua json oracle source");
+        let memory = crate::lua_memory::LuaMemoryAccount::new(crate::lua_memory::LuaMemoryLimits {
+            per_vm_bytes: 1024 * 1024,
+            total_vm_bytes: 1024 * 1024,
+            per_callback_bytes: 1024 * 1024,
+            total_callback_bytes: 1024 * 1024,
+        })
+        .expect("lua json oracle account");
+        Prepared { lua, value, memory }
+    }
+
+    pub fn admitted(prepared: &Prepared) -> usize {
+        let admission = crate::lua_runtime::lua_json::value_size(
+            &prepared.memory,
+            &prepared.lua,
+            &prepared.value,
+        )
+        .expect("lua json size");
+        admission
+            .json_bytes
+            .checked_add(admission.scratch_peak)
+            .expect("lua json admission")
+    }
+
+    pub fn build(prepared: &Prepared) -> serde_json::Value {
+        crate::lua_runtime::lua_json::value_build(&prepared.memory, &prepared.lua, &prepared.value)
+            .expect("lua json build")
+    }
+}
+
+#[cfg(feature = "allocation-oracle")]
 pub mod charged_collection {
     use std::mem::MaybeUninit;
     use std::sync::Arc;
