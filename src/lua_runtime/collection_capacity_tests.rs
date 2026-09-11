@@ -1,6 +1,7 @@
 use super::*;
 use crate::data_plane::driver::CoreSubmissionStorage;
 use crate::lua_memory::LuaMemoryLimits;
+use botster_core::PluginKey;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -374,4 +375,57 @@ fn seal_take_ablation_leaves_charge_on_source() {
     assert_eq!(bridge.test_pending_count(), 0);
     assert_eq!(bridge.test_pending_charge_bytes(), 2 * slot());
     assert_eq!(memory.usage().1, 2 * slot());
+}
+
+#[test]
+fn shared_capacity_error_reuses_one_arc() {
+    super::fund_callback_capacity_error();
+    let first = super::callback_capacity_error();
+    let second = super::callback_capacity_error();
+    match (first, second) {
+        (mlua::Error::ExternalError(first), mlua::Error::ExternalError(second)) => {
+            assert!(Arc::ptr_eq(&first, &second));
+            assert_eq!(first.to_string(), LUA_CALLBACK_CAPACITY_EXHAUSTED);
+            assert!(!first.to_string().contains("runtime error:"));
+        }
+        _ => panic!("capacity error must be ExternalError"),
+    }
+}
+
+fn bind_coordination(memory: Arc<LuaMemoryAccount>) -> mlua::Lua {
+    let lua = mlua::Lua::new();
+    super::fund_callback_capacity_error();
+    let table = super::coordination_table(
+        &lua,
+        PluginKey("capacity.plugin".into()),
+        HubCoordinationBridge::new(Arc::clone(&memory)),
+        memory,
+    )
+    .unwrap();
+    lua.globals().set("coordination", table).unwrap();
+    lua
+}
+
+fn pcall_capacity(lua: &mlua::Lua, call: &str) -> String {
+    let chunk = format!("local ok, err = pcall({call}); return ok, tostring(err)");
+    let (ok, message): (bool, String) = lua.load(&chunk).eval().unwrap();
+    assert!(!ok, "{call} must raise");
+    message
+}
+
+#[test]
+fn publish_and_drain_capacity_raise_without_runtime_prefix() {
+    let memory = account(1);
+    let lua = bind_coordination(Arc::clone(&memory));
+    let publish = "coordination.publish, { id = 'e1', target = { type = 'topic', topic = 't' } }";
+    let drain = "coordination.drain, { target = { type = 'topic', topic = 't' } }";
+    let before = memory.usage().1;
+    for call in [publish, drain] {
+        for _ in 0..8 {
+            let message = pcall_capacity(&lua, call);
+            assert_eq!(message, LUA_CALLBACK_CAPACITY_EXHAUSTED);
+            assert!(!message.contains("runtime error:"));
+        }
+    }
+    assert_eq!(memory.usage().1, before);
 }
