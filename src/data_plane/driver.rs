@@ -466,13 +466,6 @@ pub(crate) struct CoreWaiterRetirement {
     waiter_id: WaiterId,
 }
 
-impl CoreWaiterRetirement {
-    #[allow(dead_code)] // owner rows identify retirement by the held waiter
-    pub(crate) fn waiter_id(&self) -> WaiterId {
-        self.waiter_id
-    }
-}
-
 pub(crate) struct CoreSubmission<T> {
     pub(crate) ticket: ChargedCoreTicket<T>,
     pub(crate) rejected: Option<CoreRejectedRequest>,

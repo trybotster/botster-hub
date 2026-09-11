@@ -178,7 +178,7 @@ impl CoordinationContinuation {
         if let Some(completion) = state.host_completions.remove(&self.waiter_id) {
             if !matches!(
                 &completion.result,
-                HostResult::CoordinationResponseDelivered { .. } | HostResult::Failed { .. }
+                HostResult::CoordinationResponseDelivered | HostResult::Failed { .. }
             ) {
                 state.host_completions.insert(self.waiter_id, completion);
                 state.coordination_fault = Some(CoordinationFault::UnexpectedCompletion);

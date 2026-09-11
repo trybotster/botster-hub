@@ -637,7 +637,7 @@ impl SessionTypeCatalogCache {
             | HostResult::EntrypointsStopped
             | HostResult::StatusResponsePrepared(_)
             | HostResult::StatusResponseDelivered { .. }
-            | HostResult::CoordinationResponseDelivered { .. }
+            | HostResult::CoordinationResponseDelivered
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)
@@ -705,7 +705,7 @@ impl SessionTypeCatalogCache {
             | HostResult::EntrypointsStopped
             | HostResult::StatusResponsePrepared(_)
             | HostResult::StatusResponseDelivered { .. }
-            | HostResult::CoordinationResponseDelivered { .. }
+            | HostResult::CoordinationResponseDelivered
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)
