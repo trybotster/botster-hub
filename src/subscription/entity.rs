@@ -483,6 +483,7 @@ impl SessionTypeCatalogCache {
         };
         self.terminal = Some(crate::host_disposal::Job::new(
             crate::host_disposal::Parts {
+                storage: None,
                 identity,
                 permit,
                 model: None,
@@ -636,6 +637,7 @@ impl SessionTypeCatalogCache {
             | HostResult::EntrypointsStopped
             | HostResult::StatusResponsePrepared(_)
             | HostResult::StatusResponseDelivered { .. }
+            | HostResult::CoordinationResponseDelivered { .. }
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)
@@ -703,6 +705,7 @@ impl SessionTypeCatalogCache {
             | HostResult::EntrypointsStopped
             | HostResult::StatusResponsePrepared(_)
             | HostResult::StatusResponseDelivered { .. }
+            | HostResult::CoordinationResponseDelivered { .. }
             | HostResult::PluginResponseAbandoned
             | HostResult::PluginResponseDelivered { .. }
             | HostResult::Mutation(_)
@@ -1529,6 +1532,26 @@ fn publish_catalog_capacity_wake(state: &mut DaemonControlState, owner_turn: &mu
                 crate::daemon::owner_schedule::ReadyClass::HostCompletion,
                 crate::daemon::control::pending::READY_HOST_COMPLETION,
             );
+        }
+    }
+    while !state.coordination_capacity_waiters.is_empty() {
+        if owner_turn
+            .try_charge(Instant::now(), OwnerTurnCharge::opaque_move())
+            .is_err()
+        {
+            return;
+        }
+        if let Some(waiter_id) = state.coordination_capacity_waiters.pop_first() {
+            if !crate::daemon::control::pending::mark_owner_ready(
+                state,
+                waiter_id,
+                crate::daemon::owner_schedule::ReadyClass::HostCompletion,
+                crate::daemon::control::pending::READY_HOST_COMPLETION,
+            ) {
+                state.coordination_fault = Some(
+                    crate::daemon::control::coordination::CoordinationFault::SchedulerExhausted,
+                );
+            }
         }
     }
     while state.plugin_entities.has_capacity_waiters() {
@@ -2484,6 +2507,7 @@ mod tests {
         );
         let (identity, result, permit) = duplicate.into_parts();
         let mut disposal = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+            storage: None,
             identity,
             permit,
             payload: Box::new(result),

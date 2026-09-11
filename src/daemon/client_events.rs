@@ -104,6 +104,7 @@ impl ClientEvents {
             connection.record.close();
             connection.terminal = Some(crate::host_disposal::Job::new_client(
                 crate::host_disposal::Parts {
+                    storage: None,
                     identity,
                     permit,
                     payload: Box::new(payload),

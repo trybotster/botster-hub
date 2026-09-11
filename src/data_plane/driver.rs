@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core_daemon::{
@@ -104,12 +104,51 @@ impl DataPlaneProgressLatch {
 }
 
 type PendingCoreOperations = BTreeMap<PendingOperationId, CoreResultPublisher>;
-type CoreRequest = Box<dyn FnOnce(&mut CoreDaemon, &mut PendingCoreOperations) + Send + 'static>;
+type CoreRequestOperation =
+    dyn FnOnce(&mut CoreDaemon, &mut PendingCoreOperations) + Send + 'static;
+
+struct CoreRequest {
+    operation: Box<CoreRequestOperation>,
+    // Free the closure allocation before releasing its charge.
+    charge: Option<crate::lua_memory::LuaCallbackCharge>,
+}
+
+impl CoreRequest {
+    fn new<F>(operation: F) -> Self
+    where
+        F: FnOnce(&mut CoreDaemon, &mut PendingCoreOperations) + Send + 'static,
+    {
+        Self {
+            operation: Box::new(operation),
+            charge: None,
+        }
+    }
+
+    fn run(self, daemon: &mut CoreDaemon, pending: &mut PendingCoreOperations) {
+        let Self { operation, charge } = self;
+        operation(daemon, pending);
+        drop(charge);
+    }
+
+    fn charged<F>(operation: F, charge: crate::lua_memory::LuaCallbackCharge) -> Self
+    where
+        F: FnOnce(&mut CoreDaemon, &mut PendingCoreOperations) + Send + 'static,
+    {
+        Self {
+            operation: Box::new(operation),
+            charge: Some(charge),
+        }
+    }
+}
+
+#[cfg(feature = "allocation-oracle")]
+pub(crate) mod allocation_oracle;
 
 #[derive(Debug)]
 struct CoreCompletionWake {
     pending: AtomicBool,
     owner: Mutex<Option<ControlSender>>,
+    terminal_owner: Mutex<Option<thread::Thread>>,
     identities: Mutex<CoreCompletionIdentities>,
 }
 
@@ -125,6 +164,7 @@ impl CoreCompletionWake {
         Self {
             pending: AtomicBool::new(false),
             owner: Mutex::new(None),
+            terminal_owner: Mutex::new(None),
             identities: Mutex::new(CoreCompletionIdentities::default()),
         }
     }
@@ -241,14 +281,56 @@ impl CoreCompletionWake {
     }
 
     fn notify_owner(&self) {
-        if let Some(sender) = self
+        let terminal = self
+            .terminal_owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(terminal) = terminal {
+            terminal.unpark();
+            return;
+        }
+        let sender = self
             .owner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-        {
+            .clone();
+        if let Some(sender) = sender {
             let _ = sender.try_send(ControlMessage::CoreCompletionPublished);
         }
+    }
+
+    fn bind_terminal_owner(&self) {
+        *self
+            .terminal_owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(thread::current());
+        if self.pending.load(Ordering::Acquire) {
+            self.notify_owner();
+        }
+    }
+
+    fn take_terminal_identity(&self, waiter_id: WaiterId) -> Option<OwnerWorkIdentity> {
+        let mut state = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let identity = state
+            .ready
+            .range(
+                OwnerWorkIdentity {
+                    waiter_id,
+                    phase: 0,
+                }..=OwnerWorkIdentity {
+                    waiter_id,
+                    phase: u64::MAX,
+                },
+            )
+            .next()
+            .copied()?;
+        state.ready.remove(&identity);
+        state.registered.remove(&identity);
+        Some(identity)
     }
 
     fn take(&self) -> bool {
@@ -288,6 +370,15 @@ impl CoreCompletionWake {
                 .identities
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            debug_assert!(
+                state.registered.len()
+                    + identities
+                        .iter()
+                        .filter(|identity| !state.registered.contains(identity))
+                        .count()
+                    <= CORE_OWNER_COMPLETION_CAPACITY,
+                "restore the taken batch before reusing registration capacity"
+            );
             for identity in identities {
                 state.registered.insert(*identity);
                 state.ready.insert(*identity);
@@ -360,6 +451,68 @@ pub struct CoreTicket<T> {
     slot: CoreTicketSlot<T>,
 }
 
+/// A charged ticket permits only nonblocking reads.
+#[derive(Debug)]
+pub(crate) struct ChargedCoreTicket<T> {
+    ticket: CoreTicket<T>,
+}
+
+/// One owner row keeps its phase history until final retirement.
+#[derive(Debug)]
+pub(crate) struct CoreWaiterRetirement {
+    wake: Arc<CoreCompletionWake>,
+    waiter_id: WaiterId,
+}
+
+impl CoreWaiterRetirement {
+    pub(crate) fn waiter_id(&self) -> WaiterId {
+        self.waiter_id
+    }
+}
+
+pub(crate) struct CoreSubmission<T> {
+    pub(crate) ticket: ChargedCoreTicket<T>,
+    pub(crate) rejected: Option<CoreRejectedRequest>,
+}
+
+pub(crate) struct CoreSubmissionStorage {
+    pub(crate) request: crate::lua_memory::LuaCallbackCharge,
+    pub(crate) reply: crate::lua_memory::LuaCallbackCharge,
+}
+
+pub(crate) fn retained_request_bytes<T, F>() -> usize {
+    std::mem::size_of::<(F, CoreTicketPublisher<T>)>()
+}
+
+pub(crate) fn retained_reply_bytes<T>() -> Option<usize> {
+    crate::lua_memory::layout::single_reply_bytes::<CoreTicketResult<T>>(false)
+}
+
+pub(crate) struct CoreRejectedRequest {
+    request: CoreRequest,
+    pub(crate) reason: CoreRefusal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoreRefusal {
+    Registration,
+    Abandoned,
+    Full,
+    Stopped,
+}
+
+impl Drop for CoreWaiterRetirement {
+    fn drop(&mut self) {
+        self.wake.retire_waiter(self.waiter_id);
+    }
+}
+
+impl<T> ChargedCoreTicket<T> {
+    pub(crate) fn poll(&mut self) -> CoreTicketPoll<T> {
+        self.ticket.poll()
+    }
+}
+
 #[derive(Debug)]
 enum CoreTicketSlot<T> {
     /// The operation was queued; its keyed result arrives on this channel.
@@ -367,6 +520,7 @@ enum CoreTicketSlot<T> {
         identity: OwnerWorkIdentity,
         receiver: Receiver<CoreTicketResult<T>>,
         owner_wake: Option<Arc<CoreCompletionWake>>,
+        storage_lease: Option<crate::lua_memory::LuaCallbackStorageLease>,
     },
     /// Admission refused the operation; there is nothing to wait for.
     Refused,
@@ -384,6 +538,7 @@ struct CoreTicketPublisher<T> {
     sender: Option<SyncSender<CoreTicketResult<T>>>,
     wake: Arc<CoreCompletionWake>,
     notify_owner: bool,
+    storage_lease: Option<crate::lua_memory::LuaCallbackStorageLease>,
 }
 
 impl<T> CoreTicketPublisher<T> {
@@ -452,6 +607,15 @@ impl<T> CoreTicket<T> {
         wake: Arc<CoreCompletionWake>,
         notify_owner: bool,
     ) -> (Self, CoreTicketPublisher<T>) {
+        Self::channel_with_lease(identity, wake, notify_owner, None)
+    }
+
+    fn channel_with_lease(
+        identity: OwnerWorkIdentity,
+        wake: Arc<CoreCompletionWake>,
+        notify_owner: bool,
+        storage_lease: Option<crate::lua_memory::LuaCallbackStorageLease>,
+    ) -> (Self, CoreTicketPublisher<T>) {
         let (sender, receiver) = mpsc::sync_channel(1);
         (
             Self {
@@ -459,6 +623,7 @@ impl<T> CoreTicket<T> {
                     identity,
                     receiver,
                     owner_wake: notify_owner.then(|| Arc::clone(&wake)),
+                    storage_lease: storage_lease.clone(),
                 },
             },
             CoreTicketPublisher {
@@ -466,6 +631,7 @@ impl<T> CoreTicket<T> {
                 sender: Some(sender),
                 wake,
                 notify_owner,
+                storage_lease,
             },
         )
     }
@@ -476,6 +642,7 @@ impl<T> CoreTicket<T> {
                 identity,
                 receiver,
                 owner_wake: None,
+                storage_lease: None,
             },
         }
     }
@@ -511,6 +678,7 @@ impl<T> CoreTicket<T> {
                 identity,
                 receiver,
                 owner_wake,
+                ..
             } => {
                 // The result can arrive before its completion identity. The
                 // owner must collect that identity before it starts a new phase.
@@ -605,6 +773,147 @@ pub(crate) struct CoreDaemonHandle {
 }
 
 impl CoreDaemonHandle {
+    #[cfg(test)]
+    pub(crate) fn test_retains_waiter(&self, waiter_id: WaiterId) -> bool {
+        self.completion_wake
+            .identities
+            .lock()
+            .unwrap()
+            .next_phase
+            .contains_key(&waiter_id)
+    }
+    pub(crate) fn bind_terminal_owner(&self) {
+        self.completion_wake.bind_terminal_owner();
+    }
+
+    pub(crate) fn take_terminal_completion(
+        &self,
+        waiter_id: WaiterId,
+    ) -> Option<OwnerWorkIdentity> {
+        self.completion_wake.take_terminal_identity(waiter_id)
+    }
+    pub(crate) fn submit_retained_for_owner<T, F>(
+        &self,
+        retirement: &CoreWaiterRetirement,
+        operation: F,
+        claim: impl FnOnce() -> bool,
+        storage: Option<CoreSubmissionStorage>,
+    ) -> CoreSubmission<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut CoreDaemon) -> T + Send + 'static,
+    {
+        assert!(Arc::ptr_eq(&self.completion_wake, &retirement.wake));
+        let identity = self.completion_wake
+            .register_phases(retirement.waiter_id, 1)
+            .and_then(|identities| identities.into_iter().next());
+        self.submit_retained_identity(identity, true, operation, claim, storage)
+    }
+
+    pub(crate) fn submit_retained<T, F>(
+        &self,
+        operation: F,
+        claim: impl FnOnce() -> bool,
+        storage: Option<CoreSubmissionStorage>,
+    ) -> CoreSubmission<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut CoreDaemon) -> T + Send + 'static,
+    {
+        let identity = self.waiter_ids.next().map(OwnerWorkIdentity::first);
+        self.submit_retained_identity(identity, false, operation, claim, storage)
+    }
+
+    fn submit_retained_identity<T, F>(
+        &self,
+        identity: Option<OwnerWorkIdentity>,
+        notify_owner: bool,
+        operation: F,
+        claim: impl FnOnce() -> bool,
+        storage: Option<CoreSubmissionStorage>,
+    ) -> CoreSubmission<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut CoreDaemon) -> T + Send + 'static,
+    {
+        let (request_charge, reply_charge) = match storage {
+            Some(storage) => (Some(storage.request), Some(storage.reply)),
+            None => (None, None),
+        };
+        let Some(identity) = identity else {
+            let operation = move |daemon: &mut CoreDaemon, _: &mut PendingCoreOperations| {
+                drop(operation(daemon));
+            };
+            assert!(std::mem::size_of_val(&operation) <= retained_request_bytes::<T, F>());
+            let request = match request_charge {
+                Some(charge) => CoreRequest::charged(operation, charge),
+                None => CoreRequest::new(operation),
+            };
+            return CoreSubmission {
+                ticket: ChargedCoreTicket { ticket: CoreTicket::refused() },
+                rejected: Some(CoreRejectedRequest {
+                    request,
+                    reason: CoreRefusal::Registration,
+                }),
+            };
+        };
+        let lease = reply_charge.map(crate::lua_memory::LuaCallbackStorageLease::new);
+        let (ticket, publisher) = CoreTicket::channel_with_lease(
+            identity, Arc::clone(&self.completion_wake), notify_owner, lease,
+        );
+        let operation = move |daemon: &mut CoreDaemon, _: &mut PendingCoreOperations| {
+            publisher.publish(operation(daemon));
+        };
+        assert!(std::mem::size_of_val(&operation) <= retained_request_bytes::<T, F>());
+        let request = match request_charge {
+            Some(charge) => CoreRequest::charged(operation, charge),
+            None => CoreRequest::new(operation),
+        };
+        let admission = self.admission.lock().expect("Core request admission mutex");
+        let rejected = if !self.accepting.load(Ordering::Acquire) {
+            Some(CoreRejectedRequest {
+                request,
+                reason: CoreRefusal::Stopped,
+            })
+        } else if !claim() {
+            Some(CoreRejectedRequest {
+                request,
+                reason: CoreRefusal::Abandoned,
+            })
+        } else {
+            match self.requests.try_send(request) {
+                Ok(()) => None,
+                Err(TrySendError::Full(request)) => Some(CoreRejectedRequest {
+                    request,
+                    reason: CoreRefusal::Full,
+                }),
+                Err(TrySendError::Disconnected(request)) => Some(CoreRejectedRequest {
+                    request,
+                    reason: CoreRefusal::Stopped,
+                }),
+            }
+        };
+        if rejected.is_some() {
+            if notify_owner {
+                self.completion_wake.retire(identity);
+            }
+        } else {
+            self.request_pending.store(true, Ordering::Release);
+            if self.owner_waiting.swap(false, Ordering::AcqRel) {
+                self.control.interrupt();
+            }
+        }
+        drop(admission);
+        CoreSubmission { ticket: ChargedCoreTicket { ticket }, rejected }
+    }
+
+    pub(crate) fn waiter_retirement(&self, waiter_id: WaiterId) -> CoreWaiterRetirement {
+        CoreWaiterRetirement {
+            wake: Arc::clone(&self.completion_wake),
+            waiter_id,
+        }
+    }
+
     /// Queue one host operation for the Core owner thread and return its
     /// result slot. Returns at once; the operation runs on the next
     /// data-plane turn. A full queue yields a ticket that polls
@@ -622,7 +931,7 @@ impl CoreDaemonHandle {
         let identity = OwnerWorkIdentity::first(waiter_id);
         let (ticket, publisher) =
             CoreTicket::channel(identity, Arc::clone(&self.completion_wake), false);
-        let request: CoreRequest = Box::new(move |daemon, _| {
+        let request = CoreRequest::new(move |daemon, _| {
             publisher.publish(operation(daemon));
         });
         let _admission = self.admission.lock().expect("Core request admission mutex");
@@ -658,7 +967,7 @@ impl CoreDaemonHandle {
         };
         let (ticket, publisher) =
             CoreTicket::channel(identity, Arc::clone(&self.completion_wake), true);
-        let request: CoreRequest = Box::new(move |daemon, _| publisher.publish(operation(daemon)));
+        let request = CoreRequest::new(move |daemon, _| publisher.publish(operation(daemon)));
         let _admission = self.admission.lock().expect("Core request admission mutex");
         match admit_request(&self.requests, &self.accepting, request) {
             CoreAdmission::Queued => {}
@@ -699,7 +1008,7 @@ impl CoreDaemonHandle {
             Arc::clone(&self.completion_wake),
             false,
         );
-        let request: CoreRequest = Box::new(move |daemon, pending| {
+        let request = CoreRequest::new(move |daemon, pending| {
             let result = daemon.begin(operation);
             if let Ok(id) = result {
                 pending.insert(id, CoreResultPublisher(completion_publisher));
@@ -752,7 +1061,7 @@ impl CoreDaemonHandle {
         let (completion, completion_publisher) =
             CoreTicket::channel(completion_identity, Arc::clone(&self.completion_wake), true);
         let completion_wake = Arc::clone(&self.completion_wake);
-        let request: CoreRequest = Box::new(move |daemon, pending| {
+        let request = CoreRequest::new(move |daemon, pending| {
             let result = daemon.begin(operation);
             if let Ok(id) = result {
                 pending.insert(id, CoreResultPublisher(completion_publisher));
@@ -1006,7 +1315,7 @@ fn run_loop(
         );
     }
     for request in requests.try_iter().take(CORE_REQUEST_CAPACITY) {
-        request(core_daemon, &mut pending_operations);
+        request.run(core_daemon, &mut pending_operations);
     }
     publish_completions(core_daemon, &mut pending_operations);
 }
@@ -1017,7 +1326,7 @@ fn run_core_requests(
     pending_operations: &mut PendingCoreOperations,
 ) {
     for request in requests.try_iter().take(CORE_REQUESTS_PER_TURN) {
-        request(core_daemon, pending_operations);
+        request.run(core_daemon, pending_operations);
     }
 }
 
@@ -1073,7 +1382,97 @@ mod tests {
     }
 
     fn noop_request() -> CoreRequest {
-        Box::new(|_, _| {})
+        CoreRequest::new(|_, _| {})
+    }
+
+    fn callback_account() -> Arc<crate::lua_memory::LuaMemoryAccount> {
+        crate::lua_memory::LuaMemoryAccount::new(crate::lua_memory::LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: 4096,
+            total_callback_bytes: 8192,
+        })
+        .unwrap()
+    }
+
+    struct ChargedDropProbe(Arc<crate::lua_memory::LuaMemoryAccount>);
+
+    impl Drop for ChargedDropProbe {
+        fn drop(&mut self) {
+            assert!(self.0.usage().1 > 0, "payload drops before its charge");
+        }
+    }
+
+    #[test]
+    fn charged_request_releases_its_closure_before_its_charge() {
+        let memory = callback_account();
+        let probe = ChargedDropProbe(Arc::clone(&memory));
+        let operation = move |_: &mut CoreDaemon, _: &mut PendingCoreOperations| drop(probe);
+        let expected = std::mem::size_of_val(&operation);
+        let charge = memory.reserve_callback_bytes(expected).unwrap();
+        let request = CoreRequest::charged(operation, charge);
+        assert_eq!(memory.usage().1, expected);
+        drop(request);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn charged_channel_keeps_its_charge_through_unread_result_destruction() {
+        let memory = callback_account();
+        let lease = crate::lua_memory::LuaCallbackStorageLease::new(
+            memory.reserve_callback_bytes(1).unwrap(),
+        );
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (ticket, publisher) =
+            CoreTicket::channel_with_lease(identity(1, 1), wake, false, Some(lease));
+        publisher.publish(ChargedDropProbe(Arc::clone(&memory)));
+        assert_eq!(memory.usage().1, 1);
+        drop(ticket);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn charged_channel_keeps_its_charge_after_receiver_abandonment() {
+        let memory = callback_account();
+        let lease = crate::lua_memory::LuaCallbackStorageLease::new(
+            memory.reserve_callback_bytes(1).unwrap(),
+        );
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (ticket, publisher) =
+            CoreTicket::channel_with_lease(identity(1, 1), wake, false, Some(lease));
+        drop(ticket);
+        assert_eq!(memory.usage().1, 1);
+        publisher.publish(ChargedDropProbe(Arc::clone(&memory)));
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn row_retirement_preserves_phases_until_the_last_operation_finishes() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let waiter_id = WaiterId(71);
+        let retirement = CoreWaiterRetirement {
+            wake: Arc::clone(&wake),
+            waiter_id,
+        };
+        let first = wake.register_phases(waiter_id, 1).unwrap()[0];
+        let (first_ticket, first_publisher) = CoreTicket::channel(first, Arc::clone(&wake), true);
+        drop(first_ticket);
+        assert!(wake.retire(first));
+        let second = wake.register_phases(waiter_id, 1).unwrap()[0];
+        assert_eq!(second.waiter_id, first.waiter_id);
+        assert_eq!(second.phase, first.phase + 1);
+        let (mut second_ticket, second_publisher) =
+            CoreTicket::channel(second, Arc::clone(&wake), true);
+        first_publisher.publish(1_u8);
+        assert!(wake.take_identities(1).is_empty());
+        assert!(matches!(second_ticket.poll(), CoreTicketPoll::Pending));
+        second_publisher.publish(2_u8);
+        assert_eq!(wake.take_identities(1), vec![second]);
+        assert!(matches!(second_ticket.poll(), CoreTicketPoll::Ready(2)));
+        drop(second_ticket);
+        assert_eq!(wake.live_identity_counts(), (0, 0, 1));
+        drop(retirement);
+        assert_eq!(wake.live_identity_counts(), (0, 0, 0));
     }
 
     #[test]
@@ -1393,10 +1792,8 @@ mod tests {
             for _ in 0..BATCH_SIZE {
                 request_rx
                     .try_recv()
-                    .expect("each successful submission queues one Core request")(
-                    &mut daemon,
-                    &mut pending,
-                );
+                    .expect("each successful submission queues one Core request")
+                    .run(&mut daemon, &mut pending);
             }
             assert_eq!(
                 handle.take_owner_completion_identities(BATCH_SIZE).len(),
@@ -1419,9 +1816,8 @@ mod tests {
             registered_phases += 2;
             request_rx
                 .try_recv()
-                .expect("the successful begin queues one Core request")(
-                &mut daemon, &mut pending
-            );
+                .expect("the successful begin queues one Core request")
+                .run(&mut daemon, &mut pending);
             publish_completions(&mut daemon, &mut pending);
             assert_eq!(handle.take_owner_completion_identities(2).len(), 2);
             let (mut begin, mut completion) = completed.into_parts();
@@ -1441,10 +1837,8 @@ mod tests {
             registered_phases += 2;
             request_rx
                 .try_recv()
-                .expect("the failed begin queues one Core request")(
-                &mut failed_daemon,
-                &mut pending,
-            );
+                .expect("the failed begin queues one Core request")
+                .run(&mut failed_daemon, &mut pending);
             assert_eq!(handle.take_owner_completion_identities(2).len(), 1);
             let (mut begin, mut completion) = failed.into_parts();
             assert!(matches!(begin.poll(), CoreTicketPoll::Ready(Err(_))));
@@ -1474,10 +1868,8 @@ mod tests {
             assert_eq!(handle.retire_owner_waiter(retired_waiter), 1);
             request_rx
                 .try_recv()
-                .expect("the retired request remains accepted Core work")(
-                &mut daemon,
-                &mut pending,
-            );
+                .expect("the retired request remains accepted Core work")
+                .run(&mut daemon, &mut pending);
             assert!(matches!(retired.poll(), CoreTicketPoll::Ready(11)));
             assert!(handle.take_owner_completion_identities(1).is_empty());
             assert_eq!(completion_wake.live_identity_counts(), (0, 0, 0));

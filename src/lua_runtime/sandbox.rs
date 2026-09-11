@@ -255,7 +255,7 @@ mod tests {
             package_records: Vec::new(),
             package_event_router: hub.package_event_router().clone(),
             causal_scopes: hub.causal_scopes().clone(),
-            memory: None,
+            memory: hub.lua_plugin_host_api().memory,
         }
     }
 
@@ -304,7 +304,7 @@ mod tests {
             PluginKey("sandbox-test.plugin".into()),
             &entrypoint,
             host_api(&hub),
-            None,
+            hub.lua_plugin_host_api().memory,
         );
         let Err(error) = result else {
             panic!("the entrypoint must not register a finalizer");
@@ -336,7 +336,7 @@ mod tests {
             PluginKey("sandbox-test.plugin".into()),
             &entrypoint,
             host_api(&hub),
-            None,
+            hub.lua_plugin_host_api().memory,
         )
         .unwrap();
         for count in 1..=2 {

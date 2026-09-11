@@ -140,6 +140,7 @@ impl HostRecoveryRequired {
                     owner_permit,
                     None,
                     crate::host_disposal::Parts {
+                        storage: None,
                         identity,
                         permit,
                         model: None,
@@ -151,6 +152,7 @@ impl HostRecoveryRequired {
                 recovery.owner_permit,
                 None,
                 crate::host_disposal::Parts {
+                    storage: None,
                     identity,
                     permit: recovery._permit,
                     model: None,
@@ -170,6 +172,7 @@ impl HostRecoveryRequired {
                 owner_permit,
                 None,
                 crate::host_disposal::Parts {
+                    storage: None,
                     identity: failure.identity,
                     permit: failure.permit,
                     model: None,
@@ -417,6 +420,7 @@ impl HostMutationContinuation {
             family.take_terminal_parts(identity)?
         } else if let Some((prepared, permit)) = self.retained_prepare.take() {
             crate::host_disposal::Parts {
+                storage: None,
                 identity,
                 permit,
                 payload: Box::new(prepared),
@@ -425,6 +429,7 @@ impl HostMutationContinuation {
         } else {
             let (identity, result, permit) = completion.take()?.into_parts();
             crate::host_disposal::Parts {
+                storage: None,
                 identity,
                 permit,
                 payload: Box::new(result),

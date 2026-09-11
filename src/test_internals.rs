@@ -4,6 +4,12 @@
 //! dev-dependency enables for integration tests. Every entry returns the
 //! same Core ticket the runtime uses internally; nothing here blocks.
 
+/// Source seams used only by the dedicated allocation test executable.
+#[cfg(feature = "allocation-oracle")]
+pub mod allocation_oracle {
+    pub use crate::data_plane::driver::allocation_oracle::{Phase, Scenario, run, type_layouts};
+}
+
 use botster_core::contract::terminal_wake::WakingTerminalAdapter;
 use botster_core::{
     ClientId, SessionId, SubscriptionId, TerminalCapabilitySet, TerminalSubscriptionGeneration,

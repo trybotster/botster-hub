@@ -142,6 +142,7 @@ impl StatusContinuation {
             (identity, permit)
         };
         Some(crate::host_disposal::Parts {
+            storage: None,
             identity,
             permit,
             model: None,
@@ -653,6 +654,7 @@ mod tests {
             response_delivery_rx: None,
             grant_id: None,
             client: None,
+            core_retirement: None,
             permit: Some(owner_permit),
             must_finish: false,
             past_deadline: false,

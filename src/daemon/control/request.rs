@@ -182,6 +182,7 @@ pub(crate) fn handle(
         response_delivery_rx,
         grant_id,
         client,
+        core_retirement: None,
         permit: Some(permit),
         past_deadline: false,
         continuation: crate::daemon::control::pending::ControlContinuation::callback(|_, _| {
