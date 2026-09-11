@@ -78,6 +78,10 @@ The retry passed: one test passed, 47 were filtered, exit zero, no deadline expi
 Root read its raw output and verified unchanged source, executable, and fixture identities in `/private/tmp/c1-lua-policy-account-reload-tests-20260910-2`.
 All eleven selected behaviors now have passing results. The earlier setup failure remains recorded; no broad suite or matched-delivery claim follows.
 This closes the bounded policy/account wiring check. Callback-frame, worker, shared-storage, and full acknowledgement accounting remain open.
+The next ownership proposal is `/private/tmp/c1-callback-frame-ownership-plan-20260910-1/plan.md`.
+It places argument and returned-handle funding in the Lua state owner, admitted through shared Rust storage before Lua construction.
+Core worker metadata remains a separate segment. Escaped Lua owners, construction failure, teardown, and the disjoint conversion allocation inventory require source review.
+No state-storage byte value, nesting multiplier, hidden unsafe return hook, or live accounting connection is authorized by this proposal.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
