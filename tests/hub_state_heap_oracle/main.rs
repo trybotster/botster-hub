@@ -31,18 +31,34 @@ static ALLOCATOR: Counter = Counter;
 
 fn measure(name: &str, state: &HubState) -> Result<(), String> {
     let walk = walk_hub_state(state);
+    let pretty = serde_json::to_vec_pretty(state).expect("pretty");
     ALLOCATED.store(0, Ordering::Relaxed);
     RECORDING.store(true, Ordering::Release);
     let _clone = state.clone();
     RECORDING.store(false, Ordering::Release);
-    let counted = ALLOCATED.load(Ordering::Relaxed);
+    let clone_counted = ALLOCATED.load(Ordering::Relaxed);
+    ALLOCATED.store(0, Ordering::Relaxed);
+    RECORDING.store(true, Ordering::Release);
+    let mut serializer = Vec::with_capacity(pretty.len());
+    serde_json::to_writer_pretty(&mut serializer, state).expect("serialize");
+    RECORDING.store(false, Ordering::Release);
+    let serializer_counted = ALLOCATED.load(Ordering::Relaxed);
+    let peak_walk = walk.clone_heap.saturating_add(pretty.len());
+    let peak_counted = clone_counted.saturating_add(serializer_counted);
     println!(
-        "oracle {name}: counted {counted} walk.clone_heap {}",
-        walk.clone_heap
+        "g1 {name}: logical_pretty={} clone_walk={} clone_counted={} serializer_cap={} serializer_counted={} serializer_written={} peak_walk={} peak_counted={}",
+        pretty.len(),
+        walk.clone_heap,
+        clone_counted,
+        pretty.len(),
+        serializer_counted,
+        serializer.len(),
+        peak_walk,
+        peak_counted,
     );
-    if counted > walk.clone_heap {
+    if clone_counted > walk.clone_heap {
         Err(format!(
-            "{name}: counted {counted} > walk.clone_heap {}",
+            "{name}: counted {clone_counted} > walk.clone_heap {}",
             walk.clone_heap
         ))
     } else {
