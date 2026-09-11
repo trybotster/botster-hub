@@ -608,6 +608,13 @@ These tests establish synthetic admission and charge lifetime, not allocation si
 The revised design requires reload to admit new worker resources before removing the old registration. Capacity refusal preserves the old registration.
 The Core source review accepted the guarded join records. Formatting and focused verification remain pending; Hub has not connected that API.
 Worker resources do not yet account for the outer resource Box, input vector, join-record vector, or executor Arc. Their ownership remains open.
+The formatted Core source subsequently passed its build and all nine exact resource tests.
+Root verified all 360 source hashes and executable SHA256 `8b9e69585865cc8a937bdef2f185f76df979ad598699ae09cf7ee78d3f8b044f`.
+Each test executed once with 112 filtered tests, exit zero, and no deadline expiry. Deliberate panic output remains preserved.
+Evidence is `/private/tmp/core-worker-reservations-build-20260910-1` and `/private/tmp/core-worker-reservations-tests-20260910-1`.
+The tests cover exact-join release, thread-local destruction ordering, count refusal, replacement, unload, engine destruction, and unjoined failure paths.
+Exceptional tests prove retention after runtime destruction, not completed detached-thread exit. The joined test separately proves thread-local destruction ordering.
+This verifies the scoped Core interface. Hub integration, attachment metadata ownership, changed allocation sizes, and full callback accounting remain open.
 
 ## Historical verified starting points
 
