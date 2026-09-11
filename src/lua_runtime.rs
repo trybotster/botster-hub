@@ -80,6 +80,7 @@ pub struct HubCoordinationBridge {
         Mutex<crate::lua_memory::charged_collection::ChargedVecDeque<PendingCoordinationRequest>>,
     >,
     progress: Arc<CoordinationProgress>,
+    account: Arc<LuaMemoryAccount>,
 }
 
 struct CoordinationProgress {
@@ -213,7 +214,7 @@ impl HubCoordinationBridge {
         Self {
             owner_thread: thread::current().id(),
             pending: Arc::new(Mutex::new(
-                crate::lua_memory::charged_collection::ChargedVecDeque::new(account),
+                crate::lua_memory::charged_collection::ChargedVecDeque::new(Arc::clone(&account)),
             )),
             progress: Arc::new(CoordinationProgress {
                 pending: AtomicBool::new(false),
@@ -222,6 +223,7 @@ impl HubCoordinationBridge {
                 #[cfg(test)]
                 admitted: Mutex::new(Vec::new()),
             }),
+            account,
         }
     }
 
@@ -283,6 +285,7 @@ impl HubCoordinationBridge {
             },
             caller,
             storage: Some(transport.work),
+            entry: None,
         })?;
         // First blocking wait on this thread may allocate std mpmc Context once
         // (rust 1.97.0 library/std/src/sync/mpmc/context.rs:41-44, :67-77).
@@ -326,6 +329,13 @@ impl HubCoordinationBridge {
         let caller = CoordinationCaller::new();
         let _caller = CoordinationCallerGuard(caller.clone());
         let (response, receiver) = mpsc::channel();
+        let bytes = nonacknowledge_entry_bytes(&operation).ok_or(
+            CoordinationRequestError::Local(CoordinationLocalError::Capacity),
+        )?;
+        let entry = self
+            .account
+            .reserve_callback_total(bytes)
+            .map_err(|_| CoordinationRequestError::Local(CoordinationLocalError::Capacity))?;
         self.enqueue(PendingCoordinationRequest {
             #[cfg(test)]
             terminal_drop_probe: None,
@@ -333,6 +343,7 @@ impl HubCoordinationBridge {
             response: CoordinationReplySender::NonAcknowledge(response),
             caller,
             storage: None,
+            entry: Some(entry),
         })?;
         receiver
             .recv_timeout(Duration::from_millis(COORDINATION_REQUEST_TIMEOUT_MS))
@@ -433,6 +444,7 @@ impl HubCoordinationBridge {
                 response: CoordinationReplySender::NonAcknowledge(response),
                 caller: CoordinationCaller::new(),
                 storage: None,
+                entry: None,
             })
             .expect("test queue capacity");
         receiver
@@ -519,6 +531,7 @@ pub(crate) struct PendingCoordinationRequest {
     pub(crate) response: CoordinationReplySender,
     pub(crate) caller: CoordinationCaller,
     pub(crate) storage: Option<CoordinationStorage>,
+    pub(crate) entry: Option<LuaCallbackCharge>,
 }
 
 pub(crate) enum PendingCoordinationOperation {
@@ -579,6 +592,63 @@ impl PendingCoordinationOperation {
                 .map_err(CoordinationFailure::Acknowledge),
         }
     }
+}
+
+fn nonacknowledge_entry_bytes(operation: &PendingCoordinationOperation) -> Option<usize> {
+    let caller = crate::lua_memory::layout::arc_bytes::<std::sync::atomic::AtomicU8>();
+    let reply = crate::lua_memory::layout::single_reply_bytes::<CoordinationReply>(true)?;
+    operation
+        .payload_bytes()?
+        .checked_add(caller)?
+        .checked_add(reply)
+}
+
+impl PendingCoordinationOperation {
+    fn payload_bytes(&self) -> Option<usize> {
+        match self {
+            #[cfg(test)]
+            Self::Tracked { operation, .. } => operation.payload_bytes(),
+            Self::Publish { envelope } => routed_envelope_bytes(envelope),
+            Self::Drain { target, after, .. } => drain_payload_bytes(target, after.as_ref()),
+            Self::Acknowledge { .. } => Some(0),
+        }
+    }
+}
+
+fn drain_payload_bytes(target: &EnvelopeTarget, after: Option<&EnvelopeCursor>) -> Option<usize> {
+    envelope_target_bytes(target)?
+        .checked_add(after.map_or(0, |_| std::mem::size_of::<EnvelopeCursor>()))
+}
+
+fn envelope_target_bytes(target: &EnvelopeTarget) -> Option<usize> {
+    let heap = match target {
+        EnvelopeTarget::Endpoint { endpoint_id } => endpoint_id.0.len(),
+        EnvelopeTarget::Client { client_id } => client_id.0.len(),
+        EnvelopeTarget::Session { session_id } => session_id.0.len(),
+        EnvelopeTarget::Subscription {
+            session_id,
+            subscription_id,
+        } => session_id.0.len().checked_add(subscription_id.0.len())?,
+        EnvelopeTarget::Plugin { plugin_key } => plugin_key.0.len(),
+        EnvelopeTarget::Stream { stream } => stream.len(),
+        EnvelopeTarget::Topic { topic } => topic.len(),
+    };
+    std::mem::size_of::<EnvelopeTarget>().checked_add(heap)
+}
+
+fn routed_envelope_bytes(envelope: &RoutedEnvelope) -> Option<usize> {
+    let mut bytes = std::mem::size_of::<RoutedEnvelope>()
+        .checked_add(envelope.id.0.len())?
+        .checked_add(envelope.source.0.len())?
+        .checked_add(envelope.payload.content_type.len())?
+        .checked_add(envelope.payload.body.len())?;
+    if let Some(extension) = &envelope.payload.extension {
+        bytes = bytes.checked_add(serde_json::to_vec(extension).ok()?.len())?;
+    }
+    for target in &envelope.targets {
+        bytes = bytes.checked_add(envelope_target_bytes(target)?)?;
+    }
+    Some(bytes)
 }
 
 struct LuaHostApi {

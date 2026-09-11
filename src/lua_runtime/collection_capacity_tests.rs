@@ -40,6 +40,7 @@ fn pending_request() -> (
             response: CoordinationReplySender::NonAcknowledge(response),
             caller: CoordinationCaller::new(),
             storage: None,
+            entry: None,
         },
         receiver,
     )
@@ -179,6 +180,7 @@ fn assert_refused_enqueue_destroys(bridge: &HubCoordinationBridge, memory: &Arc<
             continuation,
             disposal,
         }),
+        entry: None,
     });
     assert!(matches!(
         error,
@@ -203,6 +205,20 @@ fn refused_enqueue_destroys_request_and_restores_usage() {
         CoordinationRequestError::Local(CoordinationLocalError::Capacity)
     ));
     assert_eq!(error.as_str(), LUA_CALLBACK_CAPACITY_EXHAUSTED);
+}
+
+#[test]
+fn request_typed_entry_charge_restores_on_collection_refusal() {
+    let memory = account(slot());
+    let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
+    enqueue(&bridge).unwrap();
+    let before = memory.usage().1;
+    let error = request_typed_from_worker(bridge.clone()).expect_err("collection full");
+    assert!(matches!(
+        error,
+        CoordinationRequestError::Local(CoordinationLocalError::Capacity)
+    ));
+    assert_eq!(memory.usage().1, before);
 }
 
 #[test]

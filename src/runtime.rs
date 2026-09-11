@@ -2917,6 +2917,7 @@ impl HubRuntime {
                 response: pending.response,
                 rejected: submission.rejected,
                 _storage: storage,
+                _entry: pending.entry,
             });
         }
         self.advance_inflight_plugin_core();
@@ -5724,6 +5725,7 @@ pub(crate) enum InflightPluginCore {
             crate::lua_memory::LuaCallbackCharge,
             crate::lua_memory::LuaCallbackCharge,
         )>,
+        _entry: Option<crate::lua_memory::LuaCallbackCharge>,
     },
     SessionTypeSpawn {
         start: SessionTypeSpawnStart,
