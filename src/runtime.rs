@@ -4391,6 +4391,35 @@ impl HubSessionTypeSpawner {
         self.take_abandoned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_enqueue_managed_disconnected(
+        &self,
+        plugin_key: PluginKey,
+        target_id: String,
+        branch: String,
+        session_type_id: String,
+        request: ManagedSessionTypeRequest,
+        package_records: Vec<PackageRecord>,
+    ) {
+        let (response, receiver) = mpsc::channel();
+        drop(receiver);
+        self.managed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(PendingManagedSessionSpawn {
+                plugin_key,
+                target_id,
+                branch,
+                session_type_id,
+                request,
+                package_records,
+                accepted_at: Instant::now(),
+                response,
+                _dispose_probe: None,
+            });
+        self.publish_managed_spawn();
+    }
+
     fn take_abandoned(&self) -> Vec<String> {
         std::mem::take(
             &mut *self
