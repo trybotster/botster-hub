@@ -70,6 +70,10 @@ The library test executable SHA256 is `18d5c251ffbd4d646e4bcad03c3fc74bfe493d0ed
 The JSON stream reports 153 warning events and no errors. Evidence is `/private/tmp/c1-lua-policy-account-build-20260910-3`.
 Root authorized eleven exact tests, once each: six new unit tests, four external configuration tests, and the existing external Lua reload test.
 Each test has a 60-second deadline. Execution must stop at the first failure or identity change; these tests do not certify full callback accounting.
+The six unit tests and four external configuration tests passed. Root inspected every raw result and verified unchanged before/after identities.
+The external reload test failed before behavior because its required candidate-path environment was absent. That setup failure is preserved separately.
+Root authorized one reload-only retry with the existing verified candidate fixture in `/private/tmp/botster-plugin-render-candidate.QqYTjY`.
+The retry uses the current integration-test executable. It checks library reload behavior, not matched delivery of the current Hub binary.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
