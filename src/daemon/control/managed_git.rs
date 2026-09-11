@@ -477,21 +477,9 @@ impl ManagedSpawnOperation {
             return self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None);
         };
         let start = self.spawn.as_mut().expect("managed Core spawn exists");
-        let completion = match start.tracker.poll(runtime) {
-            crate::data_plane::driver::CoreTicketPoll::Pending => return ControlPoll::Pending,
-            crate::data_plane::driver::CoreTicketPoll::Lost => {
-                Err(botster_core_daemon::CoreDaemonError::Shutdown)
-            }
-            crate::data_plane::driver::CoreTicketPoll::Refused => {
-                Err(botster_core_daemon::CoreDaemonError::Shutdown)
-            }
-            crate::data_plane::driver::CoreTicketPoll::Ready(Err(error)) => Err(error),
-            crate::data_plane::driver::CoreTicketPoll::Ready(Ok(
-                botster_core_daemon::CoreCompletion::Spawn { result, .. },
-            )) => result,
-            crate::data_plane::driver::CoreTicketPoll::Ready(Ok(_)) => {
-                Err(botster_core_daemon::CoreDaemonError::Shutdown)
-            }
+        let completion = match start.poll(runtime) {
+            crate::runtime::PluginSpawnPoll::Pending => return ControlPoll::Pending,
+            crate::runtime::PluginSpawnPoll::Ready(result) => result,
         };
         let result = runtime.finish_managed_session_spawn(
             self.spawn.as_ref().expect("managed Core spawn exists"),
