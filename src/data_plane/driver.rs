@@ -785,6 +785,11 @@ impl CoreDaemonHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_refuse_next_owner_begins_remaining(&self) -> usize {
+        self.refuse_next_owner_begins.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_lose_next_owner_begins(&self, count: usize) {
         self.lose_next_owner_begins.store(count, Ordering::Release);
     }

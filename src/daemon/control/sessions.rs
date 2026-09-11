@@ -301,7 +301,22 @@ fn handle_daemon_spawn(
                         continue;
                     }
                     match poll_spawn_ticket(&mut tracker, daemon) {
-                        CoreTicketPoll::Pending => return ControlPoll::Pending,
+                        CoreTicketPoll::Pending => {
+                            #[cfg(test)]
+                            if let Some(runtime) = daemon.runtime() {
+                                if runtime.test_retry_retained_again_on_pending() {
+                                    return ControlPoll::Again;
+                                }
+                                if runtime.test_resubmit_release_on_pending() {
+                                    if let Some(next) =
+                                        submit_release(daemon, waiter_id, retry_tokens[0].clone())
+                                    {
+                                        tracker = next;
+                                    }
+                                }
+                            }
+                            return ControlPoll::Pending;
+                        }
                         CoreTicketPoll::Refused
                         | CoreTicketPoll::Lost
                         | CoreTicketPoll::Ready(Err(_)) => {
@@ -2049,19 +2064,37 @@ mod tests {
             panic!("spawn must defer");
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut polls = 0_u32;
+        let mut loops = 0_u32;
+        let mut again = 0_u32;
         let response = loop {
-            assert!(Instant::now() < deadline, "retry-retained hang");
-            polls += 1;
-            assert!(polls < 32, "retry-retained spun");
+            loops += 1;
+            let begins = daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins();
+            let refusals = daemon
+                .runtime()
+                .unwrap()
+                .test_refuse_next_owner_begins_remaining();
+            assert!(
+                Instant::now() < deadline,
+                "retry-retained hang loops={loops} again={again} begins={begins} refusals={refusals}"
+            );
             drive_ready_test_turn(&mut daemon, &mut state);
             match pending.continuation.poll(&mut daemon, &mut state) {
-                ControlPoll::Pending | ControlPoll::Again => std::thread::yield_now(),
+                ControlPoll::Pending => std::thread::yield_now(),
+                ControlPoll::Again => {
+                    again += 1;
+                    panic!(
+                        "retry-retained Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
+                    );
+                }
                 ControlPoll::Ready(Ok(response)) => break response,
                 ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
                 _ => std::thread::yield_now(),
             }
         };
+        assert_eq!(again, 0);
         assert_eq!(
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("pending_limit")
@@ -2112,18 +2145,35 @@ mod tests {
             panic!("spawn b must defer");
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut polls = 0_u32;
+        let mut loops = 0_u32;
+        let mut again = 0_u32;
         let mut done_a = false;
         let mut done_b = false;
         while !(done_a && done_b) {
-            assert!(Instant::now() < deadline, "concurrent spawn hang");
-            polls += 1;
-            assert!(polls < 64, "concurrent spawn spun");
+            loops += 1;
+            let begins = daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins();
+            let refusals = daemon
+                .runtime()
+                .unwrap()
+                .test_refuse_next_owner_begins_remaining();
+            assert!(
+                Instant::now() < deadline,
+                "concurrent spawn hang loops={loops} again={again} begins={begins} refusals={refusals}"
+            );
             drive_ready_test_turn(&mut daemon, &mut state);
             if !done_a {
                 match pending_a.continuation.poll(&mut daemon, &mut state) {
                     ControlPoll::Ready(Ok(_)) => done_a = true,
                     ControlPoll::Ready(Err(_)) => panic!("spawn a transport failed"),
+                    ControlPoll::Again => {
+                        again += 1;
+                        panic!(
+                            "concurrent spawn A Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -2131,10 +2181,17 @@ mod tests {
                 match pending_b.continuation.poll(&mut daemon, &mut state) {
                     ControlPoll::Ready(Ok(_)) => done_b = true,
                     ControlPoll::Ready(Err(_)) => panic!("spawn b transport failed"),
+                    ControlPoll::Again => {
+                        again += 1;
+                        panic!(
+                            "concurrent spawn B Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
+                        );
+                    }
                     _ => {}
                 }
             }
         }
+        assert_eq!(again, 0);
         assert_eq!(state.retained_explicit_reservations.len(), 1);
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
@@ -2163,10 +2220,23 @@ mod tests {
         };
         assert!(state.retained_explicit_reservations.is_empty());
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut consecutive_again = 0_u32;
+        let mut loops = 0_u32;
+        let mut again = 0_u32;
         let mut armed = false;
         let response = loop {
-            assert!(Instant::now() < deadline, "accepting-queue hang");
+            loops += 1;
+            let begins = daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins();
+            let refusals = daemon
+                .runtime()
+                .unwrap()
+                .test_refuse_next_owner_begins_remaining();
+            assert!(
+                Instant::now() < deadline,
+                "accepting-queue hang loops={loops} again={again} begins={begins} refusals={refusals}"
+            );
             pump_core(&mut daemon, &mut state);
             if !armed
                 && daemon
@@ -2179,34 +2249,222 @@ mod tests {
                 armed = true;
             }
             match pending.continuation.poll(&mut daemon, &mut state) {
-                ControlPoll::Pending => {
-                    consecutive_again = 0;
-                    std::thread::yield_now();
-                }
+                ControlPoll::Pending => std::thread::yield_now(),
                 ControlPoll::Again => {
-                    consecutive_again += 1;
-                    assert!(
-                        consecutive_again < 64,
-                        "accepting-queue spun Again without waiting on Core"
+                    again += 1;
+                    let begins = daemon
+                        .runtime()
+                        .unwrap()
+                        .test_release_session_reservation_begins();
+                    let refusals = daemon
+                        .runtime()
+                        .unwrap()
+                        .test_refuse_next_owner_begins_remaining();
+                    panic!(
+                        "accepting-queue Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
                     );
-                    std::thread::yield_now();
                 }
                 ControlPoll::Ready(Ok(response)) => break response,
                 ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
                 _ => std::thread::yield_now(),
             }
         };
+        let begins = daemon
+            .runtime()
+            .unwrap()
+            .test_release_session_reservation_begins();
+        let refusals = daemon
+            .runtime()
+            .unwrap()
+            .test_refuse_next_owner_begins_remaining();
         assert_eq!(
-            daemon
-                .runtime()
-                .unwrap()
-                .test_release_session_reservation_begins(),
-            1
+            again, 0,
+            "accepting-queue Again loops={loops} again={again} begins={begins} refusals={refusals}"
+        );
+        assert_eq!(
+            begins, 1,
+            "accepting-queue release begins loops={loops} again={again} begins={begins} refusals={refusals}"
+        );
+        assert_eq!(
+            refusals, 7,
+            "accepting-queue consumed one refused begin loops={loops} again={again} begins={begins} refusals={refusals}"
         );
         assert!(state.retained_explicit_reservations.is_empty());
         assert!(response.error.is_some());
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepting_queue_fails_when_retry_returns_again() {
+        let (mut daemon, mut state, root) = spawn_fixture("accept-again");
+        daemon
+            .runtime()
+            .unwrap()
+            .test_set_retry_retained_again_on_pending(true);
+        let waiter = state.current_waiter_id.unwrap();
+        let mut reserve = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-accept-again-held".into()));
+        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        daemon.runtime().unwrap().retain_reservation(held);
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-accept-again-next".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut loops = 0_u32;
+        let mut again = 0_u32;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                loops += 1;
+                let begins = daemon
+                    .runtime()
+                    .unwrap()
+                    .test_release_session_reservation_begins();
+                let refusals = daemon
+                    .runtime()
+                    .unwrap()
+                    .test_refuse_next_owner_begins_remaining();
+                assert!(
+                    Instant::now() < deadline,
+                    "accepting-again hang loops={loops} again={again} begins={begins} refusals={refusals}"
+                );
+                pump_core(&mut daemon, &mut state);
+                match pending.continuation.poll(&mut daemon, &mut state) {
+                    ControlPoll::Pending => std::thread::yield_now(),
+                    ControlPoll::Again => {
+                        again += 1;
+                        panic!(
+                            "accepting-queue Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
+                        );
+                    }
+                    ControlPoll::Ready(Ok(_)) => panic!("spawn completed under Again ablation"),
+                    ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                    _ => std::thread::yield_now(),
+                }
+            }
+        }));
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let message = match result {
+            Err(payload) => payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .expect("Again ablation panic message"),
+            Ok(()) => panic!("Again ablation must fail"),
+        };
+        assert!(
+            message.contains("Again while waiting on Core"),
+            "unexpected panic: {message}"
+        );
+        assert!(message.contains("again=1"), "unexpected panic: {message}");
+    }
+
+    #[test]
+    fn accepting_queue_fails_when_release_is_resubmitted() {
+        let (mut daemon, mut state, root) = spawn_fixture("accept-resubmit");
+        daemon
+            .runtime()
+            .unwrap()
+            .test_set_resubmit_release_on_pending(true);
+        let waiter = state.current_waiter_id.unwrap();
+        let mut reserve = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-accept-resubmit-held".into()));
+        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        daemon.runtime().unwrap().retain_reservation(held);
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-accept-resubmit-next".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut loops = 0_u32;
+        let mut again = 0_u32;
+        let mut armed = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                loops += 1;
+                let begins = daemon
+                    .runtime()
+                    .unwrap()
+                    .test_release_session_reservation_begins();
+                let refusals = daemon
+                    .runtime()
+                    .unwrap()
+                    .test_refuse_next_owner_begins_remaining();
+                assert!(
+                    Instant::now() < deadline,
+                    "accepting-resubmit hang loops={loops} again={again} begins={begins} refusals={refusals}"
+                );
+                pump_core(&mut daemon, &mut state);
+                if !armed && begins >= 1 {
+                    daemon.runtime().unwrap().test_refuse_next_owner_begins(8);
+                    armed = true;
+                }
+                match pending.continuation.poll(&mut daemon, &mut state) {
+                    ControlPoll::Pending => std::thread::yield_now(),
+                    ControlPoll::Again => {
+                        again += 1;
+                        panic!(
+                            "accepting-queue Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
+                        );
+                    }
+                    ControlPoll::Ready(Ok(_)) => {
+                        let begins = daemon
+                            .runtime()
+                            .unwrap()
+                            .test_release_session_reservation_begins();
+                        let refusals = daemon
+                            .runtime()
+                            .unwrap()
+                            .test_refuse_next_owner_begins_remaining();
+                        assert_eq!(
+                            begins, 1,
+                            "accepting-queue release begins loops={loops} again={again} begins={begins} refusals={refusals}"
+                        );
+                        assert_eq!(
+                            refusals, 7,
+                            "accepting-queue consumed one refused begin loops={loops} again={again} begins={begins} refusals={refusals}"
+                        );
+                        return;
+                    }
+                    ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                    _ => std::thread::yield_now(),
+                }
+            }
+        }));
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let message = match result {
+            Err(payload) => payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .expect("resubmit ablation panic message"),
+            Ok(()) => panic!("resubmit ablation must fail"),
+        };
+        assert!(
+            message.contains("release begins") || message.contains("consumed one refused"),
+            "unexpected panic: {message}"
+        );
     }
 
     fn write_worker_script(root: &std::path::Path, body: &str) -> std::path::PathBuf {
