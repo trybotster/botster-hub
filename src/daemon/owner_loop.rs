@@ -7768,6 +7768,14 @@ return botster.register({tools = {{
                             let callback_owners: Box<
                                 dyn Fn() -> Vec<(String, usize)> + Send,
                             > = Box::new(runtime.test_callback_charge_breakdown_probe());
+                            // Daemon owner is bound, so coordination take_pending returns
+                            // None and inflight plugin-core is unused. Count it as 0.
+                            assert_eq!(
+                                runtime.test_inflight_charge_bytes(),
+                                0,
+                                "inflight unused while a daemon owner is bound"
+                            );
+                            assert_eq!(runtime.test_inflight_capacity(), 0);
                             started_tx
                                 .send((
                                     runtime.coordination_bridge(),
@@ -7905,7 +7913,12 @@ return botster.register({tools = {{
             );
             thread::yield_now();
         }
-        let owners = callback_owners();
+        let mut owners = callback_owners();
+        owners.push((
+            "inflight unused (daemon owner bound; take_pending returns None; asserted 0 at start)"
+                .into(),
+            0,
+        ));
         let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
         eprintln!(
             "callback charge owners before shutdown: {owners:?} sum={owner_sum} usage={}",
