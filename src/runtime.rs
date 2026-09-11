@@ -122,7 +122,8 @@ pub struct HubRuntime {
     state: SharedHubState,
     core_daemon: SharedCoreDaemon,
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
-    inflight_plugin_core: Mutex<Vec<InflightPluginCore>>,
+    inflight_plugin_core:
+        Mutex<crate::lua_memory::charged_collection::ChargedVec<InflightPluginCore>>,
     retained_plugin_reservations: Mutex<Vec<SessionReservation>>,
     created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
     confirmed_worktree_rollbacks: Mutex<Vec<crate::managed_git_worktrees::PreparedManagedWorktree>>,
@@ -469,13 +470,14 @@ impl HubRuntime {
             config.package_event_plane,
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
+        let inflight_account = Arc::clone(&lua_memory);
         Ok(Self {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             host_executor: crate::host_executor::HostExecutor::new(),
-            coordination_bridge: HubCoordinationBridge::new(),
+            coordination_bridge: HubCoordinationBridge::new(Arc::clone(&lua_memory)),
             entity_publish_bridge: HubEntityPublishBridge::new(
                 plugin_lifecycle.entity_provider_registrations(),
             ),
@@ -489,7 +491,9 @@ impl HubRuntime {
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
-            inflight_plugin_core: Mutex::new(Vec::new()),
+            inflight_plugin_core: Mutex::new(
+                crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
+            ),
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
@@ -594,13 +598,14 @@ impl HubRuntime {
             config.package_event_plane,
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
+        let inflight_account = Arc::clone(&lua_memory);
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             host_executor: crate::host_executor::HostExecutor::new(),
-            coordination_bridge: HubCoordinationBridge::new(),
+            coordination_bridge: HubCoordinationBridge::new(Arc::clone(&lua_memory)),
             entity_publish_bridge: HubEntityPublishBridge::new(
                 plugin_lifecycle.entity_provider_registrations(),
             ),
@@ -614,7 +619,9 @@ impl HubRuntime {
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
-            inflight_plugin_core: Mutex::new(Vec::new()),
+            inflight_plugin_core: Mutex::new(
+                crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
+            ),
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
@@ -1619,10 +1626,18 @@ impl HubRuntime {
             match self.fulfill_session_type_spawn(&pending) {
                 Ok(start) => {
                     if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
-                        inflight.push(InflightPluginCore::SessionTypeSpawn {
-                            start,
-                            response: pending.response,
-                        });
+                        if inflight.prepare_push().is_err() {
+                            let _ = pending.response.send(Err(
+                                crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED.into(),
+                            ));
+                        } else {
+                            inflight
+                                .try_push(InflightPluginCore::SessionTypeSpawn {
+                                    start,
+                                    response: pending.response,
+                                })
+                                .expect("capacity reserved");
+                        }
                     }
                 }
                 Err(error) => {
@@ -1638,65 +1653,83 @@ impl HubRuntime {
         let Ok(mut inflight) = self.inflight_plugin_core.lock() else {
             return;
         };
-        let mut retained = Vec::with_capacity(inflight.len());
-        for mut entry in inflight.drain(..) {
-            match &mut entry {
-                InflightPluginCore::Coordination {
-                    ticket, rejected, ..
-                } => match if rejected.is_some() {
-                    CoreTicketPoll::Refused
-                } else {
-                    ticket.poll()
-                } {
-                    CoreTicketPoll::Pending => retained.push(entry),
-                    CoreTicketPoll::Ready(result) => {
-                        if let InflightPluginCore::Coordination { response, .. } = entry {
-                            let _ = response.send(result);
-                        }
-                    }
-                    CoreTicketPoll::Lost => {
-                        if let InflightPluginCore::Coordination { response, .. } = entry {
-                            let _ =
-                                response.send(crate::lua_runtime::CoordinationDelivery::Refused(
-                                    crate::lua_runtime::CoordinationRefusal::HelperStopped,
-                                ));
-                        }
-                    }
-                    CoreTicketPoll::Refused => {
-                        if let InflightPluginCore::Coordination {
-                            response, rejected, ..
-                        } = entry
-                        {
-                            let refusal = if rejected.as_ref().is_some_and(|rejected| {
-                                rejected.reason == crate::data_plane::driver::CoreRefusal::Stopped
-                            }) {
-                                crate::lua_runtime::CoordinationRefusal::HelperStopped
-                            } else {
-                                crate::lua_runtime::CoordinationRefusal::HelperFull
-                            };
-                            drop(rejected);
-                            let _ = response
-                                .send(crate::lua_runtime::CoordinationDelivery::Refused(refusal));
-                        }
-                    }
-                },
-                InflightPluginCore::SessionTypeSpawn { start, .. } => match start.poll(self) {
-                    PluginSpawnPoll::Pending => retained.push(entry),
-                    PluginSpawnPoll::Ready(result) => {
-                        let InflightPluginCore::SessionTypeSpawn { start, response } = entry else {
+        let mut index = 0;
+        while index < inflight.len() {
+            match inflight.get_mut(index) {
+                Some(InflightPluginCore::SessionTypeSpawn { start, .. }) => {
+                    match start.poll(self) {
+                        PluginSpawnPoll::Pending => {
+                            index += 1;
                             continue;
-                        };
-                        let result = self.finish_session_type_spawn(&start, result);
-                        if response.send(result.clone()).is_err()
-                            && let Ok(spawned) = result
-                        {
-                            self.cleanup_undelivered_session_type_spawn(&spawned);
+                        }
+                        PluginSpawnPoll::Ready(result) => {
+                            let InflightPluginCore::SessionTypeSpawn { start, response } =
+                                inflight.swap_remove(index)
+                            else {
+                                continue;
+                            };
+                            let result = self.finish_session_type_spawn(&start, result);
+                            if response.send(result.clone()).is_err()
+                                && let Ok(spawned) = result
+                            {
+                                self.cleanup_undelivered_session_type_spawn(&spawned);
+                            }
+                            continue;
                         }
                     }
-                },
+                }
+                Some(InflightPluginCore::Coordination {
+                    ticket, rejected, ..
+                }) => {
+                    let finished = if rejected.is_some() {
+                        CoreTicketPoll::Refused
+                    } else {
+                        ticket.poll()
+                    };
+                    match finished {
+                        CoreTicketPoll::Pending => index += 1,
+                        CoreTicketPoll::Ready(result) => {
+                            if let InflightPluginCore::Coordination { response, .. } =
+                                inflight.swap_remove(index)
+                            {
+                                let _ = response.send(result);
+                            }
+                        }
+                        CoreTicketPoll::Lost => {
+                            if let InflightPluginCore::Coordination { response, .. } =
+                                inflight.swap_remove(index)
+                            {
+                                let _ = response.send(
+                                    crate::lua_runtime::CoordinationDelivery::Refused(
+                                        crate::lua_runtime::CoordinationRefusal::HelperStopped,
+                                    ),
+                                );
+                            }
+                        }
+                        CoreTicketPoll::Refused => {
+                            if let InflightPluginCore::Coordination {
+                                response, rejected, ..
+                            } = inflight.swap_remove(index)
+                            {
+                                let refusal = if rejected.as_ref().is_some_and(|rejected| {
+                                    rejected.reason
+                                        == crate::data_plane::driver::CoreRefusal::Stopped
+                                }) {
+                                    crate::lua_runtime::CoordinationRefusal::HelperStopped
+                                } else {
+                                    crate::lua_runtime::CoordinationRefusal::HelperFull
+                                };
+                                drop(rejected);
+                                let _ = response.send(
+                                    crate::lua_runtime::CoordinationDelivery::Refused(refusal),
+                                );
+                            }
+                        }
+                    }
+                }
+                None => break,
             }
         }
-        *inflight = retained;
     }
 
     pub(crate) fn validate_managed_git_request(
@@ -2832,12 +2865,22 @@ impl HubRuntime {
                 core_storage,
             );
             if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
-                inflight.push(InflightPluginCore::Coordination {
-                    ticket: submission.ticket,
-                    response: pending.response,
-                    rejected: submission.rejected,
-                    _storage: storage,
-                });
+                if inflight.prepare_push().is_err() {
+                    let _ = pending.response.send(Err(
+                        crate::lua_runtime::CoordinationFailure::NonAcknowledge(
+                            crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED.to_owned(),
+                        ),
+                    ));
+                } else {
+                    inflight
+                        .try_push(InflightPluginCore::Coordination {
+                            ticket: submission.ticket,
+                            response: pending.response,
+                            rejected: submission.rejected,
+                            _storage: storage,
+                        })
+                        .expect("capacity reserved");
+                }
             }
         }
         self.advance_inflight_plugin_core();

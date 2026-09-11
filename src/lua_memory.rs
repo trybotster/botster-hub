@@ -7,6 +7,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub(crate) mod charged_collection;
 pub(crate) mod layout;
 
 /// Explicit memory limits shared by every Lua plugin loaded by one Hub.
@@ -109,7 +110,6 @@ impl LuaMemoryAccount {
 
     /// Reserve only instance-owned storage that outlives individual callbacks.
     /// Callback-owned storage must use aggregate callback admission instead.
-    #[allow(dead_code)] // paused hook-error funding; keep the shared-storage interface
     pub(crate) fn reserve_shared_callback_storage(
         self: &Arc<Self>,
         bytes: usize,
