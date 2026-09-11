@@ -14,8 +14,8 @@ use botster_core::{
     PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
     PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
     RoutedEnvelopePublishOutcome, ReservedSessionSpawnError, SessionId, SessionLifecycleState,
-    SessionReservationRefusal, SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId,
-    TerminalCapabilitySet, TerminalColorProfile, TerminalSubscriptionGeneration,
+    SessionReservation, SessionReservationRefusal, SessionRuntimeErrorKind, SessionSpawnRequest,
+    SubscriptionId, TerminalCapabilitySet, TerminalColorProfile, TerminalSubscriptionGeneration,
 };
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureId, CaptureOwner, CaptureSnapshotRequest,
@@ -3323,6 +3323,43 @@ impl HubRuntime {
         CoreOperationTracker::new(self.core_daemon.begin_for_owner(
             waiter_id,
             CoreOperation::Spawn(SpawnSessionRequest { request, metadata }),
+        ))
+    }
+
+    pub(crate) fn begin_reserve_session_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        session_id: SessionId,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin_for_owner(waiter_id, CoreOperation::ReserveSession(session_id)),
+        )
+    }
+
+    pub(crate) fn begin_spawn_reserved_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        reservation: SessionReservation,
+        request: SpawnSessionRequest,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::SpawnReserved {
+                reservation,
+                request,
+            },
+        ))
+    }
+
+    pub(crate) fn begin_release_session_reservation_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        reservation: SessionReservation,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::ReleaseSessionReservation(reservation),
         ))
     }
 
