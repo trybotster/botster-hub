@@ -2850,4 +2850,35 @@ sys.exit(0)
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(worker_root);
     }
+
+    #[test]
+    fn managed_conversion_abandon_retracts_session_context() {
+        let (mut daemon, _state, root) = spawn_fixture("conv-abandon");
+        let live = crate::session_types::HubSessionContext {
+            context_id: "ctx-abandon".into(),
+            session_id: SessionId("s1-abandon".into()),
+            values: Default::default(),
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .publish_spawn_context(&live)
+            .unwrap();
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .abandon_session_type_spawn("s1-abandon".into());
+        daemon.runtime().unwrap().test_fulfill_plugin_spawns();
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_session_context("s1-abandon")
+                .is_none(),
+            "abandoned session context must be retracted"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

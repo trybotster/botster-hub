@@ -3450,6 +3450,11 @@ impl HubRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_fulfill_plugin_spawns(&self) {
+        self.fulfill_pending_session_type_spawns();
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_plugin_spawn(
         &self,
         plugin_key: &str,
@@ -4379,6 +4384,11 @@ impl HubSessionTypeSpawner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_take_abandoned(&self) -> Vec<String> {
+        self.take_abandoned()
     }
 
     fn take_abandoned(&self) -> Vec<String> {
