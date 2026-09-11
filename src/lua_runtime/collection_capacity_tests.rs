@@ -377,24 +377,8 @@ fn seal_take_ablation_leaves_charge_on_source() {
     assert_eq!(memory.usage().1, 2 * slot());
 }
 
-#[test]
-fn shared_capacity_error_reuses_one_arc() {
-    super::fund_callback_capacity_error();
-    let first = super::callback_capacity_error();
-    let second = super::callback_capacity_error();
-    match (first, second) {
-        (mlua::Error::ExternalError(first), mlua::Error::ExternalError(second)) => {
-            assert!(Arc::ptr_eq(&first, &second));
-            assert_eq!(first.to_string(), LUA_CALLBACK_CAPACITY_EXHAUSTED);
-            assert!(!first.to_string().contains("runtime error:"));
-        }
-        _ => panic!("capacity error must be ExternalError"),
-    }
-}
-
 fn bind_coordination(memory: Arc<LuaMemoryAccount>) -> mlua::Lua {
     let lua = mlua::Lua::new();
-    super::fund_callback_capacity_error();
     let table = super::coordination_table(
         &lua,
         PluginKey("capacity.plugin".into()),
@@ -406,26 +390,33 @@ fn bind_coordination(memory: Arc<LuaMemoryAccount>) -> mlua::Lua {
     lua
 }
 
-fn pcall_capacity(lua: &mlua::Lua, call: &str) -> String {
-    let chunk = format!("local ok, err = pcall({call}); return ok, tostring(err)");
-    let (ok, message): (bool, String) = lua.load(&chunk).eval().unwrap();
-    assert!(!ok, "{call} must raise");
-    message
-}
-
 #[test]
-fn publish_and_drain_capacity_raise_without_runtime_prefix() {
-    let memory = account(1);
+fn publish_and_drain_capacity_raise_precreated_lua_string() {
+    let memory = account(crate::lua_memory::layout::lua_reference_bytes());
     let lua = bind_coordination(Arc::clone(&memory));
-    let publish = "coordination.publish, { id = 'e1', target = { type = 'topic', topic = 't' } }";
-    let drain = "coordination.drain, { target = { type = 'topic', topic = 't' } }";
     let before = memory.usage().1;
-    for call in [publish, drain] {
-        for _ in 0..8 {
-            let message = pcall_capacity(&lua, call);
-            assert_eq!(message, LUA_CALLBACK_CAPACITY_EXHAUSTED);
-            assert!(!message.contains("runtime error:"));
-        }
+    for call in [
+        "coordination.publish, { id = 'e1', target = { type = 'topic', topic = 't' } }",
+        "coordination.drain, { target = { type = 'topic', topic = 't' } }",
+    ] {
+        let chunk = format!(
+            r#"
+            local kept = {{}}
+            for i = 1, 1000 do
+                local ok, err = pcall({call})
+                assert(not ok)
+                assert(tostring(err) == {text:?})
+                assert(not tostring(err):find('runtime error:', 1, true))
+                kept[i] = err
+            end
+            for i = 2, 1000 do
+                assert(rawequal(kept[1], kept[i]))
+            end
+            return true
+            "#,
+            text = LUA_CALLBACK_CAPACITY_EXHAUSTED
+        );
+        lua.load(&chunk).eval::<bool>().unwrap();
     }
     assert_eq!(memory.usage().1, before);
 }
