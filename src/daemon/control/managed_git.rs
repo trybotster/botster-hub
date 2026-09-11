@@ -201,13 +201,13 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     runtime.retry_retained_reservation_releases();
     runtime.retry_created_worktree_releases();
     runtime.reap_detached_core_operations();
-    if let Some(worktree_id) = runtime.peek_pending_managed_worktree_id() {
-        if runtime.submitted_worktree_rollback(&worktree_id) {
-            if let Some(prepared) = runtime.take_one_confirmed_worktree_rollback() {
-                accept_confirmed_rollback(daemon, state, prepared);
-            }
-            return;
+    if let Some(worktree_id) = runtime.peek_pending_managed_worktree_id()
+        && runtime.submitted_worktree_rollback(&worktree_id)
+    {
+        if let Some(prepared) = runtime.take_one_confirmed_worktree_rollback() {
+            accept_confirmed_rollback(daemon, state, prepared);
         }
+        return;
     }
     let Some(pending) = runtime.take_pending_managed_spawn() else {
         if let Some(prepared) = runtime.take_one_confirmed_worktree_rollback() {
@@ -720,10 +720,9 @@ impl ManagedSpawnOperation {
             .prepared
             .as_ref()
             .map(|prepared| prepared.worktree_id.clone())
+            && let Some(runtime) = daemon.runtime()
         {
-            if let Some(runtime) = daemon.runtime() {
-                runtime.finish_submitted_worktree_rollback(&worktree_id);
-            }
+            runtime.finish_submitted_worktree_rollback(&worktree_id);
         }
         match result {
             HostResult::ManagedWorktreeFinalized => {
@@ -748,10 +747,10 @@ impl ManagedSpawnOperation {
                 self.retain_recovery(state, prepared, error)
             }
             HostResult::Failed { error, .. } => {
-                if self.pending.is_none() {
-                    if let Some(prepared) = self.prepared.clone() {
-                        return self.retain_recovery(state, prepared, error);
-                    }
+                if self.pending.is_none()
+                    && let Some(prepared) = self.prepared.clone()
+                {
+                    return self.retain_recovery(state, prepared, error);
                 }
                 self.finish_error(managed_host_failure(error))
             }
@@ -941,10 +940,10 @@ impl ManagedSpawnOperation {
             .as_ref()
             .expect("managed worktree exists")
             .clone();
-        if matches!(decision, ManagedWorktreeDecision::Rollback) {
-            if let Some(runtime) = daemon.runtime() {
-                runtime.begin_submitted_worktree_rollback(&prepared.worktree_id);
-            }
+        if matches!(decision, ManagedWorktreeDecision::Rollback)
+            && let Some(runtime) = daemon.runtime()
+        {
+            runtime.begin_submitted_worktree_rollback(&prepared.worktree_id);
         }
         let poll = self.submit_host(
             daemon,
@@ -971,10 +970,9 @@ impl ManagedSpawnOperation {
         );
         if matches!(decision, ManagedWorktreeDecision::Rollback)
             && !matches!(poll, ControlPoll::Pending)
+            && let Some(runtime) = daemon.runtime()
         {
-            if let Some(runtime) = daemon.runtime() {
-                runtime.clear_submitted_worktree_rollback(&prepared.worktree_id);
-            }
+            runtime.clear_submitted_worktree_rollback(&prepared.worktree_id);
         }
         poll
     }

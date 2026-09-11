@@ -1855,24 +1855,23 @@ impl HubRuntime {
         if let Ok(mut suppressed) = self.suppressed_created_worktree_rollbacks.lock() {
             suppressed.remove(&prepared.worktree_id);
         }
-        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
-            if !cleanups
+        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock()
+            && !cleanups
                 .iter()
                 .any(|cleanup| cleanup.worktree_id == prepared.worktree_id)
-            {
-                let shutdown = self.begin_shutdown_session(session_id.clone());
-                cleanups.push(CreatedWorktreeCleanup {
-                    worktree_id: prepared.worktree_id.clone(),
-                    session_id,
-                    prepared,
-                    reservation,
-                    shutdown: Some(shutdown),
-                    remove: None,
-                    removed: false,
-                    release: None,
-                    release_attempted: false,
-                });
-            }
+        {
+            let shutdown = self.begin_shutdown_session(session_id.clone());
+            cleanups.push(CreatedWorktreeCleanup {
+                worktree_id: prepared.worktree_id.clone(),
+                session_id,
+                prepared,
+                reservation,
+                shutdown: Some(shutdown),
+                remove: None,
+                removed: false,
+                release: None,
+                release_attempted: false,
+            });
         }
         self.retry_created_worktree_releases();
     }
@@ -5631,6 +5630,7 @@ impl CoreOperationTracker {
 }
 
 /// Plugin-facing Core work the owner polls between plugin invocations.
+#[allow(clippy::large_enum_variant)] // retained in-flight record for the owner-less runtime path; entries are polled in place
 enum InflightPluginCore {
     Coordination {
         ticket: crate::data_plane::driver::ChargedCoreTicket<crate::lua_runtime::CoordinationReply>,

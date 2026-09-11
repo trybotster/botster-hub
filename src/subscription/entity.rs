@@ -1541,17 +1541,16 @@ fn publish_catalog_capacity_wake(state: &mut DaemonControlState, owner_turn: &mu
         {
             return;
         }
-        if let Some(waiter_id) = state.coordination_capacity_waiters.pop_first() {
-            if !crate::daemon::control::pending::mark_owner_ready(
+        if let Some(waiter_id) = state.coordination_capacity_waiters.pop_first()
+            && !crate::daemon::control::pending::mark_owner_ready(
                 state,
                 waiter_id,
                 crate::daemon::owner_schedule::ReadyClass::HostCompletion,
                 crate::daemon::control::pending::READY_HOST_COMPLETION,
-            ) {
-                state.coordination_fault = Some(
-                    crate::daemon::control::coordination::CoordinationFault::SchedulerExhausted,
-                );
-            }
+            )
+        {
+            state.coordination_fault =
+                Some(crate::daemon::control::coordination::CoordinationFault::SchedulerExhausted);
         }
     }
     while state.plugin_entities.has_capacity_waiters() {
