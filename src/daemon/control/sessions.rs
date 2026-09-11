@@ -3014,6 +3014,25 @@ sys.exit(0)
         assert!(spawned.created_worktree);
         assert!(!spawned.reused_worktree);
         assert!(std::path::Path::new(&spawned.worktree_path).exists());
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_created_worktree_cleanup_count(),
+            0,
+            "delivered spawn must not keep a cleanup marker"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            0
+        );
+        assert!(
+            hub_worktree_ids(&daemon).contains(&spawned.worktree_id),
+            "delivered spawn must persist the HubState worktree row"
+        );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3181,6 +3200,22 @@ sys.exit(0)
         let managed = root.join("managed-worktrees");
         let found = walkdir_exists(&managed);
         assert!(found, "created worktree must remain under {managed:?}");
+        assert!(
+            !daemon
+                .runtime()
+                .unwrap()
+                .retained_reservations()
+                .is_empty(),
+            "RetainedUnconfirmed must keep the reservation marker"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_created_worktree_cleanup_count(),
+            0,
+            "unconfirmed spawn must not queue Host rollback"
+        );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(worker_root);
@@ -3245,6 +3280,26 @@ sys.exit(0)
                 runtime.test_created_worktree_cleanup_count(),
                 runtime.test_confirmed_worktree_rollback_count(),
                 runtime.test_release_session_reservation_begins()
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_created_worktree_cleanup_count(),
+            0
+        );
+        let record_gone = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if hub_worktree_ids(&daemon).is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < record_gone,
+                "Released Host rollback must commit worktree record removal; rows={:?}",
+                hub_worktree_ids(&daemon)
             );
             std::thread::yield_now();
         }
@@ -3385,6 +3440,74 @@ sys.exit(0)
                 .test_confirmed_worktree_rollback_count(),
             0,
             "reuse must drain identity-matched rollback before Host FinalizeRollback"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn hub_worktree_ids(daemon: &crate::HubDaemon) -> Vec<String> {
+        daemon
+            .runtime()
+            .unwrap()
+            .state()
+            .worktrees
+            .iter()
+            .map(|worktree| worktree.worktree_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_stale_rollback_does_not_remove_a_live_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-stale", Some(worker));
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let handle = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            )
+        });
+        let spawned = pump_until_join(&mut daemon, &mut state, handle).expect("live spawn");
+        let live_id = spawned.worktree_id.clone();
+        let live_path = spawned.worktree_path.clone();
+        let stale = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: root.join("repo"),
+            common_dir: root.join("repo"),
+            branch: "stale".into(),
+            path: root.join("missing-stale-worktree"),
+            worktree_id: "wt-stale".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: false,
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .defer_confirmed_worktree_rollback(stale);
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_publish_managed_spawn();
+        let hold = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < hold {
+            pump_core(&mut daemon, &mut state);
+            std::thread::yield_now();
+        }
+        assert!(
+            std::path::Path::new(&live_path).exists(),
+            "stale rollback must not remove the live worktree"
+        );
+        assert!(
+            hub_worktree_ids(&daemon).contains(&live_id),
+            "stale rollback must not remove the live HubState row"
         );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);

@@ -1712,6 +1712,7 @@ impl HubRuntime {
         if !prepared.created_worktree {
             self.cancel_created_worktree_cleanup(&prepared.worktree_id);
         }
+        self.retry_retained_reservation_releases();
         self.retry_created_worktree_releases();
         let context = materialized.context.clone();
         let metadata = session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
@@ -1863,6 +1864,30 @@ impl HubRuntime {
         &self,
     ) -> Arc<Mutex<BTreeSet<String>>> {
         Arc::clone(&self.suppressed_created_worktree_rollbacks)
+    }
+
+    pub(crate) fn retry_retained_reservation_releases(&self) {
+        let tokens = self.take_retained_reservations();
+        if tokens.is_empty() {
+            return;
+        }
+        let mut keep = Vec::new();
+        for token in tokens {
+            match token.state() {
+                SessionReservationState::Ended
+                | SessionReservationState::Reserved
+                | SessionReservationState::Released => {
+                    let tracker = self.begin_release_session_reservation(token.clone());
+                    if let Ok(mut detached) = self.detached_operations.lock() {
+                        detached.push(tracker);
+                    }
+                }
+                SessionReservationState::Session
+                | SessionReservationState::Launching
+                | SessionReservationState::CleanupUnconfirmed => keep.push(token),
+            }
+        }
+        self.merge_retained_reservations(keep);
     }
 
     pub(crate) fn retry_created_worktree_releases(&self) {
@@ -5852,6 +5877,7 @@ impl ManagedSessionSpawnStart {
                     CoreTicketPoll::Refused
                     | CoreTicketPoll::Lost
                     | CoreTicketPoll::Ready(Err(_)) => {
+                        self.keep_reservation(runtime);
                         return spawn_fail(
                             self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown),
                             Some(SessionReservationRelease::RetainedUnconfirmed),
@@ -5865,8 +5891,25 @@ impl ManagedSessionSpawnStart {
                             .spawn_error
                             .take()
                             .unwrap_or(CoreDaemonError::Shutdown);
-                        let disposition = result.ok();
-                        return spawn_fail(error, disposition);
+                        match result {
+                            Ok(SessionReservationRelease::Released) => {
+                                return spawn_fail(
+                                    error,
+                                    Some(SessionReservationRelease::Released),
+                                );
+                            }
+                            Ok(disposition) => {
+                                self.keep_reservation(runtime);
+                                return spawn_fail(error, Some(disposition));
+                            }
+                            Err(_) => {
+                                self.keep_reservation(runtime);
+                                return spawn_fail(
+                                    error,
+                                    Some(SessionReservationRelease::RetainedUnconfirmed),
+                                );
+                            }
+                        }
                     }
                     CoreTicketPoll::Ready(Ok(_)) => {
                         return spawn_fail(CoreDaemonError::Shutdown, None);
@@ -5881,6 +5924,12 @@ impl ManagedSessionSpawnStart {
             self.tracker =
                 runtime.begin_release_session_reservation_for_owner(self.waiter_id, held);
             self.stage = PluginSpawnStage::Release;
+        }
+    }
+
+    fn keep_reservation(&mut self, runtime: &HubRuntime) {
+        if let Some(held) = self.reservation.take() {
+            runtime.retain_reservation(held);
         }
     }
 }

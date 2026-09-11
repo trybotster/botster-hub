@@ -188,6 +188,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     let Some(runtime) = daemon.runtime() else {
         return;
     };
+    runtime.retry_retained_reservation_releases();
     runtime.retry_created_worktree_releases();
     runtime.reap_detached_core_operations();
     let Some(pending) = runtime.take_pending_managed_spawn() else {
