@@ -16,8 +16,19 @@ The Core writer will propose ownership for the input vector, resource Box, join-
 The Hub writer will map account construction, both production load paths, and the acknowledgement storage owners to concrete changes.
 The reviewer will check those premises before Root authorizes source changes or new measurement execution.
 Both assignments reuse the verified worker-lifetime, shared-admission, charge-split, and consumer evidence.
+Root and the reviewer accepted the metadata contract after reviewing its complete destruction order.
+Core will replace the new resource alias with typed release, add a guarded resource batch, and make the executor handle private.
+Every executor handle will use `Arc::into_inner`; no raw Arc or Weak handle may escape.
+The final handle must destroy covered owners before explicitly releasing metadata. Failed owner cleanup retains the metadata charge.
+A valid batch may release metadata after destroying its vector, even when allocation unwinds. Allocation failure alone does not require retention.
+The Core writer may implement this contract and focused test source in the same three files. Execution and integration remain separately gated.
+The Hub writer will separately prove each affected container's population bound, including retained failures and stale identities.
+Core-private layout facts may support later sizing. They do not by themselves establish actual allocation requests or Arc header sizes.
 
 Admission must precede allocation. Capacity refusal must preserve the old registration during reload.
+The caller trace places that refusal boundary before event-generation replacement and capability cleanup in `runtime/package_effect.rs`.
+Admission only inside `lifecycle.reload_package` is too late. The refusal test must also preserve the old event generation and capability resources.
+Production package loading still uses the unbounded loader. Account construction and production policy wiring remain explicit implementation requirements.
 Every charge must survive its allocation through completion, abandonment, failure, and actual destruction.
 The implementation must remain event driven, without a new Owner wait, timer, or polling path.
 The decisive check will exercise acknowledgement through the daemon and verify retained charges before disposal and release after disposal.
