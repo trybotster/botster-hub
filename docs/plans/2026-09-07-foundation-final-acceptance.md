@@ -33,6 +33,15 @@ The Hub source pass stopped before connection because acknowledgement admission 
 The first unresolved inputs are Rust error/conversion storage and the final charged reply channel, including its lease allocation.
 The next bounded slice defines private storage owners with required pre-admitted charges and an explicit sizing contract, without defaults or placeholders.
 Those definitions will establish exact types for sizing before the live admission path changes. They do not establish connected accounting.
+The first definitions slice is frozen in `/private/tmp/c1-acknowledgement-ownership-review-20260910-1`.
+It requires separate result, error-string, and conversion charges, plus leased reply endpoints and caller handles.
+The shared candidate transport preserves Publish and Drain payloads. Its acknowledgement sender accepts only charged results and errors.
+Root checked the source and hashes. Independent review accepted the definitions; only pinned formatting is now authorized.
+Connection must fund producer-side errors and must not convert impossible shared reply variants into uncharged acknowledgement errors.
+Continuation and disposal layouts still depend on the actual Host command change. This slice does not duplicate that command.
+Earlier zero-warning reports were incorrect because compiler diagnostics were in JSON stdout, not stderr.
+Root checked both Core build streams: each contains two `unused_mut` diagnostics for the same statement, once per target.
+The build and test results remain unchanged. The definitions review records the correction and the separate Hub warning counts.
 The Hub writer will separately prove each affected container's population bound, including retained failures and stale identities.
 Root and the reviewer accepted those element-count proofs: pending requests and coordination capacity waiters are each bounded by Owner capacity.
 Host completions are bounded by the runtime's eight Host permits, including unmatched terminal completions. Pending-row membership is not required for that bound.
