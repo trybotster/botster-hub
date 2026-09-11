@@ -3098,9 +3098,15 @@ mod tests {
                 },
                 transports: crate::TransportBindings::default(),
                 core_engine: crate::config::CoreEngineOptions {
-                    session_worker_path: Some(std::path::PathBuf::from(
-                        "/tmp/core-d1a-candidate-20260911-5/botster-session-worker",
-                    )),
+                    session_worker_path: Some(
+                        std::env::var_os("BOTSTER_SESSION_WORKER_BIN")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "missing required candidate path in BOTSTER_SESSION_WORKER_BIN"
+                                )
+                            }),
+                    ),
                     ..crate::config::CoreEngineOptions::default()
                 },
                 ..crate::HubStartupOptions::default()
