@@ -160,3 +160,35 @@ pub(crate) fn single_reply_bytes<T>(receiver_waits: bool) -> Option<usize> {
 pub(crate) const fn lua_reference_bytes() -> usize {
     arc_bytes::<std::ffi::c_int>()
 }
+
+const BTREE_CAPACITY: usize = 11;
+const BTREE_EDGES: usize = 12;
+const BTREE_MIN_OCCUPANCY: usize = 5;
+
+#[repr(C)]
+struct BTreeLeafMirror<K, V> {
+    _parent: *const u8,
+    _parent_idx: u16,
+    _len: u16,
+    _keys: [K; BTREE_CAPACITY],
+    _vals: [V; BTREE_CAPACITY],
+}
+
+#[repr(C)]
+struct BTreeInternalMirror<K, V> {
+    _leaf: BTreeLeafMirror<K, V>,
+    _edges: [*const u8; BTREE_EDGES],
+}
+
+pub(crate) fn btree_internal_size<K, V>() -> usize {
+    std::mem::size_of::<BTreeInternalMirror<K, V>>()
+}
+
+pub(crate) fn btree_nodes<K, V>(len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        let internal = btree_internal_size::<K, V>();
+        internal.saturating_add(len.saturating_mul(internal / BTREE_MIN_OCCUPANCY))
+    }
+}

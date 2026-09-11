@@ -234,6 +234,7 @@ impl HubCoordinationBridge {
         )
     }
 
+    #[allow(dead_code)]
     fn publish(&self, envelope: RoutedEnvelope) -> Result<RoutedEnvelopePublishOutcome, String> {
         let response = self.request(PendingCoordinationOperation::Publish { envelope })?;
         match response {
@@ -242,6 +243,7 @@ impl HubCoordinationBridge {
         }
     }
 
+    #[allow(dead_code)]
     fn drain(
         &self,
         target: EnvelopeTarget,
@@ -333,9 +335,22 @@ impl HubCoordinationBridge {
             .account
             .reserve_callback_total(bytes)
             .map_err(|_| CoordinationRequestError::Local(CoordinationLocalError::Capacity))?;
+        self.submit_admitted(operation, entry)
+    }
+
+    fn submit_admitted(
+        &self,
+        operation: PendingCoordinationOperation,
+        entry: LuaCallbackCharge,
+    ) -> Result<HubCoordinationResponse, CoordinationRequestError> {
+        if thread::current().id() == self.owner_thread {
+            return Err(CoordinationRequestError::Local(
+                CoordinationLocalError::OwnerThread,
+            ));
+        }
         let caller = CoordinationCaller::new();
         let _caller = CoordinationCallerGuard(caller.clone());
-        let (response, receiver) = mpsc::channel();
+        let (response, receiver) = mpsc::sync_channel(1);
         self.enqueue(PendingCoordinationRequest {
             #[cfg(test)]
             terminal_drop_probe: None,
@@ -434,7 +449,7 @@ impl HubCoordinationBridge {
         &self,
         operation: PendingCoordinationOperation,
     ) -> mpsc::Receiver<CoordinationReply> {
-        let (response, receiver) = mpsc::channel();
+        let (response, receiver) = mpsc::sync_channel(1);
         self.pending
             .lock()
             .unwrap()
@@ -2588,36 +2603,62 @@ fn coordination_table(
 
     let publish_bridge = coordination_bridge.clone();
     let publish_plugin_key = plugin_key.clone();
+    let publish_memory = Arc::clone(&memory);
+    let publish_capacity = lua.create_string(LUA_CALLBACK_CAPACITY_EXHAUSTED)?;
     coordination.set(
         "publish",
         callback::create(lua, move |lua, args: Value| {
-            let envelope = routed_envelope_from_lua(lua, publish_plugin_key.clone(), args)?;
-            let outcome = publish_bridge
-                .publish(envelope)
-                .map_err(mlua::Error::RuntimeError)?;
-            lua.to_value(&outcome)
+            match admit_publish_operation(&publish_memory, &publish_plugin_key, lua, args) {
+                Ok((operation, entry)) => {
+                    let outcome = match publish_bridge.submit_admitted(operation, entry) {
+                        Ok(HubCoordinationResponse::Publish(outcome)) => outcome,
+                        Ok(_) => {
+                            return Err(mlua::Error::RuntimeError(
+                                "coordination publish returned unexpected response".into(),
+                            ));
+                        }
+                        Err(CoordinationRequestError::Local(CoordinationLocalError::Capacity)) => {
+                            return Ok(Value::String(publish_capacity.clone()));
+                        }
+                        Err(error) => {
+                            return Err(mlua::Error::RuntimeError(error.as_str().to_owned()));
+                        }
+                    };
+                    lua.to_value(&outcome)
+                }
+                Err(AdmissionError::Capacity) => Ok(Value::String(publish_capacity.clone())),
+                Err(AdmissionError::Runtime(error)) => Err(error),
+            }
         })?,
     )?;
 
     let drain_bridge = coordination_bridge.clone();
+    let drain_memory = Arc::clone(&memory);
+    let drain_capacity = lua.create_string(LUA_CALLBACK_CAPACITY_EXHAUSTED)?;
     coordination.set(
         "drain",
         callback::create(lua, move |lua, args: Value| {
-            let value = lua.from_value::<serde_json::Value>(args)?;
-            let target = target_from_json(value.get("target"))?;
-            let after = value
-                .get("after")
-                .and_then(serde_json::Value::as_u64)
-                .map(EnvelopeCursor);
-            let limit = value
-                .get("limit")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|limit| usize::try_from(limit).ok())
-                .unwrap_or(16);
-            let outcome = drain_bridge
-                .drain(target, after, limit)
-                .map_err(mlua::Error::RuntimeError)?;
-            lua.to_value(&outcome)
+            match admit_drain_operation(&drain_memory, lua, args) {
+                Ok((operation, entry)) => {
+                    let outcome = match drain_bridge.submit_admitted(operation, entry) {
+                        Ok(HubCoordinationResponse::Drain(outcome)) => outcome,
+                        Ok(_) => {
+                            return Err(mlua::Error::RuntimeError(
+                                "coordination drain returned unexpected response".into(),
+                            ));
+                        }
+                        Err(CoordinationRequestError::Local(CoordinationLocalError::Capacity)) => {
+                            return Ok(Value::String(drain_capacity.clone()));
+                        }
+                        Err(error) => {
+                            return Err(mlua::Error::RuntimeError(error.as_str().to_owned()));
+                        }
+                    };
+                    lua.to_value(&outcome)
+                }
+                Err(AdmissionError::Capacity) => Ok(Value::String(drain_capacity.clone())),
+                Err(AdmissionError::Runtime(error)) => Err(error),
+            }
         })?,
     )?;
 
@@ -2627,6 +2668,249 @@ fn coordination_table(
     )?;
 
     Ok(coordination)
+}
+
+enum AdmissionError {
+    Capacity,
+    Runtime(mlua::Error),
+}
+
+impl From<mlua::Error> for AdmissionError {
+    fn from(error: mlua::Error) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+fn lua_table(args: Value) -> Result<Table, mlua::Error> {
+    match args {
+        Value::Table(table) => Ok(table),
+        _ => Err(mlua::Error::RuntimeError(
+            "coordination request requires a table".into(),
+        )),
+    }
+}
+
+fn lua_string_bytes(table: &Table, key: &str) -> Result<Option<mlua::String>, mlua::Error> {
+    match table.raw_get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::String(text) => Ok(Some(text)),
+        _ => Err(mlua::Error::RuntimeError(format!(
+            "coordination field {key} must be a string"
+        ))),
+    }
+}
+
+fn admit_callback_bytes(
+    memory: &Arc<LuaMemoryAccount>,
+    payload: usize,
+) -> Result<LuaCallbackCharge, AdmissionError> {
+    let caller = crate::lua_memory::layout::arc_bytes::<std::sync::atomic::AtomicU8>();
+    let reply = crate::lua_memory::layout::single_reply_bytes::<CoordinationReply>(true)
+        .ok_or(AdmissionError::Capacity)?;
+    let bytes = payload
+        .checked_add(caller)
+        .and_then(|bytes| bytes.checked_add(reply))
+        .ok_or(AdmissionError::Capacity)?;
+    memory
+        .reserve_callback_total(bytes)
+        .map_err(|_| AdmissionError::Capacity)
+}
+
+fn admit_publish_operation(
+    memory: &Arc<LuaMemoryAccount>,
+    plugin_key: &PluginKey,
+    _lua: &Lua,
+    args: Value,
+) -> Result<(PendingCoordinationOperation, LuaCallbackCharge), AdmissionError> {
+    let table = lua_table(args)?;
+    let id = lua_string_bytes(&table, "id")?
+        .ok_or_else(|| mlua::Error::RuntimeError("coordination.publish requires id".into()))?;
+    let id_bytes = id.as_bytes();
+    let content_type = lua_string_bytes(&table, "content_type")?;
+    let content_bytes = content_type
+        .as_ref()
+        .map(|text| text.as_bytes().len())
+        .unwrap_or("application/json".len());
+    let body = lua_string_bytes(&table, "body")?;
+    let body_len = body.as_ref().map(|text| text.as_bytes().len()).unwrap_or(0);
+    let target_table = match table.raw_get::<Value>("target")? {
+        Value::Table(target) => target,
+        _ => {
+            return Err(
+                mlua::Error::RuntimeError("coordination.publish requires target".into()).into(),
+            );
+        }
+    };
+    let (target_kind, first, second) = lua_target_strings(&target_table)?;
+    let source_len = "plugin:"
+        .len()
+        .checked_add(plugin_key.0.len())
+        .ok_or(AdmissionError::Capacity)?;
+    let payload = id_bytes
+        .len()
+        .checked_add(source_len)
+        .and_then(|bytes| bytes.checked_add(content_bytes))
+        .and_then(|bytes| bytes.checked_add(body_len))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<EnvelopeTarget>()))
+        .and_then(|bytes| bytes.checked_add(first.as_bytes().len()))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                second
+                    .as_ref()
+                    .map(|text| text.as_bytes().len())
+                    .unwrap_or(0),
+            )
+        })
+        .ok_or(AdmissionError::Capacity)?;
+    let entry = admit_callback_bytes(memory, payload)?;
+    let target = envelope_target_from_parts(&target_kind, &first, second.as_ref())?;
+    let content_type = content_type
+        .as_ref()
+        .map(|text| String::from_utf8_lossy(&text.as_bytes()).into_owned())
+        .unwrap_or_else(|| "application/json".to_string());
+    let body = body
+        .map(|text| text.as_bytes().as_ref().to_vec())
+        .unwrap_or_default();
+    Ok((
+        PendingCoordinationOperation::Publish {
+            envelope: RoutedEnvelope::new(
+                EnvelopeId(String::from_utf8_lossy(&id_bytes).into_owned()),
+                EndpointId(format!("plugin:{}", plugin_key.0)),
+                vec![target],
+                RoutedEnvelopePayload {
+                    content_type,
+                    body,
+                    extension: None,
+                },
+                0,
+            ),
+        },
+        entry,
+    ))
+}
+
+fn admit_drain_operation(
+    memory: &Arc<LuaMemoryAccount>,
+    _lua: &Lua,
+    args: Value,
+) -> Result<(PendingCoordinationOperation, LuaCallbackCharge), AdmissionError> {
+    let table = lua_table(args)?;
+    let target_table = match table.raw_get::<Value>("target")? {
+        Value::Table(target) => target,
+        _ => {
+            return Err(
+                mlua::Error::RuntimeError("coordination.drain requires target".into()).into(),
+            );
+        }
+    };
+    let (target_kind, first, second) = lua_target_strings(&target_table)?;
+    let after = match table.raw_get::<Value>("after")? {
+        Value::Nil => None,
+        Value::Integer(value) if value >= 0 => Some(EnvelopeCursor(value as u64)),
+        Value::Number(value) if value >= 0.0 => Some(EnvelopeCursor(value as u64)),
+        _ => {
+            return Err(mlua::Error::RuntimeError(
+                "coordination.drain after must be a non-negative integer".into(),
+            )
+            .into());
+        }
+    };
+    let limit = match table.raw_get::<Value>("limit")? {
+        Value::Nil => 16,
+        Value::Integer(value) if value > 0 => value as usize,
+        Value::Number(value) if value > 0.0 => value as usize,
+        _ => 16,
+    };
+    let payload = first
+        .as_bytes()
+        .len()
+        .checked_add(
+            second
+                .as_ref()
+                .map(|text| text.as_bytes().len())
+                .unwrap_or(0),
+        )
+        .and_then(|bytes| {
+            bytes.checked_add(after.map_or(0, |_| std::mem::size_of::<EnvelopeCursor>()))
+        })
+        .ok_or(AdmissionError::Capacity)?;
+    let entry = admit_callback_bytes(memory, payload)?;
+    let target = envelope_target_from_parts(&target_kind, &first, second.as_ref())?;
+    Ok((
+        PendingCoordinationOperation::Drain {
+            target,
+            after,
+            limit,
+        },
+        entry,
+    ))
+}
+
+fn lua_target_strings(
+    table: &Table,
+) -> Result<(String, mlua::String, Option<mlua::String>), mlua::Error> {
+    let kind = lua_string_bytes(table, "type")?
+        .ok_or_else(|| mlua::Error::RuntimeError("coordination target.type is required".into()))?;
+    let kind = String::from_utf8_lossy(&kind.as_bytes()).into_owned();
+    let (first_key, second_key) = match kind.as_str() {
+        "endpoint" => ("endpoint_id", None),
+        "client" => ("client_id", None),
+        "session" => ("session_id", None),
+        "subscription" => ("session_id", Some("subscription_id")),
+        "plugin" => ("plugin_key", None),
+        "stream" => ("stream", None),
+        "topic" => ("topic", None),
+        _ => {
+            return Err(mlua::Error::RuntimeError(
+                "coordination target.type is not recognized".into(),
+            ));
+        }
+    };
+    let first = lua_string_bytes(table, first_key)?.ok_or_else(|| {
+        mlua::Error::RuntimeError(format!("coordination target.{first_key} is required"))
+    })?;
+    let second = match second_key {
+        Some(key) => Some(lua_string_bytes(table, key)?.ok_or_else(|| {
+            mlua::Error::RuntimeError(format!("coordination target.{key} is required"))
+        })?),
+        None => None,
+    };
+    Ok((kind, first, second))
+}
+
+fn envelope_target_from_parts(
+    kind: &str,
+    first: &mlua::String,
+    second: Option<&mlua::String>,
+) -> Result<EnvelopeTarget, mlua::Error> {
+    let first = String::from_utf8_lossy(&first.as_bytes()).into_owned();
+    Ok(match kind {
+        "endpoint" => EnvelopeTarget::Endpoint {
+            endpoint_id: EndpointId(first),
+        },
+        "client" => EnvelopeTarget::Client {
+            client_id: botster_core::ClientId(first),
+        },
+        "session" => EnvelopeTarget::Session {
+            session_id: botster_core::SessionId(first),
+        },
+        "subscription" => EnvelopeTarget::Subscription {
+            session_id: botster_core::SessionId(first),
+            subscription_id: botster_core::SubscriptionId(
+                String::from_utf8_lossy(&second.expect("subscription id").as_bytes()).into_owned(),
+            ),
+        },
+        "plugin" => EnvelopeTarget::Plugin {
+            plugin_key: PluginKey(first),
+        },
+        "stream" => EnvelopeTarget::Stream { stream: first },
+        "topic" => EnvelopeTarget::Topic { topic: first },
+        _ => {
+            return Err(mlua::Error::RuntimeError(
+                "coordination target.type is not recognized".into(),
+            ));
+        }
+    })
 }
 
 fn routed_envelope_from_lua(

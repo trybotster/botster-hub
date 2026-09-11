@@ -30,37 +30,7 @@ use crate::session_types::PackageSessionType;
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::{Worktree, WorktreeGitMetadata};
 
-const BTREE_CAPACITY: usize = 11;
-const BTREE_EDGES: usize = 12;
-const BTREE_MIN_OCCUPANCY: usize = 5;
-
-#[repr(C)]
-struct BTreeLeafMirror<K, V> {
-    _parent: *const u8,
-    _parent_idx: u16,
-    _len: u16,
-    _keys: [K; BTREE_CAPACITY],
-    _vals: [V; BTREE_CAPACITY],
-}
-
-#[repr(C)]
-struct BTreeInternalMirror<K, V> {
-    _leaf: BTreeLeafMirror<K, V>,
-    _edges: [*const u8; BTREE_EDGES],
-}
-
-fn btree_internal_size<K, V>() -> usize {
-    size_of::<BTreeInternalMirror<K, V>>()
-}
-
-fn btree_nodes<K, V>(len: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        let internal = btree_internal_size::<K, V>();
-        internal.saturating_add(len.saturating_mul(internal / BTREE_MIN_OCCUPANCY))
-    }
-}
+use crate::lua_memory::layout::{btree_internal_size, btree_nodes};
 
 /// New-heap walk of one `HubState` clone, excluding the retained Arc view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
