@@ -3115,20 +3115,18 @@ sys.exit(0)
         }
         let a = a.join().expect("join a");
         let b = b.join().expect("join b");
-        let ok = [a.as_ref().ok(), b.as_ref().ok()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        assert!(!ok.is_empty(), "exactly one owner must complete: {a:?} {b:?}");
+        let (ok, conflict) = match (a, b) {
+            (Ok(spawned), Err(error)) | (Err(error), Ok(spawned)) => (spawned, error),
+            other => panic!(
+                "S2 exact-conflict exclusion: one owner and one worktree_conflict, got {other:?}"
+            ),
+        };
+        assert_eq!(conflict.kind, "worktree_conflict");
+        assert!(ok.created_worktree);
         assert!(
-            ok.iter().filter(|spawned| spawned.created_worktree).count() <= 1,
-            "at most one create: {a:?} {b:?}"
-        );
-        let path = ok[0].worktree_path.clone();
-        let managed = root.join("managed-worktrees");
-        assert!(
-            std::path::Path::new(&path).exists() || walkdir_exists(&managed),
-            "worktree must survive a={a:?} b={b:?} path={path:?} managed={managed:?}"
+            std::path::Path::new(&ok.worktree_path).exists(),
+            "winning worktree must exist: {}",
+            ok.worktree_path
         );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
