@@ -103,6 +103,10 @@ Independent review accepted the VM-only contract. Root authorized implementation
 The suggested weak-upgrade check was withdrawn: a failed upgrade does not prove that another thread's destructor has completed.
 The implementation must preserve the traced private ownership boundary. A future escaping strong Lua owner must reopen that proof.
 Single-panic retention and double-panic process abort remain distinct. No formatting, build, or test execution is authorized for this new slice yet.
+The VM-owner source and eight focused test bodies subsequently passed independent review. Pinned formatting changed layout only.
+Root verified both changed files and five unchanged policy files in `/private/tmp/c1-lua-vm-owner-review-20260910-2`.
+Root authorized one 300-second no-run build of the library and two external test targets, covering production and test constructor forms.
+Test execution remains gated on artifact verification. The test hooks establish owner ordering, not cleanup of mlua's partial state or a real finalizer panic.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
