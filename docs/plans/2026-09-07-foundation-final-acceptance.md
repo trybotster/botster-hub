@@ -4,6 +4,27 @@ Status: source publication complete on September 9, 2026. Full foundation accept
 
 ## Active repair: plugin rendering on September 9
 
+### Current execution: complete the plan
+
+Jason requested implementation of all plan items after identifying repeated accounting checkpoints without requirement closure.
+This section supersedes earlier per-format, per-build, and per-test freezes for the assignments below.
+The existing limits and architectural constraints remain unchanged. Publication and installation still require separate authority.
+
+| Work | Owner | Next deliverable |
+| --- | --- | --- |
+| M1/M2/C1 accounting | Existing Hub writer, with Claude review | Connected pre-allocation admission through daemon execution and final disposal, including state, frame, cache, error, transport, and worker storage. |
+| D1(a) spawn prerequisite | Existing Core writer, with Claude review | Generic prelaunch reservation, reserved launch, definitive release, and exclusion across conflicting spawn and adoption paths. |
+| S1/S2/R1 lifecycle | Hub writer after the shared interfaces | Ordinary and managed spawn with conversion acknowledgement, confirmed cleanup, and durable recovery ownership. Unselected recovery policies remain explicit gates. |
+| Dependency integration and V1 | Root | One dependency identity, integrated source, and matched daemon and client evidence. |
+| A1/P1 | Root | Remaining accounting repairs and optimized measurements against the existing acceptance criteria. |
+
+Writers may implement, format, test, and fix within these contracts without separate approval for each routine step.
+The Hub writer owns the current compiler window. Root coordinates any Core build to preserve one compiler and at most two Cargo jobs.
+Review must evaluate the complete affected lifecycle. A passing helper test does not close a production requirement.
+Root connected the local Hub candidate to reviewed Core `6a9320393b6407a33230816508c9a7e700bfaee6` across all workspace manifests.
+The lockfile changes only six Core source identities. Local resolution does not prove publication or fresh remote resolution.
+The process correction is to assign complete requirements and retain valid evidence, instead of stopping after each mechanical verification step.
+
 ### Current phase: connect acknowledgement accounting
 
 Jason authorized this phase after the local Core worker-resource checkpoint `abee4bb` passed nine focused tests.
