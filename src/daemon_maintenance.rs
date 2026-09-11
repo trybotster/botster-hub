@@ -3097,6 +3097,12 @@ mod tests {
                     initial_cols: 80,
                 },
                 transports: crate::TransportBindings::default(),
+                core_engine: crate::config::CoreEngineOptions {
+                    session_worker_path: Some(std::path::PathBuf::from(
+                        "/tmp/core-d1a-candidate-20260911-5/botster-session-worker",
+                    )),
+                    ..crate::config::CoreEngineOptions::default()
+                },
                 ..crate::HubStartupOptions::default()
             }
             .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))

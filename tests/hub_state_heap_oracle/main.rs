@@ -179,6 +179,57 @@ fn main() -> ExitCode {
         errors.push(error);
     }
 
+    let mut leaf_properties = serde_json::Map::new();
+    for name in "abcdefghijklmnopqrstuvwxyz012345".chars() {
+        leaf_properties.insert(
+            name.to_string(),
+            serde_json::json!({ "type": "string" }),
+        );
+    }
+    let shallow_wide = serde_json::json!({
+        "type": "object",
+        "properties": leaf_properties
+    });
+    let compact = serde_json::to_vec(&shallow_wide).expect("compact schema");
+    assert!(
+        compact.len() <= 8 * 1024,
+        "shallow-wide schema {} exceeds 8 KiB compact",
+        compact.len()
+    );
+    let mut emitted = Vec::new();
+    for event_index in 0..8 {
+        emitted.push(serde_json::json!({
+            "name": format!("e{event_index}"),
+            "payload_schema": shallow_wide,
+            "audience": ["plugins"]
+        }));
+    }
+    let mut shallow_state = HubState::from_config(&config);
+    for record_index in 0..4 {
+        let record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
+            "manifest": {
+                "name": format!("shallow{record_index}.plugin"),
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "capabilities": [],
+                "entrypoints": [],
+                "events": { "emitted": emitted }
+            },
+            "state": "enabled",
+            "classification": "plugin",
+            "trust": { "classification": "first_party", "first_party": true },
+            "provenance": { "source": "oracle", "checksum": null },
+            "update_policy": "manual",
+            "last_audit_reason": "shallow"
+        }))
+        .expect("shallow record");
+        shallow_state.package_registry.records.push(record);
+    }
+    if let Err(error) = measure("shallow-wide-32", &shallow_state) {
+        errors.push(error);
+    }
+
     let skipped_record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
         "manifest": {
             "name": "skip.plugin",
