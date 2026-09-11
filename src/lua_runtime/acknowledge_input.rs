@@ -632,6 +632,7 @@ pub(super) fn callback(
                         super::CoordinationLocalError::IngressSealed => ingress_sealed.clone(),
                         super::CoordinationLocalError::Timeout => timeout.clone(),
                         super::CoordinationLocalError::Unexpected => unexpected.clone(),
+                        super::CoordinationLocalError::Capacity => capacity.clone(),
                     })),
                     other => lua.create_string(other.as_str()).map(Value::String),
                 },
@@ -983,7 +984,7 @@ mod tests {
         assert_eq!(memory.usage().1, admitted);
         drop(operation);
         assert_eq!(memory.usage().1, 0);
-        let bridge = HubCoordinationBridge::new();
+        let bridge = HubCoordinationBridge::test_new();
         let input = admit(&memory, "topic", "t", "", "e").unwrap();
         assert!(
             bridge
@@ -1003,7 +1004,7 @@ mod tests {
         lua.globals()
             .set(
                 "ack",
-                callback(&lua, HubCoordinationBridge::new(), Arc::clone(&memory)).unwrap(),
+                callback(&lua, HubCoordinationBridge::test_new(), Arc::clone(&memory)).unwrap(),
             )
             .unwrap();
         let held = memory.reserve_callback_total(admitted).unwrap();
@@ -1029,7 +1030,7 @@ mod tests {
     fn timeout_retains_input_until_terminal_disposal() {
         let admitted = sizing_total("t", "", "e");
         let memory = account(admitted, admitted);
-        let bridge = HubCoordinationBridge::new();
+        let bridge = HubCoordinationBridge::test_new();
         let input = admit(&memory, "topic", "t", "", "e").unwrap();
         let producer = bridge.clone();
         let result = std::thread::spawn(move || producer.acknowledge(input))
@@ -1051,7 +1052,7 @@ mod tests {
     fn real_wrapper_queues_charged_input_and_returns_delivery_state() {
         let admitted = sizing_total("t", "", "e");
         let memory = account(admitted, admitted);
-        let bridge = HubCoordinationBridge::new();
+        let bridge = HubCoordinationBridge::test_new();
         let producer = bridge.clone();
         let callback_memory = Arc::clone(&memory);
         let worker = std::thread::spawn(move || {

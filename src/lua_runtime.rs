@@ -4,7 +4,7 @@
 //! handler invocation by stable id, and selected hub capability helpers.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
@@ -66,6 +66,7 @@ use crate::session_types::{
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
 const INSTRUCTION_BUDGET_ERROR: &str = "lua instruction budget exceeded";
+pub(crate) const LUA_CALLBACK_CAPACITY_EXHAUSTED: &str = "Lua callback memory capacity exhausted";
 const COORDINATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
 const ENTITY_PUBLISH_REQUEST_TIMEOUT_MS: u64 = 1_000;
 /// Shared host capability runtime used by Lua capability helpers.
@@ -75,7 +76,9 @@ pub type SharedHubCapabilityRuntime = Arc<Mutex<HubCapabilityRuntime>>;
 #[derive(Clone)]
 pub struct HubCoordinationBridge {
     owner_thread: thread::ThreadId,
-    pending: Arc<Mutex<VecDeque<PendingCoordinationRequest>>>,
+    pending: Arc<
+        Mutex<crate::lua_memory::charged_collection::ChargedVecDeque<PendingCoordinationRequest>>,
+    >,
     progress: Arc<CoordinationProgress>,
 }
 
@@ -172,6 +175,7 @@ enum CoordinationLocalError {
     Unexpected,
     QueuePoisoned,
     IngressSealed,
+    Capacity,
 }
 
 impl CoordinationLocalError {
@@ -184,6 +188,7 @@ impl CoordinationLocalError {
             Self::Unexpected => "coordination acknowledge returned unexpected response",
             Self::QueuePoisoned => "coordination queue lock poisoned",
             Self::IngressSealed => "coordination ingress is sealed",
+            Self::Capacity => LUA_CALLBACK_CAPACITY_EXHAUSTED,
         }
     }
 }
@@ -204,10 +209,12 @@ impl CoordinationRequestError {
 }
 
 impl HubCoordinationBridge {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(account: Arc<LuaMemoryAccount>) -> Self {
         Self {
             owner_thread: thread::current().id(),
-            pending: Arc::new(Mutex::new(VecDeque::new())),
+            pending: Arc::new(Mutex::new(
+                crate::lua_memory::charged_collection::ChargedVecDeque::new(account),
+            )),
             progress: Arc::new(CoordinationProgress {
                 pending: AtomicBool::new(false),
                 sealed: AtomicBool::new(false),
@@ -216,6 +223,13 @@ impl HubCoordinationBridge {
                 admitted: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_new() -> Self {
+        Self::new(
+            crate::lua_memory::LuaMemoryAccount::new(crate::config::lua_memory_limits()).unwrap(),
+        )
     }
 
     fn publish(&self, envelope: RoutedEnvelope) -> Result<RoutedEnvelopePublishOutcome, String> {
@@ -337,7 +351,9 @@ impl HubCoordinationBridge {
                 CoordinationLocalError::IngressSealed,
             ));
         }
-        pending.push_back(request);
+        pending
+            .try_push_back(request)
+            .map_err(|_| CoordinationRequestError::Local(CoordinationLocalError::Capacity))?;
         Ok(())
     }
 
@@ -396,7 +412,7 @@ impl HubCoordinationBridge {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.progress.sealed.store(true, Ordering::Release);
-            std::mem::take(&mut *queue)
+            queue.take()
         };
         drop(pending);
         true
@@ -411,13 +427,14 @@ impl HubCoordinationBridge {
         self.pending
             .lock()
             .unwrap()
-            .push_back(PendingCoordinationRequest {
+            .try_push_back(PendingCoordinationRequest {
                 terminal_drop_probe: None,
                 operation,
                 response: CoordinationReplySender::NonAcknowledge(response),
                 caller: CoordinationCaller::new(),
                 storage: None,
-            });
+            })
+            .expect("test queue capacity");
         receiver
     }
 
@@ -427,6 +444,50 @@ impl HubCoordinationBridge {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_capacity(&self) -> usize {
+        self.pending.lock().unwrap().capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_charge_bytes(&self) -> usize {
+        self.pending.lock().unwrap().charge_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_charge_after_grow(&self, enabled: bool) {
+        self.pending.lock().unwrap().set_charge_after_grow(enabled);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_release_capacity_on_pop(&self, enabled: bool) {
+        self.pending
+            .lock()
+            .unwrap()
+            .set_release_capacity_on_pop(enabled);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_skip_capacity_check(&self, enabled: bool) {
+        self.pending
+            .lock()
+            .unwrap()
+            .set_skip_capacity_check(enabled);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_always_grow(&self, enabled: bool) {
+        self.pending.lock().unwrap().set_always_grow(enabled);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_take_without_charge(&self, enabled: bool) {
+        self.pending
+            .lock()
+            .unwrap()
+            .set_take_without_charge(enabled);
     }
 
     #[cfg(test)]
@@ -3039,7 +3100,7 @@ mod terminal_bridge_tests {
     #[test]
     fn terminal_coordination_pending_clears_actual_queue_on_host_even_after_poison() {
         for poisoned in [false, true] {
-            let bridge = HubCoordinationBridge::new();
+            let bridge = HubCoordinationBridge::test_new();
             let responses: Vec<_> = (0..2)
                 .map(|_| {
                     bridge.test_queue_pending(PendingCoordinationOperation::Drain {
@@ -3271,5 +3332,7 @@ mod completion_tests {
     }
 }
 
+#[cfg(test)]
+mod collection_capacity_tests;
 #[cfg(test)]
 mod coordination_lifecycle_tests;
