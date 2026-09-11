@@ -11,7 +11,7 @@ use botster_core::{
 };
 use botster_core_daemon::{
     CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError, DetachTerminalSubscriptionResult,
-    SpawnSessionRequest,
+    PendingOperationId, SpawnSessionRequest,
 };
 use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_hub_client::{
@@ -157,6 +157,48 @@ pub(crate) fn projected_sessions(state: &DaemonControlState) -> Vec<DaemonSessio
         .collect()
 }
 
+fn retained_release_code(release: SessionReservationRelease) -> &'static str {
+    match release {
+        SessionReservationRelease::Released => "released",
+        SessionReservationRelease::RetainedPending => "retained_pending",
+        SessionReservationRelease::RetainedUnconfirmed => "cleanup_unconfirmed",
+        SessionReservationRelease::RetainedSession => "retained_session",
+    }
+}
+
+fn retain_explicit_reservation(
+    state: &mut DaemonControlState,
+    reservation: SessionReservation,
+) {
+    if state
+        .retained_explicit_reservations
+        .iter()
+        .any(|held| held == &reservation)
+    {
+        return;
+    }
+    state.retained_explicit_reservations.push(reservation);
+}
+
+fn poll_spawn_ticket(
+    tracker: &mut CoreOperationTracker,
+    daemon: &HubDaemon,
+) -> CoreTicketPoll<Result<CoreCompletion, CoreDaemonError>> {
+    let Some(runtime) = daemon.runtime() else {
+        return CoreTicketPoll::Ready(Err(CoreDaemonError::Shutdown));
+    };
+    tracker.poll(runtime)
+}
+
+fn submit_release(
+    daemon: &HubDaemon,
+    waiter_id: crate::owner_identity::WaiterId,
+    reservation: SessionReservation,
+) -> Option<CoreOperationTracker> {
+    let runtime = daemon.runtime()?;
+    Some(runtime.begin_release_session_reservation_for_owner(waiter_id, reservation))
+}
+
 fn poll_tracker(
     tracker: &mut CoreOperationTracker,
     daemon: &HubDaemon,
@@ -179,6 +221,329 @@ fn poll_tracker(
         )))),
         CoreTicketPoll::Ready(Ok(completion)) => Ok(completion),
     }
+}
+
+fn handle_daemon_spawn(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    session_id: String,
+    command: String,
+) -> ControlStep {
+    let runtime = daemon.runtime().expect("runtime checked above");
+    let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+    let id = request_id("daemon-sessions-spawn");
+    let spawn = SpawnSessionRequest {
+        request: spawn_request(runtime, id.clone(), SessionId(session_id.clone()), command),
+        metadata: client_session_metadata(),
+    };
+    enum Stage {
+        RetryRetained,
+        Reserve,
+        Lookup,
+        SpawnReserved,
+        Release,
+    }
+    let mut stage = if state.retained_explicit_reservations.is_empty() {
+        Stage::Reserve
+    } else {
+        Stage::RetryRetained
+    };
+    let mut tracker = if matches!(stage, Stage::Reserve) {
+        runtime.begin_reserve_session_for_owner(waiter_id, SessionId(session_id.clone()))
+    } else {
+        let held = state.retained_explicit_reservations[0].clone();
+        runtime.begin_release_session_reservation_for_owner(waiter_id, held)
+    };
+    let mut reservation: Option<SessionReservation> = None;
+    let mut spawn_error: Option<CoreDaemonError> = None;
+    let mut reserve_operation_id: Option<PendingOperationId> = None;
+    let mut retained_index: usize = 0;
+    ControlStep::pending(move |daemon, state| loop {
+        if let Some(pending_id) = tracker.pending_id() {
+            if matches!(stage, Stage::Reserve) {
+                reserve_operation_id = Some(pending_id);
+            }
+        }
+        match stage {
+            Stage::RetryRetained => match poll_spawn_ticket(&mut tracker, daemon) {
+                CoreTicketPoll::Pending => return ControlPoll::Pending,
+                CoreTicketPoll::Refused => return ControlPoll::Pending,
+                CoreTicketPoll::Lost => {
+                    let Some(held) =
+                        state.retained_explicit_reservations.get(retained_index).cloned()
+                    else {
+                        stage = Stage::Reserve;
+                        continue;
+                    };
+                    match submit_release(daemon, waiter_id, held) {
+                        Some(next) => tracker = next,
+                        None => return ControlPoll::Pending,
+                    }
+                }
+                CoreTicketPoll::Ready(Err(_)) => return ControlPoll::Pending,
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                    result: Ok(SessionReservationRelease::Released),
+                    ..
+                })) => {
+                    if retained_index < state.retained_explicit_reservations.len() {
+                        state.retained_explicit_reservations.remove(retained_index);
+                    }
+                    if retained_index >= state.retained_explicit_reservations.len() {
+                        let Some(runtime) = daemon.runtime() else {
+                            return ControlPoll::Ready(Err(
+                                DaemonTransportError::DaemonNotRunning,
+                            ));
+                        };
+                        tracker = runtime.begin_reserve_session_for_owner(
+                            waiter_id,
+                            SessionId(session_id.clone()),
+                        );
+                        stage = Stage::Reserve;
+                    } else {
+                        let held = state.retained_explicit_reservations[retained_index].clone();
+                        match submit_release(daemon, waiter_id, held) {
+                            Some(next) => tracker = next,
+                            None => return ControlPoll::Pending,
+                        }
+                    }
+                }
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation { .. })) => {
+                    retained_index = retained_index.saturating_add(1);
+                    if retained_index >= state.retained_explicit_reservations.len() {
+                        let Some(runtime) = daemon.runtime() else {
+                            return ControlPoll::Ready(Err(
+                                DaemonTransportError::DaemonNotRunning,
+                            ));
+                        };
+                        tracker = runtime.begin_reserve_session_for_owner(
+                            waiter_id,
+                            SessionId(session_id.clone()),
+                        );
+                        stage = Stage::Reserve;
+                    } else {
+                        let held = state.retained_explicit_reservations[retained_index].clone();
+                        match submit_release(daemon, waiter_id, held) {
+                            Some(next) => tracker = next,
+                            None => return ControlPoll::Pending,
+                        }
+                    }
+                }
+                CoreTicketPoll::Ready(Ok(_)) => {
+                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                }
+            },
+            Stage::Reserve => match poll_spawn_ticket(&mut tracker, daemon) {
+                CoreTicketPoll::Pending => return ControlPoll::Pending,
+                CoreTicketPoll::Refused => return ControlPoll::Pending,
+                CoreTicketPoll::Lost => {
+                    let Some(reserve_id) = reserve_operation_id else {
+                        return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
+                    };
+                    let Some(runtime) = daemon.runtime() else {
+                        return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
+                    };
+                    tracker = runtime.begin_lookup_session_reservation_for_owner(
+                        waiter_id,
+                        SessionId(session_id.clone()),
+                        reserve_id,
+                    );
+                    stage = Stage::Lookup;
+                }
+                CoreTicketPoll::Ready(Err(error)) => {
+                    return ControlPoll::Ready(Ok(core_operator_error(
+                        "reserve_session",
+                        &id.0,
+                        &error,
+                    )));
+                }
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession { result, .. })) => {
+                    match result {
+                        Ok(reserved) => {
+                            reservation = Some(reserved.clone());
+                            let Some(runtime) = daemon.runtime() else {
+                                return ControlPoll::Ready(Err(
+                                    DaemonTransportError::DaemonNotRunning,
+                                ));
+                            };
+                            tracker = runtime.begin_spawn_reserved_for_owner(
+                                waiter_id,
+                                reserved,
+                                spawn.clone(),
+                            );
+                            stage = Stage::SpawnReserved;
+                        }
+                        Err(error) => {
+                            return ControlPoll::Ready(Ok(core_operator_error(
+                                "reserve_session",
+                                &id.0,
+                                &error,
+                            )));
+                        }
+                    }
+                }
+                CoreTicketPoll::Ready(Ok(_)) => {
+                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                }
+            },
+            Stage::Lookup => match poll_spawn_ticket(&mut tracker, daemon) {
+                CoreTicketPoll::Pending | CoreTicketPoll::Refused => return ControlPoll::Pending,
+                CoreTicketPoll::Lost => {
+                    return ControlPoll::Ready(Ok(lost_core("lookup_session_reservation", &id.0)));
+                }
+                CoreTicketPoll::Ready(Err(error)) => {
+                    return ControlPoll::Ready(Ok(core_operator_error(
+                        "lookup_session_reservation",
+                        &id.0,
+                        &error,
+                    )));
+                }
+                CoreTicketPoll::Ready(Ok(CoreCompletion::LookupSessionReservation {
+                    result,
+                    ..
+                })) => match result {
+                    Ok(Some(reserved)) => {
+                        reservation = Some(reserved.clone());
+                        spawn_error = Some(CoreDaemonError::Shutdown);
+                        match submit_release(daemon, waiter_id, reserved) {
+                            Some(next) => {
+                                tracker = next;
+                                stage = Stage::Release;
+                            }
+                            None => return ControlPoll::Pending,
+                        }
+                    }
+                    Ok(None) => {
+                        return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
+                    }
+                    Err(error) => {
+                        return ControlPoll::Ready(Ok(core_operator_error(
+                            "lookup_session_reservation",
+                            &id.0,
+                            &error,
+                        )));
+                    }
+                },
+                CoreTicketPoll::Ready(Ok(_)) => {
+                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                }
+            },
+            Stage::SpawnReserved => {
+                let outcome = poll_spawn_ticket(&mut tracker, daemon);
+                let fail = match outcome {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Refused | CoreTicketPoll::Lost => {
+                        Some(CoreDaemonError::PendingLimit(
+                            botster_core_daemon::PendingLimitKind::Spawns,
+                        ))
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => Some(error),
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Installed { session },
+                        ..
+                    })) => {
+                        let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
+                        state
+                            .drain_cursors
+                            .insert(session.session_id.0.clone(), now);
+                        return ControlPoll::Ready(Ok(daemon_spawned(
+                            DaemonSession {
+                                session_id: session.session_id.0,
+                                lifecycle: lifecycle_label(&session.lifecycle).to_string(),
+                            },
+                            Vec::new(),
+                        )));
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Refused { error },
+                        ..
+                    }))
+                    | CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::AdmittedFailure { error, .. },
+                        ..
+                    })) => Some(error),
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                    }
+                };
+                let Some(error) = fail else {
+                    return ControlPoll::Pending;
+                };
+                spawn_error = Some(error);
+                let Some(held) = reservation.clone() else {
+                    return ControlPoll::Ready(Ok(core_operator_error(
+                        "spawn_reserved",
+                        &id.0,
+                        spawn_error.as_ref().unwrap(),
+                    )));
+                };
+                match submit_release(daemon, waiter_id, held) {
+                    Some(next) => {
+                        tracker = next;
+                        stage = Stage::Release;
+                    }
+                    None => return ControlPoll::Pending,
+                }
+            }
+            Stage::Release => match poll_spawn_ticket(&mut tracker, daemon) {
+                CoreTicketPoll::Pending | CoreTicketPoll::Refused => return ControlPoll::Pending,
+                CoreTicketPoll::Lost => {
+                    let Some(held) = reservation.clone() else {
+                        return ControlPoll::Ready(Ok(lost_core(
+                            "release_session_reservation",
+                            &id.0,
+                        )));
+                    };
+                    match submit_release(daemon, waiter_id, held) {
+                        Some(next) => tracker = next,
+                        None => return ControlPoll::Pending,
+                    }
+                }
+                CoreTicketPoll::Ready(Err(_)) => return ControlPoll::Pending,
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                    result,
+                    ..
+                })) => {
+                    let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
+                    return ControlPoll::Ready(Ok(match result {
+                        Ok(SessionReservationRelease::Released) => {
+                            core_operator_error("spawn_reserved", &id.0, &error)
+                        }
+                        Ok(release) => {
+                            if let Some(held) = reservation.clone() {
+                                retain_explicit_reservation(state, held);
+                            }
+                            let mut response = core_operator_error(
+                                "release_session_reservation",
+                                &id.0,
+                                &error,
+                            );
+                            if let Some(operator) = response.error.as_mut() {
+                                operator.code = retained_release_code(release).to_string();
+                                operator.message = format!(
+                                    "spawn failed and Core retained reservation ownership ({:?}): {error}",
+                                    release
+                                );
+                            }
+                            response
+                        }
+                        Err(release_error) => {
+                            if let Some(held) = reservation.clone() {
+                                retain_explicit_reservation(state, held);
+                            }
+                            core_operator_error(
+                                "release_session_reservation",
+                                &id.0,
+                                &release_error,
+                            )
+                        }
+                    }));
+                }
+                CoreTicketPoll::Ready(Ok(_)) => {
+                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                }
+            },
+        }
+    })
 }
 
 pub(crate) fn handle_runtime(
@@ -242,155 +607,7 @@ pub(crate) fn handle_runtime(
         DaemonRequest::Spawn {
             session_id,
             command,
-        } => {
-            let runtime = daemon.runtime().expect("runtime checked above");
-            let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
-            let id = request_id("daemon-sessions-spawn");
-            let spawn = SpawnSessionRequest {
-                request: spawn_request(runtime, id.clone(), SessionId(session_id.clone()), command),
-                metadata: client_session_metadata(),
-            };
-            let mut tracker =
-                runtime.begin_reserve_session_for_owner(waiter_id, SessionId(session_id.clone()));
-            let mut reservation: Option<SessionReservation> = None;
-            let mut spawn_error: Option<CoreDaemonError> = None;
-            enum Stage {
-                Reserve,
-                SpawnReserved,
-                Release,
-            }
-            let mut stage = Stage::Reserve;
-            ControlStep::pending(move |daemon, state| loop {
-                match stage {
-                    Stage::Reserve => {
-                        let completion =
-                            match poll_tracker(&mut tracker, daemon, "reserve_session", &id.0) {
-                                Ok(completion) => completion,
-                                Err(poll) => return poll,
-                            };
-                        let CoreCompletion::ReserveSession { result, .. } = completion else {
-                            return ControlPoll::Ready(Err(
-                                DaemonTransportError::UnexpectedResponse,
-                            ));
-                        };
-                        match result {
-                            Ok(reserved) => {
-                                reservation = Some(reserved.clone());
-                                let Some(runtime) = daemon.runtime() else {
-                                    return ControlPoll::Ready(Err(
-                                        DaemonTransportError::DaemonNotRunning,
-                                    ));
-                                };
-                                tracker = runtime.begin_spawn_reserved_for_owner(
-                                    waiter_id,
-                                    reserved,
-                                    spawn.clone(),
-                                );
-                                stage = Stage::SpawnReserved;
-                            }
-                            Err(error) => {
-                                return ControlPoll::Ready(Ok(core_operator_error(
-                                    "reserve_session",
-                                    &id.0,
-                                    &error,
-                                )));
-                            }
-                        }
-                    }
-                    Stage::SpawnReserved => {
-                        let completion =
-                            match poll_tracker(&mut tracker, daemon, "spawn_reserved", &id.0) {
-                                Ok(completion) => completion,
-                                Err(poll) => return poll,
-                            };
-                        let CoreCompletion::SpawnReserved { result, .. } = completion else {
-                            return ControlPoll::Ready(Err(
-                                DaemonTransportError::UnexpectedResponse,
-                            ));
-                        };
-                        match result {
-                            ReservedSpawnResult::Installed { session } => {
-                                let now =
-                                    crate::daemon::owner_loop::tick(&mut state.logical_clock);
-                                state
-                                    .drain_cursors
-                                    .insert(session.session_id.0.clone(), now);
-                                if let Some(runtime) = daemon.runtime() {
-                                    runtime.record_acknowledged_spawn(session.session_id.0.clone());
-                                }
-                                return ControlPoll::Ready(Ok(daemon_spawned(
-                                    DaemonSession {
-                                        session_id: session.session_id.0,
-                                        lifecycle: lifecycle_label(&session.lifecycle)
-                                            .to_string(),
-                                    },
-                                    Vec::new(),
-                                )));
-                            }
-                            ReservedSpawnResult::Refused { error }
-                            | ReservedSpawnResult::AdmittedFailure { error, .. } => {
-                                let Some(runtime) = daemon.runtime() else {
-                                    return ControlPoll::Ready(Err(
-                                        DaemonTransportError::DaemonNotRunning,
-                                    ));
-                                };
-                                let Some(held) = reservation.clone() else {
-                                    return ControlPoll::Ready(Ok(core_operator_error(
-                                        "spawn_reserved",
-                                        &id.0,
-                                        &error,
-                                    )));
-                                };
-                                spawn_error = Some(error);
-                                tracker = runtime
-                                    .begin_release_session_reservation_for_owner(waiter_id, held);
-                                stage = Stage::Release;
-                            }
-                        }
-                    }
-                    Stage::Release => {
-                        let completion = match poll_tracker(
-                            &mut tracker,
-                            daemon,
-                            "release_session_reservation",
-                            &id.0,
-                        ) {
-                            Ok(completion) => completion,
-                            Err(poll) => return poll,
-                        };
-                        let CoreCompletion::ReleaseSessionReservation { result, .. } = completion
-                        else {
-                            return ControlPoll::Ready(Err(
-                                DaemonTransportError::UnexpectedResponse,
-                            ));
-                        };
-                        let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
-                        return ControlPoll::Ready(Ok(match result {
-                            Ok(SessionReservationRelease::Released) => {
-                                core_operator_error("spawn_reserved", &id.0, &error)
-                            }
-                            Ok(_) => {
-                                let mut response = core_operator_error(
-                                    "release_session_reservation",
-                                    &id.0,
-                                    &error,
-                                );
-                                if let Some(operator) = response.error.as_mut() {
-                                    operator.code = "cleanup_unconfirmed".to_string();
-                                    operator.message = format!(
-                                        "spawn failed and Core retained reservation ownership: {error}"
-                                    );
-                                }
-                                response
-                            }
-                            Err(release_error) => {
-                                core_operator_error("release_session_reservation", &id.0, &release_error)
-                            }
-                        }));
-                    }
-                }
-            })
-        }
+        } => handle_daemon_spawn(daemon, state, session_id, command),
         DaemonRequest::Attach {
             session_id,
             subscription_id,
@@ -1449,4 +1666,29 @@ fn handle_shutdown_session(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_release_codes_distinguish_core_outcomes() {
+        assert_eq!(
+            retained_release_code(SessionReservationRelease::Released),
+            "released"
+        );
+        assert_eq!(
+            retained_release_code(SessionReservationRelease::RetainedPending),
+            "retained_pending"
+        );
+        assert_eq!(
+            retained_release_code(SessionReservationRelease::RetainedUnconfirmed),
+            "cleanup_unconfirmed"
+        );
+        assert_eq!(
+            retained_release_code(SessionReservationRelease::RetainedSession),
+            "retained_session"
+        );
+    }
 }

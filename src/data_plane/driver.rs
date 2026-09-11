@@ -1484,6 +1484,28 @@ mod tests {
     }
 
     #[test]
+    fn three_sequential_owner_operations_register_fresh_phases() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let waiter_id = WaiterId(73);
+        let retirement = CoreWaiterRetirement {
+            wake: Arc::clone(&wake),
+            waiter_id,
+        };
+        let mut phases = Vec::new();
+        for expected in 1..=3 {
+            let identities = wake.register_phases(waiter_id, 2).expect("fresh phases");
+            assert_eq!(identities[0].phase, expected * 2 - 1);
+            assert_eq!(identities[1].phase, expected * 2);
+            for identity in identities {
+                assert!(wake.retire(identity));
+                phases.push(identity.phase);
+            }
+        }
+        assert_eq!(phases, vec![1, 2, 3, 4, 5, 6]);
+        drop(retirement);
+    }
+
+    #[test]
     fn progress_latch_preserves_coalesced_inventory_when_the_doorbell_queue_is_full() {
         let latch = DataPlaneProgressLatch::default();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
