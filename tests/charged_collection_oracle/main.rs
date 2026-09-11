@@ -40,12 +40,14 @@ fn grow_pending() -> Result<(), String> {
     LIVE.store(0, Ordering::Release);
     let slot = PendingQueue::slot();
     let mut q = PendingQueue::new();
-    for cap in [1usize, 2, 4] {
+    for cap in [1usize, 2, 4, 8] {
         MAX_LAYOUT.store(0, Ordering::Release);
         PEAK.store(LIVE.load(Ordering::Acquire), Ordering::Release);
         let old_charge = q.charge_bytes();
         RECORD.store(true, Ordering::Release);
-        q.try_push_uninit()?;
+        while q.capacity() < cap {
+            q.try_push_uninit()?;
+        }
         RECORD.store(false, Ordering::Release);
         let layout = MAX_LAYOUT.load(Ordering::Acquire);
         let charge = q.charge_bytes();
@@ -81,12 +83,14 @@ fn grow_inflight() -> Result<(), String> {
     LIVE.store(0, Ordering::Release);
     let slot = InflightQueue::slot();
     let mut v = InflightQueue::new();
-    for cap in [1usize, 2, 4] {
+    for cap in [1usize, 2, 4, 8] {
         MAX_LAYOUT.store(0, Ordering::Release);
         PEAK.store(LIVE.load(Ordering::Acquire), Ordering::Release);
         let old_charge = v.charge_bytes();
         RECORD.store(true, Ordering::Release);
-        v.try_push_uninit()?;
+        while v.capacity() < cap {
+            v.try_push_uninit()?;
+        }
         RECORD.store(false, Ordering::Release);
         let layout = MAX_LAYOUT.load(Ordering::Acquire);
         let charge = v.charge_bytes();
