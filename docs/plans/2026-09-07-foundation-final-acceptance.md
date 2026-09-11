@@ -82,6 +82,10 @@ The next ownership proposal is `/private/tmp/c1-callback-frame-ownership-plan-20
 It places argument and returned-handle funding in the Lua state owner, admitted through shared Rust storage before Lua construction.
 Core worker metadata remains a separate segment. Escaped Lua owners, construction failure, teardown, and the disjoint conversion allocation inventory require source review.
 No state-storage byte value, nesting multiplier, hidden unsafe return hook, or live accounting connection is authorized by this proposal.
+Independent review accepted the proposed owner and acknowledgement partition, but did not prove escaped-owner or teardown safety.
+The Hub writer will trace those ownership edges. The reviewer will inventory argument, return, and re-entry handles across installed callback families.
+The acknowledgement handle count alone cannot size the whole state. The inventory must distinguish fixed counts from payload-dependent counts.
+Any later nesting formula must include the pinned overflow path recorded by Q4, not only its normal-depth limit.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
