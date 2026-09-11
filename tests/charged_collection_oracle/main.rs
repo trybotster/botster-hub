@@ -26,6 +26,7 @@ static XRC_SIZE: AtomicUsize = AtomicUsize::new(0);
 static XRC_ALIGN: AtomicUsize = AtomicUsize::new(0);
 static XRC_LIVE: AtomicUsize = AtomicUsize::new(0);
 static XRC_PEAK: AtomicUsize = AtomicUsize::new(0);
+static XRC_OVERFLOW: AtomicBool = AtomicBool::new(false);
 const MAX_XRC: usize = 512;
 static XRC_PTRS: [AtomicUsize; MAX_XRC] = [const { AtomicUsize::new(0) }; MAX_XRC];
 
@@ -61,8 +62,7 @@ fn xrc_note_alloc(ptr: *mut u8) {
             return;
         }
     }
-    let live = XRC_LIVE.fetch_add(1, Ordering::AcqRel) + 1;
-    XRC_PEAK.fetch_max(live, Ordering::AcqRel);
+    XRC_OVERFLOW.store(true, Ordering::Release);
 }
 
 fn xrc_note_dealloc(ptr: *mut u8) {
@@ -152,6 +152,7 @@ fn begin_record() {
     }
     XRC_LIVE.store(0, Ordering::Release);
     XRC_PEAK.store(0, Ordering::Release);
+    XRC_OVERFLOW.store(false, Ordering::Release);
     RECORD.store(true, Ordering::Release);
 }
 
@@ -439,6 +440,11 @@ fn measure_lua_json() -> Result<(), String> {
         if peak > admitted {
             return Err(format!(
                 "{label}: counted peak {peak} > admitted {admitted}"
+            ));
+        }
+        if XRC_OVERFLOW.load(Ordering::Acquire) {
+            return Err(format!(
+                "{label}: XRc pointer table overflowed (MAX_XRC={MAX_XRC})"
             ));
         }
         if measured > model {
