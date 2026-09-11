@@ -101,16 +101,24 @@ const EVENT_PLANE_NOISY_COMMAND: &str = concat!(
     "    time.sleep(0.1)\"",
 );
 
+fn production_events_emit_installation(lua: &str) -> &str {
+    let install = lua
+        .split("fn install_botster_api(")
+        .nth(1)
+        .expect("install_botster_api");
+    let install = install.split("\nfn ").next().unwrap_or(install);
+    install
+        .split("\"emit\"")
+        .nth(1)
+        .and_then(|rest| rest.split("globals.set(\"events\"").next())
+        .expect("events.emit installation")
+}
+
 #[test]
 fn event_plane_saturation_source_guards_hold() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let lua = fs::read_to_string(root.join("src/lua_runtime.rs")).expect("lua runtime");
-    let production_lua = lua.split("#[cfg(test)]").next().unwrap_or(&lua);
-    let emit_fn = production_lua
-        .split("\"emit\"")
-        .nth(1)
-        .and_then(|rest| rest.split("globals.set(\"events\"").next())
-        .expect("events.emit installation");
+    let emit_fn = production_events_emit_installation(&lua);
     assert!(
         emit_fn.contains("try_ingress") && emit_fn.matches("try_ingress").count() == 1,
         "events.emit must use one try_ingress attempt"

@@ -915,6 +915,16 @@ impl HubRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_refuse_next_owner_begins(&self, count: usize) {
+        self.core_daemon.test_refuse_next_owner_begins(count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lose_next_owner_begins(&self, count: usize) {
+        self.core_daemon.test_lose_next_owner_begins(count);
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_stop_host_submissions(&mut self) {
         self.host_executor.test_stop_submissions();
     }
