@@ -46,6 +46,10 @@ This approval permits implementation. It does not permit publication or installa
 The Hub writer resumes a bounded configuration and account-propagation slice through both production load paths, preserving refusal before replacement.
 The approved limits belong in a crate-private Hub policy function. Existing public `HubStartupOptions` and `HubConfig` struct shapes must remain unchanged.
 The external construction tests explicitly preserve exhaustive literals. Policy wiring does not require new public configuration fields or weaker compatibility tests.
+The Lua Host API instead requires the runtime's account. Its existing factory will become public, and the direct reload fixture will use that factory.
+The public prepared loader must use that account too; an unfunded compatibility path is not permitted.
+The writer may adapt `tests/hub_lua_runtime_test.rs` and map the new configuration failure to the existing Runtime client category in `src/client_api.rs`.
+These caller changes must preserve reload assertions, request identity, and operation identity. They add no client protocol category.
 The reviewer will separately trace acknowledgement conversion allocations in pinned source. No build, test, or measurement execution is authorized yet.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
