@@ -301,7 +301,7 @@ fn handle_daemon_spawn(
                         match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
                             Some(next) => {
                                 tracker = next;
-                                return ControlPoll::Pending;
+                                continue;
                             }
                             None => {
                                 retry_keep.append(&mut retry_tokens);
@@ -1882,6 +1882,80 @@ mod tests {
                 _ => std::thread::yield_now(),
             }
         }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn wait_reservation(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        tracker: &mut crate::runtime::CoreOperationTracker,
+    ) -> SessionReservation {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "reserve did not complete");
+            drive_ready_test_turn(daemon, state);
+            match tracker.poll(daemon.runtime().unwrap()) {
+                CoreTicketPoll::Pending => std::thread::yield_now(),
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                    result: Ok(reserved),
+                    ..
+                })) => return reserved,
+                _ => panic!("reserve must complete with a token"),
+            }
+        }
+    }
+
+    #[test]
+    fn retry_retained_full_queue_keeps_both_tokens_and_finishes() {
+        let (mut daemon, mut state, root) = spawn_fixture("retry-two");
+        let waiter = state.current_waiter_id.unwrap();
+        let mut first = daemon.runtime().unwrap().begin_reserve_session_for_owner(
+            waiter,
+            SessionId("s1-retry-a".into()),
+        );
+        let a = wait_reservation(&mut daemon, &mut state, &mut first);
+        let mut second = daemon.runtime().unwrap().begin_reserve_session_for_owner(
+            waiter,
+            SessionId("s1-retry-b".into()),
+        );
+        let b = wait_reservation(&mut daemon, &mut state, &mut second);
+        state.retained_explicit_reservations.push(a);
+        state.retained_explicit_reservations.push(b);
+        daemon
+            .runtime()
+            .unwrap()
+            .test_refuse_next_owner_begins(8);
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-retry-c".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut polls = 0_u32;
+        let response = loop {
+            assert!(Instant::now() < deadline, "retry-retained hang");
+            polls += 1;
+            assert!(polls < 32, "retry-retained spun");
+            drive_ready_test_turn(&mut daemon, &mut state);
+            match pending.continuation.poll(&mut daemon, &mut state) {
+                ControlPoll::Pending | ControlPoll::Again => std::thread::yield_now(),
+                ControlPoll::Ready(Ok(response)) => break response,
+                ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                _ => std::thread::yield_now(),
+            }
+        };
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("pending_limit")
+        );
+        assert_eq!(state.retained_explicit_reservations.len(), 2);
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }

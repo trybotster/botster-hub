@@ -115,6 +115,30 @@ fn production_events_emit_installation(lua: &str) -> &str {
 }
 
 #[test]
+fn events_emit_guard_detects_recv_and_a_second_try_ingress() {
+    let with_recv = r#"fn install_botster_api() {
+        events.set("emit", { let _ = rx.recv(); try_ingress
+        globals.set("events", events);
+    }
+    fn next() {}
+"#;
+    let emit = production_events_emit_installation(with_recv);
+    assert!(emit.contains("recv("), "ablation: recv wait must be visible");
+    let with_two = r#"fn install_botster_api() {
+        events.set("emit", { try_ingress; try_ingress
+        globals.set("events", events);
+    }
+    fn next() {}
+"#;
+    assert_eq!(
+        production_events_emit_installation(with_two)
+            .matches("try_ingress")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn event_plane_saturation_source_guards_hold() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let lua = fs::read_to_string(root.join("src/lua_runtime.rs")).expect("lua runtime");
@@ -170,10 +194,8 @@ fn event_plane_saturation_source_guards_hold() {
         fs::read_to_string(root.join("src/daemon_maintenance.rs")).expect("maintenance");
     assert!(maintenance.contains("max_sessions: 8"));
     assert!(maintenance.contains("max_rows: 16"));
-    assert!(
-        maintenance.contains("journal_pull_held"),
-        "cursor-expiry hold must skip journal pull"
-    );
+    // 70cdf06 removed HubRuntime::journal_pull_held. Cursor-expiry behavior is
+    // covered by fault_lifecycle_cursor_expiry, not this source-string scan.
     assert_eq!(EVENT_PLANE_RATIO_R, 1.25);
     assert_eq!(EVENT_PLANE_SLACK_MS, 8.0);
     assert_eq!(EVENT_PLANE_THROUGHPUT_T, 0.80);
