@@ -20,13 +20,19 @@
 //! Option<Value>`, and the value (3), plus `RecursionGuard`'s `FxHashSet`
 //! (Rust heap). Equal peaks are not required; both are O(depth).
 //!
-//! # `ref_free` (OPEN for Root — do not add a VM host-heap limit)
+//! # `ref_free` (Jason-approved documented exclusion)
 //!
-//! On drop, each `ValueRef` index is pushed onto `ExtraData.ref_free: Vec<c_int>`
-//! (`raw.rs:917`). Capacity is retained for the VM lifetime. Growth is Vec
-//! doubling: for peak simultaneous frees `P`, capacity ≤ next power of two of
-//! `P`, bytes `cap × 4`, overlap peak old+new during realloc. Nothing funds
-//! that retained capacity after the callback charge drops.
+//! mlua 0.11.6 `ExtraData.ref_free: Vec<c_int>` (`state/raw.rs:917` push on
+//! drop; `state/extra.rs:268-292` pop on reuse) is private Rust storage whose
+//! capacity is retained for the Lua state's life, including Vec doubling and
+//! old+new realloc overlap. Jason approved leaving that retained capacity
+//! outside the memory-accounting guarantee. It is not funded. Do not add
+//! partial funding or a new limit to mask it. This conversion's live `ValueRef`
+//! count is O(depth) (`3 × depth + 2` scan transients + 1 `array_metatable`
+//! handle), which bounds how far `ref_free` can grow from this walk.
+//!
+//! Still in scope: live XRc (`lua_reference_bytes()`), walk scratch, collection
+//! capacity, and Lua allocator storage under the VM charge.
 //!
 //! # Ref-thread
 //!
