@@ -10,7 +10,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,30 @@ use crate::session_types::{
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
 const INSTRUCTION_BUDGET_ERROR: &str = "lua instruction budget exceeded";
 pub(crate) const LUA_CALLBACK_CAPACITY_EXHAUSTED: &str = "Lua callback memory capacity exhausted";
+
+#[derive(Debug)]
+struct CallbackCapacityError;
+
+impl fmt::Display for CallbackCapacityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(LUA_CALLBACK_CAPACITY_EXHAUSTED)
+    }
+}
+
+impl Error for CallbackCapacityError {}
+
+fn callback_capacity_error_arc() -> Arc<dyn Error + Send + Sync> {
+    static CELL: OnceLock<Arc<dyn Error + Send + Sync>> = OnceLock::new();
+    Arc::clone(CELL.get_or_init(|| Arc::new(CallbackCapacityError)))
+}
+
+fn callback_capacity_error() -> mlua::Error {
+    mlua::Error::ExternalError(callback_capacity_error_arc())
+}
+
+fn fund_callback_capacity_error() {
+    let _ = callback_capacity_error_arc();
+}
 const COORDINATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
 const ENTITY_PUBLISH_REQUEST_TIMEOUT_MS: u64 = 1_000;
 /// Shared host capability runtime used by Lua capability helpers.
@@ -945,7 +969,10 @@ impl LuaState {
             None => libraries,
         };
         match Lua::new_with(libraries, LuaOptions::default()) {
-            Ok(lua) => state.lua = Some(lua),
+            Ok(lua) => {
+                fund_callback_capacity_error();
+                state.lua = Some(lua);
+            }
             Err(error) => {
                 // Pinned mlua 0.11.6 returns Err only before state allocation.
                 // Internal construction failures panic and retain the armed charge.
@@ -2551,7 +2578,6 @@ fn coordination_table(
     let publish_bridge = coordination_bridge.clone();
     let publish_plugin_key = plugin_key.clone();
     let publish_memory = Arc::clone(&memory);
-    let publish_capacity = lua.create_string(LUA_CALLBACK_CAPACITY_EXHAUSTED)?;
     coordination.set(
         "publish",
         callback::create(lua, move |lua, args: Value| {
@@ -2565,7 +2591,7 @@ fn coordination_table(
                             ));
                         }
                         Err(CoordinationRequestError::Local(CoordinationLocalError::Capacity)) => {
-                            return Ok(Value::String(publish_capacity.clone()));
+                            return Err(callback_capacity_error());
                         }
                         Err(error) => {
                             return Err(mlua::Error::RuntimeError(error.as_str().to_owned()));
@@ -2573,7 +2599,7 @@ fn coordination_table(
                     };
                     lua.to_value(&outcome)
                 }
-                Err(AdmissionError::Capacity) => Ok(Value::String(publish_capacity.clone())),
+                Err(AdmissionError::Capacity) => Err(callback_capacity_error()),
                 Err(AdmissionError::Runtime(error)) => Err(error),
             }
         })?,
@@ -2581,7 +2607,6 @@ fn coordination_table(
 
     let drain_bridge = coordination_bridge.clone();
     let drain_memory = Arc::clone(&memory);
-    let drain_capacity = lua.create_string(LUA_CALLBACK_CAPACITY_EXHAUSTED)?;
     coordination.set(
         "drain",
         callback::create(lua, move |lua, args: Value| {
@@ -2595,7 +2620,7 @@ fn coordination_table(
                             ));
                         }
                         Err(CoordinationRequestError::Local(CoordinationLocalError::Capacity)) => {
-                            return Ok(Value::String(drain_capacity.clone()));
+                            return Err(callback_capacity_error());
                         }
                         Err(error) => {
                             return Err(mlua::Error::RuntimeError(error.as_str().to_owned()));
@@ -2603,7 +2628,7 @@ fn coordination_table(
                     };
                     lua.to_value(&outcome)
                 }
-                Err(AdmissionError::Capacity) => Ok(Value::String(drain_capacity.clone())),
+                Err(AdmissionError::Capacity) => Err(callback_capacity_error()),
                 Err(AdmissionError::Runtime(error)) => Err(error),
             }
         })?,
@@ -3133,6 +3158,7 @@ mod bounded_session_type_tests {
         })
         .unwrap()
     }
+
 
     #[test]
     fn session_type_errors_remain_lua_owned_after_callback_charge_releases() {
