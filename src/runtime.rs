@@ -137,6 +137,10 @@ pub struct HubRuntime {
     retry_retained_again_on_pending: AtomicBool,
     #[cfg(test)]
     resubmit_release_on_pending: AtomicBool,
+    #[cfg(test)]
+    coordination_core_submits: AtomicUsize,
+    #[cfg(test)]
+    retained_reservation_takes: AtomicUsize,
     close_work: crate::data_plane::CloseWorkSource,
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
@@ -356,7 +360,7 @@ struct PendingSessionTypeSpawn {
     session_type_id: String,
     request: SessionTypeRequest,
     package_records: Vec<PackageRecord>,
-    response: mpsc::Sender<Result<PluginSessionTypeSpawned, String>>,
+    response: mpsc::Sender<Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>>>,
 }
 
 pub(crate) struct PendingManagedSessionSpawn {
@@ -506,6 +510,10 @@ impl HubRuntime {
             #[cfg(test)]
             retry_retained_again_on_pending: AtomicBool::new(false),
             #[cfg(test)]
+            coordination_core_submits: AtomicUsize::new(0),
+            #[cfg(test)]
+            retained_reservation_takes: AtomicUsize::new(0),
+            #[cfg(test)]
             resubmit_release_on_pending: AtomicBool::new(false),
             close_work,
             data_plane: Some(data_plane),
@@ -633,6 +641,10 @@ impl HubRuntime {
             managed_accept_ones: AtomicUsize::new(0),
             #[cfg(test)]
             retry_retained_again_on_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            coordination_core_submits: AtomicUsize::new(0),
+            #[cfg(test)]
+            retained_reservation_takes: AtomicUsize::new(0),
             #[cfg(test)]
             resubmit_release_on_pending: AtomicBool::new(false),
             close_work,
@@ -1623,25 +1635,30 @@ impl HubRuntime {
             });
         }
         while let Some(pending) = self.session_type_spawner.take_pending() {
+            // Owner thread only: prepare_push, fulfill, and advance_inflight share
+            // this thread, so the reserved slot cannot be stolen before try_push.
+            if match self.inflight_plugin_core.lock() {
+                Ok(mut inflight) => inflight.prepare_push().is_err(),
+                Err(_) => true,
+            } {
+                let _ = pending.response.send(Err(std::borrow::Cow::Borrowed(
+                    crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+                )));
+                continue;
+            }
             match self.fulfill_session_type_spawn(&pending) {
                 Ok(start) => {
                     if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
-                        if inflight.prepare_push().is_err() {
-                            let _ = pending.response.send(Err(
-                                crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED.into(),
-                            ));
-                        } else {
-                            inflight
-                                .try_push(InflightPluginCore::SessionTypeSpawn {
-                                    start,
-                                    response: pending.response,
-                                })
-                                .expect("capacity reserved");
-                        }
+                        inflight
+                            .try_push(InflightPluginCore::SessionTypeSpawn {
+                                start,
+                                response: pending.response,
+                            })
+                            .expect("capacity reserved");
                     }
                 }
                 Err(error) => {
-                    let _ = pending.response.send(Err(error));
+                    let _ = pending.response.send(Err(std::borrow::Cow::Owned(error)));
                 }
             }
         }
@@ -1668,7 +1685,9 @@ impl HubRuntime {
                             else {
                                 continue;
                             };
-                            let result = self.finish_session_type_spawn(&start, result);
+                            let result = self
+                                .finish_session_type_spawn(&start, result)
+                                .map_err(std::borrow::Cow::Owned);
                             if response.send(result.clone()).is_err()
                                 && let Ok(spawned) = result
                             {
@@ -2823,6 +2842,23 @@ impl HubRuntime {
         Arc::clone(&self.lua_memory)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_fulfill_pending_coordination_requests(&self) {
+        self.fulfill_pending_coordination_requests();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_coordination_core_submits(&self) -> usize {
+        self.coordination_core_submits
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_retained_reservation_takes(&self) -> usize {
+        self.retained_reservation_takes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn bind_terminal_core_owner(&self) {
         self.core_daemon.bind_terminal_owner();
     }
@@ -2851,6 +2887,19 @@ impl HubRuntime {
 
     fn fulfill_pending_coordination_requests(&self) {
         while let Some(pending) = self.coordination_bridge.take_pending() {
+            // Owner thread only: prepare_push, submit_retained, and
+            // advance_inflight share this thread.
+            if match self.inflight_plugin_core.lock() {
+                Ok(mut inflight) => inflight.prepare_push().is_err(),
+                Err(_) => true,
+            } {
+                let _ = pending
+                    .response
+                    .send(crate::lua_runtime::CoordinationDelivery::Refused(
+                        crate::lua_runtime::CoordinationRefusal::CallbackCapacity,
+                    ));
+                continue;
+            }
             let (core_storage, storage) = match pending.storage {
                 Some(storage) => (
                     Some(storage.core),
@@ -2859,28 +2908,23 @@ impl HubRuntime {
                 None => (None, None),
             };
             let caller = pending.caller;
+            #[cfg(test)]
+            self.coordination_core_submits
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let submission = self.core_daemon.submit_retained(
                 move |daemon| pending.operation.execute(daemon),
                 move || caller.claim(),
                 core_storage,
             );
             if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
-                if inflight.prepare_push().is_err() {
-                    let _ = pending.response.send(Err(
-                        crate::lua_runtime::CoordinationFailure::NonAcknowledge(
-                            crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED.to_owned(),
-                        ),
-                    ));
-                } else {
-                    inflight
-                        .try_push(InflightPluginCore::Coordination {
-                            ticket: submission.ticket,
-                            response: pending.response,
-                            rejected: submission.rejected,
-                            _storage: storage,
-                        })
-                        .expect("capacity reserved");
-                }
+                inflight
+                    .try_push(InflightPluginCore::Coordination {
+                        ticket: submission.ticket,
+                        response: pending.response,
+                        rejected: submission.rejected,
+                        _storage: storage,
+                    })
+                    .expect("capacity reserved");
             }
         }
         self.advance_inflight_plugin_core();
@@ -3893,6 +3937,9 @@ impl HubRuntime {
     }
 
     pub(crate) fn take_retained_reservations(&self) -> Vec<SessionReservation> {
+        #[cfg(test)]
+        self.retained_reservation_takes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.retained_plugin_reservations
             .lock()
             .map(|mut held| std::mem::take(&mut *held))
@@ -3947,7 +3994,7 @@ impl HubRuntime {
         loop {
             self.fulfill_pending_session_type_spawns();
             match receiver.try_recv() {
-                Ok(result) => return result,
+                Ok(result) => return result.map_err(|error| error.into_owned()),
                 Err(mpsc::TryRecvError::Empty) => {
                     if Instant::now() >= deadline {
                         return Err("plugin session type spawn timed out".to_string());
@@ -4942,13 +4989,12 @@ impl HubSessionTypeSpawner {
         session_type_id: &str,
         request: SessionTypeRequest,
         package_records: Vec<PackageRecord>,
-    ) -> Result<PluginSessionTypeSpawned, String> {
+    ) -> Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>> {
         let (response, receiver) = mpsc::channel();
         {
-            let mut pending = self
-                .pending
-                .lock()
-                .map_err(|_| "session-type spawn queue lock poisoned".to_string())?;
+            let mut pending = self.pending.lock().map_err(|_| {
+                std::borrow::Cow::Borrowed("session-type spawn queue lock poisoned")
+            })?;
             pending.push_back(PendingSessionTypeSpawn {
                 plugin_key: plugin_key.clone(),
                 session_type_id: session_type_id.to_string(),
@@ -4962,7 +5008,9 @@ impl HubSessionTypeSpawner {
 
         receiver
             .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
-            .map_err(|_| "session-type spawn did not complete before timeout".to_string())?
+            .map_err(|_| {
+                std::borrow::Cow::Borrowed("session-type spawn did not complete before timeout")
+            })?
     }
 
     fn take_pending(&self) -> Option<PendingSessionTypeSpawn> {
@@ -5686,7 +5734,7 @@ enum InflightPluginCore {
     },
     SessionTypeSpawn {
         start: SessionTypeSpawnStart,
-        response: mpsc::Sender<Result<PluginSessionTypeSpawned, String>>,
+        response: mpsc::Sender<Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>>>,
     },
 }
 
@@ -6712,6 +6760,79 @@ pub(crate) mod tests {
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .unwrap();
         HubRuntime::new(config).unwrap()
+    }
+
+    fn occupy_inflight_and_freeze_remainder(
+        runtime: &HubRuntime,
+        topic: &str,
+    ) -> crate::lua_memory::LuaCallbackCharge {
+        let bridge = runtime.coordination_bridge();
+        bridge.test_queue_pending(PendingCoordinationOperation::Drain {
+            target: EnvelopeTarget::Topic {
+                topic: topic.into(),
+            },
+            after: None,
+            limit: 1,
+        });
+        runtime.test_fulfill_pending_coordination_requests();
+        assert_eq!(runtime.test_coordination_core_submits(), 1);
+        let memory = runtime.test_lua_memory();
+        let used = memory.usage().1;
+        let hold = memory
+            .limits()
+            .total_callback_bytes
+            .checked_sub(used)
+            .expect("callback budget remains after one inflight slot");
+        memory.reserve_shared_callback_storage(hold).unwrap()
+    }
+
+    #[test]
+    fn inflight_coordination_refuses_before_core_submit() {
+        let runtime = family_runtime("inflight-coord-cap");
+        let _hold = occupy_inflight_and_freeze_remainder(&runtime, "inflight-cap");
+        let bridge = runtime.coordination_bridge();
+        let receiver = bridge.test_queue_pending(PendingCoordinationOperation::Drain {
+            target: EnvelopeTarget::Topic {
+                topic: "inflight-cap-2".into(),
+            },
+            after: None,
+            limit: 1,
+        });
+        runtime.test_fulfill_pending_coordination_requests();
+        assert_eq!(runtime.test_coordination_core_submits(), 1);
+        assert_eq!(bridge.test_pending_count(), 0);
+        let reply = receiver.try_recv().expect("capacity refusal is immediate");
+        assert!(
+            matches!(
+                reply,
+                Err(crate::lua_runtime::CoordinationFailure::NonAcknowledge(ref message))
+                    if message == crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED
+            ),
+            "unexpected reply: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn inflight_spawn_refuses_before_taking_retained_tokens() {
+        let runtime = family_runtime("inflight-spawn-cap");
+        let _hold = occupy_inflight_and_freeze_remainder(&runtime, "inflight-spawn-fill");
+        let takes_before = runtime.test_retained_reservation_takes();
+        let error = runtime
+            .test_plugin_spawn(
+                "test.plugin",
+                "agent",
+                crate::session_types::SessionTypeRequest {
+                    target_id: None,
+                    session_id: None,
+                    cwd: None,
+                    environment: BTreeMap::new(),
+                    context: crate::session_types::SessionTypeContextInput::default(),
+                },
+                Vec::new(),
+            )
+            .expect_err("capacity must refuse before reserve");
+        assert_eq!(error, crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED);
+        assert_eq!(runtime.test_retained_reservation_takes(), takes_before);
     }
 
     #[test]

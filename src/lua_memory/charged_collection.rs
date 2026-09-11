@@ -12,7 +12,7 @@ use super::{LuaCallbackCharge, LuaMemoryAccount, LuaMemoryCapacityError, LuaMemo
 
 pub(crate) struct ChargedVecDeque<T> {
     buf: VecDeque<T>,
-    capacity_charge: Option<LuaCallbackCharge>,
+    capacity_charges: Vec<LuaCallbackCharge>,
     account: Arc<LuaMemoryAccount>,
     #[cfg(test)]
     charge_after_grow: bool,
@@ -30,7 +30,7 @@ impl<T> ChargedVecDeque<T> {
     pub(crate) fn new(account: Arc<LuaMemoryAccount>) -> Self {
         Self {
             buf: VecDeque::new(),
-            capacity_charge: None,
+            capacity_charges: Vec::new(),
             account,
             #[cfg(test)]
             charge_after_grow: false,
@@ -80,25 +80,25 @@ impl<T> ChargedVecDeque<T> {
         let item = self.buf.pop_front();
         #[cfg(test)]
         if self.release_capacity_on_pop {
-            self.capacity_charge = None;
+            self.capacity_charges.clear();
         }
         item
     }
 
     pub(crate) fn take(&mut self) -> Self {
-        let capacity_charge = {
+        let capacity_charges = {
             #[cfg(test)]
             if self.take_without_charge {
-                None
+                Vec::new()
             } else {
-                self.capacity_charge.take()
+                std::mem::take(&mut self.capacity_charges)
             }
             #[cfg(not(test))]
-            self.capacity_charge.take()
+            std::mem::take(&mut self.capacity_charges)
         };
         Self {
             buf: std::mem::take(&mut self.buf),
-            capacity_charge,
+            capacity_charges,
             account: Arc::clone(&self.account),
             #[cfg(test)]
             charge_after_grow: self.charge_after_grow,
@@ -118,10 +118,19 @@ impl<T> ChargedVecDeque<T> {
         if self.always_grow {
             return self.grow();
         }
+        self.ensure_charged()?;
         if self.buf.len() < self.buf.capacity() {
             return Ok(());
         }
         self.grow()
+    }
+
+    fn ensure_charged(&mut self) -> Result<(), LuaMemoryCapacityError> {
+        ensure_charges::<T>(
+            &self.account,
+            &mut self.capacity_charges,
+            self.buf.capacity(),
+        )
     }
 
     fn grow(&mut self) -> Result<(), LuaMemoryCapacityError> {
@@ -134,29 +143,31 @@ impl<T> ChargedVecDeque<T> {
             self.buf
                 .try_reserve_exact(additional)
                 .map_err(|_| reserve_failed::<T>(new_cap))?;
-            if self.buf.capacity() != new_cap {
-                return Err(reserve_failed::<T>(new_cap));
-            }
-            self.capacity_charge = Some(self.account.reserve_shared_callback_storage(new_bytes)?);
-            return Ok(());
+            return retain_grown_charges::<T>(
+                &self.account,
+                &mut self.capacity_charges,
+                self.account.reserve_shared_callback_storage(new_bytes)?,
+                new_cap,
+                self.buf.capacity(),
+            );
         }
-        let new_charge = self.account.reserve_shared_callback_storage(new_bytes)?;
-        if self.buf.try_reserve_exact(additional).is_err() {
-            return Err(reserve_failed::<T>(new_cap));
-        }
-        if self.buf.capacity() != new_cap {
-            return Err(reserve_failed::<T>(new_cap));
-        }
-        self.capacity_charge = Some(new_charge);
-        Ok(())
+        grow_charged::<T, _>(
+            &self.account,
+            &mut self.capacity_charges,
+            new_cap,
+            new_bytes,
+            || {
+                self.buf
+                    .try_reserve_exact(additional)
+                    .map_err(|_| ())
+                    .map(|_| self.buf.capacity())
+            },
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn charge_bytes(&self) -> usize {
-        self.capacity_charge
-            .as_ref()
-            .map(LuaCallbackCharge::bytes)
-            .unwrap_or(0)
+        charge_sum(&self.capacity_charges)
     }
 
     #[cfg(test)]
@@ -187,7 +198,7 @@ impl<T> ChargedVecDeque<T> {
 
 pub(crate) struct ChargedVec<T> {
     buf: Vec<T>,
-    capacity_charge: Option<LuaCallbackCharge>,
+    capacity_charges: Vec<LuaCallbackCharge>,
     account: Arc<LuaMemoryAccount>,
     #[cfg(test)]
     charge_after_grow: bool,
@@ -203,7 +214,7 @@ impl<T> ChargedVec<T> {
     pub(crate) fn new(account: Arc<LuaMemoryAccount>) -> Self {
         Self {
             buf: Vec::new(),
-            capacity_charge: None,
+            capacity_charges: Vec::new(),
             account,
             #[cfg(test)]
             charge_after_grow: false,
@@ -239,7 +250,7 @@ impl<T> ChargedVec<T> {
         let item = self.buf.swap_remove(index);
         #[cfg(test)]
         if self.release_capacity_on_pop {
-            self.capacity_charge = None;
+            self.capacity_charges.clear();
         }
         item
     }
@@ -253,10 +264,19 @@ impl<T> ChargedVec<T> {
         if self.always_grow {
             return self.grow();
         }
+        self.ensure_charged()?;
         if self.buf.len() < self.buf.capacity() {
             return Ok(());
         }
         self.grow()
+    }
+
+    fn ensure_charged(&mut self) -> Result<(), LuaMemoryCapacityError> {
+        ensure_charges::<T>(
+            &self.account,
+            &mut self.capacity_charges,
+            self.buf.capacity(),
+        )
     }
 
     fn grow(&mut self) -> Result<(), LuaMemoryCapacityError> {
@@ -269,29 +289,31 @@ impl<T> ChargedVec<T> {
             self.buf
                 .try_reserve_exact(additional)
                 .map_err(|_| reserve_failed::<T>(new_cap))?;
-            if self.buf.capacity() != new_cap {
-                return Err(reserve_failed::<T>(new_cap));
-            }
-            self.capacity_charge = Some(self.account.reserve_shared_callback_storage(new_bytes)?);
-            return Ok(());
+            return retain_grown_charges::<T>(
+                &self.account,
+                &mut self.capacity_charges,
+                self.account.reserve_shared_callback_storage(new_bytes)?,
+                new_cap,
+                self.buf.capacity(),
+            );
         }
-        let new_charge = self.account.reserve_shared_callback_storage(new_bytes)?;
-        if self.buf.try_reserve_exact(additional).is_err() {
-            return Err(reserve_failed::<T>(new_cap));
-        }
-        if self.buf.capacity() != new_cap {
-            return Err(reserve_failed::<T>(new_cap));
-        }
-        self.capacity_charge = Some(new_charge);
-        Ok(())
+        grow_charged::<T, _>(
+            &self.account,
+            &mut self.capacity_charges,
+            new_cap,
+            new_bytes,
+            || {
+                self.buf
+                    .try_reserve_exact(additional)
+                    .map_err(|_| ())
+                    .map(|_| self.buf.capacity())
+            },
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn charge_bytes(&self) -> usize {
-        self.capacity_charge
-            .as_ref()
-            .map(LuaCallbackCharge::bytes)
-            .unwrap_or(0)
+        charge_sum(&self.capacity_charges)
     }
 
     #[cfg(test)]
@@ -321,6 +343,64 @@ fn next_capacity(current: usize) -> usize {
     } else {
         current.saturating_mul(2)
     }
+}
+
+fn charge_sum(charges: &[LuaCallbackCharge]) -> usize {
+    charges.iter().map(LuaCallbackCharge::bytes).sum()
+}
+
+fn ensure_charges<T>(
+    account: &Arc<LuaMemoryAccount>,
+    charges: &mut Vec<LuaCallbackCharge>,
+    actual_cap: usize,
+) -> Result<(), LuaMemoryCapacityError> {
+    let needed = charged_bytes::<T>(actual_cap)?;
+    let have = charge_sum(charges);
+    if needed <= have {
+        return Ok(());
+    }
+    charges.push(account.reserve_shared_callback_storage(needed - have)?);
+    Ok(())
+}
+
+fn grow_charged<T, F>(
+    account: &Arc<LuaMemoryAccount>,
+    charges: &mut Vec<LuaCallbackCharge>,
+    new_cap: usize,
+    new_bytes: usize,
+    reserve: F,
+) -> Result<(), LuaMemoryCapacityError>
+where
+    F: FnOnce() -> Result<usize, ()>,
+{
+    let new_charge = account.reserve_shared_callback_storage(new_bytes)?;
+    let actual = reserve().map_err(|_| reserve_failed::<T>(new_cap))?;
+    retain_grown_charges::<T>(account, charges, new_charge, new_cap, actual)
+}
+
+fn retain_grown_charges<T>(
+    account: &Arc<LuaMemoryAccount>,
+    charges: &mut Vec<LuaCallbackCharge>,
+    new_charge: LuaCallbackCharge,
+    new_cap: usize,
+    actual: usize,
+) -> Result<(), LuaMemoryCapacityError> {
+    let mut next = vec![new_charge];
+    if actual > new_cap {
+        let extra = charged_bytes::<T>(actual - new_cap)?;
+        match account.reserve_shared_callback_storage(extra) {
+            Ok(charge) => next.push(charge),
+            Err(error) => {
+                *charges = next;
+                return Err(error);
+            }
+        }
+    } else if actual < new_cap {
+        *charges = next;
+        return Err(reserve_failed::<T>(new_cap));
+    }
+    *charges = next;
+    Ok(())
 }
 
 fn charged_bytes<T>(capacity: usize) -> Result<usize, LuaMemoryCapacityError> {
@@ -358,6 +438,25 @@ mod tests {
 
     fn slot() -> usize {
         size_of::<u8>()
+    }
+
+    #[test]
+    fn charge_tracks_logical_capacity_through_growth_steps() {
+        let memory = account(16 * slot());
+        let mut q = ChargedVecDeque::<u8>::new(Arc::clone(&memory));
+        let mut v = ChargedVec::<u8>::new(Arc::clone(&memory));
+        for cap in [1, 2, 4] {
+            while q.len() < cap {
+                q.try_push_back(0).unwrap();
+            }
+            while v.len() < cap {
+                v.try_push(0).unwrap();
+            }
+            assert_eq!(q.capacity(), cap);
+            assert_eq!(v.capacity(), cap);
+            assert_eq!(q.charge_bytes(), cap * slot());
+            assert_eq!(v.charge_bytes(), cap * slot());
+        }
     }
 
     #[test]

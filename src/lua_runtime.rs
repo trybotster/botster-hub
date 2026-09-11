@@ -2056,6 +2056,7 @@ fn session_types_table(
     let spawn_memory = memory.clone();
     let spawn_conversion =
         lua.create_string("session_types.spawn could not allocate its Lua result")?;
+    let spawn_capacity = lua.create_string(LUA_CALLBACK_CAPACITY_EXHAUSTED)?;
     table.set(
         "spawn",
         callback::create(lua, move |lua, args: Value| {
@@ -2070,23 +2071,26 @@ fn session_types_table(
                     )
                 })?;
             let request = session_type_request_from_lua(&value)?;
-            let result = spawn_templates
-                .spawn(
-                    &spawn_plugin_key,
-                    session_type_id,
-                    request,
-                    spawn_records.clone(),
-                )
-                .map_err(|error| {
-                    mlua::Error::RuntimeError(format!("session_types.spawn failed: {error}"))
-                })?;
-            session_type_spawn::convert_session_type_spawned(
-                lua,
-                spawn_memory.as_ref(),
-                &spawn_templates,
-                result,
-                &spawn_conversion,
-            )
+            match spawn_templates.spawn(
+                &spawn_plugin_key,
+                session_type_id,
+                request,
+                spawn_records.clone(),
+            ) {
+                Ok(result) => session_type_spawn::convert_session_type_spawned(
+                    lua,
+                    spawn_memory.as_ref(),
+                    &spawn_templates,
+                    result,
+                    &spawn_conversion,
+                ),
+                Err(error) if error.as_ref() == LUA_CALLBACK_CAPACITY_EXHAUSTED => {
+                    Ok(Value::String(spawn_capacity.clone()))
+                }
+                Err(error) => Err(mlua::Error::RuntimeError(format!(
+                    "session_types.spawn failed: {error}"
+                ))),
+            }
         })?,
     )?;
     table.set(
