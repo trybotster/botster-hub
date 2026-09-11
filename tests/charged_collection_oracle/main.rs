@@ -271,6 +271,16 @@ fn measure_lua_json() -> Result<(), String> {
             "#,
         ),
         (
+            "wide-object-tables",
+            r#"
+            local t = {}
+            for i = 1, 32 do
+                t['k' .. i] = {}
+            end
+            return t
+            "#,
+        ),
+        (
             "wide-object-64",
             r#"
             local t = {}
