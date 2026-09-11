@@ -2881,4 +2881,166 @@ sys.exit(0)
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
+
+    fn init_git_repo(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        for args in [
+            ["init", "-b", "main"].as_slice(),
+            ["config", "user.email", "botster@example.invalid"].as_slice(),
+            ["config", "user.name", "Botster Test"].as_slice(),
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(path.join("README.md"), "fixture\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(path)
+                .args(["add", "README.md"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(path)
+                .args(["commit", "-m", "fixture"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn pump_until_join<T>(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        handle: std::thread::JoinHandle<T>,
+    ) -> T {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(daemon, state);
+            if handle.is_finished() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "ensure_worktree_and_spawn hang");
+            std::thread::yield_now();
+        }
+        handle.join().expect("join managed spawn")
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_creates_a_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("s2-create", Some(worker));
+        let repo = root.join("repo");
+        init_git_repo(&repo);
+        let package_root = root.join("p1-plugin");
+        let mut record = plugin_spawn_package(&package_root);
+        record.manifest.capabilities.push(botster_core::Capability {
+            surface: botster_core::CapabilitySurface::SessionActions,
+            scope: Some("session_type_managed_git_spawn".into()),
+        });
+        record.session_types[0].target_id = Some("t1".into());
+        {
+            let runtime = daemon.runtime().unwrap();
+            let mut next = (*runtime.state()).clone();
+            next.spawn_targets.push(crate::spawn_targets::SpawnTarget {
+                target_id: "t1".into(),
+                label: "t1".into(),
+                root: repo.clone(),
+                enabled: true,
+                kind: "git".into(),
+                base_ref: Some("main".into()),
+                metadata: Default::default(),
+            });
+            runtime.replace_state(next).expect("admit git target");
+        }
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let handle = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            )
+        });
+        let spawned = pump_until_join(&mut daemon, &mut state, handle).expect("created spawn");
+        assert!(spawned.created_worktree);
+        assert!(!spawned.reused_worktree);
+        assert!(std::path::Path::new(&spawned.worktree_path).exists());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_reuses_an_existing_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("s2-reuse", Some(worker));
+        let repo = root.join("repo");
+        init_git_repo(&repo);
+        let package_root = root.join("p1-plugin");
+        let mut record = plugin_spawn_package(&package_root);
+        record.manifest.capabilities.push(botster_core::Capability {
+            surface: botster_core::CapabilitySurface::SessionActions,
+            scope: Some("session_type_managed_git_spawn".into()),
+        });
+        record.session_types[0].target_id = Some("t1".into());
+        {
+            let runtime = daemon.runtime().unwrap();
+            let mut next = (*runtime.state()).clone();
+            next.spawn_targets.push(crate::spawn_targets::SpawnTarget {
+                target_id: "t1".into(),
+                label: "t1".into(),
+                root: repo.clone(),
+                enabled: true,
+                kind: "git".into(),
+                base_ref: Some("main".into()),
+                metadata: Default::default(),
+            });
+            runtime.replace_state(next).expect("admit git target");
+        }
+        let first_record = record.clone();
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let first_spawner = spawner.clone();
+        let first = std::thread::spawn(move || {
+            first_spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![first_record],
+            )
+        });
+        let first = pump_until_join(&mut daemon, &mut state, first).expect("first create");
+        assert!(first.created_worktree);
+        let path = first.worktree_path.clone();
+        let second = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            )
+        });
+        let second = pump_until_join(&mut daemon, &mut state, second).expect("reuse spawn");
+        assert!(second.reused_worktree);
+        assert!(!second.created_worktree);
+        assert_eq!(second.worktree_path, path);
+        assert!(std::path::Path::new(&path).exists());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
