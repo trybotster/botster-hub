@@ -74,6 +74,10 @@ The six unit tests and four external configuration tests passed. Root inspected 
 The external reload test failed before behavior because its required candidate-path environment was absent. That setup failure is preserved separately.
 Root authorized one reload-only retry with the existing verified candidate fixture in `/private/tmp/botster-plugin-render-candidate.QqYTjY`.
 The retry uses the current integration-test executable. It checks library reload behavior, not matched delivery of the current Hub binary.
+The retry passed: one test passed, 47 were filtered, exit zero, no deadline expiry, and empty stderr.
+Root read its raw output and verified unchanged source, executable, and fixture identities in `/private/tmp/c1-lua-policy-account-reload-tests-20260910-2`.
+All eleven selected behaviors now have passing results. The earlier setup failure remains recorded; no broad suite or matched-delivery claim follows.
+This closes the bounded policy/account wiring check. Callback-frame, worker, shared-storage, and full acknowledgement accounting remain open.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
