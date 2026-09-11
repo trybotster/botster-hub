@@ -46,8 +46,10 @@ pub(crate) mod ownership {
             use crate::lua_runtime::PendingCoordinationOperation;
 
             let core_error = core_error_bytes();
-            let host_error = CoordinationRefusal::ALL.iter()
-                .map(|refusal| refusal.message().len()).max()?;
+            let host_error = CoordinationRefusal::ALL
+                .iter()
+                .map(|refusal| refusal.message().len())
+                .max()?;
             Some(Self {
                 input,
                 lookup: input,
@@ -55,7 +57,8 @@ pub(crate) mod ownership {
                 error_string: core_error.checked_add(host_error)?,
                 conversion: core_conversion_bytes()?.checked_add(17)?,
                 core_request: crate::data_plane::driver::retained_request_bytes::<
-                    CoordinationReply, PendingCoordinationOperation,
+                    CoordinationReply,
+                    PendingCoordinationOperation,
                 >(),
                 core_reply: crate::data_plane::driver::retained_reply_bytes::<CoordinationReply>()?,
                 callback_reply: layout::single_reply_bytes::<CoordinationReply>(true)?,
@@ -89,13 +92,25 @@ pub(crate) mod ownership {
                 input: admitted.split(self.input).expect("checked input segment"),
                 lookup: admitted.split(self.lookup).expect("checked lookup segment"),
                 result: admitted.split(self.result).expect("checked result segment"),
-                error_string: admitted.split(self.error_string).expect("checked error segment"),
-                conversion: admitted.split(self.conversion).expect("checked conversion segment"),
-                core_request: admitted.split(self.core_request).expect("checked Core request segment"),
-                core_reply: admitted.split(self.core_reply).expect("checked Core reply segment"),
-                callback_reply: admitted.split(self.callback_reply).expect("checked callback reply segment"),
+                error_string: admitted
+                    .split(self.error_string)
+                    .expect("checked error segment"),
+                conversion: admitted
+                    .split(self.conversion)
+                    .expect("checked conversion segment"),
+                core_request: admitted
+                    .split(self.core_request)
+                    .expect("checked Core request segment"),
+                core_reply: admitted
+                    .split(self.core_reply)
+                    .expect("checked Core reply segment"),
+                callback_reply: admitted
+                    .split(self.callback_reply)
+                    .expect("checked callback reply segment"),
                 caller: admitted.split(self.caller).expect("checked caller segment"),
-                continuation: admitted.split(self.continuation).expect("checked continuation segment"),
+                continuation: admitted
+                    .split(self.continuation)
+                    .expect("checked continuation segment"),
                 disposal: admitted,
             })
         }
@@ -123,7 +138,8 @@ pub(crate) mod ownership {
 
     pub(crate) fn core_conversion_bytes() -> Option<usize> {
         // Four temporary handles overlap the state-owned root result handle.
-        4usize.checked_mul(crate::lua_memory::layout::lua_reference_bytes())?
+        4usize
+            .checked_mul(crate::lua_memory::layout::lua_reference_bytes())?
             .checked_add(17)
     }
 
@@ -238,8 +254,14 @@ pub(crate) mod ownership {
 
     impl CoordinationRefusal {
         pub(crate) const ALL: [Self; 8] = [
-            Self::Registration, Self::Abandoned, Self::Full, Self::Stopped,
-            Self::Lost, Self::Unexpected, Self::HelperStopped, Self::HelperFull,
+            Self::Registration,
+            Self::Abandoned,
+            Self::Full,
+            Self::Stopped,
+            Self::Lost,
+            Self::Unexpected,
+            Self::HelperStopped,
+            Self::HelperFull,
         ];
 
         pub(crate) const fn message(self) -> &'static str {
@@ -281,22 +303,28 @@ pub(crate) mod ownership {
             match self {
                 Self::NonAcknowledge(sender) => sender.send(match delivery {
                     CoordinationDelivery::Reply(reply) => reply,
-                    CoordinationDelivery::Refused(message) => {
-                        Err(CoordinationFailure::NonAcknowledge(message.message().to_owned()))
-                    }
+                    CoordinationDelivery::Refused(message) => Err(
+                        CoordinationFailure::NonAcknowledge(message.message().to_owned()),
+                    ),
                 }),
-                Self::Acknowledge { sender, error, conversion } => {
+                Self::Acknowledge {
+                    sender,
+                    error,
+                    conversion,
+                } => {
                     let message = match delivery {
-                        CoordinationDelivery::Reply(Ok(CoordinationOutcome::Acknowledge(outcome))) => {
+                        CoordinationDelivery::Reply(Ok(CoordinationOutcome::Acknowledge(
+                            outcome,
+                        ))) => {
                             return sender.send(Ok(outcome));
                         }
-                        CoordinationDelivery::Reply(Err(CoordinationFailure::Acknowledge(failure))) => {
+                        CoordinationDelivery::Reply(Err(CoordinationFailure::Acknowledge(
+                            failure,
+                        ))) => {
                             return sender.send(Err(failure));
                         }
                         CoordinationDelivery::Refused(message) => message.message(),
-                        CoordinationDelivery::Reply(_) => {
-                            CoordinationRefusal::Unexpected.message()
-                        }
+                        CoordinationDelivery::Reply(_) => CoordinationRefusal::Unexpected.message(),
                     };
                     sender.send(Err(AcknowledgeFailure::new(
                         message.to_owned(),
@@ -432,14 +460,25 @@ impl AcknowledgeOperation {
         self,
         daemon: &mut CoreDaemon,
     ) -> Result<ownership::AcknowledgeOutcome, ownership::AcknowledgeFailure> {
-        let Self { request, charge, lookup, result, error, conversion } = self;
+        let Self {
+            request,
+            charge,
+            lookup,
+            result,
+            error,
+            conversion,
+        } = self;
         let outcome = daemon.acknowledge_routed_envelope(request);
         drop(charge);
         drop(lookup);
         match outcome {
-            Ok(outcome) => Ok(ownership::AcknowledgeOutcome::new(outcome, result, conversion)),
+            Ok(outcome) => Ok(ownership::AcknowledgeOutcome::new(
+                outcome, result, conversion,
+            )),
             Err(failure) => Err(ownership::AcknowledgeFailure::new(
-                failure.to_string(), error, conversion,
+                failure.to_string(),
+                error,
+                conversion,
             )),
         }
     }
@@ -469,11 +508,14 @@ pub(crate) fn admit(
         crate::lua_memory::LuaCallbackAdmissionError::Quota => AdmissionError::Quota,
         crate::lua_memory::LuaCallbackAdmissionError::Capacity(_) => AdmissionError::Capacity,
     })?;
-    let core_error = charges.error_string.split(ownership::core_error_bytes())
+    let core_error = charges
+        .error_string
+        .split(ownership::core_error_bytes())
         .expect("admitted Core error segment");
-    let core_conversion = charges.conversion.split(
-        ownership::core_conversion_bytes().expect("admitted conversion size"),
-    ).expect("admitted Core conversion segment");
+    let core_conversion = charges
+        .conversion
+        .split(ownership::core_conversion_bytes().expect("admitted conversion size"))
+        .expect("admitted Core conversion segment");
     // The trusted Lua wrapper supplies a known variant and only its consumed fields.
     // Each String requests its exact byte length after admission.
     let target = match kind {
@@ -549,8 +591,7 @@ pub(super) fn callback(
     let queue_poisoned = lua.create_string("coordination queue lock poisoned")?;
     let ingress_sealed = lua.create_string("coordination ingress is sealed")?;
     let timeout = lua.create_string("coordination request did not complete before timeout")?;
-    let unexpected =
-        lua.create_string("coordination acknowledge returned unexpected response")?;
+    let unexpected = lua.create_string("coordination acknowledge returned unexpected response")?;
     // Only the trusted wrapper can call this function. Foreign values never enter Rust.
     let callback = lua.create_function(
         move |lua,
@@ -696,7 +737,7 @@ mod tests {
         let accept = lua
             .create_function(
                 move |lua,
-                 (kind, first, second, envelope_id): (
+                      (kind, first, second, envelope_id): (
                     mlua::String,
                     mlua::String,
                     mlua::String,
@@ -962,12 +1003,7 @@ mod tests {
         lua.globals()
             .set(
                 "ack",
-                callback(
-                    &lua,
-                    HubCoordinationBridge::new(),
-                    Arc::clone(&memory),
-                )
-                .unwrap(),
+                callback(&lua, HubCoordinationBridge::new(), Arc::clone(&memory)).unwrap(),
             )
             .unwrap();
         let held = memory.reserve_callback_total(admitted).unwrap();
@@ -1021,10 +1057,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let lua = Lua::new();
             lua.globals()
-                .set(
-                    "ack",
-                    callback(&lua, producer, callback_memory).unwrap(),
-                )
+                .set("ack", callback(&lua, producer, callback_memory).unwrap())
                 .unwrap();
             lua.globals().set("null", lua.null()).unwrap();
             lua.load("local result=ack({target={type='topic',topic='t'},envelope_id='e'}); assert(result.state == null)").exec().unwrap();

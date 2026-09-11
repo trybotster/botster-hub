@@ -8,9 +8,9 @@
 //! wake. Pump facts use `ControlMessage::DataPlaneProgress` instead.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -787,7 +787,8 @@ pub(crate) struct CoreDaemonHandle {
 impl CoreDaemonHandle {
     #[cfg(test)]
     pub(crate) fn test_refuse_next_owner_begins(&self, count: usize) {
-        self.refuse_next_owner_begins.store(count, Ordering::Release);
+        self.refuse_next_owner_begins
+            .store(count, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -803,7 +804,8 @@ impl CoreDaemonHandle {
 
     #[cfg(test)]
     fn take_forced_owner_begin(&self) -> Option<CoreOperationTicket> {
-        if self.lose_next_owner_begins
+        if self
+            .lose_next_owner_begins
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .is_ok()
         {
@@ -812,7 +814,8 @@ impl CoreDaemonHandle {
                 completion: CoreTicket::lost(OwnerWorkIdentity::first(WaiterId(0))),
             });
         }
-        if self.refuse_next_owner_begins
+        if self
+            .refuse_next_owner_begins
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .is_ok()
         {
@@ -855,7 +858,8 @@ impl CoreDaemonHandle {
         F: FnOnce(&mut CoreDaemon) -> T + Send + 'static,
     {
         assert!(Arc::ptr_eq(&self.completion_wake, &retirement.wake));
-        let identity = self.completion_wake
+        let identity = self
+            .completion_wake
             .register_phases(retirement.waiter_id, 1)
             .and_then(|identities| identities.into_iter().next());
         self.submit_retained_identity(identity, true, operation, claim, storage)
@@ -905,7 +909,9 @@ impl CoreDaemonHandle {
                 None => CoreRequest::new(operation),
             };
             return CoreSubmission {
-                ticket: ChargedCoreTicket { ticket: CoreTicket::refused() },
+                ticket: ChargedCoreTicket {
+                    ticket: CoreTicket::refused(),
+                },
                 rejected: Some(CoreRejectedRequest {
                     request,
                     reason: CoreRefusal::Registration,
@@ -914,7 +920,10 @@ impl CoreDaemonHandle {
         };
         let lease = reply_charge.map(crate::lua_memory::LuaCallbackStorageLease::new);
         let (ticket, publisher) = CoreTicket::channel_with_lease(
-            identity, Arc::clone(&self.completion_wake), notify_owner, lease,
+            identity,
+            Arc::clone(&self.completion_wake),
+            notify_owner,
+            lease,
         );
         let operation = move |daemon: &mut CoreDaemon, _: &mut PendingCoreOperations| {
             publisher.publish(operation(daemon));
@@ -963,7 +972,10 @@ impl CoreDaemonHandle {
             }
         }
         drop(admission);
-        CoreSubmission { ticket: ChargedCoreTicket { ticket }, rejected }
+        CoreSubmission {
+            ticket: ChargedCoreTicket { ticket },
+            rejected,
+        }
     }
 
     pub(crate) fn waiter_retirement(&self, waiter_id: WaiterId) -> CoreWaiterRetirement {
