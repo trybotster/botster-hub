@@ -841,6 +841,8 @@ pub struct LuaPluginHostApi {
     pub worktrees: SharedWorktrees,
     pub package_event_router: Arc<PackageEventRouter>,
     pub causal_scopes: Arc<CausalScopeTable>,
+    #[cfg(test)]
+    pub(crate) lua_plugin_runtimes: Arc<Mutex<Vec<std::sync::Weak<LuaPluginRuntime>>>>,
 }
 
 /// Real Lua runtime for one loaded plugin package.
@@ -865,6 +867,7 @@ struct LuaStateCharges {
     // None means completed cleanup disarmed this mandatory reservation.
     vm: Option<LuaVmCharge>,
     instruction_error: Option<LuaCallbackCharge>,
+    capacity_string: Option<LuaCallbackCharge>,
 }
 
 impl LuaStateCharges {
@@ -872,10 +875,12 @@ impl LuaStateCharges {
         Self {
             vm: Some(vm),
             instruction_error: None,
+            capacity_string: None,
         }
     }
 
     fn release(&mut self) {
+        drop(self.capacity_string.take());
         drop(self.instruction_error.take());
         drop(self.vm.take());
     }
@@ -883,6 +888,9 @@ impl LuaStateCharges {
 
 impl Drop for LuaStateCharges {
     fn drop(&mut self) {
+        if let Some(capacity_string) = self.capacity_string.take() {
+            std::mem::forget(capacity_string);
+        }
         if let Some(instruction_error) = self.instruction_error.take() {
             std::mem::forget(instruction_error);
         }
@@ -952,6 +960,29 @@ impl LuaState {
     fn hold_instruction_error(&mut self, charge: LuaCallbackCharge) {
         debug_assert!(self.charges.instruction_error.is_none());
         self.charges.instruction_error = Some(charge);
+    }
+
+    fn hold_capacity_string(&mut self, charge: LuaCallbackCharge) {
+        debug_assert!(self.charges.capacity_string.is_none());
+        self.charges.capacity_string = Some(charge);
+    }
+
+    #[cfg(test)]
+    fn instruction_error_bytes(&self) -> usize {
+        self.charges
+            .instruction_error
+            .as_ref()
+            .map(LuaCallbackCharge::bytes)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn capacity_string_bytes(&self) -> usize {
+        self.charges
+            .capacity_string
+            .as_ref()
+            .map(LuaCallbackCharge::bytes)
+            .unwrap_or(0)
     }
 }
 
@@ -1272,6 +1303,8 @@ impl LuaPluginRuntime {
         api: LuaPluginHostApi,
         package_records: Vec<PackageRecord>,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
+        #[cfg(test)]
+        let lua_plugin_runtimes = Arc::clone(&api.lua_plugin_runtimes);
         let memory = api.memory;
         let plugin_key = PluginKey(prepared.package_name.clone());
         let entrypoint = prepared.selected_entrypoint_path.as_ref().ok_or_else(|| {
@@ -1291,8 +1324,14 @@ impl LuaPluginRuntime {
             memory: Arc::clone(&memory),
         };
         let loaded = LoadedLuaPlugin::load(plugin_key.clone(), entrypoint, host_api, memory)?;
+        let runtime = Arc::new(loaded.runtime);
+        #[cfg(test)]
+        lua_plugin_runtimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(std::sync::Arc::downgrade(&runtime));
         Ok(HubPluginRuntimeBundle {
-            runtime: Arc::new(loaded.runtime),
+            runtime,
             handlers: loaded.handlers,
             event_handlers: loaded.event_handlers,
             descriptors: loaded.descriptors,
@@ -1322,34 +1361,38 @@ impl LuaPluginRuntime {
             >())
             .map_err(|error| LuaPluginRuntimeError::Load(error.to_string()))?;
         state.hold_instruction_error(instruction_charge);
-        let lua = state.lua();
-        lua.set_memory_limit(memory.limits().per_vm_bytes)
-            .map_err(LuaPluginRuntimeError::from)?;
         let budget = Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET));
-        let hook_budget = budget.clone();
-        let hook_error = Arc::clone(&instruction_error);
-        lua.set_hook(
-            HookTriggers::new().every_nth_instruction(1_000),
-            move |_lua, _debug| {
-                let previous = hook_budget.fetch_sub(1_000, Ordering::Relaxed);
-                if previous <= 1_000 {
-                    return Err(mlua::Error::ExternalError(Arc::clone(&hook_error)));
-                }
-                Ok(VmState::Continue)
-            },
-        )?;
-        sandbox::install(lua)?;
-        install_botster_api(lua, plugin_key.clone(), host_api)?;
         let source_charge = memory
             .reserve_callback()
             .map_err(|error| LuaPluginRuntimeError::Load(error.to_string()))?;
         let source = read_lua_source_bounded(entrypoint, memory.limits().per_callback_bytes)?;
-        let value: Value = lua
-            .load(&source)
-            .set_name(entrypoint.to_string_lossy().as_ref())
-            .eval()
-            .map_err(LuaPluginRuntimeError::from)?;
-        let registration = registration_from_value(lua, value)?;
+        let (registration, capacity_string) = {
+            let lua = state.lua();
+            lua.set_memory_limit(memory.limits().per_vm_bytes)
+                .map_err(LuaPluginRuntimeError::from)?;
+            let hook_budget = budget.clone();
+            let hook_error = Arc::clone(&instruction_error);
+            lua.set_hook(
+                HookTriggers::new().every_nth_instruction(1_000),
+                move |_lua, _debug| {
+                    let previous = hook_budget.fetch_sub(1_000, Ordering::Relaxed);
+                    if previous <= 1_000 {
+                        return Err(mlua::Error::ExternalError(Arc::clone(&hook_error)));
+                    }
+                    Ok(VmState::Continue)
+                },
+            )?;
+            sandbox::install(lua)?;
+            let capacity_string = install_botster_api(lua, plugin_key.clone(), host_api)?;
+            let value: Value = lua
+                .load(&source)
+                .set_name(entrypoint.to_string_lossy().as_ref())
+                .eval()
+                .map_err(LuaPluginRuntimeError::from)?;
+            let registration = registration_from_value(lua, value)?;
+            (registration, capacity_string)
+        };
+        state.hold_capacity_string(capacity_string);
         drop(source);
         drop(source_charge);
 
@@ -1362,6 +1405,27 @@ impl LuaPluginRuntime {
             },
             registration,
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_plugin_key(&self) -> &str {
+        &self.plugin_key.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_instruction_error_bytes(&self) -> usize {
+        self.lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .instruction_error_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_capacity_string_bytes(&self) -> usize {
+        self.lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capacity_string_bytes()
     }
 }
 
@@ -1751,7 +1815,7 @@ fn install_botster_api(
     lua: &Lua,
     plugin_key: PluginKey,
     host_api: LuaHostApi,
-) -> Result<(), LuaPluginRuntimeError> {
+) -> Result<LuaCallbackCharge, LuaPluginRuntimeError> {
     let globals = lua.globals();
     globals.set("__botster_handlers", lua.create_table()?)?;
     globals.set("os", Value::Nil)?;
@@ -1843,21 +1907,19 @@ fn install_botster_api(
     )?;
     capabilities_table.set("config", config_table(lua, host_api.configuration)?)?;
     botster.set("capabilities", capabilities_table)?;
-    botster.set(
-        "coordination",
-        coordination_table(
-            lua,
-            plugin_key.clone(),
-            host_api.coordination,
-            host_api.memory,
-        )?,
+    let (coordination, capacity_string) = coordination_table(
+        lua,
+        plugin_key.clone(),
+        host_api.coordination,
+        host_api.memory,
     )?;
+    botster.set("coordination", coordination)?;
     botster.set(
         "entity_publish",
         entity_publish_function(lua, plugin_key, host_api.entity_publish)?,
     )?;
     globals.set("botster", botster)?;
-    Ok(())
+    Ok(capacity_string)
 }
 
 fn entity_publish_function(
@@ -2642,7 +2704,7 @@ pub(crate) fn coordination_table(
     plugin_key: PluginKey,
     coordination_bridge: HubCoordinationBridge,
     memory: Arc<LuaMemoryAccount>,
-) -> Result<Table, mlua::Error> {
+) -> Result<(Table, LuaCallbackCharge), mlua::Error> {
     let coordination = lua.create_table()?;
 
     let publish_bridge = coordination_bridge.clone();
@@ -2656,7 +2718,6 @@ pub(crate) fn coordination_table(
     coordination.set(
         "publish",
         callback::create(lua, move |lua, args: Value| {
-            let _xrc = &capacity_xrc;
             match admit_publish_operation(&publish_memory, &publish_plugin_key, lua, args) {
                 Ok((operation, entry)) => {
                     let outcome = match publish_bridge.submit_admitted(operation, entry) {
@@ -2720,7 +2781,7 @@ pub(crate) fn coordination_table(
         acknowledge_input::callback(lua, coordination_bridge, memory)?,
     )?;
 
-    Ok(coordination)
+    Ok((coordination, capacity_xrc))
 }
 
 #[derive(Debug)]

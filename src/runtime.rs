@@ -117,13 +117,18 @@ struct CreatedWorktreeCleanup {
 pub struct HubRuntime {
     config: HubConfig,
     lua_memory: Arc<crate::lua_memory::LuaMemoryAccount>,
+    #[cfg(test)]
+    lua_plugin_runtimes: std::sync::Arc<
+        Mutex<Vec<std::sync::Weak<crate::lua_runtime::LuaPluginRuntime>>>,
+    >,
     // Readers clone the current Arc under this short lock. Publication swaps
     // one Arc, so the owner never clones a durable state collection.
     state: SharedHubState,
     core_daemon: SharedCoreDaemon,
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
-    inflight_plugin_core:
+    inflight_plugin_core: std::sync::Arc<
         Mutex<crate::lua_memory::charged_collection::ChargedVec<InflightPluginCore>>,
+    >,
     retained_plugin_reservations: Mutex<Vec<SessionReservation>>,
     created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
     confirmed_worktree_rollbacks: Mutex<Vec<crate::managed_git_worktrees::PreparedManagedWorktree>>,
@@ -492,12 +497,14 @@ impl HubRuntime {
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
             lua_memory,
+            #[cfg(test)]
+            lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
-            inflight_plugin_core: Mutex::new(
+            inflight_plugin_core: std::sync::Arc::new(Mutex::new(
                 crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
-            ),
+            )),
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
@@ -624,12 +631,14 @@ impl HubRuntime {
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
             lua_memory,
+            #[cfg(test)]
+            lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
-            inflight_plugin_core: Mutex::new(
+            inflight_plugin_core: std::sync::Arc::new(Mutex::new(
                 crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
-            ),
+            )),
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
@@ -770,6 +779,8 @@ impl HubRuntime {
             worktrees: Arc::clone(&self.state),
             package_event_router: self.package_event_router.clone(),
             causal_scopes: self.causal_scopes.clone(),
+            #[cfg(test)]
+            lua_plugin_runtimes: std::sync::Arc::clone(&self.lua_plugin_runtimes),
         }
     }
 
@@ -1636,7 +1647,7 @@ impl HubRuntime {
         }
         while let Some(pending) = self.session_type_spawner.take_pending() {
             let slot = match crate::lua_memory::charged_collection::SlotReservation::try_reserve(
-                &self.inflight_plugin_core,
+                self.inflight_plugin_core.as_ref(),
             ) {
                 Ok(slot) => slot,
                 Err(_) => {
@@ -2864,6 +2875,92 @@ impl HubRuntime {
         self.inflight_plugin_core.lock().unwrap().capacity()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_inflight_charge_bytes(&self) -> usize {
+        self.inflight_plugin_core.lock().unwrap().charge_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_callback_charge_owners(&self) -> Vec<(String, usize)> {
+        let mut owners = Vec::new();
+        let bridge = self.coordination_bridge();
+        owners.push((
+            format!(
+                "pending charge_bytes capacity={}",
+                bridge.test_pending_capacity()
+            ),
+            bridge.test_pending_charge_bytes(),
+        ));
+        owners.push((
+            format!(
+                "inflight charge_bytes capacity={}",
+                self.test_inflight_capacity()
+            ),
+            self.test_inflight_charge_bytes(),
+        ));
+        let runtimes = self
+            .lua_plugin_runtimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for runtime in runtimes.iter().filter_map(std::sync::Weak::upgrade) {
+            let key = runtime.test_plugin_key();
+            owners.push((
+                format!("instruction_error:{key}"),
+                runtime.test_instruction_error_bytes(),
+            ));
+            owners.push((
+                format!("capacity_string:{key}"),
+                runtime.test_capacity_string_bytes(),
+            ));
+        }
+        owners
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_callback_charge_breakdown_probe(
+        &self,
+    ) -> impl Fn() -> Vec<(String, usize)> + Send + 'static {
+        let pending = self.coordination_bridge();
+        let inflight = std::sync::Arc::clone(&self.inflight_plugin_core);
+        let runtimes = std::sync::Arc::clone(&self.lua_plugin_runtimes);
+        move || {
+            let mut owners = Vec::new();
+            owners.push((
+                format!(
+                    "pending charge_bytes capacity={}",
+                    pending.test_pending_capacity()
+                ),
+                pending.test_pending_charge_bytes(),
+            ));
+            let inflight_guard = inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            owners.push((
+                format!(
+                    "inflight charge_bytes capacity={}",
+                    inflight_guard.capacity()
+                ),
+                inflight_guard.charge_bytes(),
+            ));
+            drop(inflight_guard);
+            let runtimes = runtimes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for runtime in runtimes.iter().filter_map(std::sync::Weak::upgrade) {
+                let key = runtime.test_plugin_key();
+                owners.push((
+                    format!("instruction_error:{key}"),
+                    runtime.test_instruction_error_bytes(),
+                ));
+                owners.push((
+                    format!("capacity_string:{key}"),
+                    runtime.test_capacity_string_bytes(),
+                ));
+            }
+            owners
+        }
+    }
+
     pub(crate) fn bind_terminal_core_owner(&self) {
         self.core_daemon.bind_terminal_owner();
     }
@@ -2893,7 +2990,7 @@ impl HubRuntime {
     fn fulfill_pending_coordination_requests(&self) {
         while let Some(pending) = self.coordination_bridge.take_pending() {
             let slot = match crate::lua_memory::charged_collection::SlotReservation::try_reserve(
-                &self.inflight_plugin_core,
+                self.inflight_plugin_core.as_ref(),
             ) {
                 Ok(slot) => slot,
                 Err(_) => {
@@ -7270,7 +7367,15 @@ pub(crate) mod tests {
             .unwrap();
         let memory = Arc::clone(&runtime.lua_memory);
         let limits = memory.limits();
-        assert_eq!(memory.usage(), (limits.per_vm_bytes, 0));
+        let owners = runtime.test_callback_charge_owners();
+        let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
+        eprintln!("callback charge owners after load: {owners:?} sum={owner_sum} usage={}", memory.usage().1);
+        assert_eq!(
+            owner_sum,
+            memory.usage().1,
+            "callback owner sum must equal usage after load owners={owners:?}"
+        );
+        assert_eq!(memory.usage(), (limits.per_vm_bytes, owner_sum));
         let registration = runtime
             .plugin_lifecycle()
             .entity_provider_registrations()
@@ -7350,7 +7455,14 @@ pub(crate) mod tests {
                 1
             );
             assert!(runtime.last_capability_cleanup().is_none());
-            assert_eq!(memory.usage(), (limits.total_vm_bytes, 0));
+            let owners = runtime.test_callback_charge_owners();
+            let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
+            assert_eq!(
+                owner_sum,
+                memory.usage().1,
+                "callback owner sum must equal usage after refused load owners={owners:?}"
+            );
+            assert_eq!(memory.usage(), (limits.total_vm_bytes, owner_sum));
             let events = runtime
                 .drain_capability_events_at(&plugin_key, now_ms)
                 .unwrap();
@@ -7389,7 +7501,14 @@ pub(crate) mod tests {
                 .removed_resources
                 .contains(&timer)
         );
-        assert_eq!(memory.usage(), (limits.per_vm_bytes, 0));
+        let owners = runtime.test_callback_charge_owners();
+        let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
+        assert_eq!(
+            owner_sum,
+            memory.usage().1,
+            "callback owner sum must equal usage after reload owners={owners:?}"
+        );
+        assert_eq!(memory.usage(), (limits.per_vm_bytes, owner_sum));
         drop(runtime);
         assert_eq!(memory.usage(), (0, 0));
         std::fs::remove_dir_all(root).unwrap();
