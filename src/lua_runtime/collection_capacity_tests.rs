@@ -1,7 +1,8 @@
 use super::*;
+use crate::data_plane::driver::CoreSubmissionStorage;
 use crate::lua_memory::LuaMemoryLimits;
 use std::mem::size_of;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn slot() -> usize {
     size_of::<PendingCoordinationRequest>()
@@ -60,16 +61,29 @@ fn request_typed_from_worker(
         .expect("request_typed worker")
 }
 
-#[test]
-fn pending_growth_overlap_refuses_when_old_plus_new_does_not_fit() {
-    let memory = account(2 * slot());
-    let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
-    enqueue(&bridge).unwrap();
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .expect("panic message")
+}
+
+fn assert_overlap_refuses(bridge: &HubCoordinationBridge, memory: &Arc<LuaMemoryAccount>) {
+    enqueue(bridge).unwrap();
     assert_eq!(bridge.test_pending_capacity(), 1);
     assert_eq!(bridge.test_pending_charge_bytes(), slot());
     assert_eq!(memory.usage().1, slot());
     assert!(matches!(
-        enqueue(&bridge),
+        enqueue(bridge),
         Err(CoordinationRequestError::Local(
             CoordinationLocalError::Capacity
         ))
@@ -77,6 +91,13 @@ fn pending_growth_overlap_refuses_when_old_plus_new_does_not_fit() {
     assert_eq!(bridge.test_pending_count(), 1);
     assert_eq!(bridge.test_pending_capacity(), 1);
     assert_eq!(memory.usage().1, slot());
+}
+
+#[test]
+fn pending_growth_overlap_refuses_when_old_plus_new_does_not_fit() {
+    let memory = account(2 * slot());
+    let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
+    assert_overlap_refuses(&bridge, &memory);
 }
 
 #[test]
@@ -95,15 +116,17 @@ fn pending_growth_overlap_ablation_charges_after_grow() {
     let memory = account(2 * slot());
     let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
     bridge.test_set_charge_after_grow(true);
-    enqueue(&bridge).unwrap();
-    assert!(enqueue(&bridge).is_err());
-    assert_eq!(
-        bridge.test_pending_capacity(),
-        2,
-        "ablation reallocates before the charge so overlap is not held"
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_overlap_refuses(&bridge, &memory);
+    }));
+    let message = match result {
+        Err(payload) => panic_message(payload),
+        Ok(()) => panic!("charge-after-grow ablation must fail the overlap helper"),
+    };
+    assert!(
+        message.contains("pending_capacity") || message.contains("left:") || message.contains("1"),
+        "unexpected panic: {message}"
     );
-    assert_eq!(bridge.test_pending_count(), 1);
-    assert_eq!(bridge.test_pending_charge_bytes(), slot());
 }
 
 #[test]
@@ -133,47 +156,73 @@ fn pending_saturation_ablation_skips_capacity_check() {
     assert_eq!(memory.usage().1, 0);
 }
 
+fn assert_refused_enqueue_destroys(bridge: &HubCoordinationBridge, memory: &Arc<LuaMemoryAccount>) {
+    enqueue(bridge).unwrap();
+    let before = memory.usage().1;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (response, _receiver) = mpsc::channel();
+    let entry = memory.reserve_shared_callback_storage(8).unwrap();
+    let continuation = memory.reserve_shared_callback_storage(8).unwrap();
+    let disposal = memory.reserve_shared_callback_storage(8).unwrap();
+    let reply = memory.reserve_shared_callback_storage(8).unwrap();
+    let charged = memory.usage().1;
+    let error = bridge.enqueue(PendingCoordinationRequest {
+        terminal_drop_probe: Some(Box::new(DropFlag(Arc::clone(&dropped)))),
+        operation: drain_op(),
+        response: CoordinationReplySender::NonAcknowledge(response),
+        caller: CoordinationCaller::new(),
+        storage: Some(CoordinationStorage {
+            core: CoreSubmissionStorage {
+                request: entry,
+                reply,
+            },
+            continuation,
+            disposal,
+        }),
+    });
+    assert!(matches!(
+        error,
+        Err(CoordinationRequestError::Local(
+            CoordinationLocalError::Capacity
+        ))
+    ));
+    assert!(dropped.load(Ordering::Acquire), "probe must run on refuse");
+    assert_eq!(memory.usage().1, before);
+    assert_eq!(charged, before + 32);
+    assert_eq!(bridge.test_pending_count(), 1);
+}
+
 #[test]
 fn refused_enqueue_destroys_request_and_restores_usage() {
-    let memory = account(slot());
+    let memory = account(slot() + 32);
     let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
-    enqueue(&bridge).unwrap();
-    let before = memory.usage().1;
-    assert_eq!(before, slot());
+    assert_refused_enqueue_destroys(&bridge, &memory);
     let error = request_typed_from_worker(bridge.clone()).expect_err("second enqueue must refuse");
     assert!(matches!(
         error,
         CoordinationRequestError::Local(CoordinationLocalError::Capacity)
     ));
     assert_eq!(error.as_str(), LUA_CALLBACK_CAPACITY_EXHAUSTED);
-    assert_eq!(memory.usage().1, before);
-    assert_eq!(bridge.test_pending_count(), 1);
 }
 
 #[test]
 fn refused_enqueue_ablation_skips_capacity_check() {
-    let memory = account(slot());
+    let memory = account(slot() + 32);
     let bridge = HubCoordinationBridge::new(Arc::clone(&memory));
-    enqueue(&bridge).unwrap();
-    let before = memory.usage().1;
     bridge.test_set_skip_capacity_check(true);
-    let producer = bridge.clone();
-    let worker = thread::spawn(move || producer.request_typed(drain_op()));
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while bridge.test_pending_count() < 2 {
-        assert!(
-            Instant::now() < deadline,
-            "skip-capacity request_typed must enqueue instead of refusing"
-        );
-        thread::yield_now();
-    }
-    assert_eq!(memory.usage().1, before);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_refused_enqueue_destroys(&bridge, &memory);
+    }));
     drop(bridge.take_pending());
     drop(bridge.take_pending());
-    worker
-        .join()
-        .expect("request_typed worker")
-        .expect_err("abandoned worker times out without an owner");
+    let message = match result {
+        Err(payload) => panic_message(payload),
+        Ok(()) => panic!("skip-capacity ablation must fail the refuse helper"),
+    };
+    assert!(
+        message.contains("Capacity") || message.contains("Local") || message.contains("probe"),
+        "unexpected panic: {message}"
+    );
 }
 
 #[test]

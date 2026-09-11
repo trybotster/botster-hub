@@ -250,10 +250,11 @@ pub(crate) mod ownership {
         Unexpected,
         HelperStopped,
         HelperFull,
+        CallbackCapacity,
     }
 
     impl CoordinationRefusal {
-        pub(crate) const ALL: [Self; 8] = [
+        pub(crate) const ALL: [Self; 9] = [
             Self::Registration,
             Self::Abandoned,
             Self::Full,
@@ -262,6 +263,7 @@ pub(crate) mod ownership {
             Self::Unexpected,
             Self::HelperStopped,
             Self::HelperFull,
+            Self::CallbackCapacity,
         ];
 
         pub(crate) const fn message(self) -> &'static str {
@@ -274,6 +276,7 @@ pub(crate) mod ownership {
                 Self::Unexpected => "coordination acknowledge returned unexpected response",
                 Self::HelperStopped => "core data-plane driver stopped",
                 Self::HelperFull => "core request queue is full",
+                Self::CallbackCapacity => crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
             }
         }
     }
