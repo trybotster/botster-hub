@@ -3419,6 +3419,45 @@ impl HubRuntime {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_plugin_spawn(
+        &self,
+        plugin_key: &str,
+        session_type_id: &str,
+        request: crate::session_types::SessionTypeRequest,
+        package_records: Vec<crate::packages::PackageRecord>,
+    ) -> Result<PluginSessionTypeSpawned, String> {
+        let (response, receiver) = mpsc::channel();
+        self.session_type_spawner
+            .pending
+            .lock()
+            .map_err(|_| "session type spawn queue lock poisoned".to_string())?
+            .push_back(PendingSessionTypeSpawn {
+                plugin_key: PluginKey(plugin_key.into()),
+                session_type_id: session_type_id.into(),
+                request,
+                package_records,
+                response,
+                _dispose_probe: None,
+            });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            self.fulfill_pending_session_type_spawns();
+            match receiver.try_recv() {
+                Ok(result) => return result,
+                Err(mpsc::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        return Err("plugin session type spawn timed out".to_string());
+                    }
+                    thread::yield_now();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("plugin session type spawn disconnected".to_string());
+                }
+            }
+        }
+    }
+
     pub(crate) fn retained_reservations(&self) -> Vec<SessionReservation> {
         self.retained_plugin_reservations
             .lock()

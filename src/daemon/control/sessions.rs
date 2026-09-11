@@ -2526,4 +2526,95 @@ sys.exit(0)
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
+
+    fn plugin_spawn_package(root: &std::path::Path) -> crate::packages::PackageRecord {
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/agent"), "#!/bin/sh\nexec true\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join("bin/agent"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        serde_json::from_value(serde_json::json!({
+            "manifest": {
+                "name": "p1.plugin",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": root.display().to_string() },
+                "capabilities": [{"surface": "session_actions", "scope": "session_type_spawn"}],
+                "entrypoints": []
+            },
+            "state": "enabled",
+            "classification": "plugin",
+            "trust": { "classification": "first_party", "first_party": true },
+            "provenance": { "source": root.display().to_string(), "checksum": null },
+            "update_policy": "manual",
+            "last_audit_reason": "test",
+            "session_types": [{
+                "id": "agent",
+                "label": "Agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "lifecycle": "task",
+                "command": "bin/agent",
+                "args": []
+            }]
+        }))
+        .expect("plugin spawn package record")
+    }
+
+    #[test]
+    fn plugin_occupied_spawn_leaves_live_session_context() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("plugin-occ", Some(worker));
+        let installed = spawn_until_ready(
+            &mut daemon,
+            &mut state,
+            "s1-plugin-live",
+            "true",
+        );
+        assert!(installed.error.is_none(), "{installed:?}");
+        let live = crate::session_types::HubSessionContext {
+            context_id: "ctx-original".into(),
+            session_id: SessionId("s1-plugin-live".into()),
+            values: Default::default(),
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .publish_spawn_context(&live)
+            .unwrap();
+        let package_root = root.join("p1-plugin");
+        let record = plugin_spawn_package(&package_root);
+        let refused = daemon.runtime().unwrap().test_plugin_spawn(
+            "p1.plugin",
+            "agent",
+            crate::session_types::SessionTypeRequest {
+                session_id: Some(SessionId("s1-plugin-live".into())),
+                ..crate::session_types::SessionTypeRequest::default()
+            },
+            vec![record],
+        );
+        assert!(refused.is_err(), "{refused:?}");
+        let stored = daemon
+            .runtime()
+            .unwrap()
+            .test_session_context("s1-plugin-live")
+            .expect("live context remains");
+        assert_eq!(stored.context_id, "ctx-original");
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_session_context("ctx-original")
+                .map(|context| context.session_id.0),
+            Some("s1-plugin-live".into())
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(package_root);
+    }
 }
