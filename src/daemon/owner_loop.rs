@@ -1737,6 +1737,9 @@ pub(crate) struct DaemonControlState {
         crate::owner_identity::WaiterId,
         crate::daemon::control::pending::PendingControlRequest,
     >,
+    /// Explicit reservations this owner still holds after a spawn failure.
+    /// Bounded by Core's pending-spawn capacity; retried on the next Spawn.
+    pub(crate) retained_explicit_reservations: Vec<botster_core::SessionReservation>,
     pub(crate) waiter_ids: crate::owner_identity::WaiterIdSource,
     pub(crate) current_waiter_id: Option<crate::owner_identity::WaiterId>,
     pub(crate) shutdown_waiter: Option<crate::owner_identity::WaiterId>,
@@ -1851,6 +1854,7 @@ impl Default for DaemonControlState {
             attach_close: crate::subscription::closed_events::AttachCloseBookkeeping::default(),
             pending_hub_update_reply: None,
             pending_requests: BTreeMap::new(),
+            retained_explicit_reservations: Vec::new(),
             waiter_ids,
             current_waiter_id: None,
             shutdown_waiter: None,

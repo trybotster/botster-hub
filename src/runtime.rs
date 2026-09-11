@@ -3363,6 +3363,21 @@ impl HubRuntime {
         ))
     }
 
+    pub(crate) fn begin_lookup_session_reservation_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        session_id: SessionId,
+        reserve_operation_id: PendingOperationId,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::LookupSessionReservation {
+                session_id,
+                reserve_operation_id,
+            },
+        ))
+    }
+
     /// Record one session id this process already returned from a successful Spawn.
     pub fn record_acknowledged_spawn(&self, session_id: impl Into<String>) {
         self.acknowledged_spawn_ids
