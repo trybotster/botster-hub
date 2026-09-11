@@ -14,8 +14,7 @@ use botster_core::{
     PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
     PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
     RoutedEnvelopePublishOutcome, ReservedSessionSpawnError, SessionId, SessionLifecycleState,
-    SessionReservation, SessionReservationRefusal, SessionReservationRelease,
-    SessionReservationState, SessionRuntimeErrorKind,
+    SessionReservation, SessionReservationRefusal, SessionReservationRelease, SessionRuntimeErrorKind,
     SessionSpawnRequest,
     SubscriptionId, TerminalCapabilitySet, TerminalColorProfile, TerminalSubscriptionGeneration,
 };
@@ -126,6 +125,9 @@ pub struct HubRuntime {
     created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
     confirmed_worktree_rollbacks: Mutex<Vec<crate::managed_git_worktrees::PreparedManagedWorktree>>,
     suppressed_created_worktree_rollbacks: Arc<Mutex<BTreeSet<String>>>,
+    submitted_created_worktree_rollbacks: Mutex<BTreeSet<String>>,
+    #[cfg(test)]
+    rollback_git_hold: Mutex<Option<Arc<crate::host_executor::TestHostGate>>>,
     close_work: crate::data_plane::CloseWorkSource,
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
@@ -484,6 +486,9 @@ impl HubRuntime {
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
             suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
+            submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            rollback_git_hold: Mutex::new(None),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -600,6 +605,9 @@ impl HubRuntime {
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
             suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
+            submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            rollback_git_hold: Mutex::new(None),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -1866,28 +1874,75 @@ impl HubRuntime {
         Arc::clone(&self.suppressed_created_worktree_rollbacks)
     }
 
+    pub(crate) fn begin_submitted_worktree_rollback(&self, worktree_id: &str) {
+        if let Ok(mut held) = self.submitted_created_worktree_rollbacks.lock() {
+            held.insert(worktree_id.to_string());
+        }
+    }
+
+    pub(crate) fn finish_submitted_worktree_rollback(&self, worktree_id: &str) {
+        if let Ok(mut held) = self.submitted_created_worktree_rollbacks.lock() {
+            held.remove(worktree_id);
+        }
+        self.session_type_spawner.publish_managed_spawn();
+    }
+
+    pub(crate) fn submitted_worktree_rollback(&self, worktree_id: &str) -> bool {
+        self.submitted_created_worktree_rollbacks
+            .lock()
+            .ok()
+            .is_some_and(|held| held.contains(worktree_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_rollback_git_hold(
+        &self,
+        gate: Arc<crate::host_executor::TestHostGate>,
+    ) {
+        if let Ok(mut held) = self.rollback_git_hold.lock() {
+            *held = Some(gate);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_rollback_git_hold(
+        &self,
+    ) -> Option<Arc<crate::host_executor::TestHostGate>> {
+        self.rollback_git_hold
+            .lock()
+            .ok()
+            .and_then(|held| held.clone())
+    }
+
+    pub(crate) fn peek_pending_managed_worktree_id(&self) -> Option<String> {
+        self.session_type_spawner.peek_managed_worktree_id()
+    }
+
     pub(crate) fn retry_retained_reservation_releases(&self) {
-        let tokens = self.take_retained_reservations();
-        if tokens.is_empty() {
+        let _ = self;
+    }
+
+    fn continue_created_worktree_cleanup_phases(&self) {
+        let Ok(mut cleanups) = self.created_worktree_cleanups.lock() else {
             return;
-        }
-        let mut keep = Vec::new();
-        for token in tokens {
-            match token.state() {
-                SessionReservationState::Ended
-                | SessionReservationState::Reserved
-                | SessionReservationState::Released => {
-                    let tracker = self.begin_release_session_reservation(token.clone());
-                    if let Ok(mut detached) = self.detached_operations.lock() {
-                        detached.push(tracker);
-                    }
-                }
-                SessionReservationState::Session
-                | SessionReservationState::Launching
-                | SessionReservationState::CleanupUnconfirmed => keep.push(token),
+        };
+        for cleanup in cleanups.iter_mut() {
+            if cleanup.shutdown.is_some() || cleanup.remove.is_some() || cleanup.release.is_some()
+            {
+                continue;
             }
+            if !cleanup.removed {
+                cleanup.remove = Some(self.begin_remove_session(&cleanup.session_id));
+                continue;
+            }
+            if cleanup.release_attempted {
+                continue;
+            }
+            cleanup.release = Some(
+                self.begin_release_session_reservation(cleanup.reservation.clone()),
+            );
+            cleanup.release_attempted = true;
         }
-        self.merge_retained_reservations(keep);
     }
 
     pub(crate) fn retry_created_worktree_releases(&self) {
@@ -1903,18 +1958,10 @@ impl HubRuntime {
                 cleanup.remove = Some(self.begin_remove_session(&cleanup.session_id));
                 continue;
             }
-            let ready = matches!(
-                cleanup.reservation.state(),
-                SessionReservationState::Ended
-                    | SessionReservationState::Reserved
-                    | SessionReservationState::Released
+            cleanup.release = Some(
+                self.begin_release_session_reservation(cleanup.reservation.clone()),
             );
-            if !cleanup.release_attempted || ready {
-                cleanup.release = Some(
-                    self.begin_release_session_reservation(cleanup.reservation.clone()),
-                );
-                cleanup.release_attempted = true;
-            }
+            cleanup.release_attempted = true;
         }
     }
 
@@ -1974,7 +2021,7 @@ impl HubRuntime {
         }
         *cleanups = keep;
         drop(cleanups);
-        self.retry_created_worktree_releases();
+        self.continue_created_worktree_cleanup_phases();
         if confirmed.is_empty() {
             return;
         }
@@ -4846,6 +4893,14 @@ impl HubSessionTypeSpawner {
                     "managed session spawn did not complete before timeout",
                 )
             })?
+    }
+
+    fn peek_managed_worktree_id(&self) -> Option<String> {
+        self.managed
+            .lock()
+            .ok()?
+            .front()
+            .map(|pending| managed_worktree_id(&pending.target_id, &pending.branch))
     }
 
     fn take_managed(&self) -> Option<PendingManagedSessionSpawn> {

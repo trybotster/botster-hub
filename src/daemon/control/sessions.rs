@@ -1739,6 +1739,8 @@ mod tests {
     use super::*;
     use crate::daemon::control::DaemonObservability;
     use crate::daemon::owner_loop::drive_ready_test_turn;
+    use crate::host_executor::TestHostGate;
+    use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn observability() -> DaemonObservability {
@@ -3509,6 +3511,97 @@ sys.exit(0)
             hub_worktree_ids(&daemon).contains(&live_id),
             "stale rollback must not remove the live HubState row"
         );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retry_created_worktree_releases_does_not_gate_on_advisory_state() {
+        let source = include_str!("../../runtime.rs");
+        let start = source
+            .find("pub(crate) fn retry_created_worktree_releases")
+            .expect("retry_created_worktree_releases");
+        let body = source[start..]
+            .split("fn advance_created_worktree_cleanups")
+            .next()
+            .expect("retry body");
+        assert!(
+            !body.contains("reservation.state()"),
+            "U-1: explicit-event retry must not gate on advisory state(): {body}"
+        );
+        assert!(
+            body.contains("begin_release_session_reservation"),
+            "explicit-event retry must issue a new release"
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_defers_reuse_until_in_flight_rollback_finishes() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-hold-rollback", Some(worker));
+        let second_record = record.clone();
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_enqueue_managed_disconnected(
+                botster_core::PluginKey("p1.plugin".into()),
+                "t1".into(),
+                "topic".into(),
+                "agent".into(),
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            );
+        let gate = Arc::new(TestHostGate::default());
+        daemon
+            .runtime()
+            .unwrap()
+            .test_install_rollback_git_hold(Arc::clone(&gate));
+        let managed = root.join("managed-worktrees");
+        let started = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if gate.has_started() {
+                break;
+            }
+            assert!(
+                Instant::now() < started,
+                "Host rollback must reach the pre-git hold"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            walkdir_exists(&managed),
+            "held rollback must not have deleted the worktree yet"
+        );
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let handle = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![second_record],
+            )
+        });
+        let wait_reuse = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wait_reuse {
+            pump_core(&mut daemon, &mut state);
+            assert!(
+                !handle.is_finished(),
+                "reuse must defer while rollback is in flight"
+            );
+            std::thread::yield_now();
+        }
+        gate.release();
+        let second = pump_until_join(&mut daemon, &mut state, handle)
+            .unwrap_or_else(|error| panic!("reuse after rollback: {}: {}", error.kind, error.message));
+        assert!(
+            second.created_worktree,
+            "reuse after an in-flight rollback must create, not reuse a path being deleted"
+        );
+        assert!(!second.reused_worktree);
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
