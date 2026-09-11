@@ -1541,13 +1541,32 @@ impl HubRuntime {
 
     fn fulfill_pending_session_type_spawns(&self) {
         for session_id in self.session_type_spawner.take_abandoned() {
-            self.cleanup_undelivered_session_type_spawn(&PluginSessionTypeSpawned {
+            let created = self
+                .created_worktrees
+                .lock()
+                .map(|held| held.contains_key(&session_id))
+                .unwrap_or(false);
+            self.cleanup_managed_session(&PluginManagedSessionSpawned {
                 session_id: session_id.clone(),
-                lifecycle: String::new(),
-                session_type_id: String::new(),
-                context_id: format!("ctx-{session_id}"),
-                context_keys: Vec::new(),
+                target_id: String::new(),
+                branch: String::new(),
+                worktree_id: String::new(),
+                worktree_path: String::new(),
+                base_ref: String::new(),
+                base_commit: String::new(),
+                created_worktree: created,
+                created_branch: false,
+                reused_worktree: false,
             });
+            if !created {
+                self.cleanup_undelivered_session_type_spawn(&PluginSessionTypeSpawned {
+                    session_id: session_id.clone(),
+                    lifecycle: String::new(),
+                    session_type_id: String::new(),
+                    context_id: format!("ctx-{session_id}"),
+                    context_keys: Vec::new(),
+                });
+            }
         }
         while let Some(pending) = self.session_type_spawner.take_pending() {
             match self.fulfill_session_type_spawn(&pending) {
