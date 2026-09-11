@@ -577,6 +577,16 @@ Claude independently verified the raw results and provenance. The tests provide 
 Registration refusal, DeliverySubmission, and UnexpectedCompletion remain untested. Callback accounting remains open.
 Root selected acknowledgement accounting next, using the existing interfaces and proofs. Production memory budgets and new measurement execution remain separately gated.
 
+The acknowledgement handoff identified retained standard-library wait storage on Core's persistent plugin workers.
+Root and Claude verified the existing source and measurement evidence. Callback completion, channel disposal, and runtime stop do not end that storage lifetime.
+A join returning either success or a worker-panic result establishes thread exit. Core owns that receipt; Hub owns the memory policy.
+The proposed interface reserves once per worker before thread creation and covers all blocking callback kinds on that worker.
+Some existing panic paths detach workers without joining them. A charge paired with a plain JoinHandle can therefore release too early during unwinding.
+The proposed failure policy retains the reservation until process exit if Core loses the join handle. Root requests Jason's approval before selecting that policy or assigning Core changes.
+The bounded review is `/private/tmp/claude-callback-review.OFb8pb/c1-worker-context-lifetime-review.md`.
+Independent Hub work continues: aggregate callback admission and a disjoint charge-split interface in `lua_memory.rs`, with test-only limits.
+No new worker attachment, production budget, measurement, or Core source change is authorized at this checkpoint.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
