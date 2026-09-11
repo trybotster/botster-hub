@@ -544,6 +544,16 @@ The first no-run library build exited 101 after 33.115 seconds, without a deadli
 Four test callers still invoked the old boxed request directly; another test match omitted the new internal-completion variant.
 Root verified the raw errors and all 22 frozen source/config hashes in `/private/tmp/c1-consumer-build-20260910-1`.
 The implementer will correct those compile errors with the Host-capacity and scheduler changes. A second build requires review of the new handoff.
+Root reviewed draft 4 and authorized one second no-run build while Claude reviewed the lifecycle correction.
+That build passed with exit zero after 58.962 seconds. No deadline fired, and no source file changed.
+Root verified all 22 frozen source/config hashes in `/private/tmp/c1-consumer-build-20260910-2`.
+The library test executable has SHA256 `a4052098d78f061c11660a12b2afde894b09c6a737dfb020d4e319e3837ade9a`.
+No functional test ran in that build. Lifecycle review must precede the three proposed exact tests; callback accounting remains open.
+Claude accepted draft 4's lifecycle correction. Root then authorized the three exact tests, with a separate 30-second deadline for each.
+The first test failed with `nonincreasing_request_id`: the fixture sent ListPackages ID 7 after callback IDs 41 and 42.
+It exited 101 with one failed test and 995 filtered tests. No deadline fired. The eight-call and terminal tests did not run.
+This protocol setup failure does not establish a C1 defect. Raw evidence remains in `/private/tmp/c1-consumer-functional-20260910-1`.
+Root authorized increasing fixture IDs and an explicit ListPackages response-kind assertion. Production code and deadlines remain unchanged.
 
 ## Historical verified starting points
 
