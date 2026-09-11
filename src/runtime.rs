@@ -100,6 +100,11 @@ pub type HubStateView = SharedView<HubState>;
 /// typed pressure-reporting operations. It intentionally does not expose core's
 /// generic `DefaultEngineCommand` router; hub callers use explicit methods so
 /// admission and policy boundaries remain visible at the hub layer.
+struct CreatedWorktreeCleanup {
+    shutdown: CoreOperationTracker,
+    prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+}
+
 pub struct HubRuntime {
     config: HubConfig,
     lua_memory: Arc<crate::lua_memory::LuaMemoryAccount>,
@@ -110,6 +115,8 @@ pub struct HubRuntime {
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
     inflight_plugin_core: Mutex<Vec<InflightPluginCore>>,
     retained_plugin_reservations: Mutex<Vec<SessionReservation>>,
+    created_worktrees: Mutex<std::collections::HashMap<String, crate::managed_git_worktrees::PreparedManagedWorktree>>,
+    created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
     close_work: crate::data_plane::CloseWorkSource,
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
@@ -465,6 +472,8 @@ impl HubRuntime {
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(Vec::new()),
             retained_plugin_reservations: Mutex::new(Vec::new()),
+            created_worktrees: Mutex::new(std::collections::HashMap::new()),
+            created_worktree_cleanups: Mutex::new(Vec::new()),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -578,6 +587,8 @@ impl HubRuntime {
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(Vec::new()),
             retained_plugin_reservations: Mutex::new(Vec::new()),
+            created_worktrees: Mutex::new(std::collections::HashMap::new()),
+            created_worktree_cleanups: Mutex::new(Vec::new()),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -1727,6 +1738,7 @@ impl HubRuntime {
             }
             ManagedGitError::new("spawn_failed", "configured session could not be spawned")
         })?;
+        self.remember_created_worktree(&outcome.session_id.0, prepared);
         Ok(PluginManagedSessionSpawned {
             session_id: outcome.session_id.0,
             target_id: prepared.target_id.clone(),
@@ -1743,14 +1755,69 @@ impl HubRuntime {
 
     pub(crate) fn cleanup_managed_session(&self, spawned: &PluginManagedSessionSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
-        self.shutdown_session_detached(session_id.clone());
+        let prepared = self
+            .created_worktrees
+            .lock()
+            .ok()
+            .and_then(|mut held| held.remove(&session_id.0));
+        if let Some(prepared) = prepared.filter(|prepared| prepared.created_worktree) {
+            let shutdown = self.begin_shutdown_session(session_id.clone());
+            if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
+                cleanups.push(CreatedWorktreeCleanup {
+                    shutdown,
+                    prepared,
+                });
+            }
+        } else {
+            self.shutdown_session_detached(session_id.clone());
+        }
         if let Ok(mut contexts) = self.session_contexts.lock() {
             contexts.remove(&session_id.0);
             contexts.remove(&format!("ctx-{}", session_id.0));
         }
     }
 
+    fn remember_created_worktree(
+        &self,
+        session_id: &str,
+        prepared: &crate::managed_git_worktrees::PreparedManagedWorktree,
+    ) {
+        if !prepared.created_worktree {
+            return;
+        }
+        if let Ok(mut held) = self.created_worktrees.lock() {
+            held.insert(session_id.to_string(), prepared.clone());
+        }
+    }
+
+    fn advance_created_worktree_cleanups(&self) {
+        let Ok(mut cleanups) = self.created_worktree_cleanups.lock() else {
+            return;
+        };
+        let mut keep = Vec::new();
+        for mut cleanup in cleanups.drain(..) {
+            match cleanup.shutdown.poll(self) {
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ShutdownSession {
+                    result: Ok(()),
+                    ..
+                })) => {
+                    let _ = crate::managed_git_worktrees::finalize_managed_worktree(
+                        &cleanup.prepared,
+                        crate::managed_git_worktrees::ManagedWorktreeDecision::Rollback,
+                        Instant::now() + Duration::from_secs(15),
+                    );
+                }
+                CoreTicketPoll::Pending => keep.push(cleanup),
+                CoreTicketPoll::Ready(_)
+                | CoreTicketPoll::Lost
+                | CoreTicketPoll::Refused => keep.push(cleanup),
+            }
+        }
+        *cleanups = keep;
+    }
+
     fn fulfill_pending_plugin_requests(&self) {
+        self.advance_created_worktree_cleanups();
         self.apply_causal_owner_ops();
         self.fulfill_pending_coordination_requests();
         self.fulfill_pending_entity_publish_requests();
@@ -5788,6 +5855,7 @@ impl HubRuntime {
     }
 
     fn reap_detached_operations(&self) {
+        self.advance_created_worktree_cleanups();
         let Ok(mut detached) = self.detached_operations.lock() else {
             return;
         };
