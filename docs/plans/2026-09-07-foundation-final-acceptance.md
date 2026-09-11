@@ -599,6 +599,15 @@ Core may release a worker reservation after that worker's join returns. A lost j
 The implementation must not add polling, periodic scans, timers, or an Owner-thread wait. Existing Host-side joins supply the completion receipt.
 Hub supplies opaque pre-funded reservations. Core owns their worker attachment and release ordering, without Lua policy or production budget values.
 Root will assign one Core writer and preserve the existing Hub writer. Publication, installation, and numerical limits remain outside this approval.
+Root and Claude accepted the shared-storage admission interface and the revised acknowledgement ownership design.
+The interface reserves instance-owned storage against shared capacity without applying the per-callback quota.
+Its build passed in 62.542 seconds. Both exact tests passed with one executed test each, 1,010 filtered tests, and no deadline expiry.
+Root verified all 23 source/config hashes and executable SHA256 `7a94be48a59b66a3cc1e076f96e6f67388b16264db4ac10044d261e1c178e03c`.
+Evidence is `/private/tmp/c1-shared-storage-build-20260910-1` and `/private/tmp/c1-shared-storage-tests-20260910-1`.
+These tests establish synthetic admission and charge lifetime, not allocation sizes or connected callback accounting.
+The revised design requires reload to admit new worker resources before removing the old registration. Capacity refusal preserves the old registration.
+The Core source review accepted the guarded join records. Formatting and focused verification remain pending; Hub has not connected that API.
+Worker resources do not yet account for the outer resource Box, input vector, join-record vector, or executor Arc. Their ownership remains open.
 
 ## Historical verified starting points
 
