@@ -563,6 +563,20 @@ These results establish the exercised daemon and terminal paths, not callback ac
 Root assigned the remaining focused lifecycle tests next: capacity wake recovery, abandonment, Core refusal, poison, and scheduling failure.
 The fixture failure exposed a review omission: both reviews missed request ordering. Future socket-fixture reviews must check the complete request sequence.
 
+Root and Claude accepted draft 6's eight focused lifecycle tests and two test-only hooks.
+The fourth no-run build passed after 63.588 seconds. Root verified all 23 source/config hashes and the executable hash.
+The executable SHA256 is `f14b8697161f851313418af844ba1cda4377fdf989bf4af892cd17c45321c04c`.
+All eight tests passed once each, with exit zero, one executed test, 1,003 filtered tests, and no deadline expiry.
+Raw evidence is `/private/tmp/c1-consumer-focused-20260910-1`; the build evidence is `/private/tmp/c1-consumer-build-20260910-4`.
+The tests cover Owner and Host capacity recovery, queued and admitted abandonment, Core full/stopped refusal, queue poison, and C1 scheduling failure.
+Execution counters and separate drop probes prove the tested no-replay and disposal behavior. Admitted Drain abandonment preserves the documented consumed-envelope loss.
+The poison test deliberately catches a panic. Its stderr records that injection; the test then verifies retained ingress and Host disposal.
+The focused fixtures do not bind the doorbell. The earlier socket tests cover that path.
+The scheduler test proves shared notification access, an unrelated collectable ticket, and terminal retirement. It does not prove progress under global scheduler exhaustion.
+Claude independently verified the raw results and provenance. The tests provide no repeated-run reliability or allocation-size evidence.
+Registration refusal, DeliverySubmission, and UnexpectedCompletion remain untested. Callback accounting remains open.
+Root selected acknowledgement accounting next, using the existing interfaces and proofs. Production memory budgets and new measurement execution remain separately gated.
+
 ## Historical verified starting points
 
 | Component | Revision | Evidence scope |
