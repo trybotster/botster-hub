@@ -15,6 +15,89 @@ pub mod hub_state_heap {
     pub use crate::hub_state_heap::{HeapWalk, admitted_pretty, walk_hub_state};
 }
 
+#[cfg(feature = "allocation-oracle")]
+pub mod charged_collection {
+    use std::mem::MaybeUninit;
+    use std::sync::Arc;
+
+    use crate::lua_memory::charged_collection::{ChargedVec, ChargedVecDeque};
+    use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+    use crate::lua_runtime::PendingCoordinationRequest;
+    use crate::runtime::InflightPluginCore;
+
+    pub struct PendingQueue {
+        inner: ChargedVecDeque<MaybeUninit<PendingCoordinationRequest>>,
+    }
+
+    pub struct InflightQueue {
+        inner: ChargedVec<MaybeUninit<InflightPluginCore>>,
+    }
+
+    fn account(bytes: usize) -> Arc<LuaMemoryAccount> {
+        LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: bytes.max(1),
+            total_vm_bytes: bytes.max(1),
+            per_callback_bytes: bytes.max(1),
+            total_callback_bytes: bytes.max(1),
+        })
+        .unwrap()
+    }
+
+    impl PendingQueue {
+        pub fn new() -> Self {
+            let slot = std::mem::size_of::<PendingCoordinationRequest>();
+            Self {
+                inner: ChargedVecDeque::new(account(slot * 16)),
+            }
+        }
+
+        pub fn slot() -> usize {
+            std::mem::size_of::<PendingCoordinationRequest>()
+        }
+
+        pub fn try_push_uninit(&mut self) -> Result<(), String> {
+            self.inner
+                .try_push_back(MaybeUninit::uninit())
+                .map_err(|error| error.to_string())
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.inner.capacity()
+        }
+
+        pub fn charge_bytes(&self) -> usize {
+            self.inner.charge_bytes()
+        }
+    }
+
+    impl InflightQueue {
+        pub fn new() -> Self {
+            let slot = std::mem::size_of::<InflightPluginCore>();
+            Self {
+                inner: ChargedVec::new(account(slot * 16)),
+            }
+        }
+
+        pub fn slot() -> usize {
+            std::mem::size_of::<InflightPluginCore>()
+        }
+
+        pub fn try_push_uninit(&mut self) -> Result<(), String> {
+            self.inner
+                .try_push(MaybeUninit::uninit())
+                .map_err(|error| error.to_string())
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.inner.capacity()
+        }
+
+        pub fn charge_bytes(&self) -> usize {
+            self.inner.charge_bytes()
+        }
+    }
+}
+
 use botster_core::contract::terminal_wake::WakingTerminalAdapter;
 use botster_core::{
     ClientId, SessionId, SubscriptionId, TerminalCapabilitySet, TerminalSubscriptionGeneration,

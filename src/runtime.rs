@@ -5722,7 +5722,8 @@ impl CoreOperationTracker {
 
 /// Plugin-facing Core work the owner polls between plugin invocations.
 #[allow(clippy::large_enum_variant)] // retained in-flight record for the owner-less runtime path; entries are polled in place
-enum InflightPluginCore {
+#[allow(private_interfaces)]
+pub(crate) enum InflightPluginCore {
     Coordination {
         ticket: crate::data_plane::driver::ChargedCoreTicket<crate::lua_runtime::CoordinationReply>,
         response: crate::lua_runtime::CoordinationReplySender,
