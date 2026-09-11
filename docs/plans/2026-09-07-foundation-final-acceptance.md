@@ -55,6 +55,10 @@ The policy/account slice subsequently passed independent source review, includin
 Its frozen source is `/private/tmp/c1-lua-policy-account-review-20260910-3`; the complete patch SHA256 is `a54c5ad32737cc70200a3e92a97f09191b4b8a1a0508f8e084e454b08858c8f9`.
 The aggregate limits apply per `HubRuntime`, not per process. Public Host API construction now uses the runtime factory; the runtime error enum gains Config.
 Root authorized one 300-second no-run build for library tests and the two affected external test targets. Test execution still requires artifact verification.
+The first build failed in the new refusal test: `current_package_generation` returns `Result`, but the test called `is_some`.
+Root and the reviewer missed that return type. The failed build is preserved in `/private/tmp/c1-lua-policy-account-build-20260910-1`.
+The corrected setup must require `Ok(value)` with `value > 0`, because the lookup returns `Ok(0)` for an absent generation.
+Root authorized only that assertion correction, pinned formatting, and one identical bounded rebuild. No test has run for this slice.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
