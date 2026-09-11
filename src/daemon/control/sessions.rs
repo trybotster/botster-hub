@@ -1812,6 +1812,7 @@ mod tests {
     fn pump_core(daemon: &mut crate::HubDaemon, state: &mut DaemonControlState) {
         drive_ready_test_turn(daemon, state);
         if let Some(runtime) = daemon.runtime() {
+            runtime.reap_detached_core_operations();
             let identities = runtime.take_owner_core_completions(8);
             if !identities.is_empty() {
                 let mut budget =
@@ -3186,13 +3187,23 @@ sys.exit(0)
     }
 
     fn walkdir_exists(root: &std::path::Path) -> bool {
-        std::fs::read_dir(root)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .any(|entry| entry.path().is_dir())
-            })
-            .unwrap_or(false)
+        git_worktree_present(root)
+    }
+
+    fn git_worktree_present(root: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.join(".git").exists() {
+                return true;
+            }
+            if path.is_dir() && git_worktree_present(&path) {
+                return true;
+            }
+        }
+        false
     }
 
     #[test]
@@ -3208,9 +3219,9 @@ sys.exit(0)
             vec![record],
         );
         let deadline = Instant::now() + Duration::from_secs(20);
+        let managed = root.join("managed-worktrees");
         loop {
             pump_core(&mut daemon, &mut state);
-            let managed = root.join("managed-worktrees");
             if walkdir_exists(&managed) {
                 break;
             }
@@ -3218,9 +3229,21 @@ sys.exit(0)
             std::thread::yield_now();
         }
         assert!(
-            walkdir_exists(&root.join("managed-worktrees")),
+            walkdir_exists(&managed),
             "disconnected caller must not roll back before confirmed shutdown"
         );
+        let gone = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if !walkdir_exists(&managed) {
+                break;
+            }
+            assert!(
+                Instant::now() < gone,
+                "created worktree must roll back after shutdown confirmation"
+            );
+            std::thread::yield_now();
+        }
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
