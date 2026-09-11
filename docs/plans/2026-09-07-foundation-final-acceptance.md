@@ -586,6 +586,14 @@ The proposed failure policy retains the reservation until process exit if Core l
 The bounded review is `/private/tmp/claude-callback-review.OFb8pb/c1-worker-context-lifetime-review.md`.
 Independent Hub work continues: aggregate callback admission and a disjoint charge-split interface in `lua_memory.rs`, with test-only limits.
 No new worker attachment, production budget, measurement, or Core source change is authorized at this checkpoint.
+Root and Claude accepted the independent `reserve_callback_total` and `LuaCallbackCharge::split` interface.
+The interface checks the per-callback quota before shared capacity. Splitting transfers disjoint reserved bytes without changing shared usage.
+Its no-run build passed after 49.447 seconds. Root verified all 23 source/config hashes and the executable hash.
+The executable SHA256 is `73145f2098dcbceaf1f4465ff2e4e23fa3020bd9f9a8ffd2a35119a3fc696058`.
+All five exact interface tests passed, each with one executed test, 1,008 filtered tests, exit zero, and no deadline expiry.
+Evidence is `/private/tmp/c1-charge-transfer-build-20260910-1` and `/private/tmp/c1-charge-transfer-tests-20260910-1`.
+These tests use synthetic charge amounts. They do not establish allocation sizes, callback storage coverage, or production budgets.
+The worker-retention policy request remains unanswered. The interface does not implement or authorize the proposed Core attachment.
 
 ## Historical verified starting points
 
