@@ -167,9 +167,13 @@ fn retained_release_code(release: SessionReservationRelease) -> &'static str {
 }
 
 fn retain_explicit_reservation(
+    daemon: &HubDaemon,
     state: &mut DaemonControlState,
     reservation: SessionReservation,
 ) {
+    if let Some(runtime) = daemon.runtime() {
+        runtime.retain_reservation(reservation.clone());
+    }
     if state
         .retained_explicit_reservations
         .iter()
@@ -224,13 +228,14 @@ fn poll_tracker(
 }
 
 fn finish_held_reservation(
+    daemon: &HubDaemon,
     state: &mut DaemonControlState,
     reservation: SessionReservation,
     request_id: &str,
     operation: &'static str,
     error: CoreDaemonError,
 ) -> ControlPoll {
-    retain_explicit_reservation(state, reservation);
+    retain_explicit_reservation(daemon, state, reservation);
     ControlPoll::Ready(Ok(core_operator_error(operation, request_id, &error)))
 }
 
@@ -254,7 +259,8 @@ fn handle_daemon_spawn(
         SpawnReserved,
         Release,
     }
-    let mut retry_tokens = std::mem::take(&mut state.retained_explicit_reservations);
+    let mut retry_tokens = runtime.take_retained_reservations();
+    retry_tokens.append(&mut std::mem::take(&mut state.retained_explicit_reservations));
     let mut retry_keep = Vec::new();
     let mut stage = if retry_tokens.is_empty() {
         Stage::Reserve
@@ -279,6 +285,11 @@ fn handle_daemon_spawn(
             Stage::RetryRetained => {
                 if retry_tokens.is_empty() {
                     state.retained_explicit_reservations.append(&mut retry_keep);
+                    if let Some(runtime) = daemon.runtime() {
+                        runtime.store_retained_reservations(
+                            state.retained_explicit_reservations.clone(),
+                        );
+                    }
                     let Some(runtime) = daemon.runtime() else {
                         return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
                     };
@@ -306,6 +317,11 @@ fn handle_daemon_spawn(
                             None => {
                                 retry_keep.append(&mut retry_tokens);
                                 state.retained_explicit_reservations.append(&mut retry_keep);
+                    if let Some(runtime) = daemon.runtime() {
+                        runtime.store_retained_reservations(
+                            state.retained_explicit_reservations.clone(),
+                        );
+                    }
                                 return ControlPoll::Ready(Err(
                                     DaemonTransportError::DaemonNotRunning,
                                 ));
@@ -325,6 +341,11 @@ fn handle_daemon_spawn(
                             None => {
                                 retry_keep.append(&mut retry_tokens);
                                 state.retained_explicit_reservations.append(&mut retry_keep);
+                    if let Some(runtime) = daemon.runtime() {
+                        runtime.store_retained_reservations(
+                            state.retained_explicit_reservations.clone(),
+                        );
+                    }
                                 return ControlPoll::Ready(Err(
                                     DaemonTransportError::DaemonNotRunning,
                                 ));
@@ -341,6 +362,11 @@ fn handle_daemon_spawn(
                             None => {
                                 retry_keep.append(&mut retry_tokens);
                                 state.retained_explicit_reservations.append(&mut retry_keep);
+                    if let Some(runtime) = daemon.runtime() {
+                        runtime.store_retained_reservations(
+                            state.retained_explicit_reservations.clone(),
+                        );
+                    }
                                 return ControlPoll::Ready(Err(
                                     DaemonTransportError::DaemonNotRunning,
                                 ));
@@ -439,6 +465,7 @@ fn handle_daemon_spawn(
                             }
                             None => {
                                 return finish_held_reservation(
+                                    daemon,
                                     state,
                                     reservation.take().expect("looked-up reservation"),
                                     &id.0,
@@ -467,6 +494,7 @@ fn handle_daemon_spawn(
                 CoreTicketPoll::Pending => return ControlPoll::Pending,
                 CoreTicketPoll::Refused => {
                     return finish_held_reservation(
+                        daemon,
                         state,
                         reservation.take().expect("reserved identity"),
                         &id.0,
@@ -476,6 +504,7 @@ fn handle_daemon_spawn(
                 }
                 CoreTicketPoll::Lost => {
                     return finish_held_reservation(
+                        daemon,
                         state,
                         reservation.take().expect("reserved identity"),
                         &id.0,
@@ -485,6 +514,7 @@ fn handle_daemon_spawn(
                 }
                 CoreTicketPoll::Ready(Err(error)) => {
                     return finish_held_reservation(
+                        daemon,
                         state,
                         reservation.take().expect("reserved identity"),
                         &id.0,
@@ -525,6 +555,7 @@ fn handle_daemon_spawn(
                         }
                         None => {
                             return finish_held_reservation(
+                                daemon,
                                 state,
                                 reservation.take().expect("reserved identity"),
                                 &id.0,
@@ -543,6 +574,7 @@ fn handle_daemon_spawn(
                 CoreTicketPoll::Refused | CoreTicketPoll::Lost | CoreTicketPoll::Ready(Err(_)) => {
                     let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
                     return finish_held_reservation(
+                        daemon,
                         state,
                         reservation.take().expect("reserved identity"),
                         &id.0,
@@ -561,7 +593,7 @@ fn handle_daemon_spawn(
                         }
                         Ok(release) => {
                             if let Some(held) = reservation.take() {
-                                retain_explicit_reservation(state, held);
+                                retain_explicit_reservation(daemon, state, held);
                             }
                             let mut response = core_operator_error(
                                 "release_session_reservation",
@@ -578,7 +610,7 @@ fn handle_daemon_spawn(
                         }
                         Err(release_error) => {
                             if let Some(held) = reservation.take() {
-                                retain_explicit_reservation(state, held);
+                                retain_explicit_reservation(daemon, state, held);
                             }
                             core_operator_error(
                                 "release_session_reservation",

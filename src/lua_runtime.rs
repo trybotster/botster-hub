@@ -2051,6 +2051,7 @@ fn session_types_table(
                     session_type_spawn::convert_managed_spawned(
                         lua,
                         memory.as_ref(),
+                        &session_types,
                         &spawned,
                         &conversion,
                     )
