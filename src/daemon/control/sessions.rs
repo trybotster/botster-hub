@@ -2163,12 +2163,10 @@ mod tests {
         };
         assert!(state.retained_explicit_reservations.is_empty());
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut polls = 0_u32;
+        let mut consecutive_again = 0_u32;
         let mut armed = false;
         let response = loop {
             assert!(Instant::now() < deadline, "accepting-queue hang");
-            polls += 1;
-            assert!(polls < 64, "accepting-queue spun");
             pump_core(&mut daemon, &mut state);
             if !armed
                 && daemon
@@ -2181,7 +2179,18 @@ mod tests {
                 armed = true;
             }
             match pending.continuation.poll(&mut daemon, &mut state) {
-                ControlPoll::Pending | ControlPoll::Again => std::thread::yield_now(),
+                ControlPoll::Pending => {
+                    consecutive_again = 0;
+                    std::thread::yield_now();
+                }
+                ControlPoll::Again => {
+                    consecutive_again += 1;
+                    assert!(
+                        consecutive_again < 64,
+                        "accepting-queue spun Again without waiting on Core"
+                    );
+                    std::thread::yield_now();
+                }
                 ControlPoll::Ready(Ok(response)) => break response,
                 ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
                 _ => std::thread::yield_now(),

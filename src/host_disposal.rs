@@ -153,11 +153,6 @@ impl Parts {
 }
 
 impl Work {
-    #[allow(dead_code)] // constructs disposal work without a storage lease
-    pub(crate) fn new(payload: impl Send + 'static, model: Option<ModelWork>) -> Self {
-        Self::with_storage(payload, model, None)
-    }
-
     fn with_storage(
         payload: impl Send + 'static,
         model: Option<ModelWork>,

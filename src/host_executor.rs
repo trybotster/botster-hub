@@ -207,10 +207,7 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
-    CoordinationResponseDelivered {
-        #[allow(dead_code)] // delivery outcome retained for owner matchers
-        received: bool,
-    },
+    CoordinationResponseDelivered,
     ClientEventCleanup(
         Result<
             crate::subscription::package_events::ClientCleanupCompletion,
@@ -233,7 +230,6 @@ pub(crate) enum HostResult {
     StatusResponsePrepared(crate::status_response::PreparedStatusResponse),
     StatusResponseDelivered {
         shutdown: bool,
-        #[allow(dead_code)] // delivery outcome retained for owner matchers
         received: bool,
     },
     SessionTypeCatalogReady {
@@ -258,7 +254,7 @@ pub(crate) enum HostResult {
 impl HostResult {
     fn generation(&self) -> u64 {
         match self {
-            Self::CoordinationResponseDelivered { .. } => 0,
+            Self::CoordinationResponseDelivered => 0,
             Self::EntityModelComplete(_) => 0,
             Self::EventOwner(_) | Self::ClientEventCleanup(_) => 0,
             Self::StatusResponsePrepared(_) | Self::StatusResponseDelivered { .. } => 0,
@@ -356,7 +352,7 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
-        HostResult::CoordinationResponseDelivered { .. } => 0,
+        HostResult::CoordinationResponseDelivered => 0,
         HostResult::StatusResponsePrepared(prepared) => prepared.logical_bytes(),
         HostResult::StatusResponseDelivered { .. } => 0,
         HostResult::EntityModelComplete(_) => 0,
@@ -1121,14 +1117,11 @@ fn execute(
             discard,
         } => {
             drop(discard);
-            let received = match response.send(result) {
-                Ok(()) => true,
-                Err(result) => {
-                    drop(result);
-                    false
-                }
-            };
-            HostResult::CoordinationResponseDelivered { received }
+            match response.send(result) {
+                Ok(()) => {}
+                Err(result) => drop(result),
+            }
+            HostResult::CoordinationResponseDelivered
         }
         #[cfg(test)]
         HostCommand::DisposalProbe(probe) => {
