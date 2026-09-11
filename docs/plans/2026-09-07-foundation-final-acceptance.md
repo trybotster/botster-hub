@@ -44,6 +44,8 @@ Root verified its first blocker: production `load_prepared` supplies `memory: No
 Jason approved production policy wiring on September 10: 16 MiB per Lua state, 128 MiB across states, 8 MiB per Rust callback, and 64 MiB across callbacks.
 This approval permits implementation. It does not permit publication or installation.
 The Hub writer resumes a bounded configuration and account-propagation slice through both production load paths, preserving refusal before replacement.
+The approved limits belong in a crate-private Hub policy function. Existing public `HubStartupOptions` and `HubConfig` struct shapes must remain unchanged.
+The external construction tests explicitly preserve exhaustive literals. Policy wiring does not require new public configuration fields or weaker compatibility tests.
 The reviewer will separately trace acknowledgement conversion allocations in pinned source. No build, test, or measurement execution is authorized yet.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
