@@ -1959,4 +1959,72 @@ mod tests {
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn concurrent_spawns_take_retained_tokens_once() {
+        let (mut daemon, mut state, root) = spawn_fixture("concurrent");
+        let waiter_a = state.current_waiter_id.unwrap();
+        let waiter_b = state.waiter_ids.next().expect("second waiter");
+        let mut reserve = daemon.runtime().unwrap().begin_reserve_session_for_owner(
+            waiter_a,
+            SessionId("s1-concurrent-held".into()),
+        );
+        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        state.retained_explicit_reservations.push(held);
+        daemon
+            .runtime()
+            .unwrap()
+            .test_refuse_next_owner_begins(16);
+        state.current_waiter_id = Some(waiter_a);
+        let ControlStep::Pending(mut pending_a) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-concurrent-a".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn a must defer");
+        };
+        state.current_waiter_id = Some(waiter_b);
+        let ControlStep::Pending(mut pending_b) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-concurrent-b".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn b must defer");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut polls = 0_u32;
+        let mut done_a = false;
+        let mut done_b = false;
+        while !(done_a && done_b) {
+            assert!(Instant::now() < deadline, "concurrent spawn hang");
+            polls += 1;
+            assert!(polls < 64, "concurrent spawn spun");
+            drive_ready_test_turn(&mut daemon, &mut state);
+            if !done_a {
+                match pending_a.continuation.poll(&mut daemon, &mut state) {
+                    ControlPoll::Ready(Ok(_)) => done_a = true,
+                    ControlPoll::Ready(Err(_)) => panic!("spawn a transport failed"),
+                    _ => {}
+                }
+            }
+            if !done_b {
+                match pending_b.continuation.poll(&mut daemon, &mut state) {
+                    ControlPoll::Ready(Ok(_)) => done_b = true,
+                    ControlPoll::Ready(Err(_)) => panic!("spawn b transport failed"),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(state.retained_explicit_reservations.len(), 1);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
