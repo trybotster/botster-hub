@@ -554,6 +554,14 @@ The first test failed with `nonincreasing_request_id`: the fixture sent ListPack
 It exited 101 with one failed test and 995 filtered tests. No deadline fired. The eight-call and terminal tests did not run.
 This protocol setup failure does not establish a C1 defect. Raw evidence remains in `/private/tmp/c1-consumer-functional-20260910-1`.
 Root authorized increasing fixture IDs and an explicit ListPackages response-kind assertion. Production code and deadlines remain unchanged.
+Root and Claude accepted the test-only correction in draft 5. The third no-run build passed after 63.078 seconds.
+Root verified the 22 source/config hashes and executable SHA256 `89997e0fe92ec4011122c3f5e9ae138e187135e320d6c8ad393f0ee96f381df0`.
+All three exact tests passed separately: two acknowledgements, eight Core-waiting calls with a Host-only sibling, and staggered terminal completion.
+Each run executed one test, filtered 995 tests, and exited zero without a deadline. Source and executable hashes remained unchanged.
+Raw evidence is `/private/tmp/c1-consumer-functional-20260910-2`; the build evidence is `/private/tmp/c1-consumer-build-20260910-3`.
+These results establish the exercised daemon and terminal paths, not callback accounting, packaged delivery, or full C1 acceptance.
+Root assigned the remaining focused lifecycle tests next: capacity wake recovery, abandonment, Core refusal, poison, and scheduling failure.
+The fixture failure exposed a review omission: both reviews missed request ordering. Future socket-fixture reviews must check the complete request sequence.
 
 ## Historical verified starting points
 
