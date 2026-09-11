@@ -59,6 +59,9 @@ The first build failed in the new refusal test: `current_package_generation` ret
 Root and the reviewer missed that return type. The failed build is preserved in `/private/tmp/c1-lua-policy-account-build-20260910-1`.
 The corrected setup must require `Ok(value)` with `value > 0`, because the lookup returns `Ok(0)` for an absent generation.
 Root authorized only that assertion correction, pinned formatting, and one identical bounded rebuild. No test has run for this slice.
+The reviewer then found that the fixture has no event contract or subscription, so its generation stays zero even during replacement.
+Root paused any rebuild not yet started and required one real event fixture before accepting the generation-preservation test.
+This corrects coverage of an existing acceptance requirement. It does not add a production mechanism or weaken the requirement to source-only evidence.
 Independent review accepted the plan with one correction: conversion storage is not yet proven independent of borrowed input size B.
 Admission must compute all eleven sizing fields from verified sizing rules and B. Neither constant nor linear conversion storage is established yet.
 The serializer-local trace is `/private/tmp/claude-callback-review.OFb8pb/c1-ack-conversion-sizing-premise.md`.
