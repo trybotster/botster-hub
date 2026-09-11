@@ -143,6 +143,42 @@ fn main() -> ExitCode {
         errors.push(error);
     }
 
+    let mut wide_properties = serde_json::Map::new();
+    for index in 0..32 {
+        wide_properties.insert(format!("p{index}"), nested_schema(8));
+    }
+    let wide_schema = serde_json::json!({
+        "type": "object",
+        "properties": wide_properties
+    });
+    let wide_record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
+        "manifest": {
+            "name": "wide.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "capabilities": [],
+            "entrypoints": [],
+            "events": { "emitted": [{
+                "name": "wide",
+                "payload_schema": wide_schema,
+                "audience": ["plugins"]
+            }]}
+        },
+        "state": "enabled",
+        "classification": "plugin",
+        "trust": { "classification": "first_party", "first_party": true },
+        "provenance": { "source": "oracle", "checksum": null },
+        "update_policy": "manual",
+        "last_audit_reason": "wide"
+    }))
+    .expect("wide record");
+    let mut wide_state = HubState::from_config(&config);
+    wide_state.package_registry.records.push(wide_record);
+    if let Err(error) = measure("wide-properties", &wide_state) {
+        errors.push(error);
+    }
+
     let skipped_record: botster_hub::packages::PackageRecord = serde_json::from_value(serde_json::json!({
         "manifest": {
             "name": "skip.plugin",
