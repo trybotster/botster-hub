@@ -26,6 +26,8 @@ static XRC_SIZE: AtomicUsize = AtomicUsize::new(0);
 static XRC_ALIGN: AtomicUsize = AtomicUsize::new(0);
 static XRC_LIVE: AtomicUsize = AtomicUsize::new(0);
 static XRC_PEAK: AtomicUsize = AtomicUsize::new(0);
+const MAX_XRC: usize = 512;
+static XRC_PTRS: [AtomicUsize; MAX_XRC] = [const { AtomicUsize::new(0) }; MAX_XRC];
 
 fn record_event(kind: u8, layout: Layout) {
     if !RECORD.load(Ordering::Acquire) {
@@ -37,52 +39,93 @@ fn record_event(kind: u8, layout: Layout) {
         EV_SIZE[index].store(layout.size(), Ordering::Release);
         EV_ALIGN[index].store(layout.align(), Ordering::Release);
     }
-    if layout.size() == XRC_SIZE.load(Ordering::Acquire)
-        && layout.align() == XRC_ALIGN.load(Ordering::Acquire)
-        && XRC_SIZE.load(Ordering::Acquire) != 0
-    {
-        if kind == KIND_ALLOC {
+}
+
+fn is_xrc_layout(layout: Layout) -> bool {
+    let size = XRC_SIZE.load(Ordering::Acquire);
+    size != 0 && layout.size() == size && layout.align() == XRC_ALIGN.load(Ordering::Acquire)
+}
+
+fn xrc_note_alloc(ptr: *mut u8) {
+    let addr = ptr as usize;
+    if addr == 0 {
+        return;
+    }
+    for slot in &XRC_PTRS {
+        if slot
+            .compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             let live = XRC_LIVE.fetch_add(1, Ordering::AcqRel) + 1;
             XRC_PEAK.fetch_max(live, Ordering::AcqRel);
-        } else {
+            return;
+        }
+    }
+    let live = XRC_LIVE.fetch_add(1, Ordering::AcqRel) + 1;
+    XRC_PEAK.fetch_max(live, Ordering::AcqRel);
+}
+
+fn xrc_note_dealloc(ptr: *mut u8) {
+    let addr = ptr as usize;
+    if addr == 0 {
+        return;
+    }
+    for slot in &XRC_PTRS {
+        if slot
+            .compare_exchange(addr, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             XRC_LIVE.fetch_sub(1, Ordering::AcqRel);
+            return;
         }
     }
 }
 
 unsafe impl GlobalAlloc for Recorder {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
         if RECORD.load(Ordering::Acquire) {
             record_event(KIND_ALLOC, layout);
             let live = LIVE.fetch_add(layout.size(), Ordering::AcqRel) + layout.size();
             PEAK.fetch_max(live, Ordering::AcqRel);
+            if !ptr.is_null() && is_xrc_layout(layout) {
+                xrc_note_alloc(ptr);
+            }
         }
-        unsafe { System.alloc(layout) }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if RECORD.load(Ordering::Acquire) {
             record_event(KIND_DEALLOC, layout);
             LIVE.fetch_sub(layout.size(), Ordering::AcqRel);
+            if is_xrc_layout(layout) {
+                xrc_note_dealloc(ptr);
+            }
         }
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_layout = Layout::from_size_align(new_size, layout.align()).unwrap_or(layout);
+        if RECORD.load(Ordering::Acquire) && is_xrc_layout(layout) {
+            xrc_note_dealloc(ptr);
+        }
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if RECORD.load(Ordering::Acquire) {
             record_event(KIND_DEALLOC, layout);
-            record_event(
-                KIND_ALLOC,
-                Layout::from_size_align(new_size, layout.align()).unwrap_or(layout),
-            );
+            record_event(KIND_ALLOC, new_layout);
             let live = LIVE.load(Ordering::Acquire);
             PEAK.fetch_max(live.saturating_add(new_size), Ordering::AcqRel);
             LIVE.store(
                 live.saturating_sub(layout.size()).saturating_add(new_size),
                 Ordering::Release,
             );
+            if !new_ptr.is_null() && is_xrc_layout(new_layout) {
+                xrc_note_alloc(new_ptr);
+            }
         }
-        unsafe { System.realloc(ptr, layout, new_size) }
+        new_ptr
     }
 }
 
@@ -104,6 +147,9 @@ fn events() -> Vec<(u8, usize)> {
 fn begin_record() {
     EV_N.store(0, Ordering::Release);
     PEAK.store(LIVE.load(Ordering::Acquire), Ordering::Release);
+    for slot in &XRC_PTRS {
+        slot.store(0, Ordering::Release);
+    }
     XRC_LIVE.store(0, Ordering::Release);
     XRC_PEAK.store(0, Ordering::Release);
     RECORD.store(true, Ordering::Release);
@@ -270,7 +316,7 @@ fn main() -> ExitCode {
     );
     let xrc = capture_xrc_layout();
     println!(
-        "xrc_layout size={} align={} (from Arc::<c_int>, not a hard-coded 24)",
+        "xrc_layout size={} align={} (from Arc::<c_int>, not a hard-coded 24); other same-layout allocations can only raise measured_xrc_peak",
         xrc.size(),
         xrc.align()
     );
