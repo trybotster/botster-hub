@@ -2703,10 +2703,15 @@ sys.exit(0)
         );
         let first = first.expect_err("first plugin spawn must retain unconfirmed");
         assert!(
-            first.to_ascii_lowercase().contains("cleanup")
-                || first.to_ascii_lowercase().contains("unconfirmed")
-                || first.to_ascii_lowercase().contains("spawn"),
-            "first plugin spawn must fail after creation possible: {first}"
+            first.contains("cleanup_unconfirmed"),
+            "first plugin spawn must report cleanup_unconfirmed: {first}"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
         );
         let held = daemon.runtime().unwrap().retained_reservations();
         assert_eq!(held.len(), 1, "plugin spawn must retain the unconfirmed token");
@@ -2720,7 +2725,19 @@ sys.exit(0)
             },
             vec![record],
         );
-        assert!(second.is_err(), "{second:?}");
+        let second = second.expect_err("second plugin spawn must fail");
+        assert!(
+            second.contains("cleanup_unconfirmed"),
+            "second plugin spawn must report cleanup_unconfirmed: {second}"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            3,
+            "second spawn must release the held token then its own reservation"
+        );
         assert!(
             daemon
                 .runtime()

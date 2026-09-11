@@ -2472,7 +2472,12 @@ impl HubRuntime {
             if start.context_published {
                 self.retract_spawn_context(context);
             }
-            format!("session type spawn failed: {}", failure.error)
+            match failure.disposition {
+                Some(SessionReservationRelease::RetainedUnconfirmed) => {
+                    format!("cleanup_unconfirmed: {}", failure.error)
+                }
+                _ => format!("session type spawn failed: {}", failure.error),
+            }
         })?;
         Ok(PluginSessionTypeSpawned {
             session_id: outcome.session_id.0,

@@ -1045,6 +1045,11 @@ impl CoreDaemonHandle {
 
     /// Start one Core operation with registered begin and completion phases.
     pub(crate) fn begin(&self, operation: CoreOperation) -> CoreOperationTicket {
+        #[cfg(test)]
+        if matches!(operation, CoreOperation::ReleaseSessionReservation(_)) {
+            self.release_session_reservation_begins
+                .fetch_add(1, Ordering::AcqRel);
+        }
         let Some(waiter_id) = self.waiter_ids.next() else {
             return CoreOperationTicket {
                 begin: CoreTicket::refused(),
