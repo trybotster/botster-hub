@@ -2598,7 +2598,11 @@ sys.exit(0)
             },
             vec![record],
         );
-        assert!(refused.is_err(), "{refused:?}");
+        let refused = refused.expect_err("plugin spawn must refuse Occupied");
+        assert!(
+            refused.to_ascii_lowercase().contains("occupied"),
+            "Occupied reservation refusal required, got {refused}"
+        );
         let stored = daemon
             .runtime()
             .unwrap()
