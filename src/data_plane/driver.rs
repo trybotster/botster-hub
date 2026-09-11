@@ -8,7 +8,7 @@
 //! wake. Pump facts use `ControlMessage::DataPlaneProgress` instead.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -770,9 +770,46 @@ pub(crate) struct CoreDaemonHandle {
     owner_waiting: Arc<AtomicBool>,
     waiter_ids: Arc<WaiterIdSource>,
     completion_wake: Arc<CoreCompletionWake>,
+    #[cfg(test)]
+    refuse_next_owner_begins: Arc<AtomicUsize>,
+    #[cfg(test)]
+    lose_next_owner_begins: Arc<AtomicUsize>,
 }
 
 impl CoreDaemonHandle {
+    #[cfg(test)]
+    pub(crate) fn test_refuse_next_owner_begins(&self, count: usize) {
+        self.refuse_next_owner_begins.store(count, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lose_next_owner_begins(&self, count: usize) {
+        self.lose_next_owner_begins.store(count, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn take_forced_owner_begin(&self) -> Option<CoreOperationTicket> {
+        if self.lose_next_owner_begins
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Some(CoreOperationTicket {
+                begin: CoreTicket::lost(OwnerWorkIdentity::first(WaiterId(0))),
+                completion: CoreTicket::lost(OwnerWorkIdentity::first(WaiterId(0))),
+            });
+        }
+        if self.refuse_next_owner_begins
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Some(CoreOperationTicket {
+                begin: CoreTicket::refused(),
+                completion: CoreTicket::refused(),
+            });
+        }
+        None
+    }
+
     #[cfg(test)]
     pub(crate) fn test_retains_waiter(&self, waiter_id: WaiterId) -> bool {
         self.completion_wake
@@ -1053,6 +1090,10 @@ impl CoreDaemonHandle {
         waiter_id: WaiterId,
         operation: CoreOperation,
     ) -> CoreOperationTicket {
+        #[cfg(test)]
+        if let Some(forced) = self.take_forced_owner_begin() {
+            return forced;
+        }
         let Some(identities) = self.completion_wake.register_phases(waiter_id, 2) else {
             return CoreOperationTicket {
                 begin: CoreTicket::refused(),
@@ -1185,6 +1226,10 @@ impl DataPlaneDriver {
             owner_waiting,
             waiter_ids,
             completion_wake,
+            #[cfg(test)]
+            refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
         };
         let driver = Self {
             core: core.clone(),
@@ -1806,6 +1851,10 @@ mod tests {
             owner_waiting: Arc::new(AtomicBool::new(false)),
             waiter_ids: Arc::new(WaiterIdSource::default()),
             completion_wake: Arc::clone(&completion_wake),
+            #[cfg(test)]
+            refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
         };
         let mut pending = PendingCoreOperations::new();
         let mut next_waiter = 1_u64;
@@ -2006,6 +2055,8 @@ mod tests {
                 owner_waiting: Arc::new(AtomicBool::new(false)),
                 waiter_ids: Arc::new(WaiterIdSource::default()),
                 completion_wake: Arc::clone(&wake),
+                refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+                lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
             };
             let drops = Arc::new(AtomicUsize::new(0));
             let probe = DropProbe(Arc::clone(&drops));

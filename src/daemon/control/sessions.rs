@@ -267,7 +267,21 @@ fn handle_daemon_spawn(
         match stage {
             Stage::RetryRetained => match poll_spawn_ticket(&mut tracker, daemon) {
                 CoreTicketPoll::Pending => return ControlPoll::Pending,
-                CoreTicketPoll::Refused => return ControlPoll::Pending,
+                CoreTicketPoll::Refused => {
+                    let Some(held) =
+                        state.retained_explicit_reservations.get(retained_index).cloned()
+                    else {
+                        stage = Stage::Reserve;
+                        continue;
+                    };
+                    match submit_release(daemon, waiter_id, held) {
+                        Some(next) => {
+                            tracker = next;
+                            return ControlPoll::Pending;
+                        }
+                        None => return ControlPoll::Pending,
+                    }
+                }
                 CoreTicketPoll::Lost => {
                     let Some(held) =
                         state.retained_explicit_reservations.get(retained_index).cloned()
@@ -334,7 +348,16 @@ fn handle_daemon_spawn(
             },
             Stage::Reserve => match poll_spawn_ticket(&mut tracker, daemon) {
                 CoreTicketPoll::Pending => return ControlPoll::Pending,
-                CoreTicketPoll::Refused => return ControlPoll::Pending,
+                CoreTicketPoll::Refused => {
+                    let Some(runtime) = daemon.runtime() else {
+                        return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
+                    };
+                    tracker = runtime.begin_reserve_session_for_owner(
+                        waiter_id,
+                        SessionId(session_id.clone()),
+                    );
+                    return ControlPoll::Pending;
+                }
                 CoreTicketPoll::Lost => {
                     let Some(reserve_id) = reserve_operation_id else {
                         return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
@@ -485,7 +508,19 @@ fn handle_daemon_spawn(
                 }
             }
             Stage::Release => match poll_spawn_ticket(&mut tracker, daemon) {
-                CoreTicketPoll::Pending | CoreTicketPoll::Refused => return ControlPoll::Pending,
+                CoreTicketPoll::Pending => return ControlPoll::Pending,
+                CoreTicketPoll::Refused => {
+                    let Some(held) = reservation.clone() else {
+                        return ControlPoll::Pending;
+                    };
+                    match submit_release(daemon, waiter_id, held) {
+                        Some(next) => {
+                            tracker = next;
+                            return ControlPoll::Pending;
+                        }
+                        None => return ControlPoll::Pending,
+                    }
+                }
                 CoreTicketPoll::Lost => {
                     let Some(held) = reservation.clone() else {
                         return ControlPoll::Ready(Ok(lost_core(
@@ -1671,6 +1706,50 @@ fn handle_shutdown_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::control::DaemonObservability;
+    use crate::daemon::owner_loop::drive_ready_test_turn;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn observability() -> DaemonObservability {
+        DaemonObservability {
+            egress: Vec::new(),
+            lifecycle: botster_hub_client::DaemonLifecycleCounters::default(),
+            client_id: None,
+            grant_id: None,
+            transport_request_id: None,
+        }
+    }
+
+    fn spawn_fixture(name: &str) -> (crate::HubDaemon, DaemonControlState, std::path::PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-spawn-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: format!("s1-{name}"),
+                display_name: "S1 Spawn Test".into(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(root.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        let daemon = crate::HubDaemon::start(config).unwrap();
+        let mut state = DaemonControlState::default();
+        state.current_waiter_id = Some(
+            state
+                .waiter_ids
+                .next()
+                .expect("fresh owner identity source"),
+        );
+        (daemon, state, root)
+    }
 
     #[test]
     fn retained_release_codes_distinguish_core_outcomes() {
@@ -1690,5 +1769,100 @@ mod tests {
             retained_release_code(SessionReservationRelease::RetainedSession),
             "retained_session"
         );
+    }
+
+    #[test]
+    fn reserve_queue_full_retries_without_retaining_a_token() {
+        let (mut daemon, mut state, root) = spawn_fixture("reserve-full");
+        daemon
+            .runtime()
+            .unwrap()
+            .test_refuse_next_owner_begins(1);
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-reserve-full".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        assert!(matches!(
+            pending.continuation.poll(&mut daemon, &mut state),
+            ControlPoll::Pending
+        ));
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lost_reserve_without_an_id_does_not_retain_a_token() {
+        let (mut daemon, mut state, root) = spawn_fixture("reserve-lost");
+        daemon
+            .runtime()
+            .unwrap()
+            .test_lose_next_owner_begins(1);
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-reserve-lost".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let poll = pending.continuation.poll(&mut daemon, &mut state);
+        let ControlPoll::Ready(Ok(response)) = poll else {
+            panic!("lost reserve without an id must complete");
+        };
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("daemon_shutdown")
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn spawn_reserved_queue_full_releases_the_held_reservation() {
+        let (mut daemon, mut state, root) = spawn_fixture("spawn-full");
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-spawn-full".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut armed = false;
+        loop {
+            assert!(Instant::now() < deadline, "spawn lifecycle stalled");
+            drive_ready_test_turn(&mut daemon, &mut state);
+            if !armed {
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .test_refuse_next_owner_begins(1);
+                armed = true;
+            }
+            match pending.continuation.poll(&mut daemon, &mut state) {
+                ControlPoll::Pending | ControlPoll::Again => std::thread::yield_now(),
+                ControlPoll::Ready(Ok(_)) => break,
+                ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                _ => std::thread::yield_now(),
+            }
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
     }
 }
