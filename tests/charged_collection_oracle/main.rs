@@ -34,7 +34,10 @@ static XRC_PTRS: [AtomicUsize; MAX_XRC] = [const { AtomicUsize::new(0) }; MAX_XR
 const MAX_LIVE: usize = 4096;
 static LIVE_PTR: [AtomicUsize; MAX_LIVE] = [const { AtomicUsize::new(0) }; MAX_LIVE];
 static LIVE_SZ: [AtomicUsize; MAX_LIVE] = [const { AtomicUsize::new(0) }; MAX_LIVE];
+static LIVE_ALIGN: [AtomicUsize; MAX_LIVE] = [const { AtomicUsize::new(0) }; MAX_LIVE];
 static WINDOW_OVERFLOW: AtomicBool = AtomicBool::new(false);
+/// mlua-sys 0.6.8: 16 on aarch64/x86_64.
+const SYS_MIN_ALIGN: usize = 16;
 
 fn record_event(kind: u8, layout: Layout) {
     if !RECORD.load(Ordering::Acquire) {
@@ -71,17 +74,22 @@ fn xrc_note_alloc(ptr: *mut u8) {
     XRC_OVERFLOW.store(true, Ordering::Release);
 }
 
-fn window_alloc(ptr: *mut u8, size: usize) {
+fn window_alloc(ptr: *mut u8, size: usize, align: usize) {
     let addr = ptr as usize;
     if addr == 0 {
         return;
     }
-    for (slot, bytes) in LIVE_PTR.iter().zip(LIVE_SZ.iter()) {
+    for ((slot, bytes), slot_align) in LIVE_PTR
+        .iter()
+        .zip(LIVE_SZ.iter())
+        .zip(LIVE_ALIGN.iter())
+    {
         if slot
             .compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             bytes.store(size, Ordering::Release);
+            slot_align.store(align, Ordering::Release);
             ALLOC_SUM.fetch_add(size, Ordering::AcqRel);
             return;
         }
@@ -94,12 +102,17 @@ fn window_dealloc(ptr: *mut u8) {
     if addr == 0 {
         return;
     }
-    for (slot, bytes) in LIVE_PTR.iter().zip(LIVE_SZ.iter()) {
+    for ((slot, bytes), slot_align) in LIVE_PTR
+        .iter()
+        .zip(LIVE_SZ.iter())
+        .zip(LIVE_ALIGN.iter())
+    {
         if slot
             .compare_exchange(addr, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             let size = bytes.swap(0, Ordering::AcqRel);
+            slot_align.store(0, Ordering::Release);
             DEALLOC_SUM.fetch_add(size, Ordering::AcqRel);
             return;
         }
@@ -131,7 +144,7 @@ unsafe impl GlobalAlloc for Recorder {
             LIVE.store(live, Ordering::Release);
             PEAK.fetch_max(live, Ordering::AcqRel);
             if !ptr.is_null() {
-                window_alloc(ptr, layout.size());
+                window_alloc(ptr, layout.size(), layout.align());
             }
             if !ptr.is_null() && is_xrc_layout(layout) {
                 xrc_note_alloc(ptr);
@@ -170,7 +183,7 @@ unsafe impl GlobalAlloc for Recorder {
             );
             window_dealloc(ptr);
             if !new_ptr.is_null() {
-                window_alloc(new_ptr, new_size);
+                window_alloc(new_ptr, new_size, new_layout.align());
             }
             if !new_ptr.is_null() && is_xrc_layout(new_layout) {
                 xrc_note_alloc(new_ptr);
@@ -201,9 +214,14 @@ fn begin_record() {
     for slot in &XRC_PTRS {
         slot.store(0, Ordering::Release);
     }
-    for (slot, bytes) in LIVE_PTR.iter().zip(LIVE_SZ.iter()) {
+    for ((slot, bytes), slot_align) in LIVE_PTR
+        .iter()
+        .zip(LIVE_SZ.iter())
+        .zip(LIVE_ALIGN.iter())
+    {
         slot.store(0, Ordering::Release);
         bytes.store(0, Ordering::Release);
+        slot_align.store(0, Ordering::Release);
     }
     WINDOW_OVERFLOW.store(false, Ordering::Release);
     XRC_LIVE.store(0, Ordering::Release);
@@ -512,13 +530,17 @@ fn measure_lua_json() -> Result<(), String> {
         }
         let _ = built;
     }
-    measure_raise_storm("publish-capacity-raises", 1000, |storm| {
-        storm.retain_publish_errors(1000)
-    })?;
-    measure_raise_storm("drain-capacity-raises", 1000, |storm| {
-        storm.retain_drain_errors(1000)
-    })?;
-    measure_hook_storm()?;
+    for n in [250, 1000, 4000] {
+        measure_raise_storm(&format!("publish-capacity-raises-{n}"), n, |storm| {
+            storm.retain_publish_errors(n)
+        })?;
+        measure_raise_storm(&format!("drain-capacity-raises-{n}"), n, |storm| {
+            storm.retain_drain_errors(n)
+        })?;
+    }
+    for n in [8, 32, 128] {
+        measure_hook_storm(n)?;
+    }
     Ok(())
 }
 
@@ -536,16 +558,21 @@ fn measure_raise_storm(
     reconcile(label, n, lua_before, storm.used_memory())
 }
 
-fn measure_hook_storm() -> Result<(), String> {
+fn measure_hook_storm(n: u32) -> Result<(), String> {
     let storm = botster_hub::test_internals::prepare_hook_raise_storm()?;
     let lua_before = storm.used_memory();
     LIVE.store(0, Ordering::Release);
     begin_record();
     storm
-        .retain_errors(32)
-        .map_err(|error| format!("hook-budget-raises: {error}"))?;
+        .retain_errors(n)
+        .map_err(|error| format!("hook-budget-raises-{n}: {error}"))?;
     end_record();
-    reconcile("hook-budget-raises", 32, lua_before, storm.used_memory())
+    reconcile(
+        &format!("hook-budget-raises-{n}"),
+        n,
+        lua_before,
+        storm.used_memory(),
+    )
 }
 
 fn reconcile(label: &str, n: u32, lua_before: usize, lua_after: usize) -> Result<(), String> {
@@ -562,8 +589,45 @@ fn reconcile(label: &str, n: u32, lua_before: usize, lua_after: usize) -> Result
     println!(
         "{label} n={n} alloc_sum={alloc} dealloc_sum={dealloc} net={net} lua_delta={lua_delta} rust_only={rust_only} rust_only_per_raise={per_raise:.4}"
     );
+    print_non_sys_min_align_histogram(label);
     if WINDOW_OVERFLOW.load(Ordering::Acquire) {
         return Err(format!("{label}: live-pointer table overflowed"));
     }
     Ok(())
+}
+
+fn print_non_sys_min_align_histogram(label: &str) {
+    let mut buckets: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for i in 0..MAX_LIVE {
+        if LIVE_PTR[i].load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        let size = LIVE_SZ[i].load(Ordering::Acquire);
+        let align = LIVE_ALIGN[i].load(Ordering::Acquire);
+        if align == 0 || align == SYS_MIN_ALIGN {
+            continue;
+        }
+        match buckets
+            .iter_mut()
+            .find(|(s, a, _, _)| *s == size && *a == align)
+        {
+            Some((_, _, count, bytes)) => {
+                *count += 1;
+                *bytes += size;
+            }
+            None => buckets.push((size, align, 1, size)),
+        }
+    }
+    buckets.sort_by_key(|b| (b.1, b.0));
+    print!("{label} non_SYS_MIN_ALIGN_live SYS_MIN_ALIGN={SYS_MIN_ALIGN}");
+    if buckets.is_empty() {
+        println!(" (none)");
+        return;
+    }
+    println!();
+    for (size, align, count, bytes) in buckets {
+        println!(
+            "{label} hist size={size} align={align} count={count} live_bytes={bytes}"
+        );
+    }
 }

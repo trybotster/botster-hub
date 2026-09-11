@@ -7930,11 +7930,6 @@ return botster.register({tools = {{
             "callback owner sum must equal usage before shutdown owners={owners:?} usage={}",
             callback_usage()
         );
-        assert_eq!(
-            callback_usage(),
-            owner_sum,
-            "callback storage retained before shutdown must equal derived owner sum owners={owners:?}"
-        );
         write_request(&mut client, status_id, DaemonRequest::Status);
         assert_eq!(
             read_response(&mut client, &mut reader, status_id).kind,
