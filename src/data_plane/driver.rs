@@ -844,7 +844,11 @@ impl CoreDaemonHandle {
             let operation = move |daemon: &mut CoreDaemon, _: &mut PendingCoreOperations| {
                 drop(operation(daemon));
             };
-            assert!(std::mem::size_of_val(&operation) <= retained_request_bytes::<T, F>());
+            let admitted = request_charge
+                .as_ref()
+                .map(crate::lua_memory::LuaCallbackCharge::bytes)
+                .unwrap_or_else(retained_request_bytes::<T, F>);
+            assert!(std::mem::size_of_val(&operation) <= admitted);
             let request = match request_charge {
                 Some(charge) => CoreRequest::charged(operation, charge),
                 None => CoreRequest::new(operation),
@@ -864,7 +868,11 @@ impl CoreDaemonHandle {
         let operation = move |daemon: &mut CoreDaemon, _: &mut PendingCoreOperations| {
             publisher.publish(operation(daemon));
         };
-        assert!(std::mem::size_of_val(&operation) <= retained_request_bytes::<T, F>());
+        let admitted = request_charge
+            .as_ref()
+            .map(crate::lua_memory::LuaCallbackCharge::bytes)
+            .unwrap_or_else(retained_request_bytes::<T, F>);
+        assert!(std::mem::size_of_val(&operation) <= admitted);
         let request = match request_charge {
             Some(charge) => CoreRequest::charged(operation, charge),
             None => CoreRequest::new(operation),

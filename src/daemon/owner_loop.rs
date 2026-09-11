@@ -7747,8 +7747,15 @@ return botster.register({tools = {{
                             }));
                             let probe: Box<dyn Fn(crate::owner_identity::WaiterId) -> bool + Send> =
                                 Box::new(runtime.test_core_waiter_probe());
+                            let callback_usage: Box<dyn Fn() -> usize + Send> =
+                                Box::new(runtime.test_lua_callback_usage_probe());
                             started_tx
-                                .send((runtime.coordination_bridge(), probe, sender.clone()))
+                                .send((
+                                    runtime.coordination_bridge(),
+                                    probe,
+                                    callback_usage,
+                                    sender.clone(),
+                                ))
                                 .unwrap();
                         }),
                         selected: Box::new(|_daemon, state, _, _| {
@@ -7763,7 +7770,7 @@ return botster.register({tools = {{
                 )
             })
             .unwrap();
-        let (bridge, retains_waiter, control) =
+        let (bridge, retains_waiter, callback_usage, control) =
             started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let stop = StopServe(control);
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -7806,6 +7813,10 @@ return botster.register({tools = {{
             call_count
         );
         assert!(waiters.iter().all(|waiter| retains_waiter(*waiter)));
+        assert!(
+            callback_usage() > 0,
+            "admitted acknowledgements must hold callback storage until disposal"
+        );
         write_request(&mut client, list_packages_id, DaemonRequest::ListPackages);
         let remaining = setup_deadline.saturating_duration_since(Instant::now());
         assert!(
@@ -7874,6 +7885,11 @@ return botster.register({tools = {{
             );
             thread::yield_now();
         }
+        assert_eq!(
+            callback_usage(),
+            0,
+            "callback storage must release after conversion and disposal, before shutdown"
+        );
         write_request(&mut client, status_id, DaemonRequest::Status);
         assert_eq!(
             read_response(&mut client, &mut reader, status_id).kind,

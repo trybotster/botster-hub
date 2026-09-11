@@ -420,7 +420,7 @@ fn abandonment(admitted: bool) {
         matches!(caller.join().unwrap(), Err(ref message) if message == "coordination request did not complete before timeout")
     );
     assert_eq!(
-        caller_state.0.load(Ordering::Acquire),
+        caller_state.test_bits(),
         if admitted { 3 } else { 2 }
     );
     if !admitted {
@@ -563,6 +563,71 @@ fn coordination_scheduling_failure_keeps_shared_core_completions_available() {
     ));
     assert!(!daemon.runtime().unwrap().test_core_waiter_probe()(waiter));
     assert_eq!(bridge.test_admitted_waiters(), vec![waiter]);
+    assert_eq!(state.budget.outstanding(), 0);
+    assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
+    daemon.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn coordination_acknowledge_terminal_disposal_releases_after_host_receipt() {
+    use crate::daemon::control::pending::dispose_terminal_requests;
+
+    let (mut daemon, mut state, root) = fixture("ack-terminal");
+    let memory = daemon.runtime().unwrap().test_lua_memory();
+    let usage = daemon.runtime().unwrap().test_lua_callback_usage_probe();
+    let bridge = daemon.runtime().unwrap().coordination_bridge();
+    let mut gate = hold_core(&daemon);
+    let input = super::acknowledge_input::admit(&memory, "topic", "t", "", "e").unwrap();
+    let admitted = usage();
+    assert!(admitted > 0, "admission must charge callback storage");
+    let producer = bridge.clone();
+    let caller = thread::spawn(move || producer.acknowledge(input));
+    let queued = Instant::now() + Duration::from_millis(500);
+    while bridge.test_pending_count() != 1 {
+        assert!(Instant::now() < queued, "the caller must queue its request");
+        thread::yield_now();
+    }
+    crate::daemon::control::coordination::accept_one(&mut daemon, &mut state);
+    assert_eq!(bridge.test_admitted_waiters().len(), 1);
+    assert_eq!(usage(), admitted);
+    gate.release();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let disposal = crate::daemon::control::coordination::disposal_bytes().unwrap();
+    let mut saw_terminal_lease = false;
+    while !state.pending_requests.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "terminal disposal must retire the acknowledged row"
+        );
+        dispose_terminal_requests(daemon.runtime().unwrap(), &mut state);
+        if state.pending_requests.values().any(|entry| {
+            matches!(
+                entry.continuation,
+                crate::daemon::control::pending::ControlContinuation::Terminal(..)
+            )
+        }) {
+            assert!(
+                usage() >= disposal,
+                "the disposal lease must remain while the Terminal row is live"
+            );
+            saw_terminal_lease = true;
+        }
+        thread::yield_now();
+    }
+    assert!(
+        saw_terminal_lease,
+        "dispose_terminal_requests must place the acknowledged row in Terminal with its lease"
+    );
+    let _ = caller.join();
+    while usage() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the last lease endpoint must release after Host disposal"
+        );
+        thread::yield_now();
+    }
+    assert_eq!(usage(), 0);
     assert_eq!(state.budget.outstanding(), 0);
     assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
     daemon.stop();

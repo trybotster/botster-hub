@@ -83,6 +83,7 @@ pub(crate) struct TerminalContinuation {
     job: crate::host_disposal::Job,
 }
 
+#[allow(dead_code)] // owner fields drop with the terminal payload
 struct TerminalOwnerPayload {
     completion: OwnerRequestCompletion,
     reply: ControlReplySender,

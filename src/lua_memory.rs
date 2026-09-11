@@ -109,6 +109,7 @@ impl LuaMemoryAccount {
 
     /// Reserve only instance-owned storage that outlives individual callbacks.
     /// Callback-owned storage must use aggregate callback admission instead.
+    #[allow(dead_code)] // paused hook-error funding; keep the shared-storage interface
     pub(crate) fn reserve_shared_callback_storage(
         self: &Arc<Self>,
         bytes: usize,
@@ -253,6 +254,10 @@ impl LuaCallbackCharge {
             account: Arc::clone(&self.account),
             bytes,
         })
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 }
 

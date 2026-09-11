@@ -25,7 +25,6 @@ use botster_core::{
     PluginStoreKey, PluginStoreOperation, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
     RoutedEnvelopePayload, RoutedEnvelopePublishOutcome, TimerCapabilityRequest,
 };
-use botster_core_daemon::RoutedEnvelopeDeliveryStateResult;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde_json::json;
 
@@ -46,6 +45,9 @@ pub(crate) use acknowledge_input::ownership::{
     CoordinationDelivery, CoordinationFailure, CoordinationOutcome as HubCoordinationResponse,
     CoordinationRefusal, CoordinationReply, CoordinationReplySender, CoordinationStorage,
 };
+
+#[cfg(feature = "allocation-oracle")]
+pub(crate) use acknowledge_input::ownership::{AcknowledgeOutcome, reply_channel};
 
 thread_local! {
     static INVOCATION_CAUSAL_SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
@@ -129,6 +131,14 @@ impl CoordinationCaller {
             Self::Acknowledge(caller) => caller.claim(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_bits(&self) -> u8 {
+        match self {
+            Self::NonAcknowledge(state) => state.load(Ordering::Acquire),
+            Self::Acknowledge(caller) => caller.test_bits(),
+        }
+    }
 }
 
 struct CoordinationCallerGuard(CoordinationCaller);
@@ -150,16 +160,39 @@ use entity_publish::EntityPublishError;
 pub(crate) use entity_publish::PendingEntityPublishRequest;
 pub use entity_publish::{EntityPublishPermit, HubEntityPublishBridge};
 
+#[derive(Debug, Clone, Copy)]
+enum CoordinationLocalError {
+    OwnerThread,
+    Timeout,
+    Unexpected,
+    QueuePoisoned,
+    IngressSealed,
+}
+
+impl CoordinationLocalError {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerThread => {
+                "botster.coordination is only available during handler invocation, not at plugin load"
+            }
+            Self::Timeout => "coordination request did not complete before timeout",
+            Self::Unexpected => "coordination acknowledge returned unexpected response",
+            Self::QueuePoisoned => "coordination queue lock poisoned",
+            Self::IngressSealed => "coordination ingress is sealed",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum CoordinationRequestError {
-    Local(&'static str),
+    Local(CoordinationLocalError),
     Response(CoordinationFailure),
 }
 
 impl CoordinationRequestError {
     fn as_str(&self) -> &str {
         match self {
-            Self::Local(message) => message,
+            Self::Local(error) => error.as_str(),
             Self::Response(failure) => failure.message(),
         }
     }
@@ -211,7 +244,7 @@ impl HubCoordinationBridge {
     ) -> Result<acknowledge_input::ownership::AcknowledgeOutcome, CoordinationRequestError> {
         if thread::current().id() == self.owner_thread {
             return Err(CoordinationRequestError::Local(
-                "botster.coordination is only available during handler invocation, not at plugin load",
+                CoordinationLocalError::OwnerThread,
             ));
         }
         let AcknowledgeInput { input, transport } = input;
@@ -232,16 +265,16 @@ impl HubCoordinationBridge {
             caller,
             storage: Some(transport.work),
         })?;
+        // First blocking wait on this thread may allocate std mpmc Context once
+        // (rust 1.97.0 library/std/src/sync/mpmc/context.rs:41-44, :67-77).
         let response = receiver
             .recv_timeout(Duration::from_millis(COORDINATION_REQUEST_TIMEOUT_MS))
-            .map_err(|_| CoordinationRequestError::Local(
-                "coordination request did not complete before timeout",
-            ))?
+            .map_err(|_| CoordinationRequestError::Local(CoordinationLocalError::Timeout))?
             .map_err(CoordinationRequestError::Response)?;
         match response {
             HubCoordinationResponse::Acknowledge(outcome) => Ok(outcome),
             _ => Err(CoordinationRequestError::Local(
-                "coordination acknowledge returned unexpected response",
+                CoordinationLocalError::Unexpected,
             )),
         }
     }
@@ -251,7 +284,7 @@ impl HubCoordinationBridge {
         operation: PendingCoordinationOperation,
     ) -> Result<HubCoordinationResponse, String> {
         self.request_typed(operation).map_err(|error| match error {
-            CoordinationRequestError::Local(message) => message.to_owned(),
+            CoordinationRequestError::Local(error) => error.as_str().to_owned(),
             CoordinationRequestError::Response(CoordinationFailure::NonAcknowledge(message)) => message,
             CoordinationRequestError::Response(CoordinationFailure::Acknowledge(_)) =>
                 CoordinationRefusal::Unexpected.message().to_owned(),
@@ -264,7 +297,7 @@ impl HubCoordinationBridge {
     ) -> Result<HubCoordinationResponse, CoordinationRequestError> {
         if thread::current().id() == self.owner_thread {
             return Err(CoordinationRequestError::Local(
-                "botster.coordination is only available during handler invocation, not at plugin load",
+                CoordinationLocalError::OwnerThread,
             ));
         }
 
@@ -281,20 +314,16 @@ impl HubCoordinationBridge {
             })?;
         receiver
             .recv_timeout(Duration::from_millis(COORDINATION_REQUEST_TIMEOUT_MS))
-            .map_err(|_| {
-                CoordinationRequestError::Local(
-                    "coordination request did not complete before timeout",
-                )
-            })?
+            .map_err(|_| CoordinationRequestError::Local(CoordinationLocalError::Timeout))?
             .map_err(CoordinationRequestError::Response)
     }
 
     fn enqueue(&self, request: PendingCoordinationRequest) -> Result<(), CoordinationRequestError> {
         let _unlock = CoordinationUnlock(&self.progress);
         let mut pending = self.pending.lock()
-            .map_err(|_| CoordinationRequestError::Local("coordination queue lock poisoned"))?;
+            .map_err(|_| CoordinationRequestError::Local(CoordinationLocalError::QueuePoisoned))?;
         if self.progress.sealed.load(Ordering::Acquire) {
-            return Err(CoordinationRequestError::Local("coordination ingress is sealed"));
+            return Err(CoordinationRequestError::Local(CoordinationLocalError::IngressSealed));
         }
         pending.push_back(request);
         Ok(())
@@ -727,6 +756,7 @@ enum LuaStateDropPhase {
 }
 
 impl LuaState {
+    #[cfg(test)]
     fn admit_hook_errors(
         &mut self,
         memory: &Arc<LuaMemoryAccount>,
