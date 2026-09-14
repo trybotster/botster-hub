@@ -66,6 +66,25 @@ pub fn request(
     botster_hub_client::request(&endpoint, request).map_err(DaemonTransportError::from)
 }
 
+/// Doctor-only Status/handshake path. Existing `request` stays blocking.
+///
+/// Passes Hub's existing 2 s write and handshake constants into the client.
+/// Does not bound AF_UNIX `connect`.
+pub fn request_for_doctor(
+    config: &HubConfig,
+    request: DaemonRequest,
+) -> DaemonTransportResult<DaemonResponse> {
+    let endpoint = daemon_endpoint(config)?;
+    botster_hub_client::request_with_handshake_deadlines(
+        &endpoint,
+        request,
+        &botster_hub_client::DaemonCompatibilityRequirement::current(),
+        Some(DAEMON_CLIENT_WRITE_TIMEOUT),
+        Some(DAEMON_HANDSHAKE_TIMEOUT),
+    )
+    .map_err(DaemonTransportError::from)
+}
+
 /// Persistent daemon connection for clients that own attach subscription state.
 pub struct DaemonConnection {
     inner: ClientDaemonConnection,
