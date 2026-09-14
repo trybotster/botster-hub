@@ -477,6 +477,7 @@ const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &[
     "ManagedSessionSpawnQueued",
     "PluginCompletionPublished",
     "PluginResultCapacityReleased",
+    "CoordinationProgress",
 ];
 
 fn control_handler_modules() -> Vec<String> {

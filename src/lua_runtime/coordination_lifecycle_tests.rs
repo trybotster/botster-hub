@@ -354,6 +354,45 @@ fn hold_core(daemon: &crate::HubDaemon) -> CoreGate {
 }
 
 #[test]
+fn coordination_progress_dispatch_marks_background_ready_without_a_second_turn() {
+    let (mut daemon, mut state, root) = fixture("progress-dispatch");
+    let bridge = daemon.runtime().unwrap().coordination_bridge();
+    let caller = request(bridge.clone());
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while bridge.test_pending_count() != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the caller must queue its request"
+        );
+        thread::yield_now();
+    }
+    state.coordination_waiting_for_owner = true;
+    assert!(
+        state.owner_ready.is_empty(),
+        "owner loop is idle before the single dispatch"
+    );
+    let transport = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+    crate::daemon::control::dispatch_control_message(
+        &mut daemon,
+        &mut state,
+        transport.handle(),
+        control_tx,
+        crate::daemon::control::message::ControlMessage::CoordinationProgress,
+    );
+    assert!(
+        !state.owner_ready.is_empty(),
+        "CoordinationProgress dispatch must mark BackgroundWork::Coordination ready in that dispatch, without a second owner turn"
+    );
+    let _ = caller;
+    daemon.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn coordination_full_core_refuses_and_retires_without_replay() {
     let (mut daemon, mut state, root) = fixture("core-full");
     let mut gate = hold_core(&daemon);
