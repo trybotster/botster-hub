@@ -547,7 +547,13 @@ fn control_message_variants_have_one_family_or_dispatcher_owner() {
     let request = hub_source("src/daemon/control/request.rs");
     assert!(request.contains("has_live_peer(grant_id)"));
     let sessions = hub_source("src/daemon/control/sessions.rs");
-    assert!(sessions.contains("overlay_live_attach_occupancy"));
+    let status = hub_source("src/daemon/control/status.rs");
+    assert!(
+        status.contains("try_live_attach_occupancy_rows(")
+            && status.contains("live_attach_occupancy_prepared_bytes("),
+        "status path must overlay occupancy from a held inventory under a prepared byte bound"
+    );
+    let _ = sessions;
 
     let owner_paths: Vec<&str> = CONTROL_MESSAGE_OWNERS
         .iter()
