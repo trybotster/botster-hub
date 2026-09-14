@@ -1090,9 +1090,7 @@ impl HookRaiseStorm {
             match self.inner.call::<()>(()) {
                 Err(_) => {}
                 Ok(()) => {
-                    return Err(format!(
-                        "precompiled hook inner returned at raise {index}"
-                    ));
+                    return Err(format!("precompiled hook inner returned at raise {index}"));
                 }
             }
         }

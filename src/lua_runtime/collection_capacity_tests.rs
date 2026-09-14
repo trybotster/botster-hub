@@ -377,7 +377,9 @@ fn seal_take_ablation_leaves_charge_on_source() {
     assert_eq!(memory.usage().1, 2 * slot());
 }
 
-fn bind_coordination(memory: Arc<LuaMemoryAccount>) -> (mlua::Lua, crate::lua_memory::LuaCallbackCharge) {
+fn bind_coordination(
+    memory: Arc<LuaMemoryAccount>,
+) -> (mlua::Lua, crate::lua_memory::LuaCallbackCharge) {
     let lua = mlua::Lua::new();
     let (table, capacity_string) = super::coordination_table(
         &lua,
