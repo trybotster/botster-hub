@@ -129,10 +129,65 @@ fn request_variant_names(source: &str) -> Vec<String> {
     names
 }
 
+fn skip_balanced_braces(source: &str, open: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut depth = 0;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    source.len()
+}
+
+/// Drop `#[cfg(test)]` items (mod, fn, impl, or `;`-terminated) so production
+/// code before and after those ranges is still scanned.
+fn without_cfg_test_items(source: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while let Some(rel) = source[i..].find("#[cfg(test)]") {
+        out.push_str(&source[i..i + rel]);
+        i += rel + "#[cfg(test)]".len();
+        while i < source.len() && source.as_bytes()[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while source[i..].starts_with("#[") {
+            if let Some(end) = source[i..].find(']') {
+                i += end + 1;
+                while i < source.len() && source.as_bytes()[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        let brace = source[i..].find('{');
+        let semi = source[i..].find(';');
+        match (brace, semi) {
+            (Some(b), Some(s)) if s < b => i += s + 1,
+            (Some(b), _) => i = skip_balanced_braces(source, i + b),
+            (_, Some(s)) => i += s + 1,
+            _ => i = source.len(),
+        }
+    }
+    out.push_str(&source[i..]);
+    out
+}
+
 fn control_message_variant_names(source: &str) -> Vec<String> {
+    let source = without_cfg_test_items(source);
     let mut names = Vec::new();
     let needle = "ControlMessage::";
-    let mut rest = source;
+    let mut rest = source.as_str();
     while let Some(index) = rest.find(needle) {
         rest = &rest[index + needle.len()..];
         let name: String = rest
@@ -580,6 +635,50 @@ fn control_message_variants_have_one_family_or_dispatcher_owner() {
         }
     }
     let _ = owner_paths;
+}
+
+#[test]
+fn control_message_variant_names_ignores_cfg_test_ranges_and_keeps_production() {
+    let ignored = r#"
+        fn production() {}
+        #[cfg(test)]
+        mod tests {
+            fn fixture() {
+                let _ = ControlMessage::Request;
+            }
+        }
+        fn after_tests() {
+            let _ = ControlMessage::Shutdown;
+        }
+    "#;
+    let names = control_message_variant_names(ignored);
+    assert!(
+        !names.iter().any(|name| name == "Request"),
+        "ControlMessage::Request inside #[cfg(test)] mod must be ignored"
+    );
+    assert!(
+        names.iter().any(|name| name == "Shutdown"),
+        "production code after a #[cfg(test)] mod must still be scanned"
+    );
+
+    let caught = r#"
+        fn production() {
+            let _ = ControlMessage::Request;
+        }
+        #[cfg(test)]
+        fn unit() {
+            let _ = ControlMessage::Spawn;
+        }
+    "#;
+    let names = control_message_variant_names(caught);
+    assert!(
+        names.iter().any(|name| name == "Request"),
+        "production ControlMessage::Request must still be caught"
+    );
+    assert!(
+        !names.iter().any(|name| name == "Spawn"),
+        "ControlMessage::Spawn inside #[cfg(test)] fn must be ignored"
+    );
 }
 
 #[test]
