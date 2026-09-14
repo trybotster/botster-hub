@@ -8083,7 +8083,7 @@ mod tests {
         assert_eq!(parse_request_id("18446744073709551616"), None);
         assert_eq!(parse_request_id("100000000000000000000"), None);
         assert_eq!(encode_request_id(42), "42");
-        assert_eq!(encode_request_id(42).len() <= MAX_REQUEST_ID_BYTES, true);
+        assert!(encode_request_id(42).len() <= MAX_REQUEST_ID_BYTES);
 
         let mut ids = RequestIdSequence::new();
         assert_eq!(ids.last(), 0);
