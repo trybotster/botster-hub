@@ -21,6 +21,10 @@ pub(crate) type ControlReplyReceiver = oneshot::Receiver<ControlReply>;
 pub(crate) struct ControlReplySender(Option<oneshot::Sender<ControlReply>>);
 
 impl ControlReplySender {
+    pub(crate) fn absent() -> Self {
+        Self(None)
+    }
+
     pub(crate) fn send(
         self,
         response: DaemonTransportResult<DaemonResponse>,
@@ -91,6 +95,7 @@ pub(crate) enum ControlMessage {
     DataPlaneProgress,
     /// The data-plane thread published one or more keyed Core results.
     CoreCompletionPublished,
+    CoordinationProgress,
     AcceptedConnection {
         stream: TokioUnixStream,
         admission_permit: OwnedSemaphorePermit,

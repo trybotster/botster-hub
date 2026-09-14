@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Build or run the isolated C1 allocation oracle after explicit approval."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tomllib
+
+COMMIT = "2d8144b7880597b6e6d3dfd63a9a9efae3f533d3"
+TARGET = "aarch64-apple-darwin"
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def source_snapshot():
+    def git(*arguments):
+        return subprocess.check_output(["git", *arguments], cwd=ROOT)
+
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")
+    untracked = sorted(name for name in untracked if name and not name.startswith(".botster/"))
+    source_files = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/data_plane/driver.rs",
+                    "src/lua_runtime.rs", "src/lua_memory.rs", "src/test_internals.rs",
+                    "src/data_plane/driver/allocation_oracle.rs",
+                    "tests/core_ticket_allocations/main.rs", "script/core-ticket-allocation-oracle"]
+    return {
+        "head": git("rev-parse", "HEAD").decode().strip(),
+        "tracked_diff_sha256": hashlib.sha256(git("diff", "HEAD", "--binary")).hexdigest(),
+        "untracked_input_hashes": {name: digest(ROOT / name) for name in untracked},
+        "source_hashes": {name: digest(ROOT / name) for name in source_files},
+    }
+
+
+def build_configuration(env):
+    cargo_home = Path(env.get("CARGO_HOME", str(Path.home() / ".cargo"))).resolve()
+    directories = [parent / ".cargo" for parent in [ROOT, *ROOT.parents]] + [cargo_home]
+    configurations = {}
+    for directory in dict.fromkeys(directories):
+        for name in ["config", "config.toml"]:
+            path = directory / name
+            if path.is_file():
+                content = tomllib.loads(path.read_text())
+                configurations[str(path)] = {
+                    "sha256": digest(path),
+                    "layout_configuration": {key: content[key] for key in ["build", "target", "profile"] if key in content},
+                }
+                # Configured environment can override compiler or profile inputs.
+                if content.get("env"):
+                    raise SystemExit(f"Review Cargo's configured environment before this build: {path}.")
+    names = {"RUSTUP_TOOLCHAIN", "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS",
+             "CARGO_INCREMENTAL", "BOTSTER_ENV", "C1_ORACLE_RUSTC_COMMIT", "C1_ORACLE_TARGET",
+             "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"}
+    relevant = {key: value for key, value in env.items()
+                if key in names or key.startswith(("CARGO_PROFILE_", "CARGO_BUILD_", "CARGO_TARGET_"))}
+    if env.get("CARGO_BUILD_TARGET"):
+        raise SystemExit("The host-cache build requires CARGO_BUILD_TARGET to be unset.")
+    for configuration in configurations.values():
+        if configuration["layout_configuration"].get("build", {}).get("target"):
+            raise SystemExit("The host-cache build requires Cargo build.target to be unset.")
+    return {"requested_profile": "test", "environment": relevant, "cargo_config_files": configurations,
+            "scope": "These observations apply only to this build. Release layouts require separate verification."}
+
+
+def wait_bounded(process, seconds):
+    try:
+        return process.wait(timeout=seconds), False
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        return process.wait(), True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["build", "run"])
+    parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--timeout-seconds", type=int, required=True)
+    args = parser.parse_args()
+    if not 1 <= args.timeout_seconds <= 600:
+        parser.error("The external deadline must be between 1 and 600 seconds.")
+    output = args.output_directory.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    manifest_path = output / "manifest.json"
+
+    if args.action == "build":
+        if manifest_path.exists():
+            raise SystemExit("The manifest already exists. Use a new output directory.")
+        env = os.environ.copy()
+        for variable in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC"]:
+            if env.get(variable):
+                raise SystemExit(f"The oracle build requires {variable} to be unset.")
+        env.update(RUSTUP_TOOLCHAIN="1.97.0", CARGO_BUILD_JOBS="2", CARGO_INCREMENTAL="0", BOTSTER_ENV="test")
+        version = subprocess.check_output(["rustc", "-Vv"], env=env, cwd=ROOT, text=True)
+        if f"commit-hash: {COMMIT}\n" not in version or f"host: {TARGET}\n" not in version or "release: 1.97.0\n" not in version:
+            raise SystemExit("The compiler does not match the approved Rust commit and target.")
+        env.update(C1_ORACLE_RUSTC_COMMIT=COMMIT, C1_ORACLE_TARGET=TARGET)
+        command = ["cargo", "test", "--locked", "--offline", "--verbose",
+                   "--features", "allocation-oracle", "--test", "core_ticket_allocations",
+                   "--no-run", "--message-format=json"]
+        frozen_sources = source_snapshot()
+        configuration = build_configuration(env)
+        with (output / "frozen-inputs.json").open("x") as frozen:
+            json.dump({"sources": frozen_sources, "configuration": configuration}, frozen, indent=2)
+            frozen.write("\n")
+        print("Build only: core_ticket_allocations", flush=True)
+        with (output / "build.jsonl").open("xb") as stdout, (output / "build.stderr").open("xb") as stderr:
+            process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=stdout, stderr=stderr, start_new_session=True)
+            code, timed_out = wait_bounded(process, args.timeout_seconds)
+        (output / "build.exit").write_text(f"{code}\n")
+        (output / "build.deadline").write_text(f"{timed_out}\n")
+        if source_snapshot() != frozen_sources or build_configuration(env) != configuration:
+            raise SystemExit("The source or build configuration changed during the build.")
+        if code or timed_out:
+            raise SystemExit(f"Build failed: exit={code}, deadline_reached={timed_out}.")
+        executables = []
+        artifact_profiles = []
+        for line in (output / "build.jsonl").read_text().splitlines():
+            message = json.loads(line)
+            if message.get("reason") == "compiler-artifact":
+                artifact_profiles.append({key: message.get(key) for key in ["package_id", "target", "profile", "features", "fresh"]})
+            if message.get("reason") == "compiler-artifact" and message.get("target", {}).get("name") == "core_ticket_allocations" and message.get("executable"):
+                executables.append(message["executable"])
+        if len(executables) != 1:
+            raise SystemExit("Cargo did not report exactly one oracle executable.")
+        executable = Path(executables[0]).resolve()
+        manifest = {"rustc": version, "commit": COMMIT, "target": TARGET, "command": command,
+                    "executable": str(executable), "executable_sha256": digest(executable),
+                    "sources": frozen_sources, "configuration": configuration,
+                    "cargo_artifact_profiles": artifact_profiles,
+                    "compiler_invocations": "build.stderr (--verbose)",
+                    "inputs_verified_after_build": True}
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"Build complete. Manifest: {manifest_path}")
+        return
+
+    manifest = json.loads(manifest_path.read_text())
+    executable = Path(manifest["executable"])
+    if manifest["commit"] != COMMIT or manifest["target"] != TARGET or digest(executable) != manifest["executable_sha256"]:
+        raise SystemExit("The executable does not match the pinned manifest.")
+    if source_snapshot() != manifest["sources"]:
+        raise SystemExit("The source changed after the oracle build.")
+    print(f"Run only: one oracle executable, external deadline {args.timeout_seconds} seconds", flush=True)
+    with (output / "run.csv").open("xb") as stdout, (output / "run.stderr").open("xb") as stderr:
+        process = subprocess.Popen([str(executable)], cwd=ROOT, stdout=stdout, stderr=stderr, start_new_session=True)
+        code, timed_out = wait_bounded(process, args.timeout_seconds)
+    (output / "run.exit").write_text(f"{code}\n")
+    (output / "run.deadline").write_text(f"{timed_out}\n")
+    if code or timed_out:
+        raise SystemExit(f"Oracle failed: exit={code}, deadline_reached={timed_out}.")
+    if not (output / "run.csv").read_text().endswith("complete,19\n"):
+        raise SystemExit("The oracle did not report all 19 completed scenarios.")
+    print(f"Oracle complete. Raw requests: {output / 'run.csv'}")
+
+
+if __name__ == "__main__":
+    main()

@@ -60,6 +60,7 @@ impl EventOwnerState {
                     self.terminal_owner = Some(pending.owner_permit);
                     self.terminal = Some(crate::host_disposal::Job::new(
                         crate::host_disposal::Parts {
+                            storage: None,
                             identity: pending.identity,
                             permit,
                             model: None,
@@ -105,6 +106,7 @@ impl EventOwnerState {
             };
         self.terminal = Some(crate::host_disposal::Job::new(
             crate::host_disposal::Parts {
+                storage: None,
                 identity,
                 permit,
                 model: None,

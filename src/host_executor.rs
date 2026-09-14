@@ -1,6 +1,6 @@
 //! Fixed, bounded execution for Hub work that must not run on the owner thread.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
@@ -46,6 +46,11 @@ impl HostError {
 }
 
 pub(crate) enum HostCommand {
+    DeliverCoordinationResponse {
+        response: crate::lua_runtime::CoordinationReplySender,
+        result: crate::lua_runtime::CoordinationDelivery,
+        discard: Option<crate::data_plane::driver::CoreRejectedRequest>,
+    },
     ClientEventCleanup {
         router: Arc<crate::package_event_router::PackageEventRouter>,
         work: crate::subscription::package_events::ClientCleanupWork,
@@ -93,6 +98,9 @@ pub(crate) enum HostCommand {
         decision: ManagedWorktreeDecision,
         deadline: Instant,
         discard: Option<Box<crate::host_mutations::PreparedMutation>>,
+        suppress_rollback: Arc<Mutex<BTreeSet<String>>>,
+        #[cfg(test)]
+        rollback_hold: Option<Arc<TestHostGate>>,
     },
     #[cfg(test)]
     Panic {
@@ -108,6 +116,7 @@ pub(crate) enum HostCommand {
 impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
+            Self::DeliverCoordinationResponse { .. } => 0,
             #[cfg(test)]
             Self::DisposalProbe(_) => 0,
             Self::Dispose(_) | Self::TerminalDispose(_) | Self::DiscardCompletion(_) => 0,
@@ -132,6 +141,9 @@ impl HostCommand {
 impl std::fmt::Debug for HostCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::DeliverCoordinationResponse { .. } => {
+                formatter.write_str("DeliverCoordinationResponse")
+            }
             Self::ClientEventCleanup { .. } => formatter.write_str("ClientEventCleanup"),
             #[cfg(test)]
             Self::DisposalProbe(_) => formatter.write_str("DisposalProbe"),
@@ -195,6 +207,7 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
+    CoordinationResponseDelivered,
     ClientEventCleanup(
         Result<
             crate::subscription::package_events::ClientCleanupCompletion,
@@ -241,6 +254,7 @@ pub(crate) enum HostResult {
 impl HostResult {
     fn generation(&self) -> u64 {
         match self {
+            Self::CoordinationResponseDelivered => 0,
             Self::EntityModelComplete(_) => 0,
             Self::EventOwner(_) | Self::ClientEventCleanup(_) => 0,
             Self::StatusResponsePrepared(_) | Self::StatusResponseDelivered { .. } => 0,
@@ -338,6 +352,7 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
+        HostResult::CoordinationResponseDelivered => 0,
         HostResult::StatusResponsePrepared(prepared) => prepared.logical_bytes(),
         HostResult::StatusResponseDelivered { .. } => 0,
         HostResult::EntityModelComplete(_) => 0,
@@ -1096,6 +1111,18 @@ fn execute(
     permit: &mut HostWorkPermit,
 ) -> HostResult {
     match command {
+        HostCommand::DeliverCoordinationResponse {
+            response,
+            result,
+            discard,
+        } => {
+            drop(discard);
+            match response.send(result) {
+                Ok(()) => {}
+                Err(result) => drop(result),
+            }
+            HostResult::CoordinationResponseDelivered
+        }
         #[cfg(test)]
         HostCommand::DisposalProbe(probe) => {
             probe.executed.store(true, Ordering::Release);
@@ -1269,13 +1296,36 @@ fn execute(
             decision,
             deadline,
             discard,
+            suppress_rollback,
+            #[cfg(test)]
+            rollback_hold,
         } => {
-            let result = match finalize_managed_worktree(&prepared, decision, deadline) {
-                Ok(()) => HostResult::ManagedWorktreeFinalized,
-                Err(error) => HostResult::ManagedWorktreeRecoveryRequired {
-                    prepared,
-                    error: HostError::new(error.kind, error.message),
-                },
+            let suppressed = matches!(decision, ManagedWorktreeDecision::Rollback)
+                && suppress_rollback
+                    .lock()
+                    .ok()
+                    .is_some_and(|held| held.contains(&prepared.worktree_id));
+            let result = if suppressed {
+                HostResult::ManagedWorktreeFinalized
+            } else {
+                #[cfg(test)]
+                if matches!(decision, ManagedWorktreeDecision::Rollback) {
+                    if let Some(gate) = rollback_hold.as_ref() {
+                        gate.wait();
+                    }
+                }
+                match finalize_managed_worktree(
+                    &prepared,
+                    decision,
+                    deadline,
+                    Some(&suppress_rollback),
+                ) {
+                    Ok(()) => HostResult::ManagedWorktreeFinalized,
+                    Err(error) => HostResult::ManagedWorktreeRecoveryRequired {
+                        prepared,
+                        error: HostError::new(error.kind, error.message),
+                    },
+                }
             };
             drop(discard);
             result
@@ -1304,7 +1354,7 @@ pub(crate) struct TestHostGate {
 
 #[cfg(test)]
 impl TestHostGate {
-    fn wait(&self) {
+    pub(crate) fn wait(&self) {
         self.started.store(true, Ordering::Release);
         let mut released = self
             .released
@@ -1389,6 +1439,7 @@ mod tests {
         let identity = HostJobIdentity::first(WaiterId(89));
         let (dropped, receiver) = mpsc::channel();
         let mut job = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+            storage: None,
             identity,
             permit,
             payload: Box::new(TestDisposalProbe {
@@ -2423,6 +2474,8 @@ mod tests {
                     decision: ManagedWorktreeDecision::Rollback,
                     deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
                     discard: None,
+                    suppress_rollback: Arc::new(Mutex::new(BTreeSet::new())),
+                    rollback_hold: None,
                 },
                 permit,
             )
@@ -2449,6 +2502,8 @@ mod tests {
                     decision: ManagedWorktreeDecision::Rollback,
                     deadline: Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT,
                     discard: None,
+                    suppress_rollback: Arc::new(Mutex::new(BTreeSet::new())),
+                    rollback_hold: None,
                 },
                 permit,
             )

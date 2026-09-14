@@ -1,6 +1,7 @@
 //! Control-plane dispatchers.
 
 pub(crate) mod connection;
+pub(crate) mod coordination;
 pub(crate) mod entities;
 pub(crate) mod events;
 pub(crate) mod host;
@@ -134,7 +135,8 @@ pub(crate) fn dispatch_control_message(
         | ControlMessage::EntityPublishProgress
         | ControlMessage::CausalProgressPublished
         | ControlMessage::HostProgressPublished
-        | ControlMessage::ManagedSessionSpawnQueued => {
+        | ControlMessage::ManagedSessionSpawnQueued
+        | ControlMessage::CoordinationProgress => {
             crate::daemon::owner_loop::publish_completion_wakes(daemon, state);
             false
         }

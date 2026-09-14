@@ -17,8 +17,8 @@ use botster_hub::package_event_router::{CausalAdmitResult, CausalOp, LeaseIdenti
 use botster_hub::runtime::{CAUSAL_OWNER_CAPACITY, CausalTransitionStatus};
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, HostIdentityOptions, HubClientApi, HubClientRequest,
-    HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginHostApi, LuaPluginRuntime,
-    PackageRegistry, RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, Worktree,
+    HubClientResponseBody, HubRuntime, HubStartupOptions, LuaPluginRuntime, PackageRegistry,
+    RuntimeEnvironment, SessionDefaults, SpawnTarget, TransportBindings, Worktree,
     default_package_policy,
 };
 use botster_ui_contract::{UiActionRequest, UiActionResultState, UiAuthoredNodeId, UiNodeKind};
@@ -2708,16 +2708,7 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             .package("reload.plugin")
             .expect("reload package")
             .configuration_view(),
-        LuaPluginHostApi {
-            capabilities: hub.capability_runtime(),
-            coordination: hub.coordination_bridge(),
-            entity_publish: hub.entity_publish_bridge(),
-            session_types: hub.session_type_spawner(),
-            spawn_targets: hub.spawn_targets(),
-            worktrees: hub.worktrees(),
-            package_event_router: hub.package_event_router().clone(),
-            causal_scopes: hub.causal_scopes().clone(),
-        },
+        hub.lua_plugin_host_api(),
         registry.packages().into_iter().cloned().collect(),
     )
     .expect("load new reload lua bundle");

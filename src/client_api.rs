@@ -2345,9 +2345,9 @@ pub(crate) fn runtime_error(
         HubRuntimeError::CoreDaemon(_) if operation == HubClientOperation::ReadModeFlags => {
             HubClientRuntimeErrorKind::ModeReadFailed
         }
-        HubRuntimeError::CoreDaemon(_) | HubRuntimeError::Capability(_) => {
-            HubClientRuntimeErrorKind::Runtime
-        }
+        HubRuntimeError::CoreDaemon(_)
+        | HubRuntimeError::Capability(_)
+        | HubRuntimeError::Config(_) => HubClientRuntimeErrorKind::Runtime,
         HubRuntimeError::State(_)
         | HubRuntimeError::Credentials(_)
         | HubRuntimeError::IncompatibleWorkers { .. } => HubClientRuntimeErrorKind::State,
@@ -2363,6 +2363,25 @@ pub(crate) fn runtime_error(
 mod runtime_error_tests {
     use super::*;
     use botster_core::SessionRuntimeError;
+
+    #[test]
+    fn invalid_lua_policy_preserves_request_identity_as_runtime_error() {
+        let error = runtime_error(
+            RequestId("lua-policy".to_string()),
+            HubClientOperation::Spawn,
+            HubRuntimeError::Config(crate::HubConfigError::InvalidCapacity {
+                field: "lua_memory",
+            }),
+        );
+        match error {
+            HubClientError::Runtime {
+                request_id,
+                operation: HubClientOperation::Spawn,
+                kind: HubClientRuntimeErrorKind::Runtime,
+            } => assert_eq!(request_id.0, "lua-policy"),
+            other => panic!("expected the runtime error with its request identity, got {other:?}"),
+        }
+    }
 
     #[test]
     fn nested_multiplexer_spawn_failed_maps_to_spawn_failed() {

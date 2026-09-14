@@ -12,11 +12,13 @@ use botster_core::{
     PluginAdmissionResult, PluginCapabilityRuntime, PluginCleanupResult, PluginCompletionDrain,
     PluginHandlerKind, PluginInvocationClass, PluginInvocationFailure, PluginInvocationFailureKind,
     PluginInvocationOutcome, PluginInvocationRequest, PluginInvocationResult, PluginKey,
-    PluginWorkerDebugSnapshot, RequestId, Rgb, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
-    RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState, SessionRuntimeErrorKind,
-    SessionSpawnRequest, SubscriptionId, TerminalCapabilitySet, TerminalColorProfile,
-    TerminalSubscriptionGeneration,
+    PluginWorkerDebugSnapshot, RequestId, ReservedSessionSpawnError, Rgb, RoutedEnvelope,
+    RoutedEnvelopeDrainOutcome, RoutedEnvelopePublishOutcome, SessionId, SessionLifecycleState,
+    SessionReservation, SessionReservationRefusal, SessionReservationRelease,
+    SessionRuntimeErrorKind, SessionSpawnRequest, SubscriptionId, TerminalCapabilitySet,
+    TerminalColorProfile, TerminalSubscriptionGeneration,
 };
+use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_core_daemon::{
     AcknowledgeRoutedEnvelopeRequest, CaptureId, CaptureOwner, CaptureSnapshotRequest,
     CoreCompletion, CoreDaemonConfig, CoreDaemonError, CoreOperation, DaemonSession,
@@ -34,6 +36,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
@@ -51,8 +55,8 @@ use crate::lifecycle::{
     HubPluginRuntimeBundle, package_entity_owner_token,
 };
 use crate::lua_runtime::{
-    HubCoordinationBridge, HubCoordinationResponse, HubEntityPublishBridge, LuaPluginHostApi,
-    LuaPluginRuntimeError, PendingCoordinationOperation, SharedHubCapabilityRuntime,
+    HubCoordinationBridge, HubEntityPublishBridge, LuaPluginHostApi, LuaPluginRuntimeError,
+    PendingCoordinationOperation, SharedHubCapabilityRuntime,
 };
 use crate::managed_git_worktrees::{
     ManagedGitError, ManagedGitRequest, PreparedManagedWorktree,
@@ -98,14 +102,49 @@ pub type HubStateView = SharedView<HubState>;
 /// typed pressure-reporting operations. It intentionally does not expose core's
 /// generic `DefaultEngineCommand` router; hub callers use explicit methods so
 /// admission and policy boundaries remain visible at the hub layer.
+struct CreatedWorktreeCleanup {
+    worktree_id: String,
+    session_id: SessionId,
+    prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+    reservation: SessionReservation,
+    shutdown: Option<CoreOperationTracker>,
+    remove: Option<CoreOperationTracker>,
+    removed: bool,
+    release: Option<CoreOperationTracker>,
+    release_attempted: bool,
+}
+
 pub struct HubRuntime {
     config: HubConfig,
+    lua_memory: Arc<crate::lua_memory::LuaMemoryAccount>,
+    #[cfg(test)]
+    lua_plugin_runtimes: std::sync::Arc<
+        Mutex<Vec<std::sync::Weak<crate::lua_runtime::LuaPluginRuntime>>>,
+    >,
     // Readers clone the current Arc under this short lock. Publication swaps
     // one Arc, so the owner never clones a durable state collection.
     state: SharedHubState,
     core_daemon: SharedCoreDaemon,
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
-    inflight_plugin_core: Mutex<Vec<InflightPluginCore>>,
+    inflight_plugin_core:
+        Mutex<crate::lua_memory::charged_collection::ChargedVec<InflightPluginCore>>,
+    retained_plugin_reservations: Mutex<Vec<SessionReservation>>,
+    created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
+    confirmed_worktree_rollbacks: Mutex<Vec<crate::managed_git_worktrees::PreparedManagedWorktree>>,
+    suppressed_created_worktree_rollbacks: Arc<Mutex<BTreeSet<String>>>,
+    submitted_created_worktree_rollbacks: Mutex<BTreeSet<String>>,
+    #[cfg(test)]
+    rollback_git_hold: Mutex<Option<Arc<crate::host_executor::TestHostGate>>>,
+    #[cfg(test)]
+    managed_accept_ones: AtomicUsize,
+    #[cfg(test)]
+    retry_retained_again_on_pending: AtomicBool,
+    #[cfg(test)]
+    resubmit_release_on_pending: AtomicBool,
+    #[cfg(test)]
+    coordination_core_submits: AtomicUsize,
+    #[cfg(test)]
+    retained_reservation_takes: AtomicUsize,
     close_work: crate::data_plane::CloseWorkSource,
     data_plane: Option<crate::data_plane::DataPlaneDriver>,
     reconciliation: HubSessionReconciliation,
@@ -263,6 +302,7 @@ pub struct HubSessionTypeSpawner {
     managed: Mutex<VecDeque<PendingManagedSessionSpawn>>,
     managed_pending: AtomicBool,
     managed_owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
+    abandoned: Mutex<Vec<String>>,
 }
 
 /// These handles permit explicit queue cleanup after the engine disposal receipt.
@@ -324,7 +364,7 @@ struct PendingSessionTypeSpawn {
     session_type_id: String,
     request: SessionTypeRequest,
     package_records: Vec<PackageRecord>,
-    response: mpsc::Sender<Result<PluginSessionTypeSpawned, String>>,
+    response: mpsc::Sender<Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>>>,
 }
 
 pub(crate) struct PendingManagedSessionSpawn {
@@ -340,10 +380,42 @@ pub(crate) struct PendingManagedSessionSpawn {
     pub(crate) response: mpsc::Sender<Result<PluginManagedSessionSpawned, ManagedGitError>>,
 }
 
+impl PendingManagedSessionSpawn {
+    #[cfg(test)]
+    pub(crate) fn test_new(
+        plugin_key: PluginKey,
+        target_id: String,
+        branch: String,
+        session_type_id: String,
+        request: ManagedSessionTypeRequest,
+        package_records: Vec<PackageRecord>,
+        response: mpsc::Sender<Result<PluginManagedSessionSpawned, ManagedGitError>>,
+    ) -> Self {
+        Self {
+            plugin_key,
+            target_id,
+            branch,
+            session_type_id,
+            request,
+            package_records,
+            accepted_at: Instant::now(),
+            response,
+            _dispose_probe: None,
+        }
+    }
+}
+
 /// One managed session spawn in flight on the Core owner thread.
 pub(crate) struct ManagedSessionSpawnStart {
     pub(crate) tracker: CoreOperationTracker,
     pub(crate) context: HubSessionContext,
+    waiter_id: crate::owner_identity::WaiterId,
+    stage: PluginSpawnStage,
+    pub(crate) reservation: Option<SessionReservation>,
+    spawn: SpawnSessionRequest,
+    spawn_error: Option<CoreDaemonError>,
+    reserve_operation_id: Option<PendingOperationId>,
+    context_published: bool,
 }
 
 /// Structured Lua-facing session-type spawn response.
@@ -386,8 +458,16 @@ impl HubRuntime {
     /// Build a hub runtime from explicit, already-validated hub config.
     ///
     /// # Errors
-    /// Returns an error when the plugin database cannot be opened.
+    /// Returns an error when memory policy is invalid or the plugin database cannot be opened.
     pub fn new(config: HubConfig) -> HubRuntimeResult<Self> {
+        let lua_memory = crate::lua_memory::LuaMemoryAccount::new(
+            crate::config::lua_memory_limits(),
+        )
+        .map_err(|_| {
+            HubRuntimeError::Config(crate::config::HubConfigError::InvalidCapacity {
+                field: "lua_memory",
+            })
+        })?;
         let state = HubState::from_config(&config);
         let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
@@ -398,13 +478,14 @@ impl HubRuntime {
             config.package_event_plane,
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
+        let inflight_account = Arc::clone(&lua_memory);
         Ok(Self {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             host_executor: crate::host_executor::HostExecutor::new(),
-            coordination_bridge: HubCoordinationBridge::new(),
+            coordination_bridge: HubCoordinationBridge::new(Arc::clone(&lua_memory)),
             entity_publish_bridge: HubEntityPublishBridge::new(
                 plugin_lifecycle.entity_provider_registrations(),
             ),
@@ -414,10 +495,32 @@ impl HubRuntime {
             next_provider_token: Cell::new(1),
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
+            lua_memory,
+            #[cfg(test)]
+            lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
-            inflight_plugin_core: Mutex::new(Vec::new()),
+            inflight_plugin_core: Mutex::new(
+                crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
+            ),
+            retained_plugin_reservations: Mutex::new(Vec::new()),
+            created_worktree_cleanups: Mutex::new(Vec::new()),
+            confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
+            suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
+            submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            rollback_git_hold: Mutex::new(None),
+            #[cfg(test)]
+            managed_accept_ones: AtomicUsize::new(0),
+            #[cfg(test)]
+            retry_retained_again_on_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            coordination_core_submits: AtomicUsize::new(0),
+            #[cfg(test)]
+            retained_reservation_takes: AtomicUsize::new(0),
+            #[cfg(test)]
+            resubmit_release_on_pending: AtomicBool::new(false),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -492,6 +595,14 @@ impl HubRuntime {
     }
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
+        let lua_memory = crate::lua_memory::LuaMemoryAccount::new(
+            crate::config::lua_memory_limits(),
+        )
+        .map_err(|_| {
+            HubRuntimeError::Config(crate::config::HubConfigError::InvalidCapacity {
+                field: "lua_memory",
+            })
+        })?;
         let state = Arc::new(HubStatePublication::new(state)?);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
@@ -501,13 +612,14 @@ impl HubRuntime {
             config.package_event_plane,
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
+        let inflight_account = Arc::clone(&lua_memory);
         let mut runtime = Self {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
             host_executor: crate::host_executor::HostExecutor::new(),
-            coordination_bridge: HubCoordinationBridge::new(),
+            coordination_bridge: HubCoordinationBridge::new(Arc::clone(&lua_memory)),
             entity_publish_bridge: HubEntityPublishBridge::new(
                 plugin_lifecycle.entity_provider_registrations(),
             ),
@@ -517,10 +629,32 @@ impl HubRuntime {
             next_provider_token: Cell::new(1),
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
+            lua_memory,
+            #[cfg(test)]
+            lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
             state,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
-            inflight_plugin_core: Mutex::new(Vec::new()),
+            inflight_plugin_core: Mutex::new(
+                crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
+            ),
+            retained_plugin_reservations: Mutex::new(Vec::new()),
+            created_worktree_cleanups: Mutex::new(Vec::new()),
+            confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
+            suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
+            submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            rollback_git_hold: Mutex::new(None),
+            #[cfg(test)]
+            managed_accept_ones: AtomicUsize::new(0),
+            #[cfg(test)]
+            retry_retained_again_on_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            coordination_core_submits: AtomicUsize::new(0),
+            #[cfg(test)]
+            retained_reservation_takes: AtomicUsize::new(0),
+            #[cfg(test)]
+            resubmit_release_on_pending: AtomicBool::new(false),
             close_work,
             data_plane: Some(data_plane),
             reconciliation: HubSessionReconciliation::default(),
@@ -631,8 +765,11 @@ impl HubRuntime {
         Arc::clone(&self.state)
     }
 
-    fn lua_plugin_host_api(&self) -> LuaPluginHostApi {
+    /// Return Host primitives that retain this Hub's shared Lua memory account.
+    #[must_use]
+    pub fn lua_plugin_host_api(&self) -> LuaPluginHostApi {
         LuaPluginHostApi {
+            memory: Arc::clone(&self.lua_memory),
             capabilities: self.capability_runtime.clone(),
             coordination: self.coordination_bridge(),
             entity_publish: self.entity_publish_bridge(),
@@ -641,6 +778,8 @@ impl HubRuntime {
             worktrees: Arc::clone(&self.state),
             package_event_router: self.package_event_router.clone(),
             causal_scopes: self.causal_scopes.clone(),
+            #[cfg(test)]
+            lua_plugin_runtimes: std::sync::Arc::clone(&self.lua_plugin_runtimes),
         }
     }
 
@@ -885,6 +1024,53 @@ impl HubRuntime {
             .families
             .get(family)
             .map(|state| state.generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stop_core_driver(&mut self) {
+        self.stop_data_plane_with_release(false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_refuse_next_owner_begins(&self, count: usize) {
+        self.core_daemon.test_refuse_next_owner_begins(count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_refuse_next_owner_begins_remaining(&self) -> usize {
+        self.core_daemon.test_refuse_next_owner_begins_remaining()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_retry_retained_again_on_pending(&self, enabled: bool) {
+        self.retry_retained_again_on_pending
+            .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_retry_retained_again_on_pending(&self) -> bool {
+        self.retry_retained_again_on_pending.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_resubmit_release_on_pending(&self, enabled: bool) {
+        self.resubmit_release_on_pending
+            .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_resubmit_release_on_pending(&self) -> bool {
+        self.resubmit_release_on_pending.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lose_next_owner_begins(&self, count: usize) {
+        self.core_daemon.test_lose_next_owner_begins(count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_release_session_reservation_begins(&self) -> usize {
+        self.core_daemon.test_release_session_reservation_begins()
     }
 
     #[cfg(test)]
@@ -1449,18 +1635,35 @@ impl HubRuntime {
     }
 
     fn fulfill_pending_session_type_spawns(&self) {
+        for session_id in self.session_type_spawner.take_abandoned() {
+            self.cleanup_undelivered_session_type_spawn(&PluginSessionTypeSpawned {
+                session_id: session_id.clone(),
+                lifecycle: String::new(),
+                session_type_id: String::new(),
+                context_id: format!("ctx-{session_id}"),
+                context_keys: Vec::new(),
+            });
+        }
         while let Some(pending) = self.session_type_spawner.take_pending() {
-            match self.fulfill_session_type_spawn(&pending) {
-                Ok(start) => {
-                    if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
-                        inflight.push(InflightPluginCore::SessionTypeSpawn {
-                            start,
-                            response: pending.response,
-                        });
-                    }
+            let slot = match crate::lua_memory::charged_collection::SlotReservation::try_reserve(
+                &self.inflight_plugin_core,
+            ) {
+                Ok(slot) => slot,
+                Err(_) => {
+                    let _ = pending.response.send(Err(std::borrow::Cow::Borrowed(
+                        crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+                    )));
+                    continue;
                 }
+            };
+            match self.fulfill_session_type_spawn(&pending) {
+                Ok(start) => slot.insert(InflightPluginCore::SessionTypeSpawn {
+                    start,
+                    response: pending.response,
+                }),
                 Err(error) => {
-                    let _ = pending.response.send(Err(error));
+                    drop(slot);
+                    let _ = pending.response.send(Err(std::borrow::Cow::Owned(error)));
                 }
             }
         }
@@ -1472,54 +1675,85 @@ impl HubRuntime {
         let Ok(mut inflight) = self.inflight_plugin_core.lock() else {
             return;
         };
-        let mut retained = Vec::with_capacity(inflight.len());
-        for mut entry in inflight.drain(..) {
-            match &mut entry {
-                InflightPluginCore::Coordination { ticket, .. } => match ticket.poll() {
-                    CoreTicketPoll::Pending => retained.push(entry),
-                    CoreTicketPoll::Ready(result) => {
-                        if let InflightPluginCore::Coordination { response, .. } = entry {
-                            let _ = response.send(result);
-                        }
-                    }
-                    CoreTicketPoll::Lost => {
-                        if let InflightPluginCore::Coordination { response, .. } = entry {
-                            let _ = response.send(Err(CoreTicketError::DriverStopped.to_string()));
-                        }
-                    }
-                    CoreTicketPoll::Refused => {
-                        if let InflightPluginCore::Coordination { response, .. } = entry {
-                            let _ = response.send(Err(CoreTicketError::Overloaded.to_string()));
-                        }
-                    }
-                },
-                InflightPluginCore::SessionTypeSpawn { start, .. } => {
-                    let completion = match start.tracker.poll(self) {
-                        CoreTicketPoll::Pending => {
-                            retained.push(entry);
+        let mut index = 0;
+        while index < inflight.len() {
+            match inflight.get_mut(index) {
+                Some(InflightPluginCore::SessionTypeSpawn { start, .. }) => {
+                    match start.poll(self) {
+                        PluginSpawnPoll::Pending => {
+                            index += 1;
                             continue;
                         }
-                        CoreTicketPoll::Lost => Err(CoreDaemonError::Shutdown),
-                        CoreTicketPoll::Refused => {
-                            Err(core_bridge_error(CoreTicketError::Overloaded))
+                        PluginSpawnPoll::Ready(result) => {
+                            let InflightPluginCore::SessionTypeSpawn { start, response } =
+                                inflight.swap_remove(index)
+                            else {
+                                continue;
+                            };
+                            let result = self
+                                .finish_session_type_spawn(&start, result)
+                                .map_err(std::borrow::Cow::Owned);
+                            if response.send(result.clone()).is_err()
+                                && let Ok(spawned) = result
+                            {
+                                self.cleanup_undelivered_session_type_spawn(&spawned);
+                            }
+                            continue;
                         }
-                        CoreTicketPoll::Ready(Err(error)) => Err(error),
-                        CoreTicketPoll::Ready(Ok(CoreCompletion::Spawn { result, .. })) => result,
-                        CoreTicketPoll::Ready(Ok(_)) => Err(CoreDaemonError::Shutdown),
-                    };
-                    let InflightPluginCore::SessionTypeSpawn { start, response } = entry else {
-                        continue;
-                    };
-                    let result = self.finish_session_type_spawn(&start, completion);
-                    if response.send(result.clone()).is_err()
-                        && let Ok(spawned) = result
-                    {
-                        self.cleanup_undelivered_session_type_spawn(&spawned);
                     }
                 }
+                Some(InflightPluginCore::Coordination {
+                    ticket, rejected, ..
+                }) => {
+                    let finished = if rejected.is_some() {
+                        CoreTicketPoll::Refused
+                    } else {
+                        ticket.poll()
+                    };
+                    match finished {
+                        CoreTicketPoll::Pending => index += 1,
+                        CoreTicketPoll::Ready(result) => {
+                            if let InflightPluginCore::Coordination { response, .. } =
+                                inflight.swap_remove(index)
+                            {
+                                let _ = response.send(result);
+                            }
+                        }
+                        CoreTicketPoll::Lost => {
+                            if let InflightPluginCore::Coordination { response, .. } =
+                                inflight.swap_remove(index)
+                            {
+                                let _ = response.send(
+                                    crate::lua_runtime::CoordinationDelivery::Refused(
+                                        crate::lua_runtime::CoordinationRefusal::HelperStopped,
+                                    ),
+                                );
+                            }
+                        }
+                        CoreTicketPoll::Refused => {
+                            if let InflightPluginCore::Coordination {
+                                response, rejected, ..
+                            } = inflight.swap_remove(index)
+                            {
+                                let refusal = if rejected.as_ref().is_some_and(|rejected| {
+                                    rejected.reason
+                                        == crate::data_plane::driver::CoreRefusal::Stopped
+                                }) {
+                                    crate::lua_runtime::CoordinationRefusal::HelperStopped
+                                } else {
+                                    crate::lua_runtime::CoordinationRefusal::HelperFull
+                                };
+                                drop(rejected);
+                                let _ = response.send(
+                                    crate::lua_runtime::CoordinationDelivery::Refused(refusal),
+                                );
+                            }
+                        }
+                    }
+                }
+                None => break,
             }
         }
-        *inflight = retained;
     }
 
     pub(crate) fn validate_managed_git_request(
@@ -1591,18 +1825,30 @@ impl HubRuntime {
         )
         .map_err(|error| ManagedGitError::new(error.kind, error.message))?;
         drop(state);
+        if !prepared.created_worktree {
+            self.cancel_created_worktree_cleanup(&prepared.worktree_id);
+        }
+        self.retry_retained_reservation_releases();
+        self.retry_created_worktree_releases();
         let context = materialized.context.clone();
         let metadata = session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
-        {
-            let mut contexts = self.session_contexts.lock().map_err(|_| {
-                ManagedGitError::new("spawn_failed", "session context state is unavailable")
-            })?;
-            contexts.insert(context.context_id.clone(), context.clone());
-            contexts.insert(context.session_id.0.clone(), context.clone());
-        }
-        let tracker =
-            self.begin_spawn_for_owner(owner_waiter, materialized.spawn_request, metadata);
-        Ok(ManagedSessionSpawnStart { tracker, context })
+        let spawn = SpawnSessionRequest {
+            request: materialized.spawn_request,
+            metadata,
+        };
+        let session_id = spawn.request.session_id.clone();
+        let tracker = self.begin_reserve_session_for_owner(owner_waiter, session_id);
+        Ok(ManagedSessionSpawnStart {
+            tracker,
+            context,
+            waiter_id: owner_waiter,
+            stage: PluginSpawnStage::Reserve,
+            reservation: None,
+            spawn,
+            spawn_error: None,
+            reserve_operation_id: None,
+            context_published: false,
+        })
     }
 
     /// Finish one managed session spawn from its Core completion.
@@ -1610,18 +1856,17 @@ impl HubRuntime {
         &self,
         start: &ManagedSessionSpawnStart,
         prepared: &PreparedManagedWorktree,
-        result: Result<CoreSession, CoreDaemonError>,
+        result: Result<CoreSession, PluginSpawnFailure>,
     ) -> Result<PluginManagedSessionSpawned, ManagedGitError> {
         let context = &start.context;
-        let outcome = result.map_err(|error| {
+        let outcome = result.map_err(|failure| {
             eprintln!(
                 "managed_session_spawn_failed session_id={} core_error={}",
                 context.session_id.0,
-                managed_session_core_error_class(&error)
+                managed_session_core_error_class(&failure.error)
             );
-            if let Ok(mut contexts) = self.session_contexts.lock() {
-                contexts.remove(&context.context_id);
-                contexts.remove(&context.session_id.0);
+            if start.context_published {
+                self.retract_spawn_context(context);
             }
             ManagedGitError::new("spawn_failed", "configured session could not be spawned")
         })?;
@@ -1641,14 +1886,346 @@ impl HubRuntime {
 
     pub(crate) fn cleanup_managed_session(&self, spawned: &PluginManagedSessionSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
-        self.shutdown_session_detached(session_id.clone());
+        let tracked = self
+            .created_worktree_cleanups
+            .lock()
+            .ok()
+            .is_some_and(|held| held.iter().any(|cleanup| cleanup.session_id == session_id));
+        if !tracked {
+            self.shutdown_session_detached(session_id.clone());
+        }
         if let Ok(mut contexts) = self.session_contexts.lock() {
             contexts.remove(&session_id.0);
             contexts.remove(&format!("ctx-{}", session_id.0));
         }
     }
 
+    pub(crate) fn queue_created_worktree_cleanup(
+        &self,
+        session_id: SessionId,
+        prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+        reservation: SessionReservation,
+    ) {
+        if !prepared.created_worktree {
+            return;
+        }
+        if let Ok(mut suppressed) = self.suppressed_created_worktree_rollbacks.lock() {
+            suppressed.remove(&prepared.worktree_id);
+        }
+        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock()
+            && !cleanups
+                .iter()
+                .any(|cleanup| cleanup.worktree_id == prepared.worktree_id)
+        {
+            let shutdown = self.begin_shutdown_session(session_id.clone());
+            cleanups.push(CreatedWorktreeCleanup {
+                worktree_id: prepared.worktree_id.clone(),
+                session_id,
+                prepared,
+                reservation,
+                shutdown: Some(shutdown),
+                remove: None,
+                removed: false,
+                release: None,
+                release_attempted: false,
+            });
+        }
+        self.retry_created_worktree_releases();
+    }
+
+    pub(crate) fn cancel_created_worktree_cleanup(&self, worktree_id: &str) {
+        let mut detached = Vec::new();
+        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
+            let mut keep = Vec::new();
+            for mut cleanup in cleanups.drain(..) {
+                if cleanup.worktree_id != worktree_id {
+                    keep.push(cleanup);
+                    continue;
+                }
+                if let Some(tracker) = cleanup.shutdown.take() {
+                    detached.push(tracker);
+                }
+                if let Some(tracker) = cleanup.remove.take() {
+                    detached.push(tracker);
+                }
+                let tracker = cleanup.release.take().unwrap_or_else(|| {
+                    self.begin_release_session_reservation(cleanup.reservation.clone())
+                });
+                detached.push(tracker);
+            }
+            *cleanups = keep;
+        }
+        if let Ok(mut confirmed) = self.confirmed_worktree_rollbacks.lock() {
+            confirmed.retain(|prepared| prepared.worktree_id != worktree_id);
+        }
+        if let Ok(mut suppressed) = self.suppressed_created_worktree_rollbacks.lock() {
+            suppressed.insert(worktree_id.to_string());
+        }
+        if let Ok(mut held) = self.detached_operations.lock() {
+            held.extend(detached);
+        }
+    }
+
+    pub(crate) fn created_worktree_rollback_suppressed(&self, worktree_id: &str) -> bool {
+        self.suppressed_created_worktree_rollbacks
+            .lock()
+            .ok()
+            .is_some_and(|held| held.contains(worktree_id))
+    }
+
+    pub(crate) fn created_worktree_rollback_suppressions(&self) -> Arc<Mutex<BTreeSet<String>>> {
+        Arc::clone(&self.suppressed_created_worktree_rollbacks)
+    }
+
+    pub(crate) fn begin_submitted_worktree_rollback(&self, worktree_id: &str) {
+        if let Ok(mut held) = self.submitted_created_worktree_rollbacks.lock() {
+            held.insert(worktree_id.to_string());
+        }
+    }
+
+    pub(crate) fn clear_submitted_worktree_rollback(&self, worktree_id: &str) {
+        if let Ok(mut held) = self.submitted_created_worktree_rollbacks.lock() {
+            held.remove(worktree_id);
+        }
+    }
+
+    pub(crate) fn finish_submitted_worktree_rollback(&self, worktree_id: &str) {
+        self.clear_submitted_worktree_rollback(worktree_id);
+        self.session_type_spawner.publish_managed_spawn();
+    }
+
+    pub(crate) fn submitted_worktree_rollback(&self, worktree_id: &str) -> bool {
+        self.submitted_created_worktree_rollbacks
+            .lock()
+            .ok()
+            .is_some_and(|held| held.contains(worktree_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_rollback_git_hold(
+        &self,
+        gate: Arc<crate::host_executor::TestHostGate>,
+    ) {
+        if let Ok(mut held) = self.rollback_git_hold.lock() {
+            *held = Some(gate);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_rollback_git_hold(&self) -> Option<Arc<crate::host_executor::TestHostGate>> {
+        self.rollback_git_hold
+            .lock()
+            .ok()
+            .and_then(|held| held.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_note_managed_accept_one(&self) {
+        self.managed_accept_ones.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_managed_accept_ones(&self) -> usize {
+        self.managed_accept_ones.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn peek_pending_managed_worktree_id(&self) -> Option<String> {
+        self.session_type_spawner.peek_managed_worktree_id()
+    }
+
+    pub(crate) fn retry_retained_reservation_releases(&self) {
+        let _ = self;
+    }
+
+    fn continue_created_worktree_cleanup_phases(&self) {
+        let Ok(mut cleanups) = self.created_worktree_cleanups.lock() else {
+            return;
+        };
+        for cleanup in cleanups.iter_mut() {
+            if cleanup.shutdown.is_some() || cleanup.remove.is_some() || cleanup.release.is_some() {
+                continue;
+            }
+            if !cleanup.removed {
+                cleanup.remove = Some(self.begin_remove_session(&cleanup.session_id));
+                continue;
+            }
+            if cleanup.release_attempted {
+                continue;
+            }
+            cleanup.release =
+                Some(self.begin_release_session_reservation(cleanup.reservation.clone()));
+            cleanup.release_attempted = true;
+        }
+    }
+
+    pub(crate) fn retry_created_worktree_releases(&self) {
+        let Ok(mut cleanups) = self.created_worktree_cleanups.lock() else {
+            return;
+        };
+        for cleanup in cleanups.iter_mut() {
+            if cleanup.shutdown.is_some() || cleanup.remove.is_some() || cleanup.release.is_some() {
+                continue;
+            }
+            if !cleanup.removed {
+                cleanup.remove = Some(self.begin_remove_session(&cleanup.session_id));
+                continue;
+            }
+            cleanup.release =
+                Some(self.begin_release_session_reservation(cleanup.reservation.clone()));
+            cleanup.release_attempted = true;
+        }
+    }
+
+    fn advance_created_worktree_cleanups(&self) {
+        let Ok(mut cleanups) = self.created_worktree_cleanups.lock() else {
+            return;
+        };
+        let mut keep = Vec::new();
+        let mut confirmed = Vec::new();
+        for mut cleanup in cleanups.drain(..) {
+            if let Some(tracker) = cleanup.shutdown.as_mut() {
+                match tracker.poll(self) {
+                    CoreTicketPoll::Pending => {
+                        keep.push(cleanup);
+                        continue;
+                    }
+                    CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
+                        cleanup.shutdown = None;
+                    }
+                }
+            }
+            if let Some(tracker) = cleanup.remove.as_mut() {
+                match tracker.poll(self) {
+                    CoreTicketPoll::Pending => {
+                        keep.push(cleanup);
+                        continue;
+                    }
+                    CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
+                        cleanup.remove = None;
+                        cleanup.removed = true;
+                    }
+                }
+            }
+            let Some(tracker) = cleanup.release.as_mut() else {
+                keep.push(cleanup);
+                continue;
+            };
+            match tracker.poll(self) {
+                CoreTicketPoll::Pending => keep.push(cleanup),
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                    result: Ok(SessionReservationRelease::Released),
+                    ..
+                })) => {
+                    confirmed.push(cleanup.prepared);
+                }
+                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
+                    cleanup.release = None;
+                    keep.push(cleanup);
+                }
+            }
+        }
+        *cleanups = keep;
+        drop(cleanups);
+        self.continue_created_worktree_cleanup_phases();
+        if confirmed.is_empty() {
+            return;
+        }
+        if let Ok(mut held) = self.confirmed_worktree_rollbacks.lock() {
+            held.extend(confirmed);
+        }
+        self.session_type_spawner.publish_managed_spawn();
+    }
+
+    pub(crate) fn defer_confirmed_worktree_rollback(
+        &self,
+        prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+    ) {
+        if let Ok(mut held) = self.confirmed_worktree_rollbacks.lock() {
+            held.push(prepared);
+        }
+    }
+
+    pub(crate) fn take_one_confirmed_worktree_rollback(
+        &self,
+    ) -> Option<crate::managed_git_worktrees::PreparedManagedWorktree> {
+        self.confirmed_worktree_rollbacks
+            .lock()
+            .ok()
+            .and_then(|mut held| {
+                if held.is_empty() {
+                    None
+                } else {
+                    Some(held.remove(0))
+                }
+            })
+    }
+
+    pub(crate) fn wake_remaining_confirmed_worktree_rollbacks(&self) {
+        let has_confirmed = self
+            .confirmed_worktree_rollbacks
+            .lock()
+            .ok()
+            .is_some_and(|held| !held.is_empty());
+        if has_confirmed {
+            self.session_type_spawner.publish_managed_spawn();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_queue_removed_created_worktree_cleanup(
+        &self,
+        session_id: SessionId,
+        prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+        reservation: SessionReservation,
+    ) {
+        let worktree_id = prepared.worktree_id.clone();
+        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
+            cleanups.push(CreatedWorktreeCleanup {
+                worktree_id,
+                session_id,
+                prepared,
+                reservation,
+                shutdown: None,
+                remove: None,
+                removed: true,
+                release: None,
+                release_attempted: false,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_created_worktree_cleanup_release_idle(&self) -> bool {
+        self.created_worktree_cleanups
+            .lock()
+            .ok()
+            .is_some_and(|held| {
+                held.iter().all(|cleanup| {
+                    cleanup.shutdown.is_none()
+                        && cleanup.remove.is_none()
+                        && cleanup.release.is_none()
+                })
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_created_worktree_cleanup_count(&self) -> usize {
+        self.created_worktree_cleanups
+            .lock()
+            .map(|held| held.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_confirmed_worktree_rollback_count(&self) -> usize {
+        self.confirmed_worktree_rollbacks
+            .lock()
+            .map(|held| held.len())
+            .unwrap_or(0)
+    }
+
     fn fulfill_pending_plugin_requests(&self) {
+        self.advance_created_worktree_cleanups();
         self.apply_causal_owner_ops();
         self.fulfill_pending_coordination_requests();
         self.fulfill_pending_entity_publish_requests();
@@ -2244,46 +2821,198 @@ impl HubRuntime {
             .is_some_and(|family| family.resync.degraded)
     }
 
+    pub(crate) fn coordination_retirement(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> crate::data_plane::driver::CoreWaiterRetirement {
+        self.core_daemon.waiter_retirement(waiter_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_core_waiter_probe(
+        &self,
+    ) -> impl Fn(crate::owner_identity::WaiterId) -> bool + Send + 'static {
+        let core = self.core_daemon.clone();
+        move |waiter_id| core.test_retains_waiter(waiter_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lua_callback_usage_probe(&self) -> impl Fn() -> usize + Send + 'static {
+        let memory = Arc::clone(&self.lua_memory);
+        move || memory.usage().1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lua_memory(&self) -> Arc<crate::lua_memory::LuaMemoryAccount> {
+        Arc::clone(&self.lua_memory)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fulfill_pending_coordination_requests(&self) {
+        self.fulfill_pending_coordination_requests();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_coordination_core_submits(&self) -> usize {
+        self.coordination_core_submits
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_retained_reservation_takes(&self) -> usize {
+        self.retained_reservation_takes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_inflight_reserved(&self) -> usize {
+        self.inflight_plugin_core.lock().unwrap().reserved()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_inflight_capacity(&self) -> usize {
+        self.inflight_plugin_core.lock().unwrap().capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_inflight_charge_bytes(&self) -> usize {
+        self.inflight_plugin_core.lock().unwrap().charge_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_callback_charge_owners(&self) -> Vec<(String, usize)> {
+        let mut owners = Vec::new();
+        let bridge = self.coordination_bridge();
+        owners.push((
+            format!(
+                "pending charge_bytes capacity={}",
+                bridge.test_pending_capacity()
+            ),
+            bridge.test_pending_charge_bytes(),
+        ));
+        owners.push((
+            format!(
+                "inflight charge_bytes capacity={}",
+                self.test_inflight_capacity()
+            ),
+            self.test_inflight_charge_bytes(),
+        ));
+        let runtimes = self
+            .lua_plugin_runtimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for runtime in runtimes.iter().filter_map(std::sync::Weak::upgrade) {
+            let key = runtime.test_plugin_key();
+            owners.push((
+                format!("instruction_error:{key}"),
+                runtime.test_instruction_error_bytes(),
+            ));
+            owners.push((
+                format!("capacity_string:{key}"),
+                runtime.test_capacity_string_bytes(),
+            ));
+        }
+        owners
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_callback_charge_breakdown_probe(
+        &self,
+    ) -> impl Fn() -> Vec<(String, usize)> + Send + 'static {
+        let pending = self.coordination_bridge();
+        let runtimes = std::sync::Arc::clone(&self.lua_plugin_runtimes);
+        move || {
+            let mut owners = Vec::new();
+            owners.push((
+                format!(
+                    "pending charge_bytes capacity={}",
+                    pending.test_pending_capacity()
+                ),
+                pending.test_pending_charge_bytes(),
+            ));
+            let runtimes = runtimes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for runtime in runtimes.iter().filter_map(std::sync::Weak::upgrade) {
+                let key = runtime.test_plugin_key();
+                owners.push((
+                    format!("instruction_error:{key}"),
+                    runtime.test_instruction_error_bytes(),
+                ));
+                owners.push((
+                    format!("capacity_string:{key}"),
+                    runtime.test_capacity_string_bytes(),
+                ));
+            }
+            owners
+        }
+    }
+
+    pub(crate) fn bind_terminal_core_owner(&self) {
+        self.core_daemon.bind_terminal_owner();
+    }
+
+    pub(crate) fn take_terminal_coordination_completion(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) {
+        self.core_daemon.take_terminal_completion(waiter_id);
+    }
+
+    pub(crate) fn submit_coordination_for_owner(
+        &self,
+        retirement: &crate::data_plane::driver::CoreWaiterRetirement,
+        operation: PendingCoordinationOperation,
+        caller: crate::lua_runtime::CoordinationCaller,
+        storage: Option<crate::data_plane::driver::CoreSubmissionStorage>,
+    ) -> crate::data_plane::driver::CoreSubmission<crate::lua_runtime::CoordinationReply> {
+        self.core_daemon.submit_retained_for_owner(
+            retirement,
+            move |daemon| operation.execute(daemon),
+            move || caller.claim(),
+            storage,
+        )
+    }
+
     fn fulfill_pending_coordination_requests(&self) {
         while let Some(pending) = self.coordination_bridge.take_pending() {
-            let ticket = match pending.operation {
-                PendingCoordinationOperation::Publish { envelope } => {
-                    self.core_daemon.submit(move |daemon| {
-                        daemon
-                            .publish_routed_envelope(PublishRoutedEnvelopeRequest { envelope })
-                            .map(HubCoordinationResponse::Publish)
-                            .map_err(|error| error.to_string())
-                    })
-                }
-                PendingCoordinationOperation::Drain {
-                    target,
-                    after,
-                    limit,
-                } => self.core_daemon.submit(move |daemon| {
-                    daemon
-                        .drain_routed_envelopes(DrainRoutedEnvelopesRequest {
-                            target,
-                            after,
-                            limit,
-                        })
-                        .map(HubCoordinationResponse::Drain)
-                        .map_err(|error| error.to_string())
-                }),
-                PendingCoordinationOperation::Acknowledge { input } => {
-                    self.core_daemon.submit(move |daemon| {
-                        input
-                            .acknowledge(daemon)
-                            .map(HubCoordinationResponse::Acknowledge)
-                            .map_err(|error| error.to_string())
-                    })
+            let slot = match crate::lua_memory::charged_collection::SlotReservation::try_reserve(
+                &self.inflight_plugin_core,
+            ) {
+                Ok(slot) => slot,
+                Err(_) => {
+                    let _ =
+                        pending
+                            .response
+                            .send(crate::lua_runtime::CoordinationDelivery::Refused(
+                                crate::lua_runtime::CoordinationRefusal::CallbackCapacity,
+                            ));
+                    continue;
                 }
             };
-            if let Ok(mut inflight) = self.inflight_plugin_core.lock() {
-                inflight.push(InflightPluginCore::Coordination {
-                    ticket,
-                    response: pending.response,
-                });
-            }
+            let (core_storage, storage) = match pending.storage {
+                Some(storage) => (
+                    Some(storage.core),
+                    Some((storage.continuation, storage.disposal)),
+                ),
+                None => (None, None),
+            };
+            let caller = pending.caller;
+            #[cfg(test)]
+            self.coordination_core_submits
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let submission = self.core_daemon.submit_retained(
+                move |daemon| pending.operation.execute(daemon),
+                move || caller.claim(),
+                core_storage,
+            );
+            slot.insert(InflightPluginCore::Coordination {
+                ticket: submission.ticket,
+                response: pending.response,
+                rejected: submission.rejected,
+                _storage: storage,
+                _entry: pending.entry,
+            });
         }
         self.advance_inflight_plugin_core();
     }
@@ -2318,18 +3047,32 @@ impl HubRuntime {
         drop(state);
         let context = materialized.context.clone();
         let metadata = session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
-        {
-            let mut contexts = self
-                .session_contexts
-                .lock()
-                .map_err(|_| "session context lock poisoned".to_string())?;
-            contexts.insert(context.context_id.clone(), context.clone());
-            contexts.insert(context.session_id.0.clone(), context.clone());
-        }
-
-        let tracker = self.begin_spawn(materialized.spawn_request, metadata);
+        let spawn = SpawnSessionRequest {
+            request: materialized.spawn_request,
+            metadata,
+        };
+        let session_id = spawn.request.session_id.clone();
+        let retry_tokens = self.take_retained_reservations();
+        let stage = if retry_tokens.is_empty() {
+            PluginSpawnStage::Reserve
+        } else {
+            PluginSpawnStage::RetryRetained
+        };
+        let tracker = if matches!(stage, PluginSpawnStage::Reserve) {
+            self.begin_reserve_session(session_id)
+        } else {
+            self.begin_release_session_reservation(retry_tokens[0].clone())
+        };
         Ok(SessionTypeSpawnStart {
             tracker,
+            stage,
+            reservation: None,
+            spawn,
+            spawn_error: None,
+            reserve_operation_id: None,
+            retry_tokens,
+            retry_keep: Vec::new(),
+            context_published: false,
             context,
             session_type_id: materialized.resolved.session_type.session_type_id,
             context_id: materialized.resolved.context_id,
@@ -2340,19 +3083,18 @@ impl HubRuntime {
     fn finish_session_type_spawn(
         &self,
         start: &SessionTypeSpawnStart,
-        result: Result<CoreSession, CoreDaemonError>,
+        result: Result<CoreSession, PluginSpawnFailure>,
     ) -> Result<PluginSessionTypeSpawned, String> {
         let context = &start.context;
-        let outcome = result.map_err(|error| match self.session_contexts.lock() {
-            Ok(mut contexts) => {
-                contexts.remove(&context.context_id);
-                contexts.remove(&context.session_id.0);
-                format!("session type spawn failed: {error}")
+        let outcome = result.map_err(|failure| {
+            if start.context_published {
+                self.retract_spawn_context(context);
             }
-            Err(_) => {
-                format!(
-                    "session type spawn failed: {error}; session context rollback lock poisoned"
-                )
+            match failure.disposition {
+                Some(SessionReservationRelease::RetainedUnconfirmed) => {
+                    format!("cleanup_unconfirmed: {}", failure.error)
+                }
+                _ => format!("session type spawn failed: {}", failure.error),
             }
         })?;
         Ok(PluginSessionTypeSpawned {
@@ -3239,6 +3981,163 @@ impl HubRuntime {
         )))
     }
 
+    pub(crate) fn begin_reserve_session(&self, session_id: SessionId) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin(CoreOperation::ReserveSession(session_id)),
+        )
+    }
+
+    pub(crate) fn begin_spawn_reserved(
+        &self,
+        reservation: SessionReservation,
+        request: SpawnSessionRequest,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin(CoreOperation::SpawnReserved {
+            reservation,
+            request,
+        }))
+    }
+
+    pub(crate) fn begin_release_session_reservation(
+        &self,
+        reservation: SessionReservation,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin(CoreOperation::ReleaseSessionReservation(reservation)),
+        )
+    }
+
+    pub(crate) fn begin_lookup_session_reservation(
+        &self,
+        session_id: SessionId,
+        reserve_operation_id: PendingOperationId,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin(CoreOperation::LookupSessionReservation {
+                    session_id,
+                    reserve_operation_id,
+                }),
+        )
+    }
+
+    pub(crate) fn take_retained_reservations(&self) -> Vec<SessionReservation> {
+        #[cfg(test)]
+        self.retained_reservation_takes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.retained_plugin_reservations
+            .lock()
+            .map(|mut held| std::mem::take(&mut *held))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn merge_retained_reservations(&self, tokens: Vec<SessionReservation>) {
+        if let Ok(mut held) = self.retained_plugin_reservations.lock() {
+            for token in tokens {
+                if !held.iter().any(|existing| existing == &token) {
+                    held.push(token);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn retain_reservation(&self, reservation: SessionReservation) {
+        if let Ok(mut held) = self.retained_plugin_reservations.lock()
+            && !held.iter().any(|existing| existing == &reservation)
+        {
+            held.push(reservation);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fulfill_plugin_spawns(&self) {
+        self.fulfill_pending_session_type_spawns();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_plugin_spawn(
+        &self,
+        plugin_key: &str,
+        session_type_id: &str,
+        request: crate::session_types::SessionTypeRequest,
+        package_records: Vec<crate::packages::PackageRecord>,
+    ) -> Result<PluginSessionTypeSpawned, String> {
+        let (response, receiver) = mpsc::channel();
+        self.session_type_spawner
+            .pending
+            .lock()
+            .map_err(|_| "session type spawn queue lock poisoned".to_string())?
+            .push_back(PendingSessionTypeSpawn {
+                plugin_key: PluginKey(plugin_key.into()),
+                session_type_id: session_type_id.into(),
+                request,
+                package_records,
+                response,
+                _dispose_probe: None,
+            });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            self.fulfill_pending_session_type_spawns();
+            match receiver.try_recv() {
+                Ok(result) => return result.map_err(|error| error.into_owned()),
+                Err(mpsc::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        return Err("plugin session type spawn timed out".to_string());
+                    }
+                    thread::yield_now();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("plugin session type spawn disconnected".to_string());
+                }
+            }
+        }
+    }
+
+    pub(crate) fn retained_reservations(&self) -> Vec<SessionReservation> {
+        self.retained_plugin_reservations
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_session_context(
+        &self,
+        key: &str,
+    ) -> Option<crate::session_types::HubSessionContext> {
+        self.session_contexts.lock().ok()?.get(key).cloned()
+    }
+
+    pub(crate) fn publish_spawn_context(&self, context: &HubSessionContext) -> Result<(), String> {
+        let mut contexts = self
+            .session_contexts
+            .lock()
+            .map_err(|_| "session context lock poisoned".to_string())?;
+        contexts.insert(context.context_id.clone(), context.clone());
+        contexts.insert(context.session_id.0.clone(), context.clone());
+        Ok(())
+    }
+
+    pub(crate) fn retract_spawn_context(&self, context: &HubSessionContext) {
+        let Ok(mut contexts) = self.session_contexts.lock() else {
+            return;
+        };
+        if contexts
+            .get(&context.context_id)
+            .is_some_and(|stored| stored.context_id == context.context_id)
+        {
+            contexts.remove(&context.context_id);
+        }
+        if contexts
+            .get(&context.session_id.0)
+            .is_some_and(|stored| stored.context_id == context.context_id)
+        {
+            contexts.remove(&context.session_id.0);
+        }
+    }
+
     pub(crate) fn begin_spawn_for_owner(
         &self,
         waiter_id: crate::owner_identity::WaiterId,
@@ -3248,6 +4147,58 @@ impl HubRuntime {
         CoreOperationTracker::new(self.core_daemon.begin_for_owner(
             waiter_id,
             CoreOperation::Spawn(SpawnSessionRequest { request, metadata }),
+        ))
+    }
+
+    pub(crate) fn begin_reserve_session_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        session_id: SessionId,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(
+            self.core_daemon
+                .begin_for_owner(waiter_id, CoreOperation::ReserveSession(session_id)),
+        )
+    }
+
+    pub(crate) fn begin_spawn_reserved_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        reservation: SessionReservation,
+        request: SpawnSessionRequest,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::SpawnReserved {
+                reservation,
+                request,
+            },
+        ))
+    }
+
+    pub(crate) fn begin_release_session_reservation_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        reservation: SessionReservation,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::ReleaseSessionReservation(reservation),
+        ))
+    }
+
+    pub(crate) fn begin_lookup_session_reservation_for_owner(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        session_id: SessionId,
+        reserve_operation_id: PendingOperationId,
+    ) -> CoreOperationTracker {
+        CoreOperationTracker::new(self.core_daemon.begin_for_owner(
+            waiter_id,
+            CoreOperation::LookupSessionReservation {
+                session_id,
+                reserve_operation_id,
+            },
         ))
     }
 
@@ -3393,6 +4344,7 @@ impl HubRuntime {
         &self,
         sender: crate::daemon::control::message::ControlSender,
     ) {
+        self.coordination_bridge.bind_owner_wake(sender.clone());
         if let Some(driver) = self.data_plane.as_ref() {
             driver.bind_owner_wake(sender);
         }
@@ -4024,7 +4976,68 @@ impl HubSessionTypeSpawner {
             managed: Mutex::new(VecDeque::new()),
             managed_pending: AtomicBool::new(false),
             managed_owner: Mutex::new(None),
+            abandoned: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn abandon_session_type_spawn(&self, session_id: String) {
+        self.abandoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_take_abandoned(&self) -> Vec<String> {
+        self.take_abandoned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_managed_queue_len(&self) -> usize {
+        self.managed.lock().map(|queue| queue.len()).unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_publish_managed_spawn(&self) {
+        self.publish_managed_spawn();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_enqueue_managed_disconnected(
+        &self,
+        plugin_key: PluginKey,
+        target_id: String,
+        branch: String,
+        session_type_id: String,
+        request: ManagedSessionTypeRequest,
+        package_records: Vec<PackageRecord>,
+    ) {
+        let (response, receiver) = mpsc::channel();
+        drop(receiver);
+        self.managed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(PendingManagedSessionSpawn {
+                plugin_key,
+                target_id,
+                branch,
+                session_type_id,
+                request,
+                package_records,
+                accepted_at: Instant::now(),
+                response,
+                _dispose_probe: None,
+            });
+        self.publish_managed_spawn();
+    }
+
+    fn take_abandoned(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .abandoned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     fn bind_managed_owner_wake(&self, sender: crate::daemon::control::message::ControlSender) {
@@ -4063,13 +5076,12 @@ impl HubSessionTypeSpawner {
         session_type_id: &str,
         request: SessionTypeRequest,
         package_records: Vec<PackageRecord>,
-    ) -> Result<PluginSessionTypeSpawned, String> {
+    ) -> Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>> {
         let (response, receiver) = mpsc::channel();
         {
-            let mut pending = self
-                .pending
-                .lock()
-                .map_err(|_| "session-type spawn queue lock poisoned".to_string())?;
+            let mut pending = self.pending.lock().map_err(|_| {
+                std::borrow::Cow::Borrowed("session-type spawn queue lock poisoned")
+            })?;
             pending.push_back(PendingSessionTypeSpawn {
                 plugin_key: plugin_key.clone(),
                 session_type_id: session_type_id.to_string(),
@@ -4083,7 +5095,9 @@ impl HubSessionTypeSpawner {
 
         receiver
             .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
-            .map_err(|_| "session-type spawn did not complete before timeout".to_string())?
+            .map_err(|_| {
+                std::borrow::Cow::Borrowed("session-type spawn did not complete before timeout")
+            })?
     }
 
     fn take_pending(&self) -> Option<PendingSessionTypeSpawn> {
@@ -4146,6 +5160,14 @@ impl HubSessionTypeSpawner {
             })?
     }
 
+    fn peek_managed_worktree_id(&self) -> Option<String> {
+        self.managed
+            .lock()
+            .ok()?
+            .front()
+            .map(|pending| managed_worktree_id(&pending.target_id, &pending.branch))
+    }
+
     fn take_managed(&self) -> Option<PendingManagedSessionSpawn> {
         let mut pending = self
             .managed
@@ -4163,6 +5185,17 @@ impl HubSessionTypeSpawner {
 
 fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
     match error {
+        CoreDaemonError::SessionReservation(refusal) => match refusal {
+            SessionReservationRefusal::Occupied => "session_reservation.occupied",
+            SessionReservationRefusal::Busy => "session_reservation.busy",
+            SessionReservationRefusal::Unsupported => "session_reservation.unsupported",
+            SessionReservationRefusal::IdentityExhausted => {
+                "session_reservation.identity_exhausted"
+            }
+            SessionReservationRefusal::Unavailable => "session_reservation.unavailable",
+            SessionReservationRefusal::InvalidToken => "session_reservation.invalid_token",
+            SessionReservationRefusal::Capacity => "session_reservation.capacity",
+        },
         CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
             MultiplexerEngineError::Runtime(runtime_error),
         ))
@@ -4185,6 +5218,15 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
             MultiplexerEngineError::MetadataTooLarge,
         )) => "engine.multiplexer.metadata_too_large",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Refused(_)),
+        )) => "engine.multiplexer.reserved_spawn.refused",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Admitted(_)),
+        )) => "engine.multiplexer.reserved_spawn.admitted",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::Multiplexer(
+            MultiplexerEngineError::InstallationAfterLaunch(_),
+        )) => "engine.multiplexer.installation_after_launch",
         CoreDaemonError::Engine(ManagedSessionRuntimeError::UnsupportedSessionRequest {
             ..
         }) => "engine.unsupported_session_request",
@@ -4388,6 +5430,8 @@ pub type HubRuntimeOutput = BotsterEngineOutput;
 /// Error emitted by the daemon-backed hub runtime.
 #[derive(Debug)]
 pub enum HubRuntimeError {
+    /// Explicit Hub memory policy failed validation.
+    Config(crate::config::HubConfigError),
     /// Core daemon operation failed.
     CoreDaemon(CoreDaemonError),
     /// The Hub capability runtime could not open its plugin database.
@@ -4404,6 +5448,7 @@ pub enum HubRuntimeError {
 impl fmt::Display for HubRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config(error) => write!(formatter, "{error}"),
             Self::CoreDaemon(error) => write!(formatter, "{error}"),
             Self::Capability(error) => write!(formatter, "{error}"),
             Self::IncompatibleWorkers { sessions } => write!(
@@ -4420,6 +5465,7 @@ impl fmt::Display for HubRuntimeError {
 impl Error for HubRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Config(error) => Some(error),
             Self::CoreDaemon(error) => Some(error),
             Self::Capability(error) => Some(error),
             Self::IncompatibleWorkers { .. } => None,
@@ -4762,24 +5808,447 @@ impl CoreOperationTracker {
 }
 
 /// Plugin-facing Core work the owner polls between plugin invocations.
-enum InflightPluginCore {
+#[allow(clippy::large_enum_variant)] // retained in-flight record for the owner-less runtime path; entries are polled in place
+#[allow(private_interfaces)]
+pub(crate) enum InflightPluginCore {
     Coordination {
-        ticket: CoreTicket<Result<HubCoordinationResponse, String>>,
-        response: mpsc::Sender<Result<HubCoordinationResponse, String>>,
+        ticket: crate::data_plane::driver::ChargedCoreTicket<crate::lua_runtime::CoordinationReply>,
+        response: crate::lua_runtime::CoordinationReplySender,
+        rejected: Option<crate::data_plane::driver::CoreRejectedRequest>,
+        _storage: Option<(
+            crate::lua_memory::LuaCallbackCharge,
+            crate::lua_memory::LuaCallbackCharge,
+        )>,
+        _entry: Option<crate::lua_memory::LuaCallbackCharge>,
     },
     SessionTypeSpawn {
         start: SessionTypeSpawnStart,
-        response: mpsc::Sender<Result<PluginSessionTypeSpawned, String>>,
+        response: mpsc::Sender<Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>>>,
     },
+}
+
+enum PluginSpawnStage {
+    RetryRetained,
+    Reserve,
+    Lookup,
+    SpawnReserved,
+    Release,
+}
+
+pub(crate) struct PluginSpawnFailure {
+    pub error: CoreDaemonError,
+    pub disposition: Option<SessionReservationRelease>,
+}
+
+pub(crate) enum PluginSpawnPoll {
+    Pending,
+    Ready(Result<CoreSession, PluginSpawnFailure>),
 }
 
 /// One session-type spawn in flight on the Core owner thread.
 struct SessionTypeSpawnStart {
     tracker: CoreOperationTracker,
+    stage: PluginSpawnStage,
+    reservation: Option<SessionReservation>,
+    spawn: SpawnSessionRequest,
+    spawn_error: Option<CoreDaemonError>,
+    reserve_operation_id: Option<PendingOperationId>,
+    retry_tokens: Vec<SessionReservation>,
+    retry_keep: Vec<SessionReservation>,
+    context_published: bool,
     context: HubSessionContext,
     session_type_id: String,
     context_id: String,
     context_keys: Vec<String>,
+}
+
+fn spawn_fail(
+    error: CoreDaemonError,
+    disposition: Option<SessionReservationRelease>,
+) -> PluginSpawnPoll {
+    PluginSpawnPoll::Ready(Err(PluginSpawnFailure { error, disposition }))
+}
+
+impl SessionTypeSpawnStart {
+    fn poll(&mut self, runtime: &HubRuntime) -> PluginSpawnPoll {
+        loop {
+            if let Some(pending_id) = self.tracker.pending_id()
+                && matches!(self.stage, PluginSpawnStage::Reserve)
+            {
+                self.reserve_operation_id = Some(pending_id);
+            }
+            match self.stage {
+                PluginSpawnStage::RetryRetained => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused
+                    | CoreTicketPoll::Lost
+                    | CoreTicketPoll::Ready(Err(_)) => {
+                        if !self.retry_tokens.is_empty() {
+                            self.retry_keep.push(self.retry_tokens.remove(0));
+                        }
+                        self.continue_retry_or_reserve(runtime);
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                        result,
+                        ..
+                    })) => {
+                        let held = self.retry_tokens.remove(0);
+                        match result {
+                            Ok(SessionReservationRelease::Released) => {}
+                            Ok(_) | Err(_) => self.retry_keep.push(held),
+                        }
+                        self.continue_retry_or_reserve(runtime);
+                    }
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
+                PluginSpawnStage::Reserve => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
+                    }
+                    CoreTicketPoll::Lost => {
+                        let Some(reserve_id) = self.reserve_operation_id else {
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
+                        };
+                        self.tracker = runtime.begin_lookup_session_reservation(
+                            self.spawn.request.session_id.clone(),
+                            reserve_id,
+                        );
+                        self.stage = PluginSpawnStage::Lookup;
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        return spawn_fail(error, None);
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                        result, ..
+                    })) => match result {
+                        Ok(reserved) => {
+                            self.reservation = Some(reserved.clone());
+                            if runtime.publish_spawn_context(&self.context).is_err() {
+                                self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                self.release_or_retain(runtime);
+                                continue;
+                            }
+                            self.context_published = true;
+                            self.tracker =
+                                runtime.begin_spawn_reserved(reserved, self.spawn.clone());
+                            self.stage = PluginSpawnStage::SpawnReserved;
+                        }
+                        Err(error) => return spawn_fail(error, None),
+                    },
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
+                PluginSpawnStage::Lookup => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
+                    }
+                    CoreTicketPoll::Lost | CoreTicketPoll::Ready(Err(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::LookupSessionReservation {
+                        result,
+                        ..
+                    })) => match result {
+                        Ok(Some(reserved)) => {
+                            self.reservation = Some(reserved.clone());
+                            self.spawn_error = Some(CoreDaemonError::Shutdown);
+                            self.tracker = runtime.begin_release_session_reservation(reserved);
+                            self.stage = PluginSpawnStage::Release;
+                        }
+                        Ok(None) => {
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
+                        }
+                        Err(error) => return spawn_fail(error, None),
+                    },
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
+                PluginSpawnStage::SpawnReserved => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        self.spawn_error = Some(core_bridge_error(CoreTicketError::Overloaded));
+                        self.release_or_retain(runtime);
+                    }
+                    CoreTicketPoll::Lost => {
+                        self.spawn_error = Some(CoreDaemonError::Shutdown);
+                        self.release_or_retain(runtime);
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        self.spawn_error = Some(error);
+                        self.release_or_retain(runtime);
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Installed { session },
+                        ..
+                    })) => {
+                        return PluginSpawnPoll::Ready(Ok(session));
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Refused { error },
+                        ..
+                    }))
+                    | CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::AdmittedFailure { error, .. },
+                        ..
+                    })) => {
+                        self.spawn_error = Some(error);
+                        self.release_or_retain(runtime);
+                    }
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
+                PluginSpawnStage::Release => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused
+                    | CoreTicketPoll::Lost
+                    | CoreTicketPoll::Ready(Err(_)) => {
+                        self.keep_reservation(runtime);
+                        return spawn_fail(
+                            self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown),
+                            Some(SessionReservationRelease::RetainedUnconfirmed),
+                        );
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                        result,
+                        ..
+                    })) => {
+                        let error = self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
+                        match result {
+                            Ok(SessionReservationRelease::Released) => {
+                                return spawn_fail(
+                                    error,
+                                    Some(SessionReservationRelease::Released),
+                                );
+                            }
+                            Ok(disposition) => {
+                                self.keep_reservation(runtime);
+                                return spawn_fail(error, Some(disposition));
+                            }
+                            Err(_) => {
+                                self.keep_reservation(runtime);
+                                return spawn_fail(
+                                    error,
+                                    Some(SessionReservationRelease::RetainedUnconfirmed),
+                                );
+                            }
+                        }
+                    }
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
+            }
+        }
+    }
+
+    fn release_or_retain(&mut self, runtime: &HubRuntime) {
+        if let Some(held) = self.reservation.clone() {
+            self.tracker = runtime.begin_release_session_reservation(held);
+            self.stage = PluginSpawnStage::Release;
+        }
+    }
+
+    fn keep_reservation(&mut self, runtime: &HubRuntime) {
+        if let Some(held) = self.reservation.take() {
+            runtime.retain_reservation(held);
+        }
+    }
+
+    fn continue_retry_or_reserve(&mut self, runtime: &HubRuntime) {
+        if self.retry_tokens.is_empty() {
+            runtime.merge_retained_reservations(std::mem::take(&mut self.retry_keep));
+            self.tracker = runtime.begin_reserve_session(self.spawn.request.session_id.clone());
+            self.stage = PluginSpawnStage::Reserve;
+        } else {
+            self.tracker = runtime.begin_release_session_reservation(self.retry_tokens[0].clone());
+        }
+    }
+}
+
+impl ManagedSessionSpawnStart {
+    pub(crate) fn poll(&mut self, runtime: &HubRuntime) -> PluginSpawnPoll {
+        loop {
+            if let Some(pending_id) = self.tracker.pending_id()
+                && matches!(self.stage, PluginSpawnStage::Reserve)
+            {
+                self.reserve_operation_id = Some(pending_id);
+            }
+            match self.stage {
+                PluginSpawnStage::RetryRetained => {
+                    return spawn_fail(CoreDaemonError::Shutdown, None);
+                }
+                PluginSpawnStage::Reserve => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
+                    }
+                    CoreTicketPoll::Lost => {
+                        let Some(reserve_id) = self.reserve_operation_id else {
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
+                        };
+                        self.tracker = runtime.begin_lookup_session_reservation_for_owner(
+                            self.waiter_id,
+                            self.spawn.request.session_id.clone(),
+                            reserve_id,
+                        );
+                        self.stage = PluginSpawnStage::Lookup;
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        return spawn_fail(error, None);
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                        result, ..
+                    })) => match result {
+                        Ok(reserved) => {
+                            self.reservation = Some(reserved.clone());
+                            if runtime.publish_spawn_context(&self.context).is_err() {
+                                self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                self.release_or_retain(runtime);
+                                continue;
+                            }
+                            self.context_published = true;
+                            self.tracker = runtime.begin_spawn_reserved_for_owner(
+                                self.waiter_id,
+                                reserved,
+                                self.spawn.clone(),
+                            );
+                            self.stage = PluginSpawnStage::SpawnReserved;
+                        }
+                        Err(error) => return spawn_fail(error, None),
+                    },
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
+                PluginSpawnStage::Lookup => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
+                    }
+                    CoreTicketPoll::Lost | CoreTicketPoll::Ready(Err(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::LookupSessionReservation {
+                        result,
+                        ..
+                    })) => match result {
+                        Ok(Some(reserved)) => {
+                            self.reservation = Some(reserved.clone());
+                            self.spawn_error = Some(CoreDaemonError::Shutdown);
+                            self.tracker = runtime.begin_release_session_reservation_for_owner(
+                                self.waiter_id,
+                                reserved,
+                            );
+                            self.stage = PluginSpawnStage::Release;
+                        }
+                        Ok(None) => {
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
+                        }
+                        Err(error) => return spawn_fail(error, None),
+                    },
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
+                PluginSpawnStage::SpawnReserved => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        self.spawn_error = Some(core_bridge_error(CoreTicketError::Overloaded));
+                        self.release_or_retain(runtime);
+                    }
+                    CoreTicketPoll::Lost => {
+                        self.spawn_error = Some(CoreDaemonError::Shutdown);
+                        self.release_or_retain(runtime);
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        self.spawn_error = Some(error);
+                        self.release_or_retain(runtime);
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Installed { session },
+                        ..
+                    })) => {
+                        return PluginSpawnPoll::Ready(Ok(session));
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Refused { error },
+                        ..
+                    }))
+                    | CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::AdmittedFailure { error, .. },
+                        ..
+                    })) => {
+                        self.spawn_error = Some(error);
+                        self.release_or_retain(runtime);
+                    }
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
+                PluginSpawnStage::Release => match self.tracker.poll(runtime) {
+                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                    CoreTicketPoll::Refused
+                    | CoreTicketPoll::Lost
+                    | CoreTicketPoll::Ready(Err(_)) => {
+                        self.keep_reservation(runtime);
+                        return spawn_fail(
+                            self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown),
+                            Some(SessionReservationRelease::RetainedUnconfirmed),
+                        );
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                        result,
+                        ..
+                    })) => {
+                        let error = self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
+                        match result {
+                            Ok(SessionReservationRelease::Released) => {
+                                return spawn_fail(
+                                    error,
+                                    Some(SessionReservationRelease::Released),
+                                );
+                            }
+                            Ok(disposition) => {
+                                self.keep_reservation(runtime);
+                                return spawn_fail(error, Some(disposition));
+                            }
+                            Err(_) => {
+                                self.keep_reservation(runtime);
+                                return spawn_fail(
+                                    error,
+                                    Some(SessionReservationRelease::RetainedUnconfirmed),
+                                );
+                            }
+                        }
+                    }
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                },
+            }
+        }
+    }
+
+    fn release_or_retain(&mut self, runtime: &HubRuntime) {
+        if let Some(held) = self.reservation.clone() {
+            self.tracker =
+                runtime.begin_release_session_reservation_for_owner(self.waiter_id, held);
+            self.stage = PluginSpawnStage::Release;
+        }
+    }
+
+    fn keep_reservation(&mut self, runtime: &HubRuntime) {
+        if let Some(held) = self.reservation.take() {
+            runtime.retain_reservation(held);
+        }
+    }
 }
 
 /// Inputs for one attach-and-bind turn on the Core owner thread.
@@ -4947,6 +6416,7 @@ impl HubRuntime {
     }
 
     fn reap_detached_operations(&self) {
+        self.advance_created_worktree_cleanups();
         let Ok(mut detached) = self.detached_operations.lock() else {
             return;
         };
@@ -5381,6 +6851,134 @@ pub(crate) mod tests {
         HubRuntime::new(config).unwrap()
     }
 
+    fn occupy_inflight_and_freeze_remainder(
+        runtime: &HubRuntime,
+        topic: &str,
+    ) -> crate::lua_memory::LuaCallbackCharge {
+        let bridge = runtime.coordination_bridge();
+        bridge.test_queue_pending(PendingCoordinationOperation::Drain {
+            target: EnvelopeTarget::Topic {
+                topic: topic.into(),
+            },
+            after: None,
+            limit: 1,
+        });
+        runtime.test_fulfill_pending_coordination_requests();
+        assert_eq!(runtime.test_coordination_core_submits(), 1);
+        let memory = runtime.test_lua_memory();
+        let used = memory.usage().1;
+        let hold = memory
+            .limits()
+            .total_callback_bytes
+            .checked_sub(used)
+            .expect("callback budget remains after one inflight slot");
+        memory.reserve_shared_callback_storage(hold).unwrap()
+    }
+
+    #[test]
+    fn inflight_coordination_refuses_before_core_submit() {
+        let runtime = family_runtime("inflight-coord-cap");
+        let _hold = occupy_inflight_and_freeze_remainder(&runtime, "inflight-cap");
+        let bridge = runtime.coordination_bridge();
+        let receiver = bridge.test_queue_pending(PendingCoordinationOperation::Drain {
+            target: EnvelopeTarget::Topic {
+                topic: "inflight-cap-2".into(),
+            },
+            after: None,
+            limit: 1,
+        });
+        runtime.test_fulfill_pending_coordination_requests();
+        assert_eq!(runtime.test_coordination_core_submits(), 1);
+        assert_eq!(bridge.test_pending_count(), 0);
+        let reply = receiver.try_recv().expect("capacity refusal is immediate");
+        assert!(
+            matches!(
+                reply,
+                Err(crate::lua_runtime::CoordinationFailure::NonAcknowledge(ref message))
+                    if message == crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED
+            ),
+            "unexpected reply: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn inflight_spawn_refuses_before_taking_retained_tokens() {
+        let runtime = family_runtime("inflight-spawn-cap");
+        let _hold = occupy_inflight_and_freeze_remainder(&runtime, "inflight-spawn-fill");
+        let takes_before = runtime.test_retained_reservation_takes();
+        let error = runtime
+            .test_plugin_spawn(
+                "test.plugin",
+                "agent",
+                crate::session_types::SessionTypeRequest {
+                    target_id: None,
+                    session_id: None,
+                    cwd: None,
+                    environment: BTreeMap::new(),
+                    context: crate::session_types::SessionTypeContextInput::default(),
+                },
+                Vec::new(),
+            )
+            .expect_err("capacity must refuse before reserve");
+        assert_eq!(error, crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED);
+        assert_eq!(runtime.test_retained_reservation_takes(), takes_before);
+    }
+
+    #[test]
+    fn inflight_spawn_cancels_reserved_slot_on_fulfill_err() {
+        let runtime = family_runtime("inflight-spawn-cancel");
+        let request = crate::session_types::SessionTypeRequest {
+            target_id: None,
+            session_id: None,
+            cwd: None,
+            environment: BTreeMap::new(),
+            context: crate::session_types::SessionTypeContextInput::default(),
+        };
+        let error = runtime
+            .test_plugin_spawn("test.plugin", "agent", request.clone(), Vec::new())
+            .expect_err("missing session_type_spawn capability");
+        assert!(error.contains("session_type_spawn"));
+        assert_eq!(runtime.test_inflight_reserved(), 0);
+        let cap = runtime.test_inflight_capacity();
+        assert!(cap >= 1);
+        let error = runtime
+            .test_plugin_spawn("test.plugin", "agent", request, Vec::new())
+            .expect_err("second missing capability reuses the slot");
+        assert!(error.contains("session_type_spawn"));
+        assert_eq!(runtime.test_inflight_reserved(), 0);
+        assert_eq!(runtime.test_inflight_capacity(), cap);
+    }
+
+    #[test]
+    fn lua_host_api_clones_share_the_runtime_memory_account() {
+        let runtime = family_runtime("lua-memory-new");
+        let api = runtime.lua_plugin_host_api();
+        let cloned_api = api.clone();
+        assert!(Arc::ptr_eq(&runtime.lua_memory, &api.memory));
+        assert!(Arc::ptr_eq(&api.memory, &cloned_api.memory));
+        let charge = api.memory.reserve_vm().unwrap();
+        assert_eq!(
+            cloned_api.memory.usage().0,
+            crate::config::lua_memory_limits().per_vm_bytes
+        );
+        drop(charge);
+        assert_eq!(runtime.lua_memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn restored_runtime_shares_its_own_lua_memory_account() {
+        let first = family_runtime("lua-memory-restored");
+        let config = first.config().clone();
+        let first_account = Arc::clone(&first.lua_memory);
+        drop(first);
+        let state = HubState::from_config(&config);
+        let restored = HubRuntime::from_validated_state(config, state).unwrap();
+        let api = restored.lua_plugin_host_api();
+        assert!(!Arc::ptr_eq(&first_account, &restored.lua_memory));
+        assert!(Arc::ptr_eq(&restored.lua_memory, &api.memory));
+        assert_eq!(api.memory.limits(), crate::config::lua_memory_limits());
+    }
+
     fn check_terminal_spawner_disposal(poison: bool) {
         use crate::host_disposal::{Job, Parts, Poll};
         use crate::host_executor::{
@@ -5414,6 +7012,7 @@ pub(crate) mod tests {
         let identity = HostJobIdentity::first(crate::owner_identity::WaiterId(71));
         let lifecycle = runtime.take_plugin_lifecycle().unwrap();
         let mut engine_job = Job::new(Parts {
+            storage: None,
             identity,
             permit,
             payload: Box::new(lifecycle),
@@ -5435,6 +7034,7 @@ pub(crate) mod tests {
         ));
         let mut bridge_job = Job::new_plugin_bridges(
             Parts {
+                storage: None,
                 identity,
                 permit,
                 payload: Box::new(()),
@@ -5723,6 +7323,182 @@ pub(crate) mod tests {
             .load_lua_plugin_package(policy.registry(), "producer")
             .unwrap();
         (runtime, root)
+    }
+
+    #[test]
+    fn lua_load_and_reload_refuse_before_replacing_live_state() {
+        use botster_core::{
+            CapabilityOperation, CapabilityOperationId, CapabilityRuntimeEvent,
+            CapabilityRuntimeRequest, TimerCapabilityRequest,
+        };
+
+        let (mut runtime, root) = publication_provider_runtime("lua-memory-refusal");
+        let entrypoint = root.join("plugin.lua");
+        let source = std::fs::read_to_string(&entrypoint).unwrap();
+        std::fs::write(
+            &entrypoint,
+            format!(
+                "events.on('hub', 'worktree_created', function(event) return {{ received = event.event }} end)\n{source}"
+            ),
+        )
+        .unwrap();
+        let mut policy = crate::default_package_policy();
+        policy
+            .install_local_path(&root, "install memory test provider")
+            .unwrap();
+        policy
+            .enable("producer", "enable memory test provider")
+            .unwrap();
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        let memory = Arc::clone(&runtime.lua_memory);
+        let limits = memory.limits();
+        let owners = runtime.test_callback_charge_owners();
+        let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
+        eprintln!("callback charge owners after load: {owners:?} sum={owner_sum} usage={}", memory.usage().1);
+        assert_eq!(
+            owner_sum,
+            memory.usage().1,
+            "callback owner sum must equal usage after load owners={owners:?}"
+        );
+        assert_eq!(memory.usage(), (limits.per_vm_bytes, owner_sum));
+        let registration = runtime
+            .plugin_lifecycle()
+            .entity_provider_registrations()
+            .select("producer", "producer.item")
+            .unwrap();
+        let generation = runtime
+            .package_event_router
+            .current_package_generation("producer");
+        assert!(registration.is_live());
+        assert!(matches!(generation, Ok(value) if value > 0));
+        assert_eq!(
+            runtime
+                .package_event_router
+                .test_subscription_count("producer"),
+            1
+        );
+        assert!(runtime.last_capability_cleanup().is_none());
+        let plugin_key = PluginKey("producer".into());
+        let timer = runtime
+            .submit_capability_request(CapabilityRuntimeRequest {
+                plugin_key: plugin_key.clone(),
+                operation_id: CapabilityOperationId("lua-memory-surviving-timer".into()),
+                operation: CapabilityOperation::Timer(TimerCapabilityRequest::Interval {
+                    interval_ms: 5,
+                }),
+                timeout_ms: 1_000,
+                callback: None,
+            })
+            .unwrap()
+            .resource
+            .expect("the interval timer must have a resource");
+        assert_eq!(timer.plugin_key, plugin_key);
+        assert_eq!(runtime.active_plugin_timer_resources(), 1);
+        let held: Vec<_> = (1..limits.total_vm_bytes / limits.per_vm_bytes)
+            .map(|_| memory.reserve_vm().unwrap())
+            .collect();
+        assert_eq!(memory.usage().0, limits.total_vm_bytes);
+        for (reload, now_ms, sequence) in [(false, 5, 1), (true, 10, 2)] {
+            let error = if reload {
+                runtime
+                    .reload_lua_plugin_package(
+                        RequestId("lua-memory-refusal".into()),
+                        policy.registry(),
+                        "producer",
+                    )
+                    .unwrap_err()
+            } else {
+                runtime
+                    .load_lua_plugin_package(policy.registry(), "producer")
+                    .unwrap_err()
+            };
+            match error {
+                HubLuaPluginLoadError::Lua(crate::lua_runtime::LuaPluginRuntimeError::Load(
+                    message,
+                )) => {
+                    assert_eq!(
+                        message,
+                        format!(
+                            "Lua VM memory capacity exhausted: requested {} bytes, 0 available",
+                            limits.per_vm_bytes,
+                        )
+                    );
+                }
+                other => panic!("expected the VM capacity refusal, got {other:?}"),
+            }
+            assert!(registration.is_live());
+            assert_eq!(
+                runtime
+                    .package_event_router
+                    .current_package_generation("producer"),
+                generation
+            );
+            assert_eq!(
+                runtime
+                    .package_event_router
+                    .test_subscription_count("producer"),
+                1
+            );
+            assert!(runtime.last_capability_cleanup().is_none());
+            let owners = runtime.test_callback_charge_owners();
+            let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
+            assert_eq!(
+                owner_sum,
+                memory.usage().1,
+                "callback owner sum must equal usage after refused load owners={owners:?}"
+            );
+            assert_eq!(memory.usage(), (limits.total_vm_bytes, owner_sum));
+            let events = runtime
+                .drain_capability_events_at(&plugin_key, now_ms)
+                .unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                CapabilityRuntimeEvent::TimerFired(event)
+                    if event.resource == timer && event.sequence == sequence
+            )));
+            assert_eq!(runtime.active_plugin_timer_resources(), 1);
+        }
+        drop(held);
+        runtime
+            .reload_lua_plugin_package(
+                RequestId("lua-memory-retry".into()),
+                policy.registry(),
+                "producer",
+            )
+            .unwrap();
+        assert!(!registration.is_live());
+        let replaced_generation = runtime
+            .package_event_router
+            .current_package_generation("producer")
+            .unwrap();
+        assert!(replaced_generation > generation.unwrap());
+        assert_eq!(
+            runtime
+                .package_event_router
+                .test_subscription_count("producer"),
+            1
+        );
+        assert_eq!(runtime.active_plugin_timer_resources(), 0);
+        assert!(
+            runtime
+                .last_capability_cleanup()
+                .unwrap()
+                .removed_resources
+                .contains(&timer)
+        );
+        let owners = runtime.test_callback_charge_owners();
+        let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
+        assert_eq!(
+            owner_sum,
+            memory.usage().1,
+            "callback owner sum must equal usage after reload owners={owners:?}"
+        );
+        assert_eq!(memory.usage(), (limits.per_vm_bytes, owner_sum));
+        drop(runtime);
+        assert_eq!(memory.usage(), (0, 0));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -7794,6 +9570,79 @@ pub(crate) mod tests {
             managed_session_core_error_class(&generic),
             "runtime.spawn_failed"
         );
+    }
+
+    #[test]
+    fn session_reservation_refusal_classes_are_kind_based_and_path_neutral() {
+        let mapped = [
+            (
+                SessionReservationRefusal::Occupied,
+                "session_reservation.occupied",
+            ),
+            (SessionReservationRefusal::Busy, "session_reservation.busy"),
+            (
+                SessionReservationRefusal::Unsupported,
+                "session_reservation.unsupported",
+            ),
+            (
+                SessionReservationRefusal::IdentityExhausted,
+                "session_reservation.identity_exhausted",
+            ),
+            (
+                SessionReservationRefusal::Unavailable,
+                "session_reservation.unavailable",
+            ),
+            (
+                SessionReservationRefusal::InvalidToken,
+                "session_reservation.invalid_token",
+            ),
+            (
+                SessionReservationRefusal::Capacity,
+                "session_reservation.capacity",
+            ),
+        ];
+        for (refusal, class) in mapped {
+            assert_eq!(
+                managed_session_core_error_class(&CoreDaemonError::SessionReservation(refusal)),
+                class
+            );
+            assert!(!class.contains('/'));
+        }
+    }
+
+    #[test]
+    fn multiplexer_reserved_spawn_classes_are_kind_based_and_path_neutral() {
+        let runtime = botster_core::SessionRuntimeError::new(
+            SessionRuntimeErrorKind::SpawnFailed,
+            "connect worker control socket failed: /private/raw/path",
+        );
+        let mapped = [
+            (
+                MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Refused(
+                    runtime.clone(),
+                )),
+                "engine.multiplexer.reserved_spawn.refused",
+            ),
+            (
+                MultiplexerEngineError::ReservedSpawn(ReservedSessionSpawnError::Admitted(runtime)),
+                "engine.multiplexer.reserved_spawn.admitted",
+            ),
+            (
+                MultiplexerEngineError::InstallationAfterLaunch(Box::new(
+                    MultiplexerEngineError::MetadataTooLarge,
+                )),
+                "engine.multiplexer.installation_after_launch",
+            ),
+        ];
+        for (error, class) in mapped {
+            assert_eq!(
+                managed_session_core_error_class(&CoreDaemonError::Engine(
+                    ManagedSessionRuntimeError::Multiplexer(error)
+                )),
+                class
+            );
+            assert!(!class.contains('/'));
+        }
     }
 
     #[test]

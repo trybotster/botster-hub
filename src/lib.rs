@@ -67,6 +67,8 @@ pub(crate) mod event_plane_counters;
 pub(crate) mod host_disposal;
 pub(crate) mod host_executor;
 pub(crate) mod host_mutations;
+#[cfg(any(test, feature = "allocation-oracle"))]
+pub(crate) mod hub_state_heap;
 pub mod lifecycle;
 pub(crate) mod lua_memory;
 pub mod lua_runtime;

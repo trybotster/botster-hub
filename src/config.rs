@@ -189,6 +189,16 @@ impl HubConfig {
     }
 }
 
+/// Explicit Lua state and Rust callback policy for one Hub runtime.
+pub(crate) const fn lua_memory_limits() -> crate::lua_memory::LuaMemoryLimits {
+    crate::lua_memory::LuaMemoryLimits {
+        per_vm_bytes: 16 * 1024 * 1024,
+        total_vm_bytes: 128 * 1024 * 1024,
+        per_callback_bytes: 8 * 1024 * 1024,
+        total_callback_bytes: 64 * 1024 * 1024,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostIdentityOptions {
     pub id: String,
@@ -930,6 +940,47 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lua_memory_policy_has_approved_limits() {
+        let limits = lua_memory_limits();
+        assert_eq!(limits.per_vm_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.total_vm_bytes, 128 * 1024 * 1024);
+        assert_eq!(limits.per_callback_bytes, 8 * 1024 * 1024);
+        assert_eq!(limits.total_callback_bytes, 64 * 1024 * 1024);
+        let account = crate::lua_memory::LuaMemoryAccount::new(limits).unwrap();
+        assert_eq!(account.limits(), limits);
+    }
+
+    #[test]
+    fn lua_memory_policy_rejects_invalid_limits() {
+        use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimitError};
+        for field in 0..4 {
+            let mut limits = lua_memory_limits();
+            match field {
+                0 => limits.per_vm_bytes = 0,
+                1 => limits.total_vm_bytes = 0,
+                2 => limits.per_callback_bytes = 0,
+                _ => limits.total_callback_bytes = 0,
+            }
+            assert_eq!(
+                LuaMemoryAccount::new(limits).unwrap_err(),
+                LuaMemoryLimitError::Zero
+            );
+        }
+        let mut limits = lua_memory_limits();
+        limits.per_vm_bytes = limits.total_vm_bytes + 1;
+        assert_eq!(
+            LuaMemoryAccount::new(limits).unwrap_err(),
+            LuaMemoryLimitError::PerVmExceedsTotal
+        );
+        let mut limits = lua_memory_limits();
+        limits.per_callback_bytes = limits.total_callback_bytes + 1;
+        assert_eq!(
+            LuaMemoryAccount::new(limits).unwrap_err(),
+            LuaMemoryLimitError::PerCallbackExceedsTotal
+        );
+    }
 
     #[test]
     fn serde_round_trip_hub_startup_options() {

@@ -357,6 +357,12 @@ primitive without embedding Project Pipelines policy in Rust:
 - `botster.coordination.acknowledge({ target = {...}, envelope_id = "..." })`:
   acknowledges one delivered target copy and returns its delivery state.
 
+An admitted `drain` removes the selected envelopes from the queue and marks
+their state `Delivered`. If timeout, shutdown, or a dropped caller loses the
+reply, the selected envelopes are removed from the queue and cannot be drained again. Their state remains
+`Delivered`, not `Acknowledged`. This outcome is not successful delivery to the
+caller. The helper does not replay the operation or promise automatic redelivery.
+
 `acknowledge` reads only raw `target` and `envelope_id` fields. The target accepts
 the seven Core variants: `endpoint`, `client`, `session`, `subscription`, `plugin`,
 `stream`, and `topic`. Each consumed identifier must be a UTF-8 string. Empty

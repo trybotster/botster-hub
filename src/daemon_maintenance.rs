@@ -3097,6 +3097,18 @@ mod tests {
                     initial_cols: 80,
                 },
                 transports: crate::TransportBindings::default(),
+                core_engine: crate::config::CoreEngineOptions {
+                    session_worker_path: Some(
+                        std::env::var_os("BOTSTER_SESSION_WORKER_BIN")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "missing required candidate path in BOTSTER_SESSION_WORKER_BIN"
+                                )
+                            }),
+                    ),
+                    ..crate::config::CoreEngineOptions::default()
+                },
                 ..crate::HubStartupOptions::default()
             }
             .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
