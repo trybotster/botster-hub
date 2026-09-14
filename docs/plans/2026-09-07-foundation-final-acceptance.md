@@ -4,7 +4,27 @@ Status: source publication complete on September 9, 2026. Full foundation accept
 
 ## Active repair: plugin rendering on September 9
 
+### September 14 isolated integration candidate
+
+Root assembled the reviewed callback checkpoint `255665ee` with baseline assets `a4d8641a`, ownership tests `825e2a63`, and doctor timeouts `fdca8b47`.
+The merge candidate is `393509954d6f0e757ccaf7a6185b7716e7bdd5f4`, before this documentation update.
+Conflict resolution preserves the reviewed callback source and all three added ownership-matrix entries. Main and the writer worktrees remain unchanged.
+This is a local candidate, not final acceptance, publication, or installation. Combined source review, asset verification, and bounded test gates remain required.
+The strict lint baseline, original refusal-ID-7 failure, and labelled Host-permit flake remain explicit. No failing gate is waived.
+
 ### Current execution: complete the plan
+
+#### September 11 approved accounting exclusion
+
+Jason approved excluding mlua's private retained Rust reference storage, `ExtraData.ref_free: Vec<c_int>`, from the memory-accounting guarantee.
+Its actual capacity, baseline growth, and growth overlap are not exposed through mlua's public API.
+Record this storage as excluded, not funded. Live reference allocations, conversion scratch, collection capacity, and Lua allocator storage remain in scope.
+This approval does not authorize unsafe access, a dependency fork, or a new memory limit.
+Jason separately approved shared capacity errors for hooks, Publish, and Drain, with raised errors and message text preserved but the `runtime error: ` prefix removed.
+Hooks use pre-funded shared `ExternalError`. Publish and Drain raise a precreated Lua string through the existing trusted callback wrapper; their errors already lack that prefix.
+Do not route Publish or Drain through `ExternalError`: the wrapper's current `to_string` branch would allocate again.
+Initial Rust and Lua storage remain charged to their actual owners. Implementation and verification remain open.
+The detailed capture is `/Users/jasonconigliari/knowledge/inbox/2026-09-11-botster-excludes-private-mlua-reference-storage.md`.
 
 Jason requested implementation of all plan items after identifying repeated accounting checkpoints without requirement closure.
 This section supersedes earlier per-format, per-build, and per-test freezes for the assignments below.
@@ -32,6 +52,13 @@ The Core reservation implementation also covers built-in local-runtime clones. I
 The first callback build stopped at a stale fixture revision guard that Root missed during dependency integration.
 Root updated the guard, fixture provenance constant, and exact test expectation to the selected Core pin. The Core fixture files are unchanged.
 Trusted argument validation must preserve the Lua null sentinel. Lua reports both full userdata and light userdata as `userdata`.
+The corrected build passed, followed by fifteen focused tests for callback errors, argument conversion, registration parity, root correlation, sandbox behavior, and load refusal.
+Root read the raw outputs and differential registration tests, then verified output hashes, recorded before/after identities, and executable hashes.
+Evidence is `/private/tmp/c1-lua-callback-error-tests-20260910-1`. This closes the tested behavior comparisons, not complete memory accounting.
+Implementation continues through the remaining accounting segments without a new mechanical approval gate.
+Final review requires integer and null type-name tests. Non-null userdata keeps Lua's `userdata` diagnostic name; no unsupported classification invariant is added.
+Root rejected the reported fallback-clone allocation defect: pinned `String` and `ValueRef` clones share their existing Arc and reference index.
+The review must distinguish reference creation from reference cloning. The separate reference-creation failure path remains in scope.
 
 ### Current phase: connect acknowledgement accounting
 
