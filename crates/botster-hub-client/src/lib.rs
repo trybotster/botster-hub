@@ -702,7 +702,28 @@ pub fn request_with_requirement(
     request: DaemonRequest,
     requirement: &DaemonCompatibilityRequirement,
 ) -> DaemonTransportResult<DaemonResponse> {
-    let mut connection = DaemonConnection::connect_with_requirement(endpoint, requirement)?;
+    request_with_handshake_deadlines(endpoint, request, requirement, None, None)
+}
+
+/// Connect, complete Hello, and send one request, with optional handshake deadlines.
+///
+/// `write_timeout` and `read_timeout` apply only to the Hello write and ack
+/// read. `None` keeps the current blocking behaviour. This crate does not
+/// choose a default. AF_UNIX `connect` is not bounded by these timeouts.
+pub fn request_with_handshake_deadlines(
+    endpoint: &DaemonEndpoint,
+    request: DaemonRequest,
+    requirement: &DaemonCompatibilityRequirement,
+    write_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+) -> DaemonTransportResult<DaemonResponse> {
+    let mut connection = DaemonConnection::connect_with_handshake_deadlines(
+        endpoint,
+        requirement,
+        None,
+        write_timeout,
+        read_timeout,
+    )?;
     connection.request(&request)
 }
 
@@ -753,10 +774,29 @@ impl DaemonConnection {
         requirement: &DaemonCompatibilityRequirement,
         terminal_compatibility: Option<&TerminalCompatibilityRequirement>,
     ) -> DaemonTransportResult<Self> {
-        let (stream, _ack) = connect_and_hello_with_terminal_requirement(
+        Self::connect_with_handshake_deadlines(
             endpoint,
             requirement,
             terminal_compatibility,
+            None,
+            None,
+        )
+    }
+
+    /// Connect and complete Hello with optional write/read deadlines on that handshake only.
+    pub fn connect_with_handshake_deadlines(
+        endpoint: &DaemonEndpoint,
+        requirement: &DaemonCompatibilityRequirement,
+        terminal_compatibility: Option<&TerminalCompatibilityRequirement>,
+        write_timeout: Option<Duration>,
+        read_timeout: Option<Duration>,
+    ) -> DaemonTransportResult<Self> {
+        let (stream, _ack) = connect_and_hello_with_handshake_deadlines(
+            endpoint,
+            requirement,
+            terminal_compatibility,
+            write_timeout,
+            read_timeout,
         )?;
         Self::from_hello_complete_stream(stream, requirement.required_features.clone())
     }
@@ -1345,6 +1385,27 @@ pub fn connect_and_hello_with_terminal_requirement(
     requirement: &DaemonCompatibilityRequirement,
     terminal_compatibility: Option<&TerminalCompatibilityRequirement>,
 ) -> DaemonTransportResult<(UnixStream, DaemonHelloAck)> {
+    connect_and_hello_with_handshake_deadlines(
+        endpoint,
+        requirement,
+        terminal_compatibility,
+        None,
+        None,
+    )
+}
+
+/// Connect and complete Hello. Optional deadlines apply to the Hello write and
+/// ack read only. AF_UNIX `UnixStream::connect` is not bounded here: a local
+/// connect can still return while the peer has not `accept`ed (listen backlog)
+/// and can block if that backlog is full. Bounding connect would need
+/// non-blocking connect plus poll, which is out of scope.
+pub fn connect_and_hello_with_handshake_deadlines(
+    endpoint: &DaemonEndpoint,
+    requirement: &DaemonCompatibilityRequirement,
+    terminal_compatibility: Option<&TerminalCompatibilityRequirement>,
+    write_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+) -> DaemonTransportResult<(UnixStream, DaemonHelloAck)> {
     let mut stream = UnixStream::connect(&endpoint.socket_path).map_err(|error| {
         if matches!(
             error.kind(),
@@ -1355,25 +1416,118 @@ pub fn connect_and_hello_with_terminal_requirement(
             normalize_socket_io_error(error)
         }
     })?;
-    write_client_frame(
-        &mut stream,
-        &ClientFrame::Hello {
-            hello: DaemonHello {
-                protocol: PROTOCOL.to_string(),
-                compatibility: requirement.clone(),
-                terminal_compatibility: terminal_compatibility.cloned(),
+    with_handshake_deadlines(&mut stream, write_timeout, read_timeout, |stream| {
+        write_client_frame(
+            stream,
+            &ClientFrame::Hello {
+                hello: DaemonHello {
+                    protocol: PROTOCOL.to_string(),
+                    compatibility: requirement.clone(),
+                    terminal_compatibility: terminal_compatibility.cloned(),
+                },
             },
-        },
-    )?;
-    let ack = read_hello_ack(&mut stream)?;
-    if ack.protocol != PROTOCOL {
-        return Err(DaemonTransportError::Protocol(
-            "unexpected hello ack protocol",
-        ));
+        )?;
+        let ack = read_hello_ack(stream)?;
+        if ack.protocol != PROTOCOL {
+            return Err(DaemonTransportError::Protocol(
+                "unexpected hello ack protocol",
+            ));
+        }
+        ensure_compatible(requirement, &ack.compatibility)
+            .map_err(DaemonTransportError::Compatibility)?;
+        Ok(ack)
+    })
+    .map(|ack| (stream, ack))
+}
+
+fn with_handshake_deadlines<T>(
+    stream: &mut UnixStream,
+    write_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    op: impl FnOnce(&mut UnixStream) -> DaemonTransportResult<T>,
+) -> DaemonTransportResult<T> {
+    let previous_write = stream
+        .write_timeout()
+        .map_err(normalize_socket_io_error)?;
+    let previous_read = stream.read_timeout().map_err(normalize_socket_io_error)?;
+    if let Some(timeout) = write_timeout {
+        stream
+            .set_write_timeout(Some(timeout.max(Duration::from_millis(1))))
+            .map_err(normalize_socket_io_error)?;
     }
-    ensure_compatible(requirement, &ack.compatibility)
-        .map_err(DaemonTransportError::Compatibility)?;
-    Ok((stream, ack))
+    if let Some(timeout) = read_timeout {
+        stream
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
+            .map_err(normalize_socket_io_error)?;
+    }
+    let result = op(stream);
+    let restore_write = stream.set_write_timeout(previous_write);
+    let restore_read = stream.set_read_timeout(previous_read);
+    match result {
+        Ok(value) => {
+            restore_write.map_err(normalize_socket_io_error)?;
+            restore_read.map_err(normalize_socket_io_error)?;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod handshake_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn handshake_deadlines_restore_timeouts_on_success() {
+        let (mut client, _server) = UnixStream::pair().expect("pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(80)))
+            .expect("read");
+        client
+            .set_write_timeout(Some(Duration::from_millis(90)))
+            .expect("write");
+        with_handshake_deadlines(
+            &mut client,
+            Some(Duration::from_millis(30)),
+            Some(Duration::from_millis(40)),
+            |_| Ok(()),
+        )
+        .expect("ok");
+        assert_eq!(
+            client.read_timeout().expect("read timeout"),
+            Some(Duration::from_millis(80))
+        );
+        assert_eq!(
+            client.write_timeout().expect("write timeout"),
+            Some(Duration::from_millis(90))
+        );
+    }
+
+    #[test]
+    fn handshake_deadlines_restore_timeouts_on_error() {
+        let (mut client, _server) = UnixStream::pair().expect("pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(80)))
+            .expect("read");
+        client
+            .set_write_timeout(Some(Duration::from_millis(90)))
+            .expect("write");
+        let err = with_handshake_deadlines(
+            &mut client,
+            Some(Duration::from_millis(20)),
+            Some(Duration::from_millis(20)),
+            |stream| read_hello_ack(stream).map(|_| ()),
+        );
+        assert!(err.is_err(), "unanswered peer must fail the handshake");
+        assert_eq!(
+            client.read_timeout().expect("read timeout"),
+            Some(Duration::from_millis(80))
+        );
+        assert_eq!(
+            client.write_timeout().expect("write timeout"),
+            Some(Duration::from_millis(90))
+        );
+    }
 }
 
 /// Read the Hello ack directly from the stream, without buffering past it.
