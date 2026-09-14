@@ -11,9 +11,9 @@
 //! Per frame, charged for the frame's lifetime:
 //! - array: table + 1 fetched value + 1 transient `metatable()` probe = 3
 //! - object: table + 1 fetched value + 1 `metatable()` probe = 3
-//! Key collection holds 2 extra transient pair refs for the scan, then drops
-//! them. A table-valued child reuses the fetched value as the child frame's
-//! table ref (not an extra width-proportional hold).
+//!   Key collection holds 2 extra transient pair refs for the scan, then drops
+//!   them. A table-valued child reuses the fetched value as the child frame's
+//!   table ref (not an extra width-proportional hold).
 //!
 //! Peak live refs ≈ `3 × depth + 2` (scan) + 1 walk-level `array_metatable`
 //! handle. Old `from_value`: per level the table, `TablePairs` `key:
@@ -534,7 +534,7 @@ fn take_size_child(
             }
             match keys.get(*next).expect("key cursor") {
                 CollectedKey::Fail(fail) => {
-                    return Err(super::AdmissionError::Runtime(raise_key_fail(*fail)));
+                    Err(super::AdmissionError::Runtime(raise_key_fail(*fail)))
                 }
                 CollectedKey::Utf8 { text, .. } => {
                     let item = frame.table.raw_get::<Value>(text.as_str())?;
