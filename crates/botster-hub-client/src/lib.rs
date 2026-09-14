@@ -199,6 +199,10 @@ pub struct DaemonLocalWebrtcDeliveryChunk {
 }
 
 /// One control frame sent by a client. Serialized as JSON with a `frame` tag.
+///
+/// Keep variant payloads inline to avoid adding a separate allocation for a
+/// boxed variant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "frame", rename_all = "snake_case")]
 pub enum ClientFrame {
@@ -216,6 +220,9 @@ pub enum ClientFrame {
 ///
 /// Hub may complete requests out of order. Events on one subscription stay
 /// ordered relative to each other; no other cross-frame ordering is promised.
+/// Keep variant payloads inline to avoid adding a separate allocation for a
+/// boxed variant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "frame", rename_all = "snake_case")]
 pub enum ServerFrame {
@@ -319,6 +326,10 @@ impl RequestIdSequence {
     }
 
     /// Next id. Ids start at 1 and never repeat within one connection.
+    ///
+    /// Named `next` as a counter method, not `Iterator::next`. Renaming would
+    /// change the public client API.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> u64 {
         self.last = self.last.saturating_add(1);
         self.last
@@ -628,6 +639,10 @@ impl DaemonUnixFrameReader {
 }
 
 /// One decoded frame on a client's Unix connection.
+///
+/// Keep variant payloads inline to avoid adding a separate allocation for a
+/// boxed variant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum DaemonUnixMuxFrame {
     Server(ServerFrame),
