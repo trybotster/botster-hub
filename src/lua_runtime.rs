@@ -22,8 +22,8 @@ use botster_core::{
     PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
     PluginInvocationResult, PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor,
     PluginResourceKind, PluginResourceRef, PluginRuntime, PluginStoreCapabilityRequest,
-    PluginStoreKey, PluginStoreOperation, RoutedEnvelope, RoutedEnvelopeDrainOutcome,
-    RoutedEnvelopePayload, RoutedEnvelopePublishOutcome, TimerCapabilityRequest,
+    PluginStoreKey, PluginStoreOperation, RoutedEnvelope, RoutedEnvelopePayload,
+    TimerCapabilityRequest,
 };
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde_json::json;

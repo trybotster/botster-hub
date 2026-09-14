@@ -150,10 +150,6 @@ impl LuaMemoryAccount {
         })
     }
 
-    pub(crate) fn callback_used(&self) -> usize {
-        self.callback_bytes.load(Ordering::Acquire)
-    }
-
     #[cfg(test)]
     pub(crate) fn usage(&self) -> (usize, usize) {
         (
