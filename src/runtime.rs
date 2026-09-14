@@ -118,9 +118,8 @@ pub struct HubRuntime {
     config: HubConfig,
     lua_memory: Arc<crate::lua_memory::LuaMemoryAccount>,
     #[cfg(test)]
-    lua_plugin_runtimes: std::sync::Arc<
-        Mutex<Vec<std::sync::Weak<crate::lua_runtime::LuaPluginRuntime>>>,
-    >,
+    lua_plugin_runtimes:
+        std::sync::Arc<Mutex<Vec<std::sync::Weak<crate::lua_runtime::LuaPluginRuntime>>>>,
     // Readers clone the current Arc under this short lock. Publication swaps
     // one Arc, so the owner never clones a durable state collection.
     state: SharedHubState,
@@ -7356,7 +7355,10 @@ pub(crate) mod tests {
         let limits = memory.limits();
         let owners = runtime.test_callback_charge_owners();
         let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
-        eprintln!("callback charge owners after load: {owners:?} sum={owner_sum} usage={}", memory.usage().1);
+        eprintln!(
+            "callback charge owners after load: {owners:?} sum={owner_sum} usage={}",
+            memory.usage().1
+        );
         assert_eq!(
             owner_sum,
             memory.usage().1,

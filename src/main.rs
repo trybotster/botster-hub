@@ -19,8 +19,7 @@ use botster_hub::{
     HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
     HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
     daemon_transport_request, daemon_transport_request_for_doctor, host_profile,
-    installation_identity, serve_daemon, serve_mcp_stdio,
-    software_identity, stream_attach,
+    installation_identity, serve_daemon, serve_mcp_stdio, software_identity, stream_attach,
 };
 use botster_hub_client::{
     DaemonDiagnostic, DaemonPackageUpdateStatus, DaemonSessionTypeDefinition,

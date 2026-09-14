@@ -152,11 +152,7 @@ fn window_alloc(ptr: *mut u8, size: usize, align: usize) {
     if addr == 0 {
         return;
     }
-    for ((slot, bytes), slot_align) in LIVE_PTR
-        .iter()
-        .zip(LIVE_SZ.iter())
-        .zip(LIVE_ALIGN.iter())
-    {
+    for ((slot, bytes), slot_align) in LIVE_PTR.iter().zip(LIVE_SZ.iter()).zip(LIVE_ALIGN.iter()) {
         if slot
             .compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -179,11 +175,7 @@ fn window_dealloc(ptr: *mut u8, size: usize, align: usize) {
     if addr == 0 {
         return;
     }
-    for ((slot, bytes), slot_align) in LIVE_PTR
-        .iter()
-        .zip(LIVE_SZ.iter())
-        .zip(LIVE_ALIGN.iter())
-    {
+    for ((slot, bytes), slot_align) in LIVE_PTR.iter().zip(LIVE_SZ.iter()).zip(LIVE_ALIGN.iter()) {
         if slot
             .compare_exchange(addr, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -297,11 +289,7 @@ fn begin_record() {
     for slot in &XRC_PTRS {
         slot.store(0, Ordering::Release);
     }
-    for ((slot, bytes), slot_align) in LIVE_PTR
-        .iter()
-        .zip(LIVE_SZ.iter())
-        .zip(LIVE_ALIGN.iter())
-    {
+    for ((slot, bytes), slot_align) in LIVE_PTR.iter().zip(LIVE_SZ.iter()).zip(LIVE_ALIGN.iter()) {
         slot.store(0, Ordering::Release);
         bytes.store(0, Ordering::Release);
         slot_align.store(0, Ordering::Release);
@@ -764,7 +752,10 @@ fn print_align16_backtraces(label: &str) {
         let frames = BT_FRAME_N[i].load(Ordering::Acquire);
         print!("{label} align16_bt size={size} frames=");
         for f in 0..frames {
-            print!("{:#x} ", BT_FRAMES[i * MAX_BT_FRAMES + f].load(Ordering::Acquire));
+            print!(
+                "{:#x} ",
+                BT_FRAMES[i * MAX_BT_FRAMES + f].load(Ordering::Acquire)
+            );
         }
         println!();
     }
@@ -800,8 +791,6 @@ fn print_non_sys_min_align_histogram(label: &str) {
     }
     println!();
     for (size, align, count, bytes) in buckets {
-        println!(
-            "{label} hist size={size} align={align} count={count} live_bytes={bytes}"
-        );
+        println!("{label} hist size={size} align={align} count={count} live_bytes={bytes}");
     }
 }

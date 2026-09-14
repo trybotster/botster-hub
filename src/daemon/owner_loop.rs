@@ -7765,9 +7765,8 @@ return botster.register({tools = {{
                                 Box::new(runtime.test_core_waiter_probe());
                             let callback_usage: Box<dyn Fn() -> usize + Send> =
                                 Box::new(runtime.test_lua_callback_usage_probe());
-                            let callback_owners: Box<
-                                dyn Fn() -> Vec<(String, usize)> + Send,
-                            > = Box::new(runtime.test_callback_charge_breakdown_probe());
+                            let callback_owners: Box<dyn Fn() -> Vec<(String, usize)> + Send> =
+                                Box::new(runtime.test_callback_charge_breakdown_probe());
                             // Daemon owner is bound, so coordination take_pending returns
                             // None and inflight plugin-core is unused. Count it as 0.
                             assert_eq!(

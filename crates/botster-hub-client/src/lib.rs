@@ -1446,9 +1446,7 @@ fn with_handshake_deadlines<T>(
     read_timeout: Option<Duration>,
     op: impl FnOnce(&mut UnixStream) -> DaemonTransportResult<T>,
 ) -> DaemonTransportResult<T> {
-    let previous_write = stream
-        .write_timeout()
-        .map_err(normalize_socket_io_error)?;
+    let previous_write = stream.write_timeout().map_err(normalize_socket_io_error)?;
     let previous_read = stream.read_timeout().map_err(normalize_socket_io_error)?;
     if let Some(timeout) = write_timeout {
         stream
