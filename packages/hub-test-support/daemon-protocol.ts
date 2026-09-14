@@ -17,6 +17,9 @@ export const SNAPSHOT_PAGE_BYTES = 262144;
 export const MAX_OPEN_CAPTURES_PER_CONNECTION = 4;
 export const SNAPSHOT_CAPTURE_TTL_SECONDS = 60;
 export const OPERATOR_ERROR_TOO_MANY_REQUESTS = "too_many_requests";
+export const OPERATOR_ERROR_RUNTIME_REPLY_CLOSED = "runtime_reply_closed";
+export const OPERATOR_ERROR_RUNTIME_REQUEST_TIMED_OUT = "runtime_request_timed_out";
+export const OPERATOR_ERROR_RUNTIME_REQUEST_FAILED = "runtime_request_failed";
 
 // Unix socket framing: [u32 LE frame_len][u8 container][payload]; frame_len = 1 + payload length.
 // Terminal container payload: [u16 LE route_len][route UTF-8][u64 LE generation][u32 LE stream_epoch][body].
