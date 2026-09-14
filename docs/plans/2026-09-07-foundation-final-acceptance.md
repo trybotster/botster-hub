@@ -20,9 +20,16 @@ Strict lint stopped at four reproduced client baseline errors. The original requ
 Formatting-only commit `bf850a4c` passed review and formatting checks. Focused handshake, collection-capacity, and coordination-lifecycle suites passed 2, 16, and 11 tests respectively.
 The allocation oracle passed and matched historical `e026bfff` scenarios. This is not a same-revision before-and-after control.
 Ten isolated event-owner runs passed on a recovered binary. Its original executed path survives, but no contemporaneous pre-rebuild hash exists.
-These runs do not resolve the full-suite failure. Claude will trace the owner-capacity fixture and propose one decisive experiment without changing source.
+These runs do not resolve the full-suite failure.
 Evidence is in `/tmp/hub-7df1e11d-combined-verify`, `/tmp/hub-bf850a4c-fmt-suites`, and `/tmp/hub-7df1e11d-event-owner-10`.
 Full acceptance, publication, and installation remain open. No failing gate is waived.
+
+The bounded event-owner diagnostic phase ended inconclusive. Source supports wall-clock exhaustion before dispatch as a candidate, not a confirmed cause.
+Test-only diagnostics remain in a separate worktree. The interrupted v3 run and invalid v4 setup run remain labelled and preserved.
+A corrected sibling bundle removed fourteen missing-worker errors, but six WebRTC fixtures rejected the external worker path.
+The target test passed without a diagnostic record. A separate missing-reused-worktree assertion remains unclassified; it is not accepted as another setup failure.
+No further diagnostic run is authorized. Evidence remains under `/tmp/hub-event-owner-diag-run` and `/tmp/hub-event-owner-v4-sibling-bundle`.
+Independent lint work may add four reviewed item-level allowances while preserving inline storage and the public counter method. No behavior change is authorized.
 
 ### Current execution: complete the plan
 
