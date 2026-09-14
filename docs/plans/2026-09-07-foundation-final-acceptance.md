@@ -12,6 +12,18 @@ Conflict resolution preserves the reviewed callback source and all three added o
 This is a local candidate, not final acceptance, publication, or installation. Combined source review, asset verification, and bounded test gates remain required.
 The strict lint baseline, original refusal-ID-7 failure, and labelled Host-permit flake remain explicit. No failing gate is waived.
 
+Claude verified preservation against actual local main `9e1ba428`, including its finalizer guard and superseded acknowledgement charge holder.
+Combined revision `7df1e11d` passed asset checks, memory build contracts, artifact generation, ten ownership tests, two handshake tests, and the unchanged incompatible-doctor fixture.
+The workspace run stopped after 1,140 Hub library tests passed and two failed. Later workspace tests did not run.
+The failures were the labelled Host-permit assertion and an unclassified event-owner `waiting_for_owner` assertion. Eight acknowledgement tests and seven sandbox tests passed.
+Strict lint stopped at four reproduced client baseline errors. The original request-ID-7 failure did not recur and remains unresolved.
+Formatting-only commit `bf850a4c` passed review and formatting checks. Focused handshake, collection-capacity, and coordination-lifecycle suites passed 2, 16, and 11 tests respectively.
+The allocation oracle passed and matched historical `e026bfff` scenarios. This is not a same-revision before-and-after control.
+Ten isolated event-owner runs passed on a recovered binary. Its original executed path survives, but no contemporaneous pre-rebuild hash exists.
+These runs do not resolve the full-suite failure. Claude will trace the owner-capacity fixture and propose one decisive experiment without changing source.
+Evidence is in `/tmp/hub-7df1e11d-combined-verify`, `/tmp/hub-bf850a4c-fmt-suites`, and `/tmp/hub-7df1e11d-event-owner-10`.
+Full acceptance, publication, and installation remain open. No failing gate is waived.
+
 ### Current execution: complete the plan
 
 #### September 11 approved accounting exclusion
