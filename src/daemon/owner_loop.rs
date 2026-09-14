@@ -1,6 +1,6 @@
 //! Hub owner thread.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +61,7 @@ enum BackgroundWork {
     CausalProgress,
     CausalDrain,
     EntityPublish,
+    Coordination,
     EventOwner,
     ManagedSpawn,
     PluginReady,
@@ -238,6 +239,7 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
         | BackgroundWork::CausalProgress
         | BackgroundWork::ManagedSpawn => ReadyClass::HostCompletion,
         BackgroundWork::EventOwner
+        | BackgroundWork::Coordination
         | BackgroundWork::EntityPublish
         | BackgroundWork::CausalDrain => ReadyClass::HostBridge,
         BackgroundWork::PluginReady | BackgroundWork::PluginEntityReady => {
@@ -360,10 +362,22 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
     if state.budget.take_capacity_notification() {
+        if state.coordination_waiting_for_owner && state.coordination_fault.is_none() {
+            state.coordination_waiting_for_owner = false;
+            if !mark_background_ready(state, BackgroundWork::Coordination) {
+                state.coordination_fault = Some(
+                    crate::daemon::control::coordination::CoordinationFault::SchedulerExhausted,
+                );
+            }
+        }
         if state.event_owner.waiting_for_owner {
             mark_event_owner_ready(state);
         }
         state.publication_owner.waiting_for_owner = false;
+        if state.managed_spawn_waiting_for_owner {
+            state.managed_spawn_waiting_for_owner = false;
+            mark_background_ready(state, BackgroundWork::ManagedSpawn);
+        }
     }
     if let Some(runtime) = daemon.runtime() {
         if runtime.take_event_plane_owner_ops_notification() {
@@ -377,6 +391,13 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         }
         if runtime.take_core_completion_notification() {
             mark_background_ready(state, BackgroundWork::CoreCompletion);
+        }
+        if state.coordination_fault.is_none()
+            && runtime.coordination_bridge().take_progress_notification()
+            && !mark_background_ready(state, BackgroundWork::Coordination)
+        {
+            state.coordination_fault =
+                Some(crate::daemon::control::coordination::CoordinationFault::SchedulerExhausted);
         }
         let table_progress = runtime.causal_scopes().take_progress_notification();
         let capacity_progress = runtime.take_causal_capacity_notification();
@@ -413,9 +434,14 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         }
         let executor = runtime.host_executor();
         state.host_completion_drain_pending |= executor.take_completion_notification();
-        state.host_capacity_wake_pending |= executor.take_capacity_notification();
+        let host_capacity = executor.take_capacity_notification();
+        state.host_capacity_wake_pending |= host_capacity;
         if state.host_completion_drain_pending || state.host_capacity_wake_pending {
             mark_host_drain_ready(state);
+        }
+        if host_capacity && state.managed_spawn_waiting_for_host {
+            state.managed_spawn_waiting_for_host = false;
+            mark_background_ready(state, BackgroundWork::ManagedSpawn);
         }
         if runtime.take_managed_spawn_notification() {
             mark_background_ready(state, BackgroundWork::ManagedSpawn);
@@ -565,6 +591,7 @@ fn control_ready_class(message: &ControlMessage) -> crate::daemon::owner_schedul
         }
         ControlMessage::HostProgressPublished
         | ControlMessage::EntityPublishProgress
+        | ControlMessage::CoordinationProgress
         | ControlMessage::CausalProgressPublished
         | ControlMessage::ManagedSessionSpawnQueued => ReadyClass::HostCompletion,
         ControlMessage::PluginCompletionPublished
@@ -735,6 +762,9 @@ pub(crate) fn run_background_ready_item(
             if crate::daemon::publication_owner::drive(daemon, state) {
                 mark_background_ready(state, BackgroundWork::EntityPublish);
             }
+        }
+        BackgroundWork::Coordination => {
+            crate::daemon::control::coordination::accept_one(daemon, state);
         }
         BackgroundWork::CausalDrain => {
             if let Some(runtime) = daemon.runtime() {
@@ -1003,7 +1033,10 @@ pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus>
 
 #[cfg(test)]
 struct ServeTerminalTest {
-    start: Box<dyn FnOnce(&mut tokio_mpsc::Receiver<ControlMessage>, &ControlSender) + Send>,
+    start: Box<
+        dyn FnOnce(&mut HubDaemon, &mut tokio_mpsc::Receiver<ControlMessage>, &ControlSender)
+            + Send,
+    >,
     selected: Box<
         dyn FnOnce(
                 &mut HubDaemon,
@@ -1082,7 +1115,7 @@ fn serve_daemon_inner(
     #[cfg(test)]
     let (selected, stopped) = match terminal_test {
         Some(test) => {
-            (test.start)(&mut control_rx, &control_tx);
+            (test.start)(&mut daemon, &mut control_rx, &control_tx);
             (Some(test.selected), Some(test.stopped))
         }
         None => (None, None),
@@ -1170,6 +1203,9 @@ fn serve_daemon_inner(
             &control_tx,
         );
     }
+    if let Some(runtime) = daemon.runtime() {
+        runtime.bind_terminal_core_owner();
+    }
     let _ = shutdown_tx.send(true);
     wait_for_connection_tasks(
         &transport_runtime,
@@ -1195,7 +1231,9 @@ fn drain_terminal_host_work(daemon: &mut HubDaemon, state: &mut DaemonControlSta
         return;
     };
     runtime.host_executor().bind_terminal_owner();
+    runtime.bind_terminal_core_owner();
     loop {
+        runtime.take_core_completion_notification();
         runtime.host_executor().take_completion_notification();
         runtime.host_executor().take_capacity_notification();
         if !state.terminal_lifecycle.ordinary_disposed
@@ -1214,7 +1252,9 @@ fn drain_terminal_host_work(daemon: &mut HubDaemon, state: &mut DaemonControlSta
                 }
             }
         }
-        thread::park();
+        if !runtime.take_core_completion_notification() {
+            thread::park();
+        }
     }
 }
 
@@ -1640,6 +1680,7 @@ impl TerminalLifecycle {
                 .expect("terminal disposal takes the lifecycle owner once");
             self.job = Some(crate::host_disposal::Job::new(
                 crate::host_disposal::Parts {
+                    storage: None,
                     identity: self.identity,
                     permit,
                     payload: Box::new(lifecycle),
@@ -1654,6 +1695,7 @@ impl TerminalLifecycle {
                 TerminalLifecycleStage::Engine => {
                     self.job = Some(crate::host_disposal::Job::new_plugin_bridges(
                         crate::host_disposal::Parts {
+                            storage: None,
                             identity: self.identity,
                             permit,
                             payload: Box::new(()),
@@ -1678,6 +1720,11 @@ impl TerminalLifecycle {
 }
 
 pub(crate) struct DaemonControlState {
+    pub(crate) coordination_fault: Option<crate::daemon::control::coordination::CoordinationFault>,
+    pub(crate) coordination_waiting_for_owner: bool,
+    pub(crate) coordination_capacity_waiters: BTreeSet<crate::owner_identity::WaiterId>,
+    pub(crate) managed_spawn_waiting_for_owner: bool,
+    pub(crate) managed_spawn_waiting_for_host: bool,
     terminal_fault: Option<TerminalDrainFault>,
     terminal_lifecycle: TerminalLifecycle,
     pub(crate) event_owner: crate::daemon::event_owner::EventOwnerState,
@@ -1700,6 +1747,9 @@ pub(crate) struct DaemonControlState {
         crate::owner_identity::WaiterId,
         crate::daemon::control::pending::PendingControlRequest,
     >,
+    /// Explicit reservations this owner still holds after a spawn failure.
+    /// Bounded by Core's pending-spawn capacity; retried on the next Spawn.
+    pub(crate) retained_explicit_reservations: Vec<botster_core::SessionReservation>,
     pub(crate) waiter_ids: crate::owner_identity::WaiterIdSource,
     pub(crate) current_waiter_id: Option<crate::owner_identity::WaiterId>,
     pub(crate) shutdown_waiter: Option<crate::owner_identity::WaiterId>,
@@ -1792,6 +1842,11 @@ impl Default for DaemonControlState {
         );
         Self {
             terminal_fault: None,
+            coordination_fault: None,
+            coordination_waiting_for_owner: false,
+            coordination_capacity_waiters: BTreeSet::new(),
+            managed_spawn_waiting_for_owner: false,
+            managed_spawn_waiting_for_host: false,
             terminal_lifecycle,
             event_owner: crate::daemon::event_owner::EventOwnerState::default(),
             publication_owner: crate::daemon::publication_owner::PublicationOwnerState::default(),
@@ -1811,6 +1866,7 @@ impl Default for DaemonControlState {
             attach_close: crate::subscription::closed_events::AttachCloseBookkeeping::default(),
             pending_hub_update_reply: None,
             pending_requests: BTreeMap::new(),
+            retained_explicit_reservations: Vec::new(),
             waiter_ids,
             current_waiter_id: None,
             shutdown_waiter: None,
@@ -2151,7 +2207,7 @@ mod tests {
                     let result = serve_daemon_inner(
                         config,
                         Some(ServeTerminalTest {
-                            start: Box::new(move |receiver, sender| {
+                            start: Box::new(move |_daemon, receiver, sender| {
                                 if error_exit {
                                     receiver.close();
                                 } else {
@@ -4424,6 +4480,7 @@ mod tests {
                 response_delivery_rx: None,
                 grant_id: None,
                 client: None,
+                core_retirement: None,
                 permit: Some(permit),
                 must_finish: true,
                 past_deadline: false,
@@ -5925,7 +5982,8 @@ mod tests {
                     }
                     | crate::daemon::control::pending::ControlPoll::StatusResponseRefused {
                         ..
-                    } => {
+                    }
+                    | crate::daemon::control::pending::ControlPoll::FinishedInternal => {
                         panic!("package helper must not receive a status response")
                     }
                     crate::daemon::control::pending::ControlPoll::Again => continue,
@@ -7582,6 +7640,467 @@ return botster.register({
             0
         );
         daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn real_daemon_routes_two_coordination_acknowledgements_through_core_wakes() {
+        real_daemon_coordination_acknowledgements(2);
+    }
+
+    #[test]
+    fn real_daemon_coordination_core_waits_preserve_host_capacity_for_sibling() {
+        real_daemon_coordination_acknowledgements(crate::host_executor::HOST_OPERATION_CAPACITY);
+    }
+
+    fn real_daemon_coordination_acknowledgements(call_count: usize) {
+        struct ReleaseCore(Option<mpsc::Sender<()>>);
+        impl Drop for ReleaseCore {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        struct StopServe(ControlSender);
+        impl Drop for StopServe {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(ControlMessage::Request {
+                    request: Box::new(DaemonRequest::DaemonShutdown),
+                    transport_request_id: None,
+                    reply_tx: ControlReplySender::absent(),
+                    response_delivery_rx: None,
+                    grant_id: None,
+                    client_id: None,
+                    enqueued_at: Instant::now(),
+                });
+            }
+        }
+        let _guard = ControlledPluginGateGuard::acquire();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            PathBuf::from("/private/tmp").join(format!("hub-c1-{}-{unique}", std::process::id()));
+        let mut config = package_control_config(root.join("data"));
+        config.transports.local_socket = Some(crate::config::LocalSocketBinding {
+            path: root.join("hub.sock"),
+        });
+        let package_dirs = (0..call_count).map(|index| {
+            let name = format!("owner.c1-{index}");
+            let directory = root.join(&name);
+            write_package_control_manifest(&directory, &name, serde_json::json!({
+                "capabilities": [{"surface":"mcp"}],
+                "entrypoints": [{"runtime":"lua","path":"plugin.lua","bootstrap":false}]
+            }));
+            let plugin = r#"
+return botster.register({tools = {{
+  name = "owner.c1___INDEX__",
+  description = "Acknowledge one seeded envelope.",
+  input_schema = {type="object", properties={token={type="string"}, topic={type="string"}, envelope_id={type="string"}}},
+  handler = "acknowledge",
+  call = function(args)
+    local result = botster.coordination.acknowledge({target={type="topic",topic=args.topic}, envelope_id=args.envelope_id})
+    return {token=args.token, result=result}
+  end,
+}}})
+"#.replace("__INDEX__", &index.to_string());
+            std::fs::write(directory.join("plugin.lua"), plugin).unwrap();
+            (name, directory)
+        }).collect::<Vec<_>>();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut release = ReleaseCore(Some(release_tx));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let server_config = config.clone();
+        let owner = thread::Builder::new()
+            .name("c1-real-serve-owner".into())
+            .spawn(move || {
+                serve_daemon_inner(
+                    server_config,
+                    Some(ServeTerminalTest {
+                        start: Box::new(move |daemon, _receiver, sender| {
+                            // Fixture installation finishes before the tested socket requests start.
+                            for (name, directory) in package_dirs {
+                                drive_package_request(
+                                    daemon,
+                                    DaemonRequest::InstallPackageLocalPath { path: directory },
+                                )
+                                .unwrap();
+                                drive_package_request(
+                                    daemon,
+                                    DaemonRequest::EnablePackage { package_name: name },
+                                )
+                                .unwrap();
+                            }
+                            let runtime = daemon.runtime().unwrap();
+                            for index in 0..call_count {
+                                let envelope = botster_core::RoutedEnvelope::new(
+                                    botster_core::EnvelopeId(format!("c1-envelope-{index}")),
+                                    botster_core::EndpointId("hub:c1-fixture".into()),
+                                    vec![botster_core::EnvelopeTarget::Topic {
+                                        topic: format!("c1-topic-{index}"),
+                                    }],
+                                    botster_core::RoutedEnvelopePayload {
+                                        content_type: "text/plain".into(),
+                                        body: vec![index as u8],
+                                        extension: None,
+                                    },
+                                    41,
+                                );
+                                runtime
+                                    .publish_routed_envelope(envelope)
+                                    .wait(Duration::from_secs(5))
+                                    .unwrap()
+                                    .unwrap();
+                            }
+                            drop(runtime.submit_core(move |_| {
+                                entered_tx.send(()).unwrap();
+                                release_rx
+                                    .recv_timeout(Duration::from_secs(10))
+                                    .expect("the fixture releases Core");
+                            }));
+                            let probe: Box<dyn Fn(crate::owner_identity::WaiterId) -> bool + Send> =
+                                Box::new(runtime.test_core_waiter_probe());
+                            let callback_usage: Box<dyn Fn() -> usize + Send> =
+                                Box::new(runtime.test_lua_callback_usage_probe());
+                            let callback_owners: Box<
+                                dyn Fn() -> Vec<(String, usize)> + Send,
+                            > = Box::new(runtime.test_callback_charge_breakdown_probe());
+                            // Daemon owner is bound, so coordination take_pending returns
+                            // None and inflight plugin-core is unused. Count it as 0.
+                            assert_eq!(
+                                runtime.test_inflight_charge_bytes(),
+                                0,
+                                "inflight unused while a daemon owner is bound"
+                            );
+                            assert_eq!(runtime.test_inflight_capacity(), 0);
+                            started_tx
+                                .send((
+                                    runtime.coordination_bridge(),
+                                    probe,
+                                    callback_usage,
+                                    callback_owners,
+                                    sender.clone(),
+                                ))
+                                .unwrap();
+                        }),
+                        selected: Box::new(|_daemon, state, _, _| {
+                            assert!(
+                                state.coordination_fault.is_none(),
+                                "{:?}",
+                                state.coordination_fault
+                            );
+                        }),
+                        stopped: Box::new(|| {}),
+                    }),
+                )
+            })
+            .unwrap();
+        let (bridge, retains_waiter, callback_usage, callback_owners, control) =
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let stop = StopServe(control);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut client =
+            UnixStream::connect(&config.transports.local_socket.as_ref().unwrap().path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = DaemonUnixFrameReader::new();
+        write_hello(&mut client);
+        read_hello_ack(&mut client, &mut reader);
+        let list_packages_id = 41 + call_count as u64;
+        let status_id = list_packages_id + 1;
+        let shutdown_id = list_packages_id + 2;
+        let held_started = Instant::now();
+        let setup_deadline = held_started + Duration::from_millis(500);
+        for index in 0..call_count {
+            write_request(
+                &mut client,
+                41 + index as u64,
+                DaemonRequest::PluginMcpCallTool {
+                    name: format!("owner.c1_{index}"),
+                    arguments: serde_json::json!({"token":format!("ack-{index}"), "topic":format!("c1-topic-{index}"), "envelope_id":format!("c1-envelope-{index}")}),
+                },
+            );
+        }
+        while bridge.test_admitted_waiters().len() != call_count {
+            assert!(
+                Instant::now() < setup_deadline,
+                "setup timing: Core admission must leave half of the callback timeout unused"
+            );
+            thread::yield_now();
+        }
+        let waiters = bridge.test_admitted_waiters();
+        assert_eq!(
+            waiters.iter().copied().collect::<BTreeSet<_>>().len(),
+            call_count
+        );
+        assert!(waiters.iter().all(|waiter| retains_waiter(*waiter)));
+        assert!(
+            callback_usage() > 0,
+            "admitted acknowledgements must hold callback storage until disposal"
+        );
+        write_request(&mut client, list_packages_id, DaemonRequest::ListPackages);
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "setup timing: the held window expired before ListPackages"
+        );
+        client.set_read_timeout(Some(remaining)).unwrap();
+        let frame = reader
+            .read_frame(&mut client)
+            .expect("setup timing: ListPackages must complete inside the held window");
+        assert!(
+            held_started.elapsed() < Duration::from_millis(500),
+            "setup timing: the held window must stay below half of the callback timeout"
+        );
+        let DaemonUnixMuxFrame::Server(ServerFrame::Response {
+            request_id,
+            response: listed,
+        }) = frame
+        else {
+            panic!("ListPackages must return a socket response");
+        };
+        assert_eq!(request_id, list_packages_id.to_string());
+        assert_eq!(listed.kind, DaemonResponseKind::Packages, "{listed:?}");
+        assert_eq!(
+            listed.packages.len(),
+            call_count,
+            "the real owner serves a sibling request while Core is held"
+        );
+        release.0.take().unwrap().send(()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut responses = BTreeMap::new();
+        for _ in 0..call_count {
+            let DaemonUnixMuxFrame::Server(ServerFrame::Response {
+                request_id,
+                response,
+            }) = reader.read_frame(&mut client).unwrap()
+            else {
+                panic!("the daemon must return a correlated callback response");
+            };
+            assert!(responses.insert(request_id, response).is_none());
+        }
+        for index in 0..call_count {
+            let response = responses.remove(&(41 + index).to_string()).unwrap();
+            assert_eq!(
+                response.kind,
+                DaemonResponseKind::PluginMcpToolResult,
+                "{response:?}"
+            );
+            assert_eq!(response.plugin_tool_result["token"], format!("ack-{index}"));
+            assert_eq!(
+                response.plugin_tool_result["result"]["state"]["envelope_id"],
+                format!("c1-envelope-{index}")
+            );
+            assert_eq!(
+                response.plugin_tool_result["result"]["state"]["status"],
+                "acknowledged"
+            );
+        }
+        let retirement_deadline = Instant::now() + Duration::from_secs(2);
+        while waiters.iter().any(|waiter| retains_waiter(*waiter)) {
+            assert!(
+                Instant::now() < retirement_deadline,
+                "normal delivery must retire all C1 waiters before shutdown"
+            );
+            thread::yield_now();
+        }
+        let mut owners = callback_owners();
+        owners.push((
+            "inflight unused (daemon owner bound; take_pending returns None; asserted 0 at start)"
+                .into(),
+            0,
+        ));
+        let owner_sum: usize = owners.iter().map(|(_, bytes)| *bytes).sum();
+        eprintln!(
+            "callback charge owners before shutdown: {owners:?} sum={owner_sum} usage={}",
+            callback_usage()
+        );
+        assert_eq!(
+            owner_sum,
+            callback_usage(),
+            "callback owner sum must equal usage before shutdown owners={owners:?} usage={}",
+            callback_usage()
+        );
+        write_request(&mut client, status_id, DaemonRequest::Status);
+        assert_eq!(
+            read_response(&mut client, &mut reader, status_id).kind,
+            DaemonResponseKind::Status
+        );
+        write_request(&mut client, shutdown_id, DaemonRequest::DaemonShutdown);
+        read_response(&mut client, &mut reader, shutdown_id);
+        drop(client);
+        assert!(owner.join().unwrap().is_ok());
+        assert!(waiters.iter().all(|waiter| !retains_waiter(*waiter)));
+        drop(stop);
+        drop(retains_waiter);
+        assert_eq!(
+            callback_usage(),
+            0,
+            "callback storage must release after daemon stop owners={owners:?}"
+        );
+        drop(bridge);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_coordination_drain_collects_two_staggered_core_completions() {
+        struct ReleaseCore(Option<mpsc::Sender<()>>);
+        impl Drop for ReleaseCore {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        struct DisposedOnHost(mpsc::Sender<String>);
+        impl Drop for DisposedOnHost {
+            fn drop(&mut self) {
+                let _ = self
+                    .0
+                    .send(thread::current().name().unwrap_or("unnamed").into());
+            }
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = PathBuf::from("/private/tmp")
+            .join(format!("hub-c1-terminal-{}-{unique}", std::process::id()));
+        let config = package_control_config(root.join("data"));
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (release_second_tx, release_second_rx) = mpsc::channel();
+        let mut first_gate = ReleaseCore(Some(release_first_tx));
+        let mut second_gate = ReleaseCore(Some(release_second_tx));
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let (first_disposed_tx, first_disposed_rx) = mpsc::channel();
+        let (second_disposed_tx, second_disposed_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let owner = thread::Builder::new()
+            .name("c1-terminal-owner".into())
+            .spawn(move || {
+                let mut daemon = HubDaemon::start(config).unwrap();
+                let mut state = DaemonControlState::default();
+                let (control, receiver) = tokio_mpsc::channel(8);
+                let runtime = daemon.runtime().unwrap();
+                runtime.bind_data_plane_owner_wake(control.clone());
+                runtime.bind_host_owner_wake(control);
+                drop(runtime.submit_core(move |_| {
+                    first_entered_tx.send(()).unwrap();
+                    release_first_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }));
+                let bridge = runtime.coordination_bridge();
+                let response_first = bridge.test_queue_pending(
+                    crate::lua_runtime::PendingCoordinationOperation::Drain {
+                        target: botster_core::EnvelopeTarget::Topic {
+                            topic: "terminal-first".into(),
+                        },
+                        after: None,
+                        limit: 1,
+                    },
+                );
+                bridge.test_set_pending_drop_probe(DisposedOnHost(first_disposed_tx));
+                crate::daemon::control::coordination::accept_one(&mut daemon, &mut state);
+                let runtime = daemon.runtime().unwrap();
+                drop(runtime.submit_core(move |_| {
+                    second_entered_tx.send(()).unwrap();
+                    release_second_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }));
+                let response_second = bridge.test_queue_pending(
+                    crate::lua_runtime::PendingCoordinationOperation::Drain {
+                        target: botster_core::EnvelopeTarget::Topic {
+                            topic: "terminal-second".into(),
+                        },
+                        after: None,
+                        limit: 1,
+                    },
+                );
+                bridge.test_set_pending_drop_probe(DisposedOnHost(second_disposed_tx));
+                crate::daemon::control::coordination::accept_one(&mut daemon, &mut state);
+                assert_eq!(state.pending_requests.len(), 2);
+                let runtime = daemon.runtime().unwrap();
+                let probe: Box<dyn Fn(crate::owner_identity::WaiterId) -> bool + Send> =
+                    Box::new(runtime.test_core_waiter_probe());
+                runtime.bind_terminal_core_owner();
+                drop(receiver);
+                started_tx
+                    .send((bridge, probe, response_first, response_second))
+                    .unwrap();
+                drain_terminal_host_work(&mut daemon, &mut state);
+                assert!(state.pending_requests.is_empty());
+                assert_eq!(state.budget.outstanding(), 0);
+                daemon.stop();
+                finished_tx.send(()).unwrap();
+            })
+            .unwrap();
+        let (bridge, retains_waiter, response_first, response_second) =
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let waiters = bridge.test_admitted_waiters();
+        assert_eq!(waiters.len(), 2);
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            response_first.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            response_second.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        first_gate.0.take().unwrap().send(()).unwrap();
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            first_disposed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .starts_with("botster-hub-host")
+        );
+        assert!(matches!(
+            response_first.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert!(matches!(
+            response_second.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(
+            retains_waiter(waiters[1]),
+            "the second row keeps its phase history while Core is held"
+        );
+        assert!(finished_rx.try_recv().is_err());
+        second_gate.0.take().unwrap().send(()).unwrap();
+        assert!(
+            second_disposed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .starts_with("botster-hub-host")
+        );
+        assert!(matches!(
+            response_second.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        owner.join().unwrap();
+        assert!(waiters.iter().all(|waiter| !retains_waiter(*waiter)));
+        drop(retains_waiter);
+        drop(bridge);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -9591,6 +10110,9 @@ return botster.register({
                 runtime.reap_detached_core_operations();
             }
             match pending.continuation.poll(daemon, state) {
+                crate::daemon::control::pending::ControlPoll::FinishedInternal => {
+                    panic!("attach must return a response")
+                }
                 crate::daemon::control::pending::ControlPoll::DeliverStatusResponse(_, _, _)
                 | crate::daemon::control::pending::ControlPoll::StatusResponseDelivered {
                     ..

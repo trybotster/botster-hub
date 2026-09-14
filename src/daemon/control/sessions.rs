@@ -5,9 +5,14 @@
 //! Core ticket or completion arrives. Reads that the owner projection can
 //! answer (`Status` session count, `ListSessions`) never touch Core.
 
-use botster_core::{ClientId, SessionId, SubscriptionId, TerminalSubscriptionGeneration};
+use botster_core::{
+    ClientId, SessionId, SessionReservation, SessionReservationRelease, SubscriptionId,
+    TerminalSubscriptionGeneration,
+};
+use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_core_daemon::{
     CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError, DetachTerminalSubscriptionResult,
+    PendingOperationId, SpawnSessionRequest,
 };
 use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonDiagnostic, DaemonModeFlags, DaemonOperatorError,
@@ -152,6 +157,56 @@ pub(crate) fn projected_sessions(state: &DaemonControlState) -> Vec<DaemonSessio
         .collect()
 }
 
+fn retained_release_code(release: SessionReservationRelease) -> &'static str {
+    match release {
+        SessionReservationRelease::Released => "released",
+        SessionReservationRelease::RetainedPending => "retained_pending",
+        SessionReservationRelease::RetainedUnconfirmed => "cleanup_unconfirmed",
+        SessionReservationRelease::RetainedSession => "retained_session",
+    }
+}
+
+fn retain_explicit_reservation(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    reservation: SessionReservation,
+) {
+    if let Some(runtime) = daemon.runtime() {
+        runtime.retain_reservation(reservation);
+        state.retained_explicit_reservations = runtime.retained_reservations();
+    }
+}
+
+fn merge_retry_keep(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    retry_keep: &mut Vec<SessionReservation>,
+) {
+    if let Some(runtime) = daemon.runtime() {
+        runtime.merge_retained_reservations(std::mem::take(retry_keep));
+        state.retained_explicit_reservations = runtime.retained_reservations();
+    }
+}
+
+fn poll_spawn_ticket(
+    tracker: &mut CoreOperationTracker,
+    daemon: &HubDaemon,
+) -> CoreTicketPoll<Result<CoreCompletion, CoreDaemonError>> {
+    let Some(runtime) = daemon.runtime() else {
+        return CoreTicketPoll::Ready(Err(CoreDaemonError::Shutdown));
+    };
+    tracker.poll(runtime)
+}
+
+fn submit_release(
+    daemon: &HubDaemon,
+    waiter_id: crate::owner_identity::WaiterId,
+    reservation: SessionReservation,
+) -> Option<CoreOperationTracker> {
+    let runtime = daemon.runtime()?;
+    Some(runtime.begin_release_session_reservation_for_owner(waiter_id, reservation))
+}
+
 fn poll_tracker(
     tracker: &mut CoreOperationTracker,
     daemon: &HubDaemon,
@@ -174,6 +229,411 @@ fn poll_tracker(
         )))),
         CoreTicketPoll::Ready(Ok(completion)) => Ok(completion),
     }
+}
+
+fn finish_held_reservation(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    reservation: SessionReservation,
+    request_id: &str,
+    operation: &'static str,
+    error: CoreDaemonError,
+) -> ControlPoll {
+    retain_explicit_reservation(daemon, state, reservation);
+    ControlPoll::Ready(Ok(core_operator_error(operation, request_id, &error)))
+}
+
+fn handle_daemon_spawn(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    session_id: String,
+    command: String,
+) -> ControlStep {
+    let runtime = daemon.runtime().expect("runtime checked above");
+    let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+    let id = request_id("daemon-sessions-spawn");
+    let spawn = SpawnSessionRequest {
+        request: spawn_request(runtime, id.clone(), SessionId(session_id.clone()), command),
+        metadata: client_session_metadata(),
+    };
+    enum Stage {
+        RetryRetained,
+        Reserve,
+        Lookup,
+        SpawnReserved,
+        Release,
+    }
+    let mut retry_tokens = runtime.take_retained_reservations();
+    state.retained_explicit_reservations.clear();
+    let mut retry_keep = Vec::new();
+    let mut stage = if retry_tokens.is_empty() {
+        Stage::Reserve
+    } else {
+        Stage::RetryRetained
+    };
+    let mut tracker = if matches!(stage, Stage::Reserve) {
+        runtime.begin_reserve_session_for_owner(waiter_id, SessionId(session_id.clone()))
+    } else {
+        runtime.begin_release_session_reservation_for_owner(waiter_id, retry_tokens[0].clone())
+    };
+    let mut reservation: Option<SessionReservation> = None;
+    let mut spawn_error: Option<CoreDaemonError> = None;
+    let mut reserve_operation_id: Option<PendingOperationId> = None;
+    ControlStep::pending(move |daemon, state| {
+        loop {
+            if let Some(pending_id) = tracker.pending_id()
+                && matches!(stage, Stage::Reserve)
+            {
+                reserve_operation_id = Some(pending_id);
+            }
+            match stage {
+                Stage::RetryRetained => {
+                    if retry_tokens.is_empty() {
+                        merge_retry_keep(daemon, state, &mut retry_keep);
+                        let Some(runtime) = daemon.runtime() else {
+                            return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
+                        };
+                        tracker = runtime.begin_reserve_session_for_owner(
+                            waiter_id,
+                            SessionId(session_id.clone()),
+                        );
+                        stage = Stage::Reserve;
+                        continue;
+                    }
+                    #[cfg(test)]
+                    if let Some(runtime) = daemon.runtime() {
+                        if runtime.test_retry_retained_again_on_pending() {
+                            return ControlPoll::Again;
+                        }
+                        if runtime.test_resubmit_release_on_pending() {
+                            if let Some(next) =
+                                submit_release(daemon, waiter_id, retry_tokens[0].clone())
+                            {
+                                tracker = next;
+                            }
+                        }
+                    }
+                    match poll_spawn_ticket(&mut tracker, daemon) {
+                        CoreTicketPoll::Pending => return ControlPoll::Pending,
+                        CoreTicketPoll::Refused
+                        | CoreTicketPoll::Lost
+                        | CoreTicketPoll::Ready(Err(_)) => {
+                            retry_keep.push(retry_tokens.remove(0));
+                            if retry_tokens.is_empty() {
+                                continue;
+                            }
+                            match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
+                                Some(next) => {
+                                    tracker = next;
+                                    continue;
+                                }
+                                None => {
+                                    retry_keep.append(&mut retry_tokens);
+                                    merge_retry_keep(daemon, state, &mut retry_keep);
+                                    return ControlPoll::Ready(Err(
+                                        DaemonTransportError::DaemonNotRunning,
+                                    ));
+                                }
+                            }
+                        }
+                        CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                            result: Ok(SessionReservationRelease::Released),
+                            ..
+                        })) => {
+                            retry_tokens.remove(0);
+                            if retry_tokens.is_empty() {
+                                continue;
+                            }
+                            match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
+                                Some(next) => tracker = next,
+                                None => {
+                                    retry_keep.append(&mut retry_tokens);
+                                    merge_retry_keep(daemon, state, &mut retry_keep);
+                                    return ControlPoll::Ready(Err(
+                                        DaemonTransportError::DaemonNotRunning,
+                                    ));
+                                }
+                            }
+                        }
+                        CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                            ..
+                        })) => {
+                            retry_keep.push(retry_tokens.remove(0));
+                            if retry_tokens.is_empty() {
+                                continue;
+                            }
+                            match submit_release(daemon, waiter_id, retry_tokens[0].clone()) {
+                                Some(next) => tracker = next,
+                                None => {
+                                    retry_keep.append(&mut retry_tokens);
+                                    merge_retry_keep(daemon, state, &mut retry_keep);
+                                    return ControlPoll::Ready(Err(
+                                        DaemonTransportError::DaemonNotRunning,
+                                    ));
+                                }
+                            }
+                        }
+                        CoreTicketPoll::Ready(Ok(_)) => {
+                            return ControlPoll::Ready(Err(
+                                DaemonTransportError::UnexpectedResponse,
+                            ));
+                        }
+                    }
+                }
+                Stage::Reserve => match poll_spawn_ticket(&mut tracker, daemon) {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return ControlPoll::Ready(Ok(overloaded_core("reserve_session", &id.0)));
+                    }
+                    CoreTicketPoll::Lost => {
+                        let Some(reserve_id) = reserve_operation_id else {
+                            return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
+                        };
+                        let Some(runtime) = daemon.runtime() else {
+                            return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
+                        };
+                        tracker = runtime.begin_lookup_session_reservation_for_owner(
+                            waiter_id,
+                            SessionId(session_id.clone()),
+                            reserve_id,
+                        );
+                        stage = Stage::Lookup;
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        return ControlPoll::Ready(Ok(core_operator_error(
+                            "reserve_session",
+                            &id.0,
+                            &error,
+                        )));
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                        result, ..
+                    })) => match result {
+                        Ok(reserved) => {
+                            reservation = Some(reserved.clone());
+                            let Some(runtime) = daemon.runtime() else {
+                                return ControlPoll::Ready(Err(
+                                    DaemonTransportError::DaemonNotRunning,
+                                ));
+                            };
+                            tracker = runtime.begin_spawn_reserved_for_owner(
+                                waiter_id,
+                                reserved,
+                                spawn.clone(),
+                            );
+                            stage = Stage::SpawnReserved;
+                        }
+                        Err(error) => {
+                            return ControlPoll::Ready(Ok(core_operator_error(
+                                "reserve_session",
+                                &id.0,
+                                &error,
+                            )));
+                        }
+                    },
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                    }
+                },
+                Stage::Lookup => match poll_spawn_ticket(&mut tracker, daemon) {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return ControlPoll::Ready(Ok(overloaded_core(
+                            "lookup_session_reservation",
+                            &id.0,
+                        )));
+                    }
+                    CoreTicketPoll::Lost => {
+                        return ControlPoll::Ready(Ok(lost_core(
+                            "lookup_session_reservation",
+                            &id.0,
+                        )));
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        return ControlPoll::Ready(Ok(core_operator_error(
+                            "lookup_session_reservation",
+                            &id.0,
+                            &error,
+                        )));
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::LookupSessionReservation {
+                        result,
+                        ..
+                    })) => match result {
+                        Ok(Some(reserved)) => {
+                            reservation = Some(reserved.clone());
+                            spawn_error = Some(CoreDaemonError::Shutdown);
+                            match submit_release(daemon, waiter_id, reserved) {
+                                Some(next) => {
+                                    tracker = next;
+                                    stage = Stage::Release;
+                                }
+                                None => {
+                                    return finish_held_reservation(
+                                        daemon,
+                                        state,
+                                        reservation.take().expect("looked-up reservation"),
+                                        &id.0,
+                                        "lookup_session_reservation",
+                                        CoreDaemonError::Shutdown,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
+                        }
+                        Err(error) => {
+                            return ControlPoll::Ready(Ok(core_operator_error(
+                                "lookup_session_reservation",
+                                &id.0,
+                                &error,
+                            )));
+                        }
+                    },
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                    }
+                },
+                Stage::SpawnReserved => match poll_spawn_ticket(&mut tracker, daemon) {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Refused => {
+                        return finish_held_reservation(
+                            daemon,
+                            state,
+                            reservation.take().expect("reserved identity"),
+                            &id.0,
+                            "spawn_reserved",
+                            core_bridge_error(CoreTicketError::Overloaded),
+                        );
+                    }
+                    CoreTicketPoll::Lost => {
+                        return finish_held_reservation(
+                            daemon,
+                            state,
+                            reservation.take().expect("reserved identity"),
+                            &id.0,
+                            "spawn_reserved",
+                            CoreDaemonError::Shutdown,
+                        );
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        return finish_held_reservation(
+                            daemon,
+                            state,
+                            reservation.take().expect("reserved identity"),
+                            &id.0,
+                            "spawn_reserved",
+                            error,
+                        );
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Installed { session },
+                        ..
+                    })) => {
+                        let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
+                        state
+                            .drain_cursors
+                            .insert(session.session_id.0.clone(), now);
+                        return ControlPoll::Ready(Ok(daemon_spawned(
+                            DaemonSession {
+                                session_id: session.session_id.0,
+                                lifecycle: lifecycle_label(&session.lifecycle).to_string(),
+                            },
+                            Vec::new(),
+                        )));
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::Refused { error },
+                        ..
+                    }))
+                    | CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                        result: ReservedSpawnResult::AdmittedFailure { error, .. },
+                        ..
+                    })) => {
+                        spawn_error = Some(error);
+                        let held = reservation.clone().expect("reserved identity");
+                        match submit_release(daemon, waiter_id, held) {
+                            Some(next) => {
+                                tracker = next;
+                                stage = Stage::Release;
+                            }
+                            None => {
+                                return finish_held_reservation(
+                                    daemon,
+                                    state,
+                                    reservation.take().expect("reserved identity"),
+                                    &id.0,
+                                    "spawn_reserved",
+                                    spawn_error.take().unwrap(),
+                                );
+                            }
+                        }
+                    }
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                    }
+                },
+                Stage::Release => match poll_spawn_ticket(&mut tracker, daemon) {
+                    CoreTicketPoll::Pending => return ControlPoll::Pending,
+                    CoreTicketPoll::Refused
+                    | CoreTicketPoll::Lost
+                    | CoreTicketPoll::Ready(Err(_)) => {
+                        let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
+                        return finish_held_reservation(
+                            daemon,
+                            state,
+                            reservation.take().expect("reserved identity"),
+                            &id.0,
+                            "release_session_reservation",
+                            error,
+                        );
+                    }
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                        result,
+                        ..
+                    })) => {
+                        let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
+                        return ControlPoll::Ready(Ok(match result {
+                            Ok(SessionReservationRelease::Released) => {
+                                core_operator_error("spawn_reserved", &id.0, &error)
+                            }
+                            Ok(release) => {
+                                if let Some(held) = reservation.take() {
+                                    retain_explicit_reservation(daemon, state, held);
+                                }
+                                let mut response = core_operator_error(
+                                    "release_session_reservation",
+                                    &id.0,
+                                    &error,
+                                );
+                                if let Some(operator) = response.error.as_mut() {
+                                    operator.code = retained_release_code(release).to_string();
+                                    operator.message = format!(
+                                        "spawn failed and Core retained reservation ownership ({release:?}): {error}"
+                                    );
+                                }
+                                response
+                            }
+                            Err(release_error) => {
+                                if let Some(held) = reservation.take() {
+                                    retain_explicit_reservation(daemon, state, held);
+                                }
+                                core_operator_error(
+                                    "release_session_reservation",
+                                    &id.0,
+                                    &release_error,
+                                )
+                            }
+                        }));
+                    }
+                    CoreTicketPoll::Ready(Ok(_)) => {
+                        return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
+                    }
+                },
+            }
+        }
+    })
 }
 
 pub(crate) fn handle_runtime(
@@ -237,43 +697,7 @@ pub(crate) fn handle_runtime(
         DaemonRequest::Spawn {
             session_id,
             command,
-        } => {
-            let runtime = daemon.runtime().expect("runtime checked above");
-            let id = request_id("daemon-sessions-spawn");
-            let spawn = spawn_request(runtime, id.clone(), SessionId(session_id), command);
-            let mut tracker = runtime.begin_spawn_for_owner(
-                state.current_waiter_id.expect("owner waiter is assigned"),
-                spawn,
-                client_session_metadata(),
-            );
-            ControlStep::pending(move |daemon, state| {
-                let completion = match poll_tracker(&mut tracker, daemon, "spawn", &id.0) {
-                    Ok(completion) => completion,
-                    Err(poll) => return poll,
-                };
-                let CoreCompletion::Spawn { result, .. } = completion else {
-                    return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
-                };
-                match result {
-                    Ok(session) => {
-                        let now = crate::daemon::owner_loop::tick(&mut state.logical_clock);
-                        state
-                            .drain_cursors
-                            .insert(session.session_id.0.clone(), now);
-                        ControlPoll::Ready(Ok(daemon_spawned(
-                            DaemonSession {
-                                session_id: session.session_id.0,
-                                lifecycle: lifecycle_label(&session.lifecycle).to_string(),
-                            },
-                            Vec::new(),
-                        )))
-                    }
-                    Err(error) => {
-                        ControlPoll::Ready(Ok(core_operator_error("spawn", &id.0, &error)))
-                    }
-                }
-            })
-        }
+        } => handle_daemon_spawn(daemon, state, session_id, command),
         DaemonRequest::Attach {
             session_id,
             subscription_id,
@@ -1332,4 +1756,2228 @@ fn handle_shutdown_session(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::control::DaemonObservability;
+    use crate::daemon::control::managed_git::accept_one;
+    use crate::daemon::owner_loop::{drive_ready_test_turn, publish_completion_wakes};
+    use crate::host_executor::TestHostGate;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn observability() -> DaemonObservability {
+        DaemonObservability {
+            egress: Vec::new(),
+            lifecycle: botster_hub_client::DaemonLifecycleCounters::default(),
+            client_id: None,
+            grant_id: None,
+            transport_request_id: None,
+        }
+    }
+
+    fn spawn_fixture(name: &str) -> (crate::HubDaemon, DaemonControlState, std::path::PathBuf) {
+        spawn_fixture_with_worker(name, None)
+    }
+
+    const MATCHED_WORKER: &str = "/tmp/core-d1a-candidate-20260911-5/botster-session-worker";
+    const MATCHED_WORKER_SHA256: &str =
+        "1dfdd4f300409bf00a6694d1979650799b6280972bd24dd6cb592b21c0382f73";
+
+    fn spawn_fixture_with_worker(
+        name: &str,
+        worker: Option<std::path::PathBuf>,
+    ) -> (crate::HubDaemon, DaemonControlState, std::path::PathBuf) {
+        spawn_fixture_case(name, worker, None)
+    }
+
+    fn spawn_fixture_case(
+        name: &str,
+        worker: Option<std::path::PathBuf>,
+        shell: Option<String>,
+    ) -> (crate::HubDaemon, DaemonControlState, std::path::PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::path::PathBuf::from("/private/tmp")
+            .join(format!("s1-spawn-{name}-{}-{stamp}", std::process::id()));
+        let mut core_engine = crate::config::CoreEngineOptions::default();
+        core_engine.session_worker_path = worker;
+        let mut session_defaults = crate::config::SessionDefaults::default();
+        if let Some(shell) = shell {
+            session_defaults.shell = shell;
+        }
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: format!("s1-{name}"),
+                display_name: "S1 Spawn Test".into(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(root.clone()),
+            session_defaults,
+            core_engine,
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        let daemon = crate::HubDaemon::start(config).unwrap();
+        let mut state = DaemonControlState::default();
+        state.current_waiter_id = Some(
+            state
+                .waiter_ids
+                .next()
+                .expect("fresh owner identity source"),
+        );
+        (daemon, state, root)
+    }
+
+    fn pump_core(daemon: &mut crate::HubDaemon, state: &mut DaemonControlState) {
+        drive_ready_test_turn(daemon, state);
+        if let Some(runtime) = daemon.runtime() {
+            runtime.reap_detached_core_operations();
+            let identities = runtime.take_owner_core_completions(8);
+            if !identities.is_empty() {
+                let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+                crate::daemon::control::pending::absorb_core_completions(
+                    state,
+                    &identities,
+                    &mut budget,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_release_codes_distinguish_core_outcomes() {
+        assert_eq!(
+            retained_release_code(SessionReservationRelease::Released),
+            "released"
+        );
+        assert_eq!(
+            retained_release_code(SessionReservationRelease::RetainedPending),
+            "retained_pending"
+        );
+        assert_eq!(
+            retained_release_code(SessionReservationRelease::RetainedUnconfirmed),
+            "cleanup_unconfirmed"
+        );
+        assert_eq!(
+            retained_release_code(SessionReservationRelease::RetainedSession),
+            "retained_session"
+        );
+    }
+
+    #[test]
+    fn reserve_queue_full_retries_without_retaining_a_token() {
+        let (mut daemon, mut state, root) = spawn_fixture("reserve-full");
+        daemon.runtime().unwrap().test_refuse_next_owner_begins(1);
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-reserve-full".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let ControlPoll::Ready(Ok(response)) = pending.continuation.poll(&mut daemon, &mut state)
+        else {
+            panic!("queue-full reserve must return immediately");
+        };
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("pending_limit")
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lost_reserve_without_an_id_does_not_retain_a_token() {
+        let (mut daemon, mut state, root) = spawn_fixture("reserve-lost");
+        daemon.runtime().unwrap().test_lose_next_owner_begins(1);
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-reserve-lost".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let poll = pending.continuation.poll(&mut daemon, &mut state);
+        let ControlPoll::Ready(Ok(response)) = poll else {
+            panic!("lost reserve without an id must complete");
+        };
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("daemon_shutdown")
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn spawn_reserved_queue_full_releases_the_held_reservation() {
+        let (mut daemon, mut state, root) = spawn_fixture("spawn-full");
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-spawn-full".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut armed = false;
+        loop {
+            assert!(Instant::now() < deadline, "spawn lifecycle stalled");
+            drive_ready_test_turn(&mut daemon, &mut state);
+            if !armed {
+                daemon.runtime().unwrap().test_refuse_next_owner_begins(1);
+                armed = true;
+            }
+            match pending.continuation.poll(&mut daemon, &mut state) {
+                ControlPoll::Pending | ControlPoll::Again => std::thread::yield_now(),
+                ControlPoll::Ready(Ok(_)) => break,
+                ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                _ => std::thread::yield_now(),
+            }
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn wait_reservation(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        tracker: &mut crate::runtime::CoreOperationTracker,
+    ) -> SessionReservation {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "reserve did not complete");
+            drive_ready_test_turn(daemon, state);
+            match tracker.poll(daemon.runtime().unwrap()) {
+                CoreTicketPoll::Pending => std::thread::yield_now(),
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                    result: Ok(reserved),
+                    ..
+                })) => return reserved,
+                _ => panic!("reserve must complete with a token"),
+            }
+        }
+    }
+
+    #[test]
+    fn merge_retained_keeps_token_pushed_during_take() {
+        let (mut daemon, mut state, root) = spawn_fixture("merge-keep");
+        let waiter = state.current_waiter_id.unwrap();
+        let mut first = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-merge-a".into()));
+        let a = wait_reservation(&mut daemon, &mut state, &mut first);
+        let mut second = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-merge-b".into()));
+        let b = wait_reservation(&mut daemon, &mut state, &mut second);
+        let runtime = daemon.runtime().unwrap();
+        runtime.retain_reservation(a.clone());
+        let taken = runtime.take_retained_reservations();
+        runtime.retain_reservation(b.clone());
+        runtime.merge_retained_reservations(taken);
+        let held = runtime.retained_reservations();
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().any(|token| token == &a));
+        assert!(held.iter().any(|token| token == &b));
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retract_spawn_context_keeps_unrelated_identity() {
+        let (mut daemon, _state, root) = spawn_fixture("retract-ctx");
+        let runtime = daemon.runtime().unwrap();
+        let live = crate::session_types::HubSessionContext {
+            context_id: "live-ctx".into(),
+            session_id: SessionId("s1-live".into()),
+            values: Default::default(),
+        };
+        let other = crate::session_types::HubSessionContext {
+            context_id: "other-ctx".into(),
+            session_id: SessionId("s1-live".into()),
+            values: Default::default(),
+        };
+        runtime.publish_spawn_context(&live).unwrap();
+        runtime.retract_spawn_context(&other);
+        assert_eq!(
+            runtime
+                .test_session_context("s1-live")
+                .map(|context| context.context_id),
+            Some("live-ctx".into())
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retry_retained_full_queue_keeps_both_tokens_and_finishes() {
+        let (mut daemon, mut state, root) = spawn_fixture("retry-two");
+        let waiter = state.current_waiter_id.unwrap();
+        let mut first = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-retry-a".into()));
+        let a = wait_reservation(&mut daemon, &mut state, &mut first);
+        let mut second = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId("s1-retry-b".into()));
+        let b = wait_reservation(&mut daemon, &mut state, &mut second);
+        daemon.runtime().unwrap().retain_reservation(a);
+        daemon.runtime().unwrap().retain_reservation(b);
+        daemon.runtime().unwrap().test_refuse_next_owner_begins(8);
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-retry-c".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut loops = 0_u32;
+        let mut again = 0_u32;
+        let response = loop {
+            loops += 1;
+            let begins = daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins();
+            let refusals = daemon
+                .runtime()
+                .unwrap()
+                .test_refuse_next_owner_begins_remaining();
+            assert!(
+                Instant::now() < deadline,
+                "retry-retained hang loops={loops} again={again} begins={begins} refusals={refusals}"
+            );
+            drive_ready_test_turn(&mut daemon, &mut state);
+            match pending.continuation.poll(&mut daemon, &mut state) {
+                ControlPoll::Pending => std::thread::yield_now(),
+                ControlPoll::Again => {
+                    again += 1;
+                    panic!(
+                        "retry-retained Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
+                    );
+                }
+                ControlPoll::Ready(Ok(response)) => break response,
+                ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                _ => std::thread::yield_now(),
+            }
+        };
+        assert_eq!(again, 0);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("pending_limit")
+        );
+        assert_eq!(state.retained_explicit_reservations.len(), 2);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_spawns_take_retained_tokens_once() {
+        let (mut daemon, mut state, root) = spawn_fixture("concurrent");
+        let waiter_a = state.current_waiter_id.unwrap();
+        let waiter_b = state.waiter_ids.next().expect("second waiter");
+        let mut reserve = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter_a, SessionId("s1-concurrent-held".into()));
+        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        daemon.runtime().unwrap().retain_reservation(held);
+        daemon.runtime().unwrap().test_refuse_next_owner_begins(16);
+        state.current_waiter_id = Some(waiter_a);
+        let ControlStep::Pending(mut pending_a) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-concurrent-a".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn a must defer");
+        };
+        assert!(
+            state.retained_explicit_reservations.is_empty(),
+            "Spawn A must take retained tokens before Spawn B is created"
+        );
+        state.current_waiter_id = Some(waiter_b);
+        let ControlStep::Pending(mut pending_b) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: "s1-concurrent-b".into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn b must defer");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut loops = 0_u32;
+        let mut again = 0_u32;
+        let mut done_a = false;
+        let mut done_b = false;
+        while !(done_a && done_b) {
+            loops += 1;
+            let begins = daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins();
+            let refusals = daemon
+                .runtime()
+                .unwrap()
+                .test_refuse_next_owner_begins_remaining();
+            assert!(
+                Instant::now() < deadline,
+                "concurrent spawn hang loops={loops} again={again} begins={begins} refusals={refusals}"
+            );
+            drive_ready_test_turn(&mut daemon, &mut state);
+            if !done_a {
+                match pending_a.continuation.poll(&mut daemon, &mut state) {
+                    ControlPoll::Ready(Ok(_)) => done_a = true,
+                    ControlPoll::Ready(Err(_)) => panic!("spawn a transport failed"),
+                    ControlPoll::Again => {
+                        again += 1;
+                        panic!(
+                            "concurrent spawn A Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if !done_b {
+                match pending_b.continuation.poll(&mut daemon, &mut state) {
+                    ControlPoll::Ready(Ok(_)) => done_b = true,
+                    ControlPoll::Ready(Err(_)) => panic!("spawn b transport failed"),
+                    ControlPoll::Again => {
+                        again += 1;
+                        panic!(
+                            "concurrent spawn B Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(again, 0);
+        assert_eq!(state.retained_explicit_reservations.len(), 1);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn drive_accepting_queue(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        pending: &mut crate::daemon::control::pending::PendingStep,
+    ) -> botster_hub_client::DaemonResponse {
+        assert!(state.retained_explicit_reservations.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut loops = 0_u32;
+        let mut again = 0_u32;
+        let mut armed = false;
+        let response = loop {
+            loops += 1;
+            let begins = daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins();
+            let refusals = daemon
+                .runtime()
+                .unwrap()
+                .test_refuse_next_owner_begins_remaining();
+            assert!(
+                Instant::now() < deadline,
+                "accepting-queue hang loops={loops} again={again} begins={begins} refusals={refusals}"
+            );
+            pump_core(daemon, state);
+            if !armed
+                && daemon
+                    .runtime()
+                    .unwrap()
+                    .test_release_session_reservation_begins()
+                    >= 1
+            {
+                daemon.runtime().unwrap().test_refuse_next_owner_begins(8);
+                armed = true;
+            }
+            match pending.continuation.poll(daemon, state) {
+                ControlPoll::Pending => std::thread::yield_now(),
+                ControlPoll::Again => {
+                    again += 1;
+                    let begins = daemon
+                        .runtime()
+                        .unwrap()
+                        .test_release_session_reservation_begins();
+                    let refusals = daemon
+                        .runtime()
+                        .unwrap()
+                        .test_refuse_next_owner_begins_remaining();
+                    panic!(
+                        "accepting-queue Again while waiting on Core loops={loops} again={again} begins={begins} refusals={refusals}"
+                    );
+                }
+                ControlPoll::Ready(Ok(response)) => break response,
+                ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                _ => std::thread::yield_now(),
+            }
+        };
+        let begins = daemon
+            .runtime()
+            .unwrap()
+            .test_release_session_reservation_begins();
+        let refusals = daemon
+            .runtime()
+            .unwrap()
+            .test_refuse_next_owner_begins_remaining();
+        assert_eq!(
+            again, 0,
+            "accepting-queue Again loops={loops} again={again} begins={begins} refusals={refusals}"
+        );
+        assert_eq!(
+            begins, 1,
+            "accepting-queue release begins loops={loops} again={again} begins={begins} refusals={refusals}"
+        );
+        assert_eq!(
+            refusals, 7,
+            "accepting-queue consumed one refused begin loops={loops} again={again} begins={begins} refusals={refusals}"
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        assert!(response.error.is_some());
+        response
+    }
+
+    fn start_accepting_queue(
+        label: &str,
+        held_id: &str,
+        next_id: &str,
+    ) -> (
+        crate::HubDaemon,
+        DaemonControlState,
+        std::path::PathBuf,
+        crate::daemon::control::pending::PendingStep,
+    ) {
+        let (mut daemon, mut state, root) = spawn_fixture(label);
+        let waiter = state.current_waiter_id.unwrap();
+        let mut reserve = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, SessionId(held_id.into()));
+        let held = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        daemon.runtime().unwrap().retain_reservation(held);
+        let ControlStep::Pending(pending) = handle_runtime(
+            &mut daemon,
+            &mut state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: next_id.into(),
+                command: "true".into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        (daemon, state, root, pending)
+    }
+
+    #[test]
+    fn accepting_queue_releases_a_retained_token_once() {
+        let (mut daemon, mut state, root, mut pending) =
+            start_accepting_queue("accept-release", "s1-accept-held", "s1-accept-next");
+        let _response = drive_accepting_queue(&mut daemon, &mut state, &mut pending);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("panic message")
+    }
+
+    #[test]
+    fn accepting_queue_fails_when_retry_returns_again() {
+        let (mut daemon, mut state, root, mut pending) = start_accepting_queue(
+            "accept-again",
+            "s1-accept-again-held",
+            "s1-accept-again-next",
+        );
+        daemon
+            .runtime()
+            .unwrap()
+            .test_set_retry_retained_again_on_pending(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drive_accepting_queue(&mut daemon, &mut state, &mut pending);
+        }));
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let message = match result {
+            Err(payload) => panic_message(payload),
+            Ok(()) => panic!("Again ablation must fail"),
+        };
+        assert!(
+            message.contains("Again while waiting on Core"),
+            "unexpected panic: {message}"
+        );
+        assert!(message.contains("again=1"), "unexpected panic: {message}");
+    }
+
+    #[test]
+    fn accepting_queue_fails_when_release_is_resubmitted() {
+        let (mut daemon, mut state, root, mut pending) = start_accepting_queue(
+            "accept-resubmit",
+            "s1-accept-resubmit-held",
+            "s1-accept-resubmit-next",
+        );
+        daemon
+            .runtime()
+            .unwrap()
+            .test_set_resubmit_release_on_pending(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drive_accepting_queue(&mut daemon, &mut state, &mut pending);
+        }));
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let message = match result {
+            Err(payload) => panic_message(payload),
+            Ok(()) => panic!("resubmit ablation must fail"),
+        };
+        assert!(
+            message.contains("release begins") || message.contains("consumed one refused"),
+            "unexpected panic: {message}"
+        );
+    }
+
+    fn write_worker_script(root: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = root.join("scripted-worker");
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    }
+
+    fn write_frame_exit_worker(root: &std::path::Path) -> std::path::PathBuf {
+        let python = String::from_utf8(
+            std::process::Command::new("python3")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .expect("python3 executable")
+                .stdout,
+        )
+        .expect("python path utf8");
+        write_worker_script(
+            root,
+            &format!(
+                r#"#!{python}
+import os, socket, sys
+path = None
+args = sys.argv
+for i, arg in enumerate(args):
+    if arg == "--control-socket" and i + 1 < len(args):
+        path = args[i + 1]
+        break
+if not path:
+    sys.exit(5)
+if os.path.exists(path):
+    os.unlink(path)
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path)
+srv.listen(1)
+sys.stdout.write("botster-session-worker-ready %s\n" % os.getpid())
+sys.stdout.flush()
+conn, _unused = srv.accept()
+hello = conn.recv(5, socket.MSG_WAITALL)
+if hello is None or len(hello) != 5:
+    sys.exit(2)
+n = conn.recv(4, socket.MSG_WAITALL)
+if n is None or len(n) != 4:
+    sys.exit(3)
+length = int.from_bytes(n, "little")
+body = b""
+while len(body) < length:
+    chunk = conn.recv(length - len(body))
+    if not chunk:
+        break
+    body += chunk
+if len(body) != length:
+    sys.exit(4)
+sys.exit(0)
+"#,
+                python = python.trim()
+            ),
+        )
+    }
+
+    fn matched_worker_path() -> std::path::PathBuf {
+        let path = std::path::PathBuf::from(MATCHED_WORKER);
+        let hashed = std::process::Command::new("shasum")
+            .args(["-a", "256", MATCHED_WORKER])
+            .output()
+            .expect("hash matched worker");
+        let text = String::from_utf8(hashed.stdout).expect("hash utf8");
+        assert!(
+            text.starts_with(MATCHED_WORKER_SHA256),
+            "matched worker hash {text}"
+        );
+        path
+    }
+
+    fn spawn_error_code(response: &botster_hub_client::DaemonResponse) -> Option<&str> {
+        response.error.as_ref().map(|error| error.code.as_str())
+    }
+
+    fn poll_spawn_until_ready(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        pending: &mut crate::daemon::control::pending::PendingStep,
+    ) -> botster_hub_client::DaemonResponse {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(Instant::now() < deadline, "scripted-worker spawn hang");
+            pump_core(daemon, state);
+            match pending.continuation.poll(daemon, state) {
+                ControlPoll::Pending | ControlPoll::Again => std::thread::yield_now(),
+                ControlPoll::Ready(Ok(response)) => return response,
+                ControlPoll::Ready(Err(_)) => panic!("spawn transport failed"),
+                _ => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn spawn_until_ready(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        session_id: &str,
+        command: &str,
+    ) -> botster_hub_client::DaemonResponse {
+        let ControlStep::Pending(mut pending) = handle_runtime(
+            daemon,
+            state,
+            observability(),
+            DaemonRequest::Spawn {
+                session_id: session_id.into(),
+                command: command.into(),
+            },
+        ) else {
+            panic!("spawn must defer");
+        };
+        poll_spawn_until_ready(daemon, state, &mut pending)
+    }
+
+    #[test]
+    fn missing_session_worker_reaches_a_terminal_spawn_outcome() {
+        let worker = std::path::PathBuf::from("/no/such/botster-session-worker");
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("missing-worker", Some(worker));
+        let response = spawn_until_ready(&mut daemon, &mut state, "s1-missing-worker", "true");
+        assert_eq!(spawn_error_code(&response), Some("core_error"));
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_exit_before_connect_releases_the_reservation() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-spawn-exit-before-{}-{stamp}",
+            std::process::id()
+        ));
+        let worker = write_worker_script(
+            &root,
+            "#!/bin/sh\nprintf 'botster-session-worker-ready %s\\n' \"$$\"\nexit 1\n",
+        );
+        let (mut daemon, mut state, fixture_root) =
+            spawn_fixture_with_worker("exit-before", Some(worker));
+        let response = spawn_until_ready(&mut daemon, &mut state, "s1-exit-before", "true");
+        assert_eq!(spawn_error_code(&response), Some("core_error"));
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn worker_reads_spawn_frame_then_exits_retains_unconfirmed() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-spawn-frame-exit-{}-{stamp}",
+            std::process::id()
+        ));
+        let python = String::from_utf8(
+            std::process::Command::new("python3")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .expect("python3 executable")
+                .stdout,
+        )
+        .expect("python path utf8");
+        let worker = write_worker_script(
+            &root,
+            &format!(
+                r#"#!{python}
+import os, socket, sys
+path = None
+args = sys.argv
+for i, arg in enumerate(args):
+    if arg == "--control-socket" and i + 1 < len(args):
+        path = args[i + 1]
+        break
+if not path:
+    sys.exit(5)
+if os.path.exists(path):
+    os.unlink(path)
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path)
+srv.listen(1)
+sys.stdout.write("botster-session-worker-ready %s\n" % os.getpid())
+sys.stdout.flush()
+conn, _unused = srv.accept()
+hello = conn.recv(5, socket.MSG_WAITALL)
+if hello is None or len(hello) != 5:
+    sys.exit(2)
+n = conn.recv(4, socket.MSG_WAITALL)
+if n is None or len(n) != 4:
+    sys.exit(3)
+length = int.from_bytes(n, "little")
+body = b""
+while len(body) < length:
+    chunk = conn.recv(length - len(body))
+    if not chunk:
+        break
+    body += chunk
+if len(body) != length:
+    sys.exit(4)
+sys.exit(0)
+"#,
+                python = python.trim()
+            ),
+        );
+        let (mut daemon, mut state, fixture_root) =
+            spawn_fixture_with_worker("frame-exit", Some(worker));
+        let first = spawn_until_ready(&mut daemon, &mut state, "s1-frame-exit", "true");
+        assert_eq!(
+            spawn_error_code(&first),
+            Some("cleanup_unconfirmed"),
+            "{first:?}"
+        );
+        assert_eq!(state.retained_explicit_reservations.len(), 1);
+        let held = state.retained_explicit_reservations[0].clone();
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        let second = spawn_until_ready(&mut daemon, &mut state, "s1-frame-exit-retry", "true");
+        assert_eq!(spawn_error_code(&second), Some("cleanup_unconfirmed"));
+        assert!(
+            state
+                .retained_explicit_reservations
+                .iter()
+                .any(|token| token == &held),
+            "next Spawn must keep the unconfirmed token"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn matched_worker_missing_session_executable_releases() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) = spawn_fixture_case(
+            "matched-missing",
+            Some(worker),
+            Some("/no/such/botster-session-executable".into()),
+        );
+        let response = spawn_until_ready(&mut daemon, &mut state, "s1-matched-missing", "true");
+        assert_eq!(spawn_error_code(&response), Some("core_error"));
+        let message = response
+            .error
+            .as_ref()
+            .map(|error| error.message.as_str())
+            .unwrap_or("");
+        assert!(
+            message.contains("worker startup failed"),
+            "SPF1 NotCreated must surface as worker startup failed: {message}"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matched_worker_real_command_installs() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("matched-install", Some(worker));
+        let response = spawn_until_ready(&mut daemon, &mut state, "s1-matched-install", "true");
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(response.kind, DaemonResponseKind::Spawned);
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            0
+        );
+        assert!(state.retained_explicit_reservations.is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn occupied_reserve_fails_without_clearing_the_installed_session() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("occupied", Some(worker));
+        let first = spawn_until_ready(&mut daemon, &mut state, "s1-occupied", "true");
+        assert!(first.error.is_none(), "{first:?}");
+        assert_eq!(first.kind, DaemonResponseKind::Spawned);
+        let second = spawn_until_ready(&mut daemon, &mut state, "s1-occupied", "true");
+        assert!(second.error.is_some(), "{second:?}");
+        let message = second
+            .error
+            .as_ref()
+            .map(|error| error.message.to_ascii_lowercase())
+            .unwrap_or_default();
+        assert!(
+            message.contains("occupied"),
+            "second Spawn must refuse Occupied: {second:?}"
+        );
+        assert!(daemon.runtime().unwrap().retained_reservations().is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn plugin_spawn_package(root: &std::path::Path) -> crate::packages::PackageRecord {
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/agent"), "#!/bin/sh\nexec true\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.join("bin/agent"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        serde_json::from_value(serde_json::json!({
+            "manifest": {
+                "name": "p1.plugin",
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": root.display().to_string() },
+                "capabilities": [{"surface": "session_actions", "scope": "session_type_spawn"}],
+                "entrypoints": []
+            },
+            "state": "enabled",
+            "classification": "plugin",
+            "trust": { "classification": "first_party", "first_party": true },
+            "provenance": { "source": root.display().to_string(), "checksum": null },
+            "update_policy": "manual",
+            "last_audit_reason": "test",
+            "session_types": [{
+                "id": "agent",
+                "label": "Agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "lifecycle": "task",
+                "command": "bin/agent",
+                "args": []
+            }]
+        }))
+        .expect("plugin spawn package record")
+    }
+
+    #[test]
+    fn plugin_occupied_spawn_leaves_live_session_context() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("plugin-occ", Some(worker));
+        let installed = spawn_until_ready(&mut daemon, &mut state, "s1-plugin-live", "true");
+        assert!(installed.error.is_none(), "{installed:?}");
+        let live = crate::session_types::HubSessionContext {
+            context_id: "ctx-original".into(),
+            session_id: SessionId("s1-plugin-live".into()),
+            values: Default::default(),
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .publish_spawn_context(&live)
+            .unwrap();
+        let package_root = root.join("p1-plugin");
+        let record = plugin_spawn_package(&package_root);
+        let refused = daemon.runtime().unwrap().test_plugin_spawn(
+            "p1.plugin",
+            "agent",
+            crate::session_types::SessionTypeRequest {
+                session_id: Some(SessionId("s1-plugin-live".into())),
+                ..crate::session_types::SessionTypeRequest::default()
+            },
+            vec![record],
+        );
+        let refused = refused.expect_err("plugin spawn must refuse Occupied");
+        assert!(
+            refused.to_ascii_lowercase().contains("occupied"),
+            "Occupied reservation refusal required, got {refused}"
+        );
+        let stored = daemon
+            .runtime()
+            .unwrap()
+            .test_session_context("s1-plugin-live")
+            .expect("live context remains");
+        assert_eq!(stored.context_id, "ctx-original");
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_session_context("ctx-original")
+                .map(|context| context.session_id.0),
+            Some("s1-plugin-live".into())
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(package_root);
+    }
+
+    #[test]
+    fn plugin_retained_token_is_retried_by_the_next_plugin_spawn() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let worker_root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-plugin-retry-worker-{}-{stamp}",
+            std::process::id()
+        ));
+        let worker = write_frame_exit_worker(&worker_root);
+        let (mut daemon, _state, root) = spawn_fixture_with_worker("plugin-retry", Some(worker));
+        let package_root = root.join("p1-plugin");
+        let record = plugin_spawn_package(&package_root);
+        let first = daemon.runtime().unwrap().test_plugin_spawn(
+            "p1.plugin",
+            "agent",
+            crate::session_types::SessionTypeRequest {
+                session_id: Some(SessionId("s1-plugin-retry-a".into())),
+                ..crate::session_types::SessionTypeRequest::default()
+            },
+            vec![record.clone()],
+        );
+        let first = first.expect_err("first plugin spawn must retain unconfirmed");
+        assert!(
+            first.contains("cleanup_unconfirmed"),
+            "first plugin spawn must report cleanup_unconfirmed: {first}"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        let held = daemon.runtime().unwrap().retained_reservations();
+        assert_eq!(
+            held.len(),
+            1,
+            "plugin spawn must retain the unconfirmed token"
+        );
+        let token = held[0].clone();
+        let second = daemon.runtime().unwrap().test_plugin_spawn(
+            "p1.plugin",
+            "agent",
+            crate::session_types::SessionTypeRequest {
+                session_id: Some(SessionId("s1-plugin-retry-b".into())),
+                ..crate::session_types::SessionTypeRequest::default()
+            },
+            vec![record],
+        );
+        let second = second.expect_err("second plugin spawn must fail");
+        assert!(
+            second.contains("cleanup_unconfirmed"),
+            "second plugin spawn must report cleanup_unconfirmed: {second}"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            3,
+            "second spawn must release the held token then its own reservation"
+        );
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .retained_reservations()
+                .iter()
+                .any(|kept| kept == &token),
+            "next plugin spawn must retry and keep the unconfirmed token"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(worker_root);
+    }
+
+    #[test]
+    fn managed_retained_unconfirmed_keeps_a_created_worktree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let worker_root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-managed-retain-worker-{}-{stamp}",
+            std::process::id()
+        ));
+        let worker = write_frame_exit_worker(&worker_root);
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("managed-retain", Some(worker));
+        let worktree = root.join("created-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let marker = worktree.join("keep-me");
+        std::fs::write(&marker, b"present").unwrap();
+        let package_root = root.join("p1-plugin");
+        let mut record = plugin_spawn_package(&package_root);
+        record.manifest.capabilities.push(botster_core::Capability {
+            surface: botster_core::CapabilitySurface::SessionActions,
+            scope: Some("session_type_managed_git_spawn".into()),
+        });
+        record.session_types[0].target_id = Some("t1".into());
+        {
+            let runtime = daemon.runtime().unwrap();
+            let mut next = (*runtime.state()).clone();
+            next.spawn_targets.push(crate::spawn_targets::SpawnTarget {
+                target_id: "t1".into(),
+                label: "t1".into(),
+                root: worktree.clone(),
+                enabled: true,
+                kind: "directory".into(),
+                base_ref: None,
+                metadata: Default::default(),
+            });
+            runtime.replace_state(next).expect("admit spawn target");
+        }
+        let (response, receiver) = std::sync::mpsc::channel();
+        let pending = crate::runtime::PendingManagedSessionSpawn::test_new(
+            botster_core::PluginKey("p1.plugin".into()),
+            "t1".into(),
+            "topic".into(),
+            "agent".into(),
+            crate::session_types::ManagedSessionTypeRequest::default(),
+            vec![record],
+            response,
+        );
+        let prepared = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: worktree.clone(),
+            common_dir: worktree.clone(),
+            branch: "topic".into(),
+            path: worktree.clone(),
+            worktree_id: "wt-keep".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: false,
+        };
+        let waiter = state.current_waiter_id.unwrap();
+        let start = daemon
+            .runtime()
+            .unwrap()
+            .spawn_prepared_managed_session(&pending, &prepared, waiter)
+            .expect("start managed spawn");
+        let mut operation =
+            crate::daemon::control::managed_git::ManagedSpawnOperation::test_spawn_phase(
+                waiter, pending, prepared, start,
+            );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(Instant::now() < deadline, "managed spawn hang");
+            pump_core(&mut daemon, &mut state);
+            match operation.test_poll_spawn(&mut daemon, &mut state) {
+                ControlPoll::Pending => std::thread::yield_now(),
+                ControlPoll::Ready(_) => break,
+                _ => std::thread::yield_now(),
+            }
+        }
+        let err = receiver
+            .try_recv()
+            .expect("managed spawn sent a result")
+            .expect_err("managed spawn must fail unconfirmed");
+        assert_eq!(err.kind, "spawn_failed");
+        assert!(
+            operation.test_skipped_rollback(),
+            "RetainedUnconfirmed must not start worktree rollback"
+        );
+        assert!(marker.exists(), "created worktree must remain");
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(worker_root);
+    }
+
+    #[test]
+    fn managed_conversion_abandon_retracts_session_context() {
+        let (mut daemon, _state, root) = spawn_fixture("conv-abandon");
+        let live = crate::session_types::HubSessionContext {
+            context_id: "ctx-abandon".into(),
+            session_id: SessionId("s1-abandon".into()),
+            values: Default::default(),
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .publish_spawn_context(&live)
+            .unwrap();
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .abandon_session_type_spawn("s1-abandon".into());
+        daemon.runtime().unwrap().test_fulfill_plugin_spawns();
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_session_context("s1-abandon")
+                .is_none(),
+            "abandoned session context must be retracted"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn init_git_repo(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        for args in [
+            ["init", "-b", "main"].as_slice(),
+            ["config", "user.email", "botster@example.invalid"].as_slice(),
+            ["config", "user.name", "Botster Test"].as_slice(),
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(path.join("README.md"), "fixture\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(path)
+                .args(["add", "README.md"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(path)
+                .args(["commit", "-m", "fixture"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn pump_until_join<T>(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        handle: std::thread::JoinHandle<T>,
+    ) -> T {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(daemon, state);
+            if handle.is_finished() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "ensure_worktree_and_spawn hang");
+            std::thread::yield_now();
+        }
+        handle.join().expect("join managed spawn")
+    }
+
+    fn s2_prepare(
+        name: &str,
+        worker: Option<std::path::PathBuf>,
+    ) -> (
+        crate::HubDaemon,
+        DaemonControlState,
+        std::path::PathBuf,
+        crate::packages::PackageRecord,
+    ) {
+        let (daemon, state, root) = spawn_fixture_with_worker(name, worker);
+        let repo = root.join("repo");
+        init_git_repo(&repo);
+        let package_root = root.join("p1-plugin");
+        let mut record = plugin_spawn_package(&package_root);
+        record.manifest.capabilities.push(botster_core::Capability {
+            surface: botster_core::CapabilitySurface::SessionActions,
+            scope: Some("session_type_managed_git_spawn".into()),
+        });
+        record.session_types[0].target_id = Some("t1".into());
+        {
+            let runtime = daemon.runtime().unwrap();
+            let mut next = (*runtime.state()).clone();
+            next.spawn_targets.push(crate::spawn_targets::SpawnTarget {
+                target_id: "t1".into(),
+                label: "t1".into(),
+                root: repo,
+                enabled: true,
+                kind: "git".into(),
+                base_ref: Some("main".into()),
+                metadata: Default::default(),
+            });
+            runtime.replace_state(next).expect("admit git target");
+        }
+        (daemon, state, root, record)
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_creates_a_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("s2-create", Some(worker));
+        let repo = root.join("repo");
+        init_git_repo(&repo);
+        let package_root = root.join("p1-plugin");
+        let mut record = plugin_spawn_package(&package_root);
+        record.manifest.capabilities.push(botster_core::Capability {
+            surface: botster_core::CapabilitySurface::SessionActions,
+            scope: Some("session_type_managed_git_spawn".into()),
+        });
+        record.session_types[0].target_id = Some("t1".into());
+        {
+            let runtime = daemon.runtime().unwrap();
+            let mut next = (*runtime.state()).clone();
+            next.spawn_targets.push(crate::spawn_targets::SpawnTarget {
+                target_id: "t1".into(),
+                label: "t1".into(),
+                root: repo.clone(),
+                enabled: true,
+                kind: "git".into(),
+                base_ref: Some("main".into()),
+                metadata: Default::default(),
+            });
+            runtime.replace_state(next).expect("admit git target");
+        }
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let handle = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            )
+        });
+        let spawned = pump_until_join(&mut daemon, &mut state, handle).expect("created spawn");
+        assert!(spawned.created_worktree);
+        assert!(!spawned.reused_worktree);
+        assert!(std::path::Path::new(&spawned.worktree_path).exists());
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_created_worktree_cleanup_count(),
+            0,
+            "delivered spawn must not keep a cleanup marker"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            0
+        );
+        assert!(
+            hub_worktree_ids(&daemon).contains(&spawned.worktree_id),
+            "delivered spawn must persist the HubState worktree row"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_reuses_an_existing_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("s2-reuse", Some(worker));
+        let repo = root.join("repo");
+        init_git_repo(&repo);
+        let package_root = root.join("p1-plugin");
+        let mut record = plugin_spawn_package(&package_root);
+        record.manifest.capabilities.push(botster_core::Capability {
+            surface: botster_core::CapabilitySurface::SessionActions,
+            scope: Some("session_type_managed_git_spawn".into()),
+        });
+        record.session_types[0].target_id = Some("t1".into());
+        {
+            let runtime = daemon.runtime().unwrap();
+            let mut next = (*runtime.state()).clone();
+            next.spawn_targets.push(crate::spawn_targets::SpawnTarget {
+                target_id: "t1".into(),
+                label: "t1".into(),
+                root: repo.clone(),
+                enabled: true,
+                kind: "git".into(),
+                base_ref: Some("main".into()),
+                metadata: Default::default(),
+            });
+            runtime.replace_state(next).expect("admit git target");
+        }
+        let first_record = record.clone();
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let first_spawner = spawner.clone();
+        let first = std::thread::spawn(move || {
+            first_spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![first_record],
+            )
+        });
+        let first = pump_until_join(&mut daemon, &mut state, first).expect("first create");
+        assert!(first.created_worktree);
+        let path = first.worktree_path.clone();
+        let second = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            )
+        });
+        let second = pump_until_join(&mut daemon, &mut state, second).expect("reuse spawn");
+        assert!(second.reused_worktree);
+        assert!(!second.created_worktree);
+        assert_eq!(second.worktree_path, path);
+        assert!(std::path::Path::new(&path).exists());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_concurrent_same_branch_does_not_damage_the_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-conflict", Some(worker));
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let a_spawner = spawner.clone();
+        let a_record = record.clone();
+        let a = std::thread::spawn(move || {
+            a_spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![a_record],
+            )
+        });
+        let b = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            )
+        });
+        let overlap = Instant::now() + Duration::from_secs(5);
+        while daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_managed_queue_len()
+            < 2
+        {
+            assert!(Instant::now() < overlap, "both managed spawns must queue");
+            std::thread::yield_now();
+        }
+        pump_core(&mut daemon, &mut state);
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_publish_managed_spawn();
+        pump_core(&mut daemon, &mut state);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !(a.is_finished() && b.is_finished()) {
+            pump_core(&mut daemon, &mut state);
+            assert!(Instant::now() < deadline, "concurrent managed spawn hang");
+            std::thread::yield_now();
+        }
+        let a = a.join().expect("join a");
+        let b = b.join().expect("join b");
+        let (ok, conflict) = match (a, b) {
+            (Ok(spawned), Err(error)) | (Err(error), Ok(spawned)) => (spawned, error),
+            other => panic!(
+                "S2 exact-conflict exclusion: one owner and one worktree_conflict, got {other:?}"
+            ),
+        };
+        assert_eq!(conflict.kind, "worktree_conflict");
+        assert!(ok.created_worktree);
+        assert!(
+            std::path::Path::new(&ok.worktree_path).exists(),
+            "winning worktree must exist: {}",
+            ok.worktree_path
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_retains_unconfirmed_created_worktree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let worker_root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s2-unconfirmed-worker-{}-{stamp}",
+            std::process::id()
+        ));
+        let worker = write_frame_exit_worker(&worker_root);
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-unconfirmed", Some(worker));
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let handle = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            )
+        });
+        let err = pump_until_join(&mut daemon, &mut state, handle)
+            .expect_err("frame-exit must fail unconfirmed");
+        assert_eq!(err.kind, "spawn_failed");
+        let managed = root.join("managed-worktrees");
+        let found = walkdir_exists(&managed);
+        assert!(found, "created worktree must remain under {managed:?}");
+        assert!(
+            !daemon.runtime().unwrap().retained_reservations().is_empty(),
+            "RetainedUnconfirmed must keep the reservation marker"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_created_worktree_cleanup_count(),
+            0,
+            "unconfirmed spawn must not queue Host rollback"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(worker_root);
+    }
+
+    fn walkdir_exists(root: &std::path::Path) -> bool {
+        git_worktree_present(root)
+    }
+
+    fn git_worktree_present(root: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.join(".git").exists() {
+                return true;
+            }
+            if path.is_dir() && git_worktree_present(&path) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_late_caller_does_not_rollback() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-late", Some(worker));
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_enqueue_managed_disconnected(
+                botster_core::PluginKey("p1.plugin".into()),
+                "t1".into(),
+                "topic".into(),
+                "agent".into(),
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let managed = root.join("managed-worktrees");
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if walkdir_exists(&managed) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "late caller spawn hang");
+            std::thread::yield_now();
+        }
+        assert!(
+            walkdir_exists(&managed),
+            "disconnected caller must not roll back before confirmed shutdown"
+        );
+        let gone = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if !walkdir_exists(&managed) {
+                break;
+            }
+            let runtime = daemon.runtime().unwrap();
+            assert!(
+                Instant::now() < gone,
+                "created worktree must roll back after Released then Host FinalizeRollback; cleanups={} confirmed={} releases={}",
+                runtime.test_created_worktree_cleanup_count(),
+                runtime.test_confirmed_worktree_rollback_count(),
+                runtime.test_release_session_reservation_begins()
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_created_worktree_cleanup_count(),
+            0
+        );
+        let record_gone = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if hub_worktree_ids(&daemon).is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < record_gone,
+                "Released Host rollback must commit worktree record removal; rows={:?}",
+                hub_worktree_ids(&daemon)
+            );
+            std::thread::yield_now();
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_failure_leaves_unrelated_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-unrelated", Some(worker));
+        let first_record = record.clone();
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let first_spawner = spawner.clone();
+        let first = std::thread::spawn(move || {
+            first_spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "keep",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![first_record],
+            )
+        });
+        let first = pump_until_join(&mut daemon, &mut state, first).expect("keep worktree");
+        let keep = first.worktree_path.clone();
+        let live = crate::session_types::HubSessionContext {
+            context_id: format!("ctx-{}", first.session_id),
+            session_id: SessionId(first.session_id.clone()),
+            values: Default::default(),
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .publish_spawn_context(&live)
+            .unwrap();
+        let refused = daemon.runtime().unwrap().test_plugin_spawn(
+            "p1.plugin",
+            "agent",
+            crate::session_types::SessionTypeRequest {
+                session_id: Some(SessionId(first.session_id.clone())),
+                ..crate::session_types::SessionTypeRequest::default()
+            },
+            vec![record],
+        );
+        let refused = refused.expect_err("Occupied must refuse");
+        assert!(
+            refused.to_ascii_lowercase().contains("occupied"),
+            "{refused}"
+        );
+        assert!(
+            std::path::Path::new(&keep).exists(),
+            "unrelated worktree must survive"
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_session_context(&format!("ctx-{}", first.session_id))
+                .map(|context| context.session_id.0),
+            Some(first.session_id.clone())
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_reuse_after_undelivered_keeps_the_created_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-reuse-late", Some(worker));
+        let second_record = record.clone();
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_enqueue_managed_disconnected(
+                botster_core::PluginKey("p1.plugin".into()),
+                "t1".into(),
+                "topic".into(),
+                "agent".into(),
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            );
+        let managed = root.join("managed-worktrees");
+        let queued = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if walkdir_exists(&managed)
+                && daemon
+                    .runtime()
+                    .unwrap()
+                    .session_type_spawner()
+                    .test_managed_queue_len()
+                    == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < queued,
+                "undelivered created worktree must queue identity-matched cleanup"
+            );
+            std::thread::yield_now();
+        }
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let handle = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![second_record],
+            )
+        });
+        let second = pump_until_join(&mut daemon, &mut state, handle).unwrap_or_else(|error| {
+            panic!("reuse spawn: {}: {}", error.kind, error.message);
+        });
+        assert!(second.reused_worktree);
+        assert!(!second.created_worktree);
+        assert!(
+            std::path::Path::new(&second.worktree_path).exists(),
+            "reused worktree must exist: {}",
+            second.worktree_path
+        );
+        let hold = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < hold {
+            pump_core(&mut daemon, &mut state);
+            assert!(
+                std::path::Path::new(&second.worktree_path).exists(),
+                "Released after reuse must not roll back the surviving worktree"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            0,
+            "reuse must drain identity-matched rollback before Host FinalizeRollback"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn hub_worktree_ids(daemon: &crate::HubDaemon) -> Vec<String> {
+        daemon
+            .runtime()
+            .unwrap()
+            .state()
+            .worktrees
+            .iter()
+            .map(|worktree| worktree.worktree_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_stale_rollback_does_not_remove_a_live_worktree() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-stale", Some(worker));
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let handle = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            )
+        });
+        let spawned = pump_until_join(&mut daemon, &mut state, handle).expect("live spawn");
+        let live_id = spawned.worktree_id.clone();
+        let live_path = spawned.worktree_path.clone();
+        let stale = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: root.join("repo"),
+            common_dir: root.join("repo"),
+            branch: "stale".into(),
+            path: root.join("missing-stale-worktree"),
+            worktree_id: "wt-stale".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: false,
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .defer_confirmed_worktree_rollback(stale);
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_publish_managed_spawn();
+        let hold = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < hold {
+            pump_core(&mut daemon, &mut state);
+            std::thread::yield_now();
+        }
+        assert!(
+            std::path::Path::new(&live_path).exists(),
+            "stale rollback must not remove the live worktree"
+        );
+        assert!(
+            hub_worktree_ids(&daemon).contains(&live_id),
+            "stale rollback must not remove the live HubState row"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retry_created_worktree_releases_does_not_gate_on_advisory_state() {
+        let source = include_str!("../../runtime.rs");
+        let start = source
+            .find("pub(crate) fn retry_created_worktree_releases")
+            .expect("retry_created_worktree_releases");
+        let body = source[start..]
+            .split("fn advance_created_worktree_cleanups")
+            .next()
+            .expect("retry body");
+        assert!(
+            !body.contains("reservation.state()"),
+            "U-1: explicit-event retry must not gate on advisory state(): {body}"
+        );
+        assert!(
+            body.contains("begin_release_session_reservation"),
+            "explicit-event retry must issue a new release"
+        );
+    }
+
+    fn wait_spawn_installed(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        tracker: &mut crate::runtime::CoreOperationTracker,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "spawn reserved did not install");
+            pump_core(daemon, state);
+            match tracker.poll(daemon.runtime().unwrap()) {
+                CoreTicketPoll::Pending => std::thread::yield_now(),
+                CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
+                    result: ReservedSpawnResult::Installed { .. },
+                    ..
+                })) => return,
+                other => panic!("spawn reserved must install, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn created_worktree_cleanup_retries_release_on_a_live_session() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("s2-u1-live", Some(worker));
+        let waiter = state.current_waiter_id.unwrap();
+        let session_id = SessionId(format!("s2-u1-live-{stamp}"));
+        let mut reserve = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(waiter, session_id.clone());
+        let reservation = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        let spawn = SpawnSessionRequest {
+            request: crate::client_api::spawn_request(
+                daemon.runtime().unwrap(),
+                crate::daemon::control::request_id("s2-u1-live"),
+                session_id.clone(),
+                "sleep 30".into(),
+            ),
+            metadata: crate::client_api::client_session_metadata(),
+        };
+        let mut spawn = daemon.runtime().unwrap().begin_spawn_reserved_for_owner(
+            waiter,
+            reservation.clone(),
+            spawn,
+        );
+        wait_spawn_installed(&mut daemon, &mut state, &mut spawn);
+        let prepared = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: root.clone(),
+            common_dir: root.clone(),
+            branch: "topic".into(),
+            path: root.join("u1-live-worktree"),
+            worktree_id: "wt-u1-live".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: false,
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .test_queue_removed_created_worktree_cleanup(session_id.clone(), prepared, reservation);
+        daemon.runtime().unwrap().retry_created_worktree_releases();
+        let first = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins()
+                >= 1
+                && daemon
+                    .runtime()
+                    .unwrap()
+                    .test_created_worktree_cleanup_count()
+                    == 1
+                && daemon
+                    .runtime()
+                    .unwrap()
+                    .test_created_worktree_cleanup_release_idle()
+            {
+                break;
+            }
+            assert!(Instant::now() < first, "first live release must complete");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            1
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            0,
+            "live session must not Host-rollback after RetainedSession"
+        );
+        daemon.runtime().unwrap().retry_created_worktree_releases();
+        let second = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins()
+                >= 2
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < second,
+                "explicit event must issue a second release"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            2
+        );
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            0
+        );
+        let mut shutdown = daemon
+            .runtime()
+            .unwrap()
+            .begin_shutdown_session(session_id.clone());
+        let stop = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            match shutdown.poll(daemon.runtime().unwrap()) {
+                CoreTicketPoll::Pending => {}
+                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => break,
+            }
+            assert!(Instant::now() < stop, "shutdown hang");
+            std::thread::yield_now();
+        }
+        let mut remove = daemon.runtime().unwrap().begin_remove_session(&session_id);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            match remove.poll(daemon.runtime().unwrap()) {
+                CoreTicketPoll::Pending => {}
+                CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => break,
+            }
+            assert!(Instant::now() < stop, "remove hang");
+            std::thread::yield_now();
+        }
+        daemon.runtime().unwrap().retry_created_worktree_releases();
+        let released = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count()
+                >= 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < released,
+                "Released after shutdown must queue Host rollback"
+            );
+            std::thread::yield_now();
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accept_confirmed_rollback_waits_for_owner_capacity() {
+        let (mut daemon, mut state, root) = spawn_fixture("s2-capacity-wait");
+        let mut held = Vec::new();
+        while let Some(permit) = state.budget.reserve() {
+            held.push(permit);
+        }
+        let prepared = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: root.clone(),
+            common_dir: root.clone(),
+            branch: "topic".into(),
+            path: root.join("missing-capacity-worktree"),
+            worktree_id: "wt-capacity".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: false,
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .defer_confirmed_worktree_rollback(prepared);
+        assert!(
+            !daemon.runtime().unwrap().take_managed_spawn_notification(),
+            "capacity defer must not self-wake"
+        );
+        accept_one(&mut daemon, &mut state);
+        assert!(state.managed_spawn_waiting_for_owner);
+        assert_eq!(daemon.runtime().unwrap().test_managed_accept_ones(), 1);
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_confirmed_worktree_rollback_count(),
+            1
+        );
+        for _ in 0..8 {
+            publish_completion_wakes(&daemon, &mut state);
+            drive_ready_test_turn(&mut daemon, &mut state);
+        }
+        assert_eq!(
+            daemon.runtime().unwrap().test_managed_accept_ones(),
+            1,
+            "accept_one must stay bounded while owner capacity is exhausted"
+        );
+        state.budget.release(held.pop().expect("held permit"));
+        publish_completion_wakes(&daemon, &mut state);
+        drive_ready_test_turn(&mut daemon, &mut state);
+        assert!(
+            daemon.runtime().unwrap().test_managed_accept_ones() >= 2,
+            "budget release must wake the waiting rollback"
+        );
+        assert!(!state.managed_spawn_waiting_for_owner);
+        for permit in held {
+            state.budget.release(permit);
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_defers_reuse_until_in_flight_rollback_finishes() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-hold-rollback", Some(worker));
+        let second_record = record.clone();
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_enqueue_managed_disconnected(
+                botster_core::PluginKey("p1.plugin".into()),
+                "t1".into(),
+                "topic".into(),
+                "agent".into(),
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![record],
+            );
+        let gate = Arc::new(TestHostGate::default());
+        daemon
+            .runtime()
+            .unwrap()
+            .test_install_rollback_git_hold(Arc::clone(&gate));
+        let managed = root.join("managed-worktrees");
+        let started = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if gate.has_started() {
+                break;
+            }
+            assert!(
+                Instant::now() < started,
+                "Host rollback must reach the pre-git hold"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            walkdir_exists(&managed),
+            "held rollback must not have deleted the worktree yet"
+        );
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        let handle = std::thread::spawn(move || {
+            spawner.ensure_worktree_and_spawn(
+                &botster_core::PluginKey("p1.plugin".into()),
+                "t1",
+                "topic",
+                "agent",
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![second_record],
+            )
+        });
+        let wait_reuse = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wait_reuse {
+            pump_core(&mut daemon, &mut state);
+            assert!(
+                !handle.is_finished(),
+                "reuse must defer while rollback is in flight"
+            );
+            std::thread::yield_now();
+        }
+        gate.release();
+        let second = pump_until_join(&mut daemon, &mut state, handle).unwrap_or_else(|error| {
+            panic!("reuse after rollback: {}: {}", error.kind, error.message)
+        });
+        assert!(
+            second.created_worktree,
+            "reuse after an in-flight rollback must create, not reuse a path being deleted"
+        );
+        assert!(!second.reused_worktree);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

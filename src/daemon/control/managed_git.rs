@@ -23,7 +23,7 @@ use crate::host_mutations::{
 };
 use crate::managed_git_worktrees::{
     MANAGED_GIT_OPERATION_TIMEOUT, ManagedGitError, ManagedWorktreeDecision,
-    PreparedManagedWorktree,
+    PreparedManagedWorktree, managed_worktree_id,
 };
 use crate::owner_identity::WaiterId;
 use crate::runtime::{ManagedSessionSpawnStart, PendingManagedSessionSpawn};
@@ -76,6 +76,7 @@ impl ManagedGitRecoveryRequired {
         (
             self.owner_permit,
             crate::host_disposal::Parts {
+                storage: None,
                 identity,
                 permit: self._permit,
                 model: None,
@@ -85,13 +86,138 @@ impl ManagedGitRecoveryRequired {
     }
 }
 
-pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+fn accept_confirmed_rollback(
+    daemon: &mut HubDaemon,
+    state: &mut DaemonControlState,
+    prepared: crate::managed_git_worktrees::PreparedManagedWorktree,
+) {
     let Some(runtime) = daemon.runtime() else {
         return;
     };
-    let Some(pending) = runtime.take_pending_managed_spawn() else {
+    if runtime.created_worktree_rollback_suppressed(&prepared.worktree_id) {
+        return;
+    }
+    let Some(owner_permit) = state.budget.reserve() else {
+        runtime.defer_confirmed_worktree_rollback(prepared);
+        state.managed_spawn_waiting_for_owner = true;
         return;
     };
+    let Some(waiter_id) = state.waiter_ids.next() else {
+        state.budget.release(owner_permit);
+        runtime.defer_confirmed_worktree_rollback(prepared);
+        state.managed_spawn_waiting_for_owner = true;
+        return;
+    };
+    let Some(host_permit) = runtime.host_executor().try_reserve() else {
+        state.budget.release(owner_permit);
+        runtime.defer_confirmed_worktree_rollback(prepared);
+        state.managed_spawn_waiting_for_host = true;
+        return;
+    };
+    let deadline = Instant::now() + MANAGED_GIT_OPERATION_TIMEOUT;
+    runtime.begin_submitted_worktree_rollback(&prepared.worktree_id);
+    if let Err(failure) = runtime.host_executor().submit(
+        HostJobIdentity {
+            waiter_id,
+            phase: 1,
+        },
+        HostCommand::FinalizeManagedWorktree {
+            prepared: prepared.clone(),
+            decision: ManagedWorktreeDecision::Rollback,
+            deadline,
+            discard: None,
+            suppress_rollback: runtime.created_worktree_rollback_suppressions(),
+            #[cfg(test)]
+            rollback_hold: runtime.test_rollback_git_hold(),
+        },
+        host_permit,
+    ) {
+        runtime.clear_submitted_worktree_rollback(&prepared.worktree_id);
+        state.budget.release(owner_permit);
+        runtime.defer_confirmed_worktree_rollback(prepared);
+        if matches!(failure.error, HostSubmitError::Full) {
+            state.managed_spawn_waiting_for_host = true;
+        }
+        return;
+    }
+    let operation = ManagedSpawnOperation {
+        waiter_id,
+        pending: None,
+        prepared: Some(prepared),
+        prepared_mutation: None,
+        spawn: None,
+        permit: None,
+        phase: Phase::FinalizeRollback,
+        next_host_phase: 2,
+        record_committed: true,
+        deferred_error: None,
+        deadline,
+    };
+    let (reply_tx, _reply_rx) = crate::daemon::control::message::control_reply_channel();
+    state.pending_requests.insert(
+        waiter_id,
+        PendingControlRequest {
+            waiter_id,
+            ready_class: ReadyClass::HostCompletion,
+            ready_key: None,
+            deadline_key: None,
+            last_core_phase: 0,
+            last_host_phase: 0,
+            completion: crate::daemon::control::pending::OwnerRequestCompletion::default(),
+            reply_tx,
+            response_delivery_rx: None,
+            grant_id: None,
+            client: None,
+            core_retirement: None,
+            permit: Some(owner_permit),
+            must_finish: true,
+            past_deadline: false,
+            continuation: crate::daemon::control::pending::ControlContinuation::ManagedSpawn(
+                Box::new(operation),
+            ),
+            retire: None,
+        },
+    );
+    let arm = state
+        .deadlines
+        .arm(waiter_id, deadline, Instant::now())
+        .expect("a rollback deadline must make progress");
+    state
+        .pending_requests
+        .get_mut(&waiter_id)
+        .expect("the rollback waiter was inserted")
+        .deadline_key = Some(arm.key());
+    mark_owner_ready(state, waiter_id, ReadyClass::HostCompletion, READY_INITIAL);
+}
+
+pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
+    #[cfg(test)]
+    if let Some(runtime) = daemon.runtime() {
+        runtime.test_note_managed_accept_one();
+    }
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    runtime.retry_retained_reservation_releases();
+    runtime.retry_created_worktree_releases();
+    runtime.reap_detached_core_operations();
+    if let Some(worktree_id) = runtime.peek_pending_managed_worktree_id()
+        && runtime.submitted_worktree_rollback(&worktree_id)
+    {
+        if let Some(prepared) = runtime.take_one_confirmed_worktree_rollback() {
+            accept_confirmed_rollback(daemon, state, prepared);
+        }
+        return;
+    }
+    let Some(pending) = runtime.take_pending_managed_spawn() else {
+        if let Some(prepared) = runtime.take_one_confirmed_worktree_rollback() {
+            accept_confirmed_rollback(daemon, state, prepared);
+        }
+        return;
+    };
+    runtime
+        .cancel_created_worktree_cleanup(&managed_worktree_id(&pending.target_id, &pending.branch));
+    runtime.wake_remaining_confirmed_worktree_rollbacks();
     if let Some(detail) = state
         .host_recovery
         .values()
@@ -193,6 +319,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             response_delivery_rx: None,
             grant_id: None,
             client: None,
+            core_retirement: None,
             permit: Some(owner_permit),
             must_finish: true,
             past_deadline: false,
@@ -233,6 +360,7 @@ impl ManagedSpawnOperation {
             (identity, permit)
         };
         Some(crate::host_disposal::Parts {
+            storage: None,
             identity,
             permit,
             model: None,
@@ -461,6 +589,42 @@ impl ManagedSpawnOperation {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_spawn_phase(
+        waiter_id: WaiterId,
+        pending: PendingManagedSessionSpawn,
+        prepared: PreparedManagedWorktree,
+        start: crate::runtime::ManagedSessionSpawnStart,
+    ) -> Self {
+        Self {
+            waiter_id,
+            pending: Some(pending),
+            prepared: Some(prepared),
+            prepared_mutation: None,
+            spawn: Some(start),
+            permit: None,
+            phase: Phase::Spawn,
+            next_host_phase: 2,
+            record_committed: true,
+            deferred_error: None,
+            deadline: Instant::now() + std::time::Duration::from_secs(15),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_poll_spawn(
+        &mut self,
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+    ) -> ControlPoll {
+        self.poll_spawn(daemon, state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_skipped_rollback(&self) -> bool {
+        self.phase == Phase::Done
+    }
+
     fn poll_spawn(
         &mut self,
         daemon: &mut HubDaemon,
@@ -474,22 +638,14 @@ impl ManagedSpawnOperation {
             return self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None);
         };
         let start = self.spawn.as_mut().expect("managed Core spawn exists");
-        let completion = match start.tracker.poll(runtime) {
-            crate::data_plane::driver::CoreTicketPoll::Pending => return ControlPoll::Pending,
-            crate::data_plane::driver::CoreTicketPoll::Lost => {
-                Err(botster_core_daemon::CoreDaemonError::Shutdown)
-            }
-            crate::data_plane::driver::CoreTicketPoll::Refused => {
-                Err(botster_core_daemon::CoreDaemonError::Shutdown)
-            }
-            crate::data_plane::driver::CoreTicketPoll::Ready(Err(error)) => Err(error),
-            crate::data_plane::driver::CoreTicketPoll::Ready(Ok(
-                botster_core_daemon::CoreCompletion::Spawn { result, .. },
-            )) => result,
-            crate::data_plane::driver::CoreTicketPoll::Ready(Ok(_)) => {
-                Err(botster_core_daemon::CoreDaemonError::Shutdown)
-            }
+        let completion = match start.poll(runtime) {
+            crate::runtime::PluginSpawnPoll::Pending => return ControlPoll::Pending,
+            crate::runtime::PluginSpawnPoll::Ready(result) => result,
         };
+        let disposition = completion
+            .as_ref()
+            .err()
+            .and_then(|failure| failure.disposition);
         let result = runtime.finish_managed_session_spawn(
             self.spawn.as_ref().expect("managed Core spawn exists"),
             self.prepared.as_ref().expect("managed worktree exists"),
@@ -507,22 +663,33 @@ impl ManagedSpawnOperation {
                 if delivered {
                     self.submit_finalize(daemon, state, ManagedWorktreeDecision::Commit, None)
                 } else {
+                    self.queue_undelivered_created_cleanup(runtime, &spawned);
                     runtime.cleanup_managed_session(&spawned);
                     self.deferred_error = Some(ManagedGitError::new(
                         "ensure_timed_out",
                         "the managed session caller left before delivery",
                     ));
-                    self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
+                    self.finish_deferred_error()
                 }
             }
             Ok(spawned) => {
+                self.queue_undelivered_created_cleanup(runtime, &spawned);
                 runtime.cleanup_managed_session(&spawned);
                 self.deferred_error = Some(timeout_error());
-                self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
+                self.finish_deferred_error()
             }
             Err(error) => {
                 self.deferred_error = Some(error);
-                self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
+                let created = self
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.created_worktree);
+                match disposition {
+                    Some(botster_core::SessionReservationRelease::Released) | None if created => {
+                        self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None)
+                    }
+                    _ => self.finish_deferred_error(),
+                }
             }
         }
     }
@@ -549,9 +716,23 @@ impl ManagedSpawnOperation {
         state: &mut DaemonControlState,
         result: HostResult,
     ) -> ControlPoll {
+        if let Some(worktree_id) = self
+            .prepared
+            .as_ref()
+            .map(|prepared| prepared.worktree_id.clone())
+            && let Some(runtime) = daemon.runtime()
+        {
+            runtime.finish_submitted_worktree_rollback(&worktree_id);
+        }
         match result {
             HostResult::ManagedWorktreeFinalized => {
-                let remove_record = self.record_committed
+                let suppressed = self.prepared.as_ref().is_some_and(|prepared| {
+                    daemon.runtime().is_some_and(|runtime| {
+                        runtime.created_worktree_rollback_suppressed(&prepared.worktree_id)
+                    })
+                });
+                let remove_record = !suppressed
+                    && self.record_committed
                     && self
                         .prepared
                         .as_ref()
@@ -565,7 +746,14 @@ impl ManagedSpawnOperation {
             HostResult::ManagedWorktreeRecoveryRequired { prepared, error } => {
                 self.retain_recovery(state, prepared, error)
             }
-            HostResult::Failed { error, .. } => self.finish_error(managed_host_failure(error)),
+            HostResult::Failed { error, .. } => {
+                if self.pending.is_none()
+                    && let Some(prepared) = self.prepared.clone()
+                {
+                    return self.retain_recovery(state, prepared, error);
+                }
+                self.finish_error(managed_host_failure(error))
+            }
             _ => {
                 self.finish_reconciliation("the host executor returned an invalid rollback result")
             }
@@ -752,17 +940,41 @@ impl ManagedSpawnOperation {
             .as_ref()
             .expect("managed worktree exists")
             .clone();
-        self.submit_host(
+        if matches!(decision, ManagedWorktreeDecision::Rollback)
+            && let Some(runtime) = daemon.runtime()
+        {
+            runtime.begin_submitted_worktree_rollback(&prepared.worktree_id);
+        }
+        let poll = self.submit_host(
             daemon,
             state,
             phase,
             HostCommand::FinalizeManagedWorktree {
-                prepared,
+                prepared: prepared.clone(),
                 decision,
                 deadline: self.deadline,
                 discard,
+                suppress_rollback: daemon
+                    .runtime()
+                    .map(|runtime| runtime.created_worktree_rollback_suppressions())
+                    .unwrap_or_else(|| {
+                        std::sync::Arc::new(
+                            std::sync::Mutex::new(std::collections::BTreeSet::new()),
+                        )
+                    }),
+                #[cfg(test)]
+                rollback_hold: daemon
+                    .runtime()
+                    .and_then(|runtime| runtime.test_rollback_git_hold()),
             },
-        )
+        );
+        if matches!(decision, ManagedWorktreeDecision::Rollback)
+            && !matches!(poll, ControlPoll::Pending)
+            && let Some(runtime) = daemon.runtime()
+        {
+            runtime.clear_submitted_worktree_rollback(&prepared.worktree_id);
+        }
+        poll
     }
 
     fn submit_host(
@@ -813,6 +1025,28 @@ impl ManagedSpawnOperation {
                 self.finish_reconciliation(detail)
             }
         }
+    }
+
+    fn queue_undelivered_created_cleanup(
+        &self,
+        runtime: &crate::runtime::HubRuntime,
+        spawned: &crate::runtime::PluginManagedSessionSpawned,
+    ) {
+        let Some(prepared) = self.prepared.clone() else {
+            return;
+        };
+        let Some(reservation) = self
+            .spawn
+            .as_ref()
+            .and_then(|start| start.reservation.clone())
+        else {
+            return;
+        };
+        runtime.queue_created_worktree_cleanup(
+            botster_core::SessionId(spawned.session_id.clone()),
+            prepared,
+            reservation,
+        );
     }
 
     fn deadline_elapsed(&self) -> bool {

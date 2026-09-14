@@ -96,7 +96,7 @@ impl HostPackageRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
-        let bundle = LuaPluginRuntime::load_prepared(
+        let bundle = LuaPluginRuntime::load_prepared_bounded(
             &prepared,
             configuration,
             self.host_api.clone(),
@@ -132,7 +132,7 @@ impl HostPackageRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
-        let bundle = LuaPluginRuntime::load_prepared(
+        let bundle = LuaPluginRuntime::load_prepared_bounded(
             &prepared,
             configuration,
             self.host_api.clone(),

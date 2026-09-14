@@ -101,16 +101,48 @@ const EVENT_PLANE_NOISY_COMMAND: &str = concat!(
     "    time.sleep(0.1)\"",
 );
 
+fn production_events_emit_installation(lua: &str) -> &str {
+    let install = lua
+        .split("fn install_botster_api(")
+        .nth(1)
+        .expect("install_botster_api");
+    let install = install.split("\nfn ").next().unwrap_or(install);
+    install
+        .split("\"emit\"")
+        .nth(1)
+        .and_then(|rest| rest.split("globals.set(\"events\"").next())
+        .expect("events.emit installation")
+}
+
+#[test]
+fn events_emit_guard_detects_recv_and_a_second_try_ingress() {
+    let with_recv = r#"fn install_botster_api() {
+        events.set("emit", { let _ = rx.recv(); try_ingress
+        globals.set("events", events);
+    }
+    fn next() {}
+"#;
+    let emit = production_events_emit_installation(with_recv);
+    assert!(emit.contains("recv("), "ablation: recv wait must be visible");
+    let with_two = r#"fn install_botster_api() {
+        events.set("emit", { try_ingress; try_ingress
+        globals.set("events", events);
+    }
+    fn next() {}
+"#;
+    assert_eq!(
+        production_events_emit_installation(with_two)
+            .matches("try_ingress")
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn event_plane_saturation_source_guards_hold() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let lua = fs::read_to_string(root.join("src/lua_runtime.rs")).expect("lua runtime");
-    let production_lua = lua.split("#[cfg(test)]").next().unwrap_or(&lua);
-    let emit_fn = production_lua
-        .split("\"emit\"")
-        .nth(1)
-        .and_then(|rest| rest.split("globals.set(\"events\"").next())
-        .expect("events.emit installation");
+    let emit_fn = production_events_emit_installation(&lua);
     assert!(
         emit_fn.contains("try_ingress") && emit_fn.matches("try_ingress").count() == 1,
         "events.emit must use one try_ingress attempt"
@@ -162,10 +194,8 @@ fn event_plane_saturation_source_guards_hold() {
         fs::read_to_string(root.join("src/daemon_maintenance.rs")).expect("maintenance");
     assert!(maintenance.contains("max_sessions: 8"));
     assert!(maintenance.contains("max_rows: 16"));
-    assert!(
-        maintenance.contains("journal_pull_held"),
-        "cursor-expiry hold must skip journal pull"
-    );
+    // 70cdf06 removed HubRuntime::journal_pull_held. Cursor-expiry behavior is
+    // covered by fault_lifecycle_cursor_expiry, not this source-string scan.
     assert_eq!(EVENT_PLANE_RATIO_R, 1.25);
     assert_eq!(EVENT_PLANE_SLACK_MS, 8.0);
     assert_eq!(EVENT_PLANE_THROUGHPUT_T, 0.80);
@@ -2706,7 +2736,7 @@ fn phase_dataset_body(
         "host_validity": host_validity.json(),
         "revisions": {
             "source_revision": source_revision,
-            "botster_core": "bf6e7d996bca2786ad4142c870a13c57a490e241",
+            "botster_core": "053148f6e8e63c3c38b2cbabd54a6e4e8211143c",
             "calibration_dataset_commit": git_path_commit(&calibration_path()),
             "acceptance_revision": match phase {
                 CampaignPhase::Acceptance => std::env::var("SUBJECT_SHA").ok(),

@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex, TryLockError};
 
 use crate::host_executor::HostWorkPermit;
+use crate::lua_memory::LuaCallbackStorageLease;
 use crate::runtime::entity_model::Work as ModelWork;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,9 +27,22 @@ struct State {
     outcome: Outcome,
 }
 
+pub(crate) fn boxed_payload_storage_bytes() -> Option<usize> {
+    use crate::lua_memory::layout;
+    // Work boxes the supplied Box. Owner and Host can initialize its mutex concurrently.
+    std::mem::size_of::<Box<dyn Send>>()
+        .checked_add(layout::arc_bytes::<Mutex<State>>())?
+        .checked_add(2usize.checked_mul(layout::lazy_mutex_bytes())?)?
+        .checked_add(layout::lease_bytes())
+}
+
 /// This handle stays in the original request or recovery row until disposal finishes.
 #[derive(Clone)]
-pub(crate) struct Work(Arc<Mutex<State>>);
+pub(crate) struct Work(
+    Arc<Mutex<State>>,
+    #[allow(dead_code)] // storage lease retained until Host disposal work drops
+    Option<LuaCallbackStorageLease>,
+);
 
 impl std::fmt::Debug for Work {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,6 +64,8 @@ pub(crate) struct Parts {
     pub(crate) permit: HostWorkPermit,
     pub(crate) payload: Box<dyn Send>,
     pub(crate) model: Option<ModelWork>,
+    // The payload and all disposal handles retain this admitted storage.
+    pub(crate) storage: Option<LuaCallbackStorageLease>,
 }
 
 /// The original Owner row retains this record through submission and destruction.
@@ -60,7 +76,7 @@ pub(crate) struct Job {
 
 impl Job {
     pub(crate) fn new(parts: Parts) -> Self {
-        let work = Work::new(parts.payload, parts.model);
+        let work = Work::with_storage(parts.payload, parts.model, parts.storage);
         Self::submit(work, parts.identity, parts.permit)
     }
 
@@ -69,7 +85,7 @@ impl Job {
         router: Arc<crate::package_event_router::PackageEventRouter>,
         cleanup: crate::subscription::package_events::ClientCleanupWork,
     ) -> Self {
-        let work = Work::new(parts.payload, parts.model);
+        let work = Work::with_storage(parts.payload, parts.model, parts.storage);
         work.0.lock().expect("new disposal record").client_cleanup = Some((router, cleanup));
         Self::submit(work, parts.identity, parts.permit)
     }
@@ -78,7 +94,7 @@ impl Job {
         parts: Parts,
         bridges: crate::runtime::TerminalPluginBridges,
     ) -> Self {
-        let work = Work::new(parts.payload, parts.model);
+        let work = Work::with_storage(parts.payload, parts.model, parts.storage);
         work.0.lock().expect("new disposal record").plugin_bridges = Some(bridges);
         Self::submit(work, parts.identity, parts.permit)
     }
@@ -137,15 +153,22 @@ impl Parts {
 }
 
 impl Work {
-    pub(crate) fn new(payload: impl Send + 'static, model: Option<ModelWork>) -> Self {
-        Self(Arc::new(Mutex::new(State {
-            payload: Some(Box::new(payload)),
-            model,
-            client_cleanup: None,
-            plugin_bridges: None,
-            permit: None,
-            outcome: Outcome::Pending,
-        })))
+    fn with_storage(
+        payload: impl Send + 'static,
+        model: Option<ModelWork>,
+        storage: Option<LuaCallbackStorageLease>,
+    ) -> Self {
+        Self(
+            Arc::new(Mutex::new(State {
+                payload: Some(Box::new(payload)),
+                model,
+                client_cleanup: None,
+                plugin_bridges: None,
+                permit: None,
+                outcome: Outcome::Pending,
+            })),
+            storage,
+        )
     }
 
     /// The existing worker calls this in disposal mode, including after normal execution stops.
@@ -232,6 +255,33 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn storage_lease_outlives_the_payload_and_last_work_handle() {
+        use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+
+        struct Payload(Arc<LuaMemoryAccount>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                assert_eq!(self.0.usage().1, 64);
+            }
+        }
+
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: 64,
+            total_callback_bytes: 64,
+        })
+        .unwrap();
+        let storage = LuaCallbackStorageLease::new(memory.reserve_callback_total(64).unwrap());
+        let owner = Work::with_storage(Payload(memory.clone()), None, Some(storage));
+        let host = owner.clone();
+        drop(owner);
+        assert_eq!(memory.usage().1, 64);
+        drop(host);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
     fn terminal_destructor_panic_keeps_the_original_slot_without_a_disposal_receipt() {
         struct PanicDrop(std::sync::mpsc::Sender<String>);
         impl Drop for PanicDrop {
@@ -250,6 +300,7 @@ mod tests {
         let executor = HostExecutor::new();
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut job = Job::new(Parts {
+            storage: None,
             identity: HostJobIdentity::first(WaiterId(19)),
             permit: executor.try_reserve().unwrap(),
             payload: Box::new(PanicDrop(sender)),
@@ -277,6 +328,7 @@ mod tests {
             "a destructor panic is not a submission refusal"
         );
         let mut sibling = Job::new(Parts {
+            storage: None,
             identity: HostJobIdentity::first(WaiterId(20)),
             permit: executor.try_reserve().unwrap(),
             payload: Box::new(()),

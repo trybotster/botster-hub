@@ -161,6 +161,7 @@ mod tests {
             let gate = Gate(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let mut job = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+                storage: None,
                 identity,
                 permit,
                 model: Some(work.clone()),
@@ -346,6 +347,7 @@ mod tests {
         let gate = Gate(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let mut job = crate::host_disposal::Job::new(crate::host_disposal::Parts {
+            storage: None,
             identity,
             permit,
             model: Some(work.clone()),

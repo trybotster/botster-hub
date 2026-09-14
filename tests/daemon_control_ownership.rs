@@ -534,6 +534,7 @@ const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &[
     "PluginResultCapacityReleased",
     "CausalProgressPublished",
     "EntityPublishProgress",
+    "CoordinationProgress",
 ];
 
 fn control_handler_modules() -> Vec<String> {

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use botster_hub::{MAX_OWNER_TURN_MS, MAX_READY_OPERATION_WAIT_MS};
 
-const REQUIRED_CORE_REV: &str = "bf6e7d996bca2786ad4142c870a13c57a490e241";
+const REQUIRED_CORE_REV: &str = "053148f6e8e63c3c38b2cbabd54a6e4e8211143c";
 const REQUIRED_CORE_URL: &str = "https://github.com/trybotster/botster-core.git";
 const SYNTHETIC_INVALID_CORE_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -14,6 +14,7 @@ const CORE_FAMILY: &[&str] = &[
     "botster-core",
     "botster-core-daemon",
     "botster-terminal-protocol",
+    "botster-terminal-protocol-client",
     "botster-core-test-support",
     "botster-terminal-ghostty",
 ];
@@ -25,6 +26,7 @@ const MEMBER_CORE_FAMILY: &[(&str, &[&str])] = &[
             "botster-core",
             "botster-core-daemon",
             "botster-terminal-protocol",
+            "botster-terminal-protocol-client",
             "botster-core-test-support",
             "botster-terminal-ghostty",
         ],
@@ -37,7 +39,9 @@ const MEMBER_CORE_FAMILY: &[(&str, &[&str])] = &[
         "crates/botster-hub-test-support/Cargo.toml",
         &[
             "botster-core",
+            "botster-core-test-support",
             "botster-terminal-protocol",
+            "botster-terminal-protocol-client",
             "botster-terminal-ghostty",
         ],
     ),

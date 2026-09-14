@@ -93,6 +93,7 @@ impl PackageEntityResyncScan {
         self.terminal_admission = self.cursor.as_ref().and_then(Cursor::terminal_admission);
         self.terminal = Some(crate::host_disposal::Job::new(
             crate::host_disposal::Parts {
+                storage: None,
                 identity,
                 permit,
                 model: self.work.clone(),
