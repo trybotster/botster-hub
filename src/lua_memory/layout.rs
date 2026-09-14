@@ -201,6 +201,7 @@ pub(crate) fn btree_nodes_checked<K, V>(len: usize) -> Option<usize> {
     internal.checked_add(len.checked_mul(per)?)
 }
 
+#[cfg(any(test, feature = "allocation-oracle"))]
 pub(crate) fn btree_nodes<K, V>(len: usize) -> usize {
     btree_nodes_checked::<K, V>(len).unwrap_or(usize::MAX)
 }
