@@ -129,10 +129,65 @@ fn request_variant_names(source: &str) -> Vec<String> {
     names
 }
 
+fn skip_balanced_braces(source: &str, open: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut depth = 0;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    source.len()
+}
+
+/// Drop `#[cfg(test)]` items (mod, fn, impl, or `;`-terminated) so production
+/// code before and after those ranges is still scanned.
+fn without_cfg_test_items(source: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while let Some(rel) = source[i..].find("#[cfg(test)]") {
+        out.push_str(&source[i..i + rel]);
+        i += rel + "#[cfg(test)]".len();
+        while i < source.len() && source.as_bytes()[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while source[i..].starts_with("#[") {
+            if let Some(end) = source[i..].find(']') {
+                i += end + 1;
+                while i < source.len() && source.as_bytes()[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        let brace = source[i..].find('{');
+        let semi = source[i..].find(';');
+        match (brace, semi) {
+            (Some(b), Some(s)) if s < b => i += s + 1,
+            (Some(b), _) => i = skip_balanced_braces(source, i + b),
+            (_, Some(s)) => i += s + 1,
+            _ => i = source.len(),
+        }
+    }
+    out.push_str(&source[i..]);
+    out
+}
+
 fn control_message_variant_names(source: &str) -> Vec<String> {
+    let source = without_cfg_test_items(source);
     let mut names = Vec::new();
     let needle = "ControlMessage::";
-    let mut rest = source;
+    let mut rest = source.as_str();
     while let Some(index) = rest.find(needle) {
         rest = &rest[index + needle.len()..];
         let name: String = rest
@@ -477,6 +532,8 @@ const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &[
     "ManagedSessionSpawnQueued",
     "PluginCompletionPublished",
     "PluginResultCapacityReleased",
+    "CausalProgressPublished",
+    "EntityPublishProgress",
 ];
 
 fn control_handler_modules() -> Vec<String> {
@@ -545,7 +602,13 @@ fn control_message_variants_have_one_family_or_dispatcher_owner() {
     let request = hub_source("src/daemon/control/request.rs");
     assert!(request.contains("has_live_peer(grant_id)"));
     let sessions = hub_source("src/daemon/control/sessions.rs");
-    assert!(sessions.contains("overlay_live_attach_occupancy"));
+    let status = hub_source("src/daemon/control/status.rs");
+    assert!(
+        status.contains("try_live_attach_occupancy_rows(")
+            && status.contains("live_attach_occupancy_prepared_bytes("),
+        "status path must overlay occupancy from a held inventory under a prepared byte bound"
+    );
+    let _ = sessions;
 
     let owner_paths: Vec<&str> = CONTROL_MESSAGE_OWNERS
         .iter()
@@ -572,6 +635,50 @@ fn control_message_variants_have_one_family_or_dispatcher_owner() {
         }
     }
     let _ = owner_paths;
+}
+
+#[test]
+fn control_message_variant_names_ignores_cfg_test_ranges_and_keeps_production() {
+    let ignored = r#"
+        fn production() {}
+        #[cfg(test)]
+        mod tests {
+            fn fixture() {
+                let _ = ControlMessage::Request;
+            }
+        }
+        fn after_tests() {
+            let _ = ControlMessage::Shutdown;
+        }
+    "#;
+    let names = control_message_variant_names(ignored);
+    assert!(
+        !names.iter().any(|name| name == "Request"),
+        "ControlMessage::Request inside #[cfg(test)] mod must be ignored"
+    );
+    assert!(
+        names.iter().any(|name| name == "Shutdown"),
+        "production code after a #[cfg(test)] mod must still be scanned"
+    );
+
+    let caught = r#"
+        fn production() {
+            let _ = ControlMessage::Request;
+        }
+        #[cfg(test)]
+        fn unit() {
+            let _ = ControlMessage::Spawn;
+        }
+    "#;
+    let names = control_message_variant_names(caught);
+    assert!(
+        names.iter().any(|name| name == "Request"),
+        "production ControlMessage::Request must still be caught"
+    );
+    assert!(
+        !names.iter().any(|name| name == "Spawn"),
+        "ControlMessage::Spawn inside #[cfg(test)] fn must be ignored"
+    );
 }
 
 #[test]
@@ -637,20 +744,32 @@ fn control_rs_request_arm_rejects_inlined_post_processing() {
 fn owner_plugin_paths_use_async_admission_and_completion_routing() {
     let plugins = hub_source("src/daemon/control/plugins.rs");
     let entities = hub_source("src/daemon/control/entities.rs");
+    let entity_worker = hub_source("src/daemon/control/entities/worker.rs");
     let subscriptions = hub_source("src/subscription/entity.rs");
-    for (path, source) in [
-        ("src/daemon/control/plugins.rs", plugins.as_str()),
-        ("src/daemon/control/entities.rs", entities.as_str()),
-    ] {
-        assert!(
-            source.contains("try_admit_plugin("),
-            "{path} must use bounded plugin worker admission"
-        );
-        assert!(
-            !source.contains("invoke_plugin("),
-            "{path} must not wait for plugin execution on the daemon owner"
-        );
-    }
+    assert!(
+        plugins.contains("try_admit_plugin("),
+        "src/daemon/control/plugins.rs must use bounded plugin worker admission"
+    );
+    assert!(
+        !plugins.contains("invoke_plugin("),
+        "src/daemon/control/plugins.rs must not wait for plugin execution on the daemon owner"
+    );
+    assert!(
+        entities.contains("mod worker;"),
+        "src/daemon/control/entities.rs must delegate to worker.rs"
+    );
+    assert!(
+        entities.contains("worker::EntityWork") && entities.contains("worker::step("),
+        "src/daemon/control/entities.rs must drive entity work through worker::step / EntityWork"
+    );
+    assert!(
+        !entities.contains("invoke_plugin("),
+        "src/daemon/control/entities.rs must not wait for plugin execution on the daemon owner"
+    );
+    assert!(
+        entity_worker.contains("try_acquire_plugin_entity_snapshot("),
+        "src/daemon/control/entities/worker.rs must use bounded entity-snapshot admission"
+    );
     assert!(
         !subscriptions.contains("plugin_entity_snapshot("),
         "entity subscription registration must not keep a blocking package-provider branch"
