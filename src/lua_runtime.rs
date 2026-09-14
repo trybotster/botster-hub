@@ -92,6 +92,8 @@ pub struct HubCoordinationBridge {
         Mutex<crate::lua_memory::charged_collection::ChargedVecDeque<PendingCoordinationRequest>>,
     >,
     progress: Arc<CoordinationProgress>,
+    /// Retained so the pending queue and test `request_typed` share one account.
+    #[cfg_attr(not(test), allow(dead_code))]
     account: Arc<LuaMemoryAccount>,
 }
 
@@ -289,6 +291,7 @@ impl HubCoordinationBridge {
         }
     }
 
+    #[cfg(test)]
     fn request(
         &self,
         operation: PendingCoordinationOperation,
@@ -304,6 +307,7 @@ impl HubCoordinationBridge {
         })
     }
 
+    #[cfg(test)]
     fn request_typed(
         &self,
         operation: PendingCoordinationOperation,
@@ -595,6 +599,7 @@ impl PendingCoordinationOperation {
     }
 }
 
+#[cfg(test)]
 fn nonacknowledge_entry_bytes(operation: &PendingCoordinationOperation) -> Option<usize> {
     let caller = crate::lua_memory::layout::arc_bytes::<std::sync::atomic::AtomicU8>();
     let reply = crate::lua_memory::layout::single_reply_bytes::<CoordinationReply>(true)?;
@@ -605,6 +610,7 @@ fn nonacknowledge_entry_bytes(operation: &PendingCoordinationOperation) -> Optio
 }
 
 impl PendingCoordinationOperation {
+    #[cfg(test)]
     fn payload_bytes(&self) -> Option<usize> {
         match self {
             #[cfg(test)]
@@ -616,11 +622,13 @@ impl PendingCoordinationOperation {
     }
 }
 
+#[cfg(test)]
 fn drain_payload_bytes(target: &EnvelopeTarget, after: Option<&EnvelopeCursor>) -> Option<usize> {
     envelope_target_heap_bytes(target)?
         .checked_add(after.map_or(0, |_| std::mem::size_of::<EnvelopeCursor>()))
 }
 
+#[cfg(test)]
 fn envelope_target_heap_bytes(target: &EnvelopeTarget) -> Option<usize> {
     Some(match target {
         EnvelopeTarget::Endpoint { endpoint_id } => endpoint_id.0.capacity(),
@@ -639,6 +647,7 @@ fn envelope_target_heap_bytes(target: &EnvelopeTarget) -> Option<usize> {
     })
 }
 
+#[cfg(test)]
 fn routed_envelope_bytes(envelope: &RoutedEnvelope) -> Option<usize> {
     let mut bytes = envelope
         .id
@@ -2946,8 +2955,13 @@ fn admit_publish_operation(
             extension_scratch.expect("sized extension has prepaid scratch"),
         )?)),
     };
-    let mut targets = Vec::with_capacity(1);
-    targets.push(target);
+    // Exact-capacity one-slot targets vec: with_capacity(1)+push keeps len==capacity.
+    #[allow(clippy::vec_init_then_push)]
+    let targets = {
+        let mut targets = Vec::with_capacity(1);
+        targets.push(target);
+        targets
+    };
     debug_assert_eq!(targets.len(), targets.capacity());
     Ok((
         PendingCoordinationOperation::Publish {

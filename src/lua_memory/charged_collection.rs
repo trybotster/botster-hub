@@ -49,10 +49,12 @@ impl<T> ChargedVecDeque<T> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.buf.len()
     }
 
+    #[cfg(any(test, feature = "allocation-oracle"))]
     pub(crate) fn capacity(&self) -> usize {
         self.buf.capacity()
     }
@@ -72,10 +74,12 @@ impl<T> ChargedVecDeque<T> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn front(&self) -> Option<&T> {
         self.buf.front()
     }
 
+    #[cfg(test)]
     pub(crate) fn front_mut(&mut self) -> Option<&mut T> {
         self.buf.front_mut()
     }
