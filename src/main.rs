@@ -18,7 +18,8 @@ use botster_hub::{
     DaemonSession, DaemonSpawnTarget, DaemonStatus, DaemonWorktree, DataDirectoryOption,
     HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
     HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
-    daemon_transport_request, host_profile, installation_identity, serve_daemon, serve_mcp_stdio,
+    daemon_transport_request, daemon_transport_request_for_doctor, host_profile,
+    installation_identity, serve_daemon, serve_mcp_stdio,
     software_identity, stream_attach,
 };
 use botster_hub_client::{
@@ -517,7 +518,8 @@ fn local_runtime_doctor(args: Vec<String>) -> Result<(), OperatorError> {
     println!("doctor=local_runtime");
     options.print_source();
 
-    let status_response = match daemon_transport_request(&config, DaemonRequest::Status) {
+    let status_response = match daemon_transport_request_for_doctor(&config, DaemonRequest::Status)
+    {
         Ok(response) => response,
         Err(
             botster_hub::DaemonTransportError::NotRunning
@@ -558,6 +560,23 @@ fn local_runtime_doctor(args: Vec<String>) -> Result<(), OperatorError> {
                 options.data_directory.display()
             ));
             return Err(OperatorError::App(message.to_string()));
+        }
+        Err(botster_hub::DaemonTransportError::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            print_runtime_check(
+                "daemon_compatible",
+                RuntimeCheckStatus::Fail,
+                "running daemon is incompatible or stale",
+            );
+            print_remediation(&format!(
+                "stop the stale botster-hub process, remove the stale local socket if needed, then run botster-hub up --data-dir {}",
+                options.data_directory.display()
+            ));
+            return Err(OperatorError::App(error.to_string()));
         }
         Err(error) => return Err(error.into()),
     };

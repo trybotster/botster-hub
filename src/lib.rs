@@ -110,7 +110,8 @@ pub const LOCAL_RUNTIME_DAEMON_READINESS_BUDGET: std::time::Duration =
 pub use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 pub use crate::daemon::owner_loop::serve_daemon;
 pub use crate::transport::unix::connection::{
-    DaemonConnection, request as daemon_transport_request, stream_attach,
+    DaemonConnection, request as daemon_transport_request,
+    request_for_doctor as daemon_transport_request_for_doctor, stream_attach,
 };
 pub use crate::transport::webrtc::{LocalWebrtcError, LocalWebrtcTransport};
 pub use botster_hub_client::{
