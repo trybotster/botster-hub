@@ -477,6 +477,8 @@ const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &[
     "ManagedSessionSpawnQueued",
     "PluginCompletionPublished",
     "PluginResultCapacityReleased",
+    "CausalProgressPublished",
+    "EntityPublishProgress",
 ];
 
 fn control_handler_modules() -> Vec<String> {
@@ -637,20 +639,32 @@ fn control_rs_request_arm_rejects_inlined_post_processing() {
 fn owner_plugin_paths_use_async_admission_and_completion_routing() {
     let plugins = hub_source("src/daemon/control/plugins.rs");
     let entities = hub_source("src/daemon/control/entities.rs");
+    let entity_worker = hub_source("src/daemon/control/entities/worker.rs");
     let subscriptions = hub_source("src/subscription/entity.rs");
-    for (path, source) in [
-        ("src/daemon/control/plugins.rs", plugins.as_str()),
-        ("src/daemon/control/entities.rs", entities.as_str()),
-    ] {
-        assert!(
-            source.contains("try_admit_plugin("),
-            "{path} must use bounded plugin worker admission"
-        );
-        assert!(
-            !source.contains("invoke_plugin("),
-            "{path} must not wait for plugin execution on the daemon owner"
-        );
-    }
+    assert!(
+        plugins.contains("try_admit_plugin("),
+        "src/daemon/control/plugins.rs must use bounded plugin worker admission"
+    );
+    assert!(
+        !plugins.contains("invoke_plugin("),
+        "src/daemon/control/plugins.rs must not wait for plugin execution on the daemon owner"
+    );
+    assert!(
+        entities.contains("mod worker;"),
+        "src/daemon/control/entities.rs must delegate to worker.rs"
+    );
+    assert!(
+        entities.contains("worker::EntityWork") && entities.contains("worker::step("),
+        "src/daemon/control/entities.rs must drive entity work through worker::step / EntityWork"
+    );
+    assert!(
+        !entities.contains("invoke_plugin("),
+        "src/daemon/control/entities.rs must not wait for plugin execution on the daemon owner"
+    );
+    assert!(
+        entity_worker.contains("try_acquire_plugin_entity_snapshot("),
+        "src/daemon/control/entities/worker.rs must use bounded entity-snapshot admission"
+    );
     assert!(
         !subscriptions.contains("plugin_entity_snapshot("),
         "entity subscription registration must not keep a blocking package-provider branch"
