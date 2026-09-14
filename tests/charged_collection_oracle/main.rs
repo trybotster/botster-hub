@@ -1,6 +1,7 @@
 //! Layout.size() versus charged collection capacity on rustc 1.97.0.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -29,6 +30,78 @@ static XRC_PEAK: AtomicUsize = AtomicUsize::new(0);
 static XRC_OVERFLOW: AtomicBool = AtomicBool::new(false);
 static ALLOC_SUM: AtomicUsize = AtomicUsize::new(0);
 static DEALLOC_SUM: AtomicUsize = AtomicUsize::new(0);
+static ALIGN16_ALLOC_SUM: AtomicUsize = AtomicUsize::new(0);
+static ALIGN16_DEALLOC_SUM: AtomicUsize = AtomicUsize::new(0);
+static OTHER_ALLOC_SUM: AtomicUsize = AtomicUsize::new(0);
+static OTHER_DEALLOC_SUM: AtomicUsize = AtomicUsize::new(0);
+const MAX_PRE: usize = 64;
+static PRE_SZ: [AtomicUsize; MAX_PRE] = [const { AtomicUsize::new(0) }; MAX_PRE];
+static PRE_CNT: [AtomicUsize; MAX_PRE] = [const { AtomicUsize::new(0) }; MAX_PRE];
+const MAX_BT_SITES: usize = 8;
+const MAX_BT_FRAMES: usize = 16;
+static BT_N: AtomicUsize = AtomicUsize::new(0);
+static BT_SIZE: [AtomicUsize; MAX_BT_SITES] = [const { AtomicUsize::new(0) }; MAX_BT_SITES];
+static BT_FRAME_N: [AtomicUsize; MAX_BT_SITES] = [const { AtomicUsize::new(0) }; MAX_BT_SITES];
+static BT_FRAMES: [AtomicUsize; 128] = [const { AtomicUsize::new(0) }; 128];
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn backtrace(buffer: *mut *mut c_void, size: i32) -> i32;
+}
+
+fn warm_backtrace() {
+    let mut buf = [std::ptr::null_mut::<c_void>(); 4];
+    unsafe {
+        backtrace(buf.as_mut_ptr(), 4);
+    }
+}
+
+fn note_pre_window_free(size: usize) {
+    for i in 0..MAX_PRE {
+        let slot = PRE_SZ[i].load(Ordering::Acquire);
+        if slot == size {
+            PRE_CNT[i].fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        if slot == 0
+            && PRE_SZ[i]
+                .compare_exchange(0, size, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            PRE_CNT[i].store(1, Ordering::Release);
+            return;
+        }
+    }
+}
+
+fn capture_align16_bt(size: usize) {
+    let i = BT_N.fetch_add(1, Ordering::AcqRel);
+    if i >= MAX_BT_SITES {
+        return;
+    }
+    BT_SIZE[i].store(size, Ordering::Release);
+    let mut buf = [std::ptr::null_mut::<c_void>(); MAX_BT_FRAMES];
+    let n = unsafe { backtrace(buf.as_mut_ptr(), MAX_BT_FRAMES as i32) }.max(0) as usize;
+    let n = n.min(MAX_BT_FRAMES);
+    BT_FRAME_N[i].store(n, Ordering::Release);
+    for f in 0..n {
+        BT_FRAMES[i * MAX_BT_FRAMES + f].store(buf[f] as usize, Ordering::Release);
+    }
+}
+
+fn add_align_sum(is_alloc: bool, size: usize, align: usize) {
+    if align == SYS_MIN_ALIGN {
+        if is_alloc {
+            ALIGN16_ALLOC_SUM.fetch_add(size, Ordering::AcqRel);
+        } else {
+            ALIGN16_DEALLOC_SUM.fetch_add(size, Ordering::AcqRel);
+        }
+    } else if is_alloc {
+        OTHER_ALLOC_SUM.fetch_add(size, Ordering::AcqRel);
+    } else {
+        OTHER_DEALLOC_SUM.fetch_add(size, Ordering::AcqRel);
+    }
+}
 const MAX_XRC: usize = 512;
 static XRC_PTRS: [AtomicUsize; MAX_XRC] = [const { AtomicUsize::new(0) }; MAX_XRC];
 const MAX_LIVE: usize = 4096;
@@ -91,13 +164,17 @@ fn window_alloc(ptr: *mut u8, size: usize, align: usize) {
             bytes.store(size, Ordering::Release);
             slot_align.store(align, Ordering::Release);
             ALLOC_SUM.fetch_add(size, Ordering::AcqRel);
+            add_align_sum(true, size, align);
+            if align == SYS_MIN_ALIGN {
+                capture_align16_bt(size);
+            }
             return;
         }
     }
     WINDOW_OVERFLOW.store(true, Ordering::Release);
 }
 
-fn window_dealloc(ptr: *mut u8) {
+fn window_dealloc(ptr: *mut u8, size: usize, align: usize) {
     let addr = ptr as usize;
     if addr == 0 {
         return;
@@ -111,11 +188,17 @@ fn window_dealloc(ptr: *mut u8) {
             .compare_exchange(addr, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            let size = bytes.swap(0, Ordering::AcqRel);
-            slot_align.store(0, Ordering::Release);
-            DEALLOC_SUM.fetch_add(size, Ordering::AcqRel);
+            let stored = bytes.swap(0, Ordering::AcqRel);
+            let stored_align = slot_align.swap(0, Ordering::AcqRel);
+            DEALLOC_SUM.fetch_add(stored, Ordering::AcqRel);
+            add_align_sum(false, stored, stored_align);
             return;
         }
+    }
+    DEALLOC_SUM.fetch_add(size, Ordering::AcqRel);
+    add_align_sum(false, size, align);
+    if align == SYS_MIN_ALIGN {
+        note_pre_window_free(size);
     }
 }
 
@@ -158,7 +241,7 @@ unsafe impl GlobalAlloc for Recorder {
             record_event(KIND_DEALLOC, layout);
             let live = LIVE.load(Ordering::Acquire).saturating_sub(layout.size());
             LIVE.store(live, Ordering::Release);
-            window_dealloc(ptr);
+            window_dealloc(ptr, layout.size(), layout.align());
             if is_xrc_layout(layout) {
                 xrc_note_dealloc(ptr);
             }
@@ -181,7 +264,7 @@ unsafe impl GlobalAlloc for Recorder {
                 live.saturating_sub(layout.size()).saturating_add(new_size),
                 Ordering::Release,
             );
-            window_dealloc(ptr);
+            window_dealloc(ptr, layout.size(), layout.align());
             if !new_ptr.is_null() {
                 window_alloc(new_ptr, new_size, new_layout.align());
             }
@@ -229,6 +312,23 @@ fn begin_record() {
     XRC_OVERFLOW.store(false, Ordering::Release);
     ALLOC_SUM.store(0, Ordering::Release);
     DEALLOC_SUM.store(0, Ordering::Release);
+    ALIGN16_ALLOC_SUM.store(0, Ordering::Release);
+    ALIGN16_DEALLOC_SUM.store(0, Ordering::Release);
+    OTHER_ALLOC_SUM.store(0, Ordering::Release);
+    OTHER_DEALLOC_SUM.store(0, Ordering::Release);
+    for i in 0..MAX_PRE {
+        PRE_SZ[i].store(0, Ordering::Release);
+        PRE_CNT[i].store(0, Ordering::Release);
+    }
+    BT_N.store(0, Ordering::Release);
+    for i in 0..MAX_BT_SITES {
+        BT_SIZE[i].store(0, Ordering::Release);
+        BT_FRAME_N[i].store(0, Ordering::Release);
+        for f in 0..MAX_BT_FRAMES {
+            BT_FRAMES[i * MAX_BT_FRAMES + f].store(0, Ordering::Release);
+        }
+    }
+    LIVE.store(0, Ordering::Release);
     RECORD.store(true, Ordering::Release);
 }
 
@@ -383,6 +483,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    warm_backtrace();
     println!(
         "commit={} pending size={} align={} inflight size={} align={}",
         option_env!("BOTSTER_EMBEDDED_BUILD_REVISION").unwrap_or("unspecified"),
@@ -551,28 +652,23 @@ fn measure_raise_storm(
 ) -> Result<(), String> {
     let storm = botster_hub::test_internals::prepare_capacity_raise_storm();
     let lua_before = storm.used_memory();
-    LIVE.store(0, Ordering::Release);
     begin_record();
     run(&storm).map_err(|error| format!("{label}: {error}"))?;
     end_record();
-    reconcile(label, n, lua_before, storm.used_memory())
+    let lua_after = storm.used_memory();
+    reconcile(label, n, lua_before, lua_after)
 }
 
 fn measure_hook_storm(n: u32) -> Result<(), String> {
     let storm = botster_hub::test_internals::prepare_hook_raise_storm()?;
     let lua_before = storm.used_memory();
-    LIVE.store(0, Ordering::Release);
     begin_record();
     storm
         .retain_errors(n)
         .map_err(|error| format!("hook-budget-raises-{n}: {error}"))?;
     end_record();
-    reconcile(
-        &format!("hook-budget-raises-{n}"),
-        n,
-        lua_before,
-        storm.used_memory(),
-    )
+    let lua_after = storm.used_memory();
+    reconcile(&format!("hook-budget-raises-{n}"), n, lua_before, lua_after)
 }
 
 fn reconcile(label: &str, n: u32, lua_before: usize, lua_after: usize) -> Result<(), String> {
@@ -586,14 +682,92 @@ fn reconcile(label: &str, n: u32, lua_before: usize, lua_after: usize) -> Result
     } else {
         rust_only as f64 / n as f64
     };
+    let a16_alloc = ALIGN16_ALLOC_SUM.load(Ordering::Acquire);
+    let a16_dealloc = ALIGN16_DEALLOC_SUM.load(Ordering::Acquire);
+    let other_alloc = OTHER_ALLOC_SUM.load(Ordering::Acquire);
+    let other_dealloc = OTHER_DEALLOC_SUM.load(Ordering::Acquire);
+    let align16_net = a16_alloc as i128 - a16_dealloc as i128;
+    let other_net = other_alloc as i128 - other_dealloc as i128;
     println!(
         "{label} n={n} alloc_sum={alloc} dealloc_sum={dealloc} net={net} lua_delta={lua_delta} rust_only={rust_only} rust_only_per_raise={per_raise:.4}"
     );
+    println!(
+        "{label} align16_alloc={a16_alloc} align16_dealloc={a16_dealloc} align16_net={align16_net} other_alloc={other_alloc} other_dealloc={other_dealloc} other_net={other_net} align16_net_minus_lua_delta={}",
+        align16_net - lua_delta
+    );
     print_non_sys_min_align_histogram(label);
+    print_align16_live_histogram(label);
+    print_pre_window_align16_frees(label);
+    if align16_net > lua_delta {
+        print_align16_backtraces(label);
+    }
     if WINDOW_OVERFLOW.load(Ordering::Acquire) {
         return Err(format!("{label}: live-pointer table overflowed"));
     }
     Ok(())
+}
+
+fn print_align16_live_histogram(label: &str) {
+    let mut buckets: Vec<(usize, usize, usize)> = Vec::new();
+    for i in 0..MAX_LIVE {
+        if LIVE_PTR[i].load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        if LIVE_ALIGN[i].load(Ordering::Acquire) != SYS_MIN_ALIGN {
+            continue;
+        }
+        let size = LIVE_SZ[i].load(Ordering::Acquire);
+        match buckets.iter_mut().find(|(s, _, _)| *s == size) {
+            Some((_, count, bytes)) => {
+                *count += 1;
+                *bytes += size;
+            }
+            None => buckets.push((size, 1, size)),
+        }
+    }
+    buckets.sort_by_key(|b| b.0);
+    print!("{label} align16_live");
+    if buckets.is_empty() {
+        println!(" (none)");
+        return;
+    }
+    println!();
+    for (size, count, bytes) in buckets {
+        println!("{label} align16_live size={size} count={count} live_bytes={bytes}");
+    }
+}
+
+fn print_pre_window_align16_frees(label: &str) {
+    let mut any = false;
+    for i in 0..MAX_PRE {
+        let size = PRE_SZ[i].load(Ordering::Acquire);
+        let count = PRE_CNT[i].load(Ordering::Acquire);
+        if size == 0 || count == 0 {
+            continue;
+        }
+        if !any {
+            println!("{label} pre_window_align16_frees");
+            any = true;
+        }
+        println!("{label} pre_window_align16_free size={size} count={count}");
+    }
+    if !any {
+        println!("{label} pre_window_align16_frees (none)");
+    }
+}
+
+fn print_align16_backtraces(label: &str) {
+    let n = BT_N.load(Ordering::Acquire).min(MAX_BT_SITES);
+    println!("{label} align16_bt_sites={n} (raw IPs, Recorder used static buffer)");
+    for i in 0..n {
+        let size = BT_SIZE[i].load(Ordering::Acquire);
+        let frames = BT_FRAME_N[i].load(Ordering::Acquire);
+        print!("{label} align16_bt size={size} frames=");
+        for f in 0..frames {
+            print!("{:#x} ", BT_FRAMES[i * MAX_BT_FRAMES + f].load(Ordering::Acquire));
+        }
+        println!();
+    }
 }
 
 fn print_non_sys_min_align_histogram(label: &str) {
