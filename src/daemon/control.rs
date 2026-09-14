@@ -91,7 +91,7 @@ pub(crate) fn dispatch_control_message(
             record_data_plane_progress(daemon, state);
             false
         }
-        ControlMessage::CoreCompletionPublished | ControlMessage::CoordinationProgress => false,
+        ControlMessage::CoreCompletionPublished => false,
         message @ ControlMessage::AcceptedConnection { .. }
         | message @ ControlMessage::ConnectionCleanup(_)
         | message @ ControlMessage::RejectedConnection
@@ -135,7 +135,8 @@ pub(crate) fn dispatch_control_message(
         | ControlMessage::EntityPublishProgress
         | ControlMessage::CausalProgressPublished
         | ControlMessage::HostProgressPublished
-        | ControlMessage::ManagedSessionSpawnQueued => {
+        | ControlMessage::ManagedSessionSpawnQueued
+        | ControlMessage::CoordinationProgress => {
             crate::daemon::owner_loop::publish_completion_wakes(daemon, state);
             false
         }
