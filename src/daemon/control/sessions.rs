@@ -668,11 +668,8 @@ pub(crate) fn handle_runtime(
                 };
                 match result {
                     Ok(true) => {
-                        suppress_unix_session_close_events(&mut state.pending_runtime, &session_id);
-                        suppress_webrtc_session_close_events(
-                            &mut state.pending_runtime,
-                            &session_id,
-                        );
+                        suppress_unix_session_close_events(&state.pending_runtime, &session_id);
+                        suppress_webrtc_session_close_events(&state.pending_runtime, &session_id);
                         ControlPoll::Ready(Ok(daemon_response_base(
                             DaemonResponseKind::SessionRemoved,
                         )))
@@ -1694,8 +1691,8 @@ fn handle_shutdown_session(
                         | Ok(ShutdownSessionClassification::Stopping)
                         | Err(_) => {}
                     }
-                    suppress_unix_session_close_events(&mut state.pending_runtime, &session_id);
-                    suppress_webrtc_session_close_events(&mut state.pending_runtime, &session_id);
+                    suppress_unix_session_close_events(&state.pending_runtime, &session_id);
+                    suppress_webrtc_session_close_events(&state.pending_runtime, &session_id);
                     let Some(runtime) = daemon.runtime() else {
                         return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
                     };
