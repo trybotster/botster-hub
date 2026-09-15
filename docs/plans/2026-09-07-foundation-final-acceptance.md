@@ -31,6 +31,208 @@ The target test passed without a diagnostic record. A separate missing-reused-wo
 No further diagnostic run is authorized. Evidence remains under `/tmp/hub-event-owner-diag-run` and `/tmp/hub-event-owner-v4-sibling-bundle`.
 Independent lint work may add four reviewed item-level allowances while preserving inline storage and the public counter method. No behavior change is authorized.
 
+### September 15 restart and lint repair
+
+Root confirmed that the integration tree survived at clean checkpoint `98af5558d352187fde81c4b78881c930ed35f7b0` before this documentation update.
+The Hub writer and Core writer reported no active compiler process. Root did not restart accepted checks.
+Core remains clean at `053148f6e8e63c3c38b2cbabd54a6e4e8211143c`.
+
+The client strict lint check now passes for all targets. The accepted helper repair removed all thirteen introduced Hub library diagnostics.
+The Hub library retains 157 baseline diagnostics. Baseline origin does not waive the strict lint requirement.
+Hub library-test lint coverage remains unproved because the library fails first.
+Normal, `test-internals`, and `allocation-oracle` library checks passed for the helper repair.
+The repaired library test artifact passed 16 collection-capacity tests, 11 coordination-lifecycle tests, and 15 Lua JSON tests.
+Both affected allocation oracle harnesses passed. These checks establish the helper repair, not full foundation acceptance.
+Evidence remains in `/tmp/hub-helper-visibility-verify` and `/tmp/hub-clippy-matched-arms`.
+
+The Hub writer owns the next repair: remove seven redundant borrow operators in `src/lua_runtime.rs` and `src/packages.rs`.
+Root checked the argument types and callee signatures. Claude reviews the exact diff before Root authorizes verification.
+The new strict lint run reported 150 Hub library errors and exited with 101. It reported no `needless_borrow` or `vec_init_then_push` diagnostics.
+Formatting and the ordinary library check passed. The library test build passed, followed by five package-refresh tests with 1,137 filtered tests.
+Root inspected the source diff and raw evidence in `/tmp/hub-needless-borrow-verify`. Root also confirmed the copied binary hashes.
+The diff removes seven borrow operators and includes formatter reflow with one removed trailing comma. No other semantic change appears.
+Claude accepted the diff and raw evidence in message `msg_plugin-w_1789456096_b40c96`.
+Root authorized a local commit of the two source files only. The writer must exclude this plan update.
+The strict lint requirement remains open. The next repair requires a separate reviewed proposal from the retained diagnostics.
+The writer committed the repair as `7f3592a86eeb59984a6eb08ee2fa487559b8f894`, with parent `98af5558d352187fde81c4b78881c930ed35f7b0`.
+Root verified the two changed source paths. Only this plan remained dirty after the commit.
+The next proposal replaces four `usize` multiplication expressions in `src/session_types/bounded_catalog.rs` with equivalent `saturating_mul` calls.
+Root checked the expressions and preserved admission checks. Claude must accept the proposal and exact diff before the writer runs bounded verification.
+Claude accepted the exact arithmetic diff in message `msg_plugin-w_1789456499_b40d93` before verification.
+The new strict lint run reported 146 Hub library errors and exited with 101. The three repaired lint categories remained absent.
+Formatting, the ordinary library check, and the library test build passed. The copied binary listed and passed all eight catalog tests, with 1,134 filtered tests.
+Root inspected the raw evidence and confirmed both binary hashes in `/tmp/hub-saturating-mul-verify`.
+The repair preserves computed values, including overflow cases. It establishes no new overflow-safety guarantee.
+Claude accepted the arithmetic evidence in message `msg_plugin-w_1789456722_cdfec1`.
+Root authorized a local commit of `src/session_types/bounded_catalog.rs` only, excluding this plan.
+Full acceptance and Hub library-test lint coverage remain open. The writer will propose the next repair from the retained 146 diagnostics.
+The arithmetic repair is committed as `fb39340ad09c913594dad9102a83a13d1254e466`, with parent `7f3592a86eeb59984a6eb08ee2fa487559b8f894`.
+Root verified that only the catalog source file entered the commit. Only this plan remained dirty.
+The next proposal prefixes five unused binding names with underscores across five daemon files. Calls, parameter types, and drop scopes must remain unchanged.
+Root found that the proposed test filters named production functions rather than tests. The writer must provide verified test selectors before authorization.
+Claude raised a possible retirement defect behind the unused `daemon` parameter in `retire_route_owner`.
+The claim cites historical adapter-binding behavior and is not verified against the current source.
+Root paused all five edits and requested bounded, independent traces of the retirement consumer and adapter-binding mutation owner.
+An empty match arm or unused parameter alone does not prove missing cleanup. No lifecycle change is authorized.
+Claude withdrew the retirement defect claim in message `msg_plugin-w_1789457011_40d01c`; he held no failing evidence at the current revision.
+His current trace identifies `AttachedStream::close_adapter` as the adapter-binding mutation owner, separate from the cited empty match arm.
+Root selected the original five named-binding renames. Signatures, statements, calls, and binding scopes must remain unchanged.
+This decision does not establish full retirement correctness. It rejects an unsupported blocker to a behavior-preserving repair.
+The writer may prepare the exact diff for review. He must supply corrected test selectors before Root authorizes verification.
+Claude accepted the five-underscore diff and four corrected test selectors in message `msg_plugin-w_1789457219_a02774`.
+Root independently inspected the diff and authorized bounded verification: formatting, strict lint, library compilation, and the four selected tests.
+The writer must confirm each full selector against the copied binary's inventory. The `host_work` rename has source and compilation coverage only.
+The new strict lint run reported 141 Hub library errors and exited with 101. It reported no unused-variable diagnostics for the library.
+Formatting, the library check, and the library test build passed. Each of the four exact test runs listed one test and passed one test.
+Each run filtered 1,141 tests. Root inspected the raw results and confirmed both binary hashes in `/tmp/hub-unused-variables-verify`.
+Claude accepted the five-rename evidence in message `msg_plugin-w_1789457478_82b881`.
+Root authorized one local commit of the five source files, excluding this plan. The writer will propose the next group from the retained 141 diagnostics.
+These results do not establish complete retirement correctness or Hub library-test lint coverage.
+The five renames are committed as `c0635cf0f5dff460f3ab9f4ba9b00217a339f9c7`, with parent `fb39340ad09c913594dad9102a83a13d1254e466`.
+Root verified the five source paths and remaining plan-only changes.
+The next proposal removes redundant rest patterns from four unit variants in `request_must_finish`, in `src/daemon/control/pending.rs`.
+Root checked all four enum declarations and the predicate. Fielded variants and classification must remain unchanged.
+Claude must accept the premise and exact diff before bounded formatting, lint, and compilation checks. No behavioral test claim follows from those checks.
+Claude accepted the exact unit-pattern diff in message `msg_plugin-w_1789457861_112578`. Root independently confirmed the four changes.
+The strict lint run reported 137 Hub library errors and exited with 101. The four unit-pattern diagnostics were absent.
+Formatting, the ordinary library check, and the library test build passed. No behavioral test ran for this equivalent pattern spelling.
+Root inspected the commands, source identity, and raw lint result in `/tmp/hub-unit-pattern-verify`.
+Claude accepted the unit-pattern evidence in message `msg_plugin-w_1789458074_a3191a`.
+Root authorized a local commit of `src/daemon/control/pending.rs` only, excluding this plan, and requested the next reviewed proposal.
+The strict lint requirement and full acceptance remain open. The confirmed library diagnostic count is 137.
+The unit-pattern repair is committed as `71ef39c27b063d2ce2e58c6dd2174ee4a1da184e`, with parent `c0635cf0f5dff460f3ab9f4ba9b00217a339f9c7`.
+Root verified its single source path and remaining plan-only changes.
+The next proposal replaces three clones of the derived `Copy` type `LeaseIdentity` with copies in `package_event_router.rs` and `runtime.rs`.
+Root confirmed the type and operands. The runtime helper is not gated by `cfg(test)` at its declaration; test usage is a separate claim.
+Root corrected the test selector to include `package_event_router::tests::`. The writer must list and execute exactly one selected test.
+Claude must accept the premise and diff before bounded verification. The runtime helper sites receive source and compilation coverage only.
+Claude accepted the exact clone diff in message `msg_plugin-w_1789458442_dbe062`. Root independently inspected all three changes.
+The strict lint run reported 134 Hub library errors and exited with 101. The three selected clone diagnostics were absent.
+Formatting, the ordinary library check, and the library test build passed. The exact reader test listed one test and passed one, with 1,141 filtered tests.
+Root inspected the raw results and confirmed both binary hashes in `/tmp/hub-clone-on-copy-verify`.
+The runtime helper sites retain source and compilation coverage only.
+Claude accepted the clone evidence in message `msg_plugin-w_1789458649_3ef386`.
+Root authorized a local commit of the two source files only, excluding this plan, and requested the next proposal from the retained 134 diagnostics.
+The clone repair is committed as `20a9443e5df34f379c84bd37fcec601438830e3b`, with parent `71ef39c27b063d2ce2e58c6dd2174ee4a1da184e`.
+Root verified the two source paths and remaining plan-only changes.
+The next proposal changes four suppression-helper arguments from mutable references to shared references in `src/daemon/control/sessions.rs`.
+Both helpers already accept shared references. Root checked their signatures and call sites; helper bodies and call order must remain unchanged.
+Claude must accept the premise and diff before bounded checks and one source-order regression test. That test does not prove runtime suppression behavior.
+Claude accepted the exact borrow diff in message `msg_plugin-w_1789458931_28a61c`. Root independently inspected the four changes and preserved call order.
+The first pair is in `handle_runtime`, not `handle_session_remove`. The second pair is in `handle_shutdown_session`.
+The strict lint run reported 130 Hub library errors and exited with 101. The four unnecessary-mutable-borrow diagnostics were absent.
+Formatting, the library check, and the library test build passed. The source-order test listed one test and passed one, with 1,141 filtered tests.
+Root inspected raw evidence and confirmed both binary hashes in `/tmp/hub-unnecessary-mut-verify`.
+The test guards source order only; it does not prove runtime suppression.
+Claude accepted the borrow evidence in message `msg_plugin-w_1789459149_c50bdf`.
+Root authorized a local commit of `src/daemon/control/sessions.rs` only, excluding this plan, and requested the next proposal from the retained 130 diagnostics.
+The borrow repair is committed as `74a5e529f9cabefc3982b90a2c351d763ec59f52`, with parent `20a9443e5df34f379c84bd37fcec601438830e3b`.
+Root verified the single source path and remaining plan-only changes.
+The next proposal replaces three `let Some(...)` statements whose else branches return `None` with `?`, in three `Option`-returning functions.
+Root checked the exact bodies and return types in `entities.rs`, `plugins.rs`, and `runtime.rs`.
+Claude must accept the premise and diff before bounded checks and two exact plugin-routing tests. The entities and runtime sites retain source and compilation coverage only.
+Claude accepted the exact `?` diff in message `msg_plugin-w_1789459558_206df7`. Root independently inspected the three rewrites.
+The strict lint run reported 127 Hub library errors and exited with 101. One `question_mark` diagnostic remains in unchanged `host_family.rs`.
+Formatting, the library check, and the library test build passed. Both exact plugin-routing tests listed and passed one test each, with 1,141 filtered tests per run.
+Root inspected raw results and confirmed both binary hashes in `/tmp/hub-question-mark-verify`.
+The two tests cover plugin routing only. The other two sites retain source and compilation coverage.
+Claude accepted the `?` evidence in message `msg_plugin-w_1789459808_931e85`.
+Root authorized a local commit of the three source files only, excluding this plan, and requested the next proposal from the retained 127 diagnostics.
+The three `?` rewrites are committed as `6fb1126a5a98e4c0677f5c99f1ff206c46dcfe1d`, with parent `74a5e529f9cabefc3982b90a2c351d763ec59f52`.
+Root verified the three source paths and remaining plan-only changes.
+The next proposal removes two bare function-level `#[must_use]` attributes. Root identified both diagnostics as `clippy::double_must_use`.
+Claude reviews the return types and ignored-result diagnostics, including the tuple returned by `EventPlaneReplaceError::into_parts`.
+Root authorized a standalone four-case compiler probe before attribute edits. Evidence is retained in `/tmp/hub-double-must-use-probe`.
+The pinned compiler warns for ignored direct and tuple-contained `Result` values without function attributes.
+With the function attributes, it emits additional function warnings. Removal preserves the type warning; it does not replace that warning or preserve identical diagnostics.
+Root inspected the probe sources, commands, diagnostics, and exact two-attribute diff. Claude reviews both before repository verification.
+Claude accepted the attribute diff and probe in message `msg_plugin-w_1789460281_8eee19` before repository verification.
+The strict lint run reported 125 Hub library errors and exited with 101. Both `double_must_use` diagnostics were absent.
+Formatting, the library check, and the library test build passed. Both exact regression tests listed and passed one test each, with 1,141 filtered tests per run.
+Root inspected raw results and confirmed both binary hashes in `/tmp/hub-double-must-use-verify`.
+The standalone probe remains separate evidence for duplicate-warning removal.
+Claude accepted the attribute evidence in message `msg_plugin-w_1789460514_66c7a0`.
+Root authorized a local commit of the two source files only, excluding this plan, and requested the next proposal from the retained 125 diagnostics.
+The attribute repair is committed as `a74e062819758e84472a431679e750499c285676`, with parent `6fb1126a5a98e4c0677f5c99f1ff206c46dcfe1d`.
+Root verified the two source paths and remaining plan-only changes.
+The next proposal removes two returned local bindings in `entities.rs` and `bounded_catalog.rs`.
+Root inspected both sites. Claude reviews concrete types and temporary drop behavior under edition 2024 before edits.
+The outer parser binding, error conversion, reservations, and releases must remain unchanged. The confirmed library diagnostic count remains 125.
+Claude accepted the exact return-binding diff in message `msg_plugin-w_1789460873_966e1d`.
+The ordinary library check ran first and passed. Formatting and the library test build also passed.
+The strict lint run reported 123 Hub library errors and exited with 101. Both `let_and_return` diagnostics were absent.
+Both exact regressions listed and passed one test each, with 1,141 filtered tests per run.
+Root inspected raw evidence and confirmed both binary hashes in `/tmp/hub-let-and-return-verify`.
+Compilation establishes borrow validity, not drop order. The named deserializer still drops at inner-block exit before error conversion and budget releases.
+Its scratch vector deallocation remains observable to accounting. The absence of an explicit `Drop` implementation does not prove unobservable destruction.
+Claude accepted the return-binding evidence in message `msg_plugin-w_1789461150_6e5523`; the parser-site conditional is closed at this scope.
+Root authorized a local commit of the two source files only, excluding this plan, and requested the next proposal from the retained 123 diagnostics.
+The return-binding repair is committed as `01f6014b626d42b30daa1af79e2a672ee57f4622`, with parent `a74e062819758e84472a431679e750499c285676`.
+Root verified the two source paths and remaining plan-only changes.
+The next proposal removes four unused import names and gates the `WebrtcTerminalAdmission` import under `cfg(test)`.
+The `AdmissionState` import remains available in production. Claude reviews descendant visibility and conditional compilation before edits.
+After premise and diff acceptance, bounded formatting, lint, library, and library-test compilation checks are authorized. No behavioral test claim follows.
+Claude accepted the exact import diff in message `msg_plugin-w_1789461520_ae5d92`. Root independently inspected all five files.
+The strict lint run reported 118 Hub library errors and exited with 101. The five unused-import diagnostics were absent.
+Formatting, the ordinary library check, and the library test build passed, including the test-only `WebrtcTerminalAdmission` import.
+Root inspected commands, source identity, and raw outputs in `/tmp/hub-unused-imports-verify`. No behavioral test ran for this group.
+Claude accepted the import evidence in message `msg_plugin-w_1789461718_a0e96b`.
+Root authorized a local commit of the five source files only, excluding this plan, and requested the next proposal from the retained 118 diagnostics.
+The import repair is committed as `d172a2e9b9bb52275ec808387c5a34b0994468e4`, with parent `01f6014b626d42b30daa1af79e2a672ee57f4622`.
+Root verified the five source paths and remaining plan-only changes.
+The next proposal replaces a duplicate lookup and insert with the `BTreeMap` entry API in `PackageEntityFamilyState::admit_retained`.
+Claude reviews entry ownership and accounting before edits. Occupied entries must remain unchanged while the duplicate input moves to `discarded`.
+The vacant branch must preserve insertion, the high-water update, and resync rearming in that order. No performance improvement is claimed.
+Claude initially cited a different `pending_by_seq` field. Root corrected the receiver before authorizing edits.
+The actual field is `PackageEntityFamilyState::pending_by_seq: BTreeMap<u64, PackageEntityMutation>`, not the leased-mutation map.
+Claude corrected the trace in message `msg_plugin-w_1789462043_452ea0` and withdrew unsupported allocation and performance claims.
+Root authorized the exact entry rewrite and diff review. The library check must run first after diff acceptance; a borrow error stops work without restructuring.
+If compilation passes, bounded lint and compilation checks plus the exact duplicate regression are authorized. The commit remains held for evidence review.
+Claude accepted the exact entry diff in message `msg_plugin-w_1789462247_69c181`. Root independently inspected both branches.
+The library check ran first and passed without restructuring. Formatting and the library test build also passed.
+The strict lint run reported 117 Hub library errors and exited with 101. The `map_entry` diagnostic was absent.
+The exact duplicate-entry test listed and passed one test. Root inspected raw evidence and confirmed binary hashes in `/tmp/hub-map-entry-verify`.
+No allocation or performance improvement is claimed.
+Claude accepted the entry evidence in message `msg_plugin-w_1789462511_db4e27`, including the test's assertion that the first pending body remains intact.
+Root authorized a local commit of `src/package_entity_fanout.rs` only, excluding this plan, and requested the next proposal from the retained 117 diagnostics.
+The entry repair is committed as `2985d4685eafb630c2ddf09dd4c1e98b4da9ae2b`, with parent `d172a2e9b9bb52275ec808387c5a34b0994468e4`.
+Root verified its single source path and remaining plan-only changes.
+The next proposal replaces one closure returning an empty string literal with an eager empty-string default in `SourceRef::eligible`.
+Root inspected the expression. Claude must accept the premise and diff before bounded formatting, lint, and compilation checks.
+No behavioral test coverage is claimed. Callers establish reachability only.
+Claude accepted the exact empty-default diff in message `msg_plugin-w_1789462801_8c0478`. Root independently inspected the expression.
+The strict lint run reported 116 Hub library errors and exited with 101. The unnecessary-lazy-evaluation diagnostic was absent.
+Formatting, the ordinary library check, and the library test build passed. Root inspected raw evidence and source identity in `/tmp/hub-unwrap-or-verify`.
+Claude accepted the empty-default evidence in message `msg_plugin-w_1789462997_00c2ac`.
+Root authorized a local commit of `src/session_types/bounded_catalog.rs` only, excluding this plan, and requested the next proposal from the retained 116 diagnostics.
+The empty-default repair is committed as `41680c145ff686a02c2ee4ef5f8c9be3e36c83e4`, with parent `2985d4685eafb630c2ddf09dd4c1e98b4da9ae2b`.
+Root verified the single source path and remaining plan-only changes.
+The next proposal passes `repo_rollback_bytes` directly to `map_or` instead of a forwarding closure in `host_mutations.rs`.
+Root inspected the expression and callee signature. Claude must accept the premise and diff before bounded formatting, lint, and compilation checks.
+Logical-byte accounting and capacity checks must remain unchanged. No behavioral test coverage is claimed.
+Claude accepted the forwarding-closure diff in message `msg_plugin-w_1789463336_9428aa`. Root independently inspected it.
+The strict lint run reported 115 Hub library errors and exited with 101. Formatting, the library check, and the library test build passed.
+Root inspected raw evidence in `/tmp/hub-redundant-closure-verify`. No behavioral test ran. The source commit remains held for final evidence review.
+
+### September 15 publication and writer handoff
+
+Jason authorized committing and pushing reviewed checkpoints along the way, plus captures of important findings.
+Root pushed accepted commit `41680c145ff686a02c2ee4ef5f8c9be3e36c83e4` to `origin/integration/callback-baselines-20260914` and verified the remote ref.
+This is checkpoint publication, not full acceptance, a main-branch merge, a release, or installation.
+Jason authorized replacing the Grok implementation writer with Codex/Astra when convenient. Claude remains the independent reviewer.
+Grok finished the current verification and reported no active compiler. He will start no further repair group before the handoff.
+Root captured important decisions and corrections in the vault inbox as `2026-09-15-botster-reviewed-checkpoints-and-compiler-evidence.md`.
+The capture passed frontmatter and wiki-link validation. It is raw inbox material, not completed atomic-note processing.
+The strict lint requirement and full acceptance remain open.
+Root owns this plan update. The writer must preserve the separate diagnostic worktree.
+
+The event-owner assertion, original request-ID-7 failure, Host-permit failure, and missing-reused-worktree assertion remain unresolved.
+R1 revision 6 remains a design proposal. The G1 account for state cloning and serialization still needs an approved capacity.
+The timer audit is complete. Root restored the historical I1 proposal from agent message `msg_plugin-w_1789455811_3114e6` after its file became unavailable.
+The restored proposal retains its historical source baselines. It does not supersede Jason's later approval of the tested `__gc` registration restriction.
+The process boundary remains unapproved. General cancellation and native-stall containment remain outside that tested restriction.
+All original accounting, lifecycle, client, and performance requirements remain in scope. Publication and installation remain separate permission gates.
+
 ### Current execution: complete the plan
 
 #### September 11 approved accounting exclusion
