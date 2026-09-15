@@ -249,9 +249,7 @@ impl PluginEntityState {
         if !request_id.0.starts_with(OWNER_ENTITY_REQUEST_PREFIX) {
             return Some(completion);
         }
-        let Some(entry) = self.pending.get_mut(&request_id.0) else {
-            return None;
-        };
+        let entry = self.pending.get_mut(&request_id.0)?;
         let mut became_ready = false;
         if completion.value().class != PluginInvocationClass::RequestResponse
             || !entry

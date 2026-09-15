@@ -193,9 +193,7 @@ impl PluginControlState {
         if !request_id.0.starts_with(OWNER_PLUGIN_REQUEST_PREFIX) {
             return Some(completion);
         }
-        let Some(entry) = self.pending.get_mut(&request_id.0) else {
-            return None;
-        };
+        let entry = self.pending.get_mut(&request_id.0)?;
         if completion.value().class != PluginInvocationClass::RequestResponse
             || entry.identity.plugin_key != handler.plugin_key.0
             || entry.identity.handler != handler
