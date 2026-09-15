@@ -426,11 +426,10 @@ impl PluginEntityState {
                 _ => None,
             })
             .collect();
-        let removed = request_ids
+        request_ids
             .into_iter()
             .filter_map(|request_id| self.remove_request_id(&request_id))
-            .collect();
-        removed
+            .collect()
     }
 
     fn has_subscription(&self, subscription_id: &str) -> bool {

@@ -1257,11 +1257,10 @@ fn read_repo_catalog(
     }
     let mut parsed = {
         let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-        let parsed = RepoCatalogFile::deserialize(&mut deserializer).and_then(|value| {
+        RepoCatalogFile::deserialize(&mut deserializer).and_then(|value| {
             deserializer.end()?;
             Ok(value)
-        });
-        parsed
+        })
     }
     .map_err(repo_parse_error)?;
     let Some(actual_retained) = repo_catalog_owned_layout(&parsed.session_types) else {
