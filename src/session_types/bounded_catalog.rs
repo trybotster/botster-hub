@@ -1226,7 +1226,7 @@ fn read_repo_catalog(
         return Ok(None);
     }
     bytes.truncate(filled);
-    let scratch = 3usize.checked_mul(filled.max(8)).unwrap_or(usize::MAX);
+    let scratch = 3usize.saturating_mul(filled.max(8));
     if !budget.retain(scratch) {
         return Ok(None);
     }
@@ -1481,9 +1481,7 @@ fn collect_repo_files<'a>(
         .iter()
         .filter(|target| target.enabled)
         .count();
-    let layout = count
-        .checked_mul(size_of::<(&str, Vec<RepoCatalogDefinition>)>())
-        .unwrap_or(usize::MAX);
+    let layout = count.saturating_mul(size_of::<(&str, Vec<RepoCatalogDefinition>)>());
     if !budget.retain(layout) {
         return Ok(None);
     }
@@ -1641,11 +1639,9 @@ pub(super) fn list(
         }
         start = end;
     }
-    let Some(total_rows) = row_bytes.checked_add(
-        row_count
-            .checked_mul(size_of::<HubSessionType>())
-            .unwrap_or(usize::MAX),
-    ) else {
+    let Some(total_rows) =
+        row_bytes.checked_add(row_count.saturating_mul(size_of::<HubSessionType>()))
+    else {
         return Ok(None);
     };
     let Some(rows_with_overlap) = total_rows.checked_mul(2) else {
@@ -1801,11 +1797,9 @@ pub(super) fn list_all(
             })?;
         start = end;
     }
-    let Some(total_rows) = row_bytes.checked_add(
-        row_count
-            .checked_mul(size_of::<HubSessionType>())
-            .unwrap_or(usize::MAX),
-    ) else {
+    let Some(total_rows) =
+        row_bytes.checked_add(row_count.saturating_mul(size_of::<HubSessionType>()))
+    else {
         return Ok(None);
     };
     let Some(with_overlap) = total_rows.checked_mul(2) else {
