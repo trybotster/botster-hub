@@ -11,8 +11,8 @@ use botster_core::{
 };
 use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_core_daemon::{
-    CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError, DetachTerminalSubscriptionResult,
-    PendingOperationId, SpawnSessionRequest,
+    CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError, PendingOperationId,
+    SpawnSessionRequest,
 };
 use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonDiagnostic, DaemonModeFlags, DaemonOperatorError,

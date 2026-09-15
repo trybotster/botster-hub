@@ -23,7 +23,9 @@ use crate::HubDaemonStatus;
 use crate::admission::budgets::{
     DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_CONTROL_QUEUE_CAPACITY, DAEMON_MAX_CONNECTIONS,
 };
-use crate::admission::unix_hello::{AdmissionState, WebrtcTerminalAdmission};
+use crate::admission::unix_hello::AdmissionState;
+#[cfg(test)]
+use crate::admission::unix_hello::WebrtcTerminalAdmission;
 use crate::daemon::control::dispatch_control_message;
 #[cfg(test)]
 use crate::daemon::control::handle_control_message;
