@@ -14,10 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 
 use botster_hub_client::DaemonTransportError as ClientDaemonTransportError;
 use botster_hub_client::{
-    ClientFrame, DaemonEntityFrame, DaemonHello, DaemonProtocolErrorCode, DaemonRequest,
-    DaemonResponse, DaemonUnixFrame, DaemonUnixTerminalFrame, MAX_CONTROL_REQUEST_BYTES,
-    MAX_UNIX_FRAME_BYTES, ServerFrame, UNIX_FRAME_LENGTH_PREFIX_BYTES, UnixTerminalContainerHeader,
-    decode_unix_frame, encode_control_json, encode_server_frame,
+    ClientFrame, DaemonHello, DaemonProtocolErrorCode, DaemonRequest, DaemonResponse,
+    DaemonUnixFrame, DaemonUnixTerminalFrame, MAX_CONTROL_REQUEST_BYTES, MAX_UNIX_FRAME_BYTES,
+    ServerFrame, UNIX_FRAME_LENGTH_PREFIX_BYTES, UnixTerminalContainerHeader, decode_unix_frame,
+    encode_control_json, encode_server_frame,
 };
 use botster_terminal_protocol::MAX_TERMINAL_INPUT_FRAME_BYTES;
 

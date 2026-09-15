@@ -23,7 +23,6 @@ use crate::daemon::owner_budget::{
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_loop::tick;
 use crate::data_plane::driver::CoreTicket;
-use crate::data_plane::driver::CoreTicketPoll;
 use crate::runtime::BindRoutePlan;
 use crate::subscription::attach_routes::{BoundAdapterHandle, negotiated_unix_capability_set};
 

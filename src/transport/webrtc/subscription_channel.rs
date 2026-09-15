@@ -7,8 +7,8 @@
 //! `ServerFrame::HelloAck`; it carries no requests.
 use botster_core::AesGcmKey;
 use botster_hub_client::{
-    ClientFrame, DaemonCompatibility, DaemonDiagnostic, DaemonEntityFrame, DaemonHello,
-    DaemonHelloAck, PROTOCOL, PROTOCOL_VERSION, ServerFrame,
+    ClientFrame, DaemonCompatibility, DaemonDiagnostic, DaemonHello, DaemonHelloAck, PROTOCOL,
+    PROTOCOL_VERSION, ServerFrame,
 };
 use botster_terminal_protocol::{
     TerminalCompatibility, ensure_compatible as ensure_terminal_compatible,
