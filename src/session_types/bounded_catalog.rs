@@ -970,7 +970,7 @@ impl SourceRef<'_> {
                 .is_none_or(|pin| pin == target_id),
             SessionTypeSourceRank::Repo => self.source_name == target_id,
             SessionTypeSourceRank::Package => {
-                self.definition.target_id().as_deref().unwrap_or_else(|| "") == target_id
+                self.definition.target_id().as_deref().unwrap_or("") == target_id
                     || (self.definition.target_id().is_none()
                         && target_id.strip_prefix("package:") == Some(self.source_name))
             }
