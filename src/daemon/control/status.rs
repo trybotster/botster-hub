@@ -540,7 +540,7 @@ pub(crate) fn submit_delivery(
         waiter_id: entry.waiter_id,
         phase,
     };
-    let shutdown = prepared.shutdown;
+    let _shutdown = prepared.shutdown;
     let command = HostCommand::DeliverStatusResponse {
         prepared,
         reply_tx: entry.reply_tx.take(),

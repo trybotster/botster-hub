@@ -952,7 +952,7 @@ pub(crate) fn retire_plugin_entity_connection(
 }
 
 fn retire_plugin_entity_entries(
-    daemon: &HubDaemon,
+    _daemon: &HubDaemon,
     state: &mut DaemonControlState,
     entries: Vec<PendingPluginEntity>,
     count_abandoned: bool,
