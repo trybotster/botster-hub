@@ -622,7 +622,7 @@ fn retire_reserved_subscription(
 }
 
 pub(crate) fn retire_route_owner(
-    daemon: &mut HubDaemon,
+    _daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
     grant_id: &str,
     reservation: &crate::admission::reservations::TerminalReservation,

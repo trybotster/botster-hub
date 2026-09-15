@@ -109,7 +109,7 @@ pub(crate) fn arm_reservation_deadline(
     };
     let now = Instant::now();
     let deadline = now + Duration::from_secs(u64::from(expires_in_seconds));
-    let Ok(arm) = state.deadlines.arm(waiter_id, deadline, now) else {
+    let Ok(_arm) = state.deadlines.arm(waiter_id, deadline, now) else {
         return false;
     };
     state

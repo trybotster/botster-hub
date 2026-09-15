@@ -500,7 +500,7 @@ impl HostMutationContinuation {
             let Some(completion) = state.host_completions.remove(&waiter_id) else {
                 return ControlPoll::Pending;
             };
-            let (identity, result, permit) = completion.into_parts();
+            let (_identity, result, permit) = completion.into_parts();
             let result = if let Some((saved, expected)) = event_cleanup.take() {
                 match result {
                     HostResult::EventOwner(Ok(completed)) if completed.identity() == &expected => {
