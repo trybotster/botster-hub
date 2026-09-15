@@ -1145,6 +1145,31 @@ Capture durable gotchas and current implementation boundaries, not every transie
 Remove obsolete executable paths and completed agent sessions only after preservation checks.
 Do not delete unrelated data or treat deletion as fulfillment of an evidence requirement.
 
+## September 15 cleanup checkpoint
+
+Jason requested integration of valid work, followed by deletion of unused agents and worktrees.
+Root fast-forwarded Core main from `b9e989be` to `053148f6` and pushed main successfully.
+The Core delivery branch is also pushed. The recorded D1(a) review accepted the committed source after 33 exact passing test runs.
+This integration does not close Hub acceptance or authorize installation.
+
+Root deleted five unused Botster sessions: Hub Grok B2, Core Grok B3, spawn Codex A9, spawn Claude AA, and timer audit B1.
+Root removed the spawn-lifecycle, event-driven-timers, callback-accounting, and Core worker-reservations worktrees.
+The three Hub worktrees had no unique commits outside the pushed integration history.
+The callback worktree had an uncommitted diagnostic patch. Root preserved that patch but did not merge it.
+Claude confirmed that no reviewer process required the callback worktree.
+
+Preserved files are at `/Users/jasonconigliari/botster-evidence/botster-cleanup-20260915.onGSh6`.
+They include seven hash-matched Core binaries, the original hash manifest, the callback diagnostic patch, and private configuration from both worktrees.
+The directory has mode 700. Private configuration files have mode 600 and are not committed.
+The callback patch hash is `7010858245cef8e3fa59bdada89d35a67a2e6a3199cba61ada4ce81258c0fdab`.
+Historical spawn-plan and worker-metadata evidence directories were already empty. Cleanup did not recover those missing records.
+
+Hub source checkpoint `e3cc644e` is accepted and pushed. Hub library strict lint still reports 115 errors and exits 101.
+Library-test lint, the event-owner failure, Host-permit accounting, request ID 7, and the reused-worktree assertion remain open.
+R1 remains a design proposal. G1 still needs a capacity decision.
+The active integration worktree remains. Other historical worktrees require a separate inventory before deletion.
+The next bounded source proposal is Astra's `PumpState` default derivation, with Claude as independent reviewer.
+
 ## Completion gate
 
 This phase completes only when integration, required product behavior, architecture findings, and measured acceptance are resolved or explicitly returned for a user decision.
