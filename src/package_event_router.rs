@@ -3256,7 +3256,7 @@ impl CausalScopeTable {
             .filter_map(|(scope_id, scope)| {
                 scope.identities.keys().find_map(|identity| {
                     matches!(identity, LeaseIdentity::PendingEntityPublish { .. })
-                        .then(|| (*scope_id, identity.clone()))
+                        .then(|| (*scope_id, *identity))
                 })
             })
             .collect()

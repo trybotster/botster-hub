@@ -3687,8 +3687,7 @@ impl HubRuntime {
                     delivery.name, delivery.envelope_id, delivery.holder.handler_id
                 ));
                 let identity = crate::package_event_router::LeaseIdentity::EventInFlight;
-                let Some(scope_id) = self.causal_scopes.mint_with_lease(Some(identity.clone()))
-                else {
+                let Some(scope_id) = self.causal_scopes.mint_with_lease(Some(identity)) else {
                     pending.push(PendingTestEvent::Requeue {
                         delivery,
                         scope: None,
@@ -3745,10 +3744,7 @@ impl HubRuntime {
                     let Some((scope_id, identity)) = scope else {
                         return;
                     };
-                    match self.admit_causal_op(CausalOp::Release {
-                        scope_id,
-                        identity: identity.clone(),
-                    }) {
+                    match self.admit_causal_op(CausalOp::Release { scope_id, identity }) {
                         CausalAdmitResult::Applied => {
                             self.apply_causal_owner_ops();
                         }
