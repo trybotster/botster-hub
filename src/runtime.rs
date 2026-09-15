@@ -2434,9 +2434,7 @@ impl HubRuntime {
             };
             Some((reservation, acquired))
         });
-        let Some((pending, (reservation, acquired))) = selected else {
-            return None;
-        };
+        let (pending, (reservation, acquired)) = selected?;
         let (result, discarded, release, drain) = if acquired {
             self.admit_package_entity_publish(
                 pending.registration,
