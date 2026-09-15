@@ -2213,8 +2213,8 @@ fn session_type_read_callback(
                     crate::session_types::show_session_type_for_target_bounded(
                         &records,
                         &state,
-                        &target_id,
-                        &session_type_id,
+                        target_id,
+                        session_type_id,
                         limit,
                     )
                 } else {
@@ -2222,8 +2222,8 @@ fn session_type_read_callback(
                     crate::session_types::show_session_type_for_target(
                         &records,
                         &state,
-                        &target_id,
-                        &session_type_id,
+                        target_id,
+                        session_type_id,
                     )
                     .map(Some)
                 };
@@ -2231,14 +2231,12 @@ fn session_type_read_callback(
             } else {
                 let result = if memory.is_some() {
                     crate::session_types::list_session_types_for_target_bounded(
-                        &records, &state, &target_id, limit,
+                        &records, &state, target_id, limit,
                     )
                 } else {
                     let records = records.iter().collect::<Vec<_>>();
-                    crate::session_types::list_session_types_for_target(
-                        &records, &state, &target_id,
-                    )
-                    .map(Some)
+                    crate::session_types::list_session_types_for_target(&records, &state, target_id)
+                        .map(Some)
                 };
                 errors.finish(lua, result)
             };

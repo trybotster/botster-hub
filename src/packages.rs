@@ -705,7 +705,7 @@ impl PackageRegistry {
                 audit_reason,
             ));
         }
-        if let Err(reason) = crate::capabilities::validate_package_namespace(&package_name) {
+        if let Err(reason) = crate::capabilities::validate_package_namespace(package_name) {
             return Err(PackageRegistryError::with_record(
                 package_name,
                 PackageAction::Reload,
