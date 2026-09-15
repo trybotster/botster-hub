@@ -188,7 +188,6 @@ pub struct EventPlaneReplaceError {
 }
 
 impl EventPlaneReplaceError {
-    #[must_use]
     pub fn into_parts(self) -> (Result<u64, EventPlaneStatus>, Option<EventOwnerWorkError>) {
         (self.result, self.cleanup)
     }
