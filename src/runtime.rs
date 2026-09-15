@@ -1440,7 +1440,6 @@ impl HubRuntime {
     }
 
     /// Unload a plugin package through core plugin worker cleanup mechanics.
-    #[must_use]
     pub fn unload_plugin_package(
         &mut self,
         request_id: RequestId,
