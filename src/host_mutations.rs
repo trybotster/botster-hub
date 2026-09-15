@@ -1851,9 +1851,7 @@ fn prepare_session_type(
         })
         .transpose()?
         .unwrap_or(0);
-    let repo_bytes = repo_file
-        .as_ref()
-        .map_or(0, |rollback| repo_rollback_bytes(rollback));
+    let repo_bytes = repo_file.as_ref().map_or(0, repo_rollback_bytes);
     let logical_bytes = checked_total(&[
         state_bytes,
         rollback_descriptor_bytes(),
