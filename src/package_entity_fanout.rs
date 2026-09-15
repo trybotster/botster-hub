@@ -3,6 +3,7 @@
 //! Ownership: HubRuntime admits publish during `invoke_plugin` pumping.
 //! Daemon control fans out admitted frames and drives targeted provider resync.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -616,15 +617,17 @@ impl PackageEntityFamilyState {
                 .last_accepted_seq
                 .saturating_add(PACKAGE_ENTITY_PENDING_WINDOW)
         {
-            if self.pending_by_seq.contains_key(&seq) {
-                work.discarded = work.input.take();
-                PackageEntityPublishStatus::DuplicateSequence
-            } else {
-                self.pending_by_seq
-                    .insert(seq, work.input.take().expect("the input is retained"));
-                self.high_water_seq = self.high_water_seq.max(seq);
-                self.resync.rearm(now);
-                PackageEntityPublishStatus::PendingGap
+            match self.pending_by_seq.entry(seq) {
+                Entry::Occupied(_) => {
+                    work.discarded = work.input.take();
+                    PackageEntityPublishStatus::DuplicateSequence
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(work.input.take().expect("the input is retained"));
+                    self.high_water_seq = self.high_water_seq.max(seq);
+                    self.resync.rearm(now);
+                    PackageEntityPublishStatus::PendingGap
+                }
             }
         } else {
             work.discarded = work.input.take();
