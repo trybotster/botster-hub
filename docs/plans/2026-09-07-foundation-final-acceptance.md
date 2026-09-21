@@ -33,10 +33,14 @@ This closes arithmetic underflow. No old-arithmetic run executed; that compariso
 Recovery lint follow-up `25fd8145` is integrated as `ddaaee34`. Thirteen recovery tests passed; strict lint reports 131 errors, not a clean pass.
 Parser probe `31466c16` is integrated as `bad5eb2d`. Fable verified all eight fixtures and source/artifact provenance.
 The latest integration includes these two additional checkpoints but has not yet been rebuilt after their integration.
-Spawn owns the compiler slot for the reviewed four-file dormant parser set and its nine tests. Execution results are pending.
+Dormant parser checkpoint `2ed7fb15` is integrated as `f951fbd4`. Fable verified formatting, library check, test compilation, and nine tests.
+The four-file checkpoint covers Content arithmetic/traversal, tagged-field counting, and charged Hub error formatting. None is a production caller yet.
+The test build emitted 83 warning records representing 59 unique diagnostics, unchanged from its matched baseline apart from one shifted line.
+The newer outer-schema draft was excluded from this build. Full parser accounting and capacity behavior remain unproved.
+Spawn released the compiler slot. No compiler slot is currently assigned.
 
 Current implementation: full-definition parser accounting and separate spawn receipt/reply/Host integration remain in progress.
-The dormant Content arithmetic module has source acceptance only. Full traversal, scratch, output, error, and disposal funding remain open.
+The dormant parser terms have bounded test evidence. Full traversal, scratch, combined output/error overlap, and disposal funding remain open.
 Root selected the existing complete decoder with conservative source-derived error funding, not a second error parser.
 Additional capacity refusals require concrete accounting evidence and an explicit acceptance decision.
 Worker resource helpers `9885c8e4` are reviewed, pushed, and integrated as `871c061a`. Five tests and restored controls passed.
@@ -80,7 +84,7 @@ Root approved a spawn-specific funded reply pair, not another pending queue. Res
 | Core support | Existing Core pair. Read-only reports in its persistent worktree. | No new Core prerequisite found. Reuse the reservation API; do not repeat D1(a). | Assigned source reviews complete. No compiler ownership. |
 
 The earlier safety/spawn scheduling uncertainty is preserved in their evidence. Both runs completed; no timing or exclusive-resource claim follows.
-Spawn currently has the bounded dormant-parser verification grant. Root must verify release before granting another build.
+The dormant-parser verification is complete. Root must grant the next build explicitly.
 Root grants later slots explicitly. A reserved slot is not evidence of an active process or completed check.
 Only one Botster compiler runs at a time: Rust 1.97.0, two build jobs, incremental compilation disabled.
 Spawn and recovery use separate persistent worktrees based on the reviewed integration source.
