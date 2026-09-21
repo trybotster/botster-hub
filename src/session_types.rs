@@ -22,6 +22,15 @@ use crate::spawn_targets::{SpawnTarget, list_spawn_targets};
 
 mod bounded_catalog;
 
+#[allow(dead_code)] // The full-definition counting seed will use this storage term.
+mod content_budget;
+
+#[allow(dead_code)] // The full-definition materialization permit will own these errors.
+mod materialization_error;
+
+#[allow(dead_code)] // The full-definition counting seed will dispatch its tagged fields here.
+mod tagged_budget;
+
 #[cfg(feature = "allocation-oracle")]
 pub(crate) mod parser_probe;
 
