@@ -50,6 +50,10 @@ pub(super) struct ContentContainer {
 }
 
 impl ContentContainer {
+    pub(super) fn output_vector<T>() -> Self {
+        Self::new(Layout::new::<T>())
+    }
+
     pub(super) fn sequence() -> Self {
         Self::new(Layout::new::<Content<'static>>())
     }
