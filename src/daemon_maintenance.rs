@@ -183,21 +183,11 @@ impl Default for PumpAdmissionCursor {
 }
 
 /// Continuation state for causal inventory work.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PumpState {
     pub close_cursor: PumpAdmissionCursor,
     pub reconcile_after: Option<(String, String)>,
     inventory_reconcile_again: bool,
-}
-
-impl Default for PumpState {
-    fn default() -> Self {
-        Self {
-            close_cursor: PumpAdmissionCursor::default(),
-            reconcile_after: None,
-            inventory_reconcile_again: false,
-        }
-    }
 }
 
 impl PumpState {
