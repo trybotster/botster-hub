@@ -28,6 +28,14 @@ Lint cleanup is not the primary work. Full accounting, client behavior, integrat
 
 ### Verified checkpoints
 
+Spawn checkpoint `a223937e` is integrated as `32e16744`. Fable accepted its four-file scope and eight selected tests.
+The matched oracle establishes the inflight slot change from 584 to 600 bytes with matching charges at capacities 1, 2, 4, and 8.
+Four Lua sizing rows vary within unchanged binaries. Their cause remains open; exclude them from the matched comparison.
+This checkpoint does not establish daemon behavior, full S1, or strict lint. Integration preserved both uncommitted safety files byte-for-byte.
+Recovery reports 13 recovery tests, 16 persistence tests, and 5 heap tests passed. Independent evidence review remains pending.
+Two lifecycle checks failed during setup because candidate binary variables were missing. Neither reached its schema assertion.
+The iterator repair and its zero-test guard have source approval. Safety verification follows the recovery slot release.
+
 | Checkpoint | Status and evidence | Limits |
 | --- | --- | --- |
 | Core `053148f6` | Merged and pushed to Core main. Accepted D1(a) source stands. Seven saved binaries independently match their manifest. | Historical 33-run acceptance survives in the plan; original logs are missing. The manifest alone does not bind the binaries to a source revision. |
