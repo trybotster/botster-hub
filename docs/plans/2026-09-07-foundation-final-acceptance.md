@@ -60,7 +60,7 @@ Root assigned minimal recovery fields/defaults in `persistence.rs` and module re
 The recovery pair also owns the exact recovery-field accounting changes in `hub_state_heap.rs`.
 Recovery must reuse the single existing Hub state document/store and verify old-snapshot compatibility.
 The existing serialization-before-charge boundary remains a G1 production-activation blocker, not permission to create another store.
-Safety has reported an active supervisor. Spawn is next; recovery follows with its reviewed tests.
+Safety supervisor `6915` completed and released the slot. Spawn now owns the slot; recovery follows with its reviewed tests.
 
 Current feature sessions:
 
@@ -88,8 +88,8 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 - Root authorized isolated schema-3-to-4 loader/normalization implementation after Fable verifies old-source rejection. Test all load/save paths, field preservation, unsupported-version refusal, and unchanged original bytes after failed writes. Production migration remains unauthorized.
 - Proposed durable IDs use a persisted host-scoped sequence, not runtime-local WaiterId. Overflow, restore, concurrent writes, and non-reuse require review.
 - The instruction counter has a source-confirmed wraparound path after caught exhaustion errors. Saturation repairs arithmetic, not general catchable-error or native-stall containment.
-- Error-key iterator safety remains a reproduction gate. Do not run a crash candidate inside the user's active runtime.
-- Safety review accepted the isolated reproducer and supervisor, conditional on selecting and hashing the executable from the successful build output. Execution results remain pending.
+- Fable accepted the isolated Error-key reproduction. The baseline build passed; both the minimal iterator and production walker modes exited with SIGABRT. Artifact provenance and controls were verified. This proves the pinned mechanism, not its frequency in real plugins. Root authorized the reviewed source-only `Table::for_each` repair. The repaired walker still needs successful execution and error-parity checks. Do not run a crash candidate inside the user's active runtime.
+- Spawn reports two lifecycle tests and six local receipt tests passed. Fable still must review the raw evidence. The matched allocation comparison is running; full asynchronous spawn acceptance remains open.
 - Spawn stage admission must charge request/channel and phase-registration storage; waiter identity alone is not an accounting proof. The spawn pair owns this bounded interface repair.
 - Spawn premise review accepted independent stage-machine extraction, ingress/owner integration, charged materialization interface, and receipt lifecycle. Implementation may proceed without a new planning gate.
 - Root rejected an uncharged repository-parser fallback for production activation. Isolated accounted fixtures may verify lifecycle components, but do not close full configured-target S1 acceptance.
