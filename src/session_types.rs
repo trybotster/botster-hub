@@ -25,6 +25,9 @@ mod bounded_catalog;
 #[allow(dead_code)] // The full-definition counting seed will use this storage term.
 mod content_budget;
 
+#[allow(dead_code)] // The admitted full-definition parser will use this counting seed.
+mod definition_budget;
+
 #[allow(dead_code)] // The full-definition materialization permit will own these errors.
 mod materialization_error;
 
