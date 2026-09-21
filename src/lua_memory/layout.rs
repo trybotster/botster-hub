@@ -4,7 +4,7 @@
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 use std::sync::{Arc, Mutex};
 
 use super::LuaCallbackCharge;
@@ -23,6 +23,71 @@ pub(crate) const fn arc_bytes<T>() -> usize {
 
 pub(crate) const fn lease_bytes() -> usize {
     arc_bytes::<LuaCallbackCharge>()
+}
+
+// Rust 1.97.0 std/sync/mpmc/context.rs: one cached Context per worker thread.
+#[allow(dead_code)]
+struct WorkerWaitContext {
+    select: AtomicUsize,
+    packet: AtomicPtr<()>,
+    thread: std::thread::Thread,
+    thread_id: usize,
+}
+
+// Core 053148f6 engine/plugin_worker_resources.rs. These are layout mirrors.
+#[allow(dead_code)]
+struct WorkerJoinRecord {
+    handle: Option<std::thread::JoinHandle<()>>,
+    resource: Option<botster_core::plugin_worker::PluginWorkerResource>,
+}
+
+struct WorkerMetadataGuard(
+    #[allow(dead_code)] Option<botster_core::plugin_worker::PluginWorkerResource>,
+);
+
+#[allow(dead_code)]
+struct WorkerExecutorResources {
+    join_handles: Option<Vec<WorkerJoinRecord>>,
+    metadata: WorkerMetadataGuard,
+}
+
+// Core 053148f6 engine/plugin_worker.rs. Existing Arc pointees are not included.
+#[allow(dead_code)]
+struct WorkerExecutor {
+    join_handles: Mutex<WorkerExecutorResources>,
+    stopping: Arc<AtomicBool>,
+    cancellations: Arc<
+        Mutex<
+            std::collections::HashMap<
+                botster_core::RequestId,
+                botster_core::PluginCancellationToken,
+            >,
+        >,
+    >,
+}
+
+/// Fund the cached wait Context and the box that holds its worker charge.
+/// This is not full worker accounting. It excludes Thread handles, stacks, TLS,
+/// stopping and cancellation allocations, invocation storage, and the Lua VM.
+/// Admission uses the existing callback allowance shared with live callbacks.
+pub(crate) fn plugin_worker_resource_bytes() -> Option<usize> {
+    // Rust 1.97.0 types determine the layout for the compilation target.
+    arc_bytes::<WorkerWaitContext>().checked_add(Layout::new::<LuaCallbackCharge>().size())
+}
+
+/// Fund both batch buffers, the executor allocation, and the metadata charge box.
+/// This is not full worker accounting. It excludes Thread handles, stacks, TLS,
+/// stopping and cancellation allocations, invocation storage, and the Lua VM.
+/// Admission uses the existing callback allowance shared with live callbacks.
+pub(crate) fn plugin_worker_metadata_bytes(workers: usize) -> Option<usize> {
+    let input = workers
+        .checked_mul(Layout::new::<botster_core::plugin_worker::PluginWorkerResource>().size())?;
+    let joins = workers.checked_mul(Layout::new::<WorkerJoinRecord>().size())?;
+    input
+        .checked_add(joins)?
+        .checked_add(arc_bytes::<WorkerExecutor>())?
+        .checked_add(lazy_mutex_bytes())?
+        .checked_add(Layout::new::<LuaCallbackCharge>().size())
 }
 
 #[allow(dead_code)]
