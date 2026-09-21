@@ -28,6 +28,20 @@ Lint cleanup is not the primary work. Full accounting, client behavior, integrat
 
 ### Verified checkpoints
 
+Counter repair `d5dca026` is committed after Fable verified the combined build, two exact checks, and the 12-test state-owner group.
+This closes arithmetic underflow. No old-arithmetic run executed; that comparison remains source reasoning.
+Recovery lint follow-up `25fd8145` is integrated as `ddaaee34`. Thirteen recovery tests passed; strict lint reports 131 errors, not a clean pass.
+Parser probe `31466c16` is integrated as `bad5eb2d`. Fable verified all eight fixtures and source/artifact provenance.
+The latest integration includes these two additional checkpoints but has not yet been rebuilt after their integration.
+No compiler slot is currently assigned. Counter verification released the last active slot.
+
+Current implementation: full-definition parser accounting and separate spawn receipt/reply/Host integration remain in progress.
+The dormant Content arithmetic module has source acceptance only. Full traversal, scratch, output, error, and disposal funding remain open.
+Root selected the existing complete decoder with conservative source-derived error funding, not a second error parser.
+Additional capacity refusals require concrete accounting evidence and an explicit acceptance decision.
+Worker resource helpers remain under source review. Their constructor/load wiring awaits Jason's standalone-account policy choice.
+The choices are an account per standalone instance with existing limits, or an explicit public account API. Neither is approved yet.
+
 Iterator repair `6921e27d` is committed after Fable verified 28 passing tests on the combined spawn/safety source.
 The former Error-key crash now returns the same typed error as the value path. Counter underflow and general execution isolation remain open.
 Recovery `bc0d5940` is pushed on its delivery branch and integrated as `c055fa31` after Fable's final verdict.
