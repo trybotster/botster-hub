@@ -3,6 +3,7 @@
 //! These values exclude input, JSON scratch, other outputs, errors, and stack storage.
 
 use std::alloc::Layout;
+use std::cell::Cell;
 
 use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -112,6 +113,10 @@ impl ContentContainer {
         Some(())
     }
 
+    fn buffer_charge(&self) -> Option<usize> {
+        self.buffer_bytes(self.capacity)
+    }
+
     pub(super) fn storage(&self) -> Option<ContentStorage> {
         Some(ContentStorage {
             retained: self
@@ -126,17 +131,109 @@ impl ContentContainer {
 /// The caller must fund the deserializer scratch and possible errors separately.
 pub(super) struct ContentSeed;
 
+/// The model retains completed allocations when decoding stops inside a child.
+/// This cell is authoritative if decoding fails. On success, its retained and peak
+/// values equal the returned storage when the cell starts at zero.
+/// The caller funds one result, never both. The combined walk uses this cell's peak
+/// as its Content contribution, without adding another Content peak.
+/// Scratch, output, and error storage remain separate accounting terms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ContentProgress {
+    pub(super) retained: usize,
+    pub(super) peak: usize,
+}
+
+impl ContentProgress {
+    fn retain(&mut self, bytes: usize) -> Option<()> {
+        let retained = self.retained.checked_add(bytes)?;
+        self.retained = retained;
+        self.peak = self.peak.max(retained);
+        Some(())
+    }
+
+    pub(super) fn release(&mut self, bytes: usize) -> Option<()> {
+        self.retained = self.retained.checked_sub(bytes)?;
+        Some(())
+    }
+}
+
+pub(super) struct ObservedContentSeed<'a> {
+    progress: Option<&'a Cell<ContentProgress>>,
+}
+
+impl ContentSeed {
+    pub(super) fn with_progress(progress: &Cell<ContentProgress>) -> ObservedContentSeed<'_> {
+        ObservedContentSeed {
+            progress: Some(progress),
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for ObservedContentSeed<'_> {
+    type Value = ContentStorage;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(ContentVisitor {
+            progress: self.progress,
+        })
+    }
+}
+
 impl<'de> DeserializeSeed<'de> for ContentSeed {
     type Value = ContentStorage;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        deserializer.deserialize_any(ContentVisitor)
+        deserializer.deserialize_any(ContentVisitor::untracked())
     }
 }
 
-pub(super) struct ContentVisitor;
+pub(super) struct ContentVisitor<'a> {
+    progress: Option<&'a Cell<ContentProgress>>,
+}
 
-impl<'de> Visitor<'de> for ContentVisitor {
+impl ContentVisitor<'_> {
+    pub(super) fn untracked() -> Self {
+        Self { progress: None }
+    }
+
+    fn retain<E: de::Error>(&self, bytes: usize) -> Result<(), E> {
+        if let Some(progress) = self.progress {
+            let mut next = progress.get();
+            next.retain(bytes)
+                .ok_or_else(|| E::custom("session type Content storage overflow"))?;
+            progress.set(next);
+        }
+        Ok(())
+    }
+
+    fn push<E: de::Error>(
+        &self,
+        container: &mut ContentContainer,
+        item: ContentStorage,
+    ) -> Result<(), E> {
+        let old = container
+            .buffer_charge()
+            .ok_or_else(|| E::custom("session type Content storage overflow"))?;
+        container
+            .push(item)
+            .ok_or_else(|| E::custom("session type Content storage overflow"))?;
+        let new = container
+            .buffer_charge()
+            .ok_or_else(|| E::custom("session type Content storage overflow"))?;
+        if new != old {
+            self.retain::<E>(new)?;
+            if let Some(progress) = self.progress {
+                let mut next = progress.get();
+                next.release(old)
+                    .ok_or_else(|| E::custom("session type Content storage underflow"))?;
+                progress.set(next);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Visitor<'de> for ContentVisitor<'_> {
     type Value = ContentStorage;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -168,16 +265,18 @@ impl<'de> Visitor<'de> for ContentVisitor {
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        ContentStorage::copied_string(value.len())
-            .ok_or_else(|| E::custom("session type Content storage overflow"))
+        let storage = ContentStorage::copied_string(value.len())
+            .ok_or_else(|| E::custom("session type Content storage overflow"))?;
+        self.retain::<E>(storage.retained)?;
+        Ok(storage)
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
         let mut storage = ContentContainer::sequence();
-        while let Some(item) = sequence.next_element_seed(ContentSeed)? {
-            storage.push(item).ok_or_else(|| {
-                <A::Error as de::Error>::custom("session type Content storage overflow")
-            })?;
+        while let Some(item) = sequence.next_element_seed(ObservedContentSeed {
+            progress: self.progress,
+        })? {
+            self.push::<A::Error>(&mut storage, item)?;
         }
         storage
             .storage()
@@ -186,14 +285,16 @@ impl<'de> Visitor<'de> for ContentVisitor {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut storage = ContentContainer::map();
-        while let Some(key) = map.next_key_seed(ContentSeed)? {
-            let value = map.next_value_seed(ContentSeed)?;
+        while let Some(key) = map.next_key_seed(ObservedContentSeed {
+            progress: self.progress,
+        })? {
+            let value = map.next_value_seed(ObservedContentSeed {
+                progress: self.progress,
+            })?;
             let entry = ContentStorage::map_entry(key, value).ok_or_else(|| {
                 <A::Error as de::Error>::custom("session type Content storage overflow")
             })?;
-            storage.push(entry).ok_or_else(|| {
-                <A::Error as de::Error>::custom("session type Content storage overflow")
-            })?;
+            self.push::<A::Error>(&mut storage, entry)?;
         }
         storage
             .storage()
@@ -204,6 +305,41 @@ impl<'de> Visitor<'de> for ContentVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_child_keeps_parent_and_completed_child_storage() {
+        let input = br#"["\n", {"\u006b":"\u0080","broken":"#;
+        let progress = Cell::new(ContentProgress::default());
+        let mut decoder = serde_json::Deserializer::from_slice(input);
+        assert!(
+            ContentSeed::with_progress(&progress)
+                .deserialize(&mut decoder)
+                .is_err()
+        );
+        let expected = 4 * Layout::new::<Content<'static>>().size()
+            + 4 * Layout::new::<(Content<'static>, Content<'static>)>().size()
+            + 1
+            + 1
+            + 2;
+        assert_eq!(progress.get().retained, expected);
+        assert!(progress.get().peak >= expected);
+    }
+
+    #[test]
+    fn observed_success_matches_the_container_recurrence() {
+        let input = br#"["\n","\n","\n","\n","\n"]"#;
+        let progress = Cell::new(ContentProgress::default());
+        let mut decoder = serde_json::Deserializer::from_slice(input);
+        let storage = ContentSeed::with_progress(&progress)
+            .deserialize(&mut decoder)
+            .unwrap();
+        decoder.end().unwrap();
+        assert_eq!(progress.get().retained, storage.retained);
+        assert_eq!(progress.get().peak, storage.peak);
+        let mut released = progress.get();
+        released.release(storage.retained).unwrap();
+        assert_eq!(released.retained, 0);
+    }
 
     #[test]
     fn seed_counts_nested_duplicate_entries_and_escaped_strings() {
