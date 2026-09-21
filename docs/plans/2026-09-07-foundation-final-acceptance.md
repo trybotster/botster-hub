@@ -32,9 +32,16 @@ Spawn checkpoint `a223937e` is integrated as `32e16744`. Fable accepted its four
 The matched oracle establishes the inflight slot change from 584 to 600 bytes with matching charges at capacities 1, 2, 4, and 8.
 Four Lua sizing rows vary within unchanged binaries. Their cause remains open; exclude them from the matched comparison.
 This checkpoint does not establish daemon behavior, full S1, or strict lint. Integration preserved both uncommitted safety files byte-for-byte.
-Recovery reports 13 recovery tests, 16 persistence tests, and 5 heap tests passed. Independent evidence review remains pending.
+Fable verified 13 recovery tests, 16 persistence tests, and 5 heap tests passed on freeze 2.
+All three ablations reached intended failures. Restored controls passed, eight source hashes matched, and the restored binary matched the original candidate.
+Strict lint failed with 133 library errors. No comparison against the historical 114 count is established.
+Root authorized the exact eight-file recovery commit as an isolated verification checkpoint, not final acceptance.
+The unchanged artifact producer requires clean committed source. After this commit, the writer will build isolated artifacts and rerun two lifecycle selectors.
 Two lifecycle checks failed during setup because candidate binary variables were missing. Neither reached its schema assertion.
 The iterator repair and its zero-test guard have source approval. Safety verification follows the recovery slot release.
+The parser probe has source approval and follows safety in the compiler queue. No parser result exists yet.
+The corrected conversion receipt has source approval only. Its helper has no production caller; the patch remains separate and unapplied.
+Root approved a spawn-specific funded reply pair, not another pending queue. Response strings, errors, and worker wait-storage ownership remain accounting gates.
 
 | Checkpoint | Status and evidence | Limits |
 | --- | --- | --- |
