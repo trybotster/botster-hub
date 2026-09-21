@@ -40,10 +40,11 @@ Lint cleanup is not the primary work. Full accounting, client behavior, integrat
 | --- | --- | --- | --- |
 | Lua safety | Existing Hub Codex/Fable pair. Owns `lua_runtime/lua_json.rs` and the hook/test regions of `lua_runtime.rs` until handoff. | Isolated Error-key baseline; supported iterator repair if confirmed; then a separate saturating-counter checkpoint. Verify error parity and repeated exhaustion/reset. | Authorized work. Latest execution result must come from the live writer, not the source review. |
 | S1/S2 spawn and conversion | Codex/Fable pair on `delivery/async-spawn-20260921`. Owns `runtime.rs`, ordinary daemon spawn integration, `spawn_input.rs`, and `session_type_spawn.rs`. | Verify the extracted shared stage machine and local receipt factory; then complete consumer, charged materialization, conversion/disposal, and two-ID daemon proof. | Writer reports source implemented and six tests written. Source accepted by Fable; execution pending compiler slot. Focused slot-layout oracle authorized. No daemon activation claimed. |
-| R1 recovery | Codex/Fable pair on `delivery/durable-recovery-20260921`. Owns new recovery modules and assigned persistence/accounting changes. | Fix source-review findings, then verify schema/transitions, restart classification, store adapter, and schema-3-to-4 normalization. | Eleven tests written, none executed. Review requires terminal-ID reuse, a WorktreeNeverCreated receipt, and a rollback-safe fixture. Three shutdown schema assertions are assigned to this pair. No runtime hooks activated. |
+| R1 recovery | Codex/Fable pair on `delivery/durable-recovery-20260921`. Owns new recovery modules and assigned persistence/accounting changes. | Verify schema/transitions, restart classification, store adapter, and schema-3-to-4 normalization. | Fable accepted source freeze 2 and verified all eight source hashes. Thirteen tests are written; none have run. Prior review findings are resolved in source. No runtime hooks are active. |
 | Core support | Existing Core pair. Read-only reports in its persistent worktree. | No new Core prerequisite found. Reuse the reservation API; do not repeat D1(a). | Assigned source reviews complete. No compiler ownership. |
 
-The safety pair keeps its current compiler slot until release. Its latest report says the fixture is ready for review; no compiler is running.
+Root checked host processes and found no active compiler. Root revoked the idle safety reservation and granted spawn its bounded checkpoint verification.
+Recovery is next after spawn releases the slot. The parser probe build needs a separate grant.
 Root grants later slots explicitly. A reserved slot is not evidence of an active process or completed check.
 Only one Botster compiler runs at a time: Rust 1.97.0, two build jobs, incremental compilation disabled.
 Spawn and recovery use separate persistent worktrees based on the reviewed integration source.
@@ -57,7 +58,7 @@ Root assigned minimal recovery fields/defaults in `persistence.rs` and module re
 The recovery pair also owns the exact recovery-field accounting changes in `hub_state_heap.rs`.
 Recovery must reuse the single existing Hub state document/store and verify old-snapshot compatibility.
 The existing serialization-before-charge boundary remains a G1 production-activation blocker, not permission to create another store.
-Spawn is next in the compiler queue after the safety checkpoint. Recovery follows when its reviewed tests are ready.
+Spawn owns the current compiler slot. Recovery follows with its reviewed tests.
 
 Current feature sessions:
 
@@ -77,6 +78,7 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 - Repository loading must preserve full definitions and environment data. The existing 4 MiB file ceiling is not permission to narrow accepted configurations.
 - The catalog's file-plus-scratch 16 MiB formula is conservative, not a proved minimum. A smaller full-definition bound remains unverified.
 - Independent source review disproved the proposed `3*max(decoded_string,nesting,8)` bound: serde's Unicode reserve request can exceed decoded output length. Tagged Content, malformed input, duplicate entries, and variable diagnostics also need funding. Root selected isolated pinned-parser allocation probes before a replacement formula; no production parser change or compatibility reduction is approved.
+- Root assigned the parser probe to the spawn writer. Reuse the existing `core_ticket_allocations` recorder; add no allocator or unsafe code. Include truncated Unicode, duplicate environment keys, and tagged sequence cases. Fable reviews source and raw evidence. Preserve the frozen lifecycle source during its matched comparison. Fixture results cannot establish a universal bound.
 - Exact-generation context ownership must preserve retained reads after session removal. Bare session IDs do not authorize replacement-generation cleanup.
 - No new Core interface is required by the reviewed S1 trace. Accepted-ID retention is a separate fault-contract candidate, not a proved normal reservation leak.
 - R1 operator resolution, retention, recovery capacity, state-clone/serialization capacity, and exceptional-stop policy remain unselected. No silent eviction or new numeric limit is authorized.
@@ -114,6 +116,9 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 ### Evidence and recovery record
 
 Design inputs are under `/Users/jasonconigliari/botster-evidence/s1-design-20260921-sess-0017`.
+Recovery freeze 2 has patch SHA256 `dd7433801d53516bfe491ec90474d9b3dce605e83d6c5dfedbac5ee9e2dbd53a`.
+Its source verdict is `/Users/jasonconigliari/botster-evidence/r1-recovery-review-20260921-sess-001e/implementation-review-3-freeze2.md`.
+This verdict permits the evidence run. It does not establish compilation, test success, or production recovery.
 Review findings are under `/Users/jasonconigliari/botster-evidence/hub-pump-default-review-20260921`.
 Core source reports are under `/Users/jasonconigliari/botster-sessions/botster-core-recovery-20260921/evidence`.
 The old temporary integration worktree is unusable. Temporary verification logs and the R1 revision-6 design/review are unavailable.
