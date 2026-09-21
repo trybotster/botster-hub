@@ -19,7 +19,7 @@ pub(super) struct TaggedStorage {
     pub(super) peak_with_output: usize,
     pub(super) output_string: usize,
     // These are token lengths, not complete formatted error reservations.
-    pub(super) unknown_tag_bytes: usize,
+    pub(super) unknown_tag_bytes: Option<usize>,
     pub(super) unexpected_string_debug_bytes: usize,
 }
 
@@ -170,7 +170,8 @@ impl TaggedField {
             }
         };
         if !known {
-            counted.unknown_tag_bytes = counted.unknown_tag_bytes.max(string.bytes);
+            counted.unknown_tag_bytes =
+                Some(counted.unknown_tag_bytes.unwrap_or(0).max(string.bytes));
         }
         matches!(self, Self::WorkingDirectory) && string.symbol == Symbol::Relative
     }
@@ -234,6 +235,8 @@ impl<'de> Visitor<'de> for TaggedField {
             container.push(entry).ok_or_else(|| {
                 <A::Error as de::Error>::custom("session type Content storage overflow")
             })?;
+            // A repeated path makes production decoding fail after buffering.
+            // Counting its first string path remains conservative for this term.
             if symbol == Some(Symbol::Path) && path.is_none() {
                 path = value.string;
             }
@@ -322,7 +325,7 @@ mod tests {
             counted.content.peak.max(counted.content.retained + 6)
         );
         assert!(counted.content.retained > 6);
-        assert_eq!(counted.unknown_tag_bytes, 0);
+        assert_eq!(counted.unknown_tag_bytes, None);
     }
 
     #[test]
@@ -352,7 +355,7 @@ mod tests {
     fn only_tag_and_wrong_shape_strings_supply_error_candidates() {
         let input = r#"{"mode":"other","label":"a long unknown field"}"#;
         let counted = count(TaggedField::Execution, input);
-        assert_eq!(counted.unknown_tag_bytes, 5);
+        assert_eq!(counted.unknown_tag_bytes, Some(5));
         assert_eq!(counted.unexpected_string_debug_bytes, 0);
         let counted = count(TaggedField::Execution, r#""\n""#);
         assert_eq!(counted.unexpected_string_debug_bytes, 4);
