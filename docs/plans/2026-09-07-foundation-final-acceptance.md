@@ -43,7 +43,9 @@ Lint cleanup is not the primary work. Full accounting, client behavior, integrat
 | R1 recovery | Codex/Fable pair on `delivery/durable-recovery-20260921`. Owns new recovery modules and assigned persistence/accounting changes. | Verify schema/transitions, restart classification, store adapter, and schema-3-to-4 normalization. | Fable accepted source freeze 2 and verified all eight source hashes. Thirteen tests are written; none have run. Prior review findings are resolved in source. No runtime hooks are active. |
 | Core support | Existing Core pair. Read-only reports in its persistent worktree. | No new Core prerequisite found. Reuse the reservation API; do not repeat D1(a). | Assigned source reviews complete. No compiler ownership. |
 
-Root checked host processes and found no active compiler. Root revoked the idle safety reservation and granted spawn its bounded checkpoint verification.
+Root checked host processes and found no active compiler. Root then granted spawn its bounded checkpoint verification.
+Safety subsequently reported active supervisor `6915`, started before it read the revocation. Root told spawn to hold if not started.
+Safety must finish that bounded run and release the slot. Neither writer may start further commands until Root resolves this scheduling race.
 Recovery is next after spawn releases the slot. The parser probe build needs a separate grant.
 Root grants later slots explicitly. A reserved slot is not evidence of an active process or completed check.
 Only one Botster compiler runs at a time: Rust 1.97.0, two build jobs, incremental compilation disabled.
@@ -58,7 +60,7 @@ Root assigned minimal recovery fields/defaults in `persistence.rs` and module re
 The recovery pair also owns the exact recovery-field accounting changes in `hub_state_heap.rs`.
 Recovery must reuse the single existing Hub state document/store and verify old-snapshot compatibility.
 The existing serialization-before-charge boundary remains a G1 production-activation blocker, not permission to create another store.
-Spawn owns the current compiler slot. Recovery follows with its reviewed tests.
+Safety has reported an active supervisor. Spawn is next; recovery follows with its reviewed tests.
 
 Current feature sessions:
 
