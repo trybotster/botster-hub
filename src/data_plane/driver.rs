@@ -772,12 +772,20 @@ pub(crate) struct CoreDaemonHandle {
     #[cfg(test)]
     refuse_next_owner_begins: Arc<AtomicUsize>,
     #[cfg(test)]
+    refuse_registered_owner_begins: Arc<AtomicUsize>,
+    #[cfg(test)]
     lose_next_owner_begins: Arc<AtomicUsize>,
     #[cfg(test)]
     release_session_reservation_begins: Arc<AtomicUsize>,
 }
 
 impl CoreDaemonHandle {
+    #[cfg(test)]
+    pub(crate) fn test_refuse_registered_owner_begins(&self, count: usize) {
+        self.refuse_registered_owner_begins
+            .store(count, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(crate) fn test_refuse_next_owner_begins(&self, count: usize) {
         self.refuse_next_owner_begins
@@ -1154,7 +1162,20 @@ impl CoreDaemonHandle {
             begin_publisher.publish(result);
         });
         let _admission = self.admission.lock().expect("Core request admission mutex");
-        match admit_request(&self.requests, &self.accepting, request) {
+        #[cfg(test)]
+        let injected_refusal = self
+            .refuse_registered_owner_begins
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok();
+        #[cfg(not(test))]
+        let injected_refusal = false;
+        let admission = if injected_refusal {
+            drop(request);
+            CoreAdmission::Refused
+        } else {
+            admit_request(&self.requests, &self.accepting, request)
+        };
+        match admission {
             CoreAdmission::Queued => {}
             CoreAdmission::Refused => {
                 self.completion_wake.retire(begin_identity);
@@ -1262,6 +1283,8 @@ impl DataPlaneDriver {
             completion_wake,
             #[cfg(test)]
             refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1889,6 +1912,7 @@ mod tests {
             completion_wake: Arc::clone(&completion_wake),
             #[cfg(test)]
             refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+            refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -2094,6 +2118,7 @@ mod tests {
                 waiter_ids: Arc::new(WaiterIdSource::default()),
                 completion_wake: Arc::clone(&wake),
                 refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+                refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
                 lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
                 release_session_reservation_begins: Arc::new(AtomicUsize::new(0)),
             };

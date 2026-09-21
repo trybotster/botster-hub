@@ -73,6 +73,7 @@ pub(crate) enum ControlContinuation {
         Option<crate::lua_memory::LuaCallbackCharge>,
     ),
     Callback(Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>),
+    SpawnCallback(Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>),
     HostMutation(Box<super::host_work::HostMutationContinuation>),
     Status(Box<super::status::StatusContinuation>),
     ManagedSpawn(Box<super::managed_git::ManagedSpawnOperation>),
@@ -119,7 +120,7 @@ impl ControlContinuation {
     ) -> ControlPoll {
         match self {
             Self::Coordination(work, _) => work.poll(daemon, state),
-            Self::Callback(callback) => callback(daemon, state),
+            Self::Callback(callback) | Self::SpawnCallback(callback) => callback(daemon, state),
             Self::HostMutation(work) => work.poll(daemon, state),
             Self::Status(work) => work.poll(daemon, state),
             Self::ManagedSpawn(work) => work.poll(daemon, state),
@@ -139,15 +140,15 @@ impl ControlContinuation {
             Self::HostMutation(work) => work.take_terminal_parts(identity, completion),
             Self::Status(work) => work.take_terminal_parts(identity, completion),
             Self::ManagedSpawn(work) => work.take_terminal_parts(identity, completion),
-            Self::Callback(_) | Self::Terminal(..) => None,
+            Self::Callback(_) | Self::SpawnCallback(_) | Self::Terminal(..) => None,
         }
     }
 
     fn begin_terminal(&mut self, parts: crate::host_disposal::Parts) {
         let storage = parts.storage.clone();
         let mut original = std::mem::replace(self, Self::callback(|_, _| ControlPoll::Pending));
-        let parts = if matches!(original, Self::Callback(_)) {
-            let Self::Callback(callback) =
+        let parts = if matches!(original, Self::Callback(_) | Self::SpawnCallback(_)) {
+            let (Self::Callback(callback) | Self::SpawnCallback(callback)) =
                 std::mem::replace(&mut original, Self::callback(|_, _| ControlPoll::Pending))
             else {
                 unreachable!()
@@ -200,7 +201,10 @@ pub(crate) fn dispose_terminal_requests(
             waiter_id: *waiter_id,
             phase: entry.last_host_phase,
         };
-        let parts = if matches!(entry.continuation, ControlContinuation::Callback(_)) {
+        let parts = if matches!(
+            entry.continuation,
+            ControlContinuation::Callback(_) | ControlContinuation::SpawnCallback(_)
+        ) {
             if state.plugin_controls.owns_waiter(*waiter_id) {
                 state.plugin_controls.take_terminal_parts(
                     *waiter_id,
@@ -286,6 +290,18 @@ pub(crate) enum ControlStep {
 }
 
 impl ControlStep {
+    pub(crate) fn pending_spawn(
+        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
+        + Send
+        + 'static,
+    ) -> Self {
+        Self::Pending(PendingStep {
+            continuation: ControlContinuation::SpawnCallback(Box::new(continuation)),
+            retire: None,
+            ready_class: ReadyClass::CoreCompletion,
+        })
+    }
+
     pub(crate) fn ready(response: DaemonResponse) -> Self {
         Self::Ready(Ok(response))
     }
@@ -565,10 +581,18 @@ pub(crate) fn absorb_core_completions(
             }
             continue;
         };
-        let Some(expected) = entry.last_core_phase.checked_add(1) else {
-            continue;
+        // A refused spawn operation retires its phases before cleanup starts.
+        // The collector and ticket still require the exact waiter and phase.
+        let spawn = matches!(
+            entry.continuation,
+            ControlContinuation::SpawnCallback(_) | ControlContinuation::ManagedSpawn(_)
+        );
+        let accepted = if spawn {
+            identity.phase > entry.last_core_phase
+        } else {
+            entry.last_core_phase.checked_add(1) == Some(identity.phase)
         };
-        if identity.phase != expected {
+        if !accepted {
             continue;
         }
         let coordination = matches!(entry.continuation, ControlContinuation::Coordination(..));
@@ -914,6 +938,260 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use botster_hub_client::DaemonResponseKind;
+
+    #[test]
+    fn spawn_cleanup_wakes_after_real_queue_refusal_phase_gap() {
+        use crate::data_plane::driver::{CORE_REQUEST_CAPACITY, CoreTicketPoll};
+        use botster_core::{SessionId, SessionReservationRelease};
+        use botster_core_daemon::{CoreCompletion, CoreOperation, SpawnSessionRequest};
+
+        struct ReleaseCore(Option<mpsc::Sender<()>>);
+        impl Drop for ReleaseCore {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        fn collect(
+            runtime: &crate::HubRuntime,
+            receiver: &mut tokio::sync::mpsc::Receiver<super::super::message::ControlMessage>,
+        ) -> Vec<OwnerWorkIdentity> {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            executor.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut identities = Vec::new();
+                    while identities.len() < 2 {
+                        receiver.recv().await.expect("Core completion notification");
+                        identities.extend(runtime.take_owner_core_completions(2));
+                    }
+                    identities
+                })
+                .await
+                .expect("both Core phases must publish")
+            })
+        }
+
+        fn absorb(state: &mut DaemonControlState, identities: &[OwnerWorkIdentity]) {
+            assert_eq!(
+                absorb_core_completions(
+                    state,
+                    identities,
+                    &mut OwnerTurnBudget::new(Instant::now()),
+                ),
+                identities.len()
+            );
+        }
+
+        let (mut daemon, directory) = test_daemon("spawn-phase-gap");
+        let runtime = daemon.runtime().unwrap();
+        let waiter_id = runtime.next_waiter_id().unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        runtime.bind_data_plane_owner_wake(sender);
+        let session_id = SessionId("spawn-phase-gap".into());
+        let mut reserve = runtime.begin_reserve_session_for_owner(waiter_id, session_id.clone());
+        assert_eq!(
+            collect(runtime, &mut receiver),
+            vec![
+                OwnerWorkIdentity {
+                    waiter_id,
+                    phase: 1
+                },
+                OwnerWorkIdentity {
+                    waiter_id,
+                    phase: 2
+                },
+            ]
+        );
+        let CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+            result: Ok(reservation),
+            ..
+        })) = reserve.poll(runtime)
+        else {
+            panic!("the collected reserve must return its exact token");
+        };
+
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut hold = ReleaseCore(Some(release_tx));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let held = runtime.submit_core(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the fixture releases Core");
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut fillers = Vec::new();
+        for index in 0..CORE_REQUEST_CAPACITY {
+            fillers.push(runtime.submit_core(move |core| {
+                core.begin(CoreOperation::RemoveSession(SessionId(format!(
+                    "absent-phase-gap-{index}"
+                ))))
+            }));
+        }
+        let spawn = SpawnSessionRequest {
+            request: crate::client_api::spawn_request(
+                runtime,
+                crate::daemon::control::request_id("phase-gap"),
+                session_id,
+                "exit 0".into(),
+            ),
+            metadata: crate::client_api::client_session_metadata(),
+        };
+        let mut refused =
+            runtime.begin_spawn_reserved_for_owner(waiter_id, reservation.clone(), spawn);
+        assert!(matches!(refused.poll(runtime), CoreTicketPoll::Refused));
+        assert!(runtime.take_owner_core_completions(2).is_empty());
+
+        hold.0.take().unwrap().send(()).unwrap();
+        held.wait(Duration::from_secs(10)).unwrap();
+        fillers
+            .pop()
+            .unwrap()
+            .wait(Duration::from_secs(10))
+            .expect("the last queued begin must free Core capacity")
+            .expect("the ownerless begin must reach Core");
+        let mut release =
+            runtime.begin_release_session_reservation_for_owner(waiter_id, reservation);
+        let identities = collect(runtime, &mut receiver);
+        assert_eq!(
+            identities,
+            vec![
+                OwnerWorkIdentity {
+                    waiter_id,
+                    phase: 5
+                },
+                OwnerWorkIdentity {
+                    waiter_id,
+                    phase: 6
+                },
+            ],
+            "the real refusal must consume phases 3 and 4"
+        );
+
+        let mut state = DaemonControlState::default();
+        let permit = state.budget.reserve().unwrap();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let ControlStep::Pending(step) = ControlStep::pending_spawn(move |daemon, _| {
+            assert!(
+                matches!(
+                    release.poll(daemon.runtime().unwrap()),
+                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                        result: Ok(SessionReservationRelease::Released),
+                        ..
+                    }))
+                ),
+                "the scheduled continuation must collect the exact release receipt"
+            );
+            completed_tx.send(()).unwrap();
+            ControlPoll::FinishedInternal
+        }) else {
+            unreachable!()
+        };
+        state.pending_requests.insert(
+            waiter_id,
+            PendingControlRequest {
+                waiter_id,
+                ready_class: step.ready_class,
+                ready_key: None,
+                deadline_key: None,
+                last_core_phase: 2,
+                last_host_phase: 0,
+                completion: OwnerRequestCompletion::default(),
+                reply_tx: ControlReplySender::absent(),
+                response_delivery_rx: None,
+                grant_id: None,
+                client: None,
+                core_retirement: None,
+                permit: Some(permit),
+                must_finish: true,
+                past_deadline: false,
+                continuation: step.continuation,
+                retire: None,
+            },
+        );
+
+        let wrong_waiter = runtime.next_waiter_id().unwrap();
+        absorb(
+            &mut state,
+            &[
+                OwnerWorkIdentity {
+                    waiter_id,
+                    phase: 1,
+                },
+                OwnerWorkIdentity {
+                    waiter_id,
+                    phase: 2,
+                },
+                OwnerWorkIdentity {
+                    waiter_id: wrong_waiter,
+                    phase: 6,
+                },
+            ],
+        );
+        assert!(state.owner_ready.is_empty());
+        assert_eq!(state.pending_requests[&waiter_id].last_core_phase, 2);
+
+        let coordination = ControlContinuation::Coordination(
+            Box::new(
+                super::super::coordination::CoordinationContinuation::empty_for_phase_test(
+                    waiter_id,
+                ),
+            ),
+            None,
+        );
+        let spawn = std::mem::replace(
+            &mut state
+                .pending_requests
+                .get_mut(&waiter_id)
+                .unwrap()
+                .continuation,
+            coordination,
+        );
+        absorb(&mut state, &identities);
+        assert!(
+            state.owner_ready.is_empty(),
+            "Coordination must reject the same gap"
+        );
+        assert_eq!(state.pending_requests[&waiter_id].last_core_phase, 2);
+        state
+            .pending_requests
+            .get_mut(&waiter_id)
+            .unwrap()
+            .continuation = spawn;
+
+        absorb(&mut state, &identities);
+        let item = state
+            .owner_ready
+            .pop_next()
+            .expect("spawn cleanup must become ready after the real refusal phase gap");
+        state
+            .pending_requests
+            .get_mut(&waiter_id)
+            .unwrap()
+            .ready_key = None;
+        absorb(&mut state, &identities);
+        assert!(
+            state.owner_ready.is_empty(),
+            "older and duplicate phases must not enqueue work"
+        );
+        assert_eq!(state.pending_requests[&waiter_id].last_core_phase, 6);
+        poll_ready_request_item(&mut daemon, &mut state, item, &mut |_, _, _, _| {
+            panic!("internal cleanup must not send a transport reply")
+        });
+        completed_rx
+            .try_recv()
+            .expect("the owner scheduler must finish cleanup");
+        assert!(state.pending_requests.is_empty());
+        assert_eq!(state.budget.outstanding(), 0);
+        assert!(state.owner_ready.is_empty());
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn terminal_status_rows_dispose_all_eight_original_slots_before_owner_retirement() {

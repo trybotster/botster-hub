@@ -612,6 +612,11 @@ impl ManagedSpawnOperation {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_spawn_reservation(&self) -> Option<botster_core::SessionReservation> {
+        self.spawn.as_ref()?.reservation.clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_poll_spawn(
         &mut self,
         daemon: &mut HubDaemon,

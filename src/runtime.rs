@@ -1036,6 +1036,11 @@ impl HubRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_refuse_registered_owner_begins(&self, count: usize) {
+        self.core_daemon.test_refuse_registered_owner_begins(count);
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_refuse_next_owner_begins_remaining(&self) -> usize {
         self.core_daemon.test_refuse_next_owner_begins_remaining()
     }
