@@ -76,6 +76,7 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 - Lua handle conversion can occur before a Rust callback body. The entry allowance and reentrancy proof remain open; body-only charging does not close them.
 - Repository loading must preserve full definitions and environment data. The existing 4 MiB file ceiling is not permission to narrow accepted configurations.
 - The catalog's file-plus-scratch 16 MiB formula is conservative, not a proved minimum. A smaller full-definition bound remains unverified.
+- Independent source review disproved the proposed `3*max(decoded_string,nesting,8)` bound: serde's Unicode reserve request can exceed decoded output length. Tagged Content, malformed input, duplicate entries, and variable diagnostics also need funding. Root selected isolated pinned-parser allocation probes before a replacement formula; no production parser change or compatibility reduction is approved.
 - Exact-generation context ownership must preserve retained reads after session removal. Bare session IDs do not authorize replacement-generation cleanup.
 - No new Core interface is required by the reviewed S1 trace. Accepted-ID retention is a separate fault-contract candidate, not a proved normal reservation leak.
 - R1 operator resolution, retention, recovery capacity, state-clone/serialization capacity, and exceptional-stop policy remain unselected. No silent eviction or new numeric limit is authorized.
