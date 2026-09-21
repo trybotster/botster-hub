@@ -1,6 +1,95 @@
 # Foundation integration and final acceptance
 
-Status: source publication complete on September 9, 2026. Full foundation acceptance remains open.
+Status: reviewed Hub checkpoints through `9cc101cb` are pushed. Full foundation acceptance remains open.
+
+## Current orchestration ledger — September 21
+
+This section is the current status and assignment record. The dated sections below preserve history, not current assignments.
+Root owns this section. Root updates it at assignments, accepted checkpoints, blockers, user decisions, and handoffs.
+Agent acknowledgments do not require new entries. Raw evidence stays in persistent evidence directories.
+Each accepted checkpoint must identify its source, review, executed checks, evidence location, and remaining limits.
+Root commits and pushes reviewed checkpoints and log updates. Installation and runtime replacement remain unauthorized.
+
+### Delivery contract and priorities
+
+Deliver usable Workspaces rendering, asynchronous coordination and spawn, responsive siblings, and charged ownership through shutdown.
+Core owns generic execution. Hub owns admission, correlation, supervision, recovery policy, and its persistence document.
+Host workers perform filesystem and repository work. Lua composes product behavior. Web and TUI own client behavior and presentation.
+Preserve no owner waits, no polling for progress, exact operation identity, existing limits, and retained context reads.
+Do not remove synchronous public callers until their supported replacement is verified.
+Do not change retention, capacity, exceptional-stop policy, or execution isolation without the applicable decision.
+
+The primary implementation milestone is a real daemon Lua tool spawning two explicit IDs while a sibling request remains responsive.
+Verify command, environment, working directory, context reads, conversion acknowledgement, and abandonment at each effect boundary.
+Do not substitute synchronous helper pumping for this production path.
+Durable recovery proceeds in parallel on independent files. Recovery policy gates final integration, not all spawn implementation.
+Safety repairs continue on a separate track. A demonstrated unsafe boundary blocks only the code that crosses it.
+Lint cleanup is not the primary work. Full accounting, client behavior, integration, and performance requirements remain in scope.
+
+### Verified checkpoints
+
+| Checkpoint | Status and evidence | Limits |
+| --- | --- | --- |
+| Core `053148f6` | Merged and pushed to Core main. Accepted D1(a) source stands. Seven saved binaries independently match their manifest. | Historical 33-run acceptance survives in the plan; original logs are missing. The manifest alone does not bind the binaries to a source revision. |
+| Hub `27c9b089` | Pushed. PumpState source review accepted. Formatting, library check, and test compilation passed. Strict lint exited 101 with 114 library errors. | No behavioral test ran. Library-test lint remains unproved. Evidence: `/Users/jasonconigliari/botster-evidence/pump-default-20260921-sess-0017`. |
+| Hub `9cc101cb` | Pushed. Spawn-family cleanup-wake repair accepted. Three exact tests passed; restoring only the old acceptance rule made all three fail at intended readiness assertions. Restored source passed again. | Establishes the tested lost-wake repair, not full asynchronous spawn or inevitable permanent noncompletion. No new lint run. Evidence: `/Users/jasonconigliari/botster-evidence/spawn-phase-gap-20260921-sess-0017`. |
+
+### Active work and ownership
+
+| Track | Owner and source boundary | Next deliverable and decisive check | Status |
+| --- | --- | --- | --- |
+| Lua safety | Existing Hub Codex/Fable pair. Owns `lua_runtime/lua_json.rs` and the hook/test regions of `lua_runtime.rs` until handoff. | Isolated Error-key baseline; supported iterator repair if confirmed; then a separate saturating-counter checkpoint. Verify error parity and repeated exhaustion/reset. | Authorized work. Latest execution result must come from the live writer, not the source review. |
+| S1/S2 spawn and conversion | New Codex/Fable pair, separate branch. Owns `runtime.rs`, ordinary daemon spawn integration, `spawn_input.rs`, and `session_type_spawn.rs`. | Implement the daemon consumer, staged input admission, Host materialization, exact-generation conversion/disposal, and the two-ID production-path proof. | Pair creation in progress. No implementation by the new pair is claimed yet. |
+| R1 recovery | New Codex/Fable pair, separate branch. Initially owns new recovery module files and isolated persistence tests. | Reconstruct the surviving contract; implement policy-independent write-ahead transitions and restart classification; return a concrete operator/capacity decision packet. | Pair creation in progress. Historical revision-6 temporary design and review files are missing. |
+| Core support | Existing Core pair. Read-only reports in its persistent worktree. | No new Core prerequisite found. Reuse the reservation API; do not repeat D1(a). | Assigned source reviews complete. No compiler ownership. |
+
+The safety pair keeps its current compiler slot until release. Root grants later slots explicitly.
+Only one Botster compiler runs at a time: Rust 1.97.0, two build jobs, incremental compilation disabled.
+Spawn and recovery use separate persistent worktrees based on the reviewed integration source.
+Separate worktrees do not permit conflicting ownership. Root approves shared-file patches and merges them in dependency order.
+Recovery must request integration hooks from the spawn owner; it must not independently rewrite `runtime.rs` or the daemon owner loop.
+The spawn pair must wait for the safety handoff before editing the owned JSON walker or hook regions.
+That boundary does not block independent daemon consumer, receipt, or recovery implementation.
+
+### Current decisions and blockers
+
+- S1 input uses staged admission, not a full 8 MiB reservation across the asynchronous wait. Whole-allowance prepayment remains unapproved.
+- Original input charges must move with queued requests and survive caller timeout. Queue, materialization, context, and result charges remain separate obligations.
+- Repository loading must preserve full definitions and environment data. The existing 4 MiB file ceiling is not permission to narrow accepted configurations.
+- The catalog's file-plus-scratch 16 MiB formula is conservative, not a proved minimum. A smaller full-definition bound remains unverified.
+- Exact-generation context ownership must preserve retained reads after session removal. Bare session IDs do not authorize replacement-generation cleanup.
+- No new Core interface is required by the reviewed S1 trace. Accepted-ID retention is a separate fault-contract candidate, not a proved normal reservation leak.
+- R1 operator resolution, retention, recovery capacity, state-clone/serialization capacity, and exceptional-stop policy remain unselected. No silent eviction or new numeric limit is authorized.
+- The instruction counter has a source-confirmed wraparound path after caught exhaustion errors. Saturation repairs arithmetic, not general catchable-error or native-stall containment.
+- Error-key iterator safety remains a reproduction gate. Do not run a crash candidate inside the user's active runtime.
+- The claimed list/show wrapped-error producer was disproved: exported Lua wrappers validate arguments. No wrapper migration is approved on that premise.
+- Shared Publish/Drain key allocation before reservation is recorded separately. The spawn-only input proposal does not repair those callers.
+
+### Open acceptance requirements
+
+| Requirement | Current disposition |
+| --- | --- |
+| M1/M2/A1 accounting | Still open for complete callback, retained state, context, transport, worker, and disposal ownership. Only the specified private mlua `ref_free` storage is excluded. |
+| C1 coordination | Earlier functional evidence exists. Complete accounting and matched current-artifact acceptance remain open. |
+| S1/S2 lifecycle | Ordinary daemon consumer, conversion acknowledgement, exact-generation cleanup, managed/direct parity, and real daemon proof remain open. |
+| R1 recovery | Durable records, restart ownership, event-driven drain, and approved recovery policy remain open. |
+| I1 isolation | Existing finalizer-registration restriction is not general cancellation or native-stall containment. No new process boundary is approved. |
+| Unresolved failures | Event-owner assertion, Host-permit accounting assertion, original request ID 7, and reused-worktree assertion remain unresolved. No fresh diagnosis follows from lint repairs. |
+| Strict checks | Last measured library lint count is 114 at the PumpState checkpoint; no full strict pass or library-test lint pass is established. |
+| V1/P1 delivery | Fresh-checkout dependency resolution, matched Web/TUI/plugin/daemon behavior, remaining input/reconnect cases, and optimized performance/presentation evidence remain open. Reuse valid historical evidence only at its recorded scope. |
+
+### Evidence and recovery record
+
+Design inputs are under `/Users/jasonconigliari/botster-evidence/s1-design-20260921-sess-0017`.
+Review findings are under `/Users/jasonconigliari/botster-evidence/hub-pump-default-review-20260921`.
+Core source reports are under `/Users/jasonconigliari/botster-sessions/botster-core-recovery-20260921/evidence`.
+The old temporary integration worktree is unusable. Temporary verification logs and the R1 revision-6 design/review are unavailable.
+Do not use a historical file path as proof that its contents survived. Preserve new reports and raw logs outside temporary and build directories.
+Current integration worktree: `/Users/jasonconigliari/botster-sessions/botster-hub-foundation-resume-20260921`.
+Current integration branch: `integration/foundation-resume-20260921`.
+
+Root must integrate reviewed work, update this ledger, and request exact policy decisions before their implementation is blocked.
+Root must not substitute message forwarding or repeated premise reviews for a concrete implementation assignment.
 
 ## Active repair: plugin rendering on September 9
 
