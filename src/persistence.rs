@@ -2,7 +2,7 @@
 //!
 //! The hub persists product and policy state here while `botster-core` remains
 //! the owner of reusable session, transport, package, and admission mechanics.
-//! Version 2 is a single local JSON file intended for the local runtime. It is a
+//! Version 4 is a single local JSON file intended for the local runtime. It is a
 //! single-writer store: atomic rename keeps the previous committed file intact
 //! when a write fails before rename, but concurrent hub processes can still
 //! produce last-writer-wins updates.
@@ -30,7 +30,7 @@ use crate::shared_view::{SharedView, SharedViewBudget};
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::Worktree;
 
-const HUB_STATE_SCHEMA_VERSION: u16 = 3;
+const HUB_STATE_SCHEMA_VERSION: u16 = 4;
 const HUB_STATE_FILE_NAME: &str = "hub-state.json";
 const HUB_STATE_TEMP_FILE_NAME: &str = "hub-state.json.tmp";
 
@@ -48,7 +48,7 @@ pub enum PersistenceBucket {
 /// Versioned durable hub state aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubState {
-    /// Version of this JSON schema. Version 3 cold-cuts session types.
+    /// Version of this JSON schema. Version 4 adds recovery ownership.
     pub schema_version: u16,
     /// Host identity metadata resolved from hub config.
     pub host: HostIdentity,
@@ -85,6 +85,9 @@ pub struct HubState {
     pub runtime_settings: LocalRuntimeSettings,
     /// Append-only operator decision history.
     pub audit_history: Vec<HubAuditEntry>,
+    /// Hub-owned intent and evidence. The worktree collection remains the registry.
+    #[serde(default)]
+    pub(crate) recovery: crate::recovery::record::RecoveryLedger,
 }
 
 impl HubState {
@@ -107,12 +110,15 @@ impl HubState {
             admission_decisions: Vec::new(),
             runtime_settings: LocalRuntimeSettings::from_config(config),
             audit_history: Vec::new(),
+            recovery: crate::recovery::record::RecoveryLedger::default(),
         }
     }
 
     fn validate_version(&self) -> HubStateResult<()> {
         if self.schema_version == HUB_STATE_SCHEMA_VERSION {
-            Ok(())
+            self.recovery
+                .validate(&self.host.id)
+                .map_err(|_| HubStateError::InvalidRecoveryState)
         } else {
             Err(HubStateError::UnsupportedVersion(self.schema_version))
         }
@@ -284,6 +290,8 @@ pub struct HubAuditEntry {
 pub enum HubStateError {
     /// The state file uses a future or unsupported schema version.
     UnsupportedVersion(u16),
+    /// Recovery identity or migration input is inconsistent.
+    InvalidRecoveryState,
 }
 
 impl fmt::Display for HubStateError {
@@ -292,6 +300,7 @@ impl fmt::Display for HubStateError {
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported hub state schema version {version}")
             }
+            Self::InvalidRecoveryState => formatter.write_str("invalid Hub recovery state"),
         }
     }
 }
@@ -303,7 +312,7 @@ pub type HubStateResult<T> = Result<T, HubStateError>;
 
 /// Storage boundary for durable hub state.
 pub trait HubStateStore {
-    /// Load existing state or create a v2 default from config when no file exists.
+    /// Load existing state or create a current default when no file exists.
     fn load_or_initialize(&self, config: &HubConfig) -> HubStateStoreResult<HubState>;
 
     /// Save state while startup has exclusive ownership and no shared view exists.
@@ -387,16 +396,7 @@ impl FileHubStateStore {
     /// Load the update base without creating a state file when it is absent.
     pub(crate) fn load_for_update(&self, config: &HubConfig) -> HubStateStoreResult<HubState> {
         match fs::read(&self.path) {
-            Ok(bytes) => {
-                let version: HubStateVersion =
-                    serde_json::from_slice(&bytes).map_err(HubStateStoreError::Corrupt)?;
-                if version.schema_version != HUB_STATE_SCHEMA_VERSION {
-                    return Err(HubStateStoreError::State(
-                        HubStateError::UnsupportedVersion(version.schema_version),
-                    ));
-                }
-                serde_json::from_slice(&bytes).map_err(HubStateStoreError::Corrupt)
-            }
+            Ok(bytes) => decode_hub_state(&bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Ok(HubState::from_config(config))
             }
@@ -496,18 +496,7 @@ fn save_failure_is_due(path: &Path) -> bool {
 impl HubStateStore for FileHubStateStore {
     fn load_or_initialize(&self, config: &HubConfig) -> HubStateStoreResult<HubState> {
         match fs::read(&self.path) {
-            Ok(bytes) => {
-                let version: HubStateVersion =
-                    serde_json::from_slice(&bytes).map_err(HubStateStoreError::Corrupt)?;
-                if version.schema_version != HUB_STATE_SCHEMA_VERSION {
-                    return Err(HubStateStoreError::State(
-                        HubStateError::UnsupportedVersion(version.schema_version),
-                    ));
-                }
-                let state: HubState =
-                    serde_json::from_slice(&bytes).map_err(HubStateStoreError::Corrupt)?;
-                Ok(state)
-            }
+            Ok(bytes) => decode_hub_state(&bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let state = HubState::from_config(config);
                 self.save_exclusive_startup_state(&state)?;
@@ -530,8 +519,38 @@ impl HubStateStore for FileHubStateStore {
 }
 
 #[derive(Debug, Deserialize)]
-struct HubStateVersion {
+struct HubStateVersion<'a> {
     schema_version: u16,
+    #[serde(default, borrow)]
+    recovery: Option<&'a RawValue>,
+}
+
+fn decode_hub_state(bytes: &[u8]) -> HubStateStoreResult<HubState> {
+    let version: HubStateVersion<'_> =
+        serde_json::from_slice(bytes).map_err(HubStateStoreError::Corrupt)?;
+    if !matches!(version.schema_version, 3 | HUB_STATE_SCHEMA_VERSION) {
+        return Err(HubStateStoreError::State(
+            HubStateError::UnsupportedVersion(version.schema_version),
+        ));
+    }
+    if version.schema_version == HUB_STATE_SCHEMA_VERSION && version.recovery.is_none() {
+        return Err(HubStateStoreError::State(
+            HubStateError::InvalidRecoveryState,
+        ));
+    }
+    let mut state: HubState = serde_json::from_slice(bytes).map_err(HubStateStoreError::Corrupt)?;
+    if version.schema_version == 3 {
+        if state.recovery != crate::recovery::record::RecoveryLedger::default() {
+            return Err(HubStateStoreError::State(
+                HubStateError::InvalidRecoveryState,
+            ));
+        }
+        state.schema_version = HUB_STATE_SCHEMA_VERSION;
+    }
+    state
+        .validate_version()
+        .map_err(HubStateStoreError::State)?;
+    Ok(state)
 }
 
 #[derive(Deserialize)]
@@ -746,7 +765,7 @@ mod tests {
             .load_or_initialize(&config)
             .expect("load committed state");
 
-        assert_eq!(state.schema_version, 3);
+        assert_eq!(state.schema_version, HUB_STATE_SCHEMA_VERSION);
         assert_eq!(reopened, state);
         assert_eq!(reopened.host.id, "state-test-host");
         assert_eq!(
@@ -801,7 +820,7 @@ mod tests {
         assert!(reopened.credential_keys.is_empty());
         assert!(reopened.trusted_browser_identities.is_empty());
         assert!(reopened.bootstrap_grants.is_empty());
-        assert_eq!(reopened.schema_version, 3);
+        assert_eq!(reopened.schema_version, HUB_STATE_SCHEMA_VERSION);
     }
 
     #[test]
