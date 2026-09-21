@@ -1170,6 +1170,24 @@ R1 remains a design proposal. G1 still needs a capacity decision.
 The active integration worktree remains. Other historical worktrees require a separate inventory before deletion.
 The next bounded source proposal is Astra's `PumpState` default derivation, with Claude as independent reviewer.
 
+## September 21 crash recovery
+
+Jason requested replacement Codex implementers and Fable reviewers after the Botster crash.
+The former temporary integration directory no longer contains a usable Git worktree.
+The PumpState verification directory is empty. Its interrupted checks are not accepted as current evidence.
+Root restored Hub checkpoint `03eaf5c2` on `integration/foundation-resume-20260921`.
+The persistent worktree is `/Users/jasonconigliari/botster-sessions/botster-hub-foundation-resume-20260921`.
+Root restored Core checkpoint `053148f6` on `delivery/core-recovery-20260921`.
+The persistent Core worktree is `/Users/jasonconigliari/botster-sessions/botster-core-recovery-20260921`.
+Core main already contains this implementation. Root did not repeat or undo that integration.
+
+The Hub Codex/Fable pair resumes the reviewed PumpState change and reconstructs missing verification evidence.
+The Hub writer has the sole Botster compiler slot, with two build jobs and incremental compilation disabled.
+The Core Codex/Fable pair first verifies saved artifact hashes and the reservation handoff from source.
+The Core pair must identify a concrete Core-owned gap before proposing additional implementation.
+Both pairs must keep evidence outside temporary storage and preserve all existing acceptance limits.
+Root retains integration and publication ownership. This recovery does not authorize installation or runtime replacement.
+
 ## Completion gate
 
 This phase completes only when integration, required product behavior, architecture findings, and measured acceptance are resolved or explicitly returned for a user decision.
