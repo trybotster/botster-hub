@@ -28,6 +28,14 @@ Lint cleanup is not the primary work. Full accounting, client behavior, integrat
 
 ### Verified checkpoints
 
+Iterator repair `6921e27d` is committed after Fable verified 28 passing tests on the combined spawn/safety source.
+The former Error-key crash now returns the same typed error as the value path. Counter underflow and general execution isolation remain open.
+Recovery `bc0d5940` is pushed on its delivery branch and integrated as `c055fa31` after Fable's final verdict.
+Both isolated lifecycle tests passed with producer-built, hash-verified Hub and Core worker artifacts. The earlier setup failures remain preserved.
+The combined spawn/safety/recovery integration has not yet been built. No installation or live schema migration is authorized.
+The parser writer reports all eight fixtures matched production results with no overflow or allocation refusal; Fable review remains pending.
+Recovery currently owns the compiler slot for the separate two-file lint follow-up. Its worker-accounting investigation is read-only.
+
 Spawn checkpoint `a223937e` is integrated as `32e16744`. Fable accepted its four-file scope and eight selected tests.
 The matched oracle establishes the inflight slot change from 584 to 600 bytes with matching charges at capacities 1, 2, 4, and 8.
 Four Lua sizing rows vary within unchanged binaries. Their cause remains open; exclude them from the matched comparison.
