@@ -68,6 +68,14 @@ const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
 const INSTRUCTION_BUDGET_ERROR: &str = "lua instruction budget exceeded";
 pub(crate) const LUA_CALLBACK_CAPACITY_EXHAUSTED: &str = "Lua callback memory capacity exhausted";
 
+fn decrement_instruction_budget(budget: &AtomicU64) -> u64 {
+    budget
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            Some(remaining.saturating_sub(1_000))
+        })
+        .expect("the instruction budget update always returns Some")
+}
+
 #[derive(Debug)]
 struct InstructionBudgetExceeded;
 
@@ -1118,6 +1126,159 @@ mod state_owner_tests {
     }
 
     #[test]
+    fn instruction_budget_stays_zero_after_exhaustion() {
+        for (initial, remaining, exhausted) in [
+            (2_000, 1_000, false),
+            (1_001, 1, false),
+            (1_000, 0, true),
+            (1, 0, true),
+            (0, 0, true),
+        ] {
+            let budget = AtomicU64::new(initial);
+            let previous = decrement_instruction_budget(&budget);
+            assert_eq!(previous, initial);
+            assert_eq!(previous <= 1_000, exhausted);
+            assert_eq!(budget.load(Ordering::Relaxed), remaining);
+            if budget.load(Ordering::Relaxed) > 0 {
+                decrement_instruction_budget(&budget);
+            }
+            assert_eq!(budget.load(Ordering::Relaxed), 0);
+            for _ in 0..3 {
+                assert_eq!(decrement_instruction_budget(&budget), 0);
+                assert_eq!(budget.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_keeps_caught_exhaustion_and_resets_for_the_next_invocation() {
+        use botster_core::{PluginInvocationContext, RequestId};
+
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "botster-instruction-budget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let config = crate::HubStartupOptions {
+            data_directory: crate::DataDirectoryOption::Explicit(directory.0.join("hub")),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        let hub = crate::HubRuntime::new(config).unwrap();
+        let api = hub.lua_plugin_host_api();
+        let memory = Arc::clone(&api.memory);
+        let host_api = LuaHostApi {
+            configuration: PackageConfigurationView {
+                schema: None,
+                effective_values: BTreeMap::new(),
+                missing_required: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            capabilities: api.capabilities,
+            coordination: api.coordination,
+            entity_publish: api.entity_publish,
+            session_types: api.session_types,
+            spawn_targets: api.spawn_targets,
+            worktrees: api.worktrees,
+            package_records: Vec::new(),
+            package_event_router: api.package_event_router,
+            causal_scopes: api.causal_scopes,
+            memory: Arc::clone(&memory),
+        };
+        let entrypoint = directory.0.join("plugin.lua");
+        std::fs::write(
+            &entrypoint,
+            r#"
+            __botster_handlers.exhaust = function()
+                caught = {}
+                for index = 1, 3 do
+                    local ok, err = pcall(function()
+                        for count = 1, 1000000 do end
+                    end)
+                    assert(not ok, 'exhausted hook continued')
+                    assert(type(err) == 'userdata')
+                    caught[index] = err
+                end
+                return {caught = #caught}
+            end
+            __botster_handlers.finite = function()
+                local total = 0
+                for index = 1, 2000 do total = total + 1 end
+                return {total = total}
+            end
+            return {}
+            "#,
+        )
+        .unwrap();
+        let key = PluginKey("instruction-budget-test".into());
+        let (runtime, _) =
+            LuaPluginRuntime::new(key.clone(), &entrypoint, host_api, memory).unwrap();
+        let invoke = |handler: &str| {
+            runtime.invoke(
+                PluginInvocationRequest {
+                    request_id: RequestId(format!("instruction-budget-{handler}")),
+                    handler: PluginHandlerRef {
+                        plugin_key: key.clone(),
+                        kind: PluginHandlerKind::McpTool,
+                        handler_id: handler.into(),
+                    },
+                    timeout_ms: 1_000,
+                    context: PluginInvocationContext {
+                        client_id: None,
+                        session_id: None,
+                        subscription_id: None,
+                        surface_id: None,
+                        origin: None,
+                        metadata: None,
+                    },
+                    payload: BoundaryJson(json!({})),
+                },
+                PluginCancellationToken::new(),
+            )
+        };
+        let PluginInvocationResult::Completed(result) = invoke("exhaust") else {
+            panic!("the handler must catch three hook errors and return");
+        };
+        assert_eq!(result.payload.unwrap().0["caught"], 3);
+        assert_eq!(runtime.instruction_budget.load(Ordering::Relaxed), 0);
+        {
+            let state = runtime.lua.lock().unwrap();
+            let caught: Table = state.lua().globals().get("caught").unwrap();
+            let mut shared = None;
+            for index in 1..=3 {
+                let Value::Error(error) = caught.raw_get::<Value>(index).unwrap() else {
+                    panic!("the caught value must remain a Rust error");
+                };
+                assert_eq!(error.to_string(), INSTRUCTION_BUDGET_ERROR);
+                let mlua::Error::ExternalError(error) = *error else {
+                    panic!("the hook must preserve the shared external error");
+                };
+                if let Some(previous) = &shared {
+                    assert!(Arc::ptr_eq(previous, &error));
+                }
+                shared = Some(error);
+            }
+        }
+        let PluginInvocationResult::Completed(result) = invoke("finite") else {
+            panic!("the next invocation must receive the existing budget reset");
+        };
+        assert_eq!(result.payload.unwrap().0["total"], 2_000);
+        let remaining = runtime.instruction_budget.load(Ordering::Relaxed);
+        assert!(remaining > 0 && remaining < DEFAULT_INSTRUCTION_BUDGET);
+    }
+
+    #[test]
     fn hook_error_keys_return_conversion_errors() {
         let memory = memory();
         let mut state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
@@ -1136,7 +1297,7 @@ mod state_owner_tests {
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(1_000),
             move |_lua, _debug| {
-                let previous = hook_budget.fetch_sub(1_000, Ordering::Relaxed);
+                let previous = decrement_instruction_budget(&hook_budget);
                 if previous <= 1_000 {
                     return Err(mlua::Error::ExternalError(Arc::clone(&shared)));
                 }
@@ -1203,7 +1364,7 @@ mod state_owner_tests {
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(1_000),
             move |_lua, _debug| {
-                let previous = hook_budget.fetch_sub(1_000, Ordering::Relaxed);
+                let previous = decrement_instruction_budget(&hook_budget);
                 if previous <= 1_000 {
                     return Err(mlua::Error::ExternalError(Arc::clone(&hook_error)));
                 }
@@ -1473,7 +1634,7 @@ impl LuaPluginRuntime {
             lua.set_hook(
                 HookTriggers::new().every_nth_instruction(1_000),
                 move |_lua, _debug| {
-                    let previous = hook_budget.fetch_sub(1_000, Ordering::Relaxed);
+                    let previous = decrement_instruction_budget(&hook_budget);
                     if previous <= 1_000 {
                         return Err(mlua::Error::ExternalError(Arc::clone(&hook_error)));
                     }
