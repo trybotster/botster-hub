@@ -52,6 +52,12 @@ Recovery must request integration hooks from the spawn owner; it must not indepe
 The spawn pair must wait for the safety handoff before editing the owned JSON walker or hook regions.
 That boundary does not block independent daemon consumer, receipt, or recovery implementation.
 
+Root assigned the crate-private local receipt factory in `data_plane/driver.rs` to the spawn pair, subject to its exact lifecycle review.
+Root assigned minimal recovery fields/defaults in `persistence.rs` and module registration in `lib.rs` to the recovery pair.
+Recovery must reuse the single existing Hub state document/store and verify old-snapshot compatibility.
+The existing serialization-before-charge boundary remains a G1 production-activation blocker, not permission to create another store.
+Spawn is next in the compiler queue after the safety checkpoint. Recovery follows when its reviewed tests are ready.
+
 Current feature sessions:
 
 - Spawn writer: `sess-1790026283-001b-831bec162af5cabf5a3b42375a529a08`; reviewer: `sess-1790026295-001c-058661451ae4bf5cf9e371481df5be04`.
