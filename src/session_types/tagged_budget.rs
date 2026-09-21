@@ -135,14 +135,14 @@ impl<'de> Visitor<'de> for ValueVisitor {
 
     fn visit_seq<A: SeqAccess<'de>>(self, sequence: A) -> Result<Self::Value, A::Error> {
         Ok(ValueStorage {
-            storage: ContentVisitor.visit_seq(sequence)?,
+            storage: ContentVisitor::untracked().visit_seq(sequence)?,
             string: None,
         })
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
         Ok(ValueStorage {
-            storage: ContentVisitor.visit_map(map)?,
+            storage: ContentVisitor::untracked().visit_map(map)?,
             string: None,
         })
     }
