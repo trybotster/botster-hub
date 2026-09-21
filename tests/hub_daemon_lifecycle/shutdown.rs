@@ -1838,7 +1838,7 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     assert_eq!(status.state_source, HubStateLoadSource::Initialized);
     assert_eq!(status.host_id, "hub-daemon-test");
     assert_eq!(status.host_display_name, "Hub Daemon Test");
-    assert_eq!(status.schema_version, 3);
+    assert_eq!(status.schema_version, 4);
     assert!(status.data_dir_configured);
     assert!(status.core_initialized);
     assert_eq!(status.package_count, 0);
@@ -1866,7 +1866,7 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     let reopened = store
         .load_or_initialize(&config)
         .expect("reload committed daemon state");
-    assert_eq!(reopened.schema_version, 3);
+    assert_eq!(reopened.schema_version, 4);
     assert_eq!(reopened.host.id, "hub-daemon-test");
 }
 
@@ -2184,7 +2184,7 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
     assert_eq!(status.enabled_package_count, 1);
     assert_eq!(status.provider_count, 1);
     assert_eq!(status.enabled_provider_count, 1);
-    assert_eq!(status.schema_version, 3);
+    assert_eq!(status.schema_version, 4);
 
     daemon.stop();
     let reopened = store
