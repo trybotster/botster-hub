@@ -28,6 +28,14 @@ Lint cleanup is not the primary work. Full accounting, client behavior, integrat
 
 ### Verified checkpoints
 
+Dormant schema checkpoint `37ed78ff` is integrated as `708cf0b1`. Fable verified the four-file scope, artifact provenance, and 13 passing tests.
+Formatting and library/test compilation passed. Matching warning sets are unchanged apart from an existing diagnostic's shifted line.
+This establishes dormant schema traversal only. Production wiring, scratch, failure-prefix retention, and the combined live maximum remain open.
+The earlier schema patch accidentally removed production code during restoration from truncated output. Review rejected it before any build.
+Committed source stayed intact. The writer restored the full file and verified its exact registration-only diff; Fable reviewed every replacement hunk.
+Future restores must use complete source and an exact diff-scope check. Rejected evidence remains preserved.
+Failure-prefix work is a separate source-review draft. No compiler slot is currently assigned.
+
 Counter repair `d5dca026` is committed after Fable verified the combined build, two exact checks, and the 12-test state-owner group.
 This closes arithmetic underflow. No old-arithmetic run executed; that comparison remains source reasoning.
 Recovery lint follow-up `25fd8145` is integrated as `ddaaee34`. Thirteen recovery tests passed; strict lint reports 131 errors, not a clean pass.
