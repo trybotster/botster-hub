@@ -31,6 +31,9 @@ mod definition_budget;
 #[allow(dead_code)] // The full-definition materialization permit will own these errors.
 mod materialization_error;
 
+#[allow(dead_code)] // The full-definition counting walk will supply scratch events.
+mod scratch_budget;
+
 #[allow(dead_code)] // The full-definition counting seed will dispatch its tagged fields here.
 mod tagged_budget;
 
