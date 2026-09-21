@@ -33,22 +33,24 @@ This closes arithmetic underflow. No old-arithmetic run executed; that compariso
 Recovery lint follow-up `25fd8145` is integrated as `ddaaee34`. Thirteen recovery tests passed; strict lint reports 131 errors, not a clean pass.
 Parser probe `31466c16` is integrated as `bad5eb2d`. Fable verified all eight fixtures and source/artifact provenance.
 The latest integration includes these two additional checkpoints but has not yet been rebuilt after their integration.
-No compiler slot is currently assigned. Counter verification released the last active slot.
+Spawn owns the compiler slot for the reviewed four-file dormant parser set and its nine tests. Execution results are pending.
 
 Current implementation: full-definition parser accounting and separate spawn receipt/reply/Host integration remain in progress.
 The dormant Content arithmetic module has source acceptance only. Full traversal, scratch, output, error, and disposal funding remain open.
 Root selected the existing complete decoder with conservative source-derived error funding, not a second error parser.
 Additional capacity refusals require concrete accounting evidence and an explicit acceptance decision.
-Worker resource helpers remain under source review. Their constructor/load wiring awaits Jason's standalone-account policy choice.
+Worker resource helpers `9885c8e4` are reviewed, pushed, and integrated as `871c061a`. Five tests and restored controls passed.
+Strict lint reports 135 errors on that helper branch, including four new unused-helper diagnostics. Full integration lint is unmeasured.
+Allocation sizing remains source-derived; an independent oracle and actual worker-join lifetime checks remain open.
+Their constructor/load wiring awaits Jason's standalone-account policy choice.
 The choices are an account per standalone instance with existing limits, or an explicit public account API. Neither is approved yet.
 
 Iterator repair `6921e27d` is committed after Fable verified 28 passing tests on the combined spawn/safety source.
-The former Error-key crash now returns the same typed error as the value path. Counter underflow and general execution isolation remain open.
+The former Error-key crash now returns the same typed error as the value path. General execution isolation remains open.
 Recovery `bc0d5940` is pushed on its delivery branch and integrated as `c055fa31` after Fable's final verdict.
 Both isolated lifecycle tests passed with producer-built, hash-verified Hub and Core worker artifacts. The earlier setup failures remain preserved.
-The combined spawn/safety/recovery integration has not yet been built. No installation or live schema migration is authorized.
-The parser writer reports all eight fixtures matched production results with no overflow or allocation refusal; Fable review remains pending.
-Recovery currently owns the compiler slot for the separate two-file lint follow-up. Its worker-accounting investigation is read-only.
+The counter run built combined spawn/safety/recovery source. Later integrated lint, probe, and worker-helper changes still need a combined build.
+No installation or live schema migration is authorized.
 
 Spawn checkpoint `a223937e` is integrated as `32e16744`. Fable accepted its four-file scope and eight selected tests.
 The matched oracle establishes the inflight slot change from 584 to 600 bytes with matching charges at capacities 1, 2, 4, and 8.
@@ -57,11 +59,8 @@ This checkpoint does not establish daemon behavior, full S1, or strict lint. Int
 Fable verified 13 recovery tests, 16 persistence tests, and 5 heap tests passed on freeze 2.
 All three ablations reached intended failures. Restored controls passed, eight source hashes matched, and the restored binary matched the original candidate.
 Strict lint failed with 133 library errors. No comparison against the historical 114 count is established.
-Root authorized the exact eight-file recovery commit as an isolated verification checkpoint, not final acceptance.
-The unchanged artifact producer requires clean committed source. After this commit, the writer will build isolated artifacts and rerun two lifecycle selectors.
-Two lifecycle checks failed during setup because candidate binary variables were missing. Neither reached its schema assertion.
-The iterator repair and its zero-test guard have source approval. Safety verification follows the recovery slot release.
-The parser probe has source approval and follows safety in the compiler queue. No parser result exists yet.
+The recovery commit remains an isolated verification checkpoint, not final acceptance.
+Two initial lifecycle checks failed during setup because candidate binary variables were missing. Their later configured runs passed.
 The corrected conversion receipt has source approval only. Its helper has no production caller; the patch remains separate and unapplied.
 Root approved a spawn-specific funded reply pair, not another pending queue. Response strings, errors, and worker wait-storage ownership remain accounting gates.
 
@@ -75,15 +74,13 @@ Root approved a spawn-specific funded reply pair, not another pending queue. Res
 
 | Track | Owner and source boundary | Next deliverable and decisive check | Status |
 | --- | --- | --- | --- |
-| Lua safety | Existing Hub Codex/Fable pair. Owns `lua_runtime/lua_json.rs` and the hook/test regions of `lua_runtime.rs` until handoff. | Isolated Error-key baseline; supported iterator repair if confirmed; then a separate saturating-counter checkpoint. Verify error parity and repeated exhaustion/reset. | Authorized work. Latest execution result must come from the live writer, not the source review. |
-| S1/S2 spawn and conversion | Codex/Fable pair on `delivery/async-spawn-20260921`. Owns `runtime.rs`, ordinary daemon spawn integration, `spawn_input.rs`, and `session_type_spawn.rs`. | Verify the extracted shared stage machine and local receipt factory; then complete consumer, charged materialization, conversion/disposal, and two-ID daemon proof. | Writer reports source implemented and six tests written. Source accepted by Fable; execution pending compiler slot. Focused slot-layout oracle authorized. No daemon activation claimed. |
-| R1 recovery | Codex/Fable pair on `delivery/durable-recovery-20260921`. Owns new recovery modules and assigned persistence/accounting changes. | Verify schema/transitions, restart classification, store adapter, and schema-3-to-4 normalization. | Fable accepted source freeze 2 and verified all eight source hashes. Thirteen tests are written; none have run. Prior review findings are resolved in source. No runtime hooks are active. |
+| Lua safety | Existing Hub Codex/Fable pair. | Completed iterator and counter checkpoints; handoff before overlapping edits. | Both fixes are verified, committed, and pushed. General isolation remains open. |
+| S1/S2 spawn and conversion | Codex/Fable pair on `delivery/async-spawn-20260921`. Owns runtime and ordinary spawn integration. | Compile the reviewed parser terms; complete full accounting and the real daemon lifecycle. | Extraction, receipt factory, and parser probe are verified. Receipt/reply and Host integration remain separate source work. No full S1 acceptance. |
+| R1 recovery and worker accounting | Codex/Fable pair on `delivery/durable-recovery-20260921`. Owns assigned recovery, persistence, lifecycle, and layout files. | Resolve approved policy gates, wire production ownership, and verify allocation sizes and actual joins. | Isolated recovery, lint follow-up, and worker helpers are verified checkpoints. Runtime recovery and worker load wiring remain incomplete. |
 | Core support | Existing Core pair. Read-only reports in its persistent worktree. | No new Core prerequisite found. Reuse the reservation API; do not repeat D1(a). | Assigned source reviews complete. No compiler ownership. |
 
-Root checked host processes and found no active compiler. Root then granted spawn its bounded checkpoint verification.
-Safety subsequently reported active supervisor `6915`, started before it read the revocation. Root told spawn to hold if not started.
-Safety must finish that bounded run and release the slot. Neither writer may start further commands until Root resolves this scheduling race.
-Recovery is next after spawn releases the slot. The parser probe build needs a separate grant.
+The earlier safety/spawn scheduling uncertainty is preserved in their evidence. Both runs completed; no timing or exclusive-resource claim follows.
+Spawn currently has the bounded dormant-parser verification grant. Root must verify release before granting another build.
 Root grants later slots explicitly. A reserved slot is not evidence of an active process or completed check.
 Only one Botster compiler runs at a time: Rust 1.97.0, two build jobs, incremental compilation disabled.
 Spawn and recovery use separate persistent worktrees based on the reviewed integration source.
@@ -97,8 +94,7 @@ Root assigned minimal recovery fields/defaults in `persistence.rs` and module re
 The recovery pair also owns the exact recovery-field accounting changes in `hub_state_heap.rs`.
 Recovery must reuse the single existing Hub state document/store and verify old-snapshot compatibility.
 The existing serialization-before-charge boundary remains a G1 production-activation blocker, not permission to create another store.
-Safety supervisor `6915` completed and released the slot. Spawn completed its bounded verification and released the slot.
-Root granted recovery the reviewed freeze 2 evidence run. Safety and parser work remain source-only until a later grant.
+Recovery worker helpers are integrated without constructor/load wiring. B1 remains pending; no uncharged fallback is approved.
 
 Current feature sessions:
 
