@@ -267,8 +267,8 @@ impl RecoveryRecord {
         {
             return false;
         }
-        if let Some(identity) = &self.managed {
-            if identity.target_id.is_empty()
+        if let Some(identity) = &self.managed
+            && (identity.target_id.is_empty()
                 || identity.worktree_id.is_empty()
                 || identity.branch.is_empty()
                 || identity.base_commit.is_empty()
@@ -276,10 +276,9 @@ impl RecoveryRecord {
                 || !identity.path.is_absolute()
                 || !identity.repository_root.is_absolute()
                 || !identity.common_dir.is_absolute()
-                || (identity.created_branch && !identity.created_worktree)
-            {
-                return false;
-            }
+                || (identity.created_branch && !identity.created_worktree))
+        {
+            return false;
         }
         match self.phase {
             Phase::Intent(Effect::CreateWorktree | Effect::RollbackWorktree)

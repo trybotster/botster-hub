@@ -131,6 +131,8 @@ impl PreparedRecoveryWrite {
     }
 
     /// Commit on Host before the caller starts the effect identified by this receipt.
+    // Refusal returns the complete preparation without allocating a box.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn commit(
         self,
         current_revision: u64,
