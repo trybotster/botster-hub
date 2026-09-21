@@ -80,9 +80,12 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 - No new Core interface is required by the reviewed S1 trace. Accepted-ID retention is a separate fault-contract candidate, not a proved normal reservation leak.
 - R1 operator resolution, retention, recovery capacity, state-clone/serialization capacity, and exceptional-stop policy remain unselected. No silent eviction or new numeric limit is authorized.
 - Recovery schema compatibility is an integration gate. Verify that old readers/writers reject incompatible records; a version bump alone does not prove protection. No live migration is authorized.
+- Root authorized isolated schema-3-to-4 loader/normalization implementation after Fable verifies old-source rejection. Test all load/save paths, field preservation, unsupported-version refusal, and unchanged original bytes after failed writes. Production migration remains unauthorized.
 - Proposed durable IDs use a persisted host-scoped sequence, not runtime-local WaiterId. Overflow, restore, concurrent writes, and non-reuse require review.
 - The instruction counter has a source-confirmed wraparound path after caught exhaustion errors. Saturation repairs arithmetic, not general catchable-error or native-stall containment.
 - Error-key iterator safety remains a reproduction gate. Do not run a crash candidate inside the user's active runtime.
+- Safety review accepted the isolated reproducer and supervisor, conditional on selecting and hashing the executable from the successful build output. Execution results remain pending.
+- Spawn stage admission must charge request/channel and phase-registration storage; waiter identity alone is not an accounting proof. The spawn pair owns this bounded interface repair.
 - The claimed list/show wrapped-error producer was disproved: exported Lua wrappers validate arguments. No wrapper migration is approved on that premise.
 - Shared Publish/Drain key allocation before reservation is recorded separately. The spawn-only input proposal does not repair those callers.
 
