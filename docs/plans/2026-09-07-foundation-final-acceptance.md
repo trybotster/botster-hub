@@ -60,7 +60,8 @@ Root assigned minimal recovery fields/defaults in `persistence.rs` and module re
 The recovery pair also owns the exact recovery-field accounting changes in `hub_state_heap.rs`.
 Recovery must reuse the single existing Hub state document/store and verify old-snapshot compatibility.
 The existing serialization-before-charge boundary remains a G1 production-activation blocker, not permission to create another store.
-Safety supervisor `6915` completed and released the slot. Spawn now owns the slot; recovery follows with its reviewed tests.
+Safety supervisor `6915` completed and released the slot. Spawn completed its bounded verification and released the slot.
+Root granted recovery the reviewed freeze 2 evidence run. Safety and parser work remain source-only until a later grant.
 
 Current feature sessions:
 
@@ -89,7 +90,7 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 - Proposed durable IDs use a persisted host-scoped sequence, not runtime-local WaiterId. Overflow, restore, concurrent writes, and non-reuse require review.
 - The instruction counter has a source-confirmed wraparound path after caught exhaustion errors. Saturation repairs arithmetic, not general catchable-error or native-stall containment.
 - Fable accepted the isolated Error-key reproduction. The baseline build passed; both the minimal iterator and production walker modes exited with SIGABRT. Artifact provenance and controls were verified. This proves the pinned mechanism, not its frequency in real plugins. Root authorized the reviewed source-only `Table::for_each` repair. The repaired walker still needs successful execution and error-parity checks. Do not run a crash candidate inside the user's active runtime.
-- Spawn reports two lifecycle tests and six local receipt tests passed. Fable still must review the raw evidence. The matched allocation comparison is running; full asynchronous spawn acceptance remains open.
+- Spawn reports two lifecycle tests and six local receipt tests passed. Matched baseline/candidate allocation runs also passed. Pending slots remain 328 bytes; inflight slots grow from 584 to 600 bytes. Reported charges match allocations at capacities 1, 2, 4, and 8. The writer verified restoration of all 1004 candidate file hashes before building. Fable still must review raw evidence; full asynchronous spawn acceptance remains open.
 - Spawn stage admission must charge request/channel and phase-registration storage; waiter identity alone is not an accounting proof. The spawn pair owns this bounded interface repair.
 - Spawn premise review accepted independent stage-machine extraction, ingress/owner integration, charged materialization interface, and receipt lifecycle. Implementation may proceed without a new planning gate.
 - Root rejected an uncharged repository-parser fallback for production activation. Isolated accounted fixtures may verify lifecycle components, but do not close full configured-target S1 acceptance.
