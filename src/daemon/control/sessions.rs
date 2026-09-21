@@ -279,7 +279,7 @@ fn handle_daemon_spawn(
     let mut reservation: Option<SessionReservation> = None;
     let mut spawn_error: Option<CoreDaemonError> = None;
     let mut reserve_operation_id: Option<PendingOperationId> = None;
-    ControlStep::pending(move |daemon, state| {
+    ControlStep::pending_spawn(move |daemon, state| {
         loop {
             if let Some(pending_id) = tracker.pending_id()
                 && matches!(stage, Stage::Reserve)
@@ -1777,6 +1777,286 @@ mod tests {
 
     fn spawn_fixture(name: &str) -> (crate::HubDaemon, DaemonControlState, std::path::PathBuf) {
         spawn_fixture_with_worker(name, None)
+    }
+
+    fn collect_phase_pair(
+        daemon: &HubDaemon,
+        receiver: &mut tokio::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage>,
+        waiter_id: crate::owner_identity::WaiterId,
+        first_phase: u64,
+    ) -> Vec<crate::owner_identity::OwnerWorkIdentity> {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let identities = executor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut identities = Vec::new();
+                while identities.len() < 2 {
+                    receiver.recv().await.expect("Core must notify the owner");
+                    identities.extend(daemon.runtime().unwrap().take_owner_core_completions(2));
+                }
+                identities
+            })
+            .await
+            .expect("both registered phases must publish")
+        });
+        assert_eq!(
+            identities,
+            vec![
+                crate::owner_identity::OwnerWorkIdentity {
+                    waiter_id,
+                    phase: first_phase
+                },
+                crate::owner_identity::OwnerWorkIdentity {
+                    waiter_id,
+                    phase: first_phase + 1
+                },
+            ]
+        );
+        identities
+    }
+
+    fn insert_phase_test_row(
+        state: &mut DaemonControlState,
+        waiter_id: crate::owner_identity::WaiterId,
+        continuation: crate::daemon::control::pending::ControlContinuation,
+    ) {
+        use crate::daemon::control::pending::{OwnerRequestCompletion, PendingControlRequest};
+        let permit = state.budget.reserve().unwrap();
+        state.pending_requests.insert(
+            waiter_id,
+            PendingControlRequest {
+                waiter_id,
+                ready_class: crate::daemon::owner_schedule::ReadyClass::CoreCompletion,
+                ready_key: None,
+                deadline_key: None,
+                last_core_phase: 0,
+                last_host_phase: 0,
+                completion: OwnerRequestCompletion::default(),
+                reply_tx: crate::daemon::control::message::ControlReplySender::absent(),
+                response_delivery_rx: None,
+                grant_id: None,
+                client: None,
+                core_retirement: None,
+                permit: Some(permit),
+                must_finish: true,
+                past_deadline: false,
+                continuation,
+                retire: None,
+            },
+        );
+    }
+
+    fn absorb_phase_test_pair(
+        state: &mut DaemonControlState,
+        identities: &[crate::owner_identity::OwnerWorkIdentity],
+    ) {
+        assert_eq!(
+            crate::daemon::control::pending::absorb_core_completions(
+                state,
+                identities,
+                &mut crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now()),
+            ),
+            identities.len()
+        );
+    }
+
+    fn run_phase_test_ready(daemon: &mut HubDaemon, state: &mut DaemonControlState) -> bool {
+        let item = state
+            .owner_ready
+            .pop_next()
+            .expect("spawn cleanup must become ready after injected post-registration refusal");
+        let mut finished = false;
+        crate::daemon::control::pending::poll_ready_request_item(
+            daemon,
+            state,
+            item,
+            &mut |_, state, mut entry, _| {
+                finished = true;
+                drop(entry.continuation);
+                state.budget.release(entry.permit.take().unwrap());
+                false
+            },
+        );
+        finished
+    }
+
+    #[test]
+    fn managed_spawn_cleanup_wakes_after_registered_refusal() {
+        use crate::daemon::control::pending::ControlContinuation;
+        let (mut daemon, mut state, root) = spawn_fixture("managed-phase-gap");
+        let waiter = daemon.runtime().unwrap().next_waiter_id().unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        daemon.runtime().unwrap().bind_data_plane_owner_wake(sender);
+        let worktree = root.join("existing-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mut record = plugin_spawn_package(&root.join("p1-plugin"));
+        record.manifest.capabilities.push(botster_core::Capability {
+            surface: botster_core::CapabilitySurface::SessionActions,
+            scope: Some("session_type_managed_git_spawn".into()),
+        });
+        record.session_types[0].target_id = Some("t1".into());
+        let runtime = daemon.runtime().unwrap();
+        let mut next = (*runtime.state()).clone();
+        next.spawn_targets.push(crate::spawn_targets::SpawnTarget {
+            target_id: "t1".into(),
+            label: "t1".into(),
+            root: worktree.clone(),
+            enabled: true,
+            kind: "directory".into(),
+            base_ref: None,
+            metadata: Default::default(),
+        });
+        runtime.replace_state(next).unwrap();
+        let (response, response_rx) = std::sync::mpsc::channel();
+        let pending = crate::runtime::PendingManagedSessionSpawn::test_new(
+            botster_core::PluginKey("p1.plugin".into()),
+            "t1".into(),
+            "topic".into(),
+            "agent".into(),
+            crate::session_types::ManagedSessionTypeRequest::default(),
+            vec![record],
+            response,
+        );
+        let prepared = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: worktree.clone(),
+            common_dir: worktree.clone(),
+            branch: "topic".into(),
+            path: worktree,
+            worktree_id: "wt-phase-gap".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: false,
+            created_branch: false,
+        };
+        let start = runtime
+            .spawn_prepared_managed_session(&pending, &prepared, waiter)
+            .unwrap();
+        let session_id = start.context.session_id.clone();
+        let operation =
+            crate::daemon::control::managed_git::ManagedSpawnOperation::test_spawn_phase(
+                waiter, pending, prepared, start,
+            );
+        insert_phase_test_row(
+            &mut state,
+            waiter,
+            ControlContinuation::ManagedSpawn(Box::new(operation)),
+        );
+        let reserve = collect_phase_pair(&daemon, &mut receiver, waiter, 1);
+        // Production needs capacity to open between refusal and immediate cleanup admission.
+        // This seam injects refusal after registration without a timing race.
+        daemon
+            .runtime()
+            .unwrap()
+            .test_refuse_registered_owner_begins(1);
+        absorb_phase_test_pair(&mut state, &reserve);
+        assert!(!run_phase_test_ready(&mut daemon, &mut state));
+        let ControlContinuation::ManagedSpawn(operation) =
+            &state.pending_requests[&waiter].continuation
+        else {
+            panic!("the managed continuation must retain the pending release");
+        };
+        let reservation = operation.test_spawn_reservation().unwrap();
+        assert_eq!(reservation.session_id(), &session_id);
+        let release = collect_phase_pair(&daemon, &mut receiver, waiter, 5);
+        absorb_phase_test_pair(&mut state, &release);
+        assert!(run_phase_test_ready(&mut daemon, &mut state));
+        assert_eq!(
+            response_rx.try_recv().unwrap().unwrap_err().kind,
+            "spawn_failed"
+        );
+        assert_eq!(
+            reservation.state(),
+            botster_core::SessionReservationState::Released
+        );
+        assert!(daemon.runtime().unwrap().retained_reservations().is_empty());
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_session_context(&session_id.0)
+                .is_none()
+        );
+        assert!(state.pending_requests.is_empty());
+        assert!(state.owner_ready.is_empty());
+        assert_eq!(state.budget.outstanding(), 0);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_retry_retained_wakes_after_registered_refusal() {
+        use crate::daemon::control::pending::{READY_INITIAL, mark_owner_ready};
+        let (mut daemon, mut state, root) = spawn_fixture("direct-phase-gap");
+        let runtime = daemon.runtime().unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        runtime.bind_data_plane_owner_wake(sender);
+        let setup_waiter = runtime.next_waiter_id().unwrap();
+        let mut tokens = Vec::new();
+        for (index, name) in ["phase-gap-retained-a", "phase-gap-retained-b"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut reserve =
+                runtime.begin_reserve_session_for_owner(setup_waiter, SessionId(name.into()));
+            collect_phase_pair(&daemon, &mut receiver, setup_waiter, 1 + index as u64 * 2);
+            let CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                result: Ok(token), ..
+            })) = reserve.poll(runtime)
+            else {
+                panic!("the fixture must reserve both retained tokens");
+            };
+            runtime.retain_reservation(token.clone());
+            tokens.push(token);
+        }
+        let waiter = runtime.next_waiter_id().unwrap();
+        state.current_waiter_id = Some(waiter);
+        // The first retained release refuses after registration. The next release is admitted.
+        runtime.test_refuse_registered_owner_begins(1);
+        let ControlStep::Pending(step) = handle_daemon_spawn(
+            &daemon,
+            &mut state,
+            "phase-gap-retained-a".into(),
+            "exit 0".into(),
+        ) else {
+            panic!("the direct spawn must retain its continuation");
+        };
+        state.current_waiter_id = None;
+        insert_phase_test_row(&mut state, waiter, step.continuation);
+        assert!(mark_owner_ready(
+            &mut state,
+            waiter,
+            crate::daemon::owner_schedule::ReadyClass::CoreCompletion,
+            READY_INITIAL
+        ));
+        assert!(!run_phase_test_ready(&mut daemon, &mut state));
+        let release = collect_phase_pair(&daemon, &mut receiver, waiter, 3);
+        absorb_phase_test_pair(&mut state, &release);
+        assert!(!run_phase_test_ready(&mut daemon, &mut state));
+        assert_eq!(
+            tokens[1].state(),
+            botster_core::SessionReservationState::Released
+        );
+        // The requested ID remains reserved by the first token, so no child can launch.
+        let reserve = collect_phase_pair(&daemon, &mut receiver, waiter, 5);
+        absorb_phase_test_pair(&mut state, &reserve);
+        assert!(run_phase_test_ready(&mut daemon, &mut state));
+        assert_eq!(
+            daemon.runtime().unwrap().retained_reservations(),
+            vec![tokens[0].clone()]
+        );
+        assert_eq!(
+            state.retained_explicit_reservations,
+            vec![tokens[0].clone()]
+        );
+        assert!(state.pending_requests.is_empty());
+        assert!(state.owner_ready.is_empty());
+        assert_eq!(state.budget.outstanding(), 0);
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     const MATCHED_WORKER: &str = "/tmp/core-d1a-candidate-20260911-5/botster-session-worker";

@@ -151,6 +151,21 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
 }
 
 impl CoordinationContinuation {
+    #[cfg(test)]
+    pub(super) fn empty_for_phase_test(waiter_id: WaiterId) -> Self {
+        Self {
+            waiter_id,
+            ticket: None,
+            response: None,
+            completed: None,
+            rejected: None,
+            delivery_failure: None,
+            terminal_drop_probe: None,
+            disposal: None,
+            entry: None,
+        }
+    }
+
     fn collect(&mut self) -> bool {
         if self.completed.is_some() || self.response.is_none() {
             return true;
