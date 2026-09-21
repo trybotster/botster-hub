@@ -26,6 +26,7 @@ use crate::persistence::{
     HubAuditEntry, HubState, LocalRuntimeSettings, PackageAdmissionDecision, SchemaMetadata,
     TrustedBrowserIdentity,
 };
+use crate::recovery::record::{AttemptId, ManagedIdentity, RecoveryLedger, RecoveryRecord};
 use crate::session_types::PackageSessionType;
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::{Worktree, WorktreeGitMetadata};
@@ -167,6 +168,7 @@ impl HeapSize for HubState {
             admission_decisions,
             runtime_settings,
             audit_history,
+            recovery,
         } = self;
         schema_version.add_to(walk);
         host.add_to(walk);
@@ -183,6 +185,68 @@ impl HeapSize for HubState {
         admission_decisions.add_to(walk);
         runtime_settings.add_to(walk);
         audit_history.add_to(walk);
+        recovery.add_to(walk);
+    }
+}
+
+impl HeapSize for RecoveryLedger {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            last_sequence,
+            records,
+        } = self;
+        last_sequence.add_to(walk);
+        records.add_to(walk);
+    }
+}
+
+impl HeapSize for AttemptId {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self { host_id, sequence } = self;
+        host_id.add_to(walk);
+        sequence.add_to(walk);
+    }
+}
+
+impl HeapSize for RecoveryRecord {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            attempt,
+            session_id,
+            managed,
+            phase: _,
+            confirmed: _,
+        } = self;
+        attempt.add_to(walk);
+        session_id.add_to(walk);
+        managed.add_to(walk);
+    }
+}
+
+impl HeapSize for ManagedIdentity {
+    fn add_to(&self, walk: &mut HeapWalk) {
+        let Self {
+            target_id,
+            worktree_id,
+            repository_root,
+            path,
+            common_dir,
+            branch,
+            base_commit,
+            head_commit,
+            created_worktree,
+            created_branch,
+        } = self;
+        target_id.add_to(walk);
+        worktree_id.add_to(walk);
+        repository_root.add_to(walk);
+        path.add_to(walk);
+        common_dir.add_to(walk);
+        branch.add_to(walk);
+        base_commit.add_to(walk);
+        head_commit.add_to(walk);
+        created_worktree.add_to(walk);
+        created_branch.add_to(walk);
     }
 }
 
