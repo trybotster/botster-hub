@@ -28,6 +28,14 @@ Lint cleanup is not the primary work. Full accounting, client behavior, integrat
 
 ### Verified checkpoints
 
+Raw-Content prefix checkpoint `79cbb51c` is integrated as `df63bce9`; Fable verified 15 passing tests and exact artifact/source provenance.
+Scratch-model checkpoint `7b3786a6` is integrated as `63c11d02`; Fable verified 20 passing tests, including the reserve(4) counterexample.
+These are dormant terms, not complete materialization accounting. Scanner completeness, tagged/outer failure retention, and total capacity remain open.
+The next implementation connects the actual repository decoder caller to one charged materialization permit. Delivery drafts remain separate.
+Ignored nesting is not bounded by the parser recursion limit. Fund actual stack growth without imposing a new nesting limit.
+Separate deserializer passes do not coexist; use their maximum workspace requirement rather than summing them.
+No compiler slot is assigned. The latest integrated combination still needs a combined verification run.
+
 Dormant schema checkpoint `37ed78ff` is integrated as `708cf0b1`. Fable verified the four-file scope, artifact provenance, and 13 passing tests.
 Formatting and library/test compilation passed. Matching warning sets are unchanged apart from an existing diagnostic's shifted line.
 This establishes dormant schema traversal only. Production wiring, scratch, failure-prefix retention, and the combined live maximum remain open.
