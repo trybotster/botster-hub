@@ -1118,6 +1118,72 @@ mod state_owner_tests {
     }
 
     #[test]
+    fn hook_error_keys_return_conversion_errors() {
+        let memory = memory();
+        let mut state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
+        let shared: Arc<dyn Error + Send + Sync> = Arc::new(InstructionBudgetExceeded);
+        state.hold_instruction_error(
+            memory
+                .reserve_shared_callback_storage(crate::lua_memory::layout::arc_bytes::<
+                    InstructionBudgetExceeded,
+                >())
+                .unwrap(),
+        );
+        let lua = state.lua();
+        lua.set_memory_limit(memory.limits().per_vm_bytes).unwrap();
+        let budget = Arc::new(AtomicU64::new(1_000));
+        let hook_budget = Arc::clone(&budget);
+        lua.set_hook(
+            HookTriggers::new().every_nth_instruction(1_000),
+            move |_lua, _debug| {
+                let previous = hook_budget.fetch_sub(1_000, Ordering::Relaxed);
+                if previous <= 1_000 {
+                    return Err(mlua::Error::ExternalError(Arc::clone(&shared)));
+                }
+                Ok(VmState::Continue)
+            },
+        )
+        .unwrap();
+        sandbox::install(lua).unwrap();
+        let tables: (Table, Table) = lua
+            .load(
+                r#"
+                local ok, e = pcall(function() while true do end end)
+                assert(not ok and type(e) == 'userdata')
+                return {k = e, z = 2}, {[e] = 1, z = 2, a = 3}
+                "#,
+            )
+            .eval()
+            .expect("the plugin must return control after it catches the hook error");
+        eprintln!(
+            "producer-returned budget={}",
+            budget.load(Ordering::Relaxed)
+        );
+        let control = lua_json::value_size(&memory, lua, &Value::Table(tables.0));
+        let Err(AdmissionError::Runtime(error)) = control else {
+            panic!("the value-only control must return an unsupported-value error");
+        };
+        eprintln!("value-control error={error}");
+        assert!(error.to_string().contains("unsupported value type `error`"));
+        eprintln!("before-key-walker");
+        let key_table = Value::Table(tables.1);
+        let result = lua_json::value_size(&memory, lua, &key_table);
+        let Err(AdmissionError::Runtime(key_error)) = result else {
+            panic!("the key walker must return an unsupported-value error");
+        };
+        eprintln!("key-walker error={key_error}");
+        assert_eq!(key_error.to_string(), error.to_string());
+
+        // Admit a valid shape to exercise both build scans with the invalid key.
+        let valid: Value = lua.load("return {a = 3, z = 2, k = 1}").eval().unwrap();
+        let admission = lua_json::value_size(&memory, lua, &valid).unwrap();
+        let prepaid = admission.prepaid(&memory).unwrap();
+        let build_error = lua_json::value_build(lua, &key_table, prepaid).unwrap_err();
+        eprintln!("key-build error={build_error}");
+        assert_eq!(build_error.to_string(), error.to_string());
+    }
+
+    #[test]
     fn instruction_budget_hook_reuses_shared_external_error() {
         let memory = memory();
         let mut state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
