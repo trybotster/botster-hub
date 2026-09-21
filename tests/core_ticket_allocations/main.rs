@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use botster_hub::test_internals::allocation_oracle::{self, Phase, Scenario};
 
+mod parser;
+
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos", target_vendor = "apple")))]
 compile_error!("The C1 allocation oracle supports only aarch64-apple-darwin.");
 
@@ -303,6 +305,21 @@ fn main() -> ExitCode {
         || option_env!("C1_ORACLE_TARGET") != Some(TARGET)
     {
         eprintln!("The oracle must use the reviewed build script and pinned compiler/target.");
+        return ExitCode::FAILURE;
+    }
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--parser")
+    {
+        if arguments.len() != 2 {
+            eprintln!("Use --parser with one directory for fixture evidence.");
+            return ExitCode::FAILURE;
+        }
+        return parser::run(std::path::Path::new(&arguments[1]));
+    }
+    if !arguments.is_empty() {
+        eprintln!("Unknown oracle arguments.");
         return ExitCode::FAILURE;
     }
     let stdout = io::stdout();

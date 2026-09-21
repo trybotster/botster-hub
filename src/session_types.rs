@@ -22,6 +22,9 @@ use crate::spawn_targets::{SpawnTarget, list_spawn_targets};
 
 mod bounded_catalog;
 
+#[cfg(feature = "allocation-oracle")]
+pub(crate) mod parser_probe;
+
 /// Package-, device-, or repo-provided session type definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageSessionType {
