@@ -562,8 +562,7 @@ fn scan_size_keys(
         .reserve_callback_bytes(pair_scan_ref_bytes())
         .map_err(capacity)?;
     scratch.add_refs(pair_scan_ref_bytes(), 2);
-    for pair in table.pairs::<Value, Value>() {
-        let (key, _item) = pair?;
+    for_each_admitted::<Value, Value>(&table, |key, _item| {
         let collected = collect_key(memory, &key)?;
         if let CollectedKey::Utf8 { text, .. } = &collected {
             let bytes = text.capacity();
@@ -587,9 +586,32 @@ fn scan_size_keys(
             frame.key_slots = new_cap.saturating_mul(size_of::<CollectedKey>());
         }
         scratch.note();
-    }
+        Ok(())
+    })?;
     drop(pair_refs);
     scratch.sub_refs(pair_scan_ref_bytes(), 2);
+    Ok(())
+}
+
+fn for_each_admitted<K: mlua::FromLua, V: mlua::FromLua>(
+    table: &Table,
+    mut function: impl FnMut(K, V) -> Result<(), super::AdmissionError>,
+) -> Result<(), super::AdmissionError> {
+    let mut failure = None;
+    let result = table.for_each::<K, V>(|key, value| {
+        match function(key, value) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                failure = Some(error);
+                // Stop iteration without allocating. Return the original error below.
+                Err(mlua::Error::StackError)
+            }
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    result?;
     Ok(())
 }
 
@@ -630,18 +652,18 @@ fn take_build_child(frame: &mut BuildFrame) -> Result<Child, mlua::Error> {
 fn scan_build_keys(frame: &mut BuildFrame) -> Result<(), mlua::Error> {
     let table = frame.table.clone();
     let mut count = 0usize;
-    for pair in table.pairs::<Value, Value>() {
-        pair?;
+    table.for_each::<Value, Value>(|_key, _item| {
         count += 1;
-    }
+        Ok(())
+    })?;
     let BuildKind::Object { keys, .. } = &mut frame.kind else {
         unreachable!("object scan");
     };
     keys.reserve_exact(count);
-    for pair in table.pairs::<Value, Value>() {
-        let (key, _item) = pair?;
+    table.for_each::<Value, Value>(|key, _item| {
         keys.push(collect_key_unfunded(&key)?);
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1281,5 +1303,50 @@ mod tests {
             };
             assert_eq!(ours, from, "{source}");
         }
+    }
+    #[test]
+    fn admitted_iteration_preserves_errors_before_and_inside_the_callback() {
+        struct RefusedKey;
+        impl mlua::FromLua for RefusedKey {
+            fn from_lua(_: Value, _: &Lua) -> mlua::Result<Self> {
+                Err(mlua::Error::StackError)
+            }
+        }
+        let lua = Lua::new();
+        let table: Table = lua.load("return {first = 1, second = 2}").eval().unwrap();
+        let mut calls = 0;
+        let result = for_each_admitted::<RefusedKey, Value>(&table, |_, _| {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(calls, 0);
+        assert!(matches!(
+            result,
+            Err(super::super::AdmissionError::Runtime(
+                mlua::Error::StackError
+            ))
+        ));
+
+        let result = for_each_admitted::<Value, Value>(&table, |_, _| {
+            calls += 1;
+            Err(super::super::AdmissionError::Capacity)
+        });
+        assert_eq!(calls, 1, "capacity refusal must stop iteration immediately");
+        assert!(matches!(
+            result,
+            Err(super::super::AdmissionError::Capacity)
+        ));
+
+        let result = for_each_admitted::<Value, Value>(&table, |_, _| {
+            Err(super::super::AdmissionError::Runtime(
+                mlua::Error::RuntimeError("original callback failure".into()),
+            ))
+        });
+        let Err(super::super::AdmissionError::Runtime(error)) = result else {
+            panic!("the original runtime error must survive iteration");
+        };
+        assert!(
+            matches!(error, mlua::Error::RuntimeError(ref message) if message == "original callback failure")
+        );
     }
 }
