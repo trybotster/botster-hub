@@ -89,6 +89,7 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 - Spawn premise review accepted independent stage-machine extraction, ingress/owner integration, charged materialization interface, and receipt lifecycle. Implementation may proceed without a new planning gate.
 - Root rejected an uncharged repository-parser fallback for production activation. Isolated accounted fixtures may verify lifecycle components, but do not close full configured-target S1 acceptance.
 - Recovery premise review accepted isolated schema/store implementation. Last-writer-wins persistence and restored-snapshot sequence reuse remain explicit identity/durability gates until actual supported writer exclusion is verified.
+- Recovery review found `inspect` and `run-one` can load/save state without the daemon's socket-owner lock. Concurrent saves can lose newer records and sequence advances. Root accepted this as an R1 activation blocker. The repair must cover one persisted document across socket configurations and preserve supported CLI behavior.
 - `client_api.rs` bare-ID context removal is a shared integration surface. Exact-generation context changes must cover that caller before acceptance.
 - The claimed list/show wrapped-error producer was disproved: exported Lua wrappers validate arguments. No wrapper migration is approved on that premise.
 - Shared Publish/Drain key allocation before reservation is recorded separately. The spawn-only input proposal does not repair those callers.
