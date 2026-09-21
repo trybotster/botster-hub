@@ -11,6 +11,13 @@ pub mod allocation_oracle {
 }
 
 #[cfg(feature = "allocation-oracle")]
+pub mod parser_probe {
+    pub use crate::session_types::parser_probe::{
+        Case, PreparedProbe, ProbePhase, definition_layout, environment_node_bound,
+    };
+}
+
+#[cfg(feature = "allocation-oracle")]
 pub mod hub_state_heap {
     pub use crate::hub_state_heap::{HeapWalk, admitted_pretty, walk_hub_state};
 }
