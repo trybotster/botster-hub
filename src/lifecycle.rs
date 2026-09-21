@@ -30,6 +30,56 @@ pub(crate) const BACKGROUND_COMPLETION_ALLOWANCE: usize = 4 * 1024;
 
 const PACKAGE_ENTITY_NAMESPACE_V1_MARKER: &str = "bns1_";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerResourcePreparationError {
+    LayoutOverflow,
+    Capacity(crate::lua_memory::LuaMemoryCapacityError),
+    ResourceCount,
+}
+
+/// Admit the wait Context and Core resource metadata before constructing the batch.
+/// This is not full worker accounting. It excludes Thread handles, stacks, TLS,
+/// stopping and cancellation allocations, invocation storage, and the Lua VM.
+/// Admission shares the existing total_callback_bytes allowance with live callbacks.
+fn prepare_worker_resources(
+    memory: &Arc<crate::lua_memory::LuaMemoryAccount>,
+    workers: usize,
+) -> Result<botster_core::plugin_worker::PluginWorkerResources, WorkerResourcePreparationError> {
+    use crate::lua_memory::layout::{plugin_worker_metadata_bytes, plugin_worker_resource_bytes};
+    use botster_core::plugin_worker::{PluginWorkerResource, PluginWorkerResources};
+
+    if workers == 0 {
+        return Err(WorkerResourcePreparationError::ResourceCount);
+    }
+    let worker_bytes =
+        plugin_worker_resource_bytes().ok_or(WorkerResourcePreparationError::LayoutOverflow)?;
+    let metadata_bytes = plugin_worker_metadata_bytes(workers)
+        .ok_or(WorkerResourcePreparationError::LayoutOverflow)?;
+    let total = worker_bytes
+        .checked_mul(workers)
+        .and_then(|bytes| bytes.checked_add(metadata_bytes))
+        .ok_or(WorkerResourcePreparationError::LayoutOverflow)?;
+    let mut charge = memory
+        .reserve_shared_callback_storage(total)
+        .map_err(WorkerResourcePreparationError::Capacity)?;
+    let metadata = charge
+        .split(metadata_bytes)
+        .expect("worker metadata is part of the admitted total");
+    let mut resources =
+        PluginWorkerResources::with_capacity(workers, PluginWorkerResource::new(metadata));
+    for _ in 0..workers {
+        let worker = charge
+            .split(worker_bytes)
+            .expect("each worker is part of the admitted total");
+        if let Err(resource) = resources.try_push(PluginWorkerResource::new(worker)) {
+            // No worker has started. Release the refused resource and the batch.
+            drop(resource);
+            return Err(WorkerResourcePreparationError::ResourceCount);
+        }
+    }
+    Ok(resources)
+}
+
 /// Map an exact package id to its canonical single-segment entity owner token.
 #[must_use]
 pub fn package_entity_owner_token(package_id: &str) -> String {
@@ -600,6 +650,94 @@ fn registration_for(
 
 fn plugin_key_for(record: &PackageRecord) -> PluginKey {
     PluginKey(record.manifest.name.clone())
+}
+
+#[cfg(test)]
+mod worker_resource_tests {
+    use super::{WorkerResourcePreparationError, prepare_worker_resources};
+    use crate::lua_memory::layout::{plugin_worker_metadata_bytes, plugin_worker_resource_bytes};
+    use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+    use std::sync::Arc;
+
+    fn account(bytes: usize) -> Arc<LuaMemoryAccount> {
+        LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: 1,
+            total_callback_bytes: bytes,
+        })
+        .expect("explicit test limits")
+    }
+
+    fn total(workers: usize) -> usize {
+        plugin_worker_resource_bytes().expect("reviewed target") * workers
+            + plugin_worker_metadata_bytes(workers).expect("reviewed target")
+    }
+
+    #[test]
+    fn unused_worker_batch_retains_then_releases_its_complete_charge() {
+        let bytes = total(2);
+        let memory = account(bytes);
+        let batch = prepare_worker_resources(&memory, 2).expect("funded batch");
+        assert_eq!(memory.usage(), (0, bytes));
+        drop(batch);
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn worker_batch_refusal_preserves_an_existing_reservation() {
+        let bytes = total(2);
+        let memory = account(bytes * 2 - 1);
+        let previous = prepare_worker_resources(&memory, 2).expect("previous batch");
+        let error = match prepare_worker_resources(&memory, 2) {
+            Err(error) => error,
+            Ok(_) => panic!("replacement must not exceed the existing account"),
+        };
+        let WorkerResourcePreparationError::Capacity(error) = error else {
+            panic!("refusal must report account capacity");
+        };
+        assert_eq!(error.requested, bytes);
+        assert_eq!(error.available, bytes - 1);
+        assert_eq!(memory.usage(), (0, bytes));
+        drop(previous);
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn worker_batch_refusal_one_byte_short_leaves_usage_zero() {
+        let bytes = total(2);
+        let memory = account(bytes - 1);
+        let error = match prepare_worker_resources(&memory, 2) {
+            Err(error) => error,
+            Ok(_) => panic!("the entire batch must be admitted before allocation"),
+        };
+        let WorkerResourcePreparationError::Capacity(error) = error else {
+            panic!("refusal must report account capacity");
+        };
+        assert_eq!(error.requested, bytes);
+        assert_eq!(error.available, bytes - 1);
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn zero_workers_fails_before_account_admission() {
+        let memory = account(total(2));
+        assert!(matches!(
+            prepare_worker_resources(&memory, 0),
+            Err(WorkerResourcePreparationError::ResourceCount)
+        ));
+        assert_eq!(memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn worker_layout_overflow_refuses_before_account_admission() {
+        let memory = account(total(2));
+        assert!(matches!(
+            prepare_worker_resources(&memory, usize::MAX),
+            Err(WorkerResourcePreparationError::LayoutOverflow)
+        ));
+        assert_eq!(memory.usage(), (0, 0));
+    }
 }
 
 #[cfg(test)]
