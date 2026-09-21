@@ -39,11 +39,12 @@ Lint cleanup is not the primary work. Full accounting, client behavior, integrat
 | Track | Owner and source boundary | Next deliverable and decisive check | Status |
 | --- | --- | --- | --- |
 | Lua safety | Existing Hub Codex/Fable pair. Owns `lua_runtime/lua_json.rs` and the hook/test regions of `lua_runtime.rs` until handoff. | Isolated Error-key baseline; supported iterator repair if confirmed; then a separate saturating-counter checkpoint. Verify error parity and repeated exhaustion/reset. | Authorized work. Latest execution result must come from the live writer, not the source review. |
-| S1/S2 spawn and conversion | New Codex/Fable pair, separate branch. Owns `runtime.rs`, ordinary daemon spawn integration, `spawn_input.rs`, and `session_type_spawn.rs`. | Implement the daemon consumer, staged input admission, Host materialization, exact-generation conversion/disposal, and the two-ID production-path proof. | Pair creation in progress. No implementation by the new pair is claimed yet. |
-| R1 recovery | New Codex/Fable pair, separate branch. Initially owns new recovery module files and isolated persistence tests. | Reconstruct the surviving contract; implement policy-independent write-ahead transitions and restart classification; return a concrete operator/capacity decision packet. | Pair creation in progress. Historical revision-6 temporary design and review files are missing. |
+| S1/S2 spawn and conversion | Codex/Fable pair on `delivery/async-spawn-20260921`. Owns `runtime.rs`, ordinary daemon spawn integration, `spawn_input.rs`, and `session_type_spawn.rs`. | Implement the daemon consumer, staged input admission, Host materialization, exact-generation conversion/disposal, and the two-ID production-path proof. | Both sessions are running. Bounded premise review precedes independent implementation. |
+| R1 recovery | Codex/Fable pair on `delivery/durable-recovery-20260921`. Initially owns new recovery module files and isolated persistence tests. | Reconstruct the surviving contract; implement policy-independent write-ahead transitions and restart classification; return a concrete operator/capacity decision packet. | Both sessions are running. Historical revision-6 temporary design and review files are missing. |
 | Core support | Existing Core pair. Read-only reports in its persistent worktree. | No new Core prerequisite found. Reuse the reservation API; do not repeat D1(a). | Assigned source reviews complete. No compiler ownership. |
 
-The safety pair keeps its current compiler slot until release. Root grants later slots explicitly.
+The safety pair keeps its current compiler slot until release. Its latest report says the fixture is ready for review; no compiler is running.
+Root grants later slots explicitly. A reserved slot is not evidence of an active process or completed check.
 Only one Botster compiler runs at a time: Rust 1.97.0, two build jobs, incremental compilation disabled.
 Spawn and recovery use separate persistent worktrees based on the reviewed integration source.
 Separate worktrees do not permit conflicting ownership. Root approves shared-file patches and merges them in dependency order.
@@ -51,10 +52,21 @@ Recovery must request integration hooks from the spawn owner; it must not indepe
 The spawn pair must wait for the safety handoff before editing the owned JSON walker or hook regions.
 That boundary does not block independent daemon consumer, receipt, or recovery implementation.
 
+Current feature sessions:
+
+- Spawn writer: `sess-1790026283-001b-831bec162af5cabf5a3b42375a529a08`; reviewer: `sess-1790026295-001c-058661451ae4bf5cf9e371481df5be04`.
+- Recovery writer: `sess-1790026323-001d-e6d217aea97a81912f0f72631d9dcee9`; reviewer: `sess-1790026335-001e-2200a15351f039615bc70ba8075e41fd`.
+- Safety writer: `sess-1790019339-0017-0db7d72fffa856605f6fbe4bf77f9236`; reviewer: `sess-1790019351-0018-71bfe4dbd98d67e5a198db16765a1660`.
+
+Spawn worktree: `/Users/jasonconigliari/botster-sessions/botster-hub-async-spawn-20260921`.
+Recovery worktree: `/Users/jasonconigliari/botster-sessions/botster-hub-durable-recovery-20260921`.
+Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc101cb`.
+
 ### Current decisions and blockers
 
 - S1 input uses staged admission, not a full 8 MiB reservation across the asynchronous wait. Whole-allowance prepayment remains unapproved.
 - Original input charges must move with queued requests and survive caller timeout. Queue, materialization, context, and result charges remain separate obligations.
+- Lua handle conversion can occur before a Rust callback body. The entry allowance and reentrancy proof remain open; body-only charging does not close them.
 - Repository loading must preserve full definitions and environment data. The existing 4 MiB file ceiling is not permission to narrow accepted configurations.
 - The catalog's file-plus-scratch 16 MiB formula is conservative, not a proved minimum. A smaller full-definition bound remains unverified.
 - Exact-generation context ownership must preserve retained reads after session removal. Bare session IDs do not authorize replacement-generation cleanup.
