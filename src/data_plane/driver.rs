@@ -146,6 +146,9 @@ impl CoreRequest {
 #[cfg(feature = "allocation-oracle")]
 pub(crate) mod allocation_oracle;
 
+#[cfg(test)]
+mod local_reply_tests;
+
 #[derive(Debug)]
 struct CoreCompletionWake {
     pending: AtomicBool,
@@ -466,6 +469,43 @@ pub(crate) struct CoreWaiterRetirement {
     waiter_id: WaiterId,
 }
 
+/// One local reply uses the existing owner completion collector.
+/// The receipt that owns this publisher must not be cloned.
+#[derive(Debug)]
+#[allow(dead_code)] // The daemon spawn receipt will own this publisher.
+pub(crate) struct CoreReplyPublisher<T>(CoreTicketPublisher<T>);
+
+#[allow(dead_code)] // The daemon spawn receipt will publish its conversion result.
+impl<T> CoreReplyPublisher<T> {
+    pub(crate) fn publish(self, value: T) {
+        self.0.publish(value);
+    }
+}
+
+impl CoreWaiterRetirement {
+    #[allow(dead_code)] // The daemon spawn continuation will register this receipt.
+    fn local_reply<T>(
+        &self,
+        charge: crate::lua_memory::LuaCallbackCharge,
+    ) -> Result<(ChargedCoreTicket<T>, CoreReplyPublisher<T>), crate::lua_memory::LuaCallbackCharge>
+    {
+        let Some(bytes) = retained_reply_bytes::<T>() else {
+            return Err(charge);
+        };
+        if charge.bytes() < bytes {
+            return Err(charge);
+        }
+        let Some(identities) = self.wake.register_phases(self.waiter_id, 1) else {
+            return Err(charge);
+        };
+        let identity = identities[0];
+        let lease = crate::lua_memory::LuaCallbackStorageLease::new(charge);
+        let (ticket, publisher) =
+            CoreTicket::channel_with_lease(identity, Arc::clone(&self.wake), true, Some(lease));
+        Ok((ChargedCoreTicket { ticket }, CoreReplyPublisher(publisher)))
+    }
+}
+
 pub(crate) struct CoreSubmission<T> {
     pub(crate) ticket: ChargedCoreTicket<T>,
     pub(crate) rejected: Option<CoreRejectedRequest>,
@@ -780,6 +820,21 @@ pub(crate) struct CoreDaemonHandle {
 }
 
 impl CoreDaemonHandle {
+    /// Register a local reply after the owner collects its previous Core phases.
+    /// The charge funds channel storage. Shared registration storage remains separate.
+    #[allow(dead_code)] // The daemon spawn continuation will register this receipt.
+    pub(crate) fn local_reply_for_owner<T>(
+        &self,
+        retirement: &CoreWaiterRetirement,
+        charge: crate::lua_memory::LuaCallbackCharge,
+    ) -> Result<(ChargedCoreTicket<T>, CoreReplyPublisher<T>), crate::lua_memory::LuaCallbackCharge>
+    {
+        if !Arc::ptr_eq(&self.completion_wake, &retirement.wake) {
+            return Err(charge);
+        }
+        retirement.local_reply(charge)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_refuse_registered_owner_begins(&self, count: usize) {
         self.refuse_registered_owner_begins
