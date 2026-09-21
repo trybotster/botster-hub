@@ -86,6 +86,10 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 - Error-key iterator safety remains a reproduction gate. Do not run a crash candidate inside the user's active runtime.
 - Safety review accepted the isolated reproducer and supervisor, conditional on selecting and hashing the executable from the successful build output. Execution results remain pending.
 - Spawn stage admission must charge request/channel and phase-registration storage; waiter identity alone is not an accounting proof. The spawn pair owns this bounded interface repair.
+- Spawn premise review accepted independent stage-machine extraction, ingress/owner integration, charged materialization interface, and receipt lifecycle. Implementation may proceed without a new planning gate.
+- Root rejected an uncharged repository-parser fallback for production activation. Isolated accounted fixtures may verify lifecycle components, but do not close full configured-target S1 acceptance.
+- Recovery premise review accepted isolated schema/store implementation. Last-writer-wins persistence and restored-snapshot sequence reuse remain explicit identity/durability gates until actual supported writer exclusion is verified.
+- `client_api.rs` bare-ID context removal is a shared integration surface. Exact-generation context changes must cover that caller before acceptance.
 - The claimed list/show wrapped-error producer was disproved: exported Lua wrappers validate arguments. No wrapper migration is approved on that premise.
 - Shared Publish/Drain key allocation before reservation is recorded separately. The spawn-only input proposal does not repair those callers.
 
