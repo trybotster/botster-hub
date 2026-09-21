@@ -54,6 +54,7 @@ That boundary does not block independent daemon consumer, receipt, or recovery i
 
 Root assigned the crate-private local receipt factory in `data_plane/driver.rs` to the spawn pair, subject to its exact lifecycle review.
 Root assigned minimal recovery fields/defaults in `persistence.rs` and module registration in `lib.rs` to the recovery pair.
+The recovery pair also owns the exact recovery-field accounting changes in `hub_state_heap.rs`.
 Recovery must reuse the single existing Hub state document/store and verify old-snapshot compatibility.
 The existing serialization-before-charge boundary remains a G1 production-activation blocker, not permission to create another store.
 Spawn is next in the compiler queue after the safety checkpoint. Recovery follows when its reviewed tests are ready.
@@ -78,6 +79,8 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 - Exact-generation context ownership must preserve retained reads after session removal. Bare session IDs do not authorize replacement-generation cleanup.
 - No new Core interface is required by the reviewed S1 trace. Accepted-ID retention is a separate fault-contract candidate, not a proved normal reservation leak.
 - R1 operator resolution, retention, recovery capacity, state-clone/serialization capacity, and exceptional-stop policy remain unselected. No silent eviction or new numeric limit is authorized.
+- Recovery schema compatibility is an integration gate. Verify that old readers/writers reject incompatible records; a version bump alone does not prove protection. No live migration is authorized.
+- Proposed durable IDs use a persisted host-scoped sequence, not runtime-local WaiterId. Overflow, restore, concurrent writes, and non-reuse require review.
 - The instruction counter has a source-confirmed wraparound path after caught exhaustion errors. Saturation repairs arithmetic, not general catchable-error or native-stall containment.
 - Error-key iterator safety remains a reproduction gate. Do not run a crash candidate inside the user's active runtime.
 - The claimed list/show wrapped-error producer was disproved: exported Lua wrappers validate arguments. No wrapper migration is approved on that premise.
