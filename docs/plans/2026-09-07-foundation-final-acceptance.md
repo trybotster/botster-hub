@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Root authorized spawn writer 001b to simplify source selection in `src/session_types.rs` only, including parity tests.
+The change reuses borrowed selection, migrates all three owned callers, and removes full-vector clones and owned sorting without changing selection semantics.
+Reviewer 0018 must check the frozen patch, iterator-signature change, all callers, diagnostic peer order, target eligibility, and qualified loser behavior before compilation.
+Recovery pair jointly selected terminal outcome handling (C). Ordinary successful drain prevents late state writers; panic/unwind bypasses that drain and remains unproved.
+The pair found post-rename path-clone and long-path CString allocations. The coordinated plan must remove or pre-fund them without adding a path limit.
+Descriptor-relative checks must preserve pathname-replacement detection. No source grant for recovery or compiler slot is assigned.
+The existing terminal wait and process-driver final disposition remain open; reporting an unresolved outcome does not prove retention or restart safety.
+
 Recovery pair corrected the lifecycle premise: successful tracked `serve_daemon` drain receives completions before stop; terminal disposal can discard typed outcomes.
 Root selected interception before opaque disposal, charged terminal evidence, and an owned unresolved outcome returned by explicit stop as the API direction.
 Report known synced commits even when the reply is lost. Published sync uncertainty must retain candidate, prior view, and authority; printing is not reconciliation.
