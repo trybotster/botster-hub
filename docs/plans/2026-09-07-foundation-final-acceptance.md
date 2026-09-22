@@ -12,6 +12,27 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Delivery contract and priorities
 
+### Decision handoff — September 21, resumed assignments
+
+Jason approved one writer per state directory. While the daemon owns the directory, `run-one` refuses immediately with a clear ownership error.
+`inspect` reads through the daemon. Without the daemon, standalone persistence and fresh-state creation remain unchanged.
+The recovery pair owns the implementation and independent review. The pair must identify additional CLI file ownership before edits.
+Verification must cover every writer, socket configurations, path aliases, lock lifetime, daemon failure, and stale snapshot prevention.
+This decision does not authorize live migration, installation, or runtime replacement.
+
+Jason selected per-plugin memory budgets. Standalone per-plugin accounts are approved in principle with existing limits.
+Do not assume a lifecycle instance contains exactly one plugin. Trace plugin identity and account lifetime before wiring.
+Whether Hub-hosted plugins also replace the shared Hub account remains an unanswered clarification. Do not change that policy yet.
+
+The live terminal audit found all eight sessions at prompts; session activity labels did not establish useful work.
+The spawn reviewer had repeated API safeguard errors. Root assigned the available Hub Fable reviewer to the pending independent review.
+The spawn writer must correct the unescaped-string excess reservation while preserving frozen replay source and evidence.
+The next acceptance target remains real daemon spawn, conversion acknowledgement, exact-generation cleanup, and a responsive sibling request.
+The recovery pair resumes state ownership independently. Both assignments were queued; acknowledgment is not yet verified.
+No compiler slot is granted. Root retains integration and publication ownership. Completed Core and safety implementation work stays stopped.
+
+### Delivery scope
+
 Deliver usable Workspaces rendering, asynchronous coordination and spawn, responsive siblings, and charged ownership through shutdown.
 Core owns generic execution. Hub owns admission, correlation, supervision, recovery policy, and its persistence document.
 Host workers perform filesystem and repository work. Lua composes product behavior. Web and TUI own client behavior and presentation.
@@ -70,8 +91,8 @@ Additional capacity refusals require concrete accounting evidence and an explici
 Worker resource helpers `9885c8e4` are reviewed, pushed, and integrated as `871c061a`. Five tests and restored controls passed.
 Strict lint reports 135 errors on that helper branch, including four new unused-helper diagnostics. Full integration lint is unmeasured.
 Allocation sizing remains source-derived; an independent oracle and actual worker-join lifetime checks remain open.
-Their constructor/load wiring awaits Jason's standalone-account policy choice.
-The choices are an account per standalone instance with existing limits, or an explicit public account API. Neither is approved yet.
+Jason selected per-plugin budgets. Constructor/load wiring must establish plugin-to-account ownership before implementation.
+Standalone per-plugin accounts may use existing limits. The Hub-hosted account policy remains unresolved.
 
 Iterator repair `6921e27d` is committed after Fable verified 28 passing tests on the combined spawn/safety source.
 The former Error-key crash now returns the same typed error as the value path. General execution isolation remains open.
@@ -122,7 +143,7 @@ Root assigned minimal recovery fields/defaults in `persistence.rs` and module re
 The recovery pair also owns the exact recovery-field accounting changes in `hub_state_heap.rs`.
 Recovery must reuse the single existing Hub state document/store and verify old-snapshot compatibility.
 The existing serialization-before-charge boundary remains a G1 production-activation blocker, not permission to create another store.
-Recovery worker helpers are integrated without constructor/load wiring. B1 remains pending; no uncharged fallback is approved.
+Recovery worker helpers are integrated without constructor/load wiring. Hub account scope remains pending; no uncharged fallback is approved.
 
 Current feature sessions:
 
@@ -158,7 +179,7 @@ Both branches start at documentation checkpoint `8438b4ae`, whose source is `9cc
 - Recovery premise review accepted isolated schema/store implementation. Last-writer-wins persistence and restored-snapshot sequence reuse remain explicit identity/durability gates until actual supported writer exclusion is verified.
 - Recovery review found `inspect` and `run-one` can load/save state without the daemon's socket-owner lock. Concurrent saves can lose newer records and sequence advances. Root accepted this as an R1 activation blocker. The repair must cover one persisted document across socket configurations and preserve supported CLI behavior.
 - The proposed read-only `inspect`/`run-one` startup mode is not approved. It changes persistent behavior, including fresh-state creation. A startup proof token alone does not establish exclusion for every later store write. Keep that policy/API decision separate from isolated recovery implementation.
-- Jason has been asked whether concurrent `run-one` should fail immediately while `inspect` routes through the owning daemon, with standalone persistence unchanged. The choice is pending; no command behavior change is approved yet.
+- Jason approved immediate concurrent `run-one` refusal and daemon-backed `inspect`, with standalone persistence unchanged. Implementation and ownership verification remain open.
 - Inconsistent-ledger startup refusal needs an explicit diagnostic/operator recovery contract before activation. Adjacent lock-file aliasing and unlink/recreation behavior also remain unproved; inode-keyed flock alone does not establish document identity.
 - `client_api.rs` bare-ID context removal is a shared integration surface. Exact-generation context changes must cover that caller before acceptance.
 - The claimed list/show wrapped-error producer was disproved: exported Lua wrappers validate arguments. No wrapper migration is approved on that premise.
