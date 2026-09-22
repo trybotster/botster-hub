@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Root authorized a narrow construction-error sizing checkpoint after inspecting the existing parser formatting arithmetic and reviewer verdict 21.
+Writer 001b owns `materialization_error.rs`; `bounded_catalog.rs` may only expose `validation_error_text_bytes` if its covered family is verified.
+The checkpoint shares checked formatting arithmetic without changing parser bounds. Construction errors must not inherit Serde boxes or position terms.
+It must enumerate concrete error families, wrapper overlap, overflow refusal, and exclusions. I/O coverage and funded construction remain unresolved.
+No generic formatter, runtime caller change, reader extraction, message change, or unnecessary candidate accumulator is authorized.
+Reviewer 0018 must review the frozen source and proposed tests before a compiler grant. No compiler slot is assigned.
+The reader reuse check confirmed partial mechanisms only: catalog projection loses required fields, local Budget is not Lua funding, and snapshot semantics differ.
+Evidence: writer `repository-reader-reuse-check.md` and reviewer `21-reuse-verdict.md` in the existing evidence directories.
+
 Reviewer 0018 accepted the trait JSON derivation in source: maximum encoded length 4,193 bytes and conservative buffer overlap 16,772 bytes.
 These are allocation-request bounds, not measured allocation peaks or executed tests. No complete materialization permit follows.
 Construction-error formatting still needs demonstrated reuse of the existing bound. Source selection still lacks funded acquisition and collect/sort correspondence.
