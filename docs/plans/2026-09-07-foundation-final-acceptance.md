@@ -14,6 +14,17 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Current spawn gate: Root froze new source application after independent review identified excessive overlapping unverified surfaces.
+The writer must report exact HEAD, all tracked/untracked changes, safety import status, source hashes, and a bounded verification plan.
+The reviewer must examine that exact combined baseline before Root grants the single compiler slot.
+The applied wake changes belong in this freeze; do not describe it as replay plus receipt/reply only.
+Unapplied counting, timeline, cleanup, client-context, and ingress proposals are parked. Resume one connected surface after baseline verification.
+This gate supersedes earlier permissions to apply independent spawn changes. Preserve all existing drafts; no rollback or deletion is requested.
+Independent reviewer accepted the original replay-only evidence: 29 tests passed, artifact/source hashes matched, and warning counts matched.
+Verdict: `/Users/jasonconigliari/botster-evidence/hub-async-spawn-review-20260921-fable/01-frozen-replay-evidence-verdict.md`.
+That evidence does not verify the current combined source. Root's sequencing mistake allowed source drafts to accumulate before combined compilation.
+Replacement rule: review and verify one frozen connected baseline before applying another overlapping surface.
+
 Jason approved one writer per state directory. While the daemon owns the directory, `run-one` refuses immediately with a clear ownership error.
 `inspect` reads through the daemon. Without the daemon, standalone persistence and fresh-state creation remain unchanged.
 The recovery pair owns the implementation and independent review. The pair must identify additional CLI file ownership before edits.
