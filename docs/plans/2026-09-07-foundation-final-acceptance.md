@@ -28,6 +28,14 @@ Lint cleanup is not the primary work. Full accounting, client behavior, integrat
 
 ### Verified checkpoints
 
+Dormant adapter `c2cfb2b4` is integrated as `cd755e3b`. Fable verified compilation, 26 passing tests, and copied artifact provenance.
+Only six files had explicit per-command hashes. Per-command Git status also showed the three omitted committed parser modules unchanged.
+The capture limitation is recorded; no concrete discrepancy requires a rerun. Future runs must validate the complete requested first-party hash set.
+RawValue capture was withdrawn: capture can allocate workspace and fail before returning a malformed value's span.
+The replacement adapter advances a token cursor through existing schema seeds. It is not a public parser or an active materialization permit.
+Numeric/ignored failure parity, counting-pass funding, one combined allocation timeline, error/output ownership, and production wiring remain open.
+The next source work connects those obligations at the repository materialization caller. No compiler slot is assigned.
+
 Raw-Content prefix checkpoint `79cbb51c` is integrated as `df63bce9`; Fable verified 15 passing tests and exact artifact/source provenance.
 Scratch-model checkpoint `7b3786a6` is integrated as `63c11d02`; Fable verified 20 passing tests, including the reserve(4) counterexample.
 These are dormant terms, not complete materialization accounting. Scanner completeness, tagged/outer failure retention, and total capacity remain open.
