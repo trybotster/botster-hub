@@ -14,6 +14,21 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core baseline `053148f6` reproduced the obsolete paste fixture failure at the same assertion with the correct working directory.
+The reviewed test-only replacement uses scheme-2 unsafe paste, exact routed identity, wake-driven completion, and typed zero byte counts.
+Its exact case and all 13 client integration tests passed. Reviewer 001a accepted artifact `614e624a` and the raw execution records.
+Combined focused behavior evidence covers 77 disjoint passing cases across unchanged library/session source and the repaired client test.
+The fixture is committed separately as `d4f92ccb`. Identity patch `3a634ee5` remains frozen and uncommitted.
+The non-strict focused lint inventory completed with 53 diagnostics. It is not strict acceptance.
+Root authorized one four-file cleanup for those diagnostics. Patch `097492af` is frozen for reviewer 001a; no build or cleanup commit is granted yet.
+The cleanup preserves StepFailure and uses five narrow lint expectations for intentional rich failure diagnostics. Runtime policy remains unchanged.
+
+Hub fixed-deduction patch `1e186b89` passed source review, including derived lease/oracle layout checks.
+Root assigned the sole compiler slot as `fixed-deduction-v1`: fresh library artifact, inventory 1,242, six exact tests, memory group 53, acknowledgement group nine.
+The test counts overlap. Preserve source/artifact hashes and compare warning records against 83; stop on any failure or mismatch.
+The Hub pair separately prepares the actual ordinary daemon path, using existing exact-loss reply machinery rather than a new notifier.
+Registration before handle escape, proposed field/drop order, and both completion/receipt observation orders still need implementation proof.
+
 Core behavior verification currently has 76 passing cases and one unresolved client integration failure.
 Behavior v1 used the wrong working directory for a source-reading test. V2 used the crate directory and passed all 12 session integration tests.
 The remaining paste test sends scheme-1 frames and expects JSON results. Current source rejects that input before admission and emits binary results.
