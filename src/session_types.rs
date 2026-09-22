@@ -34,6 +34,9 @@ mod materialization_error;
 #[allow(dead_code)] // The charged materialization caller is not connected yet.
 mod materialization_walk;
 
+#[allow(dead_code)] // The charged materialization boundary owns this model.
+mod materialization_timeline;
+
 #[allow(dead_code)] // The full-definition counting walk will supply scratch events.
 mod scratch_budget;
 

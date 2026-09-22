@@ -41,6 +41,17 @@ pub(super) struct ScratchEvent {
 }
 
 impl ScratchStorage {
+    /// Preserve a prior owner when error replay reduces a cursor prediction.
+    /// A historical growth maximum can overstate the current transition.
+    /// It cannot omit the current transition's simultaneous scratch buffers.
+    pub(super) fn conservative_observation(&self, retained_floor: usize) -> ScratchEvent {
+        let retained = self.capacity.max(retained_floor);
+        ScratchEvent {
+            live: self.peak.max(retained),
+            retained,
+        }
+    }
+
     /// Model Vec::reserve with Rust 1.97's u8 minimum capacity and doubling.
     /// Refusal leaves the model unchanged.
     pub(super) fn reserve(&mut self, additional: usize) -> Option<ScratchEvent> {
