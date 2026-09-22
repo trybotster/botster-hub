@@ -14,6 +14,19 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+### Continuation — September 22
+
+Root resumed the authorized implementation and review assignments after checking live agent status.
+The reviewed Core pin is integrated and pushed as `f128195b`. Downstream compilation remains unverified.
+Spawn writer 001b remains at `ecb9eb02` with changes in runtime.rs, runtime/session_spawn.rs, session_types.rs, and new lua_runtime/spawn_input.rs.
+The writer reports shared stage construction, retained variable allowance, and charged input projection. None of this production work is accepted or activated yet.
+The next source checkpoint defines terminal cleanup transitions before disposal wiring. Reviewer 0018 checks the actual ownership and field order.
+Recovery reviewers found that existing terminal completion handling can retain a row and finish cleanup before Core stops.
+Unresolved rows need explicit ownership. Charges retain their Arc account, but tickets become unusable after Core stops; a result value alone does not preserve a live runtime.
+The recovery pair will specify the exceptional-stop caller boundary. No new restart protocol or automatic stop policy is approved.
+The completed safety agent 0017 is absent from the live inventory. Its shared integration worktree and evidence remain intact.
+No compiler slot is assigned. The denied full-workspace command still requires direct user approval; the request to continue does not override that denial.
+
 Core published cleanup `ab1a7cee` and reservation identity `891e220295427fd93991638d7c62ba40fa25d4ae` on the recovery branch. Main remains `053148f6`.
 The full-workspace command did not start: automatic approval review rejected the tool-delivered grant and requires direct user authorization.
 Root requested that approval. No retry, alternative tool, native build, or dependency-download bypass is authorized. The compiler slot is free.
