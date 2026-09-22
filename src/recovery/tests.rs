@@ -85,6 +85,142 @@ fn observation(record: &RecoveryRecord) -> RestartObservation<'_> {
 }
 
 #[test]
+fn receipt_classification_preserves_pending_follow_up() {
+    let fixture = Fixture::new();
+    for receipt in [
+        Receipt::WorktreeNeverCreated,
+        Receipt::ConversionAcknowledged,
+        Receipt::SessionNeverCreated,
+        Receipt::SessionRemovedAndReleased,
+        Receipt::WorktreeRollbackCompleted,
+    ] {
+        for managed_created in [None, Some(false), Some(true)] {
+            if matches!(
+                receipt,
+                Receipt::WorktreeNeverCreated | Receipt::WorktreeRollbackCompleted
+            ) && managed_created != Some(true)
+            {
+                continue;
+            }
+            let identity = managed_created.map(|created| {
+                let mut identity = managed(&fixture);
+                identity.created_worktree = created;
+                identity.created_branch = created;
+                identity
+            });
+            let mut ledger = RecoveryLedger::default();
+            ledger
+                .admit("host", "session".into(), identity, policy(1))
+                .unwrap();
+            let record = &mut ledger.records[0];
+            record.phase = Phase::ReceiptRecorded(receipt);
+            record.confirmed = match receipt {
+                Receipt::WorktreeNeverCreated => ConfirmedFacts {
+                    worktree_never_created: true,
+                    ..ConfirmedFacts::default()
+                },
+                Receipt::ConversionAcknowledged => ConfirmedFacts {
+                    session_installed: true,
+                    conversion_acknowledged: true,
+                    ..ConfirmedFacts::default()
+                },
+                Receipt::SessionNeverCreated => ConfirmedFacts {
+                    session_never_created: true,
+                    ..ConfirmedFacts::default()
+                },
+                Receipt::SessionRemovedAndReleased => ConfirmedFacts {
+                    session_installed: true,
+                    session_removed_and_released: true,
+                    ..ConfirmedFacts::default()
+                },
+                Receipt::WorktreeRollbackCompleted => ConfirmedFacts {
+                    session_never_created: true,
+                    worktree_rollback_completed: true,
+                    ..ConfirmedFacts::default()
+                },
+            };
+            ledger.validate("host").unwrap();
+            let pending = receipt == Receipt::ConversionAcknowledged
+                || (managed_created == Some(true)
+                    && matches!(
+                        receipt,
+                        Receipt::SessionNeverCreated | Receipt::SessionRemovedAndReleased
+                    ));
+            let record = &ledger.records[0];
+            assert_eq!(
+                classify_restart(&ledger, record, observation(record)),
+                if pending {
+                    RestartClassification::ReceiptRecordedFollowUpPending
+                } else {
+                    RestartClassification::ReceiptRecorded
+                },
+                "{receipt:?}, created={managed_created:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn terminal_classification_matches_absence_of_permitted_successors() {
+    let fixture = Fixture::new();
+    let phases = [
+        Phase::Intent(Effect::CreateWorktree),
+        Phase::Intent(Effect::SpawnSession),
+        Phase::Intent(Effect::CleanupSession),
+        Phase::Intent(Effect::RollbackWorktree),
+        Phase::EffectRecorded(Effect::CreateWorktree),
+        Phase::EffectRecorded(Effect::SpawnSession),
+        Phase::EffectRecorded(Effect::CleanupSession),
+        Phase::EffectRecorded(Effect::RollbackWorktree),
+        Phase::ReceiptRecorded(Receipt::WorktreeNeverCreated),
+        Phase::ReceiptRecorded(Receipt::ConversionAcknowledged),
+        Phase::ReceiptRecorded(Receipt::SessionNeverCreated),
+        Phase::ReceiptRecorded(Receipt::SessionRemovedAndReleased),
+        Phase::ReceiptRecorded(Receipt::WorktreeRollbackCompleted),
+    ];
+    for managed_created in [None, Some(false), Some(true)] {
+        let identity = managed_created.map(|created| {
+            let mut identity = managed(&fixture);
+            identity.created_worktree = created;
+            identity.created_branch = created;
+            identity
+        });
+        let mut initial = RecoveryLedger::default();
+        let id = initial
+            .admit("host", "session".into(), identity, policy(1))
+            .unwrap();
+        let mut pending = vec![initial];
+        let mut visited = Vec::new();
+        while let Some(ledger) = pending.pop() {
+            let record = &ledger.records[0];
+            if visited.contains(&record.phase) {
+                continue;
+            }
+            visited.push(record.phase);
+            ledger.validate("host").unwrap();
+            let mut has_successor = false;
+            for phase in phases {
+                let mut next = ledger.clone();
+                if next.transition(&id, "session", phase).is_ok() {
+                    has_successor = true;
+                    pending.push(next);
+                }
+            }
+            assert_eq!(
+                classify_restart(&ledger, record, observation(record))
+                    == RestartClassification::ReceiptRecorded,
+                !has_successor,
+                "{:?}, created={managed_created:?}",
+                record.phase
+            );
+        }
+        if managed_created == Some(true) {
+            assert_eq!(visited.len(), phases.len());
+        }
+    }
+}
+
+#[test]
 fn interrupted_intent_reload_retains_exact_ownership() {
     let fixture = Fixture::new();
     let state = fixture.state();
@@ -273,11 +409,30 @@ fn exact_receipts_gate_transitions_and_restart_does_not_authorize_rollback() {
     let record = &ledger.records[0];
     assert_eq!(
         classify_restart(&ledger, record, observation(record)),
-        RestartClassification::ReceiptRecorded
+        RestartClassification::ReceiptRecordedFollowUpPending
     );
     ledger
         .transition(&id, "session", Phase::Intent(Effect::RollbackWorktree))
         .unwrap();
+    ledger
+        .transition(
+            &id,
+            "session",
+            Phase::EffectRecorded(Effect::RollbackWorktree),
+        )
+        .unwrap();
+    ledger
+        .transition(
+            &id,
+            "session",
+            Phase::ReceiptRecorded(Receipt::WorktreeRollbackCompleted),
+        )
+        .unwrap();
+    let record = &ledger.records[0];
+    assert_eq!(
+        classify_restart(&ledger, record, observation(record)),
+        RestartClassification::ReceiptRecorded
+    );
 }
 
 #[test]
@@ -583,6 +738,6 @@ fn confirmed_session_head_change_does_not_erase_receipt_classification() {
     seen.managed = Some(&changed);
     assert_eq!(
         classify_restart(&ledger, record, seen),
-        RestartClassification::ReceiptRecorded
+        RestartClassification::ReceiptRecordedFollowUpPending
     );
 }
