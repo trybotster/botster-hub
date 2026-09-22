@@ -14,6 +14,12 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Construction-error sizing source `6bd7bf75` is integrated as `60f864b6`. The two-file cherry-pick completed without conflicts.
+Independent verification remains scoped to the source branch. No fresh whole-integration build or production acceptance is claimed.
+The writer is idle after the accepted checkpoint. No compiler slot or further implementation assignment is active.
+Remaining construction gates include funded repository acquisition, collection allocation correspondence, and environment path acquisition.
+The broader stack, context, Core transfer, recovery, and ordinary daemon-consumer gates remain open. This checkpoint does not waive them.
+
 Reviewer 0018 verified construction-error sizing execution in verdict 23. Root accepted the checkpoint and authorized its normal two-file commit.
 Six new exact tests and the ErrorImpl guard each passed once. The enclosing group passed seven tests; the counts overlap.
 The fresh artifact contains 1,220 tests. All 1,014 source hashes matched, format and diff checks passed, and 83 warnings remained unchanged.
