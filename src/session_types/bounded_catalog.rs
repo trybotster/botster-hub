@@ -1062,7 +1062,7 @@ fn schema_error_text_bytes() -> usize {
     fixed.max(wrong_shape).max(derived_field)
 }
 
-fn validation_error_text_bytes() -> usize {
+pub(super) fn validation_error_text_bytes() -> usize {
     // These maxima include the borrowed target and package/device validators.
     longest_text(&[
         "session type id must be a non-empty token of at most 128 characters",
