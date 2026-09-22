@@ -3,6 +3,8 @@
 use super::*;
 
 mod reply;
+#[cfg(test)]
+pub(crate) use reply::spawn_reply_channel;
 
 /// The plugin reports this outcome only after it attempts Lua conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
