@@ -234,6 +234,44 @@ impl RecoveryLedger {
 }
 
 impl RecoveryRecord {
+    fn has_successor(&self) -> bool {
+        use Effect::{CleanupSession, CreateWorktree, RollbackWorktree, SpawnSession};
+        use Phase::{EffectRecorded, Intent, ReceiptRecorded};
+        use Receipt::{
+            ConversionAcknowledged, SessionNeverCreated, SessionRemovedAndReleased,
+            WorktreeNeverCreated, WorktreeRollbackCompleted,
+        };
+        let mut candidate = Intent(CreateWorktree);
+        loop {
+            if self.permits(candidate) {
+                return true;
+            }
+            // Enumerate phases, not permitted transitions. Exhaustive matches
+            // require this enumeration to cover each new enum variant.
+            candidate = match candidate {
+                Intent(effect) => match effect {
+                    CreateWorktree => Intent(SpawnSession),
+                    SpawnSession => Intent(CleanupSession),
+                    CleanupSession => Intent(RollbackWorktree),
+                    RollbackWorktree => EffectRecorded(CreateWorktree),
+                },
+                EffectRecorded(effect) => match effect {
+                    CreateWorktree => EffectRecorded(SpawnSession),
+                    SpawnSession => EffectRecorded(CleanupSession),
+                    CleanupSession => EffectRecorded(RollbackWorktree),
+                    RollbackWorktree => ReceiptRecorded(WorktreeNeverCreated),
+                },
+                ReceiptRecorded(receipt) => match receipt {
+                    WorktreeNeverCreated => ReceiptRecorded(ConversionAcknowledged),
+                    ConversionAcknowledged => ReceiptRecorded(SessionNeverCreated),
+                    SessionNeverCreated => ReceiptRecorded(SessionRemovedAndReleased),
+                    SessionRemovedAndReleased => ReceiptRecorded(WorktreeRollbackCompleted),
+                    WorktreeRollbackCompleted => return false,
+                },
+            };
+        }
+    }
+
     fn valid_shape(&self) -> bool {
         let phase_matches_facts = match self.phase {
             Phase::ReceiptRecorded(Receipt::WorktreeNeverCreated) => {
@@ -357,6 +395,7 @@ pub(crate) enum StateSource {
 pub(crate) enum RestartClassification {
     IntentRecordedNoCompletion,
     EffectRecordedNoReceipt,
+    ReceiptRecordedFollowUpPending,
     ReceiptRecorded,
     IdentityMismatch,
     LedgerReset,
@@ -385,6 +424,9 @@ pub(crate) fn classify_restart(
     match record.phase {
         Phase::Intent(_) => RestartClassification::IntentRecordedNoCompletion,
         Phase::EffectRecorded(_) => RestartClassification::EffectRecordedNoReceipt,
+        Phase::ReceiptRecorded(_) if record.has_successor() => {
+            RestartClassification::ReceiptRecordedFollowUpPending
+        }
         Phase::ReceiptRecorded(_) => RestartClassification::ReceiptRecorded,
     }
 }
