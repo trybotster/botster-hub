@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Hub fixed-deduction source `64bcb3af` is integrated as `e79dc3fb`. The single-file patch matches reviewed `1e186b89`.
+Independent review accepted six exact tests and the 53/9 regression groups against the 1,242-test artifact. Counts overlap.
+Artifact: `b51b9e3283d5551371aacea17165dc28c7cbdc974dba19928a94318ba9c4814d`. All 1,014 source hashes remained unchanged.
+Warnings remain at 83 records. One unused-method record now includes `split_fixed`; no other diagnostic changed.
+This closes the fixed-deduction primitive checkpoint only. The actual daemon spawn boundary is under review; no activation or fresh integration build is claimed.
+Core cleanup `097492af` passed source review. Root granted `core-lint-cleanup-v1` for strict focused lint and fresh 21/12/5 test groups.
+Core owns the sole compiler slot. Its cleanup and identity commits remain gated on verification.
+
 Core baseline `053148f6` reproduced the obsolete paste fixture failure at the same assertion with the correct working directory.
 The reviewed test-only replacement uses scheme-2 unsafe paste, exact routed identity, wake-driven completion, and typed zero byte counts.
 Its exact case and all 13 client integration tests passed. Reviewer 001a accepted artifact `614e624a` and the raw execution records.
