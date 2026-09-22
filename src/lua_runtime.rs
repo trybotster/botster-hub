@@ -40,6 +40,7 @@ use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktre
 
 mod acknowledge_input;
 mod sandbox;
+mod spawn_input;
 pub(crate) use acknowledge_input::ownership::{
     CoordinationDelivery, CoordinationFailure, CoordinationOutcome as HubCoordinationResponse,
     CoordinationRefusal, CoordinationReply, CoordinationReplySender, CoordinationStorage,

@@ -90,7 +90,7 @@ pub(crate) mod publication;
 pub(crate) mod resync;
 mod session_spawn;
 use provider::{ProviderExpectation, ProviderRequestPlan};
-use session_spawn::SessionTypeSpawnStart;
+pub(crate) use session_spawn::SessionTypeSpawnStart;
 #[cfg(test)]
 pub(crate) use session_spawn::spawn_reply_channel;
 #[allow(unused_imports)] // The owner continuation will use the conversion outcome.
@@ -5604,6 +5604,7 @@ pub(crate) fn core_bridge_error(error: CoreTicketError) -> CoreDaemonError {
 #[derive(Debug)]
 pub struct CoreOperationTracker {
     stage: CoreOperationStage,
+    accepted_id: Option<PendingOperationId>,
 }
 
 #[derive(Debug)]
@@ -5624,6 +5625,7 @@ impl CoreOperationTracker {
         let (ticket, completion) = ticket.into_parts();
         Self {
             stage: CoreOperationStage::Begin { ticket, completion },
+            accepted_id: None,
         }
     }
 
@@ -5636,12 +5638,32 @@ impl CoreOperationTracker {
         }
     }
 
+    /// Preserve the accepted identity for exact recovery after completion loss.
+    pub(crate) fn accepted_id(&self) -> Option<PendingOperationId> {
+        self.accepted_id
+    }
+
     /// Non-blocking progress. `Ready(Err)` carries a `begin` rejection or a
     /// completion error; `Ready(Ok)` carries the completion.
     pub fn poll(
         &mut self,
         _runtime: &HubRuntime,
     ) -> CoreTicketPoll<Result<CoreCompletion, CoreDaemonError>> {
+        self.poll_without_reaping()
+    }
+
+    /// Collect at most the two phases this tracker owns, then read their results.
+    pub(crate) fn poll_terminal(
+        &mut self,
+    ) -> CoreTicketPoll<Result<CoreCompletion, CoreDaemonError>> {
+        match &self.stage {
+            CoreOperationStage::Begin { ticket, completion } => {
+                ticket.collect_ready_phase();
+                completion.collect_ready_phase();
+            }
+            CoreOperationStage::Pending { completion, .. } => completion.collect_ready_phase(),
+            CoreOperationStage::Done => {}
+        }
         self.poll_without_reaping()
     }
 
@@ -5662,6 +5684,7 @@ impl CoreOperationTracker {
                     return CoreTicketPoll::Ready(Err(error));
                 }
                 CoreTicketPoll::Ready(Ok(id)) => {
+                    self.accepted_id = Some(id);
                     let previous = std::mem::replace(&mut self.stage, CoreOperationStage::Done);
                     let CoreOperationStage::Begin { completion, .. } = previous else {
                         unreachable!("the Core operation is in its begin phase");
@@ -5766,16 +5789,16 @@ fn spawn_fail(
 impl ManagedSessionSpawnStart {
     pub(crate) fn poll(&mut self, runtime: &HubRuntime) -> PluginSpawnPoll {
         loop {
-            if let Some(pending_id) = self.tracker.pending_id()
-                && matches!(self.stage, PluginSpawnStage::Reserve)
-            {
-                self.reserve_operation_id = Some(pending_id);
-            }
             match self.stage {
                 PluginSpawnStage::RetryRetained => {
                     return spawn_fail(CoreDaemonError::Shutdown, None);
                 }
-                PluginSpawnStage::Reserve => match self.tracker.poll(runtime) {
+                PluginSpawnStage::Reserve => match {
+                    let result = self.tracker.poll(runtime);
+                    // Poll can accept begin and lose completion in the same call.
+                    self.reserve_operation_id = self.tracker.accepted_id();
+                    result
+                } {
                     CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
                     CoreTicketPoll::Refused => {
                         return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
@@ -6515,6 +6538,102 @@ pub(crate) mod tests {
         DataDirectoryOption, HostIdentityOptions, HubStartupOptions, RuntimeEnvironment,
         SessionDefaults, TransportBindings,
     };
+
+    #[test]
+    fn tracker_keeps_accepted_identity_after_success_without_pending_identity() {
+        let id = PendingOperationId(73);
+        let mut tracker = CoreOperationTracker {
+            stage: CoreOperationStage::Begin {
+                ticket: CoreTicket::resolved(Ok(id)),
+                completion: CoreTicket::resolved(CoreCompletion::RemoveSession {
+                    id,
+                    result: Ok(true),
+                }),
+            },
+            accepted_id: None,
+        };
+        assert_eq!(tracker.accepted_id(), None);
+        assert_eq!(tracker.pending_id(), None);
+        assert!(matches!(
+            tracker.poll_without_reaping(),
+            CoreTicketPoll::Ready(Ok(CoreCompletion::RemoveSession { id: actual, .. }))
+                if actual == id
+        ));
+        assert_eq!(tracker.accepted_id(), Some(id));
+        assert_eq!(tracker.pending_id(), None);
+    }
+
+    #[test]
+    fn tracker_begin_error_does_not_create_an_accepted_identity() {
+        let mut tracker = CoreOperationTracker {
+            stage: CoreOperationStage::Begin {
+                ticket: CoreTicket::resolved(Err(CoreDaemonError::Shutdown)),
+                completion: CoreTicket::resolved(CoreCompletion::RemoveSession {
+                    id: PendingOperationId(74),
+                    result: Ok(true),
+                }),
+            },
+            accepted_id: None,
+        };
+        assert!(matches!(
+            tracker.poll_without_reaping(),
+            CoreTicketPoll::Ready(Err(CoreDaemonError::Shutdown))
+        ));
+        assert_eq!(tracker.accepted_id(), None);
+        assert_eq!(tracker.pending_id(), None);
+    }
+
+    #[test]
+    fn tracker_pre_admission_refusal_has_no_accepted_identity() {
+        let runtime = family_runtime("tracker-refused-before-admission");
+        runtime.test_refuse_next_owner_begins(1);
+        let waiter_id = runtime.next_waiter_id().unwrap();
+        let mut tracker = runtime.begin_reserve_session_for_owner(
+            waiter_id,
+            SessionId("tracker-refused-before-admission".into()),
+        );
+        assert!(matches!(tracker.poll(&runtime), CoreTicketPoll::Refused));
+        assert_eq!(tracker.accepted_id(), None);
+        assert_eq!(tracker.pending_id(), None);
+    }
+
+    #[test]
+    fn tracker_pre_admission_loss_has_no_accepted_identity() {
+        let runtime = family_runtime("tracker-lost-before-admission");
+        runtime.test_lose_next_owner_begins(1);
+        let waiter_id = runtime.next_waiter_id().unwrap();
+        let mut tracker = runtime.begin_reserve_session_for_owner(
+            waiter_id,
+            SessionId("tracker-lost-before-admission".into()),
+        );
+        assert!(matches!(tracker.poll(&runtime), CoreTicketPoll::Lost));
+        assert_eq!(tracker.accepted_id(), None);
+        assert_eq!(tracker.pending_id(), None);
+    }
+
+    #[test]
+    fn tracker_layout_reports_selected_type_sizes() {
+        fn report<T>(name: &str) {
+            println!(
+                "{name}: size={} align={}",
+                std::mem::size_of::<T>(),
+                std::mem::align_of::<T>()
+            );
+        }
+        report::<CoreOperationTracker>("CoreOperationTracker");
+        report::<Option<CoreOperationTracker>>("Option<CoreOperationTracker>");
+        report::<PendingOperationId>("PendingOperationId");
+        report::<Option<PendingOperationId>>("Option<PendingOperationId>");
+        report::<CreatedWorktreeCleanup>("CreatedWorktreeCleanup");
+        report::<InflightPluginCore>("InflightPluginCore");
+        report::<ManagedSessionSpawnStart>("ManagedSessionSpawnStart");
+        report::<SessionTypeSpawnStart>("SessionTypeSpawnStart");
+        report::<Mutex<CoreOperationTracker>>("Mutex<CoreOperationTracker>");
+        println!(
+            "Arc storage for Mutex<CoreOperationTracker>: {}",
+            crate::lua_memory::layout::arc_bytes::<Mutex<CoreOperationTracker>>()
+        );
+    }
 
     pub(super) fn family_runtime(name: &str) -> HubRuntime {
         static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
