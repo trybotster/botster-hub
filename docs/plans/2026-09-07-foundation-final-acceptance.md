@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Reviewer 0018 accepted construction-error sizing source in verdict 22. Patch SHA256: `b52968dc9263bf4b47cf8f4640365bd9a7696c4fae5f1a7822b8d59f54efe4d0`.
+Exactly two files changed. The parser arithmetic is unchanged; concrete construction candidates include wrapper overlap without Serde-specific terms.
+Root granted writer 001b compiler slot `construction-error-sizing-v1` after checking that no Rust build was active.
+The grant covers one fresh library artifact, six exact new tests, their enclosing error group, and the ErrorImpl layout guard.
+Use Rust 1.97.0, two jobs, disabled incremental compilation, locked/offline dependencies, and unchanged target configuration.
+Preserve all 1,014 source hashes, raw results, artifact provenance, and warning comparison. Stop on any mismatch or failure before edits or reruns.
+Reviewer 0018 must verify execution evidence before commit acceptance. The checkpoint does not fund construction, cover I/O errors, or activate a permit.
+
 Root authorized a narrow construction-error sizing checkpoint after inspecting the existing parser formatting arithmetic and reviewer verdict 21.
 Writer 001b owns `materialization_error.rs`; `bounded_catalog.rs` may only expose `validation_error_text_bytes` if its covered family is verified.
 The checkpoint shares checked formatting arithmetic without changing parser bounds. Construction errors must not inherit Serde boxes or position terms.
