@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Recovery writer 001d found no safe startup-only activation: existing Host mutations still construct path-only writers outside retained authority.
+Root declined another dormant startup slice and assigned the shared authority/outcome lifecycle as the next recovery task.
+The writer must compare two concrete designs for authority transfer, late completion retention, retirement, capacity funding, and restart evidence.
+Reviewer 001e independently checks actual daemon/process owners and the late-worker failure path. No owner waits, polling, automatic rollback, or retry is authorized.
+The design must separate in-process retention from durable restart reconciliation and identify only genuine product choices. No edits or builds are assigned yet.
+Evidence: `durable-recovery-20260921/retained-startup-boundary-9.md` under `/Users/jasonconigliari/botster-evidence/`.
+Spawn writer 001b is investigating exact Rust 1.97 I/O allocation and finite-parent buffer growth; reviewer 0018 investigates collection allocation correspondence.
+Both implementation/review pairs have active assignments. No compiler slot is assigned.
+
 Jason approved retained authority for File startup saves: "Yes—require retained authority".
 Jason also removed backward-compatibility constraints globally: "No worry about backwards compatibility or old callers with anything. None of this is used yet".
 Do not add legacy shims or preserve unsafe unbound File saves. Migrate current repository callers when changing an interface.
