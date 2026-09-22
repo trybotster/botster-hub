@@ -1098,8 +1098,8 @@ fn effective_session_type_rows(
     by_id
         .into_values()
         .map(|sources| {
-            let winner = choose_effective_session_type(sources.clone())?;
-            Ok(effective_session_type_row(&winner, &sources))
+            let winner = choose_effective_session_type_ref(sources.iter())?;
+            Ok(effective_session_type_row(winner, sources.iter()))
         })
         .collect()
 }
@@ -1219,21 +1219,16 @@ fn find_source_session_type_with_row(
     session_type_id: &str,
 ) -> SessionTypeResult<(SourceSessionType, HubSessionType)> {
     let sources = source_session_types(records, state)?;
-    let matches = sources
-        .iter()
-        .filter(|source| {
-            source.session_type.id == session_type_id
-                || source_session_type_id(source) == session_type_id
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let winner = choose_effective_session_type(matches.clone())?;
+    let matches = sources.iter().filter(|source| {
+        source.session_type.id == session_type_id
+            || source_session_type_id(source) == session_type_id
+    });
+    let winner = choose_effective_session_type_ref(matches)?;
     let peers = sources
-        .into_iter()
-        .filter(|source| source.session_type.id == winner.session_type.id)
-        .collect::<Vec<_>>();
-    let row = effective_session_type_row(&winner, &peers);
-    Ok((winner, row))
+        .iter()
+        .filter(|source| source.session_type.id == winner.session_type.id);
+    let row = effective_session_type_row(winner, peers);
+    Ok((winner.clone(), row))
 }
 
 /// Canonical target-scoped effective winners used by list, show, resolve, and spawn.
@@ -1265,10 +1260,10 @@ fn target_scoped_effective_winners(
     by_id
         .into_values()
         .map(|peers| {
-            let winner = choose_effective_session_type(peers.clone())?;
-            let mut row = effective_session_type_row(&winner, &peers);
+            let winner = choose_effective_session_type_ref(peers.iter())?;
+            let mut row = effective_session_type_row(winner, peers.iter());
             row.target_id = target_id.to_string();
-            Ok((winner, row))
+            Ok((winner.clone(), row))
         })
         .collect()
 }
@@ -1372,13 +1367,12 @@ fn resolve_materialization_source(
     Ok((source, row, None))
 }
 
-fn effective_session_type_row(
+fn effective_session_type_row<'a>(
     winner: &SourceSessionType,
-    sources: &[SourceSessionType],
+    sources: impl Iterator<Item = &'a SourceSessionType>,
 ) -> HubSessionType {
     let mut row = session_type_row_from_source(winner);
     row.overridden_sources = sources
-        .iter()
         .filter(|source| source.rank < winner.rank)
         .map(|source| HubSessionTypeSource {
             kind: source.source.clone(),
@@ -1394,43 +1388,16 @@ fn effective_session_type_row(
     row
 }
 
-fn choose_effective_session_type(
-    mut matches: Vec<SourceSessionType>,
-) -> SessionTypeResult<SourceSessionType> {
-    if matches.is_empty() {
-        return Err(SessionTypeError::new(
-            "unknown_session_type",
-            "session type was not found",
-        ));
-    }
-    matches.sort_by_key(|source| source.rank);
-    let best_rank = matches
-        .last()
-        .expect("matches is not empty after early return")
-        .rank;
-    let mut best = matches
-        .into_iter()
-        .filter(|source| source.rank == best_rank)
-        .collect::<Vec<_>>();
-    match best.len() {
-        1 => Ok(best.remove(0)),
-        _ => Err(SessionTypeError::new(
-            "ambiguous_session_type",
-            "session type id matches more than one source at the same precedence",
-        )),
-    }
-}
-
-fn choose_effective_session_type_ref(
-    matches: &[SourceSessionType],
-) -> SessionTypeResult<&SourceSessionType> {
-    let Some(best_rank) = matches.iter().map(|source| source.rank).max() else {
+fn choose_effective_session_type_ref<'a>(
+    matches: impl Iterator<Item = &'a SourceSessionType> + Clone,
+) -> SessionTypeResult<&'a SourceSessionType> {
+    let Some(best_rank) = matches.clone().map(|source| source.rank).max() else {
         return Err(SessionTypeError::new(
             "unknown_session_type",
             "session type was not found",
         ));
     };
-    let mut best = matches.iter().filter(|source| source.rank == best_rank);
+    let mut best = matches.filter(|source| source.rank == best_rank);
     let winner = best.next().expect("best rank came from one source");
     if best.next().is_some() {
         return Err(SessionTypeError::new(
@@ -1845,6 +1812,296 @@ fn absolute_path(path: &Path) -> PathBuf {
 
 fn package_target_id(package_name: &str) -> String {
     format!("package:{package_name}")
+}
+
+#[cfg(test)]
+mod source_selection_tests {
+    use super::*;
+    use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
+    use crate::persistence::DeviceSessionTypeSource;
+
+    fn definition(label: &str) -> PackageSessionType {
+        serde_json::from_value(serde_json::json!({
+            "id": "worker", "label": label, "role": "agent.worker",
+            "interaction": "terminal", "lifecycle": "task", "command": "bin/worker",
+            "environment": {"FULL_VALUE": "value with spaces and = signs"},
+            "working_directory": {"policy": "relative", "path": "nested/work"}
+        }))
+        .unwrap()
+    }
+
+    fn source(rank: SessionTypeSourceRank, name: &str) -> SourceSessionType {
+        SourceSessionType {
+            rank,
+            source: match rank {
+                SessionTypeSourceRank::Package => "package",
+                SessionTypeSourceRank::Device => "device",
+                SessionTypeSourceRank::Repo => "repo",
+            }
+            .into(),
+            source_name: name.into(),
+            root: PathBuf::from("/owned/source"),
+            session_type: definition(name),
+            available: true,
+        }
+    }
+
+    fn assert_error<T: std::fmt::Debug>(result: SessionTypeResult<T>, kind: &str, message: &str) {
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, kind);
+        assert_eq!(error.message, message);
+    }
+
+    #[test]
+    fn borrowed_selector_preserves_rank_permutations_and_ties() {
+        use SessionTypeSourceRank::{Device, Package, Repo};
+        for ranks in [
+            [Package, Device, Repo],
+            [Package, Repo, Device],
+            [Device, Package, Repo],
+            [Device, Repo, Package],
+            [Repo, Package, Device],
+            [Repo, Device, Package],
+        ] {
+            let sources = ranks.map(|rank| source(rank, "candidate"));
+            let winner = choose_effective_session_type_ref(sources.iter()).unwrap();
+            assert_eq!(winner.rank, Repo);
+            assert!(std::ptr::eq(
+                winner,
+                sources.iter().find(|item| item.rank == Repo).unwrap()
+            ));
+        }
+        for ranks in [
+            vec![Package, Package],
+            vec![Package, Device, Device],
+            vec![Device, Package, Device],
+            vec![Device, Device, Package],
+            vec![Repo, Device, Repo],
+            vec![Package, Repo, Repo],
+        ] {
+            let sources: Vec<_> = ranks.into_iter().map(|rank| source(rank, "tie")).collect();
+            assert_error(
+                choose_effective_session_type_ref(sources.iter()),
+                "ambiguous_session_type",
+                "session type id matches more than one source at the same precedence",
+            );
+            assert_error(
+                effective_session_type_rows(sources),
+                "ambiguous_session_type",
+                "session type id matches more than one source at the same precedence",
+            );
+        }
+        let lower_tie = [
+            source(Package, "a"),
+            source(Package, "b"),
+            source(Device, "winner"),
+        ];
+        assert_eq!(
+            choose_effective_session_type_ref(lower_tie.iter())
+                .unwrap()
+                .source_name,
+            "winner"
+        );
+        assert_error(
+            choose_effective_session_type_ref(std::iter::empty()),
+            "unknown_session_type",
+            "session type was not found",
+        );
+    }
+
+    #[test]
+    fn rows_preserve_peer_order_and_complete_diagnostics() {
+        use SessionTypeSourceRank::{Device, Package, Repo};
+        let sources = vec![
+            source(Device, "device"),
+            source(Package, "first"),
+            source(Repo, "repo"),
+            source(Package, "second"),
+        ];
+        let mut expected = session_type_row_from_source(&sources[2]);
+        expected.overridden_sources = vec![
+            HubSessionTypeSource {
+                kind: "device".into(),
+                name: "device".into(),
+            },
+            HubSessionTypeSource {
+                kind: "package".into(),
+                name: "first".into(),
+            },
+            HubSessionTypeSource {
+                kind: "package".into(),
+                name: "second".into(),
+            },
+        ];
+        expected.diagnostics = vec!["overrides 3 lower-precedence definition(s)".into()];
+        assert_eq!(
+            effective_session_type_rows(sources).unwrap(),
+            vec![expected]
+        );
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        state: HubState,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "botster-source-selection-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let config = HubStartupOptions {
+                data_directory: DataDirectoryOption::Explicit(root.join("data")),
+                ..HubStartupOptions::default()
+            }
+            .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+            .unwrap();
+            let mut state = HubState::from_config(&config);
+            state.spawn_targets.clear();
+            state.device_session_type_sources = vec![DeviceSessionTypeSource {
+                root: root.clone(),
+                session_types: vec![definition("device")],
+            }];
+            Self { root, state }
+        }
+
+        fn repo(&mut self, id: &str, definitions: &[PackageSessionType]) {
+            let root = self.root.join(id);
+            fs::create_dir_all(root.join(".botster")).unwrap();
+            fs::write(
+                root.join(REPO_SESSION_TYPES_FILE),
+                serde_json::to_vec(&serde_json::json!({"session_types": definitions})).unwrap(),
+            )
+            .unwrap();
+            self.state.spawn_targets.push(SpawnTarget {
+                target_id: id.into(),
+                label: id.into(),
+                root,
+                enabled: true,
+                kind: "directory".into(),
+                base_ref: None,
+                metadata: BTreeMap::new(),
+            });
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn bare_and_qualified_lookup_preserve_diagnostic_peers_and_owned_values() {
+        let mut fixture = Fixture::new("qualified");
+        fixture.repo("repo", &[definition("repo")]);
+        let (bare, row) = find_source_session_type_with_row(&[], &fixture.state, "worker").unwrap();
+        let (qualified, qualified_row) =
+            find_source_session_type_with_row(&[], &fixture.state, "repo/worker").unwrap();
+        assert_eq!(row, qualified_row);
+        assert_eq!(
+            row.overridden_sources,
+            vec![HubSessionTypeSource {
+                kind: "device".into(),
+                name: "device".into()
+            }]
+        );
+        assert_eq!(
+            row.diagnostics,
+            vec!["overrides 1 lower-precedence definition(s)"]
+        );
+        assert_eq!(bare.session_type, qualified.session_type);
+        assert_eq!(bare.source_name, "repo");
+        let (device, device_row) =
+            find_source_session_type_with_row(&[], &fixture.state, "device/worker").unwrap();
+        assert_eq!(device.source_name, "device");
+        assert!(device_row.overridden_sources.is_empty());
+        drop(fixture);
+        assert_eq!(
+            qualified.session_type.environment["FULL_VALUE"],
+            "value with spaces and = signs"
+        );
+        assert_eq!(
+            qualified.session_type.working_directory,
+            PackageSessionTypeWorkingDirectory::Relative {
+                path: "nested/work".into()
+            }
+        );
+        assert_eq!(qualified.session_type.command, "bin/worker");
+    }
+
+    #[test]
+    fn target_lookup_selects_effective_winners_and_rejects_qualified_losers() {
+        let mut fixture = Fixture::new("target-winner");
+        fixture.repo("repo", &[definition("repo")]);
+        let winners = target_scoped_effective_winners(&[], &fixture.state, "repo").unwrap();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].0.source_name, "repo");
+        assert_eq!(winners[0].1.target_id, "repo");
+        assert_eq!(
+            winners[0].1.diagnostics,
+            vec!["overrides 1 lower-precedence definition(s)"]
+        );
+        let (owned, row) =
+            find_source_session_type_for_target(&[], &fixture.state, "repo/worker", "repo")
+                .unwrap();
+        assert_eq!(row, winners[0].1);
+        assert_error(
+            find_source_session_type_for_target(&[], &fixture.state, "device/worker", "repo"),
+            "unknown_session_type",
+            "session type was not found",
+        );
+        drop(fixture);
+        assert_eq!(
+            owned.session_type.environment["FULL_VALUE"],
+            "value with spaces and = signs"
+        );
+        assert_eq!(
+            owned.session_type.working_directory,
+            PackageSessionTypeWorkingDirectory::Relative {
+                path: "nested/work".into()
+            }
+        );
+    }
+
+    #[test]
+    fn target_eligibility_precedes_rank_and_preserves_exact_tie_errors() {
+        let mut fixture = Fixture::new("eligibility");
+        fixture.repo("requested", &[]);
+        fixture.repo("other", &[definition("other-repo")]);
+        let winners = target_scoped_effective_winners(&[], &fixture.state, "requested").unwrap();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].0.rank, SessionTypeSourceRank::Device);
+        assert!(winners[0].1.overridden_sources.is_empty());
+        assert_error(
+            find_source_session_type_for_target(&[], &fixture.state, "other/worker", "requested"),
+            "unknown_session_type",
+            "session type was not found",
+        );
+        fixture
+            .state
+            .device_session_type_sources
+            .push(DeviceSessionTypeSource {
+                root: fixture.root.clone(),
+                session_types: vec![definition("second-device")],
+            });
+        assert_error(
+            target_scoped_effective_winners(&[], &fixture.state, "requested"),
+            "ambiguous_session_type",
+            "session type id matches more than one source at the same precedence",
+        );
+        assert_error(
+            find_source_session_type_with_row(&[], &fixture.state, "device/worker"),
+            "ambiguous_session_type",
+            "session type id matches more than one source at the same precedence",
+        );
+    }
 }
 
 #[cfg(test)]
