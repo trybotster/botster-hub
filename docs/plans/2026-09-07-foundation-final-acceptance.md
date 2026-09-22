@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Reviewer 0018 accepted selector freeze `51b1bd05` in verdict 27 after checking all three callers, distinct filters, diagnostic order, and five parity tests.
+Root granted writer 001b compiler slot `source-selection-borrowed-v1` after confirming no Rust build was active.
+The grant covers one fresh artifact, five exact new tests, and relevant existing selection/target/catalog parity tests with positive inventory-matched counts.
+Use Rust 1.97, two jobs, disabled incremental compilation, locked/offline dependencies, and unchanged target configuration. Preserve all 1,014 hashes and warning comparison.
+Repeated predicate formatting is a disclosed cost; no net allocation-traffic or performance improvement is measured. Stop on failure before edits or reruns.
+Recovery pair confirmed a joint crash-evidence packet and holds further protocol variants pending restart policy and independent protocol review.
+The proposed slot still does not establish sticky-quarantine persistence. No recovery source or schema change is authorized.
+
 Recovery restart analysis found that existing RecoveryRecord cannot represent generic state mutation without a new schema/protocol.
 A bounded pending-slot candidate remains unapproved. Its clear rename can survive despite failed directory sync, so startup can see no marker after live quarantine.
 Confirmed candidate-data durability does not prove successful marker clearing or preserve quarantine across restart. The pair must not claim unconditional restart safety.
