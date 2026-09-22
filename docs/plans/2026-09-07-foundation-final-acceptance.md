@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Reviewer 0018 verified the v2 raw evidence in `hub-async-spawn-review-20260921-fable/14-v2-execution-verdict.md`.
+Root accepted the dormant nine-file checkpoint and authorized its normal commit. Integration awaits the writer's commit SHA.
+The reviewer recomputed the artifact hash and checked all 26 test results against the 1,214-test inventory.
+The specific 256-definition refusal concern is resolved at model scope. No quota change or capacity-policy decision is needed for that fixture.
+This does not establish observed allocation peaks, general capacity acceptance, or absence of conservative refusal on other inputs.
+Root requested one bounded proposal for the next production-path step. No further source edits or builds are authorized by that request.
+Worker-stack ownership, funded ingress, the ordinary daemon consumer, full-channel wake recovery, and the real two-identifier milestone remain open.
+
 The writer reports that materialization v2 verification passed. Reviewer 0018 now owns the raw-evidence review; checkpoint acceptance remains pending.
 All 19 exact selections passed one test each. Seven groups passed 23, 4, 4, 4, 6, 5, and 1 tests; these counts overlap.
 The recorder reports unchanged 1,014 source hashes and 83 warnings. The artifact contains 1,214 tests.
