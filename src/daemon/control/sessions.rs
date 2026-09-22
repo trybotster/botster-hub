@@ -281,11 +281,6 @@ fn handle_daemon_spawn(
     let mut reserve_operation_id: Option<PendingOperationId> = None;
     ControlStep::pending_spawn(move |daemon, state| {
         loop {
-            if let Some(pending_id) = tracker.pending_id()
-                && matches!(stage, Stage::Reserve)
-            {
-                reserve_operation_id = Some(pending_id);
-            }
             match stage {
                 Stage::RetryRetained => {
                     if retry_tokens.is_empty() {
@@ -380,7 +375,12 @@ fn handle_daemon_spawn(
                         }
                     }
                 }
-                Stage::Reserve => match poll_spawn_ticket(&mut tracker, daemon) {
+                Stage::Reserve => match {
+                    let result = poll_spawn_ticket(&mut tracker, daemon);
+                    // Poll can accept begin and lose completion in the same call.
+                    reserve_operation_id = tracker.accepted_id();
+                    result
+                } {
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
                     CoreTicketPoll::Refused => {
                         return ControlPoll::Ready(Ok(overloaded_core("reserve_session", &id.0)));

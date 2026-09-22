@@ -218,6 +218,26 @@ pub struct MaterializedSessionType {
     pub metadata: CoreSessionMetadata,
 }
 
+/// A Host product and the variable allowance that moves with its payload.
+/// Only this module can construct the product after charged materialization.
+pub(crate) struct ChargedSessionTypeMaterialization {
+    materialized: MaterializedSessionType,
+    // Destroy every materialized field before releasing its allowance.
+    variable: crate::lua_memory::LuaCallbackCharge,
+}
+
+impl ChargedSessionTypeMaterialization {
+    /// The next owner must retain the allowance until its payload is destroyed.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        MaterializedSessionType,
+        crate::lua_memory::LuaCallbackCharge,
+    ) {
+        (self.materialized, self.variable)
+    }
+}
+
 /// Session type policy error with path-neutral messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTypeError {

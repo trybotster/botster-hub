@@ -232,6 +232,18 @@ impl CoreCompletionWake {
             .contains(&identity)
     }
 
+    fn collect_ready(&self, identity: OwnerWorkIdentity) -> bool {
+        let mut state = self
+            .identities
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !state.ready.remove(&identity) {
+            return false;
+        }
+        state.registered.remove(&identity);
+        true
+    }
+
     fn retire_waiter(&self, waiter_id: WaiterId) -> usize {
         let mut state = self
             .identities
@@ -641,6 +653,19 @@ impl CoreOperationTicket {
 }
 
 impl<T> CoreTicket<T> {
+    /// Collect only this ticket's ready phase during terminal progression.
+    /// A ticket without an owner wake has no registration to collect.
+    pub(crate) fn collect_ready_phase(&self) {
+        if let CoreTicketSlot::Queued {
+            identity,
+            owner_wake: Some(wake),
+            ..
+        } = &self.slot
+        {
+            wake.collect_ready(*identity);
+        }
+    }
+
     fn channel(
         identity: OwnerWorkIdentity,
         wake: Arc<CoreCompletionWake>,
@@ -816,10 +841,18 @@ pub(crate) struct CoreDaemonHandle {
     #[cfg(test)]
     lose_next_owner_begins: Arc<AtomicUsize>,
     #[cfg(test)]
+    lose_reserve_completion_for: Arc<Mutex<Option<WaiterId>>>,
+    #[cfg(test)]
     release_session_reservation_begins: Arc<AtomicUsize>,
 }
 
 impl CoreDaemonHandle {
+    #[cfg(test)]
+    pub(crate) fn test_lose_reserve_completion_for(&self, waiter_id: WaiterId) {
+        let mut selected = self.lose_reserve_completion_for.lock().unwrap();
+        assert!(selected.replace(waiter_id).is_none());
+    }
+
     /// Register a local reply after the owner collects its previous Core phases.
     /// The charge funds channel storage. Shared registration storage remains separate.
     #[allow(dead_code)] // The daemon spawn continuation will register this receipt.
@@ -1207,8 +1240,27 @@ impl CoreDaemonHandle {
         let (completion, completion_publisher) =
             CoreTicket::channel(completion_identity, Arc::clone(&self.completion_wake), true);
         let completion_wake = Arc::clone(&self.completion_wake);
+        #[cfg(test)]
+        let lose_reserve_completion = {
+            let mut selected = self.lose_reserve_completion_for.lock().unwrap();
+            if matches!(&operation, CoreOperation::ReserveSession(_))
+                && *selected == Some(waiter_id)
+            {
+                selected.take();
+                true
+            } else {
+                false
+            }
+        };
         let request = CoreRequest::new(move |daemon, pending| {
             let result = daemon.begin(operation);
+            #[cfg(test)]
+            if result.is_ok() && lose_reserve_completion {
+                // Core keeps executing. Only this accepted reply is lost.
+                drop(completion_publisher);
+                begin_publisher.publish(result);
+                return;
+            }
             if let Ok(id) = result {
                 pending.insert(id, CoreResultPublisher(completion_publisher));
             } else {
@@ -1342,6 +1394,8 @@ impl DataPlaneDriver {
             refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            lose_reserve_completion_for: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             release_session_reservation_begins: Arc::new(AtomicUsize::new(0)),
         };
@@ -1550,6 +1604,101 @@ mod tests {
 
     fn noop_request() -> CoreRequest {
         CoreRequest::new(|_, _| {})
+    }
+
+    fn terminal_tracker(
+        wake: &Arc<CoreCompletionWake>,
+        phase_count: usize,
+    ) -> (
+        crate::runtime::CoreOperationTracker,
+        CoreTicketPublisher<Result<PendingOperationId, CoreDaemonError>>,
+        CoreTicketPublisher<CoreCompletion>,
+    ) {
+        let identities = wake.register_phases(WaiterId(95), phase_count).unwrap();
+        assert_eq!(identities[0], identity(95, 1));
+        assert_eq!(identities[1], identity(95, 2));
+        let (begin, begin_publisher) = CoreTicket::channel(identities[0], Arc::clone(wake), true);
+        let (completion, completion_publisher) =
+            CoreTicket::channel(identities[1], Arc::clone(wake), true);
+        (
+            crate::runtime::CoreOperationTracker::new(CoreOperationTicket { begin, completion }),
+            begin_publisher,
+            completion_publisher,
+        )
+    }
+
+    #[test]
+    fn terminal_tracker_collects_both_ready_phases_in_one_poll() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (mut tracker, begin, completion) = terminal_tracker(&wake, 2);
+        let id = PendingOperationId(95);
+        begin.publish(Ok(id));
+        completion.publish(CoreCompletion::RemoveSession {
+            id,
+            result: Ok(true),
+        });
+        assert!(wake.take());
+        assert!(matches!(
+            tracker.poll_terminal(),
+            CoreTicketPoll::Ready(Ok(CoreCompletion::RemoveSession { id: found, .. })) if found == id
+        ));
+        assert!(!wake.awaits_collection(identity(95, 1)));
+        assert!(!wake.awaits_collection(identity(95, 2)));
+        assert!(wake.take_identities(2).is_empty());
+    }
+
+    #[test]
+    fn terminal_tracker_preserves_unready_phase_and_observes_later_wake() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        wake.bind(sender);
+        let (mut tracker, begin, completion) = terminal_tracker(&wake, 2);
+        let id = PendingOperationId(96);
+        begin.publish(Ok(id));
+        assert!(receiver.try_recv().is_ok());
+        assert!(wake.take());
+        assert!(matches!(tracker.poll_terminal(), CoreTicketPoll::Pending));
+        assert!(!wake.awaits_collection(identity(95, 1)));
+        assert!(wake.awaits_collection(identity(95, 2)));
+        assert_eq!(tracker.pending_id(), Some(id));
+        assert!(matches!(tracker.poll_terminal(), CoreTicketPoll::Pending));
+        assert!(wake.awaits_collection(identity(95, 2)));
+        assert!(!wake.take());
+        completion.publish(CoreCompletion::RemoveSession {
+            id,
+            result: Ok(true),
+        });
+        assert!(receiver.try_recv().is_ok());
+        assert!(wake.take());
+        assert!(matches!(
+            tracker.poll_terminal(),
+            CoreTicketPoll::Ready(Ok(_))
+        ));
+        assert!(!wake.awaits_collection(identity(95, 2)));
+    }
+
+    #[test]
+    fn terminal_tracker_does_not_collect_an_unrelated_same_waiter_phase() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        // This synthetic batch tests exact selection, not concurrent production operations.
+        let (mut tracker, begin, completion) = terminal_tracker(&wake, 3);
+        let (mut other, other_publisher) =
+            CoreTicket::channel(identity(95, 3), Arc::clone(&wake), true);
+        let id = PendingOperationId(97);
+        begin.publish(Ok(id));
+        completion.publish(CoreCompletion::RemoveSession {
+            id,
+            result: Ok(true),
+        });
+        other_publisher.publish(7_u8);
+        assert!(matches!(
+            tracker.poll_terminal(),
+            CoreTicketPoll::Ready(Ok(_))
+        ));
+        assert!(wake.awaits_collection(identity(95, 3)));
+        assert!(matches!(other.poll(), CoreTicketPoll::Pending));
+        assert_eq!(wake.take_identities(1), vec![identity(95, 3)]);
+        assert!(matches!(other.poll(), CoreTicketPoll::Ready(7)));
     }
 
     fn callback_account() -> Arc<crate::lua_memory::LuaMemoryAccount> {
@@ -1970,6 +2119,7 @@ mod tests {
             refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+            lose_reserve_completion_for: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             release_session_reservation_begins: Arc::new(AtomicUsize::new(0)),
         };
@@ -2175,6 +2325,7 @@ mod tests {
                 refuse_next_owner_begins: Arc::new(AtomicUsize::new(0)),
                 refuse_registered_owner_begins: Arc::new(AtomicUsize::new(0)),
                 lose_next_owner_begins: Arc::new(AtomicUsize::new(0)),
+                lose_reserve_completion_for: Arc::new(Mutex::new(None)),
                 release_session_reservation_begins: Arc::new(AtomicUsize::new(0)),
             };
             let drops = Arc::new(AtomicUsize::new(0));
