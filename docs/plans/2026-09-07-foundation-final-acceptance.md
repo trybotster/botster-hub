@@ -16,6 +16,22 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Continuation — September 22
 
+The user approved Root's recommendation to require the daemon control owner for session-type spawning.
+Runtime-only calls must reject before materialization or Core work. Synchronous callers may wait on a daemon response off the owner thread.
+Writer 001b owns the bounded implementation. Reviewer 0018 owns independent lifecycle review. Both received the decision.
+The daemon must register the operation before effects or handle escape. The client spawn method must require a `WaiterId`.
+The implementation must not transfer cleanup authority from an already-started public pending handle.
+Review must include plugin fulfillment, caller timeout, handle destruction, terminal disposal, and exact context retirement.
+Unresolved cleanup must retain its identity, payload, charge, and owner permit. This decision does not select final CLI disposition.
+Startup-captured paths remain undecided. Earlier build and export denials remain unchanged.
+
+The resumed diagnostic build failed with five compiler errors and two warnings. No tests ran and no artifact was produced.
+The failed source freeze and diagnostic records remain in the writer's local `.spawn-review/` directory.
+The compile repair remains separate from the lifecycle repair. The revised patch hash is `cf01c5c22c8b2b5052ba032e6cf45caf429b689047f7875d0ba6db846e49056f`.
+The reviewer found that the Host result pool and callback memory pool are separate. The writer replaced zero Host result cost with the existing full reserved capacity.
+The final increment review remains pending. Root has not granted a rebuild.
+Full asynchronous spawn remains incomplete. Production activation, allocation accounting, and lifecycle verification remain open.
+
 RESUMED at the user's explicit request. The user manually selected GPT-6 Sol for the implementer. Root will preserve this choice.
 Root checked the live agent inventory and the spawn worktree: HEAD is `a8884a5f`, with no tracked changes and only local `.spawn-review/` untracked.
 Writer 001b and reviewer 0018 resume the real daemon consumer and exact context retirement. Other agents remain idle until an actionable assignment exists.
