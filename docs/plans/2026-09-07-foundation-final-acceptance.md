@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Materialization source `f7ea2c67` is integrated as `71fee4e0` after independent source and execution review. The checkpoint remains dormant.
+No whole-integration build or production acceptance follows from the source-branch tests. The cherry-pick completed without conflicts.
+The next consumer proposal exposes unresolved charged-ingress, materialization, worker-stack, context, and recovery dependencies.
+Root assigned writer 001b and reviewer 0018 one bounded read-only pass on the charged materialization interface and worker-stack ownership.
+They must identify actual thread lifetime, account ownership, reservation and release points, and existing policy values before proposing implementation.
+No stack size, quota, exclusion, consumer activation, source edits, or builds are authorized by this pass.
+Evidence: `s1-async-spawn-20260921-sess-001b/next-production-path-proposal.md` under `/Users/jasonconigliari/botster-evidence/`.
+Context timing and recovery lifetime remain separate unresolved gates. No compiler slot is assigned.
+
 Reviewer 0018 verified the v2 raw evidence in `hub-async-spawn-review-20260921-fable/14-v2-execution-verdict.md`.
 Root accepted the dormant nine-file checkpoint and authorized its normal commit. Integration awaits the writer's commit SHA.
 The reviewer recomputed the artifact hash and checked all 26 test results against the 1,214-test inventory.
