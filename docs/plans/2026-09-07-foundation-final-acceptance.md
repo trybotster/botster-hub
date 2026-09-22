@@ -32,6 +32,12 @@ The recovery writer acknowledged and traced actual CLI/store callers. Root assig
 Shared hooks in `runtime.rs`, `daemon.rs`, and `host_mutations.rs` require an explicit handoff before edits.
 The spawn writer resumed source work. Both assigned reviewers currently show provider usage limits with automatic continuation at 5:50 PM Pacific.
 Review is pending, not active or accepted. Writers may prepare source and ownership traces; builds and integration remain gated.
+Recovery found path-only store authority in HostPrepare/HostPackageRestore, including rollback.
+The separate handoff proposal must cover producers in `daemon/control/host_work.rs` and `managed_git.rs`.
+Current saved transports and daemon status do not prove which daemon owns the requested state directory.
+Recovery must propose the smallest live-owner validation contract before adding endpoint metadata or a generation mechanism.
+Review must cover stale metadata, crash/restart, response validation, path aliases, and unavailable owners. No second-writer fallback is permitted.
+Spawn is checking existing identity contracts for reuse. Shared file edits remain held for an explicit handoff.
 No compiler slot is granted. Root retains integration and publication ownership. Completed Core and safety implementation work stays stopped.
 
 ### Delivery scope
