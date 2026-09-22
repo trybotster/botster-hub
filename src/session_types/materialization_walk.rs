@@ -1,9 +1,10 @@
-//! Dormant repository counting draft. No runtime caller is registered.
+//! Dormant repository heap model. No runtime caller is registered.
 //!
 //! The caller is the charged repository materialization path. This draft connects
 //! the existing schema seed to one cursor through Serde's access interfaces.
-//! It does not establish a construction permit. Funding the counting pass,
-//! combining output and Content events, and failure dominance remain required.
+//! It does not establish a construction permit. The counting pass is funded before
+//! decoder construction. Shared events produce a conservative heap bound.
+//! Worker-stack ownership remains a separate requirement before activation.
 
 use std::cell::Cell;
 use std::fmt;
@@ -11,9 +12,11 @@ use std::fmt;
 use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
-#[cfg(test)]
 use super::definition_budget::{DefinitionStorage, Shape};
+use super::materialization_error::{ErrorTrack, TypedErrorCandidates};
+use super::materialization_timeline::{Timeline, Track};
 use super::scratch_budget::ScratchStorage;
+use crate::lua_memory::{LuaCallbackCharge, LuaMemoryCapacityError, LuaMemoryClass};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureKind {
@@ -411,12 +414,28 @@ impl<'input> Cursor<'input> {
     }
 }
 
-type State<'a, 'input> = &'a Cell<Cursor<'input>>;
+#[derive(Clone, Copy)]
+struct State<'a, 'input> {
+    cursor: &'a Cell<Cursor<'input>>,
+    scratch_held: &'a Cell<usize>,
+    track: Track<'a>,
+}
 
 fn update<'input>(state: State<'_, 'input>, action: impl FnOnce(&mut Cursor<'input>)) {
-    let mut cursor = state.get();
+    let mut cursor = state.cursor.get();
     action(&mut cursor);
-    state.set(cursor);
+    // Error replay can reduce a prediction, but it cannot release an owner.
+    let old = state.scratch_held.get();
+    let event = cursor.scratch.conservative_observation(old);
+    if state
+        .track
+        .replace_with_peak(old, event.retained, event.live)
+        .is_none()
+    {
+        cursor.fail(FailureKind::Arithmetic);
+    }
+    state.scratch_held.set(event.retained);
+    state.cursor.set(cursor);
 }
 
 struct CountingDeserializer<'a, 'input, D> {
@@ -675,23 +694,200 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for CountingVisitor<'_, '_, V> {
     }
 }
 
-/// Test-only caller until the counting allocation permit and combined events exist.
-/// This result is not a materialization permit and cannot construct production output.
-#[cfg(test)]
-fn count_fixture(input: &[u8]) -> (Result<DefinitionStorage, serde_json::Error>, Cursor<'_>) {
-    let state = Cell::new(Cursor::new(input));
-    let mut decoder = serde_json::Deserializer::from_slice(input);
-    let result = Shape::File
-        .deserialize(CountingDeserializer {
-            inner: &mut decoder,
-            state: &state,
-            key: false,
-        })
-        .and_then(|value| decoder.end().map(|()| value));
-    if let Err(error) = &result {
-        update(&state, |cursor| cursor.reconcile_error(error));
+/// Conservative counting-workspace reservation, not a production peak.
+/// The scan allocates nothing and does not validate JSON or choose its errors.
+fn counting_workspace_bytes(input: &[u8]) -> Option<usize> {
+    let mut string_start = None;
+    let mut escaped = false;
+    let mut has_escape = false;
+    let mut longest_string = 0usize;
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    for (index, &byte) in input.iter().enumerate() {
+        if let Some(start) = string_start {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+                has_escape = true;
+            } else if byte == b'"' {
+                if has_escape {
+                    longest_string = longest_string.max(index.checked_sub(start)?);
+                }
+                string_start = None;
+            }
+        } else {
+            match byte {
+                b'"' => {
+                    string_start = Some(index.checked_add(1)?);
+                    has_escape = false;
+                }
+                b'[' | b'{' => {
+                    depth = depth.checked_add(1)?;
+                    deepest = deepest.max(depth);
+                }
+                b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
     }
-    (result, state.get())
+    if let Some(start) = string_start.filter(|_| has_escape) {
+        longest_string = longest_string.max(input.len().checked_sub(start)?);
+    }
+    // Raw string bytes bound every decoded append and reserve(4) request:
+    // a completed unicode escape contributes six raw bytes before reserve(4).
+    // An incomplete escape appends its prefix but does not reserve the codepoint.
+    // Unescaped strings borrow input at every schema position and need no copy.
+    // Counting every container bounds any ignored-value frame stack.
+    let required = longest_string.max(deepest);
+    // For growth, old < required and new = max(2*old, required, 8).
+    // Thus max(3*required, 8) covers old+new, including moved reallocations.
+    // Capacity history across tokens cannot exceed this bound.
+    let scratch = if required == 0 {
+        0
+    } else {
+        required.checked_mul(3)?.max(8)
+    };
+    scratch.checked_add(counting_error_bytes()?)
+}
+
+fn counting_error_bytes() -> Option<usize> {
+    let longest = [
+        "session type Content storage overflow",
+        "session type Content storage underflow",
+        "session type output storage overflow",
+        "session type error size overflow",
+        "unsupported counting deserializer method",
+    ]
+    .iter()
+    .map(|message| message.len())
+    .max()
+    .unwrap_or(0);
+    // E::custom(&str) copies exactly once. fix_position overlaps two boxes.
+    // Syntax errors use one box and no owned message, so this also covers them.
+    super::bounded_catalog::json_error_impl_bytes()
+        .checked_mul(2)?
+        .checked_add(longest)
+}
+
+/// This owns counting workspace only. It cannot authorize typed construction.
+struct ChargedCountingResult<'input> {
+    result: Result<DefinitionStorage, serde_json::Error>,
+    cursor: Cursor<'input>,
+    timeline: Timeline,
+    typed_errors: TypedErrorCandidates,
+    // Drop the result's error allocation before releasing its charge.
+    _storage: LuaCallbackCharge,
+}
+
+#[derive(Debug)]
+enum CountingRefusal {
+    Arithmetic,
+    Capacity(LuaMemoryCapacityError),
+    Correspondence { offset: usize },
+}
+
+impl ChargedCountingResult<'_> {
+    /// A conservative heap bound, never a permit to construct typed output.
+    fn typed_construction_bytes(&self) -> Result<usize, CountingRefusal> {
+        if self.timeline.refused {
+            return Err(CountingRefusal::Arithmetic);
+        }
+        match self.cursor.failure {
+            Some((FailureKind::Arithmetic, _)) => return Err(CountingRefusal::Arithmetic),
+            Some((FailureKind::Disagreement, offset)) => {
+                return Err(CountingRefusal::Correspondence { offset });
+            }
+            _ => {}
+        }
+        // The counting visitors do not validate schema values. Their Data
+        // errors are checked size/layout failures. Decoder syntax stays separate.
+        if self
+            .result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is_data())
+        {
+            return Err(CountingRefusal::Arithmetic);
+        }
+        let errors = self
+            .typed_errors
+            .storage_bytes(self.cursor.input.len())
+            .ok_or(CountingRefusal::Arithmetic)?;
+        self.timeline
+            .maximum
+            .checked_add(errors)
+            .ok_or(CountingRefusal::Arithmetic)
+    }
+}
+
+/// The caller admits the aggregate charge through the plugin account first.
+/// Splitting it cannot create a second independent callback allowance.
+/// Refusal occurs before decoder construction and leaves the input untouched.
+fn count_with_storage<'input>(
+    input: &'input [u8],
+    available: &mut LuaCallbackCharge,
+) -> Result<ChargedCountingResult<'input>, CountingRefusal> {
+    let capacity_error = |requested| LuaMemoryCapacityError {
+        class: LuaMemoryClass::Callback,
+        requested,
+        available: available.bytes(),
+    };
+    let requested = counting_workspace_bytes(input).ok_or(CountingRefusal::Arithmetic)?;
+    let failure = CountingRefusal::Capacity(capacity_error(requested));
+    let storage = available.split(requested).ok_or(failure)?;
+    let cursor = Cell::new(Cursor::new(input));
+    let timeline = Cell::new(Timeline::default());
+    let typed_errors = Cell::new(TypedErrorCandidates::default());
+    let scratch_held = Cell::new(0);
+    let track = Track::new(&timeline).excluding_owner(&scratch_held);
+    let state = State {
+        cursor: &cursor,
+        scratch_held: &scratch_held,
+        track,
+    };
+    let result = {
+        let mut decoder = serde_json::Deserializer::from_slice(input);
+        let result = Shape::File
+            .with_track(track, ErrorTrack::new(&typed_errors))
+            .deserialize(CountingDeserializer {
+                inner: &mut decoder,
+                state,
+                key: false,
+            })
+            .and_then(|value| decoder.end().map(|()| value));
+        if let Err(error) = &result {
+            update(state, |cursor| cursor.reconcile_error(error));
+        }
+        // The workspace charge remains live while the decoder drops its scratch.
+        drop(decoder);
+        result
+    };
+    let counted = ChargedCountingResult {
+        result,
+        cursor: cursor.get(),
+        timeline: timeline.get(),
+        typed_errors: typed_errors.get(),
+        _storage: storage,
+    };
+    // Refuse model failures at this boundary, never as typed diagnostics.
+    counted.typed_construction_bytes()?;
+    Ok(counted)
+}
+
+#[cfg(test)]
+fn count_fixture(input: &[u8]) -> ChargedCountingResult<'_> {
+    use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+    let bytes = counting_workspace_bytes(input).unwrap();
+    let account = LuaMemoryAccount::new(LuaMemoryLimits {
+        per_vm_bytes: 1,
+        total_vm_bytes: 1,
+        per_callback_bytes: bytes,
+        total_callback_bytes: bytes,
+    })
+    .unwrap();
+    let mut storage = account.reserve_callback_total(bytes).unwrap();
+    count_with_storage(input, &mut storage).unwrap()
 }
 
 #[cfg(test)]
@@ -699,9 +895,285 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timeline_keeps_parent_output_during_a_malformed_child() {
+        let parent = "p".repeat(4096);
+        let child = "c".repeat(2048);
+        let input =
+            format!(r#"{{"session_types":[{{"label":"{parent}","description":"{child}\q"}}]}}"#);
+        let counted = count_fixture(input.as_bytes());
+        assert!(counted.result.is_err());
+        assert!(counted.timeline.maximum >= parent.len() + child.len());
+        assert!(counted.typed_construction_bytes().unwrap() > counted.timeline.maximum);
+    }
+
+    #[test]
+    fn timeline_covers_output_and_scratch_growth_in_schema_order() {
+        let input = br#"{"session_types":[{"description":"\naaaaaaaa","label":"aaaaaaaaaaaaa\u0080","id":"agent","role":"agent","interaction":"interactive","lifecycle":"persistent","command":"agent"}]}"#;
+        let counted = count_fixture(input);
+        assert!(counted.result.is_ok());
+        // The first owned string survives the second string's 16+32 growth.
+        assert!(counted.timeline.maximum >= 9 + 48);
+        let output = &counted.result.as_ref().unwrap().output;
+        assert!(counted.timeline.live >= output.retained + counted.cursor.scratch.capacity);
+    }
+
+    #[test]
+    fn nested_content_growth_overlaps_parent_output() {
+        let parent = "p".repeat(64);
+        let input = format!(
+            r#"{{"session_types":[{{"label":"{parent}","execution":{{"mode":"shell_command","extra":[null,null,null,null,null]}}}}]}}"#
+        );
+        let counted = count_fixture(input.as_bytes());
+        assert!(counted.result.is_ok());
+        let element = std::mem::size_of::<serde::__private228::de::Content<'static>>();
+        assert!(counted.timeline.maximum >= parent.len() + (4 + 8) * element);
+    }
+
+    #[test]
+    fn failed_definition_does_not_release_its_recorded_content() {
+        let input = br#"{"session_types":[{"execution":{"mode":"shell_command","extra":[null,null,null,null,null]},"label":"\q"}]}"#;
+        let counted = count_fixture(input);
+        assert!(counted.result.is_err());
+        let element = std::mem::size_of::<serde::__private228::de::Content<'static>>();
+        // Eight sequence slots and four map pairs remain in the failed scope.
+        assert!(counted.timeline.live >= 16 * element);
+    }
+
+    #[test]
+    fn owned_relative_path_transfers_without_a_second_string_charge() {
+        let borrowed = count_fixture(
+            br#"{"session_types":[{"working_directory":{"policy":"relative","path":"sub"}}]}"#,
+        );
+        let owned = count_fixture(
+            br#"{"session_types":[{"working_directory":{"policy":"relative","path":"su\u0062"}}]}"#,
+        );
+        assert!(borrowed.result.is_ok());
+        assert!(owned.result.is_ok());
+        assert_eq!(borrowed.cursor.scratch.capacity, 0);
+        assert_eq!(owned.cursor.scratch.capacity, 8);
+        assert_eq!(owned.timeline.live, borrowed.timeline.live + 8);
+    }
+
+    #[test]
+    fn divergence_preserves_the_earlier_typed_error_candidate() {
+        let tag = "unknown".repeat(4096);
+        let input =
+            format!(r#"{{"session_types":[{{"execution":{{"mode":"{tag}"}},"label":"bad\q"}}]}}"#);
+        let counted = count_fixture(input.as_bytes());
+        assert!(counted.result.is_err());
+        assert_eq!(counted.typed_errors.tag_bytes, tag.len());
+        let error = serde_json::from_slice::<super::super::RepoSessionTypesFile>(input.as_bytes())
+            .unwrap_err();
+        assert!(error.to_string().starts_with("unknown variant"));
+        let bound = counted.typed_construction_bytes().unwrap();
+        assert!(bound >= error.to_string().len());
+    }
+
+    #[test]
+    fn accepted_counting_shape_can_still_fail_typed_decoding() {
+        let input = br#"{"session_types":"wrong shape"}"#;
+        let counted = count_fixture(input);
+        assert!(counted.result.is_ok());
+        assert_eq!(
+            counted.typed_errors.wrong_string_debug,
+            "\"wrong shape\"".len()
+        );
+        let error =
+            serde_json::from_slice::<super::super::RepoSessionTypesFile>(input).unwrap_err();
+        assert!(error.to_string().starts_with("invalid type: string"));
+        assert!(counted.typed_construction_bytes().unwrap() >= error.to_string().len());
+    }
+
+    #[test]
+    fn counting_success_release_preserves_an_earlier_typed_failure_peak() {
+        let values = std::iter::repeat_n("null", 64)
+            .collect::<Vec<_>>()
+            .join(",");
+        let tag = "unknown".repeat(128);
+        let input = format!(
+            r#"{{"session_types":[{{"execution":{{"extra":[{values}],"mode":"{tag}"}}}}]}}"#
+        );
+        let counted = count_fixture(input.as_bytes());
+        assert!(counted.result.is_ok());
+        let error = serde_json::from_slice::<super::super::RepoSessionTypesFile>(input.as_bytes())
+            .unwrap_err();
+        assert!(error.to_string().starts_with("unknown variant"));
+        assert_eq!(
+            counted.timeline.live,
+            counted.result.as_ref().unwrap().output.retained + counted.cursor.scratch.capacity
+        );
+        let content = 64 * std::mem::size_of::<serde::__private228::de::Content<'static>>();
+        assert!(counted.timeline.maximum >= content);
+        assert!(counted.typed_construction_bytes().unwrap() >= content + error.to_string().len());
+    }
+
+    #[test]
+    fn typed_error_bound_is_input_dependent_and_counted_once() {
+        let short = count_fixture(br#"{"session_types":[{"execution":{"mode":"x"}}]}"#);
+        let tag = "x".repeat(8192);
+        let input = format!(r#"{{"session_types":[{{"execution":{{"mode":"{tag}"}}}}]}}"#);
+        let long = count_fixture(input.as_bytes());
+        assert!(
+            long.typed_construction_bytes().unwrap() > short.typed_construction_bytes().unwrap()
+        );
+        assert_eq!(
+            long.typed_construction_bytes().unwrap(),
+            long.timeline.maximum + long.typed_errors.storage_bytes(input.len()).unwrap()
+        );
+    }
+
+    #[test]
+    fn completed_definition_release_keeps_the_large_corpus_within_quota() {
+        let values = std::iter::repeat_n("null", 2048)
+            .collect::<Vec<_>>()
+            .join(",");
+        let definitions = (0..256).map(|index| format!(
+            r#"{{"id":"agent-{index}","label":"Agent","role":"agent.worker","interaction":"interactive","lifecycle":"persistent","command":"agent","execution":{{"mode":"shell_command","extra":[{values}]}}}}"#
+        )).collect::<Vec<_>>().join(",");
+        let input = format!(r#"{{"session_types":[{definitions}]}}"#);
+        assert!(input.len() <= super::super::REPO_SESSION_TYPES_FILE_BYTE_CAPACITY);
+        let typed =
+            serde_json::from_slice::<super::super::RepoSessionTypesFile>(input.as_bytes()).unwrap();
+        super::super::validate_session_types(&typed.session_types).unwrap();
+        let counted = count_fixture(input.as_bytes());
+        assert!(counted.result.is_ok());
+        let bound = counted.typed_construction_bytes().unwrap();
+        assert_eq!(
+            counted.timeline.live,
+            counted.result.as_ref().unwrap().output.retained + counted.cursor.scratch.capacity
+        );
+        let quota = crate::config::lua_memory_limits().per_callback_bytes;
+        assert!(input.len() + bound <= quota);
+        let retained_content_without_release =
+            256 * 2048 * std::mem::size_of::<serde::__private228::de::Content<'static>>();
+        assert!(input.len() + retained_content_without_release > quota);
+        eprintln!(
+            "completed-definition bound: input={} typed_bound={} unreleased_content_lower_bound={} quota={}",
+            input.len(),
+            bound,
+            retained_content_without_release,
+            quota
+        );
+        // This checks the connected bound, not an allocator measurement or permit.
+    }
+
+    #[test]
+    fn duplicate_environment_and_tagged_path_preserve_complete_values() {
+        let input = br#"{"session_types":[{"id":"agent","label":"Agent","role":"agent","interaction":"interactive","lifecycle":"persistent","command":"agent","args":["a","b"],"environment":{"SAME":"old","SAME":"new","KEEP":"present"},"working_directory":{"policy":"relative","path":"sub","extra":["\n","\u0080"]},"context":["repository"]}]}"#;
+        let counted = count_fixture(input);
+        let typed = serde_json::from_slice::<super::super::RepoSessionTypesFile>(input).unwrap();
+        let value = &typed.session_types[0];
+        assert_eq!(value.command, "agent");
+        assert_eq!(value.args, ["a", "b"]);
+        assert_eq!(value.environment.get("SAME").unwrap(), "new");
+        assert_eq!(value.environment.get("KEEP").unwrap(), "present");
+        assert_eq!(value.context, ["repository"]);
+        assert!(
+            matches!(&value.working_directory, super::super::PackageSessionTypeWorkingDirectory::Relative { path } if path == "sub")
+        );
+        assert!(counted.timeline.live >= counted.result.as_ref().unwrap().output.retained);
+        assert!(counted.typed_construction_bytes().is_ok());
+    }
+
+    #[test]
+    fn short_counting_charge_refuses_without_consuming_the_parent_charge() {
+        use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+        let input = br#"{"session_types":[{"label":"\u0080"}]}"#;
+        let bytes = counting_workspace_bytes(input).unwrap();
+        let account = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: bytes,
+            total_callback_bytes: bytes,
+        })
+        .unwrap();
+        let mut storage = account.reserve_callback_total(bytes - 1).unwrap();
+        let error = match count_with_storage(input, &mut storage) {
+            Err(CountingRefusal::Capacity(error)) => error,
+            Err(other) => panic!("unexpected refusal: {other:?}"),
+            Ok(_) => panic!("short storage admitted a counting decoder"),
+        };
+        assert_eq!(error.class, LuaMemoryClass::Callback);
+        assert_eq!(error.requested, bytes);
+        assert_eq!(error.available, bytes - 1);
+        assert_eq!(storage.bytes(), bytes - 1);
+        assert_eq!(account.usage().1, bytes - 1);
+    }
+
+    #[test]
+    fn counting_result_keeps_its_charge_after_the_decoder_is_destroyed() {
+        use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+        for input in [&b"{}"[..], &b"["[..]] {
+            let bytes = counting_workspace_bytes(input).unwrap();
+            let account = LuaMemoryAccount::new(LuaMemoryLimits {
+                per_vm_bytes: 1,
+                total_vm_bytes: 1,
+                per_callback_bytes: bytes,
+                total_callback_bytes: bytes,
+            })
+            .unwrap();
+            let mut storage = account.reserve_callback_total(bytes).unwrap();
+            let counted = count_with_storage(input, &mut storage).unwrap();
+            assert_eq!(counted.result.is_err(), input == b"[");
+            assert_eq!(storage.bytes(), 0);
+            drop(storage);
+            assert_eq!(account.usage().1, bytes);
+            assert!(account.reserve_callback_total(1).is_err());
+            drop(counted);
+            assert_eq!(account.usage().1, 0);
+        }
+    }
+
+    #[test]
+    fn counting_upper_scan_covers_ignored_surrogates_and_malformed_tails() {
+        let inputs = [
+            r#"{"session_types":[{"description":"\naaaaaaaa","label":"aaaaaaaaaaaaa\u0080"}]}"#
+                .to_string(),
+            r#"{"session_types":[{"unknown":"\uD800","label":"\u0080"}]}"#.to_string(),
+            format!("{{\"unknown\":{}0{}}}", "[".repeat(300), "]".repeat(300)),
+            format!("{{\"session_types\":[{{\"label\":\"{}\\q", "a".repeat(4096)),
+            format!(
+                "{{\"session_types\":[{{\"label\":\"{}\\u00",
+                "a".repeat(4096)
+            ),
+        ];
+        for input in inputs {
+            let bytes = counting_workspace_bytes(input.as_bytes()).unwrap();
+            let counted = count_fixture(input.as_bytes());
+            let scratch = bytes - counting_error_bytes().unwrap();
+            assert!(scratch >= counted.cursor.scratch.peak);
+            if let Some(before) = counted.cursor.scratch_before_replay {
+                assert!(scratch >= before.peak);
+            }
+        }
+        let borrowed = format!("{{\"unknown\":\"{}\"}}", "a".repeat(4_194_290));
+        let counted = count_fixture(borrowed.as_bytes());
+        assert!(counted.result.is_ok());
+        assert_eq!(borrowed.len(), 4 * 1024 * 1024);
+        assert_eq!(counted.cursor.scratch.peak, 0);
+        let workspace = counting_workspace_bytes(borrowed.as_bytes()).unwrap();
+        assert_eq!(workspace, counting_error_bytes().unwrap() + 8);
+        assert!(borrowed.len() + workspace < 8 * 1024 * 1024);
+        for ending in ["\"}]}", ""] {
+            let input = format!(
+                "{{\"session_types\":[{{\"label\":\"{}{ending}",
+                "a".repeat(4096)
+            );
+            let counted = count_fixture(input.as_bytes());
+            assert_eq!(counted.cursor.scratch.peak, 0);
+            assert_eq!(
+                counting_workspace_bytes(input.as_bytes()).unwrap(),
+                counting_error_bytes().unwrap() + 9
+            );
+        }
+    }
+
+    #[test]
     fn cursor_records_the_reserve_four_counterexample_in_schema_order() {
         let input = br#"{"session_types":[{"description":"\naaaaaaaa","label":"aaaaaaaaaaaaa\u0080","id":"agent","role":"agent","interaction":"interactive","lifecycle":"persistent","command":"agent"}]}"#;
-        let (result, cursor) = count_fixture(input);
+        let counted = count_fixture(input);
+        let result = &counted.result;
+        let cursor = counted.cursor;
         assert!(result.is_ok());
         assert_eq!(cursor.failure, None);
         assert_eq!(cursor.offset, input.len());
@@ -716,7 +1188,9 @@ mod tests {
                 "{{\"session_types\":[{{\"label\":\"{}{ending}",
                 "a".repeat(4096)
             );
-            let (result, cursor) = count_fixture(input.as_bytes());
+            let counted = count_fixture(input.as_bytes());
+            let result = &counted.result;
+            let cursor = counted.cursor;
             let error = match result {
                 Err(error) => error,
                 Ok(_) => panic!("malformed input counted successfully"),
@@ -737,7 +1211,9 @@ mod tests {
     #[test]
     fn escaped_keys_advance_once_and_unknown_strings_do_not_copy() {
         let input = br#"{"session_\u0074ypes":[{"la\u0062el":"Agent","unknown":"\uD800","environment":{"K":"\u0080"}}]}"#;
-        let (result, cursor) = count_fixture(input);
+        let counted = count_fixture(input);
+        let result = &counted.result;
+        let cursor = counted.cursor;
         assert!(result.is_ok());
         assert_eq!(cursor.failure, None);
         assert_eq!(cursor.offset, input.len());
@@ -746,7 +1222,9 @@ mod tests {
     #[test]
     fn ignored_depth_is_not_limited_to_serde_typed_recursion() {
         let input = format!("{{\"unknown\":{}0{}}}", "[".repeat(300), "]".repeat(300));
-        let (result, cursor) = count_fixture(input.as_bytes());
+        let counted = count_fixture(input.as_bytes());
+        let result = &counted.result;
+        let cursor = counted.cursor;
         assert!(result.is_ok());
         assert_eq!(cursor.failure, None);
         assert!(cursor.scratch.capacity >= 299);
@@ -761,7 +1239,9 @@ mod tests {
             r#"[[["agent"]]]"#,
             r#"[[],[]]"#,
         ] {
-            let (result, cursor) = count_fixture(input.as_bytes());
+            let counted = count_fixture(input.as_bytes());
+            let result = &counted.result;
+            let cursor = counted.cursor;
             assert!(result.is_ok());
             assert_eq!(cursor.failure, None);
             assert_eq!(cursor.offset, input.len());
@@ -771,7 +1251,8 @@ mod tests {
     #[test]
     fn trailing_data_keeps_the_serde_diagnostic() {
         let input = br#"{"session_types":[]} false"#;
-        let (result, _) = count_fixture(input);
+        let counted = count_fixture(input);
+        let result = &counted.result;
         let error = match result {
             Err(error) => error,
             Ok(_) => panic!("trailing input counted successfully"),
@@ -788,7 +1269,9 @@ mod tests {
             "[".repeat(300),
             "]".repeat(300),
         );
-        let (result, cursor) = count_fixture(input.as_bytes());
+        let counted = count_fixture(input.as_bytes());
+        let result = &counted.result;
+        let cursor = counted.cursor;
         let error = match result {
             Err(error) => error,
             Ok(_) => panic!("missing comma accepted"),
@@ -809,7 +1292,9 @@ mod tests {
     #[test]
     fn ignored_failure_keeps_capacity_from_earlier_strings_and_frames() {
         let input = br#"{"session_types":[{"label":"\naaaaaaaa","unknown":[[0}]}]}"#;
-        let (result, cursor) = count_fixture(input);
+        let counted = count_fixture(input);
+        let result = &counted.result;
+        let cursor = counted.cursor;
         let error = match result {
             Err(error) => error,
             Ok(_) => panic!("mismatched closer accepted"),
@@ -829,7 +1314,9 @@ mod tests {
             "{\n\"session_types\":[{\"label\":01}]}",
             "{\n\"session_types\":[{\"label\":1e9999}]}",
         ] {
-            let (result, cursor) = count_fixture(input.as_bytes());
+            let counted = count_fixture(input.as_bytes());
+            let result = &counted.result;
+            let cursor = counted.cursor;
             let error = match result {
                 Err(error) => error,
                 Ok(_) => panic!("invalid number accepted"),

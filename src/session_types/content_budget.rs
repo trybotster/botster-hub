@@ -9,6 +9,7 @@ use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
 // Use the exact type used by the pinned derive implementation, not a layout mirror.
+use super::materialization_timeline::Track;
 use serde::__private228::de::Content;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -113,7 +114,7 @@ impl ContentContainer {
         Some(())
     }
 
-    fn buffer_charge(&self) -> Option<usize> {
+    pub(super) fn buffer_charge(&self) -> Option<usize> {
         self.buffer_bytes(self.capacity)
     }
 
@@ -159,12 +160,14 @@ impl ContentProgress {
 
 pub(super) struct ObservedContentSeed<'a> {
     progress: Option<&'a Cell<ContentProgress>>,
+    track: Track<'a>,
 }
 
 impl ContentSeed {
     pub(super) fn with_progress(progress: &Cell<ContentProgress>) -> ObservedContentSeed<'_> {
         ObservedContentSeed {
             progress: Some(progress),
+            track: Track::default(),
         }
     }
 }
@@ -175,6 +178,7 @@ impl<'de> DeserializeSeed<'de> for ObservedContentSeed<'_> {
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         deserializer.deserialize_any(ContentVisitor {
             progress: self.progress,
+            track: self.track,
         })
     }
 }
@@ -189,14 +193,28 @@ impl<'de> DeserializeSeed<'de> for ContentSeed {
 
 pub(super) struct ContentVisitor<'a> {
     progress: Option<&'a Cell<ContentProgress>>,
+    track: Track<'a>,
 }
 
-impl ContentVisitor<'_> {
+impl<'a> ContentVisitor<'a> {
     pub(super) fn untracked() -> Self {
-        Self { progress: None }
+        Self {
+            progress: None,
+            track: Track::default(),
+        }
+    }
+
+    pub(super) fn tracked(track: Track<'a>) -> Self {
+        Self {
+            progress: None,
+            track,
+        }
     }
 
     fn retain<E: de::Error>(&self, bytes: usize) -> Result<(), E> {
+        self.track
+            .allocate(bytes)
+            .ok_or_else(|| E::custom("session type Content storage overflow"))?;
         if let Some(progress) = self.progress {
             let mut next = progress.get();
             next.retain(bytes)
@@ -221,9 +239,13 @@ impl ContentVisitor<'_> {
             .buffer_charge()
             .ok_or_else(|| E::custom("session type Content storage overflow"))?;
         if new != old {
-            self.retain::<E>(new)?;
+            self.track
+                .replace(old, new)
+                .ok_or_else(|| E::custom("session type Content storage overflow"))?;
             if let Some(progress) = self.progress {
                 let mut next = progress.get();
+                next.retain(new)
+                    .ok_or_else(|| E::custom("session type Content storage overflow"))?;
                 next.release(old)
                     .ok_or_else(|| E::custom("session type Content storage underflow"))?;
                 progress.set(next);
@@ -275,6 +297,7 @@ impl<'de> Visitor<'de> for ContentVisitor<'_> {
         let mut storage = ContentContainer::sequence();
         while let Some(item) = sequence.next_element_seed(ObservedContentSeed {
             progress: self.progress,
+            track: self.track,
         })? {
             self.push::<A::Error>(&mut storage, item)?;
         }
@@ -287,9 +310,11 @@ impl<'de> Visitor<'de> for ContentVisitor<'_> {
         let mut storage = ContentContainer::map();
         while let Some(key) = map.next_key_seed(ObservedContentSeed {
             progress: self.progress,
+            track: self.track,
         })? {
             let value = map.next_value_seed(ObservedContentSeed {
                 progress: self.progress,
+                track: self.track,
             })?;
             let entry = ContentStorage::map_entry(key, value).ok_or_else(|| {
                 <A::Error as de::Error>::custom("session type Content storage overflow")
