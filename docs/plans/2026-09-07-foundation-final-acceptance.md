@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+The writer reports that materialization v2 verification passed. Reviewer 0018 now owns the raw-evidence review; checkpoint acceptance remains pending.
+All 19 exact selections passed one test each. Seven groups passed 23, 4, 4, 4, 6, 5, and 1 tests; these counts overlap.
+The recorder reports unchanged 1,014 source hashes and 83 warnings. The artifact contains 1,214 tests.
+Artifact SHA256: `a0de6db05e008c65e4a601dc38b8de79f5e687608420139dd56c60f73df87768`.
+The corpus input was 2,666,149 bytes. The model bound was 207,351 bytes; their sum was 2,873,500 bytes against the unchanged 8,388,608-byte quota.
+These are model values, not observed allocation peaks. Separate output and scratch totals were not collected. Production capacity acceptance remains open.
+Evidence: `s1-async-spawn-20260921-sess-001b/materialization-definition-release-v2-result.md` and its verification directory under `/Users/jasonconigliari/botster-evidence/`.
+The writer released the compiler slot. Source remains frozen and uncommitted until independent execution review.
+
 Reviewer 0018 accepted the complete v2 source in `hub-async-spawn-review-20260921-fable/13-v2-model-verdict.md`.
 Root assigned compiler slot `materialization-definition-release-v2` to writer 001b after checking that no Rust build process was active.
 The grant covers one fresh library test artifact, focused checks, affected parser/accounting groups, and the ErrorImpl layout guard.
