@@ -14,6 +14,16 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core lint repair is committed as `6d5308d5`. Reviewer 001a verified the exact three files and accepted hashes; identity diff `3a634ee5` remains unchanged.
+Root assigned the sole compiler slot as `core-identity-focused-v4` after Hub released it.
+The grant covers formatting, strict focused clippy, and fresh Core library and two integration test artifacts.
+Require listed and executed counts of 21 resource, 12 client, and 19 admission library tests, plus 12 session and 13 client integration tests.
+Execute artifacts in place and verify their hashes before and after. Reuse unchanged v2 doctest evidence; stop on the first failure.
+The full workspace gate, direct box-deallocation check, and second-paste rejection execution remain open.
+Hub reports all charge-phase selections passed with 1,236 inventory entries and unchanged source manifests. Independent execution review is pending.
+Artifact: `3fc1287792d5b1e9b04feb8ca8b64b6e4fc0fa14e7303867c5c7275fc040964d`.
+The writer reports warnings increased from 81 to 83, solely for the unused growth error and growth/shrink methods. The reviewer must verify that comparison.
+
 Core reviewer 001a accepted three-file lint patch `c4d3cf92` against live source and its before/after hashes.
 Root authorized its separate normal commit, staging only those three files. Identity patch `3a634ee5` must remain unchanged and uncommitted.
 The unbox body and release sequence are byte-unchanged. Existing tests do not directly observe outer-box deallocation; that evidence gap remains open.
