@@ -14,6 +14,20 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core behavior verification currently has 76 passing cases and one unresolved client integration failure.
+Behavior v1 used the wrong working directory for a source-reading test. V2 used the crate directory and passed all 12 session integration tests.
+The remaining paste test sends scheme-1 frames and expects JSON results. Current source rejects that input before admission and emits binary results.
+The old `session_not_writable` premise was retired. These are source findings; baseline execution has not yet established historical failure.
+Root granted one exact baseline test at `053148f6` in `/private/tmp/core-paste-baseline-zop7pofa`, with correct cwd and unchanged source.
+Writer 0019 owns the compiler slot. Preserve the actual failure and provenance; do not retry or edit the test under this grant.
+Reviewer 001a will identify a current rejection premise that preserves operation identity, zero writes, and a bound route. No test repair is authorized yet.
+The non-strict lint inventory remains pending; the earlier conditional grant did not run after the client failure.
+
+Hub's actual producer creates a reply endpoint before Host materialization. The funded helper is test-only, but the unfunded production channel already crosses that boundary.
+Splitting the existing charge seals later growth. Root reopened the affected accounting design instead of weakening sealed descendants.
+The Hub pair must compare a shared operation allowance with a fixed-charge deduction from the remaining growth ceiling across all ownership and cancellation paths.
+No extra independent callback allowance, blanket input-limit prepayment, or implementation change is authorized by this design review.
+
 Hub charge-phase source `b1af5eae` is integrated as `39e04f28`. The two-file patch hash matches accepted `0b34c8ae` exactly.
 Independent review accepted all eleven exact tests and the 47/9 regression groups against the 1,236-test artifact; these counts overlap.
 All source manifests held. Warnings changed from 81 to 83 solely for the dormant growth API, with no removals.
