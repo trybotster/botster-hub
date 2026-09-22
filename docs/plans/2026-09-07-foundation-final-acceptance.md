@@ -14,6 +14,16 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Recovery pair corrected the lifecycle premise: successful tracked `serve_daemon` drain receives completions before stop; terminal disposal can discard typed outcomes.
+Root selected interception before opaque disposal, charged terminal evidence, and an owned unresolved outcome returned by explicit stop as the API direction.
+Report known synced commits even when the reply is lost. Published sync uncertainty must retain candidate, prior view, and authority; printing is not reconciliation.
+The pair prepares one coordinated patch plan. No new lifecycle parent, automatic shutdown, or unrelated terminal scheduling change is assigned.
+Direct-drop reachability, startup exceptions, charged transfer, and restart treatment must remain explicit. No source or build grant has been issued.
+Spawn writer completed exact Rust 1.97 I/O source analysis at compiler commit `2d8144b7880597b6e6d3dfd63a9a9efae3f533d3`.
+Its revised growth proposal retains one parent during acquisition and splits final storage only on return. Reviewer 0018 must verify live-overlap coverage.
+Darwin libc internal allocation behavior remains unproved; no exclusion is inferred. Evidence: writer `rust197-io-allocation-proof.md` and pinned source manifest.
+Reviewer 0018 also found a possible existing borrowed-selector replacement for whole-vector clones and sort scratch; parity review precedes source changes.
+
 Recovery writer 001d found no safe startup-only activation: existing Host mutations still construct path-only writers outside retained authority.
 Root declined another dormant startup slice and assigned the shared authority/outcome lifecycle as the next recovery task.
 The writer must compare two concrete designs for authority transfer, late completion retention, retirement, capacity funding, and restart evidence.
