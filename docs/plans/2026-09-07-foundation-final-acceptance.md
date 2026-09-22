@@ -16,6 +16,12 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Continuation — September 22
 
+PAUSED at the user's request to conserve tokens and prioritize other work. Root marked the orchestration goal paused and sent pause instructions to all seven remaining Botster agents.
+All outstanding implementation and verification grants are suspended. Agents must preserve worktrees and evidence, send one brief handoff, and remain idle until the user resumes.
+Last pushed source checkpoint: `a8884a5f` on `delivery/async-spawn-20260921`; all 17 focused tests passed. Full asynchronous spawn remains incomplete.
+Resume with the daemon consumer and exact context retirement. Check saved dirty work before assigning edits. Preserve unresolved policy decisions and permission denials; pause does not resolve them.
+Other projects are outside this pause. No agents or worktrees are deleted.
+
 Partial checkpoint `a8884a5f24878b027e0f73e3ed92addc6be914f4` preserves the exact seven-file v5 source. Root verified its scope and pushed it to `origin/delivery/async-spawn-20260921` without force.
 The commit distinguishes tested tracker/collector behavior, partially exercised owner binding, and compiled-only inactive implementation. It does not claim full spawn acceptance.
 Reviewer 0018 accepted the execution evidence and confirmed identical warning multisets between v4 and v5. Local evidence remains untracked; external export is still blocked.
