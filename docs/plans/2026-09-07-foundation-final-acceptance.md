@@ -14,6 +14,13 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Jason approved conservative affected-store write pause after a visible write whose disk synchronization fails: "Sure, we can be conservative".
+Retain the unresolved candidate, prior state, and write authority. Report a clear typed error and refuse further affected-store persistence.
+Do not start effects that require the unavailable persistence step. Unrelated reads, sessions, and terminal transport continue.
+No automatic rollback, retry, clearing after a later sync, or shutdown is authorized. Writes can remain paused until reconciliation is separately selected.
+This policy approval does not approve every adapter mechanism. The writer and reviewer must settle exact capability and failure-bundle ownership before shared edits.
+Path restoration does not automatically clear the pause. A path-current check alone cannot enforce this policy.
+
 Storage registration `7d2e18e2` is integrated as `896af154` after independent source and raw-evidence acceptance.
 Nine macOS storage tests and fifteen recovery regressions passed. Removing lock and link checks caused the intended failures; restored controls passed.
 Baseline and restored binaries match `72ef6c8820ac205339f507e16d38f4ee8d65c4eb52eacf4aaf8b458d8972069e`.
