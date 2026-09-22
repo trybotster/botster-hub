@@ -1,6 +1,6 @@
 # Foundation integration and final acceptance
 
-Status: reviewed Hub checkpoints through `9cc101cb` are pushed. Full foundation acceptance remains open.
+Status: partial spawn checkpoint `a8884a5f` is pushed. Full foundation acceptance remains open.
 
 ## Current orchestration ledger — September 21
 
@@ -16,11 +16,13 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Continuation — September 22
 
-PAUSED at the user's request to conserve tokens and prioritize other work. Root marked the orchestration goal paused and sent pause instructions to all seven remaining Botster agents.
-All outstanding implementation and verification grants are suspended. Agents must preserve worktrees and evidence, send one brief handoff, and remain idle until the user resumes.
-Last pushed source checkpoint: `a8884a5f` on `delivery/async-spawn-20260921`; all 17 focused tests passed. Full asynchronous spawn remains incomplete.
-Resume with the daemon consumer and exact context retirement. Check saved dirty work before assigning edits. Preserve unresolved policy decisions and permission denials; pause does not resolve them.
-Other projects are outside this pause. No agents or worktrees are deleted.
+RESUMED at the user's explicit request. The user manually selected GPT-6 Sol for the implementer. Root will preserve this choice.
+Root checked the live agent inventory and the spawn worktree: HEAD is `a8884a5f`, with no tracked changes and only local `.spawn-review/` untracked.
+Writer 001b and reviewer 0018 resume the real daemon consumer and exact context retirement. Other agents remain idle until an actionable assignment exists.
+The next slice includes owner capacity followed by Host capacity before dequeue, capacity wake routing, and atomic migration of pre-reservation context publication and raw alias cleanup.
+Reuse the 17 passing focused tests as checkpoint evidence. Full asynchronous spawn remains incomplete. Freeze the new source for review before assigning a build.
+Root retains commit/push coordination. Prior permission denials and unresolved stop/restart decisions remain open. No new build, export, or deployment is authorized by resumption.
+The earlier pause preserved all worktrees and evidence. No agents or worktrees were deleted.
 
 Partial checkpoint `a8884a5f24878b027e0f73e3ed92addc6be914f4` preserves the exact seven-file v5 source. Root verified its scope and pushed it to `origin/delivery/async-spawn-20260921` without force.
 The commit distinguishes tested tracker/collector behavior, partially exercised owner binding, and compiled-only inactive implementation. It does not claim full spawn acceptance.
