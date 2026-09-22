@@ -730,6 +730,55 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn acknowledge_admission_preserves_zero_segments_and_charge_conservation() {
+        let sizing = ownership::AcknowledgeSizing {
+            input: 0,
+            lookup: 0,
+            result: 0,
+            error_string: 1,
+            conversion: 0,
+            core_request: 0,
+            core_reply: 0,
+            callback_reply: 0,
+            caller: 1,
+            continuation: 1,
+            disposal: 1,
+        };
+        let total = sizing.total().unwrap();
+        let memory = account(total, total);
+        let mut charges = sizing.admit(&memory).unwrap();
+        assert_eq!(charges.core_request.bytes(), 0);
+        assert_eq!(charges.input.bytes(), 0);
+        assert_eq!(charges.conversion.bytes(), 0);
+        assert_eq!(
+            charges.core_request.grow(1),
+            Err(crate::lua_memory::LuaCallbackGrowthError::Sealed)
+        );
+        assert_eq!(
+            [
+                &charges.input,
+                &charges.lookup,
+                &charges.result,
+                &charges.error_string,
+                &charges.conversion,
+                &charges.core_request,
+                &charges.core_reply,
+                &charges.callback_reply,
+                &charges.caller,
+                &charges.continuation,
+                &charges.disposal,
+            ]
+            .into_iter()
+            .map(LuaCallbackCharge::bytes)
+            .sum::<usize>(),
+            total
+        );
+        assert_eq!(memory.usage().1, total);
+        drop(charges);
+        assert_eq!(memory.usage().1, 0);
+    }
+
     fn ample_account() -> Arc<LuaMemoryAccount> {
         let total = sizing_total("subscription", "session", "envelope").saturating_mul(4);
         account(total, total.saturating_mul(8))
