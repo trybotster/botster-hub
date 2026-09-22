@@ -15,6 +15,11 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 ### Decision handoff — September 21, resumed assignments
 
 Current spawn gate: Root froze new source application after independent review identified excessive overlapping unverified surfaces.
+Reviewer accepted exact freeze `d4f368e4` plus 1,013-file manifest in `03-frozen-baseline-verdict.md`.
+Root granted spawn the sole compiler slot `freeze-v1-20260921`: formatting check, one offline locked library test build, and selected regressions.
+Each test run must pass at least one test, fail none, and match its artifact inventory count. All source hashes must remain unchanged.
+Stop on failure or drift; the grant does not permit source repair or another build. Recovery remains source-only during this slot.
+This supersedes older no-slot statements below. No build result is available yet. The ordinary daemon consumer remains absent.
 The writer must report exact HEAD, all tracked/untracked changes, safety import status, source hashes, and a bounded verification plan.
 The reviewer must examine that exact combined baseline before Root grants the single compiler slot.
 The applied wake changes belong in this freeze; do not describe it as replay plus receipt/reply only.
