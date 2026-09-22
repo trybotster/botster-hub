@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Reviewer 0018 verified selector execution in verdict 28. Root accepted the checkpoint and authorized its normal single-file commit.
+Five new exact tests and two existing target tests passed once each. Selection and catalog parity groups passed five each; counts overlap.
+Artifact `b172f82d6791826c59599868c4b2002db8bdd86a52f077d4924ef9385822996c` contains 1,225 tests; all 1,014 source hashes held.
+Warnings fell from 83 to 81 solely because the borrowed selector is now used. No performance claim follows. Integration awaits source SHA.
+Root assigned the pair the approved post-reservation context boundary next: all producers, exact-attempt cleanup, both aliases, retained reads, and persistent charges.
+They must identify actual dependencies rather than block this independent work on unresolved libc acquisition scope. No context source or build grant yet.
+No compiler slot is assigned. Recovery remains held on restart policy and protocol review, not on the completed selector checkpoint.
+
 Reviewer 0018 accepted selector freeze `51b1bd05` in verdict 27 after checking all three callers, distinct filters, diagnostic order, and five parity tests.
 Root granted writer 001b compiler slot `source-selection-borrowed-v1` after confirming no Rust build was active.
 The grant covers one fresh artifact, five exact new tests, and relevant existing selection/target/catalog parity tests with positive inventory-matched counts.
