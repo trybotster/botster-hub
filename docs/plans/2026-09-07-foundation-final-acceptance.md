@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Storage registration `7d2e18e2` is integrated as `896af154` after independent source and raw-evidence acceptance.
+Nine macOS storage tests and fifteen recovery regressions passed. Removing lock and link checks caused the intended failures; restored controls passed.
+Baseline and restored binaries match `72ef6c8820ac205339f507e16d38f4ee8d65c4eb52eacf4aaf8b458d8972069e`.
+Evidence: `/Users/jasonconigliari/botster-evidence/durable-recovery-20260921/storage-registration-v1/`.
+The macOS build newly compiles pinned rustix 1.1.4 with std/alloc/fs; dependency versions and checksums did not change.
+The storage module has no production adapter. Linux, pre-rename race, drive-cache durability, crash recovery, and strict lint remain open.
+Recovery next prepares the exact production adapter and ownership-lifetime handoff plan before edits. No compiler slot is currently assigned.
+Spawn implements the reviewed materialization model source boundary; its only extra catalog change is helper visibility for the pinned error-size bound.
+
 Remaining receipt tests `28b3afca` are integrated as `92cedcca` after independent source and execution review.
 Nine exact tests passed once each; enclosing groups passed 10, 6, and 4 tests, reported separately because counts overlap.
 Artifact: `63fffb6dc6599c65a904b4456491562027d95572167ca548efc37158199c8017`; all 1,013 hashes held; 83 warnings unchanged.
