@@ -14,6 +14,16 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Latest verification: freeze v1 stopped at formatting only. Root inspected the single whitespace correction and granted conditional freeze-v2 verification.
+No compilation/test result is recorded yet. The writer must preserve failed logs and prove only that correction changed the manifest.
+Recovery review 1 accepted the directory-lock premise conditionally, with target execution checks still required.
+Storage must not report a post-rename committed write as a precommit failure. Apple directory durability and fresh-state NotFound handling need correction.
+The inspection protocol proposal is held: version/generated client compatibility and exact registry reads remain unresolved.
+Writer and reviewer must reconcile default-socket claims with the earlier custom-socket trace before removing endpoint discovery.
+The next spawn checkpoint needs behavioral tests for receipt, reply, and conversion paths; current managed tests do not cover those paths.
+Root rejected the reviewer's proposed exclusion for std blocking-receive Context storage. Worker-lifetime accounting remains required and open.
+Only the previously approved private mlua reference-storage exclusion stands. A source comment cannot create another exclusion.
+
 Current spawn gate: Root froze new source application after independent review identified excessive overlapping unverified surfaces.
 Reviewer accepted exact freeze `d4f368e4` plus 1,013-file manifest in `03-frozen-baseline-verdict.md`.
 Root granted spawn the sole compiler slot `freeze-v1-20260921`: formatting check, one offline locked library test build, and selected regressions.
