@@ -14,6 +14,19 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core published cleanup `ab1a7cee` and reservation identity `891e220295427fd93991638d7c62ba40fa25d4ae` on the recovery branch. Main remains `053148f6`.
+The full-workspace command did not start: automatic approval review rejected the tool-delivered grant and requires direct user authorization.
+Root requested that approval. No retry, alternative tool, native build, or dependency-download bypass is authorized. The compiler slot is free.
+
+Root granted the coherent ordinary spawn implementation to Hub writer 001b in the reviewed production boundary.
+Reuse the existing pending bit, shared doorbell, Core stage, Host executor, and exact-loss reply mechanism. No parallel spawn engine or uncharged activation is allowed.
+Reviewer 0018 checks owner registration, loss signaling, field/drop order, saturation, both observation orders, all context writers, and the real Lua two-ID test.
+Allocation proofs remain acceptance blockers where missing. Source implementation can advance independently of the blocked Core workspace run.
+
+Hub pin patch `1e9daf3e` passed independent source review. Ten files contain exactly 24 old-to-new revision substitutions: 12 manifest pins, six lock sources, six active literals.
+All five Core fixture files are byte-identical across revisions. Historical reports and evidence remain unchanged; future-report source tracks the new pin.
+Root authorized a separate commit of only the frozen pin diff. Downstream compilation has not run and is not claimed.
+
 Core reviewer 001a accepted cleanup execution and the scoped reservation-identity checkpoint.
 Strict focused all-target clippy passed without warnings or unfulfilled lint expectations. Fresh resource/client/route-observer tests passed 21/12/5.
 Identity acceptance reuses the unchanged 19 admission tests and seven doctests, including the intended E0308 rejection. No downstream build is claimed.
