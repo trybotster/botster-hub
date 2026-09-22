@@ -14,9 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
-Current materialization checkpoint: complete nine-file model `0e1a4c50` is frozen with 1,014-file manifest and passing format preflight.
-The independent reviewer must check the connected allocation/error proof before a build grant. No permit or runtime activation is claimed.
-A 256-definition corpus candidate may expose conservative capacity refusal; no narrowing or stack-accounting exclusion is approved.
+The reviewer accepted materialization model `0e1a4c50` in source. Its 1,014-file manifest and passing format preflight remain preserved.
+No build or runtime proof follows from this review. The 256-definition candidate may expose conservative capacity refusal.
+Root authorized `materialization-definition-release-v2` within the same nine files after an independent review of the pinned ownership chain.
+The writer must release only completed-definition temporary storage. The release must exclude parent-vector growth and remain unreachable on child failure.
+The model must retain output, decoder scratch, prior owners, the recorded maximum, and the separate typed-error bound.
+The reviewer must check the complete revised model before a compiler grant. No quota change, permit activation, or stack-accounting exclusion is approved.
+Evidence: `hub-async-spawn-review-20260921-fable/11-materialization-model-verdict.md` and `12-completed-definition-release-endorsed.md` under `/Users/jasonconigliari/botster-evidence/`.
+The writer's `completed-definition-release-audit.md` is under `s1-async-spawn-20260921-sess-001b/` in that evidence directory.
 Recovery adapter work is held. Returned authority (B2) is selected, but unbound public File saves need Jason's compatibility decision.
 HostExecutor drops closed-delivery completions. A detached writer can finish after daemon stop returns; no surviving outcome reporter is established.
 The reviewer withdrew both the assumed shutdown/status consumer and authority-slot retention claim. A log is not retained recovery evidence.
