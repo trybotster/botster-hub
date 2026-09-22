@@ -4,12 +4,15 @@
 //! and recreated while another owner retains the original lock.
 //! This module is not connected to persistence or runtime startup yet.
 
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Clones authorize work on the same loaded document, not another state snapshot.
 #[derive(Debug, Clone)]
@@ -18,9 +21,17 @@ pub(crate) struct StateDirectoryOwnership(Arc<DirectoryLock>);
 #[derive(Debug)]
 struct DirectoryLock {
     directory: PathBuf,
+    directory_cstr: CString,
     file: File,
     device: u64,
     inode: u64,
+    quarantine_reason: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuarantineReason {
+    DirectorySyncFailed = 1,
+    DirectoryChanged = 2,
 }
 
 #[derive(Debug)]
@@ -28,7 +39,8 @@ pub(crate) enum StateDirectoryError {
     Io(io::Error),
     DocumentRead(io::Error),
     Owned(PathBuf),
-    Replaced(PathBuf),
+    Replaced,
+    Quarantined(QuarantineReason),
     InvalidTemporaryFile,
 }
 
@@ -60,10 +72,12 @@ impl fmt::Display for StateDirectoryError {
                 "state directory {} already has a writer",
                 directory.display()
             ),
-            Self::Replaced(directory) => write!(
+            Self::Replaced => {
+                formatter.write_str("state directory changed while its writer was active")
+            }
+            Self::Quarantined(reason) => write!(
                 formatter,
-                "state directory {} changed while its writer was active",
-                directory.display()
+                "state directory write is paused after uncertain publication: {reason:?}"
             ),
             Self::InvalidTemporaryFile => formatter
                 .write_str("state temporary file is not an exclusively linked regular file"),
@@ -75,7 +89,9 @@ impl std::error::Error for StateDirectoryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) | Self::DocumentRead(error) => Some(error),
-            Self::Owned(_) | Self::Replaced(_) | Self::InvalidTemporaryFile => None,
+            Self::Owned(_) | Self::Replaced | Self::Quarantined(_) | Self::InvalidTemporaryFile => {
+                None
+            }
         }
     }
 }
@@ -85,6 +101,12 @@ impl StateDirectoryOwnership {
     pub(crate) fn acquire(directory: &Path) -> Result<Self, StateDirectoryError> {
         fs::create_dir_all(directory).map_err(StateDirectoryError::Io)?;
         let directory = fs::canonicalize(directory).map_err(StateDirectoryError::Io)?;
+        let directory_cstr = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
+            StateDirectoryError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "state directory path contains a null byte",
+            ))
+        })?;
         let file = File::open(&directory).map_err(StateDirectoryError::Io)?;
         match file.try_lock() {
             Ok(()) => {}
@@ -93,13 +115,15 @@ impl StateDirectoryOwnership {
         }
         let metadata = file.metadata().map_err(StateDirectoryError::Io)?;
         if !metadata.is_dir() {
-            return Err(StateDirectoryError::Replaced(directory));
+            return Err(StateDirectoryError::Replaced);
         }
         let ownership = Self(Arc::new(DirectoryLock {
             directory,
+            directory_cstr,
             file,
             device: metadata.dev(),
             inode: metadata.ino(),
+            quarantine_reason: AtomicU8::new(0),
         }));
         ownership.ensure_current()?;
         Ok(ownership)
@@ -154,6 +178,9 @@ impl StateDirectoryOwnership {
     ) -> Result<StateDocumentCommit, StateDirectoryError> {
         use rustix::fs::{Mode, OFlags, openat, renameat};
 
+        if let Some(reason) = self.quarantine_reason() {
+            return Err(StateDirectoryError::Quarantined(reason));
+        }
         self.ensure_current()?;
         let descriptor = openat(
             &self.0.file,
@@ -183,31 +210,81 @@ impl StateDirectoryOwnership {
         }
         #[cfg(test)]
         if fault.directory_sync_error {
-            return Ok(StateDocumentCommit::RenamedSyncFailed(io::Error::other(
-                "injected directory sync failure",
-            )));
+            self.set_quarantine(QuarantineReason::DirectorySyncFailed);
+            return Ok(StateDocumentCommit::RenamedSyncFailed(
+                rustix::io::Errno::IO.into(),
+            ));
         }
         if let Err(error) = rustix::fs::fsync(&self.0.file) {
+            self.set_quarantine(QuarantineReason::DirectorySyncFailed);
             return Ok(StateDocumentCommit::RenamedSyncFailed(error.into()));
         }
-        Ok(match self.ensure_current() {
-            Ok(()) => StateDocumentCommit::Synced,
-            Err(error) => StateDocumentCommit::SyncedDirectoryChanged(error),
-        })
+        if self.post_rename_directory_matches() {
+            Ok(StateDocumentCommit::Synced)
+        } else {
+            self.set_quarantine(QuarantineReason::DirectoryChanged);
+            Ok(StateDocumentCommit::SyncedDirectoryChanged(
+                StateDirectoryError::Replaced,
+            ))
+        }
+    }
+
+    fn quarantine_reason(&self) -> Option<QuarantineReason> {
+        match self.0.quarantine_reason.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(QuarantineReason::DirectorySyncFailed),
+            2 => Some(QuarantineReason::DirectoryChanged),
+            _ => unreachable!("only fixed quarantine reasons can be stored"),
+        }
+    }
+
+    fn set_quarantine(&self, reason: QuarantineReason) {
+        let _ = self.0.quarantine_reason.compare_exchange(
+            0,
+            reason as u8,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// No path conversion or error construction occurs after rename.
+    /// A failed lookup cannot prove that the directory is still current.
+    fn post_rename_directory_matches(&self) -> bool {
+        let Ok(current) = rustix::fs::stat(self.0.directory_cstr.as_c_str()) else {
+            return false;
+        };
+        let Ok(retained) = rustix::fs::fstat(&self.0.file) else {
+            return false;
+        };
+        self.stat_identity_matches(&current, &retained)
+    }
+
+    fn stat_identity_matches(
+        &self,
+        current: &rustix::fs::Stat,
+        retained: &rustix::fs::Stat,
+    ) -> bool {
+        use rustix::fs::FileType;
+
+        FileType::from_raw_mode(current.st_mode) == FileType::Directory
+            && FileType::from_raw_mode(retained.st_mode) == FileType::Directory
+            && current.st_dev as u64 == self.0.device
+            && current.st_ino as u64 == self.0.inode
+            && retained.st_dev as u64 == self.0.device
+            && retained.st_ino as u64 == self.0.inode
     }
 
     /// Reject replacement detected before a filesystem operation.
     /// This check does not make later path-based operations atomic with rename.
     pub(crate) fn ensure_current(&self) -> Result<(), StateDirectoryError> {
-        let retained = self.0.file.metadata().map_err(StateDirectoryError::Io)?;
-        let current = fs::metadata(&self.0.directory).map_err(StateDirectoryError::Io)?;
-        if !current.is_dir()
-            || current.dev() != self.0.device
-            || current.ino() != self.0.inode
-            || retained.dev() != self.0.device
-            || retained.ino() != self.0.inode
-        {
-            return Err(StateDirectoryError::Replaced(self.0.directory.clone()));
+        use rustix::fs::{fstat, stat};
+
+        let retained =
+            fstat(&self.0.file).map_err(|error| StateDirectoryError::Io(error.into()))?;
+        let current = stat(self.0.directory_cstr.as_c_str())
+            .map_err(|error| StateDirectoryError::Io(error.into()))?;
+        if !self.stat_identity_matches(&current, &retained) {
+            return Err(StateDirectoryError::Replaced);
         }
         Ok(())
     }
@@ -294,7 +371,7 @@ mod tests {
         fs::write(directory.join("hub-state.json"), b"unrelated").unwrap();
         assert!(matches!(
             owner.write_document(b"stale"),
-            Err(StateDirectoryError::Replaced(_))
+            Err(StateDirectoryError::Replaced)
         ));
         assert_eq!(
             fs::read(directory.join("hub-state.json")).unwrap(),
@@ -357,7 +434,7 @@ mod tests {
         assert!(matches!(
             outcome,
             Ok(StateDocumentCommit::SyncedDirectoryChanged(
-                StateDirectoryError::Replaced(_)
+                StateDirectoryError::Replaced
             ))
         ));
         assert_eq!(
@@ -368,6 +445,17 @@ mod tests {
             fs::read(directory.join("hub-state.json")).unwrap(),
             b"unrelated"
         );
+        fs::remove_file(directory.join("hub-state.json")).expect("remove unrelated document");
+        fs::remove_dir(&directory).expect("remove empty replacement");
+        fs::rename(&retained_path, &directory).expect("restore original pathname");
+        assert_eq!(owner.read_document().unwrap(), b"committed");
+        assert!(matches!(
+            owner.write_document(b"later"),
+            Err(StateDirectoryError::Quarantined(
+                QuarantineReason::DirectoryChanged
+            ))
+        ));
+        assert_eq!(owner.read_document().unwrap(), b"committed");
     }
 
     #[test]
@@ -389,6 +477,79 @@ mod tests {
             fs::read(fixture.0.join("hub-state.json")).unwrap(),
             b"published"
         );
+        assert_eq!(owner.read_document().unwrap(), b"published");
+        assert!(matches!(
+            owner.write_document(b"later"),
+            Err(StateDirectoryError::Quarantined(
+                QuarantineReason::DirectorySyncFailed
+            ))
+        ));
+        assert_eq!(owner.read_document().unwrap(), b"published");
+    }
+
+    #[test]
+    fn quarantine_is_shared_by_clones_and_survives_a_directory_round_trip() {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("data");
+        let moved = fixture.0.join("moved");
+        let owner = StateDirectoryOwnership::acquire(&directory).unwrap();
+        let clone = owner.clone();
+        assert!(matches!(
+            owner.write_document_inner(
+                b"published",
+                CommitTestFault {
+                    after_rename: None,
+                    directory_sync_error: true,
+                },
+            ),
+            Ok(StateDocumentCommit::RenamedSyncFailed(_))
+        ));
+        fs::rename(&directory, &moved).unwrap();
+        fs::rename(&moved, &directory).unwrap();
+        assert!(matches!(
+            clone.write_document(b"later"),
+            Err(StateDirectoryError::Quarantined(
+                QuarantineReason::DirectorySyncFailed
+            ))
+        ));
+        assert_eq!(clone.read_document().unwrap(), b"published");
+        assert!(!directory.join("hub-state.json.tmp").exists());
+    }
+
+    #[test]
+    fn a_new_directory_owner_does_not_inherit_process_local_quarantine() {
+        let fixture = Fixture::new();
+        let owner = StateDirectoryOwnership::acquire(&fixture.0).unwrap();
+        assert!(matches!(
+            owner.write_document_inner(
+                b"published",
+                CommitTestFault {
+                    after_rename: None,
+                    directory_sync_error: true,
+                },
+            ),
+            Ok(StateDocumentCommit::RenamedSyncFailed(_))
+        ));
+        drop(owner);
+        let reopened = StateDirectoryOwnership::acquire(&fixture.0).unwrap();
+        assert_eq!(reopened.read_document().unwrap(), b"published");
+        assert!(matches!(
+            reopened.write_document(b"next"),
+            Ok(StateDocumentCommit::Synced)
+        ));
+    }
+
+    #[test]
+    fn long_directory_path_keeps_post_rename_identity_check() {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("a".repeat(190)).join("b".repeat(190));
+        let owner = StateDirectoryOwnership::acquire(&directory).unwrap();
+        assert!(owner.directory().as_os_str().as_bytes().len() > 384);
+        assert!(matches!(
+            owner.write_document(b"published"),
+            Ok(StateDocumentCommit::Synced)
+        ));
+        assert_eq!(owner.read_document().unwrap(), b"published");
     }
 
     #[test]
