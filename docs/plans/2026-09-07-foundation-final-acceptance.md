@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Reviewer 0018 accepted the trait JSON derivation in source: maximum encoded length 4,193 bytes and conservative buffer overlap 16,772 bytes.
+These are allocation-request bounds, not measured allocation peaks or executed tests. No complete materialization permit follows.
+Construction-error formatting still needs demonstrated reuse of the existing bound. Source selection still lacks funded acquisition and collect/sort correspondence.
+Root assigned one narrow read-only interface check: trace repository acquisition to existing funded-reader code and identify the reusable formatting-bound helper.
+The writer must distinguish an unwired mechanism from a missing contract. Reviewer 0018 checks those findings before any implementation decision.
+Environment path acquisition remains unresolved. No code changes or compiler slot are authorized.
+Evidence: writer `three-input-terms-derivation.md` and reviewer `19-three-terms-verdict.md` in the existing evidence directories.
+
 Reviewer 0018 withdrew the startup-caching solution and the claim that a complete bound follows from resolving paths.
 Four construction prerequisites remain unproved: environment path acquisition, formatting growth, selection collections, and construction errors.
 These are technical questions, not impossibility results or a request to relax accounting. Independent increments are not the proved sole alternative.
