@@ -16,6 +16,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Continuation — September 22
 
+Reviewer 0018 accepted the combined lifecycle source contract at report hash `93fe2dbcc49067d96f6aa7caae29bdd6c602fa8b6623fa0cf09eecd74cab3a23`.
+Root released writer 001b to implement the bounded capacity and lifecycle changes. This is design acceptance, not implementation acceptance.
+The scope includes typed daemon and plugin rows, local transport or Lua conversion receipts, and exact cleanup during terminal drain.
+The conditional file scope now includes `src/data_plane/driver.rs` and `src/daemon/owner_loop.rs` for the derived capacity and regressions.
+Ordinary plugin spawns must reserve an existing owner permit before work. They can receive a typed capacity refusal under client load.
+This operation limit does not replace per-plugin memory accounting. The existing operation limit remains unchanged.
+The report update adds this admission rule and the `RetainedUnconfirmed` regression. Reviewer 0018 will check that small delta during implementation.
+The next gate is a combined source freeze and test-plan review. No build is granted. Parser activation and final unresolved CLI disposition remain open.
+
 The reviewer accepted the compile-repair increment after independent reconstruction. No rebuild has run.
 The writer implemented the runtime-only refusal before materialization and made `WaiterId` required. These changes remain untested.
 The writer also kept client-owned reservations out of the shared retained-reservation store. Full daemon ownership remains incomplete.
