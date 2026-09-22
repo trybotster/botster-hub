@@ -14,6 +14,16 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Root granted Hub writer 001b the sole compiler slot for `charge-phase-v1`.
+The plan requires one fresh library artifact, 1,236 inventory entries, eleven exact tests, and regression groups of 47 and nine tests.
+Group counts overlap the exact tests. Record artifact identity, unchanged source manifests, and warning differences; stop on a failure or mismatch.
+This run does not establish allocation measurements, context migration, or daemon-path acceptance.
+Core writer 0019 may prepare the three-file lint repair while Hub verifies. Reviewer 001a must accept the frozen diff before compilation or commit.
+Preserve the existing Box-taking unbox helper with a narrow explained `clippy::boxed_local` allowance. Do not change the trait solely to avoid this lint.
+The function boundary preserves outer allocation release before resource destruction. Existing allocation-order evidence still needs identification.
+The other repairs preserve the empty-queue return, exact Result type, and existing `>= 1` predicate as a compile-time assertion.
+The identity patch remains frozen. No Core compiler slot, identity commit, or new allocator harness is granted.
+
 Core focused v3 passed formatting, then failed strict clippy with four diagnostics in three unchanged files.
 The diagnostics concern question-mark syntax, a constant assertion, the resource unbox helper, and a redundant result wrapper.
 No identity diagnostic appeared, but the failed run does not pass the Core gate. These failures have no executed baseline comparison yet.
