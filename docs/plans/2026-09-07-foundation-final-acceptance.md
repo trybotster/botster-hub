@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Current materialization checkpoint: complete nine-file model `0e1a4c50` is frozen with 1,014-file manifest and passing format preflight.
+The independent reviewer must check the connected allocation/error proof before a build grant. No permit or runtime activation is claimed.
+A 256-definition corpus candidate may expose conservative capacity refusal; no narrowing or stack-accounting exclusion is approved.
+Recovery adapter work is held. Returned authority (B2) is selected, but unbound public File saves need Jason's compatibility decision.
+HostExecutor drops closed-delivery completions. A detached writer can finish after daemon stop returns; no surviving outcome reporter is established.
+The reviewer withdrew both the assumed shutdown/status consumer and authority-slot retention claim. A log is not retained recovery evidence.
+The sticky write pause remains approved, but late-worker evidence ownership and restart reconciliation are unresolved activation gates.
+Recovery source stays clean until a concrete lifecycle contract is selected. No compiler slot is currently assigned.
+
 Jason approved conservative affected-store write pause after a visible write whose disk synchronization fails: "Sure, we can be conservative".
 Retain the unresolved candidate, prior state, and write authority. Report a clear typed error and refuse further affected-store persistence.
 Do not start effects that require the unavailable persistence step. Unrelated reads, sessions, and terminal transport continue.
