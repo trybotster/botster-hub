@@ -28,7 +28,10 @@ The live terminal audit found all eight sessions at prompts; session activity la
 The spawn reviewer had repeated API safeguard errors. Root assigned the available Hub Fable reviewer to the pending independent review.
 The spawn writer must correct the unescaped-string excess reservation while preserving frozen replay source and evidence.
 The next acceptance target remains real daemon spawn, conversion acknowledgement, exact-generation cleanup, and a responsive sibling request.
-The recovery pair resumes state ownership independently. Both assignments were queued; acknowledgment is not yet verified.
+The recovery writer acknowledged and traced actual CLI/store callers. Root assigned the relevant `src/main.rs` command regions.
+Shared hooks in `runtime.rs`, `daemon.rs`, and `host_mutations.rs` require an explicit handoff before edits.
+The spawn writer resumed source work. Both assigned reviewers currently show provider usage limits with automatic continuation at 5:50 PM Pacific.
+Review is pending, not active or accepted. Writers may prepare source and ownership traces; builds and integration remain gated.
 No compiler slot is granted. Root retains integration and publication ownership. Completed Core and safety implementation work stays stopped.
 
 ### Delivery scope
