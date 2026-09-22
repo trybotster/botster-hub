@@ -42,6 +42,9 @@ Spawn found no reusable directory-owner proof in the reviewed status, installati
 Recovery identified a storage premise gap: path-based writes can diverge from a retained directory descriptor after replacement.
 Root authorized a separate dependency proposal using already-locked `rustix` 1.1.4 for safe descriptor-relative operations.
 No manifest application, version update, or portability/safety acceptance follows. Review must cover the complete persistence lifecycle.
+Directory locking is advisory. It cannot exclude legacy writers that do not acquire the lock.
+Recovery must state that compatibility boundary and propose rollout prerequisites; no process termination, permission change, or migration is authorized.
+Known endpoint rejection cannot prove absence of every legacy writer. This remains a release prerequisite, not a block on source preparation.
 Spawn traced the ordinary Lua queue to the synchronous consumer without an ordinary daemon owner wake.
 The writer must prepare one connected daemon continuation and reuse existing notifications where suitable, with exact-generation cleanup.
 No compiler slot is granted. Root retains integration and publication ownership. Completed Core and safety implementation work stays stopped.
