@@ -14,6 +14,17 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Spawn freeze-v2 checkpoint `7d920f69` is integrated as `161030b8` after independent source and raw-evidence acceptance.
+Formatting, fresh library test compilation, and 12 selected groups passed: 62 tests, zero failures. All 1,013 source hashes held.
+Artifact SHA256: `4087d3011c6432b5d058f7261c7d9d397024a73b8aa9013a917b31fb4eaee545`. Warning comparison stayed at 83.
+Evidence: `/Users/jasonconigliari/botster-evidence/s1-async-spawn-20260921-sess-001b/applied-freeze-v2-verification/`.
+Receipt/reply/wrapper are compiled only, dormant, and behaviorally untested. Ordinary wake is live, but its daemon consumer remains absent.
+The next source checkpoint adds 13 receipt/reply/wrapper behavioral cases. No new compiler slot is granted; the previous slot is released.
+Integration contains additional checkpoints beyond the tested branch; no fresh whole-integration verification is claimed.
+Recovery will separately correct successor-bearing receipt classification without changing schema or transitions.
+Root selected preparation of coordinated protocol 9-to-10 changes, preserving exact matching and supported custom sockets.
+Shared protocol application, other-repository edits, client rollout, installation, and deployment remain held.
+
 Latest verification: freeze v1 stopped at formatting only. Root inspected the single whitespace correction and granted conditional freeze-v2 verification.
 No compilation/test result is recorded yet. The writer must preserve failed logs and prove only that correction changed the manifest.
 Recovery review 1 accepted the directory-lock premise conditionally, with target execution checks still required.
