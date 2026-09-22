@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Writer 001b completed the read-only materialization/stack pass. Reviewer 0018 must verify its premises before implementation resumes.
+The parser model does not itself cover source resolution, context, metadata, and Core request copies. Existing coverage for those allocations requires review.
+The writer also reports that separate callback reservations lack a shared per-callback ceiling. The reviewer must check existing ownership mechanisms before adding one.
+Host workers receive no account and can survive executor destruction through disposal permits. No explicit stack size or stack account policy was found.
+A guard inside a worker does not alone prove platform stack-release timing. Requested stack size and actual allocated storage must remain distinct.
+Root requested the smallest evidenced contract or user decision, not an invented quota, exclusion, or accounting mechanism.
+Evidence: `s1-async-spawn-20260921-sess-001b/materialization-stack-contract-pass.md` under `/Users/jasonconigliari/botster-evidence/`.
+No source edits or builds followed this pass. Consumer activation remains held.
+
 Materialization source `f7ea2c67` is integrated as `71fee4e0` after independent source and execution review. The checkpoint remains dormant.
 No whole-integration build or production acceptance follows from the source-branch tests. The cherry-pick completed without conflicts.
 The next consumer proposal exposes unresolved charged-ingress, materialization, worker-stack, context, and recovery dependencies.
