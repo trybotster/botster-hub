@@ -14,6 +14,17 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Receipt tests `8d4ca50a` are integrated as `b2832401` after independent raw-evidence review.
+Three exact tests passed once each. Enclosing groups passed 3 and 8 tests; those groups include the exact tests and are not additive.
+The tests establish receipt loss, refused mint preserving phase identity, and quota conversion reporting Abandoned through actual entry paths.
+Artifact SHA256: `fd62ab6759c7a47c36497a8ac3ca4ef619c341da9d0aac925fe9e1233d6be464`; 1,013 source hashes held; 83 warnings.
+Evidence: `/Users/jasonconigliari/botster-evidence/s1-async-spawn-20260921-sess-001b/receipt-first-three-v2-verification/`.
+No mutation control ran. Full daemon behavior remains open. Spawn prepares the remaining nine meaningful cases together, without a build grant.
+Recovery owns compiler slot `classifier-v2-20260921` for the corrected classifier, negative control, and exact restored controls.
+Read-only formatting checks no longer require the compiler slot. Writers format owned drafts before source review and freeze.
+The six-case worktree refusal proposal is held because existing managed reuse suppresses earlier rollback; durable authority needs full lifecycle review.
+Recovery withdrew its unsafe-release claim after checking Core retention guards. Discarded retained-release results remain a separate suspected ownership leak.
+
 Spawn freeze-v2 checkpoint `7d920f69` is integrated as `161030b8` after independent source and raw-evidence acceptance.
 Formatting, fresh library test compilation, and 12 selected groups passed: 62 tests, zero failures. All 1,013 source hashes held.
 Artifact SHA256: `4087d3011c6432b5d058f7261c7d9d397024a73b8aa9013a917b31fb4eaee545`. Warning comparison stayed at 83.
