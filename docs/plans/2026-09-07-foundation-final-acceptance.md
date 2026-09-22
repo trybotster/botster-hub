@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core owner 0019 proved an opaque detached scope/generation identity can preserve reservation equality without retaining its Arc graph.
+Root authorized Core-only identity type, accessor, reexports, and focused tests at baseline `053148f6`, with independent reviewer 001a.
+No new counter, serialization, numeric getters, or release capability is allowed. Real reservation ownership remains in spawn/cleanup stages.
+The token is process-local and does not prove current reservation liveness or launch success. No Core build or Hub dependency update is granted yet.
+Spawn pair continues the context producer/read charge trace using the proposed detached identity. No context source grant exists.
+Writer proposed a phase allowance in `context-parent-transfer-trace.md`; reviewer 0018 must first check existing account primitives and complete live-byte conservation.
+That shared-account API remains unapproved. No independent helper-removal or dormant context-sizing slice is assigned.
+Core and Hub pairs can progress independently. Recovery protocol changes remain held pending restart policy and review.
+
 Selector source `076fa923` is integrated as `106e412a`; the single-file cherry-pick completed without conflicts.
 Verification remains scoped to the reviewed source branch. No fresh whole-integration build or final delivery acceptance is claimed.
 Writer 001b is tracing the approved context caller/identity boundary. Reviewer 0018 independently checks its ownership requirements.
