@@ -14,6 +14,17 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Hub charge-phase source `b1af5eae` is integrated as `39e04f28`. The two-file patch hash matches accepted `0b34c8ae` exactly.
+Independent review accepted all eleven exact tests and the 47/9 regression groups against the 1,236-test artifact; these counts overlap.
+All source manifests held. Warnings changed from 81 to 83 solely for the dormant growth API, with no removals.
+Tests executed the evidence copy, not the Cargo output path. The reviewer corrected this claim against actual command records; hashes match.
+This closes primitive verification only. No fresh integration build, context activation, or complete asynchronous spawn acceptance is claimed.
+The Hub pair now traces reply-channel charge splitting before enqueue against later materialization growth. Sealed descendants must remain sealed.
+
+Core focused v4 passed formatting but stopped at six test-support lint errors. No planned behavior test ran in v4.
+Root granted the separate `core-identity-behavior-v1` run for the same 77 cases at frozen `6d5308d5` plus identity `3a634ee5`.
+The next lint step is one non-strict focused inventory, after a separate grant. Strict acceptance remains required; StepFailure stays unchanged pending that inventory.
+
 Core lint repair is committed as `6d5308d5`. Reviewer 001a verified the exact three files and accepted hashes; identity diff `3a634ee5` remains unchanged.
 Root assigned the sole compiler slot as `core-identity-focused-v4` after Hub released it.
 The grant covers formatting, strict focused clippy, and fresh Core library and two integration test artifacts.
