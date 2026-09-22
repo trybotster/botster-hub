@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Reviewer 0018 verified construction-error sizing execution in verdict 23. Root accepted the checkpoint and authorized its normal two-file commit.
+Six new exact tests and the ErrorImpl guard each passed once. The enclosing group passed seven tests; the counts overlap.
+The fresh artifact contains 1,220 tests. All 1,014 source hashes matched, format and diff checks passed, and 83 warnings remained unchanged.
+Artifact SHA256: `b50b865bd900b8043002132b732541beea849d4a3bac5f8730febe2749a17bfa`.
+This closes only the covered error-sizing prerequisite. Funded construction, excluded I/O errors, environment paths, and source-selection collections remain open.
+Evidence: `construction-error-sizing-v1-result.md` and its verification directory in the existing writer evidence directory.
+Integration awaits the source commit. No compiler slot is assigned and no new source work is authorized.
+
 Reviewer 0018 accepted construction-error sizing source in verdict 22. Patch SHA256: `b52968dc9263bf4b47cf8f4640365bd9a7696c4fae5f1a7822b8d59f54efe4d0`.
 Exactly two files changed. The parser arithmetic is unchanged; concrete construction candidates include wrapper overlap without Serde-specific terms.
 Root granted writer 001b compiler slot `construction-error-sizing-v1` after checking that no Rust build was active.
