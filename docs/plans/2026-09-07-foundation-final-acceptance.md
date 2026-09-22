@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core v1 verification stopped at a reproduced baseline-only format failure. No compilation ran in v1; failed evidence remains preserved.
+The reviewed formatting-only repair is committed as `f8e0b759` on the Core writer branch. Reviewer 001a confirmed identity patch `3a634ee5` is unchanged.
+Root's conditional `core-session-reservation-identity-v2` compiler grant is now active. Run the full pinned verification sequence from formatting onward.
+Hub reviewer 0018 accepted the charge-primitive contract at its scope. Root authorized implementation in `lua_memory.rs` and focused tests, not caller activation.
+Split descendants must remain sealed; explicit shrink preserves state; sharing seals; growth checks the complete unsplit charge and aggregate delta before mutation.
+The pair must agree zero-split semantics and audit allocation layout. A size_of-derived formula adjusts automatically; only proved stale assumptions justify extra edits.
+Hub may edit and freeze source while Core verifies, but it has no compiler slot. Context ownership and recovery restart acceptance remain incomplete.
+
 Core reviewer 001a accepted identity patch `3a634ee5d65a07deac0d1947ffa5d038bd03f7049794e31bf2319593b4098380` for verification.
 Root granted writer 0019 compiler slot `core-session-reservation-identity-v1` after checking no Rust build was active.
 Run pinned Rust 1.97 format/diff checks first, then fresh admission tests, doctests with actual E0308 rejection evidence, and the documented clippy gate.
