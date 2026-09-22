@@ -47,6 +47,12 @@ Recovery must state that compatibility boundary and propose rollout prerequisite
 Known endpoint rejection cannot prove absence of every legacy writer. This remains a release prerequisite, not a block on source preparation.
 Spawn traced the ordinary Lua queue to the synchronous consumer without an ordinary daemon owner wake.
 The writer must prepare one connected daemon continuation and reuse existing notifications where suitable, with exact-generation cleanup.
+Spawn's allocation timeline report identifies lost event order across existing visitors and the decoder adapter.
+Root requested independent review of that replacement boundary before dependent edits. Counting/typed semantic divergence remains unresolved.
+A sound conservative bound can suffice; exact minimum peak is not a new requirement. Additional capacity refusals still require acceptance.
+Receipt/reply patches are applied but dormant and uncommitted. Their combined review and verification remain pending.
+Recovery prepared separate contract, dependency, and protocol proposals plus an unregistered descriptor-relative storage draft.
+Its five test definitions have not run. Shared-file and manifest application remain held for storage premise review.
 No compiler slot is granted. Root retains integration and publication ownership. Completed Core and safety implementation work stays stopped.
 
 ### Delivery scope
