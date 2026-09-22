@@ -14,6 +14,16 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Recovery restart analysis found that existing RecoveryRecord cannot represent generic state mutation without a new schema/protocol.
+A bounded pending-slot candidate remains unapproved. Its clear rename can survive despite failed directory sync, so startup can see no marker after live quarantine.
+Confirmed candidate-data durability does not prove successful marker clearing or preserve quarantine across restart. The pair must not claim unconditional restart safety.
+Runtime base revision resets on load and is not durable identity. Persisted attempt/host identity and its candidate relationship need proof.
+Successive C1/C2 file replacements do not retain both prior documents. Root requested an exact crash-boundary evidence inventory, not another protocol variant.
+Jason's conservative restart-refusal decision remains pending. No schema, recovery source, marker protocol, or compiler grant is authorized.
+The pair proposes moving the existing shared-view budget before startup mutation and transferring that same budget into publication; source implementation remains held.
+Spawn selector source is frozen at `51b1bd056d91aae366fa2484e5ede2a03e29a22ce0da9cb53313e109ea1bfdaf` for whole-source review.
+Spawn acquisition now requires error headroom before I/O. Rust-visible I/O bounds have source evidence, but libc scope is not settled by counter visibility.
+
 Root authorized spawn writer 001b to simplify source selection in `src/session_types.rs` only, including parity tests.
 The change reuses borrowed selection, migrates all three owned callers, and removes full-vector clones and owned sorting without changing selection semantics.
 Reviewer 0018 must check the frozen patch, iterator-signature change, all callers, diagnostic peer order, target eligibility, and qualified loser behavior before compilation.
