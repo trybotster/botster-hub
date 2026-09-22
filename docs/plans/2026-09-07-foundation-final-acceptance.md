@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Root assigned an independent technical pass on complete materialization allocations and enforcement of the per-callback ceiling.
+Writer 001b must map actual allocations, existing charges, overlapping lifetimes, refusal ownership, and final release through Core copies.
+The pass must determine whether splitting one admitted parent charge can enforce the ceiling before proposing another mechanism.
+Reviewer 0018 must verify the table and minimal private interface. No source edits or builds are authorized yet.
+The reviewer confirmed detached workers can outlive executor destruction. Root rejected the recommendation to bypass stack accounting for activation.
+A requested stack size, recursion-depth limit, or worker-body exit signal does not alone prove mapped-stack ownership and release.
+Technical allocation work can proceed independently. Runtime activation remains gated; no stack exclusion or new limit is approved.
+
 Writer 001b completed the read-only materialization/stack pass. Reviewer 0018 must verify its premises before implementation resumes.
 The parser model does not itself cover source resolution, context, metadata, and Core request copies. Existing coverage for those allocations requires review.
 The writer also reports that separate callback reservations lack a shared per-callback ceiling. The reviewer must check existing ownership mechanisms before adding one.
