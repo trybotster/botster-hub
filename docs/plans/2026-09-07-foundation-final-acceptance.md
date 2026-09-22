@@ -14,6 +14,23 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core v2 passed 19 admission tests and seven doctests, including the intended E0308 identity rejection.
+Strict workspace clippy stopped in protocol code before it checked Core. A separate baseline run reproduced that lifetime diagnostic and the unused-mut warning.
+Reviewer 001a accepted the two-file lint repair, committed as `4afa8e52` after formatting commit `f8e0b759`.
+The uncommitted identity patch remains `3a634ee5`. Root granted the sole compiler slot as `core-identity-focused-v3`.
+Run pinned formatting, then strict all-target clippy for `botster-core` and `botster-terminal-protocol`. Stop on the first failure.
+The verified dependency graph excludes Ghostty from this focused run. Full workspace verification remains open because the pinned Ghostty submodule is uninitialized.
+Zig 0.16.0 is available. No submodule initialization, dependency update, or identity commit is authorized by this grant.
+Core evidence is under the writer worktree's `evidence/core-session-reservation-identity-v2`, `core-identity-baseline-diagnosis`, and `core-identity-lint-repair` directories.
+
+Hub reviewer 0018 accepted charge-phase patch `0b34c8ae` in report 36. The patch changes exactly two files at base `076fa923`.
+Only total admission opens growth. Every successful split seals both outputs, including zero splits; failed splits preserve state.
+Shrink preserves state, and lease sharing seals growth. Existing layout formulas derive the changed charge size automatically.
+The reviewer checked all eleven new test bodies. Formatting and diff checks passed with all 1,014 source hashes unchanged.
+No charge-phase test has executed. Hub writer 001b will prepare exact selectors and regression counts while Core holds the compiler slot.
+Evidence: `s1-async-spawn-20260921-sess-001b/charge-phase-v1-verification` and reviewer report `36-charge-phase-v1-source-verdict.md`.
+This primitive does not close funded context migration or the real daemon spawn path. Recovery remains held on restart policy and protocol review.
+
 Core v1 verification stopped at a reproduced baseline-only format failure. No compilation ran in v1; failed evidence remains preserved.
 The reviewed formatting-only repair is committed as `f8e0b759` on the Core writer branch. Reviewer 001a confirmed identity patch `3a634ee5` is unchanged.
 Root's conditional `core-session-reservation-identity-v2` compiler grant is now active. Run the full pinned verification sequence from formatting onward.
