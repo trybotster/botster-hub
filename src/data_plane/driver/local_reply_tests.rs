@@ -14,11 +14,15 @@ pub(crate) struct SpawnReceiptFixture {
 
 impl SpawnReceiptFixture {
     pub(crate) fn new(memory: &Arc<LuaMemoryAccount>) -> (Self, SpawnConversionReceipt) {
+        Self::from_charge(charge::<SpawnConversionOutcome>(memory))
+    }
+
+    pub(crate) fn from_charge(
+        charge: crate::lua_memory::LuaCallbackCharge,
+    ) -> (Self, SpawnConversionReceipt) {
         let wake = Arc::new(CoreCompletionWake::new());
         let row = new_row(&wake, 91);
-        let (ticket, publisher) = row
-            .local_reply::<SpawnConversionOutcome>(charge::<SpawnConversionOutcome>(memory))
-            .unwrap();
+        let (ticket, publisher) = row.local_reply::<SpawnConversionOutcome>(charge).unwrap();
         let identity = publisher.0.identity;
         (
             Self {
@@ -41,6 +45,26 @@ impl SpawnReceiptFixture {
         drop(self.row);
         assert_eq!(self.wake.live_identity_counts(), (0, 0, 0));
     }
+}
+
+#[test]
+fn spawn_receipt_reports_converted_once() {
+    let memory = memory();
+    let (fixture, receipt) = SpawnReceiptFixture::new(&memory);
+    receipt.converted();
+    assert!(memory.usage().1 > 0);
+    fixture.assert_outcome(SpawnConversionOutcome::Converted);
+    assert_eq!(memory.usage().1, 0);
+}
+
+#[test]
+fn spawn_receipt_reports_abandoned_once() {
+    let memory = memory();
+    let (fixture, receipt) = SpawnReceiptFixture::new(&memory);
+    receipt.abandon();
+    assert!(memory.usage().1 > 0);
+    fixture.assert_outcome(SpawnConversionOutcome::Abandoned);
+    assert_eq!(memory.usage().1, 0);
 }
 
 #[test]

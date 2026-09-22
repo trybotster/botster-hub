@@ -134,6 +134,147 @@ mod tests {
     use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
     use crate::runtime::{HubSessionTypeSpawner, PluginManagedSessionSpawned};
 
+    fn delivery_memory() -> Arc<LuaMemoryAccount> {
+        LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1024 * 1024,
+            total_vm_bytes: 1024 * 1024,
+            per_callback_bytes: 1024 * 1024,
+            total_callback_bytes: 1024 * 1024,
+        })
+        .unwrap()
+    }
+
+    fn delivery_spawned() -> PluginSessionTypeSpawned {
+        PluginSessionTypeSpawned {
+            session_id: "receipt-success".into(),
+            lifecycle: "running".into(),
+            session_type_id: "shell".into(),
+            context_id: "context".into(),
+            context_keys: vec!["key".into()],
+        }
+    }
+
+    #[test]
+    fn delivery_conversion_success_reports_converted_once() {
+        use crate::data_plane::driver::local_reply_tests::SpawnReceiptFixture;
+        use crate::runtime::SpawnConversionOutcome;
+
+        let account = delivery_memory();
+        let lua = Lua::new();
+        let failure = lua.create_string("conversion failed").unwrap();
+        let spawned = delivery_spawned();
+        let (fixture, receipt) = SpawnReceiptFixture::new(&account);
+        let receipt_bytes = account.usage().1;
+        let value =
+            convert_session_type_spawn_delivery(&lua, &account, &spawned, receipt, &failure)
+                .unwrap();
+        let Value::Table(table) = value else {
+            panic!("conversion must return a table")
+        };
+        assert_eq!(
+            table.get::<String>("session_id").unwrap(),
+            spawned.session_id
+        );
+        assert_eq!(table.get::<String>("lifecycle").unwrap(), spawned.lifecycle);
+        assert_eq!(
+            table.get::<String>("session_type_id").unwrap(),
+            spawned.session_type_id
+        );
+        assert_eq!(
+            table.get::<String>("context_id").unwrap(),
+            spawned.context_id
+        );
+        assert_eq!(
+            table.get::<Vec<String>>("context_keys").unwrap(),
+            spawned.context_keys
+        );
+        assert_eq!(account.usage().1, receipt_bytes);
+        fixture.assert_outcome(SpawnConversionOutcome::Converted);
+        assert_eq!(account.usage().1, 0);
+    }
+
+    #[test]
+    fn delivery_lua_allocation_failure_reports_abandoned_once() {
+        use crate::data_plane::driver::local_reply_tests::SpawnReceiptFixture;
+        use crate::runtime::SpawnConversionOutcome;
+
+        let account = delivery_memory();
+        let lua = Lua::new();
+        let failure = lua.create_string("conversion failed").unwrap();
+        let mut spawned = delivery_spawned();
+        spawned.context_id = "large-context-".repeat(4096);
+        let (fixture, receipt) = SpawnReceiptFixture::new(&account);
+        let receipt_bytes = account.usage().1;
+        let mut sink = CountingSink(0);
+        serde_json::to_writer(&mut sink, &spawned).unwrap();
+        // Prove that Rust admission succeeds before forcing Lua allocation failure.
+        let admission = account.reserve_callback_total(sink.0 + 17).unwrap();
+        drop(admission);
+        lua.set_memory_limit(lua.used_memory() + 1024).unwrap();
+        let result =
+            convert_session_type_spawn_delivery(&lua, &account, &spawned, receipt, &failure);
+        lua.set_memory_limit(0).unwrap();
+        assert!(matches!(result.unwrap(), Value::String(ref value) if value == &failure));
+        assert_eq!(account.usage().1, receipt_bytes);
+        fixture.assert_outcome(SpawnConversionOutcome::Abandoned);
+        assert_eq!(account.usage().1, 0);
+    }
+
+    #[test]
+    fn admitted_delivery_retains_disjoint_charges_through_conversion() {
+        use crate::data_plane::driver::{
+            local_reply_tests::SpawnReceiptFixture, retained_reply_bytes,
+        };
+        use crate::lua_memory::{LuaCallbackCharge, layout};
+        use crate::runtime::{SpawnConversionOutcome, SpawnConversionReceipt, spawn_reply_channel};
+        use std::time::Duration;
+
+        type Delivery = (
+            PluginSessionTypeSpawned,
+            SpawnConversionReceipt,
+            LuaCallbackCharge,
+        );
+        let account = delivery_memory();
+        let lua = Lua::new();
+        let failure = lua.create_string("conversion failed").unwrap();
+        let spawned = delivery_spawned();
+        let payload_bytes = spawned.session_id.capacity()
+            + spawned.lifecycle.capacity()
+            + spawned.session_type_id.capacity()
+            + spawned.context_id.capacity()
+            + spawned.context_keys.capacity() * std::mem::size_of::<String>()
+            + spawned
+                .context_keys
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>();
+        let receipt_bytes = retained_reply_bytes::<SpawnConversionOutcome>().unwrap();
+        let channel_bytes = layout::single_reply_bytes::<Delivery>(true).unwrap();
+        let total = receipt_bytes + channel_bytes + payload_bytes;
+        let mut admitted = account.reserve_callback_total(total).unwrap();
+        let (fixture, receipt) =
+            SpawnReceiptFixture::from_charge(admitted.split(receipt_bytes).unwrap());
+        let (sender, receiver) =
+            spawn_reply_channel::<Delivery>(admitted.split(channel_bytes).unwrap()).unwrap();
+        assert_eq!(admitted.bytes(), payload_bytes);
+        assert!(sender.try_send((spawned, receipt, admitted)).is_ok());
+        assert_eq!(account.usage().1, total);
+        let (spawned, receipt, payload) = receiver.recv_timeout(Duration::ZERO).unwrap();
+        assert_eq!(account.usage().1, total);
+        let value =
+            convert_session_type_spawn_delivery(&lua, &account, &spawned, receipt, &failure)
+                .unwrap();
+        assert!(matches!(value, Value::Table(_)));
+        assert_eq!(account.usage().1, total);
+        drop(receiver);
+        assert_eq!(account.usage().1, receipt_bytes + payload_bytes);
+        drop(spawned);
+        drop(payload);
+        assert_eq!(account.usage().1, receipt_bytes);
+        fixture.assert_outcome(SpawnConversionOutcome::Converted);
+        assert_eq!(account.usage().1, 0);
+    }
+
     #[test]
     fn delivery_conversion_quota_reports_abandoned_once() {
         use crate::data_plane::driver::{

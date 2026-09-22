@@ -91,6 +91,8 @@ pub(crate) mod resync;
 mod session_spawn;
 use provider::{ProviderExpectation, ProviderRequestPlan};
 use session_spawn::SessionTypeSpawnStart;
+#[cfg(test)]
+pub(crate) use session_spawn::spawn_reply_channel;
 #[allow(unused_imports)] // The owner continuation will use the conversion outcome.
 pub(crate) use session_spawn::{SpawnConversionOutcome, SpawnConversionReceipt};
 pub(crate) mod family_cleanup;
