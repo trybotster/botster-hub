@@ -105,6 +105,7 @@ impl LuaMemoryAccount {
         Ok(LuaCallbackCharge {
             account: Arc::clone(self),
             bytes,
+            growth: ChargeGrowth::Open,
         })
     }
 
@@ -123,6 +124,7 @@ impl LuaMemoryAccount {
         Ok(LuaCallbackCharge {
             account: Arc::clone(self),
             bytes,
+            growth: ChargeGrowth::Sealed,
         })
     }
 
@@ -147,6 +149,7 @@ impl LuaMemoryAccount {
         Ok(LuaCallbackCharge {
             account: Arc::clone(self),
             bytes,
+            growth: ChargeGrowth::Sealed,
         })
     }
 
@@ -201,6 +204,19 @@ pub(crate) enum LuaCallbackAdmissionError {
     Capacity(LuaMemoryCapacityError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LuaCallbackGrowthError {
+    Sealed,
+    Quota,
+    Capacity(LuaMemoryCapacityError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChargeGrowth {
+    Open,
+    Sealed,
+}
+
 impl fmt::Display for LuaMemoryCapacityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -241,18 +257,57 @@ impl Drop for LuaVmCharge {
 pub(crate) struct LuaCallbackCharge {
     account: Arc<LuaMemoryAccount>,
     bytes: usize,
+    growth: ChargeGrowth,
 }
 
 impl LuaCallbackCharge {
+    /// Admit additional bytes before allocation. Only an unsplit parent can grow.
+    /// Callers must not admit another parent for the same live operation.
+    pub(crate) fn grow(&mut self, additional: usize) -> Result<(), LuaCallbackGrowthError> {
+        if self.growth == ChargeGrowth::Sealed {
+            return Err(LuaCallbackGrowthError::Sealed);
+        }
+        let next = self
+            .bytes
+            .checked_add(additional)
+            .filter(|next| *next <= self.account.limits.per_callback_bytes)
+            .ok_or(LuaCallbackGrowthError::Quota)?;
+        reserve(
+            &self.account.callback_bytes,
+            additional,
+            self.account.limits.total_callback_bytes,
+            LuaMemoryClass::Callback,
+        )
+        .map_err(LuaCallbackGrowthError::Capacity)?;
+        self.bytes = next;
+        Ok(())
+    }
+
+    /// Release bytes after their payload is destroyed. Preserve growth authority.
+    /// Return false without mutation if the requested size is larger.
+    pub(crate) fn shrink_to(&mut self, next_bytes: usize) -> bool {
+        let Some(released) = self.bytes.checked_sub(next_bytes) else {
+            return false;
+        };
+        self.account
+            .callback_bytes
+            .fetch_sub(released, Ordering::AcqRel);
+        self.bytes = next_bytes;
+        true
+    }
+
     /// Transfer disjoint bytes without changing the shared account's usage.
+    /// Every successful split seals both outputs, including a zero-byte split.
     pub(crate) fn split(&mut self, bytes: usize) -> Option<Self> {
         if bytes > self.bytes {
             return None;
         }
         self.bytes -= bytes;
+        self.growth = ChargeGrowth::Sealed;
         Some(Self {
             account: Arc::clone(&self.account),
             bytes,
+            growth: ChargeGrowth::Sealed,
         })
     }
 
@@ -268,7 +323,8 @@ pub(crate) struct LuaCallbackStorageLease {
 }
 
 impl LuaCallbackStorageLease {
-    pub(crate) fn new(charge: LuaCallbackCharge) -> Self {
+    pub(crate) fn new(mut charge: LuaCallbackCharge) -> Self {
+        charge.growth = ChargeGrowth::Sealed;
         Self {
             charge: Some(Arc::new(charge)),
         }
@@ -306,6 +362,223 @@ impl Drop for LuaCallbackCharge {
         self.account
             .callback_bytes
             .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod charge_phase_tests {
+    use super::*;
+
+    fn account(per_callback_bytes: usize, total_callback_bytes: usize) -> Arc<LuaMemoryAccount> {
+        LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes,
+            total_callback_bytes,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn split_seals_parent_child_and_grandchild_in_every_drop_order() {
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let memory = account(8, 16);
+            let mut parent = memory.reserve_callback_total(6).unwrap();
+            let mut child = parent.split(2).unwrap();
+            let grandchild = child.split(1).unwrap();
+            let mut charges = [Some(parent), Some(child), Some(grandchild)];
+            for charge in charges.iter_mut().flatten() {
+                assert_eq!(charge.grow(1), Err(LuaCallbackGrowthError::Sealed));
+                assert_eq!(charge.grow(0), Err(LuaCallbackGrowthError::Sealed));
+            }
+            assert_eq!(memory.usage().1, 6);
+            let mut remaining = 6;
+            for index in order {
+                let charge = charges[index].take().unwrap();
+                remaining -= charge.bytes();
+                drop(charge);
+                assert_eq!(memory.usage().1, remaining);
+                for survivor in charges.iter_mut().flatten() {
+                    assert_eq!(survivor.grow(1), Err(LuaCallbackGrowthError::Sealed));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_split_preserves_open_growth() {
+        let memory = account(8, 16);
+        let mut parent = memory.reserve_callback_total(3).unwrap();
+        assert!(parent.split(4).is_none());
+        assert_eq!(parent.bytes(), 3);
+        assert_eq!(memory.usage().1, 3);
+        parent.grow(2).unwrap();
+        assert_eq!(parent.bytes(), 5);
+        assert_eq!(memory.usage().1, 5);
+        drop(parent);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn zero_and_full_splits_seal_both_outputs() {
+        for bytes in [0, 3] {
+            for parent_first in [false, true] {
+                let memory = account(8, 16);
+                let mut parent = memory.reserve_callback_total(3).unwrap();
+                let mut child = parent.split(bytes).unwrap();
+                assert_eq!((parent.bytes(), child.bytes()), (3 - bytes, bytes));
+                assert_eq!(parent.grow(1), Err(LuaCallbackGrowthError::Sealed));
+                assert_eq!(child.grow(1), Err(LuaCallbackGrowthError::Sealed));
+                assert_eq!(memory.usage().1, 3);
+                if parent_first {
+                    drop(parent);
+                    assert_eq!(memory.usage().1, bytes);
+                    assert_eq!(child.grow(1), Err(LuaCallbackGrowthError::Sealed));
+                    drop(child);
+                } else {
+                    drop(child);
+                    assert_eq!(memory.usage().1, 3 - bytes);
+                    assert_eq!(parent.grow(1), Err(LuaCallbackGrowthError::Sealed));
+                    drop(parent);
+                }
+                assert_eq!(memory.usage().1, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn shrink_preserves_open_state_across_phase_growth() {
+        let memory = account(8, 16);
+        let mut charge = memory.reserve_callback_total(5).unwrap();
+        for (retained, additional, expected) in [(3, 4, 7), (4, 2, 6), (0, 8, 8)] {
+            assert!(charge.shrink_to(retained));
+            assert_eq!(memory.usage().1, retained);
+            assert!(charge.shrink_to(retained));
+            assert!(!charge.shrink_to(retained + 1));
+            assert_eq!(charge.bytes(), retained);
+            assert_eq!(memory.usage().1, retained);
+            charge.grow(additional).unwrap();
+            assert_eq!(charge.bytes(), expected);
+            assert_eq!(memory.usage().1, expected);
+        }
+        charge.grow(0).unwrap();
+        drop(charge);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn shrink_does_not_open_a_sealed_charge_or_release_its_sibling() {
+        let memory = account(8, 16);
+        let mut parent = memory.reserve_callback_total(6).unwrap();
+        let mut child = parent.split(3).unwrap();
+        assert!(child.shrink_to(1));
+        assert_eq!((parent.bytes(), child.bytes()), (3, 1));
+        assert_eq!(memory.usage().1, 4);
+        assert_eq!(child.grow(1), Err(LuaCallbackGrowthError::Sealed));
+        assert_eq!(parent.grow(1), Err(LuaCallbackGrowthError::Sealed));
+        assert!(child.shrink_to(0));
+        drop(child);
+        assert_eq!(memory.usage().1, 3);
+        drop(parent);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn grow_refuses_quota_and_capacity_without_mutation_then_retries() {
+        let memory = account(8, 10);
+        let mut charge = memory.reserve_callback_total(4).unwrap();
+        let other = memory.reserve_callback_total(6).unwrap();
+        assert_eq!(charge.grow(5), Err(LuaCallbackGrowthError::Quota));
+        assert_eq!(
+            charge.grow(1),
+            Err(LuaCallbackGrowthError::Capacity(LuaMemoryCapacityError {
+                class: LuaMemoryClass::Callback,
+                requested: 1,
+                available: 0,
+            }))
+        );
+        assert_eq!(charge.bytes(), 4);
+        assert_eq!(memory.usage().1, 10);
+        drop(other);
+        charge.grow(4).unwrap();
+        assert_eq!(charge.bytes(), 8);
+        assert_eq!(memory.usage().1, 8);
+        drop(charge);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn grow_refuses_arithmetic_overflow_before_account_mutation() {
+        let memory = account(usize::MAX, usize::MAX);
+        let mut charge = memory.reserve_callback_total(1).unwrap();
+        assert_eq!(charge.grow(usize::MAX), Err(LuaCallbackGrowthError::Quota));
+        assert_eq!(charge.bytes(), 1);
+        assert_eq!(memory.usage().1, 1);
+        charge.grow(1).unwrap();
+        assert_eq!(memory.usage().1, 2);
+        drop(charge);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn only_total_admission_opens_growth_and_lease_sharing_seals_it() {
+        let memory = account(8, 32);
+        for mut charge in [
+            memory.reserve_callback().unwrap(),
+            memory.reserve_callback_bytes(1).unwrap(),
+            memory.reserve_shared_callback_storage(1).unwrap(),
+        ] {
+            assert_eq!(charge.grow(0), Err(LuaCallbackGrowthError::Sealed));
+            assert_eq!(charge.grow(1), Err(LuaCallbackGrowthError::Sealed));
+        }
+        assert_eq!(memory.usage().1, 0);
+        let mut charge = memory.reserve_callback_total(0).unwrap();
+        charge.grow(0).unwrap();
+        charge.grow(2).unwrap();
+        let mut lease = LuaCallbackStorageLease::new(charge);
+        let shared = lease.clone();
+        assert_eq!(lease.charge.as_ref().unwrap().growth, ChargeGrowth::Sealed);
+        drop(shared);
+        let charge = Arc::get_mut(lease.charge.as_mut().unwrap()).unwrap();
+        assert_eq!(charge.grow(1), Err(LuaCallbackGrowthError::Sealed));
+        assert_eq!(memory.usage().1, 2);
+        drop(lease);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn payload_destruction_precedes_phase_reduction() {
+        struct Payload(Arc<LuaMemoryAccount>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                assert_eq!(self.0.usage().1, 5);
+            }
+        }
+        let memory = account(8, 16);
+        let mut charge = memory.reserve_callback_total(5).unwrap();
+        let payload = Payload(Arc::clone(&memory));
+        drop(payload);
+        assert!(charge.shrink_to(2));
+        assert_eq!(memory.usage().1, 2);
+        charge.grow(4).unwrap();
+        drop(charge);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn lease_layout_includes_charge_state_and_arc_counters() {
+        let charge = std::alloc::Layout::new::<LuaCallbackCharge>();
+        let counters = std::alloc::Layout::array::<AtomicUsize>(2).unwrap();
+        let (inner, _) = counters.extend(charge).unwrap();
+        assert_eq!(layout::lease_bytes(), inner.pad_to_align().size());
+        assert!(layout::lease_bytes() >= charge.size() + counters.size());
     }
 }
 
