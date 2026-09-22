@@ -8,6 +8,8 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 
 use super::PackageSessionType;
 use super::content_budget::{ContentContainer, ContentStorage};
+use super::materialization_error::ErrorTrack;
+use super::materialization_timeline::Track;
 use super::tagged_budget::{TaggedField, TaggedStorage};
 
 #[derive(Clone, Copy)]
@@ -60,7 +62,10 @@ impl ErrorCandidates {
 }
 
 impl DefinitionStorage {
-    fn append<E: de::Error>(&mut self, next: Self) -> Result<(), E> {
+    fn append<E: de::Error>(&mut self, next: Self, track: Track<'_>) -> Result<(), E> {
+        track
+            .transfer(next.output.retained)
+            .ok_or_else(|| E::custom("session type output storage overflow"))?;
         self.output = ContentStorage::map_entry(self.output, next.output)
             .ok_or_else(|| E::custom("session type output storage overflow"))?;
         self.errors.merge(next.errors);
@@ -170,23 +175,51 @@ impl Shape {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ObservedShape<'a> {
+    shape: Shape,
+    track: Track<'a>,
+    errors: ErrorTrack<'a>,
+}
+impl Shape {
+    pub(super) fn with_track<'a>(
+        self,
+        track: Track<'a>,
+        errors: ErrorTrack<'a>,
+    ) -> ObservedShape<'a> {
+        ObservedShape {
+            shape: self,
+            track,
+            errors,
+        }
+    }
+}
 impl<'de> DeserializeSeed<'de> for Shape {
+    type Value = DefinitionStorage;
+    fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
+        self.with_track(Track::default(), ErrorTrack::default())
+            .deserialize(decoder)
+    }
+}
+impl<'de> DeserializeSeed<'de> for ObservedShape<'_> {
     type Value = DefinitionStorage;
 
     fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
-        match self {
-            Self::Execution => TaggedField::Execution
+        match self.shape {
+            Shape::Execution => TaggedField::Execution
+                .with_track(self.track, self.errors)
                 .deserialize(decoder)
-                .map(|value| self.tagged(value)),
-            Self::WorkingDirectory => TaggedField::WorkingDirectory
+                .map(|value| self.shape.tagged(value)),
+            Shape::WorkingDirectory => TaggedField::WorkingDirectory
+                .with_track(self.track, self.errors)
                 .deserialize(decoder)
-                .map(|value| self.tagged(value)),
+                .map(|value| self.shape.tagged(value)),
             _ => decoder.deserialize_any(self),
         }
     }
 }
 
-impl<'de> Visitor<'de> for Shape {
+impl<'de> Visitor<'de> for ObservedShape<'_> {
     type Value = DefinitionStorage;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -195,11 +228,15 @@ impl<'de> Visitor<'de> for Shape {
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
         let mut counted = DefinitionStorage::default();
-        if let Some(index) = self.error_index() {
+        if let Some(index) = self.shape.error_index() {
             let mut bytes = CountBytes(0);
             write!(bytes, "{text:?}").map_err(|_| E::custom("session type error size overflow"))?;
             counted.errors.wrong_shape_debug[index] = Some(bytes.0);
+            self.errors.wrong_string(bytes.0);
         } else {
+            self.track
+                .allocate(text.len())
+                .ok_or_else(|| E::custom("session type output storage overflow"))?;
             counted.output = ContentStorage::copied_string(text.len())
                 .ok_or_else(|| E::custom("session type output storage overflow"))?;
         }
@@ -232,31 +269,73 @@ impl<'de> Visitor<'de> for Shape {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
         let mut counted = DefinitionStorage::default();
-        match self {
-            Self::File => {
-                if let Some(value) = sequence.next_element_seed(Self::Definitions)? {
-                    counted.append::<A::Error>(value)?;
+        match self.shape {
+            Shape::File => {
+                if let Some(value) = sequence
+                    .next_element_seed(Shape::Definitions.with_track(self.track, self.errors))?
+                {
+                    counted.append::<A::Error>(value, self.track)?;
                 }
             }
-            Self::Definition => {
+            Shape::Definition => {
                 for (_, shape) in FIELDS {
-                    let Some(value) = sequence.next_element_seed(shape)? else {
+                    let Some(value) =
+                        sequence.next_element_seed(shape.with_track(self.track, self.errors))?
+                    else {
                         return Ok(counted);
                     };
-                    counted.append::<A::Error>(value)?;
+                    counted.append::<A::Error>(value, self.track)?;
                 }
             }
-            Self::Definitions | Self::Strings => {
-                let (shape, mut vector) = if matches!(self, Self::Definitions) {
+            Shape::Definitions | Shape::Strings => {
+                let (shape, mut vector) = if matches!(self.shape, Shape::Definitions) {
                     (
-                        Self::Definition,
+                        Shape::Definition,
                         ContentContainer::output_vector::<PackageSessionType>(),
                     )
                 } else {
-                    (Self::String, ContentContainer::output_vector::<String>())
+                    (Shape::String, ContentContainer::output_vector::<String>())
                 };
-                while let Some(value) = sequence.next_element_seed(shape)? {
+                loop {
+                    // Only this schema seed selects a completed-definition scope.
+                    let before = if matches!(self.shape, Shape::Definitions) {
+                        Some(self.track.begin_scope().ok_or_else(|| {
+                            <A::Error as de::Error>::custom("session type output storage overflow")
+                        })?)
+                    } else {
+                        None
+                    };
+                    let Some(value) =
+                        sequence.next_element_seed(shape.with_track(self.track, self.errors))?
+                    else {
+                        break;
+                    };
+                    // Err has propagated and None has left the loop. Sample and
+                    // release before parent growth enters the shared byte count.
+                    if let Some(before) = before {
+                        self.track
+                            .finish_scope(before, value.output.retained)
+                            .ok_or_else(|| {
+                                <A::Error as de::Error>::custom(
+                                    "session type output storage overflow",
+                                )
+                            })?;
+                    }
+                    let old = vector.buffer_charge().ok_or_else(|| {
+                        <A::Error as de::Error>::custom("session type output storage overflow")
+                    })?;
                     vector.push(value.output).ok_or_else(|| {
+                        <A::Error as de::Error>::custom("session type output storage overflow")
+                    })?;
+                    let new = vector.buffer_charge().ok_or_else(|| {
+                        <A::Error as de::Error>::custom("session type output storage overflow")
+                    })?;
+                    if old != new {
+                        self.track.replace(old, new).ok_or_else(|| {
+                            <A::Error as de::Error>::custom("session type output storage overflow")
+                        })?;
+                    }
+                    self.track.transfer(value.output.retained).ok_or_else(|| {
                         <A::Error as de::Error>::custom("session type output storage overflow")
                     })?;
                     counted.errors.merge(value.errors);
@@ -277,11 +356,15 @@ impl<'de> Visitor<'de> for Shape {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut counted = DefinitionStorage::default();
-        if matches!(self, Self::Environment) {
+        if matches!(self.shape, Shape::Environment) {
             let mut entries = 0usize;
+            let mut previous_nodes = 0usize;
             let mut strings = ContentStorage::default();
-            while let Some(key) = map.next_key_seed(Self::String)? {
-                let value = map.next_value_seed(Self::String)?;
+            while let Some(key) =
+                map.next_key_seed(Shape::String.with_track(self.track, self.errors))?
+            {
+                let value =
+                    map.next_value_seed(Shape::String.with_track(self.track, self.errors))?;
                 let entry =
                     ContentStorage::map_entry(key.output, value.output).ok_or_else(|| {
                         <A::Error as de::Error>::custom("session type output storage overflow")
@@ -297,6 +380,14 @@ impl<'de> Visitor<'de> for Shape {
                         .ok_or_else(|| {
                             <A::Error as de::Error>::custom("session type output storage overflow")
                         })?;
+                self.track
+                    .allocate(nodes.checked_sub(previous_nodes).ok_or_else(|| {
+                        <A::Error as de::Error>::custom("session type output storage overflow")
+                    })?)
+                    .ok_or_else(|| {
+                        <A::Error as de::Error>::custom("session type output storage overflow")
+                    })?;
+                previous_nodes = nodes;
                 counted.output.retained = nodes.checked_add(strings.retained).ok_or_else(|| {
                     <A::Error as de::Error>::custom("session type output storage overflow")
                 })?;
@@ -315,13 +406,16 @@ impl<'de> Visitor<'de> for Shape {
         // Production rejects duplicate known keys with duplicate_field.
         // This count retains their storage as a conservative term.
         while let Some(key) = map.next_key_seed(KeySeed)? {
-            let shape = match (self, key) {
-                (Self::File, Key::SessionTypes) => Some(Self::Definitions),
-                (Self::Definition, Key::Definition(index)) => Some(FIELDS[index].1),
+            let shape = match (self.shape, key) {
+                (Shape::File, Key::SessionTypes) => Some(Shape::Definitions),
+                (Shape::Definition, Key::Definition(index)) => Some(FIELDS[index].1),
                 _ => None,
             };
             if let Some(shape) = shape {
-                counted.append::<A::Error>(map.next_value_seed(shape)?)?;
+                counted.append::<A::Error>(
+                    map.next_value_seed(shape.with_track(self.track, self.errors))?,
+                    self.track,
+                )?;
             } else {
                 map.next_value::<IgnoredAny>()?;
             }

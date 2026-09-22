@@ -1,9 +1,114 @@
 //! Count and fund the Hub error text while the Serde error remains live.
 
+use std::cell::Cell;
 use std::fmt::{self, Write};
 
 use super::SessionTypeError;
 use crate::lua_memory::LuaCallbackCharge;
+
+/// Candidate text survives a later counting failure without owning heap data.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct TypedErrorCandidates {
+    pub(super) tag_bytes: usize,
+    pub(super) wrong_string_debug: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct ErrorTrack<'a>(Option<&'a Cell<TypedErrorCandidates>>);
+
+impl<'a> ErrorTrack<'a> {
+    pub(super) fn new(state: &'a Cell<TypedErrorCandidates>) -> Self {
+        Self(Some(state))
+    }
+
+    pub(super) fn tag(self, bytes: usize) {
+        if let Some(state) = self.0 {
+            let mut next = state.get();
+            next.tag_bytes = next.tag_bytes.max(bytes);
+            state.set(next);
+        }
+    }
+
+    pub(super) fn wrong_string(self, debug_bytes: usize) {
+        if let Some(state) = self.0 {
+            let mut next = state.get();
+            next.wrong_string_debug = next.wrong_string_debug.max(debug_bytes);
+            state.set(next);
+        }
+    }
+}
+
+impl TypedErrorCandidates {
+    /// Bound simultaneous typed error storage, not counting-decoder errors.
+    pub(super) fn storage_bytes(self, input_bytes: usize) -> Option<usize> {
+        let expected = [
+            "a string",
+            "a sequence",
+            "a map",
+            "a string or map",
+            "struct RepoSessionTypesFile with 1 element",
+            "struct PackageSessionType with 16 elements",
+            "internally tagged enum PackageSessionTypeExecution",
+            "internally tagged enum PackageSessionTypeWorkingDirectory",
+            "struct variant PackageSessionTypeWorkingDirectory::Relative with 1 element",
+            "unit variant PackageSessionTypeExecution::RelativeExecutable",
+            "unit variant PackageSessionTypeExecution::ShellCommand",
+            "unit variant PackageSessionTypeWorkingDirectory::PackageRoot",
+        ]
+        .iter()
+        .map(|text| text.len())
+        .max()?;
+        // Pinned serde_json formats floats through zmij's 24-byte buffer.
+        // Integer and boolean Unexpected text is shorter than this term.
+        let unexpected = ("floating point ``".len() + 24)
+            .max("string ".len().checked_add(self.wrong_string_debug)?);
+        let wrong_shape = "invalid value: , expected "
+            .len()
+            .checked_add(unexpected)?
+            .checked_add(expected)?;
+        let tag = "unknown variant ``, expected one of `relative_executable`, `shell_command`"
+            .len()
+            .checked_add(self.tag_bytes)?;
+        let field = "duplicate field ``"
+            .len()
+            .max("missing field ``".len())
+            .checked_add("allowed_environment_overrides".len())?;
+        let length = "invalid length , expected "
+            .len()
+            .checked_add(decimal_digits(usize::MAX))?
+            .checked_add(expected)?;
+        let message = wrong_shape
+            .max(tag)
+            .max(field)
+            .max(length)
+            .max("control character (\\u0000-\\u001F) found while parsing a string".len());
+        let position_digits = decimal_digits(input_bytes.checked_add(1)?);
+        let final_message = "repo-local session type file is invalid: "
+            .len()
+            .checked_add(message)?
+            .checked_add(" at line  column ".len())?
+            .checked_add(position_digits.checked_mul(2)?)?;
+        // Formatting growth overlaps old and new buffers. Shrinking to Box<str>
+        // can overlap its final copy. Position correction overlaps two boxes.
+        message
+            .max(8)
+            .checked_mul(4)?
+            .checked_add(message)?
+            .checked_add(super::bounded_catalog::json_error_impl_bytes().checked_mul(2)?)?
+            // Cover both the existing format! caller and the charged wrapper.
+            // The charged wrapper reserves exactly and uses less than this term.
+            .checked_add(final_message.max(8).checked_mul(4)?)
+    }
+}
+
+fn decimal_digits(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
 
 pub(super) struct ChargedMaterializationError {
     error: SessionTypeError,
