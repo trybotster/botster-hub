@@ -10,6 +10,37 @@ use crate::runtime::{
     PluginManagedSessionSpawned, PluginSessionTypeSpawned, SharedSessionTypeSpawner,
 };
 
+/// Report conversion through the exact owner receipt instead of a session ID.
+#[allow(dead_code)] // The daemon callback will use this conversion path.
+pub(super) fn convert_session_type_spawn_delivery(
+    lua: &Lua,
+    memory: &Arc<LuaMemoryAccount>,
+    spawned: &PluginSessionTypeSpawned,
+    receipt: crate::runtime::SpawnConversionReceipt,
+    conversion_failure: &mlua::String,
+) -> mlua::Result<Value> {
+    let mut receipt = Some(receipt);
+    let result = convert_json(
+        lua,
+        Some(memory),
+        || {
+            if let Some(receipt) = receipt.take() {
+                receipt.abandon();
+            }
+        },
+        spawned,
+        conversion_failure,
+    );
+    if let Some(receipt) = receipt.take() {
+        if result.is_ok() {
+            receipt.converted();
+        } else {
+            receipt.abandon();
+        }
+    }
+    result
+}
+
 pub(super) fn convert_session_type_spawned(
     lua: &Lua,
     memory: Option<&Arc<LuaMemoryAccount>>,
