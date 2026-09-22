@@ -14,6 +14,12 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core reviewer 001a accepted three-file lint patch `c4d3cf92` against live source and its before/after hashes.
+Root authorized its separate normal commit, staging only those three files. Identity patch `3a634ee5` must remain unchanged and uncommitted.
+The unbox body and release sequence are byte-unchanged. Existing tests do not directly observe outer-box deallocation; that evidence gap remains open.
+Core will prepare exact test targets and positive counts before its next grant. Integration tests must not be mistaken for library module tests.
+Hub owns the compiler slot for charge-phase verification. The writer reported build process 32466 running; no test result is accepted yet.
+
 Root granted Hub writer 001b the sole compiler slot for `charge-phase-v1`.
 The plan requires one fresh library artifact, 1,236 inventory entries, eleven exact tests, and regression groups of 47 and nine tests.
 Group counts overlap the exact tests. Record artifact identity, unchanged source manifests, and warning differences; stop on a failure or mismatch.
