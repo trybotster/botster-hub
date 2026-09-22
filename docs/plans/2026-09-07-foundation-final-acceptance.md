@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Jason challenged Root's stop after the error-sizing checkpoint. Root stopped too early; checkpoint completion did not end the authorized orchestration task.
+Root resumed writer 001b on a concrete funded full-definition acquisition contract, including ownership, I/O errors, and file-change behavior.
+Reviewer 0018 independently traces pinned collect, clone, and stable-sort allocation behavior on actual selection paths, then reviews the acquisition contract.
+Both assignments are bounded source investigations. They must return concrete interfaces or precise failed operations, not another broad blocker inventory.
+Root inspected the ordinary and catalog readers directly. The ordinary reader uses `fs::read`; catalog acquisition admits metadata-sized storage and probes one extra byte.
+Their diagnostic and growth behavior differs. No silent semantic replacement, source edit, or runtime activation is authorized by these investigations.
+Root requested Jason's pending decisions on post-reservation context publication and retained-authority File saves without stopping independent engineering work.
+No compiler slot is assigned. Root must continue from assignment results instead of treating an integrated checkpoint as task completion.
+
 Construction-error sizing source `6bd7bf75` is integrated as `60f864b6`. The two-file cherry-pick completed without conflicts.
 Independent verification remains scoped to the source branch. No fresh whole-integration build or production acceptance is claimed.
 The writer is idle after the accepted checkpoint. No compiler slot or further implementation assignment is active.
