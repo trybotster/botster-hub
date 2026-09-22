@@ -14,6 +14,16 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Remaining receipt tests `28b3afca` are integrated as `92cedcca` after independent source and execution review.
+Nine exact tests passed once each; enclosing groups passed 10, 6, and 4 tests, reported separately because counts overlap.
+Artifact: `63fffb6dc6599c65a904b4456491562027d95572167ca548efc37158199c8017`; all 1,013 hashes held; 83 warnings unchanged.
+Evidence: `/Users/jasonconigliari/botster-evidence/s1-async-spawn-20260921-sess-001b/receipt-remaining-nine-v1-verification/`.
+All twelve specified receipt/reply cases now have executed evidence. The surface remains dormant; immediate receive does not cover worker wait-context storage.
+The ordinary consumer, full-channel wake recovery, funded ingress, typed materialization, and real daemon milestone remain open.
+Spawn next prepares one bounded materialization plan before edits. Recovery owns compiler slot `storage-registration-v1`.
+Storage verification covers macOS operations, nine storage tests, fifteen recovery regressions, and reviewed lock/link controls.
+The ineffective rename control is withdrawn. Linux execution and rename-race execution are not claimed. No production storage activation is authorized.
+
 Classifier `b904be36` is integrated as `6e4a51e6` after independent verification of 15 baseline tests, four intended negative failures, and four restored passes.
 Restored and baseline artifacts match: `ac6c198dcbf17753210aa55965b51ce12e63fabadab2107dff17120411d5c08b`.
 Evidence: `/Users/jasonconigliari/botster-evidence/durable-recovery-20260921/classifier-v1/`; 1,007-file manifests restored exactly; 107 warning diagnostics per build.
