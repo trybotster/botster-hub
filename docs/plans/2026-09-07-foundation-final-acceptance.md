@@ -14,6 +14,16 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core reviewer 001a accepted cleanup execution and the scoped reservation-identity checkpoint.
+Strict focused all-target clippy passed without warnings or unfulfilled lint expectations. Fresh resource/client/route-observer tests passed 21/12/5.
+Identity acceptance reuses the unchanged 19 admission tests and seven doctests, including the intended E0308 rejection. No downstream build is claimed.
+The separate support build without default features emitted 19 Core unused/dead-code warnings. That configuration was not a strict lint gate.
+Root authorized separate cleanup and identity commits, followed by a push of `delivery/core-recovery-20260921` only. Main, tags, and force pushes are excluded.
+Root authorized initialization of the existing Ghostty gitlink `eb72ec61304ea256be1d86ed8fa961c84e43ecbd` only.
+Native dependency downloads and full-workspace builds require the next scoped plan. Existing Zig 0.16 is available; no installation is assigned.
+Hub must keep Cargo unchanged until Root supplies the reviewed published Core SHA. Its production-boundary review continues at clean source `64bcb3af`.
+No compiler slot is currently assigned. Full workspace, downstream compilation, allocation-order evidence, and complete spawn acceptance remain open.
+
 Hub fixed-deduction source `64bcb3af` is integrated as `e79dc3fb`. The single-file patch matches reviewed `1e186b89`.
 Independent review accepted six exact tests and the 53/9 regression groups against the 1,242-test artifact. Counts overlap.
 Artifact: `b51b9e3283d5551371aacea17165dc28c7cbdc974dba19928a94318ba9c4814d`. All 1,014 source hashes remained unchanged.
