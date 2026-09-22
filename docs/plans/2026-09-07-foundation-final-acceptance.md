@@ -16,6 +16,50 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Continuation — September 22
 
+Partial checkpoint `a8884a5f24878b027e0f73e3ed92addc6be914f4` preserves the exact seven-file v5 source. Root verified its scope and pushed it to `origin/delivery/async-spawn-20260921` without force.
+The commit distinguishes tested tracker/collector behavior, partially exercised owner binding, and compiled-only inactive implementation. It does not claim full spawn acceptance.
+Reviewer 0018 accepted the execution evidence and confirmed identical warning multisets between v4 and v5. Local evidence remains untracked; external export is still blocked.
+Root instructed writer 001b to resume the authorized daemon consumer and exact context retirement. No new build, integration merge, deployment, or unresolved-stop policy is granted.
+
+The repaired v5 run passed its build and all 17 exact cases. Root read all 17 result lines and recomputed artifact SHA256 `c5b1ca9e142fb164e33b86f88925022b3be59f7a873a5a357f549dddb30d4b34`.
+The writer reports 1,015 unchanged source hashes and 108 unchanged warning records relative to v4. Independent evidence review remains pending.
+Source freeze: `02bb017cb7bd558b53f5c82ebeb82f6271179980eb389b82f9c89695b7113daf`. Only the test fixture changed after v4; the failed v4 run remains preserved.
+The compiler slot is free. Root requested a commit partition that preserves the tested source without presenting inactive production work as complete.
+The next implementation priority remains the actual daemon consumer and exact context retirement. These passing cases do not close daemon activation, full accounting, or unresolved-stop policy.
+
+The writer reports that the v4 build passed in 99.85 seconds. Artifact SHA256 is `0b4621757573bb7ff8b0928273c89e06b29e05df35f5c96c66081e437154b92e`; inventory contains 1,254 tests.
+Cases 1–6 each passed once, including live reservation lookup and definitive release. Independent execution review remains pending.
+Case 7 failed during fixture setup before terminal polling. Cases 8–17 did not run. The writer stopped and released the compiler slot.
+Root checked the failure log and registration code: a waiter cannot register a second batch while its earlier phases remain registered.
+Root granted a test-only fixture repair: register both tracker phases together. A three-phase batch can test exact isolation, but cannot establish concurrent independent production registrations.
+Preserve the failed run. No rebuild is granted before fixture review. This review missed the helper's registration precondition; future fixture review must trace helper preconditions before accepting test coverage.
+
+Reviewer 0018 accepted combined source `f3649d356f5f2924df4892bbf539cc5f5335ef4e90c0631c6374a5364977173d` and exact-phase increment `2392bd0d701b64389ddb3fe7e342cce39e3fa4e00e2c7e103b47288b2cd7b07d`.
+Root assigned writer 001b the sole compiler slot for `owner-tracker-v4`: one library-test build, nine new exact cases, and eight existing exact regressions.
+The run must use Rust 1.97.0, two Cargo jobs, incremental compilation disabled, locked/offline dependencies, the original artifact, and the crate directory.
+Source edits remain paused. Local evidence must retain source/artifact hashes, effective configuration, exact counts, and diagnostics. Stop at the first failure or permission denial; no repair or retry is granted.
+This is a verification grant, not a successful run. Full daemon activation, terminal-loop integration, context retirement, and complete allocation accounting remain open.
+
+Reviewer 0018 accepted tracker v2 at source scope: `ee6a2b188b26c77f4af8527e3e5c46ae23bb1b7acddbcd82114522d7b6f11b45`. No tests have run.
+The writer will freeze the tracker repair and exact-phase cleanup change together. The existing v2 artifacts remain unchanged review history.
+Root verified that queued tickets already retain their exact identity and wake handle. The reviewer withdrew the contrary claim. No new identity storage is needed.
+The bounded source grant collects at most the current tracker's two exact ready phases. Unready registrations and unrelated phases must remain intact.
+The next verification plan uses the original Cargo artifact from the crate directory, records effective build configuration, and checks unchanged source hashes.
+No compiler slot is assigned until the incremental source review and combined freeze are ready. Type-size output does not close the remaining allocation-accounting gaps.
+
+Source inspection reopened terminal cleanup progression: the existing collector removes one ready phase, while an operation has begin and completion phases.
+If both phases are ready, the draft can leave completion registered and return Pending before the terminal loop parks. This is a source finding, not an executed regression.
+Writer 001b and reviewer 0018 must define bounded collection of the current operation's exact phases. Disposal stays unwired. Tests must cover simultaneous readiness, staggered readiness, and unrelated-phase isolation.
+The projection module is included, but its projection function has no production caller. The reviewer withdrew the production-use claim and warning prediction.
+
+The tracker repair passed independent source review at patch `22015209f8a254c260dc9fc2f434fda19d61e9bacf4188bb89c9a22ce49f1102`.
+The tracker now retains the accepted operation ID after completion loss. Three Reserve consumers capture this ID after polling. Capture cancellation keeps its current-pending semantics.
+The live loss regression and actual layout checks remain open. Root granted a test-only driver injection for one selected owner Reserve operation; no build is assigned.
+Production draft `d3348951e1aff7d1e208d0a6588d5094579b8d734fcd14aac5f8fcbf8e2a08ef` is under review. It has no daemon consumer or activation. Context retirement and disposal wiring remain incomplete.
+Automatic approval review denied external evidence export twice. Existing local frozen artifacts support review. Direct user approval is required before export; no alternate export route is authorized.
+The recovery pair withdrew the proposed equivalence between process exit and normal release. Process exit skips cleanup for pending launches, and a launched worker can lack a registry record.
+The source investigation is closed. Normal same-owner cleanup can continue. Final unresolved CLI disposition still requires a user decision; no worker-survival or restart-safety claim is accepted.
+
 Root resumed the authorized implementation and review assignments after checking live agent status.
 The reviewed Core pin is integrated and pushed as `f128195b`. Downstream compilation remains unverified.
 Spawn writer 001b remains at `ecb9eb02` with changes in runtime.rs, runtime/session_spawn.rs, session_types.rs, and new lua_runtime/spawn_input.rs.
