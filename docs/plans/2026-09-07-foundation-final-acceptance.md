@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Reviewer 0018 accepted the complete v2 source in `hub-async-spawn-review-20260921-fable/13-v2-model-verdict.md`.
+Root assigned compiler slot `materialization-definition-release-v2` to writer 001b after checking that no Rust build process was active.
+The grant covers one fresh library test artifact, focused checks, affected parser/accounting groups, and the ErrorImpl layout guard.
+Use Rust 1.97.0, two jobs, disabled incremental compilation, locked/offline dependencies, and the existing target configuration.
+The writer must preserve source hashes, artifact provenance, raw results, positive test counts, and warning comparisons for independent review.
+Stop on source mismatch, compilation failure, or an unexpected test failure. No source checkpoint acceptance or runtime activation follows from this grant.
+The corpus check establishes model quantities only. Observed allocations, production capacity acceptance, and worker-stack ownership remain open.
+
 Materialization v2 is frozen at patch SHA256 `4ebd6f595333129e306d756539a91df9c2dc9709aa86b0931910a5877ab4f924`.
 The writer reports 1,014 source hashes and passing format preflight. Only three files differ from v1; the other 1,011 hashes match.
 Root assigned the complete revised model to reviewer 0018. No compilation or test execution has occurred for v2.
