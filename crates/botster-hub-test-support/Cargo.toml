@@ -15,14 +15,14 @@ include = [
 
 [dependencies]
 base64 = "0.22.1"
-botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "053148f6e8e63c3c38b2cbabd54a6e4e8211143c" }
-botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "053148f6e8e63c3c38b2cbabd54a6e4e8211143c" }
+botster-core = { git = "https://github.com/trybotster/botster-core.git", rev = "891e220295427fd93991638d7c62ba40fa25d4ae" }
+botster-core-test-support = { git = "https://github.com/trybotster/botster-core.git", rev = "891e220295427fd93991638d7c62ba40fa25d4ae" }
 botster-hub-client = { path = "../botster-hub-client" }
 # GHOSTSNP fixture bytes live in the Hub-safe protocol crate's source tree.
 # The client crate supplies the scheme 2 input encoder this harness sends as a
 # client; the Hub daemon itself never depends on it.
-botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "053148f6e8e63c3c38b2cbabd54a6e4e8211143c" }
-botster-terminal-protocol-client = { git = "https://github.com/trybotster/botster-core.git", rev = "053148f6e8e63c3c38b2cbabd54a6e4e8211143c" }
+botster-terminal-protocol = { git = "https://github.com/trybotster/botster-core.git", rev = "891e220295427fd93991638d7c62ba40fa25d4ae" }
+botster-terminal-protocol-client = { git = "https://github.com/trybotster/botster-core.git", rev = "891e220295427fd93991638d7c62ba40fa25d4ae" }
 botster-ui-contract = { git = "https://github.com/trybotster/botster-hub.git", tag = "botster-ui-contract-v0.3.3" }
 libc = "0.2.177"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -36,4 +36,4 @@ serde_json = "1.0.150"
 # Import-semantic proof for Core-owned GHOSTSNP late-attach files. Same Core
 # pin as the workspace lockfile. Requires Zig 0.16.0 for libghostty-vt,
 # matching hub session-worker production builds.
-botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "053148f6e8e63c3c38b2cbabd54a6e4e8211143c", features = ["libghostty-vt"] }
+botster-terminal-ghostty = { git = "https://github.com/trybotster/botster-core.git", rev = "891e220295427fd93991638d7c62ba40fa25d4ae", features = ["libghostty-vt"] }
