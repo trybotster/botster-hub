@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Reviewer 0018 withdrew the startup-caching solution and the claim that a complete bound follows from resolving paths.
+Four construction prerequisites remain unproved: environment path acquisition, formatting growth, selection collections, and construction errors.
+These are technical questions, not impossibility results or a request to relax accounting. Independent increments are not the proved sole alternative.
+Root assigned writer 001b a concrete read-only derivation of the three input-derived terms: formatting, selection collections, and construction errors.
+The output must contain formulas, exact constructor correspondence, allocation overlaps, failure candidates, and proposed decisive tests, or the failed premise.
+Reviewer 0018 will review that proof. Environment paths, Core transport, context policy, and stacks are outside this bounded derivation.
+No source edits or builds are assigned. Evidence for the corrected prerequisites: `hub-async-spawn-review-20260921-fable/18-unresolved-prerequisites.md`.
+
 The complete allocation table now reuses one admitted parent and disjoint splits. The writer withdrew the proposed new aggregate owner and Lua memory API.
 Reviewer 0018 proposed a two-file construction boundary, but Root withheld implementation authorization because its prerequisites remain unproved.
 Moving `current_dir` or `current_exe` to startup does not establish admission before their first allocation. Caching also needs a behavior proof.
