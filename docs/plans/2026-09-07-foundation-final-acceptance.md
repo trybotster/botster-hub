@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core reviewer 001a accepted identity patch `3a634ee5d65a07deac0d1947ffa5d038bd03f7049794e31bf2319593b4098380` for verification.
+Root granted writer 0019 compiler slot `core-session-reservation-identity-v1` after checking no Rust build was active.
+Run pinned Rust 1.97 format/diff checks first, then fresh admission tests, doctests with actual E0308 rejection evidence, and the documented clippy gate.
+Preserve full source/artifact provenance, positive selected counts, and warning comparison. Stop on unexpected failure before editing or rerunning.
+Earlier formatting used an older rustfmt and does not satisfy the pinned gate. No Core commit or Hub dependency update is authorized yet.
+Hub charge review identified proposed growth on the existing charge type. Root requires sealed descendants, explicit shrink semantics, and complete live-byte conservation before approval.
+No new Hub charge API or context source is authorized. Core verification proceeds independently of these design checks.
+
 Core owner 0019 proved an opaque detached scope/generation identity can preserve reservation equality without retaining its Arc graph.
 Root authorized Core-only identity type, accessor, reexports, and focused tests at baseline `053148f6`, with independent reviewer 001a.
 No new counter, serialization, numeric getters, or release capability is allowed. Real reservation ownership remains in spawn/cleanup stages.
