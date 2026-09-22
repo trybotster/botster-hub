@@ -38,6 +38,12 @@ Current saved transports and daemon status do not prove which daemon owns the re
 Recovery must propose the smallest live-owner validation contract before adding endpoint metadata or a generation mechanism.
 Review must cover stale metadata, crash/restart, response validation, path aliases, and unavailable owners. No second-writer fallback is permitted.
 Spawn is checking existing identity contracts for reuse. Shared file edits remain held for an explicit handoff.
+Spawn found no reusable directory-owner proof in the reviewed status, installation, or endpoint interfaces.
+Recovery identified a storage premise gap: path-based writes can diverge from a retained directory descriptor after replacement.
+Root authorized a separate dependency proposal using already-locked `rustix` 1.1.4 for safe descriptor-relative operations.
+No manifest application, version update, or portability/safety acceptance follows. Review must cover the complete persistence lifecycle.
+Spawn traced the ordinary Lua queue to the synchronous consumer without an ordinary daemon owner wake.
+The writer must prepare one connected daemon continuation and reuse existing notifications where suitable, with exact-generation cleanup.
 No compiler slot is granted. Root retains integration and publication ownership. Completed Core and safety implementation work stays stopped.
 
 ### Delivery scope
