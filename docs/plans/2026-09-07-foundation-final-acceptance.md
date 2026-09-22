@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Core focused v3 passed formatting, then failed strict clippy with four diagnostics in three unchanged files.
+The diagnostics concern question-mark syntax, a constant assertion, the resource unbox helper, and a redundant result wrapper.
+No identity diagnostic appeared, but the failed run does not pass the Core gate. These failures have no executed baseline comparison yet.
+Source manifests, HEAD `4afa8e52`, and identity patch `3a634ee5` remained unchanged. Writer 0019 released the compiler slot.
+Root assigned writer 0019 and reviewer 001a a bounded source review of those four diagnostics. No repair or rerun is authorized yet.
+The unbox helper must preserve outer-box deallocation before the supplied resource drops. A syntax-only repair must not change that contract.
+Hub writer 001b will submit the prepared charge-phase test plan for the next compiler grant. No compiler slot is currently assigned.
+Raw Core evidence: `evidence/core-identity-focused-v3` in the Core writer worktree. Full workspace and identity acceptance remain open.
+
 Core v2 passed 19 admission tests and seven doctests, including the intended E0308 identity rejection.
 Strict workspace clippy stopped in protocol code before it checked Core. A separate baseline run reproduced that lifetime diagnostic and the unused-mut warning.
 Reviewer 001a accepted the two-file lint repair, committed as `4afa8e52` after formatting commit `f8e0b759`.
