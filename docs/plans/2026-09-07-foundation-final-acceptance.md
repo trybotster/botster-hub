@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Materialization v2 is frozen at patch SHA256 `4ebd6f595333129e306d756539a91df9c2dc9709aa86b0931910a5877ab4f924`.
+The writer reports 1,014 source hashes and passing format preflight. Only three files differ from v1; the other 1,011 hashes match.
+Root assigned the complete revised model to reviewer 0018. No compilation or test execution has occurred for v2.
+The proof separates earlier typed failures from later typed prefixes. Counting success does not establish typed success.
+The preserved maximum and typed-error bound cover earlier failures. The pinned destruction chain protects later prefixes after the release.
+The proposed 256-definition check compares model bounds only. It does not measure allocations or establish production capacity acceptance.
+Evidence: `s1-async-spawn-20260921-sess-001b/materialization-definition-release-v2-proof.md` and adjacent patch and manifest under `/Users/jasonconigliari/botster-evidence/`.
+
 The reviewer accepted materialization model `0e1a4c50` in source. Its 1,014-file manifest and passing format preflight remain preserved.
 No build or runtime proof follows from this review. The 256-definition candidate may expose conservative capacity refusal.
 Root authorized `materialization-definition-release-v2` within the same nine files after an independent review of the pinned ownership chain.
