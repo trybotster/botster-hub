@@ -134,6 +134,40 @@ mod tests {
     use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
     use crate::runtime::{HubSessionTypeSpawner, PluginManagedSessionSpawned};
 
+    #[test]
+    fn delivery_conversion_quota_reports_abandoned_once() {
+        use crate::data_plane::driver::{
+            local_reply_tests::SpawnReceiptFixture, retained_reply_bytes,
+        };
+        use crate::runtime::SpawnConversionOutcome;
+
+        let bytes = retained_reply_bytes::<SpawnConversionOutcome>().unwrap();
+        let account = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 64 * 1024,
+            total_vm_bytes: 64 * 1024,
+            per_callback_bytes: bytes + 1,
+            total_callback_bytes: bytes + 1,
+        })
+        .unwrap();
+        let lua = Lua::new();
+        let failure = lua.create_string("conversion failed").unwrap();
+        let spawned = PluginSessionTypeSpawned {
+            session_id: "receipt-quota".into(),
+            lifecycle: "running".into(),
+            session_type_id: "shell".into(),
+            context_id: "context".into(),
+            context_keys: vec!["key".into()],
+        };
+        let (fixture, receipt) = SpawnReceiptFixture::new(&account);
+        let result =
+            convert_session_type_spawn_delivery(&lua, &account, &spawned, receipt, &failure)
+                .unwrap();
+        assert!(matches!(result, Value::String(ref value) if value == &failure));
+        assert_eq!(account.usage().1, bytes);
+        fixture.assert_outcome(SpawnConversionOutcome::Abandoned);
+        assert_eq!(account.usage().1, 0);
+    }
+
     fn spawned() -> PluginManagedSessionSpawned {
         PluginManagedSessionSpawned {
             session_id: "s1-abandon".into(),

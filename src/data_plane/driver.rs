@@ -147,7 +147,7 @@ impl CoreRequest {
 pub(crate) mod allocation_oracle;
 
 #[cfg(test)]
-mod local_reply_tests;
+pub(crate) mod local_reply_tests;
 
 #[derive(Debug)]
 struct CoreCompletionWake {
