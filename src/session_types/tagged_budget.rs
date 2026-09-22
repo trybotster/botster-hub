@@ -6,6 +6,8 @@ use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
 use super::content_budget::{ContentContainer, ContentStorage, ContentVisitor};
+use super::materialization_error::ErrorTrack;
+use super::materialization_timeline::Track;
 
 #[derive(Clone, Copy)]
 pub(super) enum TaggedField {
@@ -48,14 +50,14 @@ struct ValueStorage {
     string: Option<StringInfo>,
 }
 
-struct ValueSeed;
-struct ValueVisitor;
+struct ValueSeed<'a>(Track<'a>);
+struct ValueVisitor<'a>(Track<'a>);
 
-impl<'de> DeserializeSeed<'de> for ValueSeed {
+impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
     type Value = ValueStorage;
 
     fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
-        decoder.deserialize_any(ValueVisitor)
+        decoder.deserialize_any(ValueVisitor(self.0))
     }
 }
 
@@ -68,7 +70,11 @@ impl Write for DebugBytes {
     }
 }
 
-fn string_value<E: de::Error>(value: &str, borrowed: bool) -> Result<ValueStorage, E> {
+fn string_value<E: de::Error>(
+    value: &str,
+    borrowed: bool,
+    track: Track<'_>,
+) -> Result<ValueStorage, E> {
     let symbol = match value {
         "mode" => Symbol::Mode,
         "policy" => Symbol::Policy,
@@ -84,6 +90,9 @@ fn string_value<E: de::Error>(value: &str, borrowed: bool) -> Result<ValueStorag
     let storage = if borrowed {
         ContentStorage::default()
     } else {
+        track
+            .allocate(value.len())
+            .ok_or_else(|| E::custom("session type Content storage overflow"))?;
         ContentStorage::copied_string(value.len())
             .ok_or_else(|| E::custom("session type Content storage overflow"))?
     };
@@ -98,7 +107,7 @@ fn string_value<E: de::Error>(value: &str, borrowed: bool) -> Result<ValueStorag
     })
 }
 
-impl<'de> Visitor<'de> for ValueVisitor {
+impl<'de> Visitor<'de> for ValueVisitor<'_> {
     type Value = ValueStorage;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -126,23 +135,23 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        string_value(value, false)
+        string_value(value, false, self.0)
     }
 
     fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
-        string_value(value, true)
+        string_value(value, true, self.0)
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, sequence: A) -> Result<Self::Value, A::Error> {
         Ok(ValueStorage {
-            storage: ContentVisitor::untracked().visit_seq(sequence)?,
+            storage: ContentVisitor::tracked(self.0).visit_seq(sequence)?,
             string: None,
         })
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
         Ok(ValueStorage {
-            storage: ContentVisitor::untracked().visit_map(map)?,
+            storage: ContentVisitor::tracked(self.0).visit_map(map)?,
             string: None,
         })
     }
@@ -177,9 +186,33 @@ impl TaggedField {
     }
 }
 
+pub(super) struct ObservedTagged<'a> {
+    field: TaggedField,
+    track: Track<'a>,
+    errors: ErrorTrack<'a>,
+}
+impl TaggedField {
+    pub(super) fn with_track<'a>(
+        self,
+        track: Track<'a>,
+        errors: ErrorTrack<'a>,
+    ) -> ObservedTagged<'a> {
+        ObservedTagged {
+            field: self,
+            track,
+            errors,
+        }
+    }
+}
 impl<'de> DeserializeSeed<'de> for TaggedField {
     type Value = TaggedStorage;
-
+    fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
+        self.with_track(Track::default(), ErrorTrack::default())
+            .deserialize(decoder)
+    }
+}
+impl<'de> DeserializeSeed<'de> for ObservedTagged<'_> {
+    type Value = TaggedStorage;
     fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
         decoder.deserialize_any(self)
     }
@@ -190,6 +223,7 @@ fn finish<E: de::Error>(
     container: ContentContainer,
     relative: bool,
     path: Option<StringInfo>,
+    track: Track<'_>,
 ) -> Result<TaggedStorage, E> {
     counted.content = container
         .storage()
@@ -199,6 +233,15 @@ fn finish<E: de::Error>(
     let copied = path
         .filter(|value| value.borrowed)
         .map_or(0, |value| value.bytes);
+    if copied != 0 {
+        track
+            .allocate(copied)
+            .ok_or_else(|| E::custom("session type Content storage overflow"))?;
+    }
+    track
+        .transfer(counted.output_string)
+        .ok_or_else(|| E::custom("session type Content storage overflow"))?;
+    // Keep uncertain buffered owners live through any earlier typed failure.
     counted.peak_with_output = counted
         .content
         .with_borrowed_output(copied)
@@ -206,7 +249,7 @@ fn finish<E: de::Error>(
     Ok(counted)
 }
 
-impl<'de> Visitor<'de> for TaggedField {
+impl<'de> Visitor<'de> for ObservedTagged<'_> {
     type Value = TaggedStorage;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -219,12 +262,15 @@ impl<'de> Visitor<'de> for TaggedField {
         let mut tag_seen = false;
         let mut relative = false;
         let mut path = None;
-        while let Some(key) = map.next_key_seed(ValueSeed)? {
+        while let Some(key) = map.next_key_seed(ValueSeed(self.track))? {
             let symbol = key.string.as_ref().map(|key| key.symbol);
-            let value = map.next_value_seed(ValueSeed)?;
-            if symbol == Some(self.tag_key()) {
+            let value = map.next_value_seed(ValueSeed(self.track))?;
+            if symbol == Some(self.field.tag_key()) {
                 if !tag_seen {
-                    relative = self.classify_tag(&value, &mut counted);
+                    relative = self.field.classify_tag(&value, &mut counted);
+                    if let Some(bytes) = counted.unknown_tag_bytes {
+                        self.errors.tag(bytes);
+                    }
                     tag_seen = true;
                 }
                 continue;
@@ -232,42 +278,69 @@ impl<'de> Visitor<'de> for TaggedField {
             let entry = ContentStorage::map_entry(key.storage, value.storage).ok_or_else(|| {
                 <A::Error as de::Error>::custom("session type Content storage overflow")
             })?;
+            let old = container.buffer_charge().ok_or_else(|| {
+                <A::Error as de::Error>::custom("session type Content storage overflow")
+            })?;
             container.push(entry).ok_or_else(|| {
                 <A::Error as de::Error>::custom("session type Content storage overflow")
             })?;
+            let new = container.buffer_charge().ok_or_else(|| {
+                <A::Error as de::Error>::custom("session type Content storage overflow")
+            })?;
+            if old != new {
+                self.track.replace(old, new).ok_or_else(|| {
+                    <A::Error as de::Error>::custom("session type Content storage overflow")
+                })?;
+            }
             // A repeated path makes production decoding fail after buffering.
             // Counting its first string path remains conservative for this term.
             if symbol == Some(Symbol::Path) && path.is_none() {
                 path = value.string;
             }
         }
-        finish(counted, container, relative, path)
+        finish(counted, container, relative, path, self.track)
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
         let mut counted = TaggedStorage::default();
         let relative = sequence
-            .next_element_seed(ValueSeed)?
-            .is_some_and(|tag| self.classify_tag(&tag, &mut counted));
+            .next_element_seed(ValueSeed(self.track))?
+            .is_some_and(|tag| self.field.classify_tag(&tag, &mut counted));
+        if let Some(bytes) = counted.unknown_tag_bytes {
+            self.errors.tag(bytes);
+        }
         let mut container = ContentContainer::sequence();
         let mut first = true;
         let mut path = None;
-        while let Some(value) = sequence.next_element_seed(ValueSeed)? {
+        while let Some(value) = sequence.next_element_seed(ValueSeed(self.track))? {
+            let old = container.buffer_charge().ok_or_else(|| {
+                <A::Error as de::Error>::custom("session type Content storage overflow")
+            })?;
             container.push(value.storage).ok_or_else(|| {
                 <A::Error as de::Error>::custom("session type Content storage overflow")
             })?;
+            let new = container.buffer_charge().ok_or_else(|| {
+                <A::Error as de::Error>::custom("session type Content storage overflow")
+            })?;
+            if old != new {
+                self.track.replace(old, new).ok_or_else(|| {
+                    <A::Error as de::Error>::custom("session type Content storage overflow")
+                })?;
+            }
             if first {
                 path = value.string;
                 first = false;
             }
         }
-        finish(counted, container, relative, path)
+        finish(counted, container, relative, path, self.track)
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        let counted = string_value::<E>(value, false)?;
+        let counted = string_value::<E>(value, false, self.track)?;
+        let debug_bytes = counted.string.expect("string metadata").debug_bytes;
+        self.errors.wrong_string(debug_bytes);
         Ok(TaggedStorage {
-            unexpected_string_debug_bytes: counted.string.expect("string metadata").debug_bytes,
+            unexpected_string_debug_bytes: debug_bytes,
             ..TaggedStorage::default()
         })
     }

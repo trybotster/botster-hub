@@ -1077,7 +1077,7 @@ fn validation_error_text_bytes() -> usize {
     ])
 }
 
-fn json_error_impl_bytes() -> usize {
+pub(super) fn json_error_impl_bytes() -> usize {
     // ErrorCode has one tagged payload: Box<str> or io::Error, plus unit variants.
     // The pinned compiler needs at most one aligned word for its discriminant.
     let alignment = align_of::<Box<str>>()
