@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Classifier `b904be36` is integrated as `6e4a51e6` after independent verification of 15 baseline tests, four intended negative failures, and four restored passes.
+Restored and baseline artifacts match: `ac6c198dcbf17753210aa55965b51ce12e63fabadab2107dff17120411d5c08b`.
+Evidence: `/Users/jasonconigliari/botster-evidence/durable-recovery-20260921/classifier-v1/`; 1,007-file manifests restored exactly; 107 warning diagnostics per build.
+This changes only restart classification. Recovery consumers, durable reuse, storage activation, and strict lint remain open.
+Recovery now prepares the reviewed storage module registration and exact pinned rustix dependency edge as a separate checkpoint.
+No production store replacement, protocol application, or schema change is assigned in that checkpoint.
+Spawn owns compiler slot `receipt-remaining-nine-v1` for the accepted remaining-nine test patch `9893d46c`.
+The source removes an unused refusal classification while preserving returned ownership. Worker blocking-receive storage remains unwaived.
+
 Receipt tests `8d4ca50a` are integrated as `b2832401` after independent raw-evidence review.
 Three exact tests passed once each. Enclosing groups passed 3 and 8 tests; those groups include the exact tests and are not additive.
 The tests establish receipt loss, refused mint preserving phase identity, and quota conversion reporting Abandoned through actual entry paths.
