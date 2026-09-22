@@ -4,6 +4,7 @@
 //! Runtime integration must use the existing single Hub mutation owner.
 
 pub(crate) mod record;
+pub(crate) mod state_directory;
 pub(crate) mod store;
 
 #[cfg(test)]

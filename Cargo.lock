@@ -454,6 +454,7 @@ dependencies = [
  "mlua",
  "notify",
  "portable-pty",
+ "rustix",
  "semver",
  "serde",
  "serde_json",
