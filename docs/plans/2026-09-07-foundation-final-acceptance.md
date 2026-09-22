@@ -14,6 +14,13 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Jason approved the context visibility decision: "Yes—publish after reservation".
+Spawn context may become visible only after Core reserves the session ID, before process launch. The previous timing question is resolved.
+Failed reservation must not publish or replace context. Cleanup still needs exact attempt/generation ownership for both aliases and must preserve retained reads.
+Persistent context charges and cleanup implementation remain engineering requirements. This decision does not waive them or authorize an unspecified mechanism.
+Root sent the decision to writer 001b and reviewer 0018. Their current acquisition and collection investigations continue without overlapping context edits.
+The separate retained-authority File-save compatibility question remains unanswered.
+
 Jason challenged Root's stop after the error-sizing checkpoint. Root stopped too early; checkpoint completion did not end the authorized orchestration task.
 Root resumed writer 001b on a concrete funded full-definition acquisition contract, including ownership, I/O errors, and file-change behavior.
 Reviewer 0018 independently traces pinned collect, clone, and stable-sort allocation behavior on actual selection paths, then reviews the acquisition contract.
