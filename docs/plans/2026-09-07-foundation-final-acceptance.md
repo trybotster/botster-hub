@@ -14,6 +14,11 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Selector source `076fa923` is integrated as `106e412a`; the single-file cherry-pick completed without conflicts.
+Verification remains scoped to the reviewed source branch. No fresh whole-integration build or final delivery acceptance is claimed.
+Writer 001b is tracing the approved context caller/identity boundary. Reviewer 0018 independently checks its ownership requirements.
+Context and acquisition source remain unchanged. No compiler slot is assigned. Orchestration continues beyond this checkpoint.
+
 Reviewer 0018 verified selector execution in verdict 28. Root accepted the checkpoint and authorized its normal single-file commit.
 Five new exact tests and two existing target tests passed once each. Selection and catalog parity groups passed five each; counts overlap.
 Artifact `b172f82d6791826c59599868c4b2002db8bdd86a52f077d4924ef9385822996c` contains 1,225 tests; all 1,014 source hashes held.
