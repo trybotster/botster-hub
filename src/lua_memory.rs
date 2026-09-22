@@ -105,7 +105,9 @@ impl LuaMemoryAccount {
         Ok(LuaCallbackCharge {
             account: Arc::clone(self),
             bytes,
-            growth: ChargeGrowth::Open,
+            growth: ChargeGrowth::Open {
+                ceiling: self.limits.per_callback_bytes,
+            },
         })
     }
 
@@ -213,7 +215,7 @@ pub(crate) enum LuaCallbackGrowthError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChargeGrowth {
-    Open,
+    Open { ceiling: usize },
     Sealed,
 }
 
@@ -261,16 +263,16 @@ pub(crate) struct LuaCallbackCharge {
 }
 
 impl LuaCallbackCharge {
-    /// Admit additional bytes before allocation. Only an unsplit parent can grow.
+    /// Admit bytes before allocation, within the parent's remaining growth ceiling.
     /// Callers must not admit another parent for the same live operation.
     pub(crate) fn grow(&mut self, additional: usize) -> Result<(), LuaCallbackGrowthError> {
-        if self.growth == ChargeGrowth::Sealed {
+        let ChargeGrowth::Open { ceiling } = self.growth else {
             return Err(LuaCallbackGrowthError::Sealed);
-        }
+        };
         let next = self
             .bytes
             .checked_add(additional)
-            .filter(|next| *next <= self.account.limits.per_callback_bytes)
+            .filter(|next| *next <= ceiling)
             .ok_or(LuaCallbackGrowthError::Quota)?;
         reserve(
             &self.account.callback_bytes,
@@ -294,6 +296,26 @@ impl LuaCallbackCharge {
             .fetch_sub(released, Ordering::AcqRel);
         self.bytes = next_bytes;
         true
+    }
+
+    /// Transfer a fixed allowance and permanently deduct it from the growth ceiling.
+    /// The child is sealed. Dropping it does not restore the parent's ceiling.
+    /// Return None without mutation for a sealed parent or insufficient allowance.
+    pub(crate) fn split_fixed(&mut self, bytes: usize) -> Option<Self> {
+        let ChargeGrowth::Open { ceiling } = self.growth else {
+            return None;
+        };
+        let remaining_bytes = self.bytes.checked_sub(bytes)?;
+        let remaining_ceiling = ceiling.checked_sub(bytes)?;
+        self.bytes = remaining_bytes;
+        self.growth = ChargeGrowth::Open {
+            ceiling: remaining_ceiling,
+        };
+        Some(Self {
+            account: Arc::clone(&self.account),
+            bytes,
+            growth: ChargeGrowth::Sealed,
+        })
     }
 
     /// Transfer disjoint bytes without changing the shared account's usage.
@@ -362,6 +384,164 @@ impl Drop for LuaCallbackCharge {
         self.account
             .callback_bytes
             .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod fixed_deduction_tests {
+    use super::*;
+
+    fn account() -> Arc<LuaMemoryAccount> {
+        LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: 10,
+            total_callback_bytes: 20,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn multiple_fixed_partitions_preserve_the_exact_remaining_ceiling() {
+        let memory = account();
+        let mut parent = memory.reserve_callback_total(8).unwrap();
+        let mut first = parent.split_fixed(2).unwrap();
+        let mut second = parent.split_fixed(3).unwrap();
+        assert_eq!(parent.bytes(), 3);
+        assert_eq!(parent.growth, ChargeGrowth::Open { ceiling: 5 });
+        assert_eq!(memory.usage().1, 8);
+        parent.grow(2).unwrap();
+        assert_eq!(parent.bytes() + first.bytes() + second.bytes(), 10);
+        assert_eq!(memory.usage().1, 10);
+        assert_eq!(parent.grow(1), Err(LuaCallbackGrowthError::Quota));
+        assert_eq!(first.grow(1), Err(LuaCallbackGrowthError::Sealed));
+        assert_eq!(second.grow(1), Err(LuaCallbackGrowthError::Sealed));
+        assert!(first.split_fixed(0).is_none());
+        assert!(second.split_fixed(1).is_none());
+        drop((parent, first, second));
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn zero_fixed_partition_preserves_growth_but_seals_its_child() {
+        let memory = account();
+        let mut parent = memory.reserve_callback_total(0).unwrap();
+        let mut child = parent.split_fixed(0).unwrap();
+        assert_eq!(parent.growth, ChargeGrowth::Open { ceiling: 10 });
+        assert_eq!(child.bytes(), 0);
+        assert_eq!(child.grow(0), Err(LuaCallbackGrowthError::Sealed));
+        assert!(child.split_fixed(0).is_none());
+        parent.grow(10).unwrap();
+        drop(child);
+        assert_eq!(memory.usage().1, 10);
+        assert_eq!(parent.grow(1), Err(LuaCallbackGrowthError::Quota));
+        drop(parent);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn fixed_partition_refusals_preserve_bytes_ceiling_and_account() {
+        let memory = account();
+        let mut parent = memory.reserve_callback_total(4).unwrap();
+        for requested in [5, usize::MAX] {
+            assert!(parent.split_fixed(requested).is_none());
+            assert_eq!(parent.bytes(), 4);
+            assert_eq!(parent.growth, ChargeGrowth::Open { ceiling: 10 });
+            assert_eq!(memory.usage().1, 4);
+        }
+        parent.grow(1).unwrap();
+        let mut child = parent.split(2).unwrap();
+        for charge in [&mut parent, &mut child] {
+            let before = charge.bytes();
+            for requested in [0, 1, usize::MAX] {
+                assert!(charge.split_fixed(requested).is_none());
+                assert_eq!(charge.bytes(), before);
+                assert_eq!(charge.growth, ChargeGrowth::Sealed);
+                assert_eq!(memory.usage().1, 5);
+            }
+        }
+        drop((parent, child));
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn fixed_descendant_destruction_never_restores_the_parent_ceiling() {
+        for child_first in [false, true] {
+            let memory = account();
+            let mut parent = memory.reserve_callback_total(7).unwrap();
+            let mut child = parent.split_fixed(4).unwrap();
+            let mut grandchild = child.split(2).unwrap();
+            assert_eq!(grandchild.grow(1), Err(LuaCallbackGrowthError::Sealed));
+            assert!(grandchild.split_fixed(0).is_none());
+            if child_first {
+                drop(child);
+                assert_eq!(memory.usage().1, 5);
+                drop(grandchild);
+            } else {
+                drop(grandchild);
+                assert_eq!(memory.usage().1, 5);
+                drop(child);
+            }
+            assert_eq!(memory.usage().1, 3);
+            assert_eq!(parent.growth, ChargeGrowth::Open { ceiling: 6 });
+            parent.grow(3).unwrap();
+            assert_eq!(parent.grow(1), Err(LuaCallbackGrowthError::Quota));
+            assert_eq!(memory.usage().1, 6);
+            drop(parent);
+            assert_eq!(memory.usage().1, 0);
+        }
+    }
+
+    #[test]
+    fn fixed_deduction_survives_shrink_regrow_and_aggregate_refusal() {
+        let memory = account();
+        let mut parent = memory.reserve_callback_total(10).unwrap();
+        let mut fixed = parent.split_fixed(3).unwrap();
+        assert!(parent.shrink_to(2));
+        assert!(fixed.shrink_to(1));
+        assert_eq!(memory.usage().1, 3);
+        let other = memory.reserve_shared_callback_storage(17).unwrap();
+        assert!(matches!(
+            parent.grow(5),
+            Err(LuaCallbackGrowthError::Capacity(_))
+        ));
+        assert_eq!(parent.bytes(), 2);
+        assert_eq!(parent.growth, ChargeGrowth::Open { ceiling: 7 });
+        assert_eq!(memory.usage().1, 20);
+        drop(other);
+        parent.grow(5).unwrap();
+        assert_eq!(memory.usage().1, 8);
+        drop(fixed);
+        assert_eq!(parent.grow(1), Err(LuaCallbackGrowthError::Quota));
+        assert!(parent.shrink_to(0));
+        parent.grow(7).unwrap();
+        drop(parent);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn terminal_split_and_lease_seal_a_parent_after_fixed_partition() {
+        let memory = account();
+        let mut parent = memory.reserve_callback_total(8).unwrap();
+        let mut fixed = parent.split_fixed(3).unwrap();
+        let mut terminal = parent.split(2).unwrap();
+        for charge in [&mut parent, &mut fixed, &mut terminal] {
+            assert_eq!(charge.grow(0), Err(LuaCallbackGrowthError::Sealed));
+            assert!(charge.split_fixed(0).is_none());
+        }
+        drop((parent, fixed, terminal));
+        assert_eq!(memory.usage().1, 0);
+        let mut parent = memory.reserve_callback_total(10).unwrap();
+        let fixed = parent.split_fixed(10).unwrap();
+        parent.grow(0).unwrap();
+        assert_eq!(parent.grow(1), Err(LuaCallbackGrowthError::Quota));
+        let mut lease = LuaCallbackStorageLease::new(parent);
+        let parent = Arc::get_mut(lease.charge.as_mut().unwrap()).unwrap();
+        assert!(parent.split_fixed(0).is_none());
+        assert_eq!(parent.grow(0), Err(LuaCallbackGrowthError::Sealed));
+        drop(fixed);
+        drop(lease);
+        assert_eq!(memory.usage().1, 0);
     }
 }
 
