@@ -16,6 +16,24 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Continuation — September 22
 
+The reviewer accepted the compile-repair increment after independent reconstruction. No rebuild has run.
+The writer implemented the runtime-only refusal before materialization and made `WaiterId` required. These changes remain untested.
+The writer also kept client-owned reservations out of the shared retained-reservation store. Full daemon ownership remains incomplete.
+Root assigned the local transport receipt changes to writer 001b, subject to the complete lifecycle review.
+Success means completion at the existing local transport write boundary, not channel acceptance or remote application receipt.
+The owner must retain cleanup authority through receipt loss, refused sends, partial writes, and terminal disposal.
+The plugin cleanup helper starts detached shutdown and retracts context without confirmed release. It does not satisfy the retained-operation contract.
+
+The capacity audit found five background registration slots outside ordinary owner permits.
+The existing bound, `2 * OWNER_BUDGET_CAPACITY`, does not include these slots. Connection capacity does not reserve unused permits.
+Root selected `2 * OWNER_BUDGET_CAPACITY + background_slots` for final review. The proposed background bound is five.
+This choice preserves ordinary request admission. It does not authorize an arbitrary limit increase or a second queue.
+Before implementation, reviewer 0018 must check every production registration owner and the registered, ready, and phase-counter storage lifetimes.
+The audit establishes an insufficient capacity guarantee, not an executed exhaustion case. No capacity edit or build is accepted yet.
+Root rejected a speculative completion-wake retry because the required wake was not proved.
+Root also rejected an alleged charge leak: successful `grow(bytes)` makes the immediate `split_fixed(bytes)` failure unreachable under exclusive access.
+The next milestone is one reviewed lifecycle contract, followed by a combined source freeze and focused production-path verification.
+
 The user approved Root's recommendation to require the daemon control owner for session-type spawning.
 Runtime-only calls must reject before materialization or Core work. Synchronous callers may wait on a daemon response off the owner thread.
 Writer 001b owns the bounded implementation. Reviewer 0018 owns independent lifecycle review. Both received the decision.
