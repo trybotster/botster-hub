@@ -2,6 +2,83 @@
 
 use super::*;
 use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+use crate::runtime::{SpawnConversionOutcome, SpawnConversionReceipt};
+
+/// Tests use the real mint and collector without exposing production fields.
+pub(crate) struct SpawnReceiptFixture {
+    wake: Arc<CoreCompletionWake>,
+    row: CoreWaiterRetirement,
+    ticket: ChargedCoreTicket<SpawnConversionOutcome>,
+    identity: OwnerWorkIdentity,
+}
+
+impl SpawnReceiptFixture {
+    pub(crate) fn new(memory: &Arc<LuaMemoryAccount>) -> (Self, SpawnConversionReceipt) {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let row = new_row(&wake, 91);
+        let (ticket, publisher) = row
+            .local_reply::<SpawnConversionOutcome>(charge::<SpawnConversionOutcome>(memory))
+            .unwrap();
+        let identity = publisher.0.identity;
+        (
+            Self {
+                wake,
+                row,
+                ticket,
+                identity,
+            },
+            SpawnConversionReceipt::new(publisher),
+        )
+    }
+
+    pub(crate) fn assert_outcome(mut self, expected: SpawnConversionOutcome) {
+        assert!(matches!(self.ticket.poll(), CoreTicketPoll::Pending));
+        assert_eq!(self.wake.take_identities(1), vec![self.identity]);
+        assert!(matches!(self.ticket.poll(), CoreTicketPoll::Ready(value) if value == expected));
+        assert!(self.wake.take_identities(1).is_empty());
+        assert_eq!(self.wake.live_identity_counts(), (0, 0, 1));
+        drop(self.ticket);
+        drop(self.row);
+        assert_eq!(self.wake.live_identity_counts(), (0, 0, 0));
+    }
+}
+
+#[test]
+fn dropped_spawn_receipt_reports_loss_through_collector() {
+    let memory = memory();
+    let (mut fixture, receipt) = SpawnReceiptFixture::new(&memory);
+    drop(receipt);
+    assert!(fixture.wake.take());
+    assert!(matches!(fixture.ticket.poll(), CoreTicketPoll::Pending));
+    assert_eq!(fixture.wake.take_identities(1), vec![fixture.identity]);
+    assert!(matches!(fixture.ticket.poll(), CoreTicketPoll::Lost));
+    assert!(fixture.wake.take_identities(1).is_empty());
+    assert!(memory.usage().1 > 0);
+    drop(fixture);
+    assert_eq!(memory.usage().1, 0);
+}
+
+#[test]
+fn refused_spawn_receipt_mint_preserves_first_phase() {
+    let memory = memory();
+    let wake = Arc::new(CoreCompletionWake::new());
+    let row = new_row(&wake, 92);
+    let bytes = retained_reply_bytes::<SpawnConversionOutcome>().unwrap();
+    let charge = memory.reserve_callback_total(bytes - 1).unwrap();
+    let returned = row
+        .local_reply::<SpawnConversionOutcome>(charge)
+        .unwrap_err();
+    assert_eq!(returned.bytes(), bytes - 1);
+    assert_eq!(memory.usage().1, bytes - 1);
+    assert_eq!(wake.live_identity_counts(), (0, 0, 0));
+    drop(returned);
+    let charge = memory.reserve_callback_total(bytes).unwrap();
+    let (ticket, publisher) = row.local_reply::<SpawnConversionOutcome>(charge).unwrap();
+    assert_eq!(publisher.0.identity.phase, 1);
+    drop((publisher, ticket, row));
+    assert_eq!(wake.live_identity_counts(), (0, 0, 0));
+    assert_eq!(memory.usage().1, 0);
+}
 
 fn memory() -> Arc<LuaMemoryAccount> {
     LuaMemoryAccount::new(LuaMemoryLimits {
