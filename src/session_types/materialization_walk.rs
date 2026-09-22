@@ -38,8 +38,11 @@ struct Cursor<'input> {
     input: &'input [u8],
     offset: usize,
     token: Token,
+    // Predicted production storage, not the counting decoder's actual allocation.
     scratch: ScratchStorage,
     failure: Option<(FailureKind, usize)>,
+    pending_ignore: Option<(usize, ScratchStorage)>,
+    scratch_before_replay: Option<ScratchStorage>,
 }
 
 impl<'input> Cursor<'input> {
@@ -50,6 +53,8 @@ impl<'input> Cursor<'input> {
             token: Token::None,
             scratch: ScratchStorage::default(),
             failure: None,
+            pending_ignore: None,
+            scratch_before_replay: None,
         }
     }
 
@@ -69,6 +74,7 @@ impl<'input> Cursor<'input> {
     }
 
     fn expect_item(&mut self, first: bool, closing: u8, key: bool) {
+        self.pending_ignore = None;
         if self.failure.is_some() {
             return;
         }
@@ -93,6 +99,7 @@ impl<'input> Cursor<'input> {
     }
 
     fn colon(&mut self) {
+        self.pending_ignore = None;
         if self.failure.is_some() {
             return;
         }
@@ -280,6 +287,7 @@ impl<'input> Cursor<'input> {
     }
 
     fn close(&mut self, expected: u8) {
+        self.pending_ignore = None;
         if self.failure.is_some() {
             return;
         }
@@ -297,6 +305,7 @@ impl<'input> Cursor<'input> {
             return;
         }
         self.whitespace();
+        self.pending_ignore = Some((self.offset, self.scratch));
         self.scratch.clear();
         let mut depth = 0usize;
         loop {
@@ -344,6 +353,62 @@ impl<'input> Cursor<'input> {
         }
         self.token = Token::Ignored;
     }
+
+    /// Serde selects the diagnostic and its byte position. This code does not
+    /// interpret number syntax or choose a replacement structural error.
+    /// The offset is line_start + column: an exclusive prefix end that includes
+    /// the byte named by a peek error, even if Serde did not consume that byte.
+    /// Replay can therefore include one inspected byte. It is a storage bound,
+    /// not a claim about the decoder's internal read index.
+    fn reconcile_error(&mut self, error: &serde_json::Error) {
+        let mut line = 1usize;
+        let mut start = 0usize;
+        for (index, byte) in self.input.iter().enumerate() {
+            if line == error.line() {
+                break;
+            }
+            if *byte == b'\n' {
+                line += 1;
+                start = index + 1;
+            }
+        }
+        let Some(offset) = start.checked_add(error.column()) else {
+            self.fail(FailureKind::Arithmetic);
+            return;
+        };
+        if line != error.line() || offset > self.input.len() {
+            self.fail(FailureKind::Disagreement);
+            return;
+        }
+        if let Some((begin, scratch)) = self.pending_ignore {
+            if offset < begin {
+                self.fail(FailureKind::Disagreement);
+                return;
+            }
+            // The eager ignored-value scan can pass a structural failure.
+            // Recompute its storage from only the prefix Serde reached.
+            let mut prefix = Self::new(&self.input[..offset]);
+            prefix.offset = begin;
+            prefix.scratch = scratch;
+            prefix.ignore();
+            if matches!(prefix.failure, Some((FailureKind::Arithmetic, _))) {
+                self.fail(FailureKind::Arithmetic);
+                return;
+            }
+            // Retain the earlier prediction for evidence. Neither model owns
+            // the counting decoder's workspace or can release its charge.
+            self.scratch_before_replay = Some(self.scratch);
+            self.scratch = prefix.scratch;
+        }
+        self.offset = offset;
+        let kind = match self.failure {
+            Some((FailureKind::Arithmetic | FailureKind::Disagreement, _)) => return,
+            Some((kind, _)) => kind,
+            None if self.pending_ignore.is_some() => FailureKind::Structure,
+            None => FailureKind::Lexical,
+        };
+        self.failure = Some((kind, offset));
+    }
 }
 
 type State<'a, 'input> = &'a Cell<Cursor<'input>>;
@@ -387,14 +452,20 @@ macro_rules! reject_counting_method {
 impl<'de, D: Deserializer<'de>> Deserializer<'de> for CountingDeserializer<'_, '_, D> {
     type Error = D::Error;
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
-        update(self.state, Cursor::advance);
+        update(self.state, |cursor| {
+            cursor.pending_ignore = None;
+            cursor.advance();
+        });
         self.inner.deserialize_any(CountingVisitor {
             inner: visitor,
             state: self.state,
         })
     }
     fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
-        update(self.state, Cursor::advance);
+        update(self.state, |cursor| {
+            cursor.pending_ignore = None;
+            cursor.advance();
+        });
         self.inner.deserialize_identifier(CountingVisitor {
             inner: visitor,
             state: self.state,
@@ -617,6 +688,9 @@ fn count_fixture(input: &[u8]) -> (Result<DefinitionStorage, serde_json::Error>,
             key: false,
         })
         .and_then(|value| decoder.end().map(|()| value));
+    if let Err(error) = &result {
+        update(&state, |cursor| cursor.reconcile_error(error));
+    }
     (result, state.get())
 }
 
@@ -705,5 +779,76 @@ mod tests {
         let typed =
             serde_json::from_slice::<super::super::RepoSessionTypesFile>(input).unwrap_err();
         assert_eq!(error.to_string(), typed.to_string());
+    }
+
+    #[test]
+    fn ignored_failure_discards_scratch_growth_after_the_serde_error() {
+        let input = format!(
+            "{{\"unknown\":[0 1,{}0{}]}}",
+            "[".repeat(300),
+            "]".repeat(300),
+        );
+        let (result, cursor) = count_fixture(input.as_bytes());
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("missing comma accepted"),
+        };
+        let typed = serde_json::from_slice::<super::super::RepoSessionTypesFile>(input.as_bytes())
+            .unwrap_err();
+        assert_eq!(error.to_string(), typed.to_string());
+        assert_eq!(cursor.offset, error.column());
+        assert_eq!(
+            cursor.failure,
+            Some((FailureKind::Structure, error.column()))
+        );
+        assert_eq!(cursor.scratch.capacity, 0);
+        assert_eq!(cursor.scratch.peak, 0);
+        assert!(cursor.scratch_before_replay.unwrap().peak > 0);
+    }
+
+    #[test]
+    fn ignored_failure_keeps_capacity_from_earlier_strings_and_frames() {
+        let input = br#"{"session_types":[{"label":"\naaaaaaaa","unknown":[[0}]}]}"#;
+        let (result, cursor) = count_fixture(input);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched closer accepted"),
+        };
+        let typed =
+            serde_json::from_slice::<super::super::RepoSessionTypesFile>(input).unwrap_err();
+        assert_eq!(error.to_string(), typed.to_string());
+        assert_eq!(cursor.offset, error.column());
+        assert_eq!(cursor.scratch.capacity, 16);
+        assert_eq!(cursor.scratch.peak, 24);
+    }
+
+    #[test]
+    fn numeric_failures_use_serde_positions_without_a_second_number_parser() {
+        for input in [
+            "{\n\"session_types\":[{\"label\":1e+}]}",
+            "{\n\"session_types\":[{\"label\":01}]}",
+            "{\n\"session_types\":[{\"label\":1e9999}]}",
+        ] {
+            let (result, cursor) = count_fixture(input.as_bytes());
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("invalid number accepted"),
+            };
+            let typed =
+                serde_json::from_slice::<super::super::RepoSessionTypesFile>(input.as_bytes())
+                    .unwrap_err();
+            assert_eq!(error.to_string(), typed.to_string());
+            let line_start = input
+                .as_bytes()
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap()
+                + 1;
+            assert_eq!(cursor.offset, line_start + error.column());
+            assert_eq!(
+                cursor.failure.map(|(_, offset)| offset),
+                Some(cursor.offset)
+            );
+        }
     }
 }

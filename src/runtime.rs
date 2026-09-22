@@ -91,6 +91,8 @@ pub(crate) mod resync;
 mod session_spawn;
 use provider::{ProviderExpectation, ProviderRequestPlan};
 use session_spawn::SessionTypeSpawnStart;
+#[allow(unused_imports)] // The owner continuation will use the conversion outcome.
+pub(crate) use session_spawn::{SpawnConversionOutcome, SpawnConversionReceipt};
 pub(crate) mod family_cleanup;
 pub(crate) mod package_effect;
 use package_effect::{HostPackageCleanup, HostPackageRuntime};
@@ -300,6 +302,7 @@ impl PluginEntitySnapshotInvocation {
 /// Hub-owned policy bridge for plugin-safe session-type spawns.
 pub struct HubSessionTypeSpawner {
     pending: Mutex<VecDeque<PendingSessionTypeSpawn>>,
+    ordinary_pending: AtomicBool,
     managed: Mutex<VecDeque<PendingManagedSessionSpawn>>,
     managed_pending: AtomicBool,
     managed_owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
@@ -4790,6 +4793,7 @@ impl HubSessionTypeSpawner {
         // Payload destructors run after every queue lock is released.
         drop(queues);
         self.managed_pending.store(false, Ordering::Release);
+        self.ordinary_pending.store(false, Ordering::Release);
         true
     }
 
@@ -4860,6 +4864,7 @@ impl HubSessionTypeSpawner {
     pub(crate) fn new() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
+            ordinary_pending: AtomicBool::new(false),
             managed: Mutex::new(VecDeque::new()),
             managed_pending: AtomicBool::new(false),
             managed_owner: Mutex::new(None),
@@ -4933,7 +4938,8 @@ impl HubSessionTypeSpawner {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         *owner = Some(sender.clone());
-        let pending = self.managed_pending.load(Ordering::Acquire);
+        let pending = self.managed_pending.load(Ordering::Acquire)
+            || self.ordinary_pending.load(Ordering::Acquire);
         drop(owner);
         if pending {
             let _ = sender.try_send(
@@ -4944,6 +4950,15 @@ impl HubSessionTypeSpawner {
 
     fn publish_managed_spawn(&self) {
         self.managed_pending.store(true, Ordering::Release);
+        self.ring_spawn_doorbell();
+    }
+
+    fn publish_session_type_spawn(&self) {
+        self.ordinary_pending.store(true, Ordering::Release);
+        self.ring_spawn_doorbell();
+    }
+
+    fn ring_spawn_doorbell(&self) {
         if let Some(owner) = self
             .managed_owner
             .lock()
@@ -4979,6 +4994,7 @@ impl HubSessionTypeSpawner {
                 _dispose_probe: None,
             });
         }
+        self.publish_session_type_spawn();
 
         receiver
             .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
@@ -4988,10 +5004,16 @@ impl HubSessionTypeSpawner {
     }
 
     fn take_pending(&self) -> Option<PendingSessionTypeSpawn> {
-        self.pending
-            .lock()
-            .expect("session-type spawn queue lock")
-            .pop_front()
+        let mut queue = self.pending.lock().expect("session-type spawn queue lock");
+        // Clear under the queue lock. A later producer publishes after enqueue.
+        self.ordinary_pending.store(false, Ordering::Release);
+        let pending = queue.pop_front();
+        let remaining = !queue.is_empty();
+        drop(queue);
+        if remaining {
+            self.publish_session_type_spawn();
+        }
+        pending
     }
 
     /// Queue the one atomic managed-worktree/session spawn operation.
