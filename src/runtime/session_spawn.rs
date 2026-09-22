@@ -2,6 +2,41 @@
 
 use super::*;
 
+mod reply;
+
+/// The plugin reports this outcome only after it attempts Lua conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // The owner continuation will collect this outcome.
+pub(crate) enum SpawnConversionOutcome {
+    Converted,
+    Abandoned,
+}
+
+/// A dropped receipt reports loss through the registered owner phase.
+/// The publisher retains its funded channel storage until both endpoints end.
+#[derive(Debug)]
+#[allow(dead_code)] // Host delivery will carry this receipt to the plugin.
+pub(crate) struct SpawnConversionReceipt {
+    publisher: crate::data_plane::driver::CoreReplyPublisher<SpawnConversionOutcome>,
+}
+
+#[allow(dead_code)] // The owner continuation will construct this receipt.
+impl SpawnConversionReceipt {
+    pub(crate) fn new(
+        publisher: crate::data_plane::driver::CoreReplyPublisher<SpawnConversionOutcome>,
+    ) -> Self {
+        Self { publisher }
+    }
+
+    pub(crate) fn converted(self) {
+        self.publisher.publish(SpawnConversionOutcome::Converted);
+    }
+
+    pub(crate) fn abandon(self) {
+        self.publisher.publish(SpawnConversionOutcome::Abandoned);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CoreBinding {
     Ownerless,
