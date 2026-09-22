@@ -14,6 +14,14 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+The complete allocation table now reuses one admitted parent and disjoint splits. The writer withdrew the proposed new aggregate owner and Lua memory API.
+Reviewer 0018 proposed a two-file construction boundary, but Root withheld implementation authorization because its prerequisites remain unproved.
+Moving `current_dir` or `current_exe` to startup does not establish admission before their first allocation. Caching also needs a behavior proof.
+Root found no `set_current_dir` or `chdir` call in this worktree's `src` and `crates`; that search alone does not authorize changed path semantics.
+Resolving path acquisition does not by itself prove the complete selection, formatting, and error bound before construction.
+The reviewer must return the corrected prerequisite list. No further broad design pass, caching, source edits, or builds are assigned.
+Evidence: `complete-materialization-ownership-table.md` in the writer evidence directory and `17-minimal-first-boundary.md` in the reviewer evidence directory.
+
 Root assigned an independent technical pass on complete materialization allocations and enforcement of the per-callback ceiling.
 Writer 001b must map actual allocations, existing charges, overlapping lifetimes, refusal ownership, and final release through Core copies.
 The pass must determine whether splitting one admitted parent charge can enforce the ceiling before proposing another mechanism.
