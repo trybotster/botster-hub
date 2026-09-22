@@ -14,6 +14,15 @@ Root commits and pushes reviewed checkpoints and log updates. Installation and r
 
 ### Decision handoff — September 21, resumed assignments
 
+Jason approved retained authority for File startup saves: "Yes—require retained authority".
+Jason also removed backward-compatibility constraints globally: "No worry about backwards compatibility or old callers with anything. None of this is used yet".
+Do not add legacy shims or preserve unsafe unbound File saves. Migrate current repository callers when changing an interface.
+The specific File-save decision leaves custom stores unchanged. Surface any necessary wider store-contract change rather than assuming it.
+Compatibility relief does not waive accounting, error ownership, intended product behavior, or the no-owner-wait requirement.
+Root resumed recovery writer 001d and reviewer 001e on the smallest coherent retained-authority startup checkpoint and current-caller migration.
+They must separate startup ownership from unresolved late-worker outcome retention and restart treatment. No production quarantine activation or build is assigned.
+Root also sent the compatibility decision to the spawn pair so they can remove compatibility-only obstacles without duplicating semantic implementations.
+
 Jason approved the context visibility decision: "Yes—publish after reservation".
 Spawn context may become visible only after Core reserves the session ID, before process launch. The previous timing question is resolved.
 Failed reservation must not publish or replace context. Cleanup still needs exact attempt/generation ownership for both aliases and must preserve retained reads.
