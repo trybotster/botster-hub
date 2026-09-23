@@ -2085,6 +2085,36 @@ The Core pair must identify a concrete Core-owned gap before proposing additiona
 Both pairs must keep evidence outside temporary storage and preserve all existing acceptance limits.
 Root retains integration and publication ownership. This recovery does not authorize installation or runtime replacement.
 
+## September 23 reviewed corrections and candidate verification
+
+The Host diagnostic reproduced one outstanding permit at the original frame-completion boundary.
+The entity-resync scan held that permit. Three additional owner turns retired the work in this run.
+The final test correction checks the original frames first, then requires Host work to retire within two seconds.
+It no longer requires global Host idleness at the frame-completion boundary.
+
+The WebRTC correction preserves the typed usage-query error.
+Only `ErrDataChannelClosed` enters the existing bounded close-event wait. Other query errors remain `UsageFailed`.
+The correction preserves send-error precedence, conservative byte accounting, and the active frame.
+The original real-peer assertion remains unchanged.
+If the close event never arrives, the existing wait still returns `SendFailed`.
+
+Fable accepted both source diffs and independently checked the raw focused evidence.
+Seven exact focused tests passed, one invocation each. The build and all seven invocations exited zero.
+This evidence does not establish repeat stability or full workspace acceptance.
+The focused log SHA-256 is `5bf67961ffe2133abcb906b8e6797ae8559e3e216e2ecb6391e10392bb16e35c`.
+
+Agent 001b committed and pushed both corrections on `delivery/durable-recovery-20260921`:
+
+- `1be7eb62a91b6842609c75d77d7b54c14481fb18`: Host-permit test correction.
+- `ebc60c12a33fb85bc5558c6b15afc14398914348`: WebRTC usage-query correction.
+
+The fresh candidate build from clean tip `ebc60c12` exited zero.
+Its manifest SHA-256 is `4986cd5c991b4c3a0b35e1b3c083880e409bba4fbd9d98bf932a67d17ec6871f`.
+Agent 001b started one full workspace run with the fresh candidate in live session `88927`.
+The raw log is `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/reviewed-ebc60c12-full-suite.log`.
+The adjacent `reviewed-ebc60c12-full-suite-run.md` records the command and environment.
+The full result remains pending. No installation or runtime replacement occurred.
+
 ## Completion gate
 
 ### September 23 verification update
