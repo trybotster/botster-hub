@@ -145,6 +145,8 @@ pub(crate) enum ControlMessage {
     },
     /// A transport dropped retained plugin-result storage and released byte capacity.
     PluginResultCapacityReleased,
+    /// A transport removed one entity frame from a bounded subscription queue.
+    EntitySubscriptionCapacityReleased,
     /// Core published one or more plugin completions for the owner to drain.
     PluginCompletionPublished,
     /// A host job completed or released bounded executor capacity.

@@ -383,8 +383,12 @@ return botster.register({ handlers = {
         botster_hub_client::DaemonResponseKind::PackageDecision
     );
     assert!(
-        held.next_frame().is_err(),
-        "disabled provider subscription must close"
+        matches!(
+            held.next_frame(),
+            Ok(botster_hub_client::DaemonEntityFrame::Error { code, .. })
+                if code == "entity_provider_unloaded"
+        ),
+        "disabled provider subscription must receive a terminal error"
     );
     let cleanup_deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -6057,7 +6061,7 @@ fn daemon_package_entity_publish_gap_pending_then_accepts_in_order() {
 }
 
 #[test]
-fn daemon_package_entity_publish_unload_closes_held_subscription() {
+fn daemon_package_entity_publish_unload_sends_terminal_error() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("pkg-entity-unload");
     let package_dir = unique_test_dir("pkg-entity-unload-pkg");
@@ -6096,8 +6100,12 @@ fn daemon_package_entity_publish_unload_closes_held_subscription() {
     held.set_read_timeout(Some(Duration::from_secs(2)))
         .expect("timeout");
     assert!(
-        held.next_frame().is_err(),
-        "disabled package subscription must close"
+        matches!(
+            held.next_frame(),
+            Ok(botster_hub_client::DaemonEntityFrame::Error { code, .. })
+                if code == "entity_provider_unloaded"
+        ),
+        "disabled package subscription must receive a terminal error"
     );
     let cleanup_deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -6116,6 +6124,129 @@ fn daemon_package_entity_publish_unload_closes_held_subscription() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_provider_retirement_preserves_sibling_on_one_unix_connection() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-sibling");
+    let package_dir = unique_test_dir("pkg-entity-sibling-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = daemon_endpoint(&config);
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("shared Unix connection");
+    connection
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound shared connection reads");
+    for (entity_type, subscription_id) in [
+        ("project-pipelines.membership", "retiring-on-shared"),
+        ("session_type", "surviving-on-shared"),
+    ] {
+        let response = connection
+            .request(&botster_hub_client::DaemonRequest::SubscribeEntities {
+                entity_type: entity_type.to_string(),
+                subscription_id: subscription_id.to_string(),
+            })
+            .expect("subscribe on shared connection");
+        assert_eq!(
+            response.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+    }
+    let mut snapshots = std::collections::BTreeSet::new();
+    while snapshots.len() < 2 {
+        match connection.next_frame().expect("shared initial entity frame") {
+            botster_hub_client::DaemonUnixMuxFrame::Server(
+                botster_hub_client::ServerFrame::Entity {
+                    entity: botster_hub_client::DaemonEntityFrame::Snapshot {
+                        subscription_id,
+                        ..
+                    },
+                },
+            ) => {
+                snapshots.insert(subscription_id);
+            }
+            other => panic!("unexpected shared initial frame: {other:?}"),
+        }
+    }
+    assert_eq!(
+        snapshots,
+        std::collections::BTreeSet::from([
+            "retiring-on-shared".to_string(),
+            "surviving-on-shared".to_string(),
+        ])
+    );
+
+    let disabled = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DisablePackage {
+            package_name: "project-pipelines".to_string(),
+        },
+    )
+    .expect("disable provider on another connection");
+    assert_eq!(
+        disabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    assert!(matches!(
+        connection.next_frame().expect("retiring provider terminal frame"),
+        botster_hub_client::DaemonUnixMuxFrame::Server(
+            botster_hub_client::ServerFrame::Entity {
+                entity: botster_hub_client::DaemonEntityFrame::Error {
+                    subscription_id,
+                    code,
+                    ..
+                },
+            },
+        ) if subscription_id == "retiring-on-shared" && code == "entity_provider_unloaded"
+    ));
+
+    let definition = botster_hub_client::DaemonSessionTypeDefinition {
+        id: "g2-sibling".to_string(),
+        label: "G2 sibling".to_string(),
+        description: None,
+        icon: None,
+        role: "botster.accessory".to_string(),
+        interaction: "interactive".to_string(),
+        traits: vec!["terminal".to_string()],
+        lifecycle: "persistent".to_string(),
+        execution: botster_hub_client::DaemonSessionTypeExecution::RelativeExecutable,
+        command: "bin/accessory.sh".to_string(),
+        args: Vec::new(),
+        working_directory: botster_hub_client::DaemonSessionTypeWorkingDirectory::Relative {
+            path: "nested/dir".to_string(),
+        },
+        environment: BTreeMap::new(),
+        allowed_environment_overrides: Vec::new(),
+        context: Vec::new(),
+        target_id: None,
+    };
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            definition,
+        },
+    )
+    .expect("create sibling session type");
+    assert!(matches!(
+        connection.next_frame().expect("surviving sibling update"),
+        botster_hub_client::DaemonUnixMuxFrame::Server(
+            botster_hub_client::ServerFrame::Entity {
+                entity: botster_hub_client::DaemonEntityFrame::Upsert {
+                    subscription_id,
+                    id,
+                    ..
+                },
+            },
+        ) if subscription_id == "surviving-on-shared" && id == "device/g2-sibling"
+    ));
+    drop(connection);
     shutdown_cli_daemon(&data_dir, child);
 }
 

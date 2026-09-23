@@ -23,6 +23,7 @@ use webrtc::runtime::{Runtime, Sender as AsyncSender, default_runtime};
 #[cfg(test)]
 use crate::daemon::control::message::control_reply_channel;
 use crate::daemon::control::message::{ControlMessage, ControlSender};
+use crate::subscription::entity::EntitySubscriptionCapacityWake;
 use crate::transport::webrtc::adapter::WebRtcConnectionMux;
 use crate::transport::webrtc::control_channel::{
     LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH, LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW, LocalWebrtcDataChannel,
@@ -73,6 +74,7 @@ impl Default for SharedEventPlane {
 pub struct LocalWebrtcTransport {
     pub(crate) grants: crate::admission::grants::GrantRegistry,
     pub(crate) event_plane: SharedEventPlane,
+    pub(crate) entity_capacity_wake: EntitySubscriptionCapacityWake,
     pub(crate) peers: BTreeMap<String, Arc<dyn PeerConnection>>,
     /// Live peer ownership records used for fail-closed sibling cleanup.
     pub(crate) peer_states: BTreeMap<String, Arc<LocalWebrtcPeerState>>,
@@ -117,6 +119,10 @@ pub(crate) struct PeerRemoveResult {
     pub attached_subscriptions: Vec<LocalWebrtcAttachedSubscription>,
 }
 impl LocalWebrtcTransport {
+    pub(crate) fn bind_entity_capacity_wake(&mut self, wake: EntitySubscriptionCapacityWake) {
+        self.entity_capacity_wake = wake;
+    }
+
     #[must_use]
     pub(crate) fn event_plane(&self) -> Arc<crate::subscription::package_events::ClientEventPlane> {
         self.event_plane.0.clone()
@@ -535,6 +541,7 @@ impl LocalWebrtcTransport {
 pub(crate) struct LocalWebrtcPeerState {
     pub(crate) grant_id: String,
     pub(crate) runtime_tx: ControlSender,
+    pub(crate) entity_capacity_wake: EntitySubscriptionCapacityWake,
     pub(crate) attached_subscriptions: Mutex<Vec<LocalWebrtcAttachedSubscription>>,
     pub(crate) entity_subscription_ids: Mutex<BTreeSet<String>>,
     pub(crate) terminal_state: Mutex<LocalWebrtcTerminalState>,
@@ -707,6 +714,7 @@ impl LocalWebrtcPeerState {
             grant_id,
             runtime_tx,
             Arc::new(crate::subscription::package_events::ClientEventPlane::default()),
+            EntitySubscriptionCapacityWake::default(),
         )
     }
 
@@ -714,11 +722,13 @@ impl LocalWebrtcPeerState {
         grant_id: String,
         runtime_tx: ControlSender,
         _event_plane: Arc<crate::subscription::package_events::ClientEventPlane>,
+        entity_capacity_wake: EntitySubscriptionCapacityWake,
     ) -> Self {
         let (peer_terminal_tx, _peer_terminal_rx) = watch::channel(None);
         Self {
             grant_id,
             runtime_tx,
+            entity_capacity_wake,
             attached_subscriptions: Mutex::new(Vec::new()),
             entity_subscription_ids: Mutex::new(BTreeSet::new()),
             terminal_state: Mutex::new(LocalWebrtcTerminalState::default()),

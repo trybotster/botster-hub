@@ -746,6 +746,10 @@ impl HostMutationContinuation {
                     .runtime_mut()
                     .expect("package effect retains its runtime")
                     .apply_host_package_cleanup(cleanup);
+                state
+                    .maintenance
+                    .wakes
+                    .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
                 release_document(state, waiter_id);
                 match reply {
                     Ok(reply) => finish_reply(permit, reply),
