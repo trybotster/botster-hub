@@ -13,6 +13,7 @@ This checkpoint supersedes older assignment and build-status statements below.
 - Spawn writer 001b continues the real producer and consumer path. Reviewer 0018 checks that path. The capacity enumeration closed at `2 * OWNER_BUDGET_CAPACITY + 5`. Production-path verification remains open.
 - Root verified that `split_fixed` permanently reduces the parent ceiling. Temporary scratch must not prevent later valid projection admission. Root directed a scoped scratch lifetime under the original callback parent. A generic join based only on account identity is not accepted.
 - Root assigned recovery caller migration to writer 001d and reviewer 001e in their recovery worktree. They own startup, publication, persistence callers, and exact test helpers. Spawn regions and `host_executor` remain with writer 001b. Root will integrate both changes. The breaking API must not publish alone.
+- The recovery scope includes persistence callers and typed-result handling in `daemon/control/host_work.rs` and `managed_git.rs`. Root verified their mutation constructors and result consumers. Uncertain writes must retain their state through these cleanup paths without rollback.
 - The compiler slot is free. No new build is assigned. Startup-captured paths, final CLI handling of unresolved state, and restart reconciliation remain undecided. Earlier permission denials remain in force.
 
 Recovery evidence: `/Users/jasonconigliari/botster-evidence/durable-recovery-20260921/quarantine-v1/`.
