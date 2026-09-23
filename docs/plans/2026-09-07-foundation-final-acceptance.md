@@ -1,6 +1,23 @@
 # Foundation integration and final acceptance
 
-Status: partial spawn checkpoint `a8884a5f` is pushed. Full foundation acceptance remains open.
+Status: spawn checkpoint `a8884a5f` and recovery checkpoint `3bc264a8` are pushed. Full foundation acceptance remains open.
+
+## Current checkpoint — September 22
+
+This checkpoint supersedes older assignment and build-status statements below.
+
+- Recovery: `3bc264a8` adds sticky write quarantine. All 12 state-directory tests passed. Reviewer 001e accepted the evidence. This proves the storage primitive, not runtime activation.
+- Spawn: the parser oracle passed all 12 fixtures. Artifact SHA256 is `8506fcf5b977d968085179b51de02f7d8a26962640c456f245781c735ac6d7c1`. Evidence is in the spawn worktree at `target/parser-oracle-20260922-v2`. This is fixture evidence, not a bound for all inputs.
+- Recovery writer 001d and reviewer 001e completed source review of retained authority and the inspect migration. The four-file API diff is `b623f605c57fc0b120c8b8b655c85bf8bb03dba8b5a386f11a134ee62ed2fa16`. The two-file inspect diff is `3d1146d61019350b8c107df1de1b2d1aef4af255a9e84207d167bc45c11e5d3b`. These changes are unbuilt and uncommitted. Runtime, daemon, Host, and test callers must migrate with the API.
+- Inspect now uses the existing daemon transport. Source review accepted the live-daemon and offline tests. The found-session output lacks an executed assertion. The new source uses Hub projection rows rather than the old Core listing.
+- Spawn writer 001b continues the real producer and consumer path. Reviewer 0018 checks that path. The capacity enumeration closed at `2 * OWNER_BUDGET_CAPACITY + 5`. Production-path verification remains open.
+- Root verified that `split_fixed` permanently reduces the parent ceiling. Temporary scratch must not prevent later valid projection admission. Root directed a scoped scratch lifetime under the original callback parent. A generic join based only on account identity is not accepted.
+- Root owns the recovery caller-migration schedule because it overlaps the spawn files. The recovery pair will provide the exact handoff. The breaking API must not publish alone.
+- The compiler slot is free. No new build is assigned. Startup-captured paths, final CLI handling of unresolved state, and restart reconciliation remain undecided. Earlier permission denials remain in force.
+
+Recovery evidence: `/Users/jasonconigliari/botster-evidence/durable-recovery-20260921/quarantine-v1/`.
+The next decisive checks are a reachable spawn lifecycle and the coordinated recovery caller migration.
+Final matched-client verification, production activation, and full foundation acceptance remain open.
 
 ## Current orchestration ledger — September 21
 
