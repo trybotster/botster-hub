@@ -45,6 +45,13 @@ impl Fixture {
         self.store.load_retained(&self.config).unwrap().0
     }
 
+    fn replace_initialized_document(&self, bytes: &[u8]) {
+        if !self.directory.join("hub-recovery.log").exists() {
+            let _ = self.state();
+        }
+        fs::write(self.store.path(), bytes).expect("replace initialized test document");
+    }
+
     fn retained_view(&self) -> (SharedView<HubState>, HubStateAuthority) {
         let (state, Some(mut authority)) = self.store.load_retained(&self.config).unwrap() else {
             panic!("File load must return authority");
@@ -57,13 +64,11 @@ impl Fixture {
     }
 
     fn reject_both_load_paths(&self, bytes: &[u8], expected: HubStateError) {
-        fs::write(
-            self.store.path(),
-            serde_json::to_vec(&HubState::from_config(&self.config)).unwrap(),
-        )
-        .unwrap();
+        self.replace_initialized_document(
+            &serde_json::to_vec(&HubState::from_config(&self.config)).unwrap(),
+        );
         let (prior, authority) = self.retained_view();
-        fs::write(self.store.path(), bytes).unwrap();
+        self.replace_initialized_document(bytes);
         assert!(matches!(
             self.store.load_for_update(&authority, &self.config),
             Err(HubStateStoreError::State(error)) if error == expected
@@ -427,7 +432,13 @@ fn failed_write_returns_no_receipt_and_preserves_committed_bytes() {
     assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
     drop(authority);
     drop(state);
-    assert!(fixture.state().recovery.records.is_empty());
+    assert!(matches!(
+        fixture.store.load_retained(&fixture.config),
+        Err(HubStateStoreError::RecoveryRequired {
+            reason: "recovery_intent_unresolved",
+            sequence: Some(2),
+        })
+    ));
 }
 
 #[test]
@@ -608,7 +619,7 @@ fn schema_three_migrates_both_load_paths_without_mutating_disk() {
     value["session_type_generation"] = 71.into();
     value.as_object_mut().unwrap().remove("recovery");
     let bytes = serde_json::to_vec(&value).unwrap();
-    fs::write(fixture.store.path(), &bytes).unwrap();
+    fixture.replace_initialized_document(&bytes);
     let loaded = fixture.state();
     assert_eq!(loaded.schema_version, 4);
     assert_eq!(loaded.session_type_generation, 71);
@@ -630,18 +641,27 @@ fn schema_three_migrates_both_load_paths_without_mutating_disk() {
             .is_err()
     );
     assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
-    assert!(matches!(
-        fixture.store.save_retained_startup_state(
-            &authority,
-            0,
-            Some(prior.clone()),
-            loaded.clone()
-        ),
-        Ok(FileCommitOutcome::Synced { .. })
-    ));
     drop(prior);
     drop(authority);
-    assert_eq!(fixture.state(), loaded);
+    assert!(matches!(
+        fixture.store.load_retained(&fixture.config),
+        Err(HubStateStoreError::RecoveryRequired {
+            reason: "recovery_intent_unresolved",
+            sequence: Some(2),
+        })
+    ));
+
+    let successful = Fixture::new();
+    successful.replace_initialized_document(&bytes);
+    let (prior, authority) = successful.retained_view();
+    assert!(matches!(
+        successful
+            .store
+            .save_retained_startup_state(&authority, 0, Some(prior), loaded.clone()),
+        Ok(FileCommitOutcome::Synced { .. })
+    ));
+    drop(authority);
+    assert_eq!(successful.state(), loaded);
 }
 
 #[test]

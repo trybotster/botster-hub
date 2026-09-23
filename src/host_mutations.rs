@@ -2681,6 +2681,28 @@ mod tests {
         )
     }
 
+    fn persisted_inputs(
+        name: &str,
+    ) -> (
+        SharedView<HubState>,
+        SharedView<PackageRegistry>,
+        PathBuf,
+        Arc<HubStateAuthority>,
+    ) {
+        let (state, packages, data_directory, authority) = inputs(name);
+        let store = FileHubStateStore::for_data_directory(&data_directory);
+        let prepared = store
+            .prepare_shared(&authority, 0, None, (*state).clone(), &authority.budget())
+            .expect("prepare initial state fixture");
+        let FileCommitOutcome::Synced { state, .. } = store
+            .commit_shared(prepared, 0)
+            .expect("commit initial state fixture")
+        else {
+            panic!("initial state fixture must synchronize");
+        };
+        (state, packages, data_directory, authority)
+    }
+
     fn unique_test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3182,7 +3204,7 @@ mod tests {
 
     #[test]
     fn commit_publishes_the_candidate_and_advances_one_revision() {
-        let (state, packages, data_directory, authority) = inputs("commit");
+        let (state, packages, data_directory, authority) = persisted_inputs("commit");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
                 request: create_target_request("committed-target".to_string()),
@@ -3215,8 +3237,10 @@ mod tests {
 
     #[test]
     fn failed_atomic_commit_returns_the_typed_previous_view() {
-        let (state, packages, data_directory, authority) = inputs("recover");
+        let (state, packages, data_directory, authority) = persisted_inputs("recover");
         let expected = (*state).clone();
+        let prior_bytes =
+            fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
                 request: create_target_request("recovered-target".to_string()),
@@ -3237,13 +3261,16 @@ mod tests {
         };
         assert_eq!(*view, expected);
         assert_eq!(failure.code, "hub_state_commit_failed");
-        assert!(!data_directory.join("hub-state.json").exists());
+        assert_eq!(
+            fs::read(data_directory.join("hub-state.json")).expect("read unchanged state"),
+            prior_bytes
+        );
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
     #[test]
     fn uncertain_commit_keeps_both_views_and_does_not_run_recovery() {
-        let (state, packages, data_directory, authority) = inputs("uncertain-commit");
+        let (state, packages, data_directory, authority) = persisted_inputs("uncertain-commit");
         let expected = (*state).clone();
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {

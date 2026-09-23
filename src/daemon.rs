@@ -670,6 +670,7 @@ mod tests {
             )
             .expect("persist startup package registry");
         assert!(matches!(outcome, FileCommitOutcome::Synced { .. }));
+        drop(authority);
         daemon.stop();
 
         let mut restarted = HubDaemon::start(config).expect("start with isolated package failure");
