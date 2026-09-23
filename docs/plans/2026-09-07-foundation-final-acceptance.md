@@ -2283,8 +2283,14 @@ The packet is `managed-recovery-20260922/g3-g4-test-only-fixture-run.md` under `
 Its SHA-256 is `5b70f7fdf8c3507b2ad685063c116d088e39413f603b341a59a84168875a1bed`.
 Agent 001b committed and pushed `abe4ceb6f3ca4604304a437a7546b82e1dd19d7e` with only the four reviewed test files.
 The writer reported that HEAD equals the remote branch and the worktree is clean.
-Agent 001b and reviewer 001e next trace G5 operation labels through Host failure and restoration paths.
-The compiler slot is free. No G5 source change is authorized before the premise review.
+Root accepted the G5 premise after reading the response builder, continuation, and admission paths.
+The response builder replaces package operation labels with `host_execution`. The configure failure log confirms that value.
+The install and enable tests fail at their operation assertions, but their logs do not print the actual value.
+Agent 001b now owns the bounded correction in `host_work.rs` and diagnostic test assertions.
+The continuation retains the static label from the typed request before the request moves into the Host command.
+Both admission calls and all `finish_error` calls must receive that label. Unclassified and non-package labels remain unchanged.
+Restoration transport errors remain unchanged. `PreparedMutation`, submission errors, and commit-outcome mapping remain outside this correction.
+Reviewer 001e must check the diff and focused tests before compilation. The compiler slot is free.
 The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
 
 The remaining failure groups cover operation labels,
