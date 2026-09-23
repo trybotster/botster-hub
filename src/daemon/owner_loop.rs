@@ -7129,7 +7129,6 @@ return botster.register({ handlers = {{
                     .is_none()
             );
         }
-        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
         let decode = |delivery| match delivery {
             crate::entity_delivery::EntityDelivery::Typed(frame) => frame,
             crate::entity_delivery::EntityDelivery::Encoded(frame) => frame.into_typed(),
@@ -7147,6 +7146,16 @@ return botster.register({ handlers = {{
                 "the sequence-1 mutation is superseded"
             );
         }
+        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        while daemon.runtime().unwrap().host_executor().outstanding() != 0 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < drain_deadline,
+                "Host work must retire after snapshots and fanout complete"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
         let bridge = daemon.runtime().unwrap().entity_publish_bridge();
         let publication = bridge.test_queue_publish(
             botster_core::PluginKey("owner-entity-gate".into()),
