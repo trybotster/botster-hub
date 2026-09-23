@@ -2309,8 +2309,15 @@ The Host formatter bypassed the existing `package_error_display_name` policy in 
 Root and reviewer 001e accepted bounded reuse of that helper, with its refresh exception unchanged.
 The three-file diff is `098a518feecf7669b42bc32325681e87099297e6af40a7de6d6ccfb3e9c1f099`.
 Its library build passed. The new Host policy test and the existing projection test each executed one test and passed.
-Root checked both result logs. Independent evidence review is pending.
-Root conditionally authorized the scoped commit, push, and fresh candidate build after that review.
+Root checked both result logs. Reviewer 001e verified the focused evidence.
+The reviewed display correction is committed and pushed as `db3dc263e9ceac8b8747564b86eaa5ac1f4cae08`.
+Root and reviewer 001e verified its clean candidate, manifest, and artifact hashes.
+All three exact lifecycle selectors passed against that candidate, each executing one test with 322 filtered tests.
+The local CLI test passed in 8.40 seconds. The plugin namespace test passed in 5.63 seconds.
+The package contract matrix passed in 10.72 seconds. Root checked all three raw result logs and the recorded commands.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/g5-candidate-db3dc263-20260923`.
+Independent lifecycle evidence review is pending. These passes do not establish full acceptance.
+Root released the compiler slot. Agent 001b next audits the G6 source guard without edits.
 Reason-payload sanitization is outside this correction. The separate CLI Package Display site remains an unverified follow-up candidate.
 The formatting check failed. Baseline attribution remains unverified; no strict formatting acceptance is claimed.
 The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
