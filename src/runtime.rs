@@ -134,7 +134,6 @@ pub struct HubRuntime {
     retained_plugin_reservations: Mutex<Vec<SessionReservation>>,
     created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
     confirmed_worktree_rollbacks: Mutex<Vec<crate::managed_git_worktrees::PreparedManagedWorktree>>,
-    suppressed_created_worktree_rollbacks: Arc<Mutex<BTreeSet<String>>>,
     submitted_created_worktree_rollbacks: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     rollback_git_hold: Mutex<Option<Arc<crate::host_executor::TestHostGate>>>,
@@ -518,7 +517,6 @@ impl HubRuntime {
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
-            suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
             submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             rollback_git_hold: Mutex::new(None),
@@ -705,7 +703,6 @@ impl HubRuntime {
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
-            suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
             submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             rollback_git_hold: Mutex::new(None),
@@ -1980,9 +1977,6 @@ impl HubRuntime {
         if !prepared.created_worktree {
             return;
         }
-        if let Ok(mut suppressed) = self.suppressed_created_worktree_rollbacks.lock() {
-            suppressed.remove(&prepared.worktree_id);
-        }
         if let Ok(mut cleanups) = self.created_worktree_cleanups.lock()
             && !cleanups
                 .iter()
@@ -2002,50 +1996,6 @@ impl HubRuntime {
             });
         }
         self.retry_created_worktree_releases();
-    }
-
-    pub(crate) fn cancel_created_worktree_cleanup(&self, worktree_id: &str) {
-        let mut detached = Vec::new();
-        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
-            let mut keep = Vec::new();
-            for mut cleanup in cleanups.drain(..) {
-                if cleanup.worktree_id != worktree_id {
-                    keep.push(cleanup);
-                    continue;
-                }
-                if let Some(tracker) = cleanup.shutdown.take() {
-                    detached.push(tracker);
-                }
-                if let Some(tracker) = cleanup.remove.take() {
-                    detached.push(tracker);
-                }
-                let tracker = cleanup.release.take().unwrap_or_else(|| {
-                    self.begin_release_session_reservation(cleanup.reservation.clone())
-                });
-                detached.push(tracker);
-            }
-            *cleanups = keep;
-        }
-        if let Ok(mut confirmed) = self.confirmed_worktree_rollbacks.lock() {
-            confirmed.retain(|prepared| prepared.worktree_id != worktree_id);
-        }
-        if let Ok(mut suppressed) = self.suppressed_created_worktree_rollbacks.lock() {
-            suppressed.insert(worktree_id.to_string());
-        }
-        if let Ok(mut held) = self.detached_operations.lock() {
-            held.extend(detached);
-        }
-    }
-
-    pub(crate) fn created_worktree_rollback_suppressed(&self, worktree_id: &str) -> bool {
-        self.suppressed_created_worktree_rollbacks
-            .lock()
-            .ok()
-            .is_some_and(|held| held.contains(worktree_id))
-    }
-
-    pub(crate) fn created_worktree_rollback_suppressions(&self) -> Arc<Mutex<BTreeSet<String>>> {
-        Arc::clone(&self.suppressed_created_worktree_rollbacks)
     }
 
     pub(crate) fn begin_submitted_worktree_rollback(&self, worktree_id: &str) {
