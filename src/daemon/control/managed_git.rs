@@ -479,16 +479,34 @@ impl ManagedSpawnOperation {
             .base_revision;
         match admit_document(state, self.waiter_id, base_revision, daemon.state_view().0) {
             DocumentAdmission::Granted => {
+                if !state.reserve_uncertain_publication(self.waiter_id) {
+                    release_document(state, self.waiter_id);
+                    self.deferred_error = Some(ManagedGitError::new(
+                        "state_publication_slot_occupied",
+                        "another unresolved state publication owns the retention cell",
+                    ));
+                    let discard = self.prepared_mutation.take();
+                    return self.submit_finalize(
+                        daemon,
+                        state,
+                        ManagedWorktreeDecision::Rollback,
+                        discard,
+                    );
+                }
                 let prepared = *self
                     .prepared_mutation
                     .take()
                     .expect("record preparation exists");
-                self.submit_host(
+                let poll = self.submit_host(
                     daemon,
                     state,
                     Phase::CommitRecord,
                     HostCommand::Mutation(HostMutationCommand::Commit(HostCommit { prepared })),
-                )
+                );
+                if !matches!(poll, ControlPoll::Pending) {
+                    state.release_uncertain_reservation(self.waiter_id);
+                }
+                poll
             }
             DocumentAdmission::Busy => {
                 self.phase = Phase::ParkRecord;
@@ -510,7 +528,31 @@ impl ManagedSpawnOperation {
         state: &mut DaemonControlState,
         result: HostResult,
     ) -> ControlPoll {
+        if !matches!(
+            result,
+            HostResult::Mutation(HostMutationResult::PublishedUncertain { .. })
+        ) {
+            state.release_uncertain_reservation(self.waiter_id);
+        }
         match result {
+            HostResult::Mutation(HostMutationResult::PublishedUncertain { write, rollback }) => {
+                let prepared = self.prepared.take().expect("managed worktree exists");
+                state.retain_uncertain_publication(
+                    self.waiter_id,
+                    write,
+                    rollback,
+                    Some(
+                        crate::daemon::owner_loop::UncertainPublicationCleanup::ManagedGit(
+                            prepared,
+                        ),
+                    ),
+                );
+                release_document(state, self.waiter_id);
+                self.finish_error(ManagedGitError::new(
+                    "state_publication_uncertain",
+                    "the managed worktree record reached publication without a confirmed durable result",
+                ))
+            }
             HostResult::Mutation(HostMutationResult::Committed(committed)) => {
                 if committed.committed_revision != daemon.state_view().0.saturating_add(1) {
                     release_document(state, self.waiter_id);
@@ -798,16 +840,34 @@ impl ManagedSpawnOperation {
             .base_revision;
         match admit_document(state, self.waiter_id, base_revision, daemon.state_view().0) {
             DocumentAdmission::Granted => {
+                if !state.reserve_uncertain_publication(self.waiter_id) {
+                    release_document(state, self.waiter_id);
+                    let prepared = self.prepared.take().expect("managed worktree exists");
+                    self.prepared_mutation.take();
+                    return self.retain_recovery_with_code(
+                        state,
+                        prepared,
+                        crate::host_executor::HostError::new(
+                            "state_publication_slot_occupied",
+                            "another unresolved state publication owns the retention cell",
+                        ),
+                        "state_publication_slot_occupied",
+                    );
+                }
                 let prepared = *self
                     .prepared_mutation
                     .take()
                     .expect("record removal exists");
-                self.submit_host(
+                let poll = self.submit_host(
                     daemon,
                     state,
                     Phase::CommitRemoval,
                     HostCommand::Mutation(HostMutationCommand::Commit(HostCommit { prepared })),
-                )
+                );
+                if !matches!(poll, ControlPoll::Pending) {
+                    state.release_uncertain_reservation(self.waiter_id);
+                }
+                poll
             }
             DocumentAdmission::Busy => {
                 self.phase = Phase::ParkRemoval;
@@ -829,7 +889,31 @@ impl ManagedSpawnOperation {
         state: &mut DaemonControlState,
         result: HostResult,
     ) -> ControlPoll {
+        if !matches!(
+            result,
+            HostResult::Mutation(HostMutationResult::PublishedUncertain { .. })
+        ) {
+            state.release_uncertain_reservation(self.waiter_id);
+        }
         match result {
+            HostResult::Mutation(HostMutationResult::PublishedUncertain { write, rollback }) => {
+                let prepared = self.prepared.take().expect("managed worktree exists");
+                state.retain_uncertain_publication(
+                    self.waiter_id,
+                    write,
+                    rollback,
+                    Some(
+                        crate::daemon::owner_loop::UncertainPublicationCleanup::ManagedGit(
+                            prepared,
+                        ),
+                    ),
+                );
+                release_document(state, self.waiter_id);
+                self.finish_error(ManagedGitError::new(
+                    "state_publication_uncertain",
+                    "the managed worktree removal reached publication without a confirmed durable result",
+                ))
+            }
             HostResult::Mutation(HostMutationResult::Committed(committed)) => {
                 if committed.committed_revision != daemon.state_view().0.saturating_add(1) {
                     release_document(state, self.waiter_id);
@@ -880,6 +964,11 @@ impl ManagedSpawnOperation {
                 .expect("managed worktree exists")
                 .worktree(),
             base_revision,
+            authority: daemon
+                .runtime()
+                .expect("managed operation requires runtime")
+                .state_authority()
+                .expect("File managed Git mutation retains its state authority"),
             state: view,
             data_directory: daemon
                 .runtime()
@@ -912,6 +1001,11 @@ impl ManagedSpawnOperation {
                 .worktree_id
                 .clone(),
             base_revision,
+            authority: daemon
+                .runtime()
+                .expect("managed operation requires runtime")
+                .state_authority()
+                .expect("File managed Git mutation retains its state authority"),
             state: view,
             data_directory: daemon
                 .runtime()
@@ -1085,6 +1179,16 @@ impl ManagedSpawnOperation {
         prepared: PreparedManagedWorktree,
         error: crate::host_executor::HostError,
     ) -> ControlPoll {
+        self.retain_recovery_with_code(state, prepared, error, "reconciliation_required")
+    }
+
+    fn retain_recovery_with_code(
+        &mut self,
+        state: &mut DaemonControlState,
+        prepared: PreparedManagedWorktree,
+        error: crate::host_executor::HostError,
+        response_code: &'static str,
+    ) -> ControlPoll {
         let Some(permit) = self.permit.take() else {
             return self
                 .finish_reconciliation("the managed Git recovery result lost its host permit");
@@ -1100,7 +1204,7 @@ impl ManagedSpawnOperation {
                 _permit: permit,
             }),
         );
-        self.finish_reconciliation(&detail)
+        self.finish_error(ManagedGitError::new(response_code, detail))
     }
 
     fn finish_internal(&mut self) -> ControlPoll {

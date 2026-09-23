@@ -72,7 +72,10 @@ use crate::package_event_router::{
     CausalAdmitResult, CausalOp, EventPlaneStatus, EventSubscription, LeaseIdentity,
 };
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
-use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
+use crate::persistence::{
+    FileCommitError, FileCommitOutcome, FileHubStateStore, HubState, HubStateAuthority,
+    HubStateStore, HubStateStoreError,
+};
 use crate::session_types::{
     EnsuredManagedWorktree, HubSessionContext, ManagedSessionTypeRequest, SessionTypeRequest,
     materialize_managed_session_type, materialize_session_type, show_session_type_for_target,
@@ -123,6 +126,7 @@ pub struct HubRuntime {
     // Readers clone the current Arc under this short lock. Publication swaps
     // one Arc, so the owner never clones a durable state collection.
     state: SharedHubState,
+    state_authority: Option<Arc<HubStateAuthority>>,
     core_daemon: SharedCoreDaemon,
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
     inflight_plugin_core:
@@ -221,6 +225,10 @@ impl HubStatePublication {
             }
         })?;
         Ok(Self(RwLock::new(PublishedHubState { revision: 0, state })))
+    }
+
+    pub(crate) fn from_retained(state: SharedView<HubState>, revision: u64) -> Self {
+        Self(RwLock::new(PublishedHubState { revision, state }))
     }
 
     pub(crate) fn snapshot(&self) -> (u64, SharedView<HubState>) {
@@ -498,6 +506,7 @@ impl HubRuntime {
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
             state,
+            state_authority: None,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(
@@ -554,20 +563,12 @@ impl HubRuntime {
         config: HubConfig,
         store: &impl HubStateStore,
     ) -> HubRuntimeResult<Self> {
-        let mut state = store.load_or_initialize(&config)?;
-        if adopt_unrecorded_managed_worktrees(
-            &state.spawn_targets,
-            &mut state.worktrees,
-            &managed_worktree_root(&config),
-        ) {
-            store.save_exclusive_startup_state(&state)?;
-        }
-        validate_hub_credentials(
-            &state,
+        Self::load_from_store_with_credentials(
+            config,
+            store,
             CredentialProviderKind::OsKeychain,
             &OsKeychainCredentialStore::new(),
-        )?;
-        Self::from_validated_state(config, state)
+        )
     }
 
     /// Load durable hub state with an explicit credential store.
@@ -581,19 +582,77 @@ impl HubRuntime {
         provider_kind: CredentialProviderKind,
         credential_store: &impl botster_core::CredentialStore,
     ) -> HubRuntimeResult<Self> {
-        let mut state = store.load_or_initialize(&config)?;
-        if adopt_unrecorded_managed_worktrees(
-            &state.spawn_targets,
-            &mut state.worktrees,
-            &managed_worktree_root(&config),
-        ) {
-            store.save_exclusive_startup_state(&state)?;
-        }
-        validate_hub_credentials(&state, provider_kind, credential_store)?;
-        Self::from_validated_state(config, state)
+        let (state, authority) = store.load_retained(&config)?;
+        let (publication, authority) = if let Some(mut authority) = authority {
+            let prior = SharedView::from_reserved(
+                state,
+                authority
+                    .take_startup_charge()
+                    .expect("File retained load reserves its startup view"),
+            );
+            let mut candidate = (*prior).clone();
+            let (view, revision) = if adopt_unrecorded_managed_worktrees(
+                &candidate.spawn_targets,
+                &mut candidate.worktrees,
+                &managed_worktree_root(&config),
+            ) {
+                match authority.store().save_retained_startup_state(
+                    &authority,
+                    0,
+                    Some(prior),
+                    candidate,
+                ) {
+                    Ok(FileCommitOutcome::Synced { state, revision }) => (state, revision),
+                    Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+                        return Err(HubRuntimeError::State(
+                            HubStateStoreError::PublishedUncertain(write),
+                        ));
+                    }
+                    Err(FileCommitError::Preparation(error))
+                    | Err(FileCommitError::BeforePublication { error, .. }) => {
+                        return Err(HubRuntimeError::State(error));
+                    }
+                    Err(FileCommitError::Stale(_)) => {
+                        return Err(HubRuntimeError::State(HubStateStoreError::StaleRevision));
+                    }
+                    Err(FileCommitError::RevisionExhausted(_)) => {
+                        return Err(HubRuntimeError::State(
+                            HubStateStoreError::RevisionExhausted,
+                        ));
+                    }
+                }
+            } else {
+                (prior, 0)
+            };
+            validate_hub_credentials(&view, provider_kind, credential_store)?;
+            (
+                HubStatePublication::from_retained(view, revision),
+                Some(Arc::new(authority)),
+            )
+        } else {
+            let mut state = state;
+            if adopt_unrecorded_managed_worktrees(
+                &state.spawn_targets,
+                &mut state.worktrees,
+                &managed_worktree_root(&config),
+            ) {
+                store.save_exclusive_startup_state(&state)?;
+            }
+            validate_hub_credentials(&state, provider_kind, credential_store)?;
+            (HubStatePublication::new(state)?, None)
+        };
+        Self::from_initialized_state(config, publication, authority)
     }
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
+        Self::from_initialized_state(config, HubStatePublication::new(state)?, None)
+    }
+
+    fn from_initialized_state(
+        config: HubConfig,
+        publication: HubStatePublication,
+        state_authority: Option<Arc<HubStateAuthority>>,
+    ) -> HubRuntimeResult<Self> {
         let lua_memory = crate::lua_memory::LuaMemoryAccount::new(
             crate::config::lua_memory_limits(),
         )
@@ -602,7 +661,7 @@ impl HubRuntime {
                 field: "lua_memory",
             })
         })?;
-        let state = Arc::new(HubStatePublication::new(state)?);
+        let state = Arc::new(publication);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let plugin_lifecycle = HubPluginLifecycle::with_config(plugin_worker_config);
@@ -632,6 +691,7 @@ impl HubRuntime {
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
             state,
+            state_authority,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(
@@ -727,6 +787,10 @@ impl HubRuntime {
     /// Return the shared state publication used by daemon and plugin readers.
     pub(crate) fn state_publication(&self) -> SharedHubState {
         Arc::clone(&self.state)
+    }
+
+    pub(crate) fn state_authority(&self) -> Option<Arc<HubStateAuthority>> {
+        self.state_authority.as_ref().map(Arc::clone)
     }
 
     /// Publish durable hub state after an owner-thread mutation.

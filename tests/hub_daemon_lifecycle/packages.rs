@@ -848,8 +848,10 @@ fn foreground_terminal_app_open_absolutizes_relative_runtime_paths() {
 }
 
 #[test]
-fn cli_inspect_reports_not_found_for_fresh_in_process_daemon() {
+fn cli_inspect_reports_not_found_from_running_daemon() {
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-inspect");
+    let daemon = start_cli_daemon(&data_dir);
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("inspect")
         .arg("--data-dir")
@@ -868,6 +870,27 @@ fn cli_inspect_reports_not_found_for_fresh_in_process_daemon() {
     assert!(stdout.contains("session_id=runtime-session"));
     assert!(stdout.contains("found=false"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+    daemon.shutdown();
+}
+
+#[test]
+fn cli_inspect_reports_daemon_unavailable_without_initializing_storage() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("cli-inspect-offline");
+    assert!(!data_dir.exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("inspect")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("runtime-session")
+        .output()
+        .expect("run botster-hub inspect without daemon");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf8");
+    assert!(stderr.contains("daemon not running"));
+    assert!(!data_dir.exists());
+    assert!(!data_dir.join("hub-state.json").exists());
 }
 
 #[test]

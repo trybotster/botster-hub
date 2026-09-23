@@ -42,6 +42,8 @@ pub(crate) enum StateDirectoryError {
     Replaced,
     Quarantined(QuarantineReason),
     InvalidTemporaryFile,
+    #[cfg(test)]
+    InjectedWriteFailure,
 }
 
 /// Every variant means rename completed. None authorizes a not-committed rollback.
@@ -60,6 +62,7 @@ pub(crate) enum StateDocumentCommit {
 struct CommitTestFault<'a> {
     after_rename: Option<&'a dyn Fn()>,
     directory_sync_error: bool,
+    before_rename_error: bool,
 }
 
 impl fmt::Display for StateDirectoryError {
@@ -81,6 +84,8 @@ impl fmt::Display for StateDirectoryError {
             ),
             Self::InvalidTemporaryFile => formatter
                 .write_str("state temporary file is not an exclusively linked regular file"),
+            #[cfg(test)]
+            Self::InjectedWriteFailure => formatter.write_str("injected failure before rename"),
         }
     }
 }
@@ -92,6 +97,8 @@ impl std::error::Error for StateDirectoryError {
             Self::Owned(_) | Self::Replaced | Self::Quarantined(_) | Self::InvalidTemporaryFile => {
                 None
             }
+            #[cfg(test)]
+            Self::InjectedWriteFailure => None,
         }
     }
 }
@@ -171,6 +178,36 @@ impl StateDirectoryOwnership {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn write_document_with_sync_failure_for_test(
+        &self,
+        bytes: &[u8],
+    ) -> Result<StateDocumentCommit, StateDirectoryError> {
+        self.write_document_inner(
+            bytes,
+            CommitTestFault {
+                after_rename: None,
+                directory_sync_error: true,
+                before_rename_error: false,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_document_with_pre_rename_failure_for_test(
+        &self,
+        bytes: &[u8],
+    ) -> Result<StateDocumentCommit, StateDirectoryError> {
+        self.write_document_inner(
+            bytes,
+            CommitTestFault {
+                after_rename: None,
+                directory_sync_error: false,
+                before_rename_error: true,
+            },
+        )
+    }
+
     fn write_document_inner(
         &self,
         bytes: &[u8],
@@ -197,6 +234,10 @@ impl StateDirectoryOwnership {
         file.set_len(0).map_err(StateDirectoryError::Io)?;
         file.write_all(bytes).map_err(StateDirectoryError::Io)?;
         file.sync_all().map_err(StateDirectoryError::Io)?;
+        #[cfg(test)]
+        if fault.before_rename_error {
+            return Err(StateDirectoryError::InjectedWriteFailure);
+        }
         renameat(
             &self.0.file,
             "hub-state.json.tmp",
@@ -429,6 +470,7 @@ mod tests {
             CommitTestFault {
                 after_rename: Some(&replace),
                 directory_sync_error: false,
+                before_rename_error: false,
             },
         );
         assert!(matches!(
@@ -467,6 +509,7 @@ mod tests {
             CommitTestFault {
                 after_rename: None,
                 directory_sync_error: true,
+                before_rename_error: false,
             },
         );
         assert!(matches!(
@@ -488,6 +531,26 @@ mod tests {
     }
 
     #[test]
+    fn pre_rename_failure_preserves_the_committed_document() {
+        let fixture = Fixture::new();
+        let owner = StateDirectoryOwnership::acquire(&fixture.0).unwrap();
+        assert!(matches!(
+            owner.write_document(b"committed"),
+            Ok(StateDocumentCommit::Synced)
+        ));
+        assert!(matches!(
+            owner.write_document_with_pre_rename_failure_for_test(b"unpublished"),
+            Err(StateDirectoryError::InjectedWriteFailure)
+        ));
+        assert_eq!(owner.read_document().unwrap(), b"committed");
+        assert!(matches!(
+            owner.write_document(b"next"),
+            Ok(StateDocumentCommit::Synced)
+        ));
+        assert_eq!(owner.read_document().unwrap(), b"next");
+    }
+
+    #[test]
     fn quarantine_is_shared_by_clones_and_survives_a_directory_round_trip() {
         let fixture = Fixture::new();
         let directory = fixture.0.join("data");
@@ -500,6 +563,7 @@ mod tests {
                 CommitTestFault {
                     after_rename: None,
                     directory_sync_error: true,
+                    before_rename_error: false,
                 },
             ),
             Ok(StateDocumentCommit::RenamedSyncFailed(_))
@@ -526,6 +590,7 @@ mod tests {
                 CommitTestFault {
                     after_rename: None,
                     directory_sync_error: true,
+                    before_rename_error: false,
                 },
             ),
             Ok(StateDocumentCommit::RenamedSyncFailed(_))
