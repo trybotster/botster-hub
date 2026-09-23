@@ -50,15 +50,16 @@ use crate::packages::{
     PackageAction, PackageAdmissionReason, PackageDecision, PackageRegistryError, PackageState,
 };
 use crate::persistence::{
-    FileCommitError, FileCommitOutcome, FileHubStateStore, HubState, HubStateAuthority,
-    HubStateUncertainWrite, PreparedHubStateWrite,
+    ExternalFileIntent, FileCommitError, FileCommitOutcome, FileHubStateStore, HubState,
+    HubStateAuthority, HubStateStoreError, HubStateUncertainWrite, PendingFileCommit,
+    PreparedHubStateWrite,
 };
 use crate::runtime::package_effect::{HostPackageCleanup, HostPackageRuntime};
 use crate::session_types::{
-    PackageSessionType, RepoSessionTypeFileSnapshot, SessionTypeMutation,
-    SessionTypeMutationSource, commit_repo_session_type_mutation,
-    list_session_types_with_staged_repo, restore_repo_session_type_file,
-    snapshot_repo_session_type_file,
+    PackageSessionType, RepoSessionTypeFileCommit, RepoSessionTypeFileSnapshot, SessionTypeError,
+    SessionTypeMutation, SessionTypeMutationSource, commit_repo_session_type_bytes,
+    encode_repo_session_type_bytes, list_session_types_with_staged_repo,
+    restore_repo_session_type_file, snapshot_repo_session_type_file,
 };
 use crate::shared_view::SharedView;
 use crate::{
@@ -326,6 +327,11 @@ pub(crate) enum HostMutationResult {
         write: HubStateUncertainWrite,
         rollback: Option<RollbackDescriptor>,
     },
+    ExternalEffectUncertain {
+        pending: PendingFileCommit,
+        rollback: RollbackDescriptor,
+        cause: ExternalEffectCause,
+    },
     Recovered(RecoveryOutcome),
     PackageRestored(RestoredPackageView),
     PackageRestoreFailed(crate::HubStateStoreError),
@@ -357,6 +363,10 @@ impl std::fmt::Debug for HostMutationResult {
             Self::PublishedUncertain { write, .. } => formatter
                 .debug_tuple("PublishedUncertain")
                 .field(write)
+                .finish(),
+            Self::ExternalEffectUncertain { cause, .. } => formatter
+                .debug_tuple("ExternalEffectUncertain")
+                .field(cause)
                 .finish(),
             Self::Recovered(_) => formatter.write_str("Recovered(..)"),
             Self::PackageRestored(_) => formatter.write_str("PackageRestored(..)"),
@@ -700,6 +710,27 @@ pub(crate) enum SessionTypeRecovery {
 pub(crate) struct HostMutationError {
     pub(crate) code: String,
     pub(crate) message: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum ExternalEffectCause {
+    RepoPublicationSyncUnconfirmed(SessionTypeError),
+    RepoSyncedStateRefused(HubStateStoreError),
+}
+
+impl ExternalEffectCause {
+    pub(crate) fn client_error(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::RepoPublicationSyncUnconfirmed(_) => (
+                "repo_session_type_publication_uncertain",
+                "the repository file was renamed, but its synchronization is unconfirmed; Hub state was not written",
+            ),
+            Self::RepoSyncedStateRefused(_) => (
+                "repo_session_type_state_refused",
+                "the repository file is synchronized, but the Hub state write was refused",
+            ),
+        }
+    }
 }
 
 impl HostMutationError {
@@ -2161,13 +2192,97 @@ fn execute_session_type_commit(
     } = state;
     debug_assert!(packages.is_none());
     debug_assert!(package_effect.is_none());
-    if let Err(error) = commit_repo_session_type_mutation(repo_write) {
-        return HostMutationResult::Recovered(execute_recovery(HostRecover {
+    let Some((root, definitions)) = repo_write else {
+        return finish_session_type_state_commit(
+            store.commit_shared(write, committed_revision - 1),
             rollback,
-            failure: session_type_error(error),
-        }));
+            reply,
+        );
+    };
+    let RollbackDescriptor::SessionType {
+        repo_file: Some(repo_prior),
+        ..
+    } = &rollback
+    else {
+        return HostMutationResult::Failed(HostMutationError::new(
+            "repo_session_type_recovery_required",
+            "repository file prior evidence is missing",
+        ));
+    };
+    if repo_prior.root != root {
+        return HostMutationResult::Failed(HostMutationError::new(
+            "repo_session_type_recovery_required",
+            "repository file root changed after preparation",
+        ));
     }
-    match store.commit_shared(write, committed_revision - 1) {
+    let current_prior = match snapshot_repo_session_type_file(&root, HOST_PREPARED_BYTE_CAPACITY) {
+        Ok(prior) => prior,
+        Err(error) => return HostMutationResult::Failed(session_type_error(error)),
+    };
+    if current_prior != repo_prior.prior {
+        return HostMutationResult::Failed(HostMutationError::new(
+            "repo_session_type_recovery_required",
+            "repository file changed after preparation",
+        ));
+    }
+    let repo_bytes = match encode_repo_session_type_bytes(&definitions) {
+        Ok(bytes) => bytes,
+        Err(error) => return HostMutationResult::Failed(session_type_error(error)),
+    };
+    let external_path = root.join(".botster/session-types.json");
+    let prior_bytes = match &repo_prior.prior {
+        RepoSessionTypeFileSnapshot::Missing => None,
+        RepoSessionTypeFileSnapshot::Present(bytes) => Some(bytes.as_slice()),
+    };
+    let pending = match store.begin_shared_effect(
+        write,
+        committed_revision - 1,
+        Some(ExternalFileIntent {
+            path: &external_path,
+            prior: prior_bytes,
+            candidate: &repo_bytes,
+        }),
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            return HostMutationResult::Failed(HostMutationError::new(
+                "repo_session_type_recovery_required",
+                file_commit_error(error).message,
+            ));
+        }
+    };
+    match commit_repo_session_type_bytes(&root, &repo_bytes) {
+        Ok(RepoSessionTypeFileCommit::Synced) => {}
+        Ok(RepoSessionTypeFileCommit::PublishedUncertain(error)) => {
+            return HostMutationResult::ExternalEffectUncertain {
+                pending,
+                rollback,
+                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed(error),
+            };
+        }
+        Err(error) => {
+            return HostMutationResult::Failed(HostMutationError::new(
+                "repo_session_type_recovery_required",
+                error.message,
+            ));
+        }
+    }
+    match store.commit_shared_effect(pending) {
+        Ok(outcome) => finish_session_type_state_commit(Ok(outcome), rollback, reply),
+        Err(failure) => HostMutationResult::ExternalEffectUncertain {
+            pending: failure.pending,
+            rollback,
+            cause: ExternalEffectCause::RepoSyncedStateRefused(failure.error),
+        },
+    }
+}
+
+fn finish_session_type_state_commit(
+    result: Result<FileCommitOutcome, FileCommitError>,
+    rollback: RollbackDescriptor,
+    reply: HostReply,
+) -> HostMutationResult {
+    match result {
         Ok(FileCommitOutcome::Synced {
             state: view,
             revision,
@@ -2712,9 +2827,19 @@ mod tests {
         )
         .expect("create admitted target fixture");
         let budget = authority.budget();
+        let store = FileHubStateStore::for_data_directory(&data_directory);
+        let prepared = store
+            .prepare_shared(&authority, 0, None, candidate, &budget)
+            .expect("prepare initial state fixture");
+        let crate::persistence::FileCommitOutcome::Synced { state, .. } = store
+            .commit_shared(prepared, 0)
+            .expect("commit initial state fixture")
+        else {
+            panic!("initial state fixture must synchronize");
+        };
         (
             config,
-            SharedView::try_new(&budget, candidate, 1).expect("state view fits"),
+            state,
             packages,
             data_directory,
             target_id,
@@ -3185,11 +3310,12 @@ mod tests {
     }
 
     #[test]
-    fn failed_state_commit_restores_the_exact_repo_file_state() {
+    fn failed_state_commit_keeps_the_repo_effect_and_durable_intent() {
         let (config, state, packages, data_directory, target_id, authority) =
             session_type_inputs("session-type-recovery");
-        let expected = state.clone();
         let repo_file = data_directory.join("repo/.botster/session-types.json");
+        let prior_state_bytes =
+            fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
                 request: session_type_create_request(target_id),
@@ -3204,17 +3330,35 @@ mod tests {
             panic!("session-type prepare must succeed");
         };
         FileHubStateStore::inject_next_save_failure(&data_directory);
-        let HostMutationResult::Recovered(RecoveryOutcome::SessionType {
-            view,
-            failure,
-            recovery: SessionTypeRecovery::Restored,
-        }) = execute(HostMutationCommand::Commit(HostCommit { prepared }))
+        let HostMutationResult::ExternalEffectUncertain {
+            pending,
+            rollback:
+                RollbackDescriptor::SessionType {
+                    repo_file: Some(prior),
+                    ..
+                },
+            cause: ExternalEffectCause::RepoSyncedStateRefused(_),
+        } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
         else {
-            panic!("failed session-type state commit must restore the repository file");
+            panic!("failed state commit must retain the repo effect for reconciliation");
         };
-        assert!(SharedView::ptr_eq(&view, &expected));
-        assert_eq!(failure.code, "hub_state_commit_failed");
-        assert!(!repo_file.exists());
+        assert_eq!(pending.receipt_sequence(), 2);
+        assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
+        assert!(repo_file.is_file());
+        assert!(data_directory.join("hub-recovery.log").is_file());
+        assert_eq!(
+            fs::read(data_directory.join("hub-state.json")).expect("read retained state"),
+            prior_state_bytes
+        );
+        drop(pending);
+        assert!(matches!(
+            crate::recovery::journal::RecoveryJournal::scan(
+                crate::recovery::state_directory::StateDirectoryOwnership::acquire(&data_directory)
+                    .expect("reopen state directory"),
+                true,
+            ),
+            Err(crate::recovery::journal::JournalError::Unresolved(2))
+        ));
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
@@ -3257,6 +3401,61 @@ mod tests {
         );
         assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
         drop(write);
+        fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
+    }
+
+    #[test]
+    fn repo_directory_sync_failure_retains_the_intent_and_prior_file() {
+        let (config, state, packages, data_directory, target_id, authority) =
+            session_type_inputs("repo-directory-sync-uncertain");
+        let root = data_directory.join("repo");
+        let repo_file = root.join(".botster/session-types.json");
+        let prior_state_bytes =
+            fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
+        let HostMutationResult::Prepared(prepared) =
+            execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
+                request: session_type_create_request(target_id),
+                base_revision: 4,
+                authority,
+                config,
+                state,
+                packages,
+                data_directory: data_directory.clone(),
+            }))
+        else {
+            panic!("session-type preparation must succeed");
+        };
+        crate::session_types::inject_next_repo_directory_sync_failure(&root);
+        let HostMutationResult::ExternalEffectUncertain {
+            pending,
+            rollback:
+                RollbackDescriptor::SessionType {
+                    repo_file: Some(prior),
+                    ..
+                },
+            cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed(error),
+        } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
+        else {
+            panic!("repo rename with failed directory sync must retain uncertainty");
+        };
+        assert_eq!(error.kind, "repo_session_type_sync_uncertain");
+        assert_eq!(pending.receipt_sequence(), 2);
+        assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
+        assert!(repo_file.is_file());
+        assert!(data_directory.join("hub-recovery.log").is_file());
+        assert_eq!(
+            fs::read(data_directory.join("hub-state.json")).expect("read retained state"),
+            prior_state_bytes
+        );
+        drop(pending);
+        assert!(matches!(
+            crate::recovery::journal::RecoveryJournal::scan(
+                crate::recovery::state_directory::StateDirectoryOwnership::acquire(&data_directory)
+                    .expect("reopen state directory"),
+                true,
+            ),
+            Err(crate::recovery::journal::JournalError::Unresolved(2))
+        ));
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
