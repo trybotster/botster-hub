@@ -690,7 +690,7 @@ impl HostMutationContinuation {
                 next_phase,
             ),
             HostMutationResult::Committed(committed) => {
-                let current_revision = daemon.state_view().0;
+                let (current_revision, current_state) = daemon.state_view();
                 if committed.committed_revision != current_revision.saturating_add(1) {
                     release_document(state, waiter_id);
                     return finish_error(
@@ -703,9 +703,17 @@ impl HostMutationContinuation {
                         },
                     );
                 }
+                let session_type_generation_changed = current_state.session_type_generation
+                    != committed.view.session_type_generation;
                 daemon.publish_state(committed.view);
                 if let Some(packages) = committed.packages {
                     daemon.publish_package_registry_view(packages);
+                }
+                if session_type_generation_changed {
+                    state
+                        .maintenance
+                        .wakes
+                        .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
                 }
                 if let Some(effect) = committed.package_effect {
                     let runtime = daemon
@@ -1591,6 +1599,80 @@ mod tests {
             HubDaemon::start(config).expect("start test daemon"),
             directory,
         )
+    }
+
+    #[test]
+    fn committed_session_type_generation_change_wakes_subscriber_delivery() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let mut state = DaemonControlState::default();
+        let delivery = crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery;
+        assert!(state.maintenance.wakes.take(delivery));
+        for (index, changed) in [false, true].into_iter().enumerate() {
+            let (revision, prior) = daemon.state_view();
+            let mut next = (*prior).clone();
+            if changed {
+                next.session_type_generation += 1;
+            }
+            let view = daemon
+                .runtime()
+                .expect("runtime")
+                .prepare_state(next)
+                .expect("prepare committed view");
+            let waiter_id = WaiterId(90 + index as u64);
+            state.document_owner = Some(waiter_id);
+            let permit = daemon
+                .runtime()
+                .expect("runtime")
+                .host_executor()
+                .try_reserve()
+                .expect("reserve Host slot");
+            let reply = crate::host_mutations::HostReply::try_new(
+                crate::client_api_dto::response::daemon_response_base(
+                    botster_hub_client::DaemonResponseKind::SessionTypes,
+                ),
+            )
+            .expect("bounded session type reply");
+            state.host_completions.insert(
+                waiter_id,
+                HostCompletion::from_parts(
+                    HostJobIdentity::first(waiter_id),
+                    HostResult::Mutation(HostMutationResult::Committed(
+                        crate::host_mutations::CommittedView {
+                            committed_revision: revision + 1,
+                            view,
+                            packages: None,
+                            package_effect: None,
+                            reply,
+                        },
+                    )),
+                    permit,
+                ),
+            );
+            let mut continuation = HostMutationContinuation {
+                waiter_id,
+                must_finish: false,
+                retained_prepare: None,
+                prior_compensation_failure: None,
+                failed_package_effect: None,
+                next_phase: 2,
+                family_work: None,
+                event_cleanup: None,
+            };
+            assert!(!state.maintenance.wakes.take(delivery));
+            let ControlPoll::ReadyHost(Ok(response), charge) =
+                continuation.poll(&mut daemon, &mut state)
+            else {
+                panic!("committed session type view must return its reply");
+            };
+            assert_eq!(
+                response.kind,
+                botster_hub_client::DaemonResponseKind::SessionTypes
+            );
+            drop(charge);
+            assert_eq!(state.maintenance.wakes.take(delivery), changed);
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove generation wake test directory");
     }
 
     fn poll_uncertain_result(
