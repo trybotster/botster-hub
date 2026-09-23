@@ -67,6 +67,8 @@ pub(crate) struct FakeDataChannel {
     pub(crate) hang_after_first_send: AtomicBool,
     pub(crate) usage_hangs: AtomicBool,
     pub(crate) usage_entered: AtomicBool,
+    pub(crate) usage_closed: AtomicBool,
+    pub(crate) usage_fails: AtomicBool,
     pub(crate) usage_notify: tokio::sync::Notify,
     pub(crate) close_hangs: AtomicBool,
     pub(crate) close_fails: AtomicBool,
@@ -101,7 +103,7 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
         Ok(())
     }
 
-    async fn local_outstanding_bytes(&self) -> Result<usize, String> {
+    async fn local_outstanding_bytes(&self) -> Result<usize, webrtc::error::Error> {
         self.usage_entered.store(true, Ordering::Release);
         while self.usage_hangs.load(Ordering::Acquire) {
             let notified = self.usage_notify.notified();
@@ -110,6 +112,14 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
                 break;
             }
             notified.await;
+        }
+        if self.usage_closed.load(Ordering::Acquire) {
+            return Err(webrtc::error::Error::ErrDataChannelClosed);
+        }
+        if self.usage_fails.load(Ordering::Acquire) {
+            return Err(webrtc::error::Error::Other(
+                "fixture usage failure".to_string(),
+            ));
         }
         Ok(self.outstanding_bytes.load(Ordering::Acquire))
     }
