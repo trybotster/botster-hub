@@ -2519,6 +2519,10 @@ mod tests {
     fn provider_retirement_waits_for_one_dequeue_without_other_owner_work() {
         let (mut daemon, data_directory) = retirement_daemon("retire-after-dequeue");
         let mut state = DaemonControlState::default();
+        for kind in crate::daemon_maintenance::MaintenanceSliceKind::ALL {
+            assert!(state.maintenance.wakes.take(kind));
+        }
+        assert!(!state.maintenance.wakes.has_any());
         let (sender, receiver) = mpsc::sync_channel(1);
         sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
         state.entity_subscriptions.insert(
@@ -2535,6 +2539,7 @@ mod tests {
         receiver.recv().expect("drain exactly one queued frame");
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
         state.entity_capacity_wake.bind(control_tx);
+        assert!(!state.maintenance.wakes.has_any());
         state.entity_capacity_wake.publish();
         assert!(matches!(
             control_rx.try_recv(),
@@ -2557,6 +2562,10 @@ mod tests {
     fn full_control_queue_keeps_entity_capacity_flag_until_owner_turn() {
         let (mut daemon, data_directory) = retirement_daemon("retire-full-control");
         let mut state = DaemonControlState::default();
+        for kind in crate::daemon_maintenance::MaintenanceSliceKind::ALL {
+            assert!(state.maintenance.wakes.take(kind));
+        }
+        assert!(!state.maintenance.wakes.has_any());
         let (sender, receiver) = mpsc::sync_channel(1);
         sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
         state.entity_subscriptions.insert(
@@ -2570,6 +2579,7 @@ mod tests {
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
         state.entity_capacity_wake.bind(control_tx.clone());
         control_tx.try_send(ControlMessage::DataPlaneProgress).expect("fill control queue");
+        assert!(!state.maintenance.wakes.has_any());
         state.entity_capacity_wake.publish();
         assert!(matches!(control_rx.try_recv(), Ok(ControlMessage::DataPlaneProgress)));
         assert!(control_rx.try_recv().is_err(), "capacity notice was dropped");
@@ -2615,6 +2625,8 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let mut state = DaemonControlState::default();
+        let delivery = crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery;
+        assert!(state.maintenance.wakes.take(delivery));
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let target = Arc::new(crate::plugin_entity::Target {
             subscription_id: "retiring".to_string(),
@@ -2651,6 +2663,7 @@ mod tests {
         assert!(!live.load(Ordering::Acquire));
         assert!(!state.plugin_entities.targets.contains_key("retiring"));
         assert!(arm_package_entity_delivery(&mut state, &target, identity, 1, true, 1).is_none());
+        assert!(!state.maintenance.wakes.take(delivery));
         assert!(!complete_package_entity_delivery(
             &mut state,
             &target,
@@ -2661,9 +2674,7 @@ mod tests {
             crate::plugin_entity::DeliveryStatus::Sent,
         ));
         assert_eq!(state.entity_subscriptions["retiring"].package_last_applied_seq, None);
-        assert!(state.maintenance.wakes.take(
-            crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery
-        ));
+        assert!(state.maintenance.wakes.take(delivery));
         receiver.try_recv().expect("drain queued frame");
         retire_unloaded_entity_subscriptions(&mut state, |_| true);
         assert!(!state.entity_subscriptions.contains_key("retiring"));
@@ -2682,6 +2693,8 @@ mod tests {
 
         for malformed in [false, true] {
             let mut state = DaemonControlState::default();
+            let delivery = crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery;
+            assert!(state.maintenance.wakes.take(delivery));
             let mut executor = crate::host_executor::HostExecutor::new();
             let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
             let target = Arc::new(crate::plugin_entity::Target {
@@ -2771,10 +2784,9 @@ mod tests {
                     )
                 ));
             }
+            assert!(!state.maintenance.wakes.take(delivery));
             route_host_completion(&mut state, completion);
-            assert!(state.maintenance.wakes.take(
-                crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery
-            ));
+            assert!(state.maintenance.wakes.take(delivery));
             retire_unloaded_entity_subscriptions(&mut state, |_| false);
             assert!(!state.entity_subscriptions.contains_key("retiring"));
             assert_eq!(state.released_entity_generations, 1);

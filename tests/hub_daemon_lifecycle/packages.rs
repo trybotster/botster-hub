@@ -6226,7 +6226,7 @@ fn daemon_provider_retirement_preserves_sibling_on_one_unix_connection() {
         context: Vec::new(),
         target_id: None,
     };
-    botster_hub_client::request(
+    let created = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::CreateSessionType {
             source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
@@ -6234,6 +6234,11 @@ fn daemon_provider_retirement_preserves_sibling_on_one_unix_connection() {
         },
     )
     .expect("create sibling session type");
+    assert_eq!(
+        created.kind,
+        botster_hub_client::DaemonResponseKind::SessionTypes,
+        "sibling session type mutation response: {created:?}"
+    );
     assert!(matches!(
         connection.next_frame().expect("surviving sibling update"),
         botster_hub_client::DaemonUnixMuxFrame::Server(
