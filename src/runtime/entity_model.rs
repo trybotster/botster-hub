@@ -40,7 +40,9 @@ pub(crate) enum PublicationSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host_executor::{HostCommand, HostCompletion, HostCompletionPoll, HostResult};
+    use crate::host_executor::{
+        HostCommand, HostCompletion, HostCompletionPoll, HostExecutor, HostResult,
+    };
     use crate::owner_identity::WaiterId;
     use crate::package_entity_fanout::{EntityMutationLease, PackageEntityMutation};
     use std::time::{Duration, Instant};
@@ -76,6 +78,122 @@ mod tests {
         );
         let (pending, ()) = bridge.take_if(|_| Some(())).unwrap();
         (bridge, pending.mutation)
+    }
+
+    fn behind_family() -> PackageEntities {
+        let mut model = PackageEntities::default();
+        let family = model.family("p.item");
+        family.generation = 7;
+        family.last_accepted_seq = 1;
+        family.high_water_seq = 20;
+        family.resync.rearm(Instant::now());
+        model
+    }
+
+    #[test]
+    fn stale_resync_snapshot_preserves_attempts_and_degradation() {
+        let mut model = behind_family();
+        let family = model.family("p.item");
+        for _ in 0..crate::package_entity_fanout::PACKAGE_ENTITY_RESYNC_MAX_ATTEMPTS - 1 {
+            assert!(!family.resync.record_attempt(Instant::now()));
+        }
+        let progress = begin_family_snapshot(&mut model, "p.item", 0, SnapshotOrigin::Resync);
+        assert_eq!((progress.floor, progress.high_water), (1, 20));
+        assert!(progress.needed && !progress.degraded);
+        let family = model.family("p.item");
+        assert_eq!(
+            family.resync.attempts,
+            crate::package_entity_fanout::PACKAGE_ENTITY_RESYNC_MAX_ATTEMPTS - 1
+        );
+        assert!(family.resync.record_attempt(Instant::now()));
+        let progress = begin_family_snapshot(&mut model, "p.item", 0, SnapshotOrigin::Resync);
+        assert_eq!((progress.floor, progress.high_water), (1, 20));
+        assert!(!progress.needed && progress.degraded);
+        let family = model.family("p.item");
+        assert_eq!(
+            family.resync.attempts,
+            crate::package_entity_fanout::PACKAGE_ENTITY_RESYNC_MAX_ATTEMPTS
+        );
+        assert!(family.resync.degraded);
+    }
+
+    #[test]
+    fn stale_new_subscription_rearms_after_degradation_without_lowering_floor() {
+        let mut model = behind_family();
+        let family = model.family("p.item");
+        let attempted_at = Instant::now();
+        for _ in 0..crate::package_entity_fanout::PACKAGE_ENTITY_RESYNC_MAX_ATTEMPTS {
+            family.resync.record_attempt(attempted_at);
+        }
+        assert!(family.resync.degraded);
+        let progress = begin_family_snapshot(&mut model, "p.item", 0, SnapshotOrigin::Subscribe);
+        assert_eq!((progress.floor, progress.high_water), (1, 20));
+        assert!(progress.needed && !progress.degraded);
+        let family = model.family("p.item");
+        assert_eq!(family.resync.attempts, 0);
+        assert!(
+            family.resync.next_attempt_at().unwrap() >= attempted_at + Duration::from_secs(1),
+            "a new subscription retains the rolling rate limit"
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_with_replaced_family_generation_does_not_rearm() {
+        for attempts in [
+            crate::package_entity_fanout::PACKAGE_ENTITY_RESYNC_MAX_ATTEMPTS - 1,
+            crate::package_entity_fanout::PACKAGE_ENTITY_RESYNC_MAX_ATTEMPTS,
+        ] {
+            let mut initial = behind_family();
+            let family = initial.family("p.item");
+            for _ in 0..attempts {
+                family.resync.record_attempt(Instant::now());
+            }
+            let before = (
+                family.resync.attempts,
+                family.resync.needed,
+                family.resync.degraded,
+                family.resync.last_attempt_at,
+                family.resync.next_eligible_at,
+                family.resync.next_attempt_at(),
+            );
+            let model = Arc::new(Mutex::new(initial));
+            let executor = HostExecutor::new();
+            let permit = executor.try_reserve().expect("Host work permit");
+            let work = Work::new(
+                identity(),
+                Arc::clone(&model),
+                Operation::Family {
+                    name: Some(Arc::new("p.item".to_string())),
+                    expected_generation: 6,
+                    action: FamilyAction::BeginSnapshot {
+                        sequence: 0,
+                        origin: SnapshotOrigin::Subscribe,
+                    },
+                    progress: None,
+                },
+                &permit,
+            );
+            assert_eq!(work.run(identity()), Kind::BeginSnapshot);
+            let state = work.0.state.lock().expect("model output");
+            assert!(!state.valid);
+            assert_eq!(state.family_progress(), None);
+            drop(state);
+            let model = model.lock().expect("family state");
+            let family = model.families.get("p.item").expect("existing family");
+            assert_eq!(family.generation, 7);
+            assert_eq!((family.last_accepted_seq, family.high_water_seq), (1, 20));
+            assert_eq!(
+                (
+                    family.resync.attempts,
+                    family.resync.needed,
+                    family.resync.degraded,
+                    family.resync.last_attempt_at,
+                    family.resync.next_eligible_at,
+                    family.resync.next_attempt_at(),
+                ),
+                before
+            );
+        }
     }
 
     #[test]
@@ -928,7 +1046,34 @@ pub(crate) enum Operation {
 pub(crate) enum FamilyAction {
     Check,
     MarkResync,
-    BeginSnapshot(u64),
+    BeginSnapshot {
+        sequence: u64,
+        origin: SnapshotOrigin,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotOrigin {
+    Subscribe,
+    Resync,
+}
+
+fn begin_family_snapshot(
+    model: &mut PackageEntities,
+    name: &str,
+    sequence: u64,
+    origin: SnapshotOrigin,
+) -> super::PackageEntityFamilyProgress {
+    let mut progress = model.begin_snapshot(name, sequence);
+    if origin == SnapshotOrigin::Subscribe && sequence < progress.floor {
+        model.rearm_resync(name);
+        progress = model
+            .families
+            .get(name)
+            .expect("the snapshot retains its family")
+            .provider_snapshot_progress();
+    }
+    progress
 }
 
 pub(crate) struct ProviderSelection {
@@ -977,7 +1122,7 @@ impl Operation {
             Self::Family { action, .. } => match action {
                 FamilyAction::Check => Kind::CheckFamily,
                 FamilyAction::MarkResync => Kind::MarkResync,
-                FamilyAction::BeginSnapshot(_) => Kind::BeginSnapshot,
+                FamilyAction::BeginSnapshot { .. } => Kind::BeginSnapshot,
             },
             Self::SelectProvider { .. } => Kind::SelectProvider,
             Self::TakeFanout { .. } => Kind::TakeFanout,
@@ -1811,13 +1956,10 @@ impl Work {
                             *resync_changed = true;
                             model.mark_resync(name);
                         }
-                        FamilyAction::BeginSnapshot(sequence) => {
+                        FamilyAction::BeginSnapshot { sequence, origin } => {
                             *resync_changed = true;
-                            let next = model.begin_snapshot(name, *sequence);
-                            if *sequence < next.floor {
-                                model.rearm_resync(name);
-                            }
-                            *progress = Some(next);
+                            *progress =
+                                Some(begin_family_snapshot(&mut model, name, *sequence, *origin));
                         }
                     }
                 }
