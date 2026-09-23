@@ -33,7 +33,10 @@ use crate::packages::{
     PackageClassification, PackageConfigurationView, PackageRecord, PackageRegistry,
     PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageState,
 };
-use crate::runtime::{CoreOperationTracker, STARTUP_CORE_WAIT, core_bridge_error};
+use crate::runtime::{
+    CoreOperationTracker, PluginSpawnPoll, SessionTypeSpawnStart, STARTUP_CORE_WAIT,
+    core_bridge_error,
+};
 use crate::session_types::{
     HubSessionContext, HubSessionType, HubSessionTypeDefinition, ResolvedSessionType,
     SessionTypeRequest, list_session_types, list_session_types_for_target,
@@ -92,10 +95,22 @@ enum HubClientPendingStage {
         tracker: CoreOperationTracker,
         finish: Box<dyn FnOnce(CoreCompletion) -> HubClientResult<HubClientResponse> + Send>,
     },
+    SessionType(SessionTypeSpawnStart),
     Done,
 }
 
 impl HubClientPending {
+    fn session_type(
+        request_id: RequestId,
+        operation: HubClientOperation,
+        start: SessionTypeSpawnStart,
+    ) -> Self {
+        Self {
+            request_id,
+            operation,
+            stage: HubClientPendingStage::SessionType(start),
+        }
+    }
     fn ticket(
         request_id: RequestId,
         operation: HubClientOperation,
@@ -178,6 +193,29 @@ impl HubClientPending {
                         return Some(Err(self.lost()));
                     };
                     Some(finish(completion))
+                }
+            },
+            HubClientPendingStage::SessionType(start) => match start.poll(runtime) {
+                PluginSpawnPoll::Pending => None,
+                PluginSpawnPoll::Ready(result) => {
+                    let stage = std::mem::replace(&mut self.stage, HubClientPendingStage::Done);
+                    let HubClientPendingStage::SessionType(start) = stage else {
+                        return Some(Err(self.lost()));
+                    };
+                    Some(
+                        runtime
+                            .finish_client_session_type_spawn(&start, result)
+                            .map(|session| HubClientResponse {
+                                request_id: self.request_id.clone(),
+                                body: HubClientResponseBody::Spawned(HubClientSpawned {
+                                    session: HubClientSession::from(session),
+                                    events: Vec::new(),
+                                }),
+                            })
+                            .map_err(|error| {
+                                runtime_error(self.request_id.clone(), self.operation, error)
+                            }),
+                    )
                 }
             },
             HubClientPendingStage::Done => Some(Err(self.lost())),
@@ -882,6 +920,14 @@ impl HubClientApi {
                 now_seconds,
                 ..
             } => {
+                let Some(owner_waiter_id) = owner_waiter_id else {
+                    return Err(HubClientError::InvalidRequest {
+                        request_id,
+                        operation,
+                        message: "session type spawning requires the daemon control owner"
+                            .to_string(),
+                    });
+                };
                 let records = packages.packages();
                 let materialized = materialize_session_type(
                     runtime.config(),
@@ -896,43 +942,14 @@ impl HubClientApi {
                     kind: error.kind,
                     message: error.message,
                 })?;
-                let context = materialized.context.clone();
-                let metadata = session_type_client_metadata(materialized.metadata);
-                runtime.record_session_context(context.clone());
+                let mut materialized = materialized;
+                materialized.metadata = session_type_client_metadata(materialized.metadata);
                 let _ = now_seconds;
-                let tracker = match owner_waiter_id {
-                    Some(waiter_id) => runtime.begin_spawn_for_owner(
-                        waiter_id,
-                        materialized.spawn_request,
-                        metadata,
-                    ),
-                    None => runtime.begin_spawn(materialized.spawn_request, metadata),
-                };
-                let respond = respond.clone();
-                let core_error = core_error.clone();
-                let contexts = runtime.session_contexts_handle();
-                return Ok(HubClientStep::Pending(HubClientPending::operation(
+                let start = runtime.begin_client_session_type_spawn(materialized, owner_waiter_id);
+                return Ok(HubClientStep::Pending(HubClientPending::session_type(
                     request_id,
                     operation,
-                    tracker,
-                    move |completion| match completion {
-                        CoreCompletion::Spawn { result, .. } => match result {
-                            Ok(outcome) => {
-                                Ok(respond(HubClientResponseBody::Spawned(HubClientSpawned {
-                                    session: HubClientSession::from(outcome),
-                                    events: Vec::new(),
-                                })))
-                            }
-                            Err(error) => {
-                                if let Ok(mut contexts) = contexts.lock() {
-                                    contexts.remove(&context.context_id);
-                                    contexts.remove(&context.session_id.0);
-                                }
-                                Err(core_error(error))
-                            }
-                        },
-                        _ => Err(core_error(CoreDaemonError::Shutdown)),
-                    },
+                    start,
                 )));
             }
             HubClientRequest::ReadSessionContext {

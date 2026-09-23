@@ -302,6 +302,7 @@ fn finish(
     let ControlReply::Typed {
         response,
         charge: plugin_result_charge,
+        delivery,
     } = response
     else {
         return send_control_reply(reply_tx, response, response_delivery_rx);
@@ -440,6 +441,7 @@ fn finish(
         ControlReply::Typed {
             response,
             charge: plugin_result_charge,
+            delivery,
         },
         response_delivery_rx,
     )

@@ -90,11 +90,12 @@ pub(crate) mod publication;
 pub(crate) mod resync;
 mod session_spawn;
 use provider::{ProviderExpectation, ProviderRequestPlan};
-pub(crate) use session_spawn::SessionTypeSpawnStart;
-#[cfg(test)]
-pub(crate) use session_spawn::spawn_reply_channel;
+pub(crate) use session_spawn::{SessionSpawnCleanupPoll, SessionTypeSpawnStart};
 #[allow(unused_imports)] // The owner continuation will use the conversion outcome.
-pub(crate) use session_spawn::{SpawnConversionOutcome, SpawnConversionReceipt};
+pub(crate) use session_spawn::{
+    SpawnConversionOutcome, SpawnConversionReceipt, SpawnDeliveryOutcome, SpawnDeliveryReceipt,
+};
+pub(crate) use session_spawn::{SpawnReplySender, spawn_reply_channel};
 pub(crate) mod family_cleanup;
 pub(crate) mod package_effect;
 use package_effect::{HostPackageCleanup, HostPackageRuntime};
@@ -201,7 +202,29 @@ enum PendingTestEvent {
 }
 
 type SharedCoreDaemon = crate::data_plane::driver::CoreDaemonHandle;
-type SharedSessionContexts = Arc<Mutex<BTreeMap<String, HubSessionContext>>>;
+type SharedSessionContexts = Arc<Mutex<BTreeMap<String, Arc<StoredSessionContext>>>>;
+
+struct StoredSessionContext {
+    identity: botster_core::SessionReservationIdentity,
+    context: HubSessionContext,
+    // Both aliases share this owner. Reads need their own response allowance.
+    _charge: crate::lua_memory::LuaCallbackCharge,
+}
+
+fn stored_context_bytes(context: &HubSessionContext) -> Option<usize> {
+    use crate::lua_memory::layout;
+    let values = layout::btree_nodes_checked::<String, String>(context.values.len())?;
+    let aliases = layout::btree_nodes_checked::<String, Arc<StoredSessionContext>>(2)?;
+    let mut bytes = layout::arc_bytes::<StoredSessionContext>()
+        .checked_add(values)?
+        .checked_add(aliases)?
+        .checked_add(context.context_id.len().checked_mul(2)?)?
+        .checked_add(context.session_id.0.len().checked_mul(2)?)?;
+    for (key, value) in &context.values {
+        bytes = bytes.checked_add(key.len())?.checked_add(value.len())?;
+    }
+    Some(bytes)
+}
 const SESSION_TYPE_SPAWN_TIMEOUT_MS: u64 = 30_000;
 const PLUGIN_EVENT_TIMEOUT_MS: u64 = 1_000;
 /// Shared hub-owned session-type spawn bridge exposed to Lua plugin workers.
@@ -303,12 +326,13 @@ impl PluginEntitySnapshotInvocation {
 
 /// Hub-owned policy bridge for plugin-safe session-type spawns.
 pub struct HubSessionTypeSpawner {
-    pending: Mutex<VecDeque<PendingSessionTypeSpawn>>,
+    pending: Mutex<crate::lua_memory::charged_collection::ChargedVecDeque<PendingSessionTypeSpawn>>,
     ordinary_pending: AtomicBool,
     managed: Mutex<VecDeque<PendingManagedSessionSpawn>>,
     managed_pending: AtomicBool,
     managed_owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
-    abandoned: Mutex<Vec<String>>,
+    ordinary_owner_thread: Mutex<Option<thread::ThreadId>>,
+    abandoned: Mutex<Vec<(String, botster_core::SessionReservationIdentity)>>,
 }
 
 /// These handles permit explicit queue cleanup after the engine disposal receipt.
@@ -363,14 +387,58 @@ impl Drop for TerminalSpawnerProbe {
     }
 }
 
-struct PendingSessionTypeSpawn {
+pub(crate) enum OrdinarySpawnReply {
+    Legacy(mpsc::Sender<Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>>>),
+    Admitted(SpawnReplySender<AdmittedSpawnDelivery>),
+}
+
+pub(crate) enum AdmittedSpawnDelivery {
+    Unavailable(&'static str),
+    Spawned {
+        result: PluginSessionTypeSpawned,
+        conversion: SpawnConversionReceipt,
+        _variable: crate::lua_memory::LuaCallbackCharge,
+    },
+    Refused {
+        message: String,
+        _variable: crate::lua_memory::LuaCallbackCharge,
+    },
+}
+
+impl AdmittedSpawnDelivery {
+    pub(crate) fn refused(
+        message: String,
+        variable: crate::lua_memory::LuaCallbackCharge,
+    ) -> Self {
+        Self::Refused {
+            message,
+            _variable: variable,
+        }
+    }
+
+    pub(crate) fn spawned(
+        result: PluginSessionTypeSpawned,
+        conversion: SpawnConversionReceipt,
+        variable: crate::lua_memory::LuaCallbackCharge,
+    ) -> Self {
+        Self::Spawned {
+            result,
+            conversion,
+            _variable: variable,
+        }
+    }
+}
+
+pub(crate) struct PendingSessionTypeSpawn {
     #[cfg(test)]
     _dispose_probe: Option<TerminalSpawnerProbe>,
-    plugin_key: PluginKey,
-    session_type_id: String,
-    request: SessionTypeRequest,
-    package_records: Vec<PackageRecord>,
-    response: mpsc::Sender<Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>>>,
+    pub(crate) plugin_key: PluginKey,
+    pub(crate) session_type_id: String,
+    pub(crate) request: SessionTypeRequest,
+    pub(crate) package_records: Arc<Vec<PackageRecord>>,
+    pub(crate) response: OrdinarySpawnReply,
+    // The admitted Lua projection remains funded after the caller times out.
+    pub(crate) parent: Option<crate::lua_memory::LuaCallbackCharge>,
 }
 
 pub(crate) struct PendingManagedSessionSpawn {
@@ -383,10 +451,43 @@ pub(crate) struct PendingManagedSessionSpawn {
     pub(crate) request: ManagedSessionTypeRequest,
     pub(crate) package_records: Vec<PackageRecord>,
     pub(crate) accepted_at: Instant,
-    pub(crate) response: mpsc::Sender<Result<PluginManagedSessionSpawned, ManagedGitError>>,
+    response: ManagedSpawnReply,
+    // Lua ingress moves its open parent through the queued request.
+    pub(crate) parent: Option<crate::lua_memory::LuaCallbackCharge>,
+}
+
+pub(crate) struct ManagedSpawnDelivery {
+    pub(crate) result: Result<PluginManagedSessionSpawned, ManagedGitError>,
+    // The result and its strings drop before this open parent.
+    pub(crate) parent: Option<crate::lua_memory::LuaCallbackCharge>,
+}
+
+enum ManagedSpawnReply {
+    Legacy(mpsc::Sender<Result<PluginManagedSessionSpawned, ManagedGitError>>),
+    Admitted(mpsc::Sender<ManagedSpawnDelivery>),
 }
 
 impl PendingManagedSessionSpawn {
+    pub(crate) fn respond(
+        mut self,
+        result: Result<PluginManagedSessionSpawned, ManagedGitError>,
+    ) -> Result<(), ManagedSpawnDelivery> {
+        let delivery = ManagedSpawnDelivery {
+            result,
+            parent: self.parent.take(),
+        };
+        match self.response {
+            ManagedSpawnReply::Legacy(sender) => {
+                debug_assert!(delivery.parent.is_none());
+                sender.send(delivery.result).map_err(|error| ManagedSpawnDelivery {
+                    result: error.0,
+                    parent: delivery.parent,
+                })
+            }
+            ManagedSpawnReply::Admitted(sender) => sender.send(delivery).map_err(|error| error.0),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_new(
         plugin_key: PluginKey,
@@ -405,7 +506,8 @@ impl PendingManagedSessionSpawn {
             request,
             package_records,
             accepted_at: Instant::now(),
-            response,
+            response: ManagedSpawnReply::Legacy(response),
+            parent: None,
             _dispose_probe: None,
         }
     }
@@ -414,7 +516,7 @@ impl PendingManagedSessionSpawn {
 /// One managed session spawn in flight on the Core owner thread.
 pub(crate) struct ManagedSessionSpawnStart {
     pub(crate) tracker: CoreOperationTracker,
-    pub(crate) context: HubSessionContext,
+    pub(crate) context: Option<HubSessionContext>,
     waiter_id: crate::owner_identity::WaiterId,
     stage: PluginSpawnStage,
     pub(crate) reservation: Option<SessionReservation>,
@@ -432,6 +534,8 @@ pub struct PluginSessionTypeSpawned {
     pub session_type_id: String,
     pub context_id: String,
     pub context_keys: Vec<String>,
+    #[serde(skip)]
+    pub(crate) reservation_identity: Option<botster_core::SessionReservationIdentity>,
 }
 
 /// Tagged Lua-facing result for the atomic managed-worktree/session operation.
@@ -447,6 +551,8 @@ pub struct PluginManagedSessionSpawned {
     pub created_worktree: bool,
     pub created_branch: bool,
     pub reused_worktree: bool,
+    #[serde(skip)]
+    pub(crate) reservation_identity: Option<botster_core::SessionReservationIdentity>,
 }
 
 /// Deterministic session reconciliation summary from hub startup.
@@ -489,7 +595,7 @@ impl HubRuntime {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
-            session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
+            session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(&lua_memory))),
             host_executor: crate::host_executor::HostExecutor::new(),
             coordination_bridge: HubCoordinationBridge::new(Arc::clone(&lua_memory)),
             entity_publish_bridge: HubEntityPublishBridge::new(
@@ -623,7 +729,7 @@ impl HubRuntime {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
-            session_type_spawner: Arc::new(HubSessionTypeSpawner::new()),
+            session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(&lua_memory))),
             host_executor: crate::host_executor::HostExecutor::new(),
             coordination_bridge: HubCoordinationBridge::new(Arc::clone(&lua_memory)),
             entity_publish_bridge: HubEntityPublishBridge::new(
@@ -1644,40 +1750,30 @@ impl HubRuntime {
         }
     }
 
-    fn fulfill_pending_session_type_spawns(&self) {
-        for session_id in self.session_type_spawner.take_abandoned() {
+    pub(crate) fn fulfill_pending_session_type_spawns(&self) {
+        for (session_id, reservation_identity) in self.session_type_spawner.take_abandoned() {
             self.cleanup_undelivered_session_type_spawn(&PluginSessionTypeSpawned {
                 session_id: session_id.clone(),
                 lifecycle: String::new(),
                 session_type_id: String::new(),
                 context_id: format!("ctx-{session_id}"),
                 context_keys: Vec::new(),
+                reservation_identity: Some(reservation_identity),
             });
         }
-        while let Some(pending) = self.session_type_spawner.take_pending() {
-            let slot = match crate::lua_memory::charged_collection::SlotReservation::try_reserve(
-                &self.inflight_plugin_core,
-            ) {
-                Ok(slot) => slot,
-                Err(_) => {
-                    let _ = pending.response.send(Err(std::borrow::Cow::Borrowed(
-                        crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
-                    )));
-                    continue;
-                }
-            };
-            match self.fulfill_session_type_spawn(&pending) {
-                Ok(start) => slot.insert(InflightPluginCore::SessionTypeSpawn {
-                    start,
-                    response: pending.response,
-                }),
-                Err(error) => {
-                    drop(slot);
-                    let _ = pending.response.send(Err(std::borrow::Cow::Owned(error)));
-                }
-            }
+        while let Some(pending) = self.session_type_spawner.take_pending_legacy() {
+            self.accept_legacy_session_type_spawn(pending);
         }
         self.advance_inflight_plugin_core();
+    }
+
+    pub(crate) fn accept_legacy_session_type_spawn(&self, pending: PendingSessionTypeSpawn) {
+        let OrdinarySpawnReply::Legacy(ref response) = pending.response else {
+            unreachable!("the legacy queue reader selected one legacy response");
+        };
+        let _ = response.send(Err(std::borrow::Cow::Borrowed(
+            "session-type spawn requires the daemon owner",
+        )));
     }
 
     /// Poll every plugin-facing Core operation and deliver finished results.
@@ -1688,30 +1784,6 @@ impl HubRuntime {
         let mut index = 0;
         while index < inflight.len() {
             match inflight.get_mut(index) {
-                Some(InflightPluginCore::SessionTypeSpawn { start, .. }) => {
-                    match start.poll(self) {
-                        PluginSpawnPoll::Pending => {
-                            index += 1;
-                            continue;
-                        }
-                        PluginSpawnPoll::Ready(result) => {
-                            let InflightPluginCore::SessionTypeSpawn { start, response } =
-                                inflight.swap_remove(index)
-                            else {
-                                continue;
-                            };
-                            let result = self
-                                .finish_session_type_spawn(&start, result)
-                                .map_err(std::borrow::Cow::Owned);
-                            if response.send(result.clone()).is_err()
-                                && let Ok(spawned) = result
-                            {
-                                self.cleanup_undelivered_session_type_spawn(&spawned);
-                            }
-                            continue;
-                        }
-                    }
-                }
                 Some(InflightPluginCore::Coordination {
                     ticket, rejected, ..
                 }) => {
@@ -1840,17 +1912,22 @@ impl HubRuntime {
         }
         self.retry_retained_reservation_releases();
         self.retry_created_worktree_releases();
-        let context = materialized.context.clone();
-        let metadata = session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
+        let crate::session_types::MaterializedSessionType {
+            spawn_request,
+            context,
+            metadata,
+            ..
+        } = materialized;
+        let metadata = session_type_plugin_metadata(metadata, &pending.plugin_key);
         let spawn = SpawnSessionRequest {
-            request: materialized.spawn_request,
+            request: spawn_request,
             metadata,
         };
         let session_id = spawn.request.session_id.clone();
         let tracker = self.begin_reserve_session_for_owner(owner_waiter, session_id);
         Ok(ManagedSessionSpawnStart {
             tracker,
-            context,
+            context: Some(context),
             waiter_id: owner_waiter,
             stage: PluginSpawnStage::Reserve,
             reservation: None,
@@ -1868,15 +1945,21 @@ impl HubRuntime {
         prepared: &PreparedManagedWorktree,
         result: Result<CoreSession, PluginSpawnFailure>,
     ) -> Result<PluginManagedSessionSpawned, ManagedGitError> {
-        let context = &start.context;
         let outcome = result.map_err(|failure| {
             eprintln!(
                 "managed_session_spawn_failed session_id={} core_error={}",
-                context.session_id.0,
+                start.spawn.request.session_id.0,
                 managed_session_core_error_class(&failure.error)
             );
-            if start.context_published {
-                self.retract_spawn_context(context);
+            if start.context_published
+                && failure.disposition == Some(SessionReservationRelease::Released)
+                && let Some(reservation) = start.reservation.as_ref()
+            {
+                self.retract_spawn_context_aliases(
+                    &format!("ctx-{}", start.spawn.request.session_id.0),
+                    &start.spawn.request.session_id.0,
+                    reservation.identity(),
+                );
             }
             ManagedGitError::new("spawn_failed", "configured session could not be spawned")
         })?;
@@ -1891,11 +1974,18 @@ impl HubRuntime {
             created_worktree: prepared.created_worktree,
             created_branch: prepared.created_branch,
             reused_worktree: !prepared.created_worktree,
+            reservation_identity: start.reservation.as_ref().map(SessionReservation::identity),
         })
     }
 
     pub(crate) fn cleanup_managed_session(&self, spawned: &PluginManagedSessionSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
+        let Some(identity) = spawned.reservation_identity else {
+            return;
+        };
+        if !self.spawn_context_matches(&session_id.0, identity) {
+            return;
+        }
         let tracked = self
             .created_worktree_cleanups
             .lock()
@@ -1904,10 +1994,11 @@ impl HubRuntime {
         if !tracked {
             self.shutdown_session_detached(session_id.clone());
         }
-        if let Ok(mut contexts) = self.session_contexts.lock() {
-            contexts.remove(&session_id.0);
-            contexts.remove(&format!("ctx-{}", session_id.0));
-        }
+        self.retract_spawn_context_aliases(
+            &format!("ctx-{}", session_id.0),
+            &session_id.0,
+            identity,
+        );
     }
 
     pub(crate) fn queue_created_worktree_cleanup(
@@ -3027,11 +3118,14 @@ impl HubRuntime {
 
     fn cleanup_undelivered_session_type_spawn(&self, spawned: &PluginSessionTypeSpawned) {
         let session_id = SessionId(spawned.session_id.clone());
-        self.shutdown_session_detached(session_id.clone());
-        if let Ok(mut contexts) = self.session_contexts.lock() {
-            contexts.remove(&spawned.context_id);
-            contexts.remove(&session_id.0);
+        let Some(identity) = spawned.reservation_identity else {
+            return;
+        };
+        if !self.spawn_context_matches(&session_id.0, identity) {
+            return;
         }
+        self.shutdown_session_detached(session_id.clone());
+        self.retract_spawn_context_aliases(&spawned.context_id, &session_id.0, identity);
     }
 
     /// Render a plugin-owned surface route through the plugin worker path.
@@ -3961,14 +4055,16 @@ impl HubRuntime {
             .pending
             .lock()
             .map_err(|_| "session type spawn queue lock poisoned".to_string())?
-            .push_back(PendingSessionTypeSpawn {
+            .try_push_back(PendingSessionTypeSpawn {
                 plugin_key: PluginKey(plugin_key.into()),
                 session_type_id: session_type_id.into(),
                 request,
-                package_records,
-                response,
+                package_records: Arc::new(package_records),
+                response: OrdinarySpawnReply::Legacy(response),
+                parent: None,
                 _dispose_probe: None,
-            });
+            })
+            .map_err(|_| "session type spawn queue capacity exhausted".to_string())?;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             self.fulfill_pending_session_type_spawns();
@@ -3999,35 +4095,104 @@ impl HubRuntime {
         &self,
         key: &str,
     ) -> Option<crate::session_types::HubSessionContext> {
-        self.session_contexts.lock().ok()?.get(key).cloned()
+        self.session_contexts.lock().ok()?.get(key).map(|entry| entry.context.clone())
     }
 
-    pub(crate) fn publish_spawn_context(&self, context: &HubSessionContext) -> Result<(), String> {
+    #[cfg(test)]
+    pub(crate) fn test_publish_spawn_context(
+        &self,
+        context: &HubSessionContext,
+    ) -> botster_core::SessionReservationIdentity {
+        let reservation = botster_core::SessionAdmission::default()
+            .reserve(context.session_id.clone())
+            .expect("the isolated test admission accepts the session");
+        let bytes = stored_context_bytes(context).unwrap();
+        let charge = self.lua_memory.reserve_callback_total(bytes).unwrap();
+        self.publish_spawn_context(context.clone(), &reservation, charge).unwrap();
+        reservation.identity()
+    }
+
+    pub(crate) fn publish_spawn_context(
+        &self,
+        context: HubSessionContext,
+        reservation: &SessionReservation,
+        charge: crate::lua_memory::LuaCallbackCharge,
+    ) -> Result<(), String> {
+        if charge.bytes() < stored_context_bytes(&context)
+            .ok_or_else(|| "session context size overflow".to_string())?
+        {
+            return Err("session context has no allocation allowance".to_string());
+        }
         let mut contexts = self
             .session_contexts
             .lock()
             .map_err(|_| "session context lock poisoned".to_string())?;
-        contexts.insert(context.context_id.clone(), context.clone());
-        contexts.insert(context.session_id.0.clone(), context.clone());
+        let entry = Arc::new(StoredSessionContext {
+            identity: reservation.identity(),
+            context,
+            _charge: charge,
+        });
+        let context_id = entry.context.context_id.clone();
+        let session_id = entry.context.session_id.0.clone();
+        contexts.insert(context_id, Arc::clone(&entry));
+        contexts.insert(session_id, entry);
         Ok(())
     }
 
-    pub(crate) fn retract_spawn_context(&self, context: &HubSessionContext) {
+    pub(crate) fn retract_spawn_context(
+        &self,
+        context: &HubSessionContext,
+        identity: botster_core::SessionReservationIdentity,
+    ) {
+        self.retract_spawn_context_aliases(
+            &context.context_id,
+            &context.session_id.0,
+            identity,
+        );
+    }
+
+    fn retract_spawn_context_aliases(
+        &self,
+        context_id: &str,
+        session_id: &str,
+        identity: botster_core::SessionReservationIdentity,
+    ) {
         let Ok(mut contexts) = self.session_contexts.lock() else {
             return;
         };
-        if contexts
-            .get(&context.context_id)
-            .is_some_and(|stored| stored.context_id == context.context_id)
+        let old_context = if contexts
+            .get(context_id)
+            .is_some_and(|stored| stored.identity == identity)
         {
-            contexts.remove(&context.context_id);
-        }
-        if contexts
-            .get(&context.session_id.0)
-            .is_some_and(|stored| stored.context_id == context.context_id)
+            contexts.remove(context_id)
+        } else {
+            None
+        };
+        let old_session = if contexts
+            .get(session_id)
+            .is_some_and(|stored| stored.identity == identity)
         {
-            contexts.remove(&context.session_id.0);
+            contexts.remove(session_id)
+        } else {
+            None
+        };
+        if contexts.is_empty() {
+            // Rust 1.97 can retain an empty BTreeMap leaf root after removal.
+            // Destroy that root before either removed entry releases its charge.
+            drop(std::mem::take(&mut *contexts));
         }
+        drop(old_context);
+        drop(old_session);
+    }
+
+    fn spawn_context_matches(
+        &self,
+        session_id: &str,
+        identity: botster_core::SessionReservationIdentity,
+    ) -> bool {
+        self.session_contexts
+            .lock()
+            .is_ok_and(|contexts| contexts.get(session_id).is_some_and(|entry| entry.identity == identity))
     }
 
     pub(crate) fn begin_spawn_for_owner(
@@ -4119,26 +4284,6 @@ impl HubRuntime {
             .clone()
     }
 
-    /// Store hub-owned context for one spawned template session.
-    pub fn record_session_context(&self, context: HubSessionContext) {
-        let mut contexts = self
-            .session_contexts
-            .lock()
-            .expect("session contexts mutex");
-        contexts.insert(context.context_id.clone(), context.clone());
-        contexts.insert(context.session_id.0.clone(), context);
-    }
-
-    /// Remove hub-owned context for a template session that did not start.
-    pub fn remove_session_context(&self, context: &HubSessionContext) {
-        let mut contexts = self
-            .session_contexts
-            .lock()
-            .expect("session contexts mutex");
-        contexts.remove(&context.context_id);
-        contexts.remove(&context.session_id.0);
-    }
-
     /// Read hub-owned context by context id or session id.
     #[must_use]
     /// Shared handle to the session context map for deferred completions.
@@ -4151,7 +4296,7 @@ impl HubRuntime {
             .lock()
             .expect("session contexts mutex")
             .get(id)
-            .cloned()
+            .map(|entry| entry.context.clone())
     }
 
     /// Attach one route and bind its terminal adapter in one Core owner turn.
@@ -4266,6 +4411,16 @@ impl HubRuntime {
 
     pub(crate) fn take_pending_managed_spawn(&self) -> Option<PendingManagedSessionSpawn> {
         self.session_type_spawner.take_managed()
+    }
+
+    pub(crate) fn take_ordinary_spawn_notification(&self) -> bool {
+        self.session_type_spawner
+            .ordinary_pending
+            .swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_pending_spawn_for_owner(&self) -> Option<PendingSessionTypeSpawn> {
+        self.session_type_spawner.take_pending_for_owner()
     }
 
     pub(crate) fn host_executor(&self) -> &crate::host_executor::HostExecutor {
@@ -4790,7 +4945,7 @@ impl HubSessionTypeSpawner {
                 .managed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (std::mem::take(&mut *pending), std::mem::take(&mut *managed))
+            (pending.take(), std::mem::take(&mut *managed))
         };
         // Payload destructors run after every queue lock is released.
         drop(queues);
@@ -4815,17 +4970,19 @@ impl HubSessionTypeSpawner {
         self.pending
             .lock()
             .unwrap()
-            .push_back(PendingSessionTypeSpawn {
+            .try_push_back(PendingSessionTypeSpawn {
                 plugin_key: PluginKey("terminal-spawner".into()),
                 session_type_id: "plain".into(),
                 request: SessionTypeRequest {
                     environment: BTreeMap::from([("PAYLOAD".into(), "spawn payload".repeat(128))]),
                     ..SessionTypeRequest::default()
                 },
-                package_records: Vec::new(),
-                response,
+                package_records: Arc::new(Vec::new()),
+                response: OrdinarySpawnReply::Legacy(response),
+                parent: None,
                 _dispose_probe: Some(probe(gate)),
-            });
+            })
+            .expect("the terminal test queue must fit");
         let (response, _) = mpsc::channel();
         self.managed
             .lock()
@@ -4841,7 +4998,8 @@ impl HubSessionTypeSpawner {
                 },
                 package_records: Vec::new(),
                 accepted_at: Instant::now(),
-                response,
+                response: ManagedSpawnReply::Legacy(response),
+                parent: None,
                 _dispose_probe: Some(probe(None)),
             });
         self.managed_pending.store(true, Ordering::Release);
@@ -4863,26 +5021,42 @@ impl HubSessionTypeSpawner {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        let account = crate::lua_memory::LuaMemoryAccount::new(
+            crate::config::lua_memory_limits(),
+        )
+        .expect("the test Lua memory limits are valid");
+        Self::new_with_account(account)
+    }
+
+    pub(crate) fn new_with_account(account: Arc<crate::lua_memory::LuaMemoryAccount>) -> Self {
         Self {
-            pending: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(crate::lua_memory::charged_collection::ChargedVecDeque::new(account)),
             ordinary_pending: AtomicBool::new(false),
             managed: Mutex::new(VecDeque::new()),
             managed_pending: AtomicBool::new(false),
             managed_owner: Mutex::new(None),
+            ordinary_owner_thread: Mutex::new(None),
             abandoned: Mutex::new(Vec::new()),
         }
     }
 
-    pub(crate) fn abandon_session_type_spawn(&self, session_id: String) {
+    pub(crate) fn abandon_session_type_spawn(
+        &self,
+        session_id: String,
+        identity: botster_core::SessionReservationIdentity,
+    ) {
         self.abandoned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(session_id);
+            .push((session_id, identity));
     }
 
     #[cfg(test)]
-    pub(crate) fn test_take_abandoned(&self) -> Vec<String> {
+    pub(crate) fn test_take_abandoned(
+        &self,
+    ) -> Vec<(String, botster_core::SessionReservationIdentity)> {
         self.take_abandoned()
     }
 
@@ -4919,13 +5093,14 @@ impl HubSessionTypeSpawner {
                 request,
                 package_records,
                 accepted_at: Instant::now(),
-                response,
+                response: ManagedSpawnReply::Legacy(response),
+                parent: None,
                 _dispose_probe: None,
             });
         self.publish_managed_spawn();
     }
 
-    fn take_abandoned(&self) -> Vec<String> {
+    fn take_abandoned(&self) -> Vec<(String, botster_core::SessionReservationIdentity)> {
         std::mem::take(
             &mut *self
                 .abandoned
@@ -4935,6 +5110,10 @@ impl HubSessionTypeSpawner {
     }
 
     fn bind_managed_owner_wake(&self, sender: crate::daemon::control::message::ControlSender) {
+        *self
+            .ordinary_owner_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(thread::current().id());
         let mut owner = self
             .managed_owner
             .lock()
@@ -4976,38 +5155,107 @@ impl HubSessionTypeSpawner {
     /// Queue a session-type spawn for the hub owner and wait for its result.
     pub fn spawn(
         &self,
-        plugin_key: &PluginKey,
-        session_type_id: &str,
-        request: SessionTypeRequest,
-        package_records: Vec<PackageRecord>,
+        _plugin_key: &PluginKey,
+        _session_type_id: &str,
+        _request: SessionTypeRequest,
+        _package_records: Vec<PackageRecord>,
     ) -> Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>> {
-        let (response, receiver) = mpsc::channel();
-        {
-            let mut pending = self.pending.lock().map_err(|_| {
-                std::borrow::Cow::Borrowed("session-type spawn queue lock poisoned")
-            })?;
-            pending.push_back(PendingSessionTypeSpawn {
-                plugin_key: plugin_key.clone(),
-                session_type_id: session_type_id.to_string(),
-                request,
-                package_records,
-                response,
-                #[cfg(test)]
-                _dispose_probe: None,
-            });
-        }
-        self.publish_session_type_spawn();
-
-        receiver
-            .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
-            .map_err(|_| {
-                std::borrow::Cow::Borrowed("session-type spawn did not complete before timeout")
-            })?
+        Err(std::borrow::Cow::Borrowed(
+            "session-type spawn requires the daemon owner",
+        ))
     }
 
-    fn take_pending(&self) -> Option<PendingSessionTypeSpawn> {
+    /// Admit one Lua request through the existing ordinary queue and wait on its worker.
+    pub(crate) fn spawn_admitted(
+        &self,
+        input: crate::lua_runtime::spawn_input::SpawnInput,
+        package_records: Arc<Vec<PackageRecord>>,
+    ) -> Result<AdmittedSpawnDelivery, std::borrow::Cow<'static, str>> {
+        if self
+            .ordinary_owner_thread
+            .lock()
+            .map_err(|_| std::borrow::Cow::Borrowed("session-type owner thread lock poisoned"))?
+            .is_some_and(|owner| owner == thread::current().id())
+        {
+            return Err(std::borrow::Cow::Borrowed(
+                "session-type spawn cannot wait on the Hub owner thread",
+            ));
+        }
+        if self
+            .managed_owner
+            .lock()
+            .map_err(|_| std::borrow::Cow::Borrowed("session-type owner wake lock poisoned"))?
+            .as_ref()
+            .is_none_or(crate::daemon::control::message::ControlSender::is_closed)
+        {
+            return Err(std::borrow::Cow::Borrowed(
+                "session-type spawn requires the daemon owner",
+            ));
+        }
+        let (plugin_key, session_type_id, request, mut parent) = input.into_parts();
+        let bytes = crate::lua_memory::layout::single_reply_bytes::<AdmittedSpawnDelivery>(true)
+            .ok_or(std::borrow::Cow::Borrowed(
+                crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+            ))?;
+        parent.grow(bytes).map_err(|_| {
+            std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
+        })?;
+        let channel_charge = parent
+            .split_fixed(bytes)
+            .expect("the admitted parent owns the reply channel bytes");
+        let (response, receiver) = spawn_reply_channel(channel_charge).map_err(|_| {
+            std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
+        })?;
+        let item = PendingSessionTypeSpawn {
+            #[cfg(test)]
+            _dispose_probe: None,
+            plugin_key,
+            session_type_id,
+            request,
+            package_records,
+            response: OrdinarySpawnReply::Admitted(response),
+            parent: Some(parent),
+        };
+        {
+            let mut queue = self.pending.lock().map_err(|_| {
+                std::borrow::Cow::Borrowed("session-type spawn queue lock poisoned")
+            })?;
+            queue.try_push_back_owned(item).map_err(|(_, item)| {
+                drop(item);
+                std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
+            })?;
+        }
+        self.publish_session_type_spawn();
+        receiver
+            .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => std::borrow::Cow::Borrowed(
+                    "session-type spawn did not complete before timeout",
+                ),
+                mpsc::RecvTimeoutError::Disconnected => std::borrow::Cow::Borrowed(
+                    "session-type spawn owner dropped its reply",
+                ),
+            })
+    }
+
+    fn take_pending_legacy(&self) -> Option<PendingSessionTypeSpawn> {
         let mut queue = self.pending.lock().expect("session-type spawn queue lock");
+        if !matches!(queue.front()?.response, OrdinarySpawnReply::Legacy(_)) {
+            return None;
+        }
         // Clear under the queue lock. A later producer publishes after enqueue.
+        self.ordinary_pending.store(false, Ordering::Release);
+        let pending = queue.pop_front();
+        let remaining = !queue.is_empty();
+        drop(queue);
+        if remaining {
+            self.publish_session_type_spawn();
+        }
+        pending
+    }
+
+    fn take_pending_for_owner(&self) -> Option<PendingSessionTypeSpawn> {
+        let mut queue = self.pending.lock().expect("session-type spawn queue lock");
         self.ordinary_pending.store(false, Ordering::Release);
         let pending = queue.pop_front();
         let remaining = !queue.is_empty();
@@ -5055,7 +5303,8 @@ impl HubSessionTypeSpawner {
             request,
             package_records,
             accepted_at: Instant::now(),
-            response,
+            response: ManagedSpawnReply::Legacy(response),
+            parent: None,
             #[cfg(test)]
             _dispose_probe: None,
         });
@@ -5091,6 +5340,62 @@ impl HubSessionTypeSpawner {
             self.publish_managed_spawn();
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod ordinary_spawn_queue_tests {
+    use super::*;
+
+    #[test]
+    fn owner_takes_legacy_then_admitted_from_one_charged_fifo() {
+        let memory = crate::lua_memory::LuaMemoryAccount::new(
+            crate::config::lua_memory_limits(),
+        )
+        .unwrap();
+        let spawner = HubSessionTypeSpawner::new_with_account(Arc::clone(&memory));
+        let (legacy_sender, _legacy_receiver) = mpsc::channel();
+        let channel_bytes = crate::lua_memory::layout::single_reply_bytes::<
+            AdmittedSpawnDelivery,
+        >(true)
+        .unwrap();
+        let channel_charge = memory.reserve_callback_total(channel_bytes).unwrap();
+        let (admitted_sender, admitted_receiver) = spawn_reply_channel(channel_charge).unwrap();
+        let item = |response, parent| PendingSessionTypeSpawn {
+            _dispose_probe: None,
+            plugin_key: PluginKey("plugin".into()),
+            session_type_id: "worker".into(),
+            request: SessionTypeRequest::default(),
+            package_records: Arc::new(Vec::new()),
+            response,
+            parent,
+        };
+        {
+            let mut queue = spawner.pending.lock().unwrap();
+            queue
+                .try_push_back_owned(item(OrdinarySpawnReply::Legacy(legacy_sender), None))
+                .unwrap_or_else(|_| panic!("the legacy queue item fits"));
+            queue
+                .try_push_back_owned(item(
+                    OrdinarySpawnReply::Admitted(admitted_sender),
+                    Some(memory.reserve_callback_total(0).unwrap()),
+                ))
+                .unwrap_or_else(|_| panic!("the admitted queue item fits"));
+        }
+        spawner.publish_session_type_spawn();
+        assert!(matches!(
+            spawner.take_pending_for_owner().unwrap().response,
+            OrdinarySpawnReply::Legacy(_)
+        ));
+        assert!(spawner.ordinary_pending.load(Ordering::Acquire));
+        assert!(matches!(
+            spawner.take_pending_for_owner().unwrap().response,
+            OrdinarySpawnReply::Admitted(_)
+        ));
+        assert!(!spawner.ordinary_pending.load(Ordering::Acquire));
+        drop(admitted_receiver);
+        drop(spawner);
+        assert_eq!(memory.usage().1, 0);
     }
 }
 
@@ -5755,10 +6060,6 @@ pub(crate) enum InflightPluginCore {
         )>,
         _entry: Option<crate::lua_memory::LuaCallbackCharge>,
     },
-    SessionTypeSpawn {
-        start: SessionTypeSpawnStart,
-        response: mpsc::Sender<Result<PluginSessionTypeSpawned, std::borrow::Cow<'static, str>>>,
-    },
 }
 
 enum PluginSpawnStage {
@@ -5787,7 +6088,11 @@ fn spawn_fail(
 }
 
 impl ManagedSessionSpawnStart {
-    pub(crate) fn poll(&mut self, runtime: &HubRuntime) -> PluginSpawnPoll {
+    pub(crate) fn poll(
+        &mut self,
+        runtime: &HubRuntime,
+        parent: &mut Option<crate::lua_memory::LuaCallbackCharge>,
+    ) -> PluginSpawnPoll {
         loop {
             match self.stage {
                 PluginSpawnStage::RetryRetained => {
@@ -5822,7 +6127,26 @@ impl ManagedSessionSpawnStart {
                     })) => match result {
                         Ok(reserved) => {
                             self.reservation = Some(reserved.clone());
-                            if runtime.publish_spawn_context(&self.context).is_err() {
+                            let context_charge = self
+                                .context
+                                .as_ref()
+                                .and_then(stored_context_bytes)
+                                .and_then(|bytes| match parent.as_mut() {
+                                    Some(parent) => {
+                                        parent.grow(bytes).ok()?;
+                                        parent.split_fixed(bytes)
+                                    }
+                                    None => runtime.lua_memory.reserve_callback_total(bytes).ok(),
+                                });
+                            let published = context_charge
+                                .ok_or(())
+                                .and_then(|charge| {
+                                    let context = self.context.take().ok_or(())?;
+                                    runtime
+                                        .publish_spawn_context(context, &reserved, charge)
+                                        .map_err(|_| ())
+                                });
+                            if published.is_err() {
                                 self.spawn_error = Some(CoreDaemonError::Shutdown);
                                 self.release_or_retain(runtime);
                                 continue;
@@ -6773,6 +7097,37 @@ pub(crate) mod tests {
         );
         drop(charge);
         assert_eq!(runtime.lua_memory.usage(), (0, 0));
+    }
+
+    #[test]
+    fn context_alias_replacement_retains_each_generation_until_its_last_alias() {
+        let runtime = family_runtime("context-alias-generation");
+        let first = HubSessionContext {
+            context_id: "ctx-first".into(),
+            session_id: SessionId("same-session".into()),
+            values: BTreeMap::from([("value".into(), "first".into())]),
+        };
+        let second = HubSessionContext {
+            context_id: "ctx-second".into(),
+            session_id: first.session_id.clone(),
+            values: BTreeMap::from([("value".into(), "second".into())]),
+        };
+        let first_identity = runtime.test_publish_spawn_context(&first);
+        let first_charge = runtime.lua_memory.usage().1;
+        let second_identity = runtime.test_publish_spawn_context(&second);
+        assert_ne!(first_identity, second_identity);
+        assert_eq!(runtime.session_context("same-session"), Some(second.clone()));
+        assert_eq!(runtime.session_context("ctx-first"), Some(first.clone()));
+        assert!(runtime.lua_memory.usage().1 > first_charge);
+
+        runtime.retract_spawn_context(&first, first_identity);
+        assert_eq!(runtime.session_context("ctx-first"), None);
+        assert_eq!(runtime.session_context("same-session"), Some(second.clone()));
+        assert!(runtime.lua_memory.usage().1 > 0);
+
+        runtime.retract_spawn_context(&second, second_identity);
+        assert_eq!(runtime.session_context("same-session"), None);
+        assert_eq!(runtime.lua_memory.usage().1, 0);
     }
 
     #[test]

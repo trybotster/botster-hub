@@ -3,8 +3,32 @@
 use super::*;
 
 mod reply;
-#[cfg(test)]
-pub(crate) use reply::spawn_reply_channel;
+pub(crate) use reply::{SpawnReplySender, spawn_reply_channel};
+
+struct CountedFailure(usize);
+
+impl std::fmt::Write for CountedFailure {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+struct BoundedFailure {
+    value: String,
+    limit: usize,
+}
+
+impl std::fmt::Write for BoundedFailure {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let next = self.value.len().checked_add(text.len()).ok_or(std::fmt::Error)?;
+        if next > self.limit {
+            return Err(std::fmt::Error);
+        }
+        self.value.push_str(text);
+        Ok(())
+    }
+}
 
 /// The plugin reports this outcome only after it attempts Lua conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +36,34 @@ pub(crate) use reply::spawn_reply_channel;
 pub(crate) enum SpawnConversionOutcome {
     Converted,
     Abandoned,
+}
+
+/// The local transport reports success only after its complete response write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnDeliveryOutcome {
+    Delivered,
+}
+
+/// Dropping this receipt closes its charged ticket and wakes the exact owner.
+#[derive(Debug)]
+pub(crate) struct SpawnDeliveryReceipt {
+    publisher: Option<crate::data_plane::driver::CoreReplyPublisher<SpawnDeliveryOutcome>>,
+}
+
+impl SpawnDeliveryReceipt {
+    pub(crate) fn new(
+        publisher: crate::data_plane::driver::CoreReplyPublisher<SpawnDeliveryOutcome>,
+    ) -> Self {
+        Self {
+            publisher: Some(publisher),
+        }
+    }
+
+    pub(crate) fn delivered(mut self) {
+        if let Some(publisher) = self.publisher.take() {
+            publisher.publish(SpawnDeliveryOutcome::Delivered);
+        }
+    }
 }
 
 /// A dropped receipt reports loss through the registered owner phase.
@@ -41,9 +93,10 @@ impl SpawnConversionReceipt {
 
 enum CoreBinding {
     Ownerless,
+    ClientOwner(crate::owner_identity::WaiterId),
     Owner {
         waiter_id: crate::owner_identity::WaiterId,
-        _variable: crate::lua_memory::LuaCallbackCharge,
+        allowance: crate::session_types::ChargedMaterializationAllowance,
     },
 }
 
@@ -51,11 +104,29 @@ impl CoreBinding {
     fn begin(&self, runtime: &HubRuntime, operation: CoreOperation) -> CoreOperationTracker {
         let ticket = match self {
             Self::Ownerless => runtime.core_daemon.begin(operation),
+            Self::ClientOwner(waiter_id) => runtime.core_daemon.begin_for_owner(*waiter_id, operation),
             Self::Owner { waiter_id, .. } => {
                 runtime.core_daemon.begin_for_owner(*waiter_id, operation)
             }
         };
         CoreOperationTracker::new(ticket)
+    }
+
+    fn context_charge(
+        &mut self,
+        runtime: &HubRuntime,
+        context: &HubSessionContext,
+    ) -> Option<crate::lua_memory::LuaCallbackCharge> {
+        let bytes = stored_context_bytes(context)?;
+        match self {
+            Self::Owner { allowance, .. } => {
+                allowance.parent.grow(bytes).ok()?;
+                allowance.parent.split_fixed(bytes)
+            }
+            Self::Ownerless | Self::ClientOwner(_) => {
+                runtime.lua_memory.reserve_callback_total(bytes).ok()
+            }
+        }
     }
 }
 
@@ -70,7 +141,7 @@ pub(crate) struct SessionTypeSpawnStart {
     retry_tokens: Vec<SessionReservation>,
     retry_keep: Vec<SessionReservation>,
     context_published: bool,
-    context: HubSessionContext,
+    context: Option<HubSessionContext>,
     session_type_id: String,
     context_id: String,
     context_keys: Vec<String>,
@@ -99,6 +170,61 @@ pub(crate) enum SessionSpawnCleanupPoll {
 }
 
 impl HubRuntime {
+    pub(crate) fn session_spawn_host_reply(
+        &self,
+        retirement: &crate::data_plane::driver::CoreWaiterRetirement,
+        charge: crate::lua_memory::LuaCallbackCharge,
+    ) -> Result<
+        (
+            crate::data_plane::driver::ChargedCoreTicket<()>,
+            crate::data_plane::driver::CoreReplyPublisher<()>,
+        ),
+        crate::lua_memory::LuaCallbackCharge,
+    > {
+        self.core_daemon.local_reply_for_owner(retirement, charge)
+    }
+
+    pub(crate) fn session_spawn_conversion_reply(
+        &self,
+        retirement: &crate::data_plane::driver::CoreWaiterRetirement,
+        charge: crate::lua_memory::LuaCallbackCharge,
+    ) -> Result<
+        (
+            crate::data_plane::driver::ChargedCoreTicket<SpawnConversionOutcome>,
+            SpawnConversionReceipt,
+        ),
+        crate::lua_memory::LuaCallbackCharge,
+    > {
+        self.core_daemon
+            .local_reply_for_owner(retirement, charge)
+            .map(|(ticket, publisher)| (ticket, SpawnConversionReceipt::new(publisher)))
+    }
+
+    /// Daemon requests fund their local delivery ticket from the callback pool.
+    /// Plugin requests must split the original admitted callback parent instead.
+    pub(crate) fn daemon_session_spawn_delivery_charge(
+        &self,
+    ) -> Option<crate::lua_memory::LuaCallbackCharge> {
+        let bytes = crate::data_plane::driver::retained_reply_bytes::<SpawnDeliveryOutcome>()?;
+        self.lua_memory.reserve_callback_total(bytes).ok()
+    }
+
+    pub(crate) fn session_spawn_delivery_reply(
+        &self,
+        retirement: &crate::data_plane::driver::CoreWaiterRetirement,
+        charge: crate::lua_memory::LuaCallbackCharge,
+    ) -> Result<
+        (
+            crate::data_plane::driver::ChargedCoreTicket<SpawnDeliveryOutcome>,
+            SpawnDeliveryReceipt,
+        ),
+        crate::lua_memory::LuaCallbackCharge,
+    > {
+        self.core_daemon
+            .local_reply_for_owner(retirement, charge)
+            .map(|(ticket, publisher)| (ticket, SpawnDeliveryReceipt::new(publisher)))
+    }
+
     pub(super) fn fulfill_session_type_spawn(
         &self,
         pending: &PendingSessionTypeSpawn,
@@ -129,14 +255,23 @@ impl HubRuntime {
         waiter_id: crate::owner_identity::WaiterId,
         product: crate::session_types::ChargedSessionTypeMaterialization,
     ) -> SessionTypeSpawnStart {
-        let (materialized, variable) = product.into_parts();
+        let (materialized, allowance) = product.into_parts();
         self.begin_materialized_session_type_spawn(
             materialized,
             CoreBinding::Owner {
                 waiter_id,
-                _variable: variable,
+                allowance,
             },
         )
+    }
+
+    /// Direct client callers use the same reservation and context stages.
+    pub(crate) fn begin_client_session_type_spawn(
+        &self,
+        materialized: crate::session_types::MaterializedSessionType,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> SessionTypeSpawnStart {
+        self.begin_materialized_session_type_spawn(materialized, CoreBinding::ClientOwner(waiter_id))
     }
 
     fn begin_materialized_session_type_spawn(
@@ -152,7 +287,7 @@ impl HubRuntime {
         let retry_tokens = match &binding {
             CoreBinding::Ownerless => self.take_retained_reservations(),
             // An owner row must not take another operation's cleanup authority.
-            CoreBinding::Owner { .. } => Vec::new(),
+            CoreBinding::ClientOwner(_) | CoreBinding::Owner { .. } => Vec::new(),
         };
         let stage = if retry_tokens.is_empty() {
             PluginSpawnStage::Reserve
@@ -176,7 +311,7 @@ impl HubRuntime {
             retry_tokens,
             retry_keep: Vec::new(),
             context_published: false,
-            context: materialized.context,
+            context: Some(materialized.context),
             session_type_id: materialized.resolved.session_type.session_type_id,
             context_id: materialized.resolved.context_id,
             context_keys: materialized.resolved.context_keys,
@@ -190,10 +325,16 @@ impl HubRuntime {
         start: &SessionTypeSpawnStart,
         result: Result<CoreSession, PluginSpawnFailure>,
     ) -> Result<PluginSessionTypeSpawned, String> {
-        let context = &start.context;
         let outcome = result.map_err(|failure| {
-            if start.context_published {
-                self.retract_spawn_context(context);
+            if start.context_published
+                && failure.disposition == Some(SessionReservationRelease::Released)
+                && let Some(reservation) = start.reservation.as_ref()
+            {
+                self.retract_spawn_context_aliases(
+                    &start.context_id,
+                    &start.spawn.request.session_id.0,
+                    reservation.identity(),
+                );
             }
             match failure.disposition {
                 Some(SessionReservationRelease::RetainedUnconfirmed) => {
@@ -208,11 +349,100 @@ impl HubRuntime {
             session_type_id: start.session_type_id.clone(),
             context_id: start.context_id.clone(),
             context_keys: start.context_keys.clone(),
+            reservation_identity: start.reservation.as_ref().map(SessionReservation::identity),
+        })
+    }
+
+    pub(crate) fn finish_client_session_type_spawn(
+        &self,
+        start: &SessionTypeSpawnStart,
+        result: Result<CoreSession, PluginSpawnFailure>,
+    ) -> Result<CoreSession, CoreDaemonError> {
+        result.map_err(|failure| {
+            if start.context_published
+                && failure.disposition == Some(SessionReservationRelease::Released)
+                && let Some(reservation) = start.reservation.as_ref()
+            {
+                self.retract_spawn_context_aliases(
+                    &start.context_id,
+                    &start.spawn.request.session_id.0,
+                    reservation.identity(),
+                );
+            }
+            failure.error
         })
     }
 }
 
 impl SessionTypeSpawnStart {
+    /// Fund the plugin error before formatting it while Core failure data is live.
+    pub(crate) fn charged_plugin_failure(
+        &mut self,
+        failure: &PluginSpawnFailure,
+    ) -> Option<(String, crate::lua_memory::LuaCallbackCharge)> {
+        use std::fmt::Write;
+
+        let CoreBinding::Owner { allowance, .. } = &mut self.binding else {
+            return None;
+        };
+        let prefix = if failure.disposition == Some(SessionReservationRelease::RetainedUnconfirmed)
+        {
+            "cleanup_unconfirmed: "
+        } else {
+            "session type spawn failed: "
+        };
+        let mut counted = CountedFailure(prefix.len());
+        write!(&mut counted, "{}", failure.error).ok()?;
+        allowance.parent.grow(counted.0).ok()?;
+        let charge = allowance.parent.split_fixed(counted.0)?;
+        let mut message = BoundedFailure {
+            value: String::with_capacity(counted.0),
+            limit: counted.0,
+        };
+        message.write_str(prefix).ok()?;
+        write!(&mut message, "{}", failure.error).ok()?;
+        Some((message.value, charge))
+    }
+
+    /// Reserve response copies before finish_session_type_spawn constructs them.
+    pub(crate) fn charged_plugin_response(
+        &mut self,
+        session: &CoreSession,
+    ) -> Option<(
+        crate::lua_memory::LuaCallbackCharge,
+        crate::lua_memory::LuaCallbackCharge,
+    )> {
+        let CoreBinding::Owner { allowance, .. } = &mut self.binding else {
+            return None;
+        };
+        let keys = self.context_keys.len();
+        let key_slots = keys
+            .checked_mul(std::mem::size_of::<String>())?
+            .checked_mul(3)?;
+        let key_strings = self
+            .context_keys
+            .iter()
+            .try_fold(0usize, |sum, key| sum.checked_add(key.len()))?;
+        let response_bytes = session
+            .session_id
+            .0
+            .len()
+            .checked_add(session_lifecycle_label(session.lifecycle.clone()).len())?
+            .checked_add(self.session_type_id.len())?
+            .checked_add(self.context_id.len())?
+            .checked_add(key_slots)?
+            .checked_add(key_strings)?;
+        let ticket_bytes =
+            crate::data_plane::driver::retained_reply_bytes::<SpawnConversionOutcome>()?;
+        allowance
+            .parent
+            .grow(response_bytes.checked_add(ticket_bytes)?)
+            .ok()?;
+        let ticket = allowance.parent.split_fixed(ticket_bytes)?;
+        let response = allowance.parent.split_fixed(response_bytes)?;
+        Some((response, ticket))
+    }
+
     /// Collect the waiter's exact phase before advancing terminal cleanup.
     /// Unresolved retains the complete stage; it never authorizes disposal.
     pub(crate) fn abandon_and_poll_cleanup(
@@ -282,7 +512,17 @@ impl SessionTypeSpawnStart {
                     })) => self.cleanup = CleanupStage::Confirmed,
                     _ => self.cleanup = CleanupStage::Unresolved,
                 },
-                CleanupStage::Confirmed => return SessionSpawnCleanupPoll::Confirmed,
+                CleanupStage::Confirmed => {
+                    if self.context_published && let Some(reservation) = self.reservation.as_ref() {
+                        runtime.retract_spawn_context_aliases(
+                            &self.context_id,
+                            &self.spawn.request.session_id.0,
+                            reservation.identity(),
+                        );
+                        self.context_published = false;
+                    }
+                    return SessionSpawnCleanupPoll::Confirmed;
+                }
                 CleanupStage::Unresolved => return SessionSpawnCleanupPoll::Unresolved,
             }
         }
@@ -364,7 +604,20 @@ impl SessionTypeSpawnStart {
                                 self.release_or_retain(runtime);
                                 continue;
                             }
-                            if runtime.publish_spawn_context(&self.context).is_err() {
+                            let published = self
+                                .binding
+                                .context_charge(
+                                    runtime,
+                                    self.context.as_ref().expect("context precedes publication"),
+                                )
+                                .ok_or(())
+                                .and_then(|charge| {
+                                    let context = self.context.take().ok_or(())?;
+                                    runtime
+                                        .publish_spawn_context(context, &reserved, charge)
+                                        .map_err(|_| ())
+                                });
+                            if published.is_err() {
                                 self.spawn_error = Some(CoreDaemonError::Shutdown);
                                 self.release_or_retain(runtime);
                                 continue;
@@ -582,7 +835,9 @@ mod tests {
         let session_id = SessionId("ordinary-reserve-first-poll-loss".into());
         let binding = CoreBinding::Owner {
             waiter_id,
-            _variable: runtime.lua_memory.reserve_callback_total(0).unwrap(),
+            allowance: crate::session_types::ChargedMaterializationAllowance::empty_for_test(
+                runtime.lua_memory.reserve_callback_total(0).unwrap(),
+            ),
         };
         let tracker = binding.begin(&runtime, CoreOperation::ReserveSession(session_id.clone()));
         let mut start = SessionTypeSpawnStart {
@@ -603,11 +858,11 @@ mod tests {
             retry_tokens: Vec::new(),
             retry_keep: Vec::new(),
             context_published: false,
-            context: HubSessionContext {
+            context: Some(HubSessionContext {
                 context_id: "context-first-poll-loss".into(),
                 session_id: session_id.clone(),
                 values: BTreeMap::new(),
-            },
+            }),
             session_type_id: "fixture".into(),
             context_id: "context-first-poll-loss".into(),
             context_keys: Vec::new(),

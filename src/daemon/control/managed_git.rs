@@ -235,20 +235,18 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
             HostRecoveryRequired::Terminal(_) => None,
         })
     {
-        let _ = pending
-            .response
-            .send(Err(ManagedGitError::new("reconciliation_required", detail)));
+        let _ = pending.respond(Err(ManagedGitError::new("reconciliation_required", detail)));
         return;
     }
     let request = match runtime.validate_managed_git_request(&pending) {
         Ok(request) => request,
         Err(error) => {
-            let _ = pending.response.send(Err(error));
+            let _ = pending.respond(Err(error));
             return;
         }
     };
     let Some(owner_permit) = state.budget.reserve() else {
-        let _ = pending.response.send(Err(ManagedGitError::new(
+        let _ = pending.respond(Err(ManagedGitError::new(
             "ensure_backpressured",
             "the Hub owner has no available operation slot",
         )));
@@ -256,7 +254,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     };
     let Some(waiter_id) = state.waiter_ids.next() else {
         state.budget.release(owner_permit);
-        let _ = pending.response.send(Err(ManagedGitError::new(
+        let _ = pending.respond(Err(ManagedGitError::new(
             "ensure_unavailable",
             "the Hub owner exhausted unique operation identifiers",
         )));
@@ -264,7 +262,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     };
     let Some(host_permit) = runtime.host_executor().try_reserve() else {
         state.budget.release(owner_permit);
-        let _ = pending.response.send(Err(ManagedGitError::new(
+        let _ = pending.respond(Err(ManagedGitError::new(
             "ensure_backpressured",
             "the bounded host executor has no available operation slot",
         )));
@@ -283,7 +281,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         .is_err()
     {
         state.budget.release(owner_permit);
-        let _ = pending.response.send(Err(ManagedGitError::new(
+        let _ = pending.respond(Err(ManagedGitError::new(
             "ensure_unavailable",
             "the host executor stopped before it accepted managed Git work",
         )));
@@ -643,7 +641,8 @@ impl ManagedSpawnOperation {
             return self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None);
         };
         let start = self.spawn.as_mut().expect("managed Core spawn exists");
-        let completion = match start.poll(runtime) {
+        let parent = &mut self.pending.as_mut().expect("managed request exists").parent;
+        let completion = match start.poll(runtime, parent) {
             crate::runtime::PluginSpawnPoll::Pending => return ControlPoll::Pending,
             crate::runtime::PluginSpawnPoll::Ready(result) => result,
         };
@@ -658,23 +657,36 @@ impl ManagedSpawnOperation {
         );
         match result {
             Ok(spawned) if !self.deadline_elapsed() => {
-                let delivered = self
+                let delivery = self
                     .pending
                     .take()
                     .expect("managed request exists")
-                    .response
-                    .send(Ok(spawned.clone()))
-                    .is_ok();
-                if delivered {
-                    self.submit_finalize(daemon, state, ManagedWorktreeDecision::Commit, None)
-                } else {
-                    self.queue_undelivered_created_cleanup(runtime, &spawned);
-                    runtime.cleanup_managed_session(&spawned);
-                    self.deferred_error = Some(ManagedGitError::new(
-                        "ensure_timed_out",
-                        "the managed session caller left before delivery",
-                    ));
-                    self.finish_deferred_error()
+                    .respond(Ok(spawned));
+                match delivery {
+                    Ok(()) => self.submit_finalize(
+                        daemon,
+                        state,
+                        ManagedWorktreeDecision::Commit,
+                        None,
+                    ),
+                    Err(crate::runtime::ManagedSpawnDelivery {
+                        result: Ok(spawned),
+                        parent,
+                    }) => {
+                        self.queue_undelivered_created_cleanup(runtime, &spawned);
+                        runtime.cleanup_managed_session(&spawned);
+                        self.deferred_error = Some(ManagedGitError::new(
+                            "ensure_timed_out",
+                            "the managed session caller left before delivery",
+                        ));
+                        let outcome = self.finish_deferred_error();
+                        drop(spawned);
+                        drop(parent);
+                        outcome
+                    }
+                    Err(crate::runtime::ManagedSpawnDelivery { result: Err(_), .. }) => {
+                        unreachable!("a successful managed spawn sent an error")
+                    }
                 }
             }
             Ok(spawned) => {
@@ -1067,7 +1079,7 @@ impl ManagedSpawnOperation {
 
     fn finish_error(&mut self, error: ManagedGitError) -> ControlPoll {
         if let Some(pending) = self.pending.take() {
-            let _ = pending.response.send(Err(error));
+            let _ = pending.respond(Err(error));
         }
         self.finish_internal()
     }

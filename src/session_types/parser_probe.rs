@@ -1,9 +1,9 @@
 //! Isolated allocation fixtures for the complete repository definition parser.
 
 use super::{
-    PackageSessionType, REPO_SESSION_TYPES_FILE, REPO_SESSION_TYPES_FILE_BYTE_CAPACITY,
-    RepoSessionTypesFile, SessionTypeError, SessionTypeResult, repo_session_types,
-    validate_session_types,
+    repo_session_types, validate_session_types, PackageSessionType, RepoSessionTypesFile,
+    SessionTypeError, SessionTypeResult, REPO_SESSION_TYPES_FILE,
+    REPO_SESSION_TYPES_FILE_BYTE_CAPACITY,
 };
 use std::path::Path;
 
@@ -19,10 +19,14 @@ pub enum Case {
     DuplicateEnvironment,
     TaggedSequence,
     Whitespace,
+    DeepTaggedValue,
+    DeepIgnoredField,
+    LongNonTagKeys,
+    OmittedDefaults,
 }
 
 impl Case {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 12] = [
         Self::Counterexample,
         Self::MalformedEscape,
         Self::TruncatedUnicode,
@@ -31,6 +35,10 @@ impl Case {
         Self::DuplicateEnvironment,
         Self::TaggedSequence,
         Self::Whitespace,
+        Self::DeepTaggedValue,
+        Self::DeepIgnoredField,
+        Self::LongNonTagKeys,
+        Self::OmittedDefaults,
     ];
 
     pub fn name(self) -> &'static str {
@@ -43,6 +51,10 @@ impl Case {
             Self::DuplicateEnvironment => "duplicate-environment",
             Self::TaggedSequence => "tagged-sequence",
             Self::Whitespace => "whitespace",
+            Self::DeepTaggedValue => "deep-tagged-value",
+            Self::DeepIgnoredField => "deep-ignored-field",
+            Self::LongNonTagKeys => "long-non-tag-keys",
+            Self::OmittedDefaults => "omitted-defaults",
         }
     }
 
@@ -89,6 +101,28 @@ impl Case {
                 bytes.resize(REPO_SESSION_TYPES_FILE_BYTE_CAPACITY, b' ');
                 bytes
             }
+            Self::DeepTaggedValue => {
+                let nested = format!("{}0{}", "[".repeat(96), "]".repeat(96));
+                definition(&format!(
+                    r#""execution":{{"unknown":{nested},"mode":"shell_command"}}"#
+                ))
+            }
+            Self::DeepIgnoredField => {
+                let nested = format!("{}0{}", "[".repeat(96), "]".repeat(96));
+                definition(&format!(r#""ignored":{{"nested":{nested}}}"#))
+            }
+            Self::LongNonTagKeys => {
+                let fields = (0..40)
+                    .map(|index| {
+                        format!(r#""unused-{index}-{}":"value-{index}""#, "k".repeat(512))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                definition(&format!(
+                    r#""execution":{{{fields},"mode":"shell_command"}}"#
+                ))
+            }
+            Self::OmittedDefaults => br#"{"session_types":[{"id":"agent","label":"Agent","role":"agent","interaction":"interactive","lifecycle":"persistent","command":"agent"}]}"#.to_vec(),
         }
     }
 }
@@ -155,6 +189,23 @@ impl PreparedProbe {
                 "error": {"kind": error.kind, "message": error.message}
             }),
         }
+    }
+
+    /// Size the parser model outside the allocation recorder.
+    pub fn counted_parser_peak(&self) -> Result<usize, &'static str> {
+        use crate::lua_memory::{LuaMemoryAccount, LuaMemoryLimits};
+
+        let account = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: 128 * 1024 * 1024,
+            total_callback_bytes: 128 * 1024 * 1024,
+        })
+        .map_err(|_| "parser oracle account unavailable")?;
+        let mut parent = account
+            .reserve_callback_total(0)
+            .map_err(|_| "parser oracle parent unavailable")?;
+        super::materialization_walk::counted_parser_peak(&self.input, &mut parent)
     }
 
     /// Compare all definition fields and exact error bytes without cloning them.

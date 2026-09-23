@@ -51,7 +51,11 @@ pub(super) fn convert_session_type_spawned(
     convert_json(
         lua,
         memory,
-        || spawner.abandon_session_type_spawn(spawned.session_id.clone()),
+        || {
+            if let Some(identity) = spawned.reservation_identity {
+                spawner.abandon_session_type_spawn(spawned.session_id.clone(), identity);
+            }
+        },
         &spawned,
         conversion_failure,
     )
@@ -67,7 +71,11 @@ pub(super) fn convert_managed_spawned(
     convert_json(
         lua,
         memory,
-        || spawner.abandon_session_type_spawn(spawned.session_id.clone()),
+        || {
+            if let Some(identity) = spawned.reservation_identity {
+                spawner.abandon_session_type_spawn(spawned.session_id.clone(), identity);
+            }
+        },
         spawned,
         conversion_failure,
     )
@@ -151,6 +159,7 @@ mod tests {
             session_type_id: "shell".into(),
             context_id: "context".into(),
             context_keys: vec!["key".into()],
+            reservation_identity: None,
         }
     }
 
@@ -298,6 +307,7 @@ mod tests {
             session_type_id: "shell".into(),
             context_id: "context".into(),
             context_keys: vec!["key".into()],
+            reservation_identity: None,
         };
         let (fixture, receipt) = SpawnReceiptFixture::new(&account);
         let result =
@@ -310,6 +320,10 @@ mod tests {
     }
 
     fn spawned() -> PluginManagedSessionSpawned {
+        let identity = botster_core::SessionAdmission::default()
+            .reserve(botster_core::SessionId("s1-abandon".into()))
+            .unwrap()
+            .identity();
         PluginManagedSessionSpawned {
             session_id: "s1-abandon".into(),
             target_id: "t1".into(),
@@ -321,6 +335,7 @@ mod tests {
             created_worktree: true,
             created_branch: false,
             reused_worktree: false,
+            reservation_identity: Some(identity),
         }
     }
 
@@ -336,12 +351,13 @@ mod tests {
         .expect("tiny callback account");
         let spawner = std::sync::Arc::new(HubSessionTypeSpawner::new());
         let failure = lua.create_string("conversion failed").unwrap();
+        let spawned = spawned();
         let value =
-            convert_managed_spawned(&lua, Some(&account), &spawner, &spawned(), &failure).unwrap();
+            convert_managed_spawned(&lua, Some(&account), &spawner, &spawned, &failure).unwrap();
         assert!(matches!(value, Value::String(_)));
         assert_eq!(
             spawner.test_take_abandoned(),
-            vec!["s1-abandon".to_string()]
+            vec![("s1-abandon".to_string(), spawned.reservation_identity.unwrap())]
         );
     }
 
