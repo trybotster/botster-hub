@@ -2113,7 +2113,7 @@ Its manifest SHA-256 is `4986cd5c991b4c3a0b35e1b3c083880e409bba4fbd9d98bf932a67d
 Agent 001b started one full workspace run with the fresh candidate in live session `88927`.
 The raw log is `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/reviewed-ebc60c12-full-suite.log`.
 The adjacent `reviewed-ebc60c12-full-suite-run.md` records the command and environment.
-The full result remains pending. No installation or runtime replacement occurred.
+The full result is recorded in the September 23 current checkpoint below. No installation or runtime replacement occurred.
 
 ## Completion gate
 
@@ -2151,3 +2151,43 @@ No installation or runtime replacement is authorized.
 This phase completes only when integration, required product behavior, architecture findings, and measured acceptance are resolved or explicitly returned for a user decision.
 The final report separates completed work, evidence, known limits, and remaining product choices.
 Neither a green test count nor clean source formatting is a substitute for this gate.
+
+### September 23 current checkpoint: lifecycle failures and subscription retirement
+
+This section supersedes the pending-run and active-diagnostic statements above. It does not change the completion gate.
+
+The workspace run at `ebc60c12` exited 101. Completed binaries reported 1,204 library passes, 30 main passes, 10 ownership passes,
+four external-options passes, 14 capability passes, and 35 client-API passes.
+The lifecycle binary reported 135 passed, 183 failed, and one ignored. Later binaries did not run.
+The raw log SHA-256 is `d7d9c5a0d22f793052400a3a0d6f56b13358e3306e9dfe24d3d0ae33b570a28c`.
+Of the failures, 163 reported the same harness taint after worker identity capture failed.
+These are not 163 independently established product defects. The other 20 failures remain grouped by behavior.
+
+Two reviewed, test-only checkpoints are pushed on `delivery/durable-recovery-20260921`:
+
+- `1e1b1876` validates cleanup identity against the exact candidate and attributes cleanup taint to the originating test.
+  Four exact focused tests passed. This does not authorize cleanup of old diagnostic workers.
+- `073500d0` corrects retained-authority fixtures and copies the matching recovery journal in the CLI fixture.
+  Four exact focused tests passed. Production authority checks remain unchanged.
+
+The evidence directory is `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922`.
+The records are `validated-candidate-harness-run.md` and `authority-fixture-run.md`.
+No full workspace run has passed after these corrections.
+
+Agent 001b finished the uncompiled G2 subscription-retirement diff in the recovery worktree.
+Agent 001e owns independent source review. The final diff SHA-256 is
+`3bccfbe4aa2302222e7e22bb3d59bdb278c0c314185626dc02cb88c88702fb96`.
+The earlier hash was superseded after the sibling cleanup test retained the retired subscription ID.
+Root sent the corrected hash to the reviewer. The writer must keep this diff unchanged during review.
+The review checks provider-loss delivery, retained terminal intent, capacity notifications, disconnect accounting, and outstanding publications.
+The sibling test uses one cleanup guard and two owner rows. It does not use a live Unix socket.
+No G2 build or test result exists yet. Source acceptance precedes focused verification and a fresh production candidate.
+
+The remaining failure groups cover entity resynchronization, protocol constants, CLI schema expectations, operation labels,
+the terminal-path source guard, shutdown during update checks, chunk reassembly, and deterministic WebRTC failure evidence.
+The selected WebRTC test design must prove an incomplete response and read the record through the real owner consumer.
+CLI failure-format coverage remains open. The test design does not close that requirement.
+
+Full delivery still requires async-spawn integration, ordinary spawn materialization, recovery verification, strict lint,
+the full workspace suite, and verification with matched artifacts and real clients.
+No installation, deployment, or running-daemon replacement occurred.
