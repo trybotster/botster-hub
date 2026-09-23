@@ -141,6 +141,8 @@ pub struct HubRuntime {
     #[cfg(test)]
     managed_accept_ones: AtomicUsize,
     #[cfg(test)]
+    inherited_managed_cleanup_transfers: AtomicUsize,
+    #[cfg(test)]
     retry_retained_again_on_pending: AtomicBool,
     #[cfg(test)]
     resubmit_release_on_pending: AtomicBool,
@@ -309,6 +311,7 @@ pub struct HubSessionTypeSpawner {
     managed: Mutex<VecDeque<PendingManagedSessionSpawn>>,
     managed_pending: AtomicBool,
     managed_owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
+    managed_active: Mutex<BTreeMap<String, crate::owner_identity::WaiterId>>,
     abandoned: Mutex<Vec<String>>,
 }
 
@@ -522,6 +525,8 @@ impl HubRuntime {
             #[cfg(test)]
             managed_accept_ones: AtomicUsize::new(0),
             #[cfg(test)]
+            inherited_managed_cleanup_transfers: AtomicUsize::new(0),
+            #[cfg(test)]
             retry_retained_again_on_pending: AtomicBool::new(false),
             #[cfg(test)]
             coordination_core_submits: AtomicUsize::new(0),
@@ -706,6 +711,8 @@ impl HubRuntime {
             rollback_git_hold: Mutex::new(None),
             #[cfg(test)]
             managed_accept_ones: AtomicUsize::new(0),
+            #[cfg(test)]
+            inherited_managed_cleanup_transfers: AtomicUsize::new(0),
             #[cfg(test)]
             retry_retained_again_on_pending: AtomicBool::new(false),
             #[cfg(test)]
@@ -1892,9 +1899,6 @@ impl HubRuntime {
         )
         .map_err(|error| ManagedGitError::new(error.kind, error.message))?;
         drop(state);
-        if !prepared.created_worktree {
-            self.cancel_created_worktree_cleanup(&prepared.worktree_id);
-        }
         self.retry_retained_reservation_releases();
         self.retry_created_worktree_releases();
         let context = materialized.context.clone();
@@ -2225,6 +2229,38 @@ impl HubRuntime {
                     Some(held.remove(0))
                 }
             })
+    }
+
+    pub(crate) fn created_worktree_cleanup_active(&self, worktree_id: &str) -> bool {
+        self.created_worktree_cleanups
+            .lock()
+            .is_ok_and(|held| held.iter().any(|cleanup| cleanup.worktree_id == worktree_id))
+    }
+
+    pub(crate) fn take_confirmed_worktree_rollback(
+        &self,
+        worktree_id: &str,
+    ) -> Option<crate::managed_git_worktrees::PreparedManagedWorktree> {
+        let mut held = self.confirmed_worktree_rollbacks.lock().ok()?;
+        let index = held.iter().position(|prepared| prepared.worktree_id == worktree_id)?;
+        Some(held.remove(index))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_inherited_managed_cleanup_transfer(&self) {
+        self.inherited_managed_cleanup_transfers
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_inherited_managed_cleanup_transfers(&self) -> usize {
+        self.inherited_managed_cleanup_transfers.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn confirmed_worktree_rollback_exists(&self, worktree_id: &str) -> bool {
+        self.confirmed_worktree_rollbacks
+            .lock()
+            .is_ok_and(|held| held.iter().any(|prepared| prepared.worktree_id == worktree_id))
     }
 
     pub(crate) fn wake_remaining_confirmed_worktree_rollbacks(&self) {
@@ -4947,6 +4983,34 @@ impl HubRuntime {
 }
 
 impl HubSessionTypeSpawner {
+    pub(crate) fn managed_attempt_active(&self, worktree_id: &str) -> bool {
+        self.managed_active
+            .lock()
+            .is_ok_and(|held| held.contains_key(worktree_id))
+    }
+
+    pub(crate) fn begin_managed_attempt(
+        &self,
+        worktree_id: String,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) {
+        let mut held = self.managed_active.lock().expect("managed attempt lock");
+        assert!(held.insert(worktree_id, waiter_id).is_none());
+    }
+
+    pub(crate) fn finish_managed_attempt(
+        &self,
+        worktree_id: &str,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) {
+        let mut held = self.managed_active.lock().expect("managed attempt lock");
+        if held.get(worktree_id) == Some(&waiter_id) {
+            held.remove(worktree_id);
+        }
+        drop(held);
+        self.publish_managed_spawn();
+    }
+
     /// Host destroys queued payloads after all scoped producers stop.
     pub(crate) fn dispose_terminal_pending(&self) -> bool {
         let queues = {
@@ -5037,6 +5101,7 @@ impl HubSessionTypeSpawner {
             managed: Mutex::new(VecDeque::new()),
             managed_pending: AtomicBool::new(false),
             managed_owner: Mutex::new(None),
+            managed_active: Mutex::new(BTreeMap::new()),
             abandoned: Mutex::new(Vec::new()),
         }
     }
@@ -5073,8 +5138,27 @@ impl HubSessionTypeSpawner {
         request: ManagedSessionTypeRequest,
         package_records: Vec<PackageRecord>,
     ) {
+        drop(self.test_enqueue_managed_with_reply(
+            plugin_key,
+            target_id,
+            branch,
+            session_type_id,
+            request,
+            package_records,
+        ));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_enqueue_managed_with_reply(
+        &self,
+        plugin_key: PluginKey,
+        target_id: String,
+        branch: String,
+        session_type_id: String,
+        request: ManagedSessionTypeRequest,
+        package_records: Vec<PackageRecord>,
+    ) -> mpsc::Receiver<Result<PluginManagedSessionSpawned, ManagedGitError>> {
         let (response, receiver) = mpsc::channel();
-        drop(receiver);
         self.managed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5090,6 +5174,7 @@ impl HubSessionTypeSpawner {
                 _dispose_probe: None,
             });
         self.publish_managed_spawn();
+        receiver
     }
 
     fn take_abandoned(&self) -> Vec<String> {

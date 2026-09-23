@@ -2059,10 +2059,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    const MATCHED_WORKER: &str = "/tmp/core-d1a-candidate-20260911-5/botster-session-worker";
-    const MATCHED_WORKER_SHA256: &str =
-        "1dfdd4f300409bf00a6694d1979650799b6280972bd24dd6cb592b21c0382f73";
-
     fn spawn_fixture_with_worker(
         name: &str,
         worker: Option<std::path::PathBuf>,
@@ -2723,17 +2719,24 @@ sys.exit(0)
     }
 
     fn matched_worker_path() -> std::path::PathBuf {
-        let path = std::path::PathBuf::from(MATCHED_WORKER);
-        let hashed = std::process::Command::new("shasum")
-            .args(["-a", "256", MATCHED_WORKER])
-            .output()
-            .expect("hash matched worker");
-        let text = String::from_utf8(hashed.stdout).expect("hash utf8");
-        assert!(
-            text.starts_with(MATCHED_WORKER_SHA256),
-            "matched worker hash {text}"
-        );
-        path
+        static WORKER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        WORKER
+            .get_or_init(|| {
+                let candidate = |variable| {
+                    std::env::var_os(variable)
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| panic!("missing required candidate path in {variable}"))
+                };
+                let hub = candidate("BOTSTER_HUB_BIN");
+                let worker = candidate("BOTSTER_SESSION_WORKER_BIN");
+                let manifest = candidate("BOTSTER_CANDIDATE_MANIFEST");
+                botster_hub_test_support::verify_candidate_manifest(&manifest, &hub, &worker)
+                    .unwrap_or_else(|error| {
+                        panic!("candidate manifest verification failed: {error}")
+                    });
+                worker
+            })
+            .clone()
     }
 
     fn spawn_error_code(response: &botster_hub_client::DaemonResponse) -> Option<&str> {
@@ -3509,7 +3512,7 @@ sys.exit(0)
     }
 
     #[test]
-    fn ensure_worktree_and_spawn_concurrent_same_branch_does_not_damage_the_worktree() {
+    fn ensure_worktree_and_spawn_serial_same_branch_reuses_without_damage() {
         let worker = matched_worker_path();
         let (mut daemon, mut state, root, record) = s2_prepare("s2-conflict", Some(worker));
         let spawner = daemon.runtime().unwrap().session_type_spawner();
@@ -3559,20 +3562,17 @@ sys.exit(0)
             assert!(Instant::now() < deadline, "concurrent managed spawn hang");
             std::thread::yield_now();
         }
-        let a = a.join().expect("join a");
-        let b = b.join().expect("join b");
-        let (ok, conflict) = match (a, b) {
-            (Ok(spawned), Err(error)) | (Err(error), Ok(spawned)) => (spawned, error),
-            other => panic!(
-                "S2 exact-conflict exclusion: one owner and one worktree_conflict, got {other:?}"
-            ),
-        };
-        assert_eq!(conflict.kind, "worktree_conflict");
-        assert!(ok.created_worktree);
+        let a = a.join().expect("join a").expect("first serial spawn");
+        let b = b.join().expect("join b").expect("second serial spawn");
+        assert_ne!(a.session_id, b.session_id);
+        assert_eq!(a.worktree_id, b.worktree_id);
+        assert_eq!(a.worktree_path, b.worktree_path);
+        assert_eq!(usize::from(a.created_worktree) + usize::from(b.created_worktree), 1);
+        assert_eq!(usize::from(a.reused_worktree) + usize::from(b.reused_worktree), 1);
         assert!(
-            std::path::Path::new(&ok.worktree_path).exists(),
-            "winning worktree must exist: {}",
-            ok.worktree_path
+            std::path::Path::new(&a.worktree_path).exists(),
+            "serial reuse must keep the worktree: {}",
+            a.worktree_path
         );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
@@ -3790,40 +3790,30 @@ sys.exit(0)
                 crate::session_types::ManagedSessionTypeRequest::default(),
                 vec![record],
             );
-        let managed = root.join("managed-worktrees");
-        let queued = Instant::now() + Duration::from_secs(20);
-        loop {
-            pump_core(&mut daemon, &mut state);
-            if walkdir_exists(&managed)
-                && daemon
-                    .runtime()
-                    .unwrap()
-                    .session_type_spawner()
-                    .test_managed_queue_len()
-                    == 0
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < queued,
-                "undelivered created worktree must queue identity-matched cleanup"
-            );
-            std::thread::yield_now();
-        }
         let spawner = daemon.runtime().unwrap().session_type_spawner();
-        let handle = std::thread::spawn(move || {
-            spawner.ensure_worktree_and_spawn(
-                &botster_core::PluginKey("p1.plugin".into()),
-                "t1",
-                "topic",
-                "agent",
-                crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![second_record],
-            )
-        });
-        let second = pump_until_join(&mut daemon, &mut state, handle).unwrap_or_else(|error| {
-            panic!("reuse spawn: {}: {}", error.kind, error.message);
-        });
+        let second_reply = spawner.test_enqueue_managed_with_reply(
+            botster_core::PluginKey("p1.plugin".into()),
+            "t1".into(),
+            "topic".into(),
+            "agent".into(),
+            crate::session_types::ManagedSessionTypeRequest::default(),
+            vec![second_record],
+        );
+        assert_eq!(spawner.test_managed_queue_len(), 2);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let second = loop {
+            pump_core(&mut daemon, &mut state);
+            match second_reply.try_recv() {
+                Ok(result) => break result.expect("reuse spawn"),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "queued reuse spawn hang");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("queued reuse reply disconnected")
+                }
+            }
+            std::thread::yield_now();
+        };
         assert!(second.reused_worktree);
         assert!(!second.created_worktree);
         assert!(
@@ -3848,6 +3838,147 @@ sys.exit(0)
             0,
             "reuse must drain identity-matched rollback before Host FinalizeRollback"
         );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_undelivered_reuse_rolls_back_original_creation() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-reuse-undelivered", Some(worker));
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        for package_records in [vec![record.clone()], vec![record]] {
+            spawner.test_enqueue_managed_disconnected(
+                botster_core::PluginKey("p1.plugin".into()),
+                "t1".into(),
+                "topic".into(),
+                "agent".into(),
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                package_records,
+            );
+        }
+        assert_eq!(spawner.test_managed_queue_len(), 2);
+        let managed = root.join("managed-worktrees");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if daemon.runtime().unwrap().test_inherited_managed_cleanup_transfers() == 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reuse did not inherit the original cleanup");
+            std::thread::yield_now();
+        }
+        let gone = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            let runtime = daemon.runtime().unwrap();
+            if !walkdir_exists(&managed)
+                && hub_worktree_ids(&daemon).is_empty()
+                && runtime.test_created_worktree_cleanup_count() == 0
+                && runtime.test_confirmed_worktree_rollback_count() == 0
+            {
+                break;
+            }
+            assert!(Instant::now() < gone, "undelivered reuse did not roll back the original worktree");
+            std::thread::yield_now();
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_worktree_and_spawn_refused_reuse_preserves_original_cleanup() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, record) = s2_prepare("s2-reuse-refused", Some(worker));
+        let spawner = daemon.runtime().unwrap().session_type_spawner();
+        spawner.test_enqueue_managed_disconnected(
+            botster_core::PluginKey("p1.plugin".into()),
+            "t1".into(),
+            "topic".into(),
+            "agent".into(),
+            crate::session_types::ManagedSessionTypeRequest::default(),
+            vec![record],
+        );
+        let refused = spawner.test_enqueue_managed_with_reply(
+            botster_core::PluginKey("p1.plugin".into()),
+            "t1".into(),
+            "topic".into(),
+            "agent".into(),
+            crate::session_types::ManagedSessionTypeRequest::default(),
+            Vec::new(),
+        );
+        let managed = root.join("managed-worktrees");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let refusal = loop {
+            pump_core(&mut daemon, &mut state);
+            match refused.try_recv() {
+                Ok(result) => break result.expect_err("missing package must refuse reuse"),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "reuse refusal did not complete");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("reuse refusal reply disconnected"),
+            }
+            std::thread::yield_now();
+        };
+        assert_ne!(refusal.kind, "spawn_failed");
+        assert_eq!(daemon.runtime().unwrap().test_inherited_managed_cleanup_transfers(), 0);
+        let gone = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if !walkdir_exists(&managed) && hub_worktree_ids(&daemon).is_empty() {
+                break;
+            }
+            assert!(Instant::now() < gone, "refused reuse lost the original cleanup");
+            std::thread::yield_now();
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_terminal_drain_retains_inherited_creation() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root, _record) =
+            s2_prepare("s2-terminal-inherited", Some(worker));
+        let runtime = daemon.runtime().unwrap();
+        let waiter = runtime.next_waiter_id().unwrap();
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        let prepared = crate::managed_git_worktrees::PreparedManagedWorktree {
+            target_id: "t1".into(),
+            repository_root: root.join("repo"),
+            common_dir: root.join("repo/.git"),
+            branch: "topic".into(),
+            path: root.join("managed-worktrees/topic"),
+            worktree_id: "wt-terminal-inherited".into(),
+            base_ref: "main".into(),
+            base_commit: "0".repeat(40),
+            head_commit: "0".repeat(40),
+            created_worktree: true,
+            created_branch: true,
+        };
+        let operation = crate::daemon::control::managed_git::ManagedSpawnOperation::test_inherited_terminal(
+            waiter,
+            prepared,
+            permit,
+        );
+        insert_phase_test_row(
+            &mut state,
+            waiter,
+            crate::daemon::control::pending::ControlContinuation::ManagedSpawn(Box::new(operation)),
+        );
+        crate::daemon::control::pending::dispose_terminal_requests(runtime, &mut state);
+        assert_eq!(
+            runtime.test_confirmed_worktree_rollback_count(),
+            1,
+            "terminal disposal must retain the original creation right"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.pending_requests.is_empty() {
+            crate::daemon::control::pending::dispose_terminal_requests(runtime, &mut state);
+            assert!(Instant::now() < deadline, "managed terminal disposal did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(runtime.test_confirmed_worktree_rollback_count(), 1);
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }

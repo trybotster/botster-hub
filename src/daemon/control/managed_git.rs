@@ -45,6 +45,10 @@ enum Phase {
 
 pub(crate) struct ManagedSpawnOperation {
     waiter_id: WaiterId,
+    worktree_id: String,
+    spawner: Option<crate::runtime::SharedSessionTypeSpawner>,
+    inherited_creation: Option<PreparedManagedWorktree>,
+    core_release_confirmed: bool,
     pending: Option<PendingManagedSessionSpawn>,
     prepared: Option<PreparedManagedWorktree>,
     prepared_mutation: Option<Box<PreparedMutation>>,
@@ -94,6 +98,13 @@ fn accept_confirmed_rollback(
     let Some(runtime) = daemon.runtime() else {
         return;
     };
+    let worktree_id = &prepared.worktree_id;
+    if runtime.session_type_spawner().managed_attempt_active(worktree_id)
+        || runtime.peek_pending_managed_worktree_id().as_deref() == Some(worktree_id)
+    {
+        runtime.defer_confirmed_worktree_rollback(prepared);
+        return;
+    }
     if runtime.created_worktree_rollback_suppressed(&prepared.worktree_id) {
         return;
     }
@@ -142,6 +153,10 @@ fn accept_confirmed_rollback(
     }
     let operation = ManagedSpawnOperation {
         waiter_id,
+        worktree_id: prepared.worktree_id.clone(),
+        spawner: None,
+        inherited_creation: None,
+        core_release_confirmed: false,
         pending: None,
         prepared: Some(prepared),
         prepared_mutation: None,
@@ -202,6 +217,12 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     runtime.retry_created_worktree_releases();
     runtime.reap_detached_core_operations();
     if let Some(worktree_id) = runtime.peek_pending_managed_worktree_id()
+        && (runtime.session_type_spawner().managed_attempt_active(&worktree_id)
+            || runtime.created_worktree_cleanup_active(&worktree_id))
+    {
+        return;
+    }
+    if let Some(worktree_id) = runtime.peek_pending_managed_worktree_id()
         && runtime.submitted_worktree_rollback(&worktree_id)
     {
         if let Some(prepared) = runtime.take_one_confirmed_worktree_rollback() {
@@ -215,9 +236,11 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         }
         return;
     };
-    runtime
-        .cancel_created_worktree_cleanup(&managed_worktree_id(&pending.target_id, &pending.branch));
+    // A refusal before Host admission leaves the old right in the confirmed
+    // queue. Keep its existing event live without transferring ownership.
     runtime.wake_remaining_confirmed_worktree_rollbacks();
+    let worktree_id = managed_worktree_id(&pending.target_id, &pending.branch);
+    let spawner = runtime.session_type_spawner();
     if let Some(detail) = state
         .host_recovery
         .values()
@@ -289,10 +312,16 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         )));
         return;
     }
+    // The owner has no fallible step between Host admission and this claim.
+    spawner.begin_managed_attempt(worktree_id.clone(), waiter_id);
 
     let accepted_at = pending.accepted_at;
     let operation = ManagedSpawnOperation {
         waiter_id,
+        worktree_id,
+        spawner: Some(spawner),
+        inherited_creation: None,
+        core_release_confirmed: false,
         pending: Some(pending),
         prepared: None,
         prepared_mutation: None,
@@ -348,9 +377,11 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
 impl ManagedSpawnOperation {
     pub(crate) fn take_terminal_parts(
         &mut self,
+        runtime: &crate::HubRuntime,
         identity: HostJobIdentity,
         completion: &mut Option<crate::host_executor::HostCompletion>,
     ) -> Option<crate::host_disposal::Parts> {
+        self.finish_inherited_creation(runtime);
         let mut result = None;
         let (identity, permit) = if let Some(permit) = self.permit.take() {
             (identity, permit)
@@ -377,6 +408,22 @@ impl ManagedSpawnOperation {
     }
 
     pub(crate) fn poll(
+        &mut self,
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+    ) -> ControlPoll {
+        let outcome = self.poll_inner(daemon, state);
+        if matches!(&outcome, ControlPoll::Ready(_) | ControlPoll::FinishedInternal) {
+            let runtime = daemon
+                .runtime()
+                .expect("managed completion runs before daemon runtime stop");
+            self.finish_inherited_creation(runtime);
+            self.finish_active_attempt();
+        }
+        outcome
+    }
+
+    fn poll_inner(
         &mut self,
         daemon: &mut HubDaemon,
         state: &mut DaemonControlState,
@@ -415,6 +462,32 @@ impl ManagedSpawnOperation {
     ) -> ControlPoll {
         match result {
             HostResult::ManagedWorktreeCreated(prepared) => {
+                if let Some(runtime) = daemon.runtime() {
+                    if prepared.created_worktree
+                        && runtime.confirmed_worktree_rollback_exists(&self.worktree_id)
+                    {
+                        self.prepared = Some(prepared);
+                        self.deferred_error = Some(ManagedGitError::new(
+                            "reconciliation_required",
+                            "a prior created worktree still owns cleanup",
+                        ));
+                        return self.submit_finalize(
+                            daemon,
+                            state,
+                            ManagedWorktreeDecision::Rollback,
+                            None,
+                        );
+                    }
+                    if !prepared.created_worktree {
+                        // Reuse does not create a new Git rollback right.
+                        self.inherited_creation =
+                            runtime.take_confirmed_worktree_rollback(&self.worktree_id);
+                        #[cfg(test)]
+                        if self.inherited_creation.is_some() {
+                            runtime.note_inherited_managed_cleanup_transfer();
+                        }
+                    }
+                }
                 self.prepared = Some(prepared);
                 if self.deadline_elapsed() {
                     self.deferred_error = Some(timeout_error());
@@ -640,6 +713,10 @@ impl ManagedSpawnOperation {
     ) -> Self {
         Self {
             waiter_id,
+            worktree_id: prepared.worktree_id.clone(),
+            spawner: None,
+            inherited_creation: None,
+            core_release_confirmed: false,
             pending: Some(pending),
             prepared: Some(prepared),
             prepared_mutation: None,
@@ -648,6 +725,31 @@ impl ManagedSpawnOperation {
             phase: Phase::Spawn,
             next_host_phase: 2,
             record_committed: true,
+            deferred_error: None,
+            deadline: Instant::now() + std::time::Duration::from_secs(15),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_inherited_terminal(
+        waiter_id: WaiterId,
+        prepared: PreparedManagedWorktree,
+        permit: HostWorkPermit,
+    ) -> Self {
+        Self {
+            waiter_id,
+            worktree_id: prepared.worktree_id.clone(),
+            spawner: None,
+            inherited_creation: Some(prepared),
+            core_release_confirmed: true,
+            pending: None,
+            prepared: None,
+            prepared_mutation: None,
+            spawn: None,
+            permit: Some(permit),
+            phase: Phase::Spawn,
+            next_host_phase: 2,
+            record_committed: false,
             deferred_error: None,
             deadline: Instant::now() + std::time::Duration::from_secs(15),
         }
@@ -693,6 +795,10 @@ impl ManagedSpawnOperation {
             .as_ref()
             .err()
             .and_then(|failure| failure.disposition);
+        self.core_release_confirmed = matches!(
+            disposition,
+            Some(botster_core::SessionReservationRelease::Released)
+        );
         let result = runtime.finish_managed_session_spawn(
             self.spawn.as_ref().expect("managed Core spawn exists"),
             self.prepared.as_ref().expect("managed worktree exists"),
@@ -708,6 +814,9 @@ impl ManagedSpawnOperation {
                     .send(Ok(spawned.clone()))
                     .is_ok();
                 if delivered {
+                    // The live reused session now owns the path. A's Core
+                    // reservation was Released before this right transferred.
+                    self.inherited_creation = None;
                     self.submit_finalize(daemon, state, ManagedWorktreeDecision::Commit, None)
                 } else {
                     self.queue_undelivered_created_cleanup(runtime, &spawned);
@@ -1127,17 +1236,21 @@ impl ManagedSpawnOperation {
     }
 
     fn queue_undelivered_created_cleanup(
-        &self,
+        &mut self,
         runtime: &crate::runtime::HubRuntime,
         spawned: &crate::runtime::PluginManagedSessionSpawned,
     ) {
-        let Some(prepared) = self.prepared.clone() else {
-            return;
-        };
         let Some(reservation) = self
             .spawn
             .as_ref()
             .and_then(|start| start.reservation.clone())
+        else {
+            return;
+        };
+        let Some(prepared) = self
+            .inherited_creation
+            .take()
+            .or_else(|| self.prepared.clone())
         else {
             return;
         };
@@ -1213,6 +1326,46 @@ impl ManagedSpawnOperation {
         let response =
             crate::client_api_dto::response::daemon_response_base(DaemonResponseKind::Worktrees);
         ControlPoll::Ready(Ok(response))
+    }
+
+    fn finish_inherited_creation(&mut self, runtime: &crate::HubRuntime) {
+        let Some(prepared) = self.inherited_creation.take() else {
+            return;
+        };
+        let reservation = self
+            .spawn
+            .as_ref()
+            .and_then(|start| start.reservation.clone());
+        if let Some(reservation) = reservation
+            && !self.core_release_confirmed
+        {
+            let session_id = self
+                .spawn
+                .as_ref()
+                .expect("the reservation has a managed spawn")
+                .context
+                .session_id
+                .clone();
+            // A release that never returns Released keeps this cleanup live.
+            // Git rollback cannot begin while that Core obligation is unresolved.
+            runtime.queue_created_worktree_cleanup(session_id, prepared, reservation);
+        } else {
+            runtime.defer_confirmed_worktree_rollback(prepared);
+            runtime.wake_remaining_confirmed_worktree_rollbacks();
+        }
+    }
+
+    fn finish_active_attempt(&mut self) {
+        if let Some(spawner) = self.spawner.take() {
+            spawner.finish_managed_attempt(&self.worktree_id, self.waiter_id);
+        }
+    }
+}
+
+impl Drop for ManagedSpawnOperation {
+    fn drop(&mut self) {
+        // Terminal disposal retains this continuation until Host finishes.
+        self.finish_active_attempt();
     }
 }
 
