@@ -1,12 +1,34 @@
 # Foundation integration and final acceptance
 
-Status: spawn checkpoint `b7864ff9` and recovery checkpoint `5b030dd2` are pushed. Full foundation acceptance remains open.
+Status: spawn checkpoint `b7864ff9` and recovery checkpoint `d45c90da` are pushed. Full foundation acceptance remains open.
 
 ## Current handoff — September 22
 
 This section supersedes the earlier status and assignment statements below.
 
 ### Latest checkpoint and verification results
+
+The worktree correction is committed and pushed as `d45c90da09304c9928ef106c7ada58225c5c450d` over `5b030dd2`.
+This result supersedes the earlier worktree failure and pending implementation statements below.
+Automatic review initially denied the correction. The writer reverted partial changes after each denial.
+Jason then directly approved the specific transition and its stated risk in the implementer's conversation.
+The writer resumed through normal tool review. No deployment or deletion of existing user worktrees was authorized.
+
+The correction serializes attempts through Core release and transfers the original creation right after successful reuse.
+Two admitted requests for the same branch can now both succeed: one creates the worktree, and the other reuses it.
+The renamed regression checks this intentional API change. It does not permit an arbitrary success-or-conflict result.
+The reviewer verified the five-file patch against the live source and checked the raw run records.
+All 18 invocations passed; they cover 17 distinct tests, including the original worktree failure and terminal disposal.
+The library-test artifact SHA256 is `116efb8d91da13661fb1877e6826b93d29e8893994125102df603853b1da3d65`.
+The source patch SHA256 is `882219bd0432653174f1443eb169777d902205315c77364ddfa0729b5eba9a05`.
+The focused log SHA256 is `2173c13161a51f6f8769ec5b0909521783f60653478162f4277e4079ca2ce6e3`.
+Evidence is in `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/`.
+The candidate binaries still come from clean `5b030dd2`; these results do not verify a packaged daemon containing the correction.
+The full suite, repeated stability, and negative controls remain unproved by this run.
+
+Writer 001b now removes only the inert suppression mechanism from `runtime.rs`, `managed_git.rs`, `host_executor.rs`, and `managed_git_worktrees.rs`.
+Reviewer 001e must verify that removal preserves identity checks, submitted rollback exclusion, creation rights, and Core release gating.
+No removal build has started. Integration, complete asynchronous spawning, crash/restart proof, and matched-client verification remain open.
 
 The following update supersedes the earlier recovery publication and test statements in this section.
 
