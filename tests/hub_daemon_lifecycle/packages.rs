@@ -4514,7 +4514,7 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(text.contains("response=operator_error"));
     assert!(text.contains("operation=install"), "{text}");
     assert!(text.contains("InvalidLocalManifest"));
-    assert!(!text.contains(invalid_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(invalid_dir.to_string_lossy().as_ref()), "{text}");
     assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
 
     let incompatible = Command::new(env!("CARGO_BIN_EXE_botster-hub"))

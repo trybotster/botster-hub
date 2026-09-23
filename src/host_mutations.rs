@@ -2535,11 +2535,12 @@ fn daemon_error(error: DaemonTransportError) -> HostMutationError {
 }
 
 fn package_error(error: PackageRegistryError) -> HostMutationError {
+    let package_name = crate::daemon_projection::package_error_display_name(&error);
     HostMutationError::new(
         "package_policy_rejected",
         format!(
             "package {} was rejected: {:?}",
-            error.package_name, error.reason
+            package_name, error.reason
         ),
     )
 }
@@ -2744,6 +2745,42 @@ mod tests {
             base_ref: None,
             metadata: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn host_package_error_uses_existing_display_name_policy() {
+        let path = "/private/local-package/botster-package.json";
+        for reason in [
+            PackageAdmissionReason::InvalidLocalManifest("invalid JSON".to_string()),
+            PackageAdmissionReason::UnsafeLocalPath("path unavailable".to_string()),
+        ] {
+            let error = PackageRegistryError::without_record(
+                path,
+                PackageAction::Install,
+                reason,
+                "install local package".to_string(),
+            );
+            let response = package_error(error);
+            assert_eq!(response.code, "package_policy_rejected");
+            assert!(response.message.starts_with("package <local-package> was rejected: "));
+            assert!(!response.message.contains(path));
+        }
+
+        let named = package_error(PackageRegistryError::without_record(
+            "named.plugin",
+            PackageAction::Install,
+            PackageAdmissionReason::AlreadyInstalled,
+            "install package".to_string(),
+        ));
+        assert!(named.message.contains("package named.plugin was rejected"));
+
+        let refresh = package_error(PackageRegistryError::without_record(
+            path,
+            PackageAction::Show,
+            PackageAdmissionReason::InvalidLocalManifest("invalid JSON".to_string()),
+            "refresh local package registrations".to_string(),
+        ));
+        assert!(refresh.message.contains(path));
     }
 
     fn package_inputs(
