@@ -2294,7 +2294,13 @@ Root and reviewer 001e accepted G5 diff `5e518a82934abaedfb72ba83ae7ec2c203a2583
 The two-file patch includes classifier checks, later-phase error checks, and retained admission checks for package and non-package requests.
 The package admission test checks `configure` after the second poll, with the request ID and both diagnostic copies.
 Root granted agent 001b the sole compiler slot for compilation and four serial, exact library tests.
-Results remain pending. Lifecycle verification requires a fresh candidate after review and the production commit.
+The first build failed on three errors in new tests: two private constructor calls and one invalid mutable borrow.
+The writer applied only mechanical test fixes. The accepted diff is now `7b705ab55224d73168ab742365094f8245bb199b8f53f0b4e7597343fd14b107`.
+The retry build passed. All four exact library tests passed, each with one test executed and 1223 filtered tests.
+Root checked the raw result lines. Reviewer 001e verified the unchanged diff, six log hashes, and both test binaries.
+The retry log SHA-256 is `d75e86c55e04982601f91cf1661d5ce2eaabe0b4308060fccca8241b9f7ebde7`.
+Evidence remains in `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/g5-operation-label`.
+Root authorized the scoped commit, push, and fresh candidate build. Publication and lifecycle verification remain pending.
 The formatting check failed. Baseline attribution remains unverified; no strict formatting acceptance is claimed.
 The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
 
