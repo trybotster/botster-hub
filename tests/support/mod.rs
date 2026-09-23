@@ -7,8 +7,9 @@ struct CandidateBinaries {
     worker: PathBuf,
 }
 
+static CANDIDATE: OnceLock<CandidateBinaries> = OnceLock::new();
+
 fn candidate_binaries() -> &'static CandidateBinaries {
-    static CANDIDATE: OnceLock<CandidateBinaries> = OnceLock::new();
     CANDIDATE.get_or_init(|| {
         let hub = required_candidate_path("BOTSTER_HUB_BIN");
         let worker = required_candidate_path("BOTSTER_SESSION_WORKER_BIN");
@@ -33,6 +34,11 @@ pub fn candidate_hub_binary_path() -> &'static Path {
 #[allow(dead_code)]
 pub fn candidate_session_worker_binary_path() -> &'static Path {
     &candidate_binaries().worker
+}
+
+#[allow(dead_code)]
+pub fn cached_candidate_session_worker_binary_path() -> Option<&'static Path> {
+    CANDIDATE.get().map(|candidate| candidate.worker.as_path())
 }
 
 #[allow(dead_code)]
