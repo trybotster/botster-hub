@@ -6,6 +6,14 @@ Status: spawn checkpoint `a8884a5f` and recovery checkpoint `3bc264a8` are pushe
 
 This checkpoint supersedes older assignment and build-status statements below.
 
+### Latest implementation decisions
+
+- Recovery caller changes remain unbuilt and uncommitted. Root selected one pre-admitted cell for live uncertainty retention. Writer 001d owns the narrow state and transfer changes in `owner_loop.rs`, `pending.rs`, `host_work.rs`, and `managed_git.rs`. Reviewer 001e checks admission, evidence transfer, occupied-cell refusal, and cleanup ownership. General polling and spawn dispatch remain outside this assignment.
+- The cell addresses live retention only. Startup error disposal, terminal disposal, and restart refusal share one unresolved durable-ownership blocker. Root requested user approval to extend recovery with durable intent and conservative restart refusal. No protocol implementation is approved yet.
+- The existing in-document ledger covers session and worktree phases. A post-failure record cannot establish its own durability. A precommitted intent remains a candidate, not an accepted protocol. A digest match proves visible content, not successful synchronization.
+- Spawn writer 001b reports that runtime-only spawning now refuses before enqueue or effects. Legacy queued requests receive the same refusal. Source verification remains pending. The Lua handoff, Host connection, and owner receipt lifecycle remain incomplete.
+- The single spawn queue remains selected. Review confirmed one pop per owner activation, not a byte or time bound. The reviewer withdrew the bare-channel loss claim after tracing the conversion receipt in the payload. Its owner-side ticket still requires connection.
+
 - Recovery: `3bc264a8` adds sticky write quarantine. All 12 state-directory tests passed. Reviewer 001e accepted the evidence. This proves the storage primitive, not runtime activation.
 - Spawn: the parser oracle passed all 12 fixtures. Artifact SHA256 is `8506fcf5b977d968085179b51de02f7d8a26962640c456f245781c735ac6d7c1`. Evidence is in the spawn worktree at `target/parser-oracle-20260922-v2`. This is fixture evidence, not a bound for all inputs.
 - Recovery writer 001d and reviewer 001e completed source review of retained authority and the inspect migration. The four-file API diff is `b623f605c57fc0b120c8b8b655c85bf8bb03dba8b5a386f11a134ee62ed2fa16`. The two-file inspect diff is `3d1146d61019350b8c107df1de1b2d1aef4af255a9e84207d167bc45c11e5d3b`. These changes are unbuilt and uncommitted. Runtime, daemon, Host, and test callers must migrate with the API.
