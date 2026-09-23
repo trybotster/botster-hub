@@ -2316,14 +2316,30 @@ All three exact lifecycle selectors passed against that candidate, each executin
 The local CLI test passed in 8.40 seconds. The plugin namespace test passed in 5.63 seconds.
 The package contract matrix passed in 10.72 seconds. Root checked all three raw result logs and the recorded commands.
 Evidence resides in `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/g5-candidate-db3dc263-20260923`.
-Independent lifecycle evidence review is pending. These passes do not establish full acceptance.
-Root released the compiler slot. Agent 001b next audits the G6 source guard without edits.
+Reviewer 001e verified the lifecycle evidence and closed the focused G5 checkpoint. These passes do not establish full acceptance.
 Reason-payload sanitization is outside this correction. The separate CLI Package Display site remains an unverified follow-up candidate.
 The formatting check failed. Baseline attribution remains unverified; no strict formatting acceptance is claimed.
 The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
 
-The remaining failure groups cover operation labels,
-the terminal-path source guard, shutdown during update checks, chunk reassembly, and deterministic WebRTC failure evidence.
+### G6 source guard: source accepted; execution pending
+
+The old guard treats all Lua references outside two files as forbidden. Newer ownership contracts require typed bridge consumers.
+The correction preserves the recursive source scan and the explicit terminal file checks.
+It permits reviewed runtime owners and exact typed carriers. It does not permit additional references in carrier files.
+The checked test-item scanner preserves production code after test modules. It rejects malformed reviewed boundaries.
+The feature-gate check rejects declarations whose apparent gate occurs inside a comment or string.
+This source guard does not prove the absence of every possible Lua execution path.
+
+Root and reviewer 001e accepted combined patch `22d0f621877e77437b708dc31c2f0cb6b4631e79f745166d290860e576955f81`.
+The three changed files are lifecycle test files. Production source remains at `db3dc263`.
+The patch resides in `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/g6-guard-review-20260923/combined.patch`.
+Agent 001b owns the sole compiler slot for Rust 1.97, jobs 2, incremental 0, locked/offline.
+The next checks are six exact helper tests, the outer guard, and two existing terminal behavior tests.
+Each invocation must execute one test. The writer must stop at the first failure and preserve the evidence.
+The terminal tests use the verified `db3dc263` candidate. No G6 execution result is accepted yet.
+
+The remaining failure groups cover the terminal-path source guard, shutdown during update checks,
+chunk reassembly, and deterministic WebRTC failure evidence.
 The selected WebRTC test design must prove an incomplete response and read the record through the real owner consumer.
 CLI failure-format coverage remains open. The test design does not close that requirement.
 
