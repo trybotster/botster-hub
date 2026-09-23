@@ -42,8 +42,8 @@ use crate::subscription::attach_routes::{
     record_attached_subscription_change,
 };
 use crate::subscription::entity::{
-    EntitySubscriptionState, drive_entity_subscriptions, drive_package_entity_fanout,
-    seed_lifecycle_reconciliation,
+    EntitySubscriptionCapacityWake, EntitySubscriptionState, drive_entity_subscriptions,
+    drive_package_entity_fanout, seed_lifecycle_reconciliation,
 };
 use crate::subscription::entity_resync::drive_package_entity_resync;
 use crate::transport::unix::connection::{
@@ -363,6 +363,12 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
 /// Read persistent notification bits before the owner can block.
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if state.entity_capacity_wake.take() {
+        state
+            .maintenance
+            .wakes
+            .mark(MaintenanceSliceKind::SubscriberDelivery);
+    }
     if state.budget.take_capacity_notification() {
         if state.coordination_waiting_for_owner && state.coordination_fault.is_none() {
             state.coordination_waiting_for_owner = false;
@@ -986,6 +992,7 @@ fn run_control_ingress_item(
                 .accepted_connections
                 .saturating_add(1);
             let tx = control_tx.clone();
+            let entity_capacity_wake = state.entity_capacity_wake.clone();
             let shutdown = shutdown_tx.subscribe();
             state.lifecycle_counters.live_connections =
                 state.lifecycle_counters.live_connections.saturating_add(1);
@@ -996,7 +1003,14 @@ fn run_control_ingress_item(
             connection_tasks.push(transport_runtime.spawn(async move {
                 let _admission_permit = admission_permit;
                 if let Err(error) =
-                    handle_connection_async(stream, tx, cleanup_permit, shutdown, connection_permit)
+                    handle_connection_async(
+                        stream,
+                        tx,
+                        entity_capacity_wake,
+                        cleanup_permit,
+                        shutdown,
+                        connection_permit,
+                    )
                         .await
                 {
                     eprintln!("botster-hub daemon connection error: {error}");
@@ -1102,6 +1116,10 @@ fn serve_daemon_inner(
     control_state
         .plugin_result_budget
         .bind_owner_wake(control_tx.clone());
+    control_state.entity_capacity_wake.bind(control_tx.clone());
+    daemon
+        .local_webrtc()
+        .bind_entity_capacity_wake(control_state.entity_capacity_wake.clone());
     if let Some(runtime) = daemon.runtime() {
         runtime.install_plugin_completion_notifier(
             control_state.plugin_result_budget.completion_notifier(),
@@ -1767,6 +1785,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) drain_cursors: BTreeMap<String, u64>,
     pub(crate) egress_diagnostics: DaemonEgressDiagnostics,
     pub(crate) entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
+    pub(crate) entity_capacity_wake: EntitySubscriptionCapacityWake,
     pub(crate) event_plane: std::sync::Arc<crate::subscription::package_events::ClientEventPlane>,
     pub(crate) client_events: crate::daemon::client_events::ClientEvents,
     pub(crate) pending_runtime: PendingRuntimeState,
@@ -2031,6 +2050,7 @@ impl Default for DaemonControlState {
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
             entity_subscriptions: BTreeMap::new(),
+            entity_capacity_wake: EntitySubscriptionCapacityWake::default(),
             client_events: crate::daemon::client_events::ClientEvents::default(),
             event_plane: std::sync::Arc::new(
                 crate::subscription::package_events::ClientEventPlane::default(),
@@ -2868,6 +2888,7 @@ mod tests {
             runtime.block_on(handle_connection_async(
                 stream,
                 connection_tx,
+                EntitySubscriptionCapacityWake::default(),
                 cleanup_permit,
                 shutdown_rx,
                 permit,

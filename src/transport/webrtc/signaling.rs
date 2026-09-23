@@ -40,12 +40,14 @@ impl LocalWebrtcTransport {
         let grant_id = accepted.grant_id.clone();
 
         let event_plane = self.event_plane.0.clone();
+        let entity_capacity_wake = self.entity_capacity_wake.clone();
         let answer = self.runtime()?.block_on(answer_offer(
             grant_id.clone(),
             accepted.stream_key,
             request.offer,
             runtime_tx,
             event_plane,
+            entity_capacity_wake,
         ))?;
         self.peers.insert(grant_id.clone(), answer.peer);
         self.peer_states.insert(grant_id.clone(), answer.peer_state);
@@ -71,6 +73,7 @@ pub(crate) async fn answer_offer(
     offer: Value,
     runtime_tx: ControlSender,
     event_plane: Arc<crate::subscription::package_events::ClientEventPlane>,
+    entity_capacity_wake: crate::subscription::entity::EntitySubscriptionCapacityWake,
 ) -> LocalWebrtcResult<LocalWebrtcAnswer> {
     let runtime = default_runtime()
         .ok_or_else(|| LocalWebrtcError::Webrtc("no async runtime".to_string()))?;
@@ -79,6 +82,7 @@ pub(crate) async fn answer_offer(
         grant_id.clone(),
         runtime_tx,
         event_plane,
+        entity_capacity_wake,
     ));
     let handler = Arc::new(LocalWebrtcHandler {
         stream_key,

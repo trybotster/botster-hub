@@ -144,6 +144,7 @@ struct CompletedRequest {
 pub(crate) async fn handle_connection_async(
     stream: TokioUnixStream,
     control_tx: ControlSender,
+    entity_capacity_wake: crate::subscription::entity::EntitySubscriptionCapacityWake,
     cleanup_permit: tokio_mpsc::OwnedPermit<ControlMessage>,
     mut shutdown_rx: watch::Receiver<bool>,
     permit: OwnerPermit,
@@ -262,6 +263,7 @@ pub(crate) async fn handle_connection_async(
                     }
                     entity = entity_rx.recv() => {
                         if let Some(entity) = entity {
+                            entity_capacity_wake.publish();
                             mux_write.enqueue_entity_frame(entity)?;
                             mux.clear_deferred_flushes();
                             if let Err(error) = flush_unix_mux_writes(
@@ -899,6 +901,7 @@ pub(crate) fn handle_connection(
     let result = runtime.block_on(handle_connection_async(
         stream,
         control_tx,
+        crate::subscription::entity::EntitySubscriptionCapacityWake::default(),
         cleanup_permit,
         shutdown_rx,
         permit,

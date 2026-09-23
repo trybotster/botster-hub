@@ -522,6 +522,20 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_a_running_delivery_does_not_release_its_completion_fence() {
+        let identity = HostJobIdentity::first(WaiterId(703));
+        let mut work = EntityWork::new(None);
+        work.phase = Phase::Running(identity);
+        let publication = Arc::new(AtomicBool::new(true));
+        work.publication = Some(Arc::clone(&publication));
+
+        work.cancel();
+
+        assert!(work.accepts(identity));
+        assert!(!publication.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn entity_completion_requires_the_exact_waiter_and_phase() {
         let executor = HostExecutor::new();
         let identity = HostJobIdentity::first(WaiterId(702));

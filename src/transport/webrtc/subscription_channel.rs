@@ -624,6 +624,7 @@ async fn run_bound_entity_channel<C>(
             biased;
             frame = receiver.recv() => {
                 let Some(entity) = frame else { break };
+                route.peer_state.entity_capacity_wake.publish();
                 let (frames, retained_delivery) = match entity {
                     crate::entity_delivery::EntityDelivery::Typed(entity) => (framed_server_frame(stream_key, &ServerFrame::Entity { entity }), None),
                     crate::entity_delivery::EntityDelivery::Encoded(delivery) => {
