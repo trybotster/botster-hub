@@ -2290,7 +2290,12 @@ Agent 001b now owns the bounded correction in `host_work.rs` and diagnostic test
 The continuation retains the static label from the typed request before the request moves into the Host command.
 Both admission calls and all `finish_error` calls must receive that label. Unclassified and non-package labels remain unchanged.
 Restoration transport errors remain unchanged. `PreparedMutation`, submission errors, and commit-outcome mapping remain outside this correction.
-Reviewer 001e must check the diff and focused tests before compilation. The compiler slot is free.
+Root and reviewer 001e accepted G5 diff `5e518a82934abaedfb72ba83ae7ec2c203a258392adea6da163fe0ef46a3a7bb` at HEAD `abe4ceb6`.
+The two-file patch includes classifier checks, later-phase error checks, and retained admission checks for package and non-package requests.
+The package admission test checks `configure` after the second poll, with the request ID and both diagnostic copies.
+Root granted agent 001b the sole compiler slot for compilation and four serial, exact library tests.
+Results remain pending. Lifecycle verification requires a fresh candidate after review and the production commit.
+The formatting check failed. Baseline attribution remains unverified; no strict formatting acceptance is claimed.
 The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
 
 The remaining failure groups cover operation labels,
