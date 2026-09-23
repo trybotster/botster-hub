@@ -1044,6 +1044,11 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
         failed_data_dir.join("hub-state.json"),
     )
     .expect("copy installed package state into fresh failed-start directory");
+    fs::copy(
+        data_dir.join("hub-recovery.log"),
+        failed_data_dir.join("hub-recovery.log"),
+    )
+    .expect("copy matching recovery journal into fresh failed-start directory");
     fs::remove_dir_all(&web_package_dir).expect("remove installed web checkout");
 
     let failed = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -1949,11 +1954,14 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     let stopped_again = daemon.stop();
     assert_eq!(stopped_again, stopped);
 
-    let reopened = store
-        .load_or_initialize(&config)
+    drop(daemon);
+    let (reopened, authority) = store
+        .load_retained(&config)
         .expect("reload committed daemon state");
+    let authority = authority.expect("File reload retains state authority");
     assert_eq!(reopened.schema_version, 4);
     assert_eq!(reopened.host.id, "hub-daemon-test");
+    drop(authority);
 }
 
 #[test]
@@ -2273,11 +2281,14 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
     assert_eq!(status.schema_version, 4);
 
     daemon.stop();
-    let reopened = store
-        .load_or_initialize(&config)
+    drop(daemon);
+    let (reopened, authority) = store
+        .load_retained(&config)
         .expect("reload existing state after stop");
+    let authority = authority.expect("File reload retains state authority");
     assert_eq!(reopened.package_registry.records.len(), 1);
     assert!(reopened.package_registry.records[0].is_enabled());
+    drop(authority);
 }
 
 #[test]

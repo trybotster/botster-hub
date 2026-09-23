@@ -4224,9 +4224,11 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
     );
 
     shutdown_cli_daemon(&data_dir, child);
-    let state = FileHubStateStore::for_data_directory(&data_dir)
-        .load_or_initialize(&explicit_config(&data_dir))
+    let store = FileHubStateStore::for_data_directory(&data_dir);
+    let (state, authority) = store
+        .load_retained(&explicit_config(&data_dir))
         .expect("load persisted hub state after registry install");
+    let authority = authority.expect("File reload retains state authority");
     let restored = PackageRegistry::from_snapshot(state.package_registry)
         .expect("restore package registry snapshot");
     let record = restored.package("runtime.git").expect("restored package");
@@ -4243,6 +4245,7 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
         record.pin.as_ref().expect("pin").rev.as_deref(),
         Some("abc123")
     );
+    drop(authority);
 }
 
 #[test]
