@@ -997,7 +997,7 @@ fn package_registry_error_diagnostics(
     }
 }
 
-fn package_error_display_name(error: &crate::PackageRegistryError) -> &str {
+pub(crate) fn package_error_display_name(error: &crate::PackageRegistryError) -> &str {
     if error
         .audit_reason
         .contains("refresh local package registrations")
