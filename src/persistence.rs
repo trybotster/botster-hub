@@ -1252,6 +1252,16 @@ mod tests {
         store.load_retained(config).map(|(state, _authority)| state)
     }
 
+    fn replace_initialized_file_document(
+        store: &FileHubStateStore,
+        config: &HubConfig,
+        bytes: &[u8],
+    ) {
+        let (_, authority) = store.load_retained(config).expect("initialize File state");
+        drop(authority);
+        fs::write(store.path(), bytes).expect("replace initialized test document");
+    }
+
     fn unique_test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1664,12 +1674,11 @@ mod tests {
         object.remove("credential_keys");
         object.remove("trusted_browser_identities");
         object.remove("bootstrap_grants");
-        fs::create_dir_all(&config.data_directory).expect("create data dir");
-        fs::write(
-            store.path(),
-            serde_json::to_vec_pretty(&value).expect("serialize legacy-shaped state"),
-        )
-        .expect("write legacy-shaped state");
+        replace_initialized_file_document(
+            &store,
+            &config,
+            &serde_json::to_vec_pretty(&value).expect("serialize legacy-shaped state"),
+        );
 
         let reopened = load_file_state(&store, &config)
             .expect("load current state with omitted optional collections");
@@ -1700,12 +1709,11 @@ mod tests {
             "device_session_template_sources".to_string(),
             serde_json::json!([{"root": ".", "session_templates": []}]),
         );
-        fs::create_dir_all(&config.data_directory).expect("create data dir");
-        fs::write(
-            store.path(),
-            serde_json::to_vec_pretty(&value).expect("serialize v2 state"),
-        )
-        .expect("write v2 state");
+        replace_initialized_file_document(
+            &store,
+            &config,
+            &serde_json::to_vec_pretty(&value).expect("serialize v2 state"),
+        );
 
         assert!(matches!(
             load_file_state(&store, &config),
@@ -1734,12 +1742,11 @@ mod tests {
             .expect("current queue capacity");
         core_engine.remove("plugin_worker_executor_concurrency");
         core_engine.insert("plugin_worker_capacity".to_string(), queue_capacity);
-        fs::create_dir_all(&config.data_directory).expect("create data dir");
-        fs::write(
-            store.path(),
-            serde_json::to_vec_pretty(&value).expect("serialize v1 state"),
-        )
-        .expect("write v1 state");
+        replace_initialized_file_document(
+            &store,
+            &config,
+            &serde_json::to_vec_pretty(&value).expect("serialize v1 state"),
+        );
 
         assert!(matches!(
             load_file_state(&store, &config),
@@ -2091,6 +2098,7 @@ mod tests {
         let (original, Some(mut authority)) = store.load_retained(&config).unwrap() else {
             panic!("File load must return its authority");
         };
+        let prior_bytes = fs::read(store.path()).expect("read initial state document");
         let prior = SharedView::from_reserved(
             original.clone(),
             authority.take_startup_charge().expect("startup charge"),
@@ -2115,18 +2123,24 @@ mod tests {
             })
         ));
         drop(authority);
-
-        let reopened = load_file_state(&store, &config)
-            .expect("old state still loads after interrupted write");
-        assert_eq!(reopened, original);
+        assert_eq!(
+            fs::read(store.path()).expect("read unchanged state document"),
+            prior_bytes
+        );
+        assert!(matches!(
+            load_file_state(&store, &config),
+            Err(HubStateStoreError::RecoveryRequired {
+                reason: "recovery_intent_unresolved",
+                sequence: Some(2),
+            })
+        ));
     }
 
     #[test]
     fn file_store_rejects_corrupt_state_file() {
         let config = test_config("corrupt");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
-        fs::create_dir_all(&config.data_directory).expect("create test data dir");
-        fs::write(store.path(), b"{not json").expect("write corrupt state");
+        replace_initialized_file_document(&store, &config, b"{not json");
 
         let error = load_file_state(&store, &config).expect_err("corrupt state should fail");
 
@@ -2139,12 +2153,11 @@ mod tests {
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let mut state = HubState::from_config(&config);
         state.schema_version = 99;
-        fs::create_dir_all(&config.data_directory).expect("create test data dir");
-        fs::write(
-            store.path(),
-            serde_json::to_vec_pretty(&state).expect("serialize unsupported state"),
-        )
-        .expect("write unsupported state");
+        replace_initialized_file_document(
+            &store,
+            &config,
+            &serde_json::to_vec_pretty(&state).expect("serialize unsupported state"),
+        );
 
         let error = load_file_state(&store, &config).expect_err("unsupported version should fail");
 
