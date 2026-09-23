@@ -21,6 +21,22 @@ The following update supersedes the earlier recovery publication and test statem
 
 Earlier checkpoint details follow.
 
+### Worktree correction assignment
+
+Root selected serialization of attempts for the same worktree, with transfer of the original creation right.
+Later requests remain in the existing bounded queue until the active attempt reaches its terminal state.
+The terminal event must wake the queue. No polling or new queue is approved.
+The original creation right remains distinct from each attempt's session cleanup and reservation release.
+Early refusal must not change that right. Git rollback must wait for all relevant Core releases.
+The existing exclusion for submitted rollback remains in force.
+
+Writer 001b may implement after reviewer 001e accepts this lifecycle.
+The assigned recovery files are `runtime.rs`, `daemon/control/managed_git.rs`, and the session tests.
+An `owner_loop.rs` change requires a demonstrated missing terminal wake.
+The writer must preserve the frozen fixture patch and recovery publication logic.
+The four regressions cover delayed completion, failed reuse, submitted rollback, and refusal before admission.
+No build, Host recheck, durable protocol change, integration merge, or deployment is assigned by this step.
+
 - Spawn checkpoint `b7864ff947e22fe48b49eb27c286543fabfffa61` contains all 28 reviewed code/test files. Writer 001b reports a successful non-force push to `delivery/async-spawn-20260921`. Local evidence remains untracked. No deployment occurred.
 - The complete spawn patch matches the tested tree. The earlier partial file proposal omitted required dependencies and was rejected. Review established that the shared Lua changes belong to this spawn work; no separate safety checkpoint is required.
 - The exact final-output parity test passed on artifact `138b00a4163cd9433534a0c285ffc67b36bcc2c9e0846170a79f4162aa870151`. A direct rerun recorded the command and actual numeric exit 0 after the first run omitted those records. Full daemon spawning remains unproved; the production path still returns `Unavailable` pending the startup-path decision.
