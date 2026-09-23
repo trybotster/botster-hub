@@ -2321,7 +2321,7 @@ Reason-payload sanitization is outside this correction. The separate CLI Package
 The formatting check failed. Baseline attribution remains unverified; no strict formatting acceptance is claimed.
 The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
 
-### G6 source guard: focused verification accepted; publication pending
+### G6 source guard: focused verification accepted and published
 
 The old guard treats all Lua references outside two files as forbidden. Newer ownership contracts require typed bridge consumers.
 The correction preserves the recursive source scan and the explicit terminal file checks.
@@ -2342,7 +2342,8 @@ The terminal tests used the verified `db3dc263` candidate. The WebRTC output tes
 Root inspected the commands and raw results. Root and reviewer 001e verified every entry in `SHA256SUMS`.
 The test binary SHA-256 is `015283d1ab1f47c9092fbb971a7cdaf58d7e0538dcdd484c498497aa219f0e2b`.
 Reviewer 001e accepted the focused evidence. The writer released the compiler slot.
-Root authorized the three-file checkpoint commit and push. Publication confirmation remains pending.
+Agent 001b committed and pushed `8fe98a85f6562ba41546a2ec7a4464b157749276` with only the three reviewed test files.
+The writer confirmed the exact remote head. Root verified the local commit, changed file list, and clean worktree.
 Agent 001b next diagnoses the G7 shutdown timeout and cancelled-read failure without source changes.
 These passes establish only the tested behavior. They do not establish full acceptance.
 
