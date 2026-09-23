@@ -105,9 +105,6 @@ fn accept_confirmed_rollback(
         runtime.defer_confirmed_worktree_rollback(prepared);
         return;
     }
-    if runtime.created_worktree_rollback_suppressed(&prepared.worktree_id) {
-        return;
-    }
     let Some(owner_permit) = state.budget.reserve() else {
         runtime.defer_confirmed_worktree_rollback(prepared);
         state.managed_spawn_waiting_for_owner = true;
@@ -137,7 +134,6 @@ fn accept_confirmed_rollback(
             decision: ManagedWorktreeDecision::Rollback,
             deadline,
             discard: None,
-            suppress_rollback: runtime.created_worktree_rollback_suppressions(),
             #[cfg(test)]
             rollback_hold: runtime.test_rollback_git_hold(),
         },
@@ -882,13 +878,7 @@ impl ManagedSpawnOperation {
         }
         match result {
             HostResult::ManagedWorktreeFinalized => {
-                let suppressed = self.prepared.as_ref().is_some_and(|prepared| {
-                    daemon.runtime().is_some_and(|runtime| {
-                        runtime.created_worktree_rollback_suppressed(&prepared.worktree_id)
-                    })
-                });
-                let remove_record = !suppressed
-                    && self.record_committed
+                let remove_record = self.record_committed
                     && self
                         .prepared
                         .as_ref()
@@ -1162,14 +1152,6 @@ impl ManagedSpawnOperation {
                 decision,
                 deadline: self.deadline,
                 discard,
-                suppress_rollback: daemon
-                    .runtime()
-                    .map(|runtime| runtime.created_worktree_rollback_suppressions())
-                    .unwrap_or_else(|| {
-                        std::sync::Arc::new(
-                            std::sync::Mutex::new(std::collections::BTreeSet::new()),
-                        )
-                    }),
                 #[cfg(test)]
                 rollback_hold: daemon
                     .runtime()
