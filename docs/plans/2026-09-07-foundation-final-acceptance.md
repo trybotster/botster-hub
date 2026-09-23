@@ -2259,17 +2259,34 @@ Three exact lifecycle tests then passed, each with one passed, zero failed, and 
 - Stagnant provider without a family gap: 15.61 seconds; SHA-256 `3eb9d432286f5db96c98e30bb4e19938ef9b27e0a7938f05ef5eec975c7ddbba`.
 - Original pressure case: 15.13 seconds; SHA-256 `7dade79b79063f9023c516dd6e0242a2b669c6f260ed1bbdd290bf18a6f62354`.
 
-Root inspected the raw result lines and recorded commands. Independent runtime evidence review is pending.
+Root inspected the raw result lines and recorded commands. The reviewer verified the runtime evidence.
 The stagnant test checks eight new attempts, one new degradation, stable counters for three seconds, and no rollback or Error for A.
 These focused passes do not establish repeat stability or full acceptance. Strict lint and the full suite remain open.
-Agent 001b now audits the remaining protocol/constants and CLI schema failures without edits. Agent 001e verifies the runtime evidence.
+The same test binary failed against the prior `10b13941` candidate at the intended final catch-up assertion.
+All setup checks passed. The final wait received one additional stale snapshot, with one attempt and zero degradations.
+The negative-control log SHA-256 is `02662db744a4415d394dc101389c127aa5679c048c107f01879b7589925ba833`.
+The reviewer verified this comparison and closed the candidate-isolation caveat.
 The candidate build reported warnings; attribution remains unverified. No installation or running-daemon replacement occurred.
 The old candidate must not supply runtime evidence for this production change.
 The evidence packet is `g2-implementation-review.md` in the evidence directory above.
 The retry compile log SHA-256 is `cb24e49cc131bfca7358e736c9b85e905f8bf03dad73502551d0829562b8ff60`.
 The focused log SHA-256 is `57b2450b711ec3c28a11592eecc26ab01df810335697c2aa96def692b56275f0`.
 
-The remaining failure groups cover entity resynchronization, protocol constants, CLI schema expectations, operation labels,
+The G3/G4 correction changes four test files only. It updates stale protocol, conformance, and CLI schema expectations.
+It preserves feature refusal checks, the protocol 8 rejection fixture, and legacy schema 3 reader support.
+The reviewed diff SHA-256 is `a68a014095da71a756656c711a6688e5f07aec7f6a90ee3f15bc260147ac84b2`.
+Eight exact client tests and five exact lifecycle tests passed. Each invocation executed one test.
+The lifecycle tests used the unchanged production candidate from `8d9cc48e`.
+The reviewer verified all fifteen log hashes, both test binaries, and the current selectors.
+Root read the evidence packet and checked the raw result lines. Root accepted this focused checkpoint.
+The packet is `managed-recovery-20260922/g3-g4-test-only-fixture-run.md` under `/Users/jasonconigliari/botster-evidence`.
+Its SHA-256 is `5b70f7fdf8c3507b2ad685063c116d088e39413f603b341a59a84168875a1bed`.
+Agent 001b owns the scoped commit and push. Publication is pending confirmation.
+Agent 001b and reviewer 001e next trace G5 operation labels through Host failure and restoration paths.
+The compiler slot is free. No G5 source change is authorized before the premise review.
+The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
+
+The remaining failure groups cover operation labels,
 the terminal-path source guard, shutdown during update checks, chunk reassembly, and deterministic WebRTC failure evidence.
 The selected WebRTC test design must prove an incomplete response and read the record through the real owner consumer.
 CLI failure-format coverage remains open. The test design does not close that requirement.
