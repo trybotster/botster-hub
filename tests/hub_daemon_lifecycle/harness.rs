@@ -420,7 +420,7 @@ fn collect_registry_record(
     if let Some(snapshot) = process_snapshot(command_pid) {
         capture.owned.push_pid(command_pid);
         capture.owned.push_pgid(snapshot.pgid);
-        match worktree_session_worker_ancestor(command_pid) {
+        match validated_candidate_session_worker_ancestor(command_pid) {
             Some(worker_pid) => retain_verified_worker(capture, &session_id, worker_pid),
             None => match reread_until_exited_or_bound(registry, &record.session_id) {
                 Ok(None) => {}
@@ -472,7 +472,7 @@ fn retain_recovery_worker(
     if !recovery_worker_is_live(worker_pid) {
         return;
     }
-    if !worker_pid_matches_worktree_session_worker(worker_pid) {
+    if !worker_pid_matches_validated_candidate(worker_pid) {
         capture.errors.push(format!(
             "resolved worker {worker_pid} is live but unverifiable for session {session_id}"
         ));
@@ -567,10 +567,10 @@ fn identity_from_record(record: RegistryRecord) -> RegistryWorkerIdentity {
     }
 }
 
-pub(crate) fn worktree_session_worker_ancestor(pid: u32) -> Option<u32> {
+pub(crate) fn validated_candidate_session_worker_ancestor(pid: u32) -> Option<u32> {
     let mut current = pid;
     for _ in 0..8 {
-        if worker_pid_matches_worktree_session_worker(current) {
+        if worker_pid_matches_validated_candidate(current) {
             return Some(current);
         }
         let snapshot = process_snapshot(current)?;
@@ -582,7 +582,7 @@ pub(crate) fn worktree_session_worker_ancestor(pid: u32) -> Option<u32> {
     None
 }
 
-pub(crate) fn worker_pid_matches_worktree_session_worker(pid: u32) -> bool {
+pub(crate) fn worker_pid_matches_validated_candidate(pid: u32) -> bool {
     let output = Command::new("ps")
         .arg("-p")
         .arg(pid.to_string())
@@ -595,7 +595,7 @@ pub(crate) fn worker_pid_matches_worktree_session_worker(pid: u32) -> bool {
     let command = String::from_utf8_lossy(&output.stdout);
     let argv0 = command.split_whitespace().next().unwrap_or("");
     Path::new(argv0).file_name().and_then(|name| name.to_str()) == Some("botster-session-worker")
-        && worker_executable_from_this_worktree(&SessionWorkerProcessIdentity {
+        && worker_executable_is_validated_candidate(&SessionWorkerProcessIdentity {
             pid,
             command: command.trim().to_string(),
             shell_descendant_pids: Vec::new(),
@@ -707,7 +707,7 @@ pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReap
                 Ok(workers) => {
                     let mut matched = false;
                     for worker in workers {
-                        if worker_pid_matches_worktree_session_worker(worker.pid) {
+                        if worker_pid_matches_validated_candidate(worker.pid) {
                             match signal_worker_group(worker.pid) {
                                 Ok(()) => outcome.reaped.push(worker.pid),
                                 Err(error) => outcome.errors.push(error),
@@ -726,7 +726,7 @@ pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReap
             }
             continue;
         };
-        match worktree_session_worker_ancestor(pid) {
+        match validated_candidate_session_worker_ancestor(pid) {
             Some(worker_pid) => {
                 match signal_worker_group(worker_pid) {
                     Ok(()) => outcome.reaped.push(worker_pid),
@@ -755,7 +755,7 @@ pub(crate) fn reap_registry_backed_workers(data_dir: &Path) -> Result<WorkerReap
                 Ok(Some(latest)) => match recovery_worker_pid(&latest) {
                     Some(worker_pid)
                         if recovery_worker_is_live(worker_pid)
-                            && worker_pid_matches_worktree_session_worker(worker_pid) =>
+                            && worker_pid_matches_validated_candidate(worker_pid) =>
                     {
                         match signal_worker_group(worker_pid) {
                             Ok(()) => outcome.reaped.push(worker_pid),

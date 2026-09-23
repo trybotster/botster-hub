@@ -405,6 +405,7 @@ impl PanicSafeCliDaemon {
             record_harness_taint(format!("{}: {error}", self.panic_context));
             panic!("{error}");
         }
+        check_harness_taint();
         output
     }
 
