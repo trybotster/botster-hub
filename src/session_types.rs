@@ -6,8 +6,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use botster_core::{
     CoreSessionMetadata, PackageSource, RequestId, ResizePayload, SessionId, SessionSpawnRequest,
@@ -243,6 +246,13 @@ pub(crate) enum RepoSessionTypeFileSnapshot {
     Present(Vec<u8>),
 }
 
+/// A repository file reached rename but its directory sync did not confirm.
+#[must_use]
+pub(crate) enum RepoSessionTypeFileCommit {
+    Synced,
+    PublishedUncertain(SessionTypeError),
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RepoSessionTypesFile {
     #[serde(default)]
@@ -264,7 +274,11 @@ pub(crate) fn commit_repo_session_type_mutation(
     repo_write: Option<(PathBuf, Vec<PackageSessionType>)>,
 ) -> SessionTypeResult<()> {
     if let Some((root, definitions)) = repo_write {
-        write_repo_session_types(&root, &definitions)?;
+        let bytes = encode_repo_session_type_bytes(&definitions)?;
+        match commit_repo_session_type_bytes(&root, &bytes)? {
+            RepoSessionTypeFileCommit::Synced => {}
+            RepoSessionTypeFileCommit::PublishedUncertain(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -385,10 +399,9 @@ fn apply_definition_mutation(
         .map_err(|message| SessionTypeError::new("invalid_session_types", message))
 }
 
-fn write_repo_session_types(
-    root: &Path,
+pub(crate) fn encode_repo_session_type_bytes(
     definitions: &[PackageSessionType],
-) -> SessionTypeResult<()> {
+) -> SessionTypeResult<Vec<u8>> {
     let bytes = serde_json::to_vec(&serde_json::json!({
         "session_types": definitions,
     }))
@@ -407,7 +420,40 @@ fn write_repo_session_types(
             ),
         ));
     }
+    Ok(bytes)
+}
+
+/// Sync the file before rename and the directory after rename.
+/// A post-rename failure remains an uncertain publication.
+pub(crate) fn commit_repo_session_type_bytes(
+    root: &Path,
+    bytes: &[u8],
+) -> SessionTypeResult<RepoSessionTypeFileCommit> {
+    use rustix::fs::{Mode, OFlags, openat, renameat};
+
+    let canonical_root = root.canonicalize().map_err(|error| {
+        SessionTypeError::new(
+            "target_not_admitted",
+            format!("admitted target is unavailable: {error}"),
+        )
+    })?;
+    let root_file = File::open(&canonical_root).map_err(|error| {
+        SessionTypeError::new(
+            "target_not_admitted",
+            format!("admitted target could not be opened: {error}"),
+        )
+    })?;
     let directory = root.join(".botster");
+    let created_directory = match fs::symlink_metadata(&directory) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(SessionTypeError::new(
+                "repo_session_type_write_failed",
+                format!("repo session type directory could not be checked: {error}"),
+            ));
+        }
+    };
     fs::create_dir_all(&directory).map_err(|error| {
         SessionTypeError::new(
             "repo_session_type_write_failed",
@@ -420,25 +466,161 @@ fn write_repo_session_types(
             "repo session type directory is unavailable",
         )
     })?;
-    if !canonical_directory.starts_with(root) {
+    if !canonical_directory.starts_with(&canonical_root) {
         return Err(SessionTypeError::new(
             "target_not_admitted",
             "repo session type directory escapes the admitted target",
         ));
     }
-    let temporary = root.join(REPO_SESSION_TYPES_TEMP_FILE);
-    fs::write(&temporary, bytes).map_err(|error| {
+    let descriptor = openat(
+        &root_file,
+        ".botster",
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        SessionTypeError::new(
+            "target_not_admitted",
+            format!("repo session type directory could not be opened safely: {error}"),
+        )
+    })?;
+    let directory_file = File::from(descriptor);
+    if !directory_file
+        .metadata()
+        .map_err(|error| {
+            SessionTypeError::new(
+                "target_not_admitted",
+                format!("repo session type directory could not be checked: {error}"),
+            )
+        })?
+        .is_dir()
+    {
+        return Err(SessionTypeError::new(
+            "target_not_admitted",
+            "repo session type directory is not a directory",
+        ));
+    }
+    let descriptor = openat(
+        &directory_file,
+        "session-types.json.tmp",
+        OFlags::WRONLY | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| {
+        SessionTypeError::new(
+            "repo_session_type_write_failed",
+            format!("repo session type temporary file could not be opened: {error}"),
+        )
+    })?;
+    let mut file = File::from(descriptor);
+    let metadata = file.metadata().map_err(|error| {
+        SessionTypeError::new(
+            "repo_session_type_write_failed",
+            format!("repo session type temporary file could not be checked: {error}"),
+        )
+    })?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(SessionTypeError::new(
+            "repo_session_type_write_failed",
+            "repo session type temporary file is not an exclusive regular file",
+        ));
+    }
+    file.set_len(0).map_err(|error| {
+        SessionTypeError::new(
+            "repo_session_type_write_failed",
+            format!("repo session type temporary file could not be truncated: {error}"),
+        )
+    })?;
+    file.write_all(bytes).map_err(|error| {
         SessionTypeError::new(
             "repo_session_type_write_failed",
             format!("repo session type temporary file could not be written: {error}"),
         )
     })?;
-    fs::rename(&temporary, root.join(REPO_SESSION_TYPES_FILE)).map_err(|error| {
+    file.sync_all().map_err(|error| {
+        SessionTypeError::new(
+            "repo_session_type_write_failed",
+            format!("repo session type temporary file could not be synced: {error}"),
+        )
+    })?;
+    renameat(
+        &directory_file,
+        "session-types.json.tmp",
+        &directory_file,
+        "session-types.json",
+    )
+    .map_err(|error| {
         SessionTypeError::new(
             "repo_session_type_write_failed",
             format!("repo session type file could not be replaced: {error}"),
         )
-    })
+    })?;
+    #[cfg(test)]
+    if repo_sync_failure_is_due(root) {
+        return Ok(RepoSessionTypeFileCommit::PublishedUncertain(
+            SessionTypeError::new(
+                "repo_session_type_sync_uncertain",
+                "injected repository directory sync failure after rename",
+            ),
+        ));
+    }
+    let sync_result = (|| {
+        directory_file.sync_all()?;
+        if created_directory {
+            root_file.sync_all()?;
+        }
+        let current = openat(
+            &root_file,
+            ".botster",
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let current = File::from(current);
+        let held = directory_file.metadata()?;
+        let named = current.metadata()?;
+        if !named.is_dir() || held.dev() != named.dev() || held.ino() != named.ino() {
+            return Err(std::io::Error::other(
+                "repo session type directory changed after rename",
+            ));
+        }
+        Ok::<_, std::io::Error>(())
+    })();
+    match sync_result {
+        Ok(()) => Ok(RepoSessionTypeFileCommit::Synced),
+        Err(error) => Ok(RepoSessionTypeFileCommit::PublishedUncertain(
+            SessionTypeError::new(
+                "repo_session_type_sync_uncertain",
+                format!("repo session type file was renamed but directory sync failed: {error}"),
+            ),
+        )),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_next_repo_directory_sync_failure(root: impl AsRef<Path>) {
+    let canonical_root = root
+        .as_ref()
+        .canonicalize()
+        .expect("injected repo sync failure needs an existing root");
+    repo_sync_failures()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(canonical_root);
+}
+
+#[cfg(test)]
+fn repo_sync_failures() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static FAILURES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn repo_sync_failure_is_due(root: &Path) -> bool {
+    repo_sync_failures()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(root)
 }
 
 /// Read the exact prior repo file with a hard logical-byte bound.

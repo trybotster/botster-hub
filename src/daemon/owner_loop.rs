@@ -1724,10 +1724,25 @@ impl TerminalLifecycle {
 /// One allocation made before a File commit starts. Publication fills this cell in place.
 pub(crate) struct UncertainPublicationCell {
     waiter_id: crate::owner_identity::WaiterId,
-    write: Option<crate::persistence::HubStateUncertainWrite>,
+    write: Option<UncertainPublicationPayload>,
     rollback: Option<crate::host_mutations::RollbackDescriptor>,
     cleanup: Option<UncertainPublicationCleanup>,
     owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
+}
+
+enum UncertainPublicationPayload {
+    State(crate::persistence::HubStateUncertainWrite),
+    External {
+        pending: crate::persistence::PendingFileCommit,
+        cause: crate::host_mutations::ExternalEffectCause,
+    },
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UncertainPublicationKind {
+    State,
+    External,
 }
 
 pub(crate) enum UncertainPublicationCleanup {
@@ -1888,9 +1903,50 @@ impl DaemonControlState {
             cell.write.is_none(),
             "publication cell cannot be overwritten"
         );
-        cell.write = Some(write);
+        cell.write = Some(UncertainPublicationPayload::State(write));
         cell.rollback = rollback;
         cell.cleanup = cleanup;
+    }
+
+    /// Retain an unresolved external effect in the cell claimed before Host commit.
+    pub(crate) fn retain_uncertain_external(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+        pending: crate::persistence::PendingFileCommit,
+        rollback: crate::host_mutations::RollbackDescriptor,
+        cause: crate::host_mutations::ExternalEffectCause,
+    ) {
+        let cell = self
+            .uncertain_publication
+            .as_mut()
+            .expect("uncertain publication has a pre-admitted cell");
+        assert_eq!(
+            cell.waiter_id, waiter_id,
+            "publication cell belongs to the writer"
+        );
+        assert!(
+            cell.write.is_none(),
+            "publication cell cannot be overwritten"
+        );
+        cell.write = Some(UncertainPublicationPayload::External { pending, cause });
+        cell.rollback = Some(rollback);
+    }
+
+    /// Read the exact waiter's retained kind and rollback presence in tests.
+    #[cfg(test)]
+    pub(crate) fn uncertain_publication_for_test(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> Option<(UncertainPublicationKind, bool)> {
+        let cell = self.uncertain_publication.as_ref()?;
+        if cell.waiter_id != waiter_id {
+            return None;
+        }
+        let kind = match cell.write.as_ref()? {
+            UncertainPublicationPayload::State(_) => UncertainPublicationKind::State,
+            UncertainPublicationPayload::External { .. } => UncertainPublicationKind::External,
+        };
+        Some((kind, cell.rollback.is_some()))
     }
 
     /// The control reply can retire only after its unresolved Owner permit moves here.

@@ -584,7 +584,11 @@ impl HostMutationContinuation {
             (result, permit)
         };
         let mut result = result;
-        if !matches!(result, HostMutationResult::PublishedUncertain { .. }) {
+        if !matches!(
+            result,
+            HostMutationResult::PublishedUncertain { .. }
+                | HostMutationResult::ExternalEffectUncertain { .. }
+        ) {
             state.release_uncertain_reservation(waiter_id);
         }
         if let Some(cleanup) = package_event_cleanup(&mut result) {
@@ -651,6 +655,7 @@ impl HostMutationContinuation {
             }
             HostMutationResult::ReadReady(reply) => finish_reply(permit, reply),
             HostMutationResult::PublishedUncertain { write, rollback } => {
+                let (code, message) = write.cause().client_error();
                 let cleanup = failed_package_effect.take().map(|(effect, original)| {
                     crate::daemon::owner_loop::UncertainPublicationCleanup::PackageRestore {
                         effect,
@@ -661,11 +666,18 @@ impl HostMutationContinuation {
                 release_document(state, waiter_id);
                 // Host work completed. The unresolved Owner permit moves in pending.rs.
                 drop(permit);
-                ControlPoll::Ready(Ok(error_response(
-                    "state_publication_uncertain",
-                    "hub_state",
-                    "the state write reached publication without a confirmed durable result",
-                )))
+                ControlPoll::Ready(Ok(error_response(code, "hub_state", message)))
+            }
+            HostMutationResult::ExternalEffectUncertain {
+                pending,
+                rollback,
+                cause,
+            } => {
+                let (code, message) = cause.client_error();
+                state.retain_uncertain_external(waiter_id, pending, rollback, cause);
+                release_document(state, waiter_id);
+                drop(permit);
+                ControlPoll::Ready(Ok(error_response(code, "repo_session_type", message)))
             }
             HostMutationResult::Prepared(prepared) => admit_or_park_commit(
                 daemon,
@@ -1545,6 +1557,11 @@ fn is_session_type_prepare(request: &DaemonRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::owner_loop::UncertainPublicationKind;
+    use crate::host_executor::HostCompletion;
+    use crate::host_mutations::{ExternalEffectCause, RollbackDescriptor};
+    use crate::persistence::{ExternalFileIntent, FileCommitOutcome, FileHubStateStore};
+    use crate::session_types::SessionTypeError;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn recovery_test_daemon() -> (HubDaemon, std::path::PathBuf) {
@@ -1570,6 +1587,153 @@ mod tests {
             HubDaemon::start(config).expect("start test daemon"),
             directory,
         )
+    }
+
+    fn poll_uncertain_result(
+        daemon: &mut HubDaemon,
+        result: HostMutationResult,
+        expected_kind: UncertainPublicationKind,
+        expected_error: &str,
+    ) {
+        let waiter_id = WaiterId(82);
+        let next_waiter = WaiterId(83);
+        let later_waiter = WaiterId(84);
+        let mut state = DaemonControlState::default();
+        assert!(state.reserve_uncertain_publication(waiter_id));
+        state.document_owner = Some(waiter_id);
+        state.document_waiters = [next_waiter, later_waiter].into_iter().collect();
+        let permit = daemon
+            .runtime()
+            .expect("runtime")
+            .host_executor()
+            .try_reserve()
+            .expect("reserve host work");
+        state.host_completions.insert(
+            waiter_id,
+            HostCompletion::from_parts(
+                HostJobIdentity::first(waiter_id),
+                HostResult::Mutation(result),
+                permit,
+            ),
+        );
+        let mut continuation = HostMutationContinuation {
+            waiter_id,
+            must_finish: false,
+            retained_prepare: None,
+            prior_compensation_failure: None,
+            failed_package_effect: None,
+            next_phase: 2,
+            family_work: None,
+            event_cleanup: None,
+        };
+        let poll = continuation.poll(daemon, &mut state);
+        assert!(matches!(
+            poll,
+            ControlPoll::Ready(Ok(response))
+                if response.error.as_ref().is_some_and(|error| error.code == expected_error)
+        ));
+        assert_eq!(
+            state.uncertain_publication_for_test(waiter_id),
+            Some((expected_kind, true))
+        );
+        assert_eq!(state.uncertain_publication_for_test(next_waiter), None);
+        assert_eq!(state.document_owner, None);
+        assert_eq!(state.document_waiters, [later_waiter].into_iter().collect());
+    }
+
+    #[test]
+    fn external_uncertainty_uses_the_host_completion_cell_and_releases_one_document_waiter() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let (revision, prior) = daemon.state_view();
+        let authority = daemon
+            .runtime()
+            .expect("runtime")
+            .state_authority()
+            .expect("File authority");
+        let store = FileHubStateStore::for_data_directory(&directory);
+        let prepared = store
+            .prepare_shared(
+                &authority,
+                revision,
+                Some(prior.clone()),
+                (*prior).clone(),
+                &authority.budget(),
+            )
+            .expect("prepare state write");
+        let external_path = directory.join("repo/.botster/session-types.json");
+        let pending = store
+            .begin_shared_effect(
+                prepared,
+                revision,
+                Some(ExternalFileIntent {
+                    path: &external_path,
+                    prior: None,
+                    candidate: b"candidate repo bytes",
+                }),
+            )
+            .expect("synchronize real external intent");
+        poll_uncertain_result(
+            &mut daemon,
+            HostMutationResult::ExternalEffectUncertain {
+                pending,
+                rollback: RollbackDescriptor::SessionType {
+                    previous: prior,
+                    repo_file: None,
+                },
+                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed(SessionTypeError::new(
+                    "repo_session_type_sync_uncertain",
+                    "test uncertainty",
+                )),
+            },
+            UncertainPublicationKind::External,
+            "repo_session_type_publication_uncertain",
+        );
+        drop(authority);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove external uncertainty test directory");
+    }
+
+    #[test]
+    fn state_uncertainty_uses_the_host_completion_cell_and_releases_one_document_waiter() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let (revision, prior) = daemon.state_view();
+        let authority = daemon
+            .runtime()
+            .expect("runtime")
+            .state_authority()
+            .expect("File authority");
+        let store = FileHubStateStore::for_data_directory(&directory);
+        let prepared = store
+            .prepare_shared(
+                &authority,
+                revision,
+                Some(prior.clone()),
+                (*prior).clone(),
+                &authority.budget(),
+            )
+            .expect("prepare state write");
+        FileHubStateStore::inject_next_directory_sync_failure(&directory);
+        let FileCommitOutcome::PublishedUncertain(write) = store
+            .commit_shared(prepared, revision)
+            .expect("state write reached rename")
+        else {
+            panic!("state directory sync must remain uncertain");
+        };
+        poll_uncertain_result(
+            &mut daemon,
+            HostMutationResult::PublishedUncertain {
+                write,
+                rollback: Some(RollbackDescriptor::SessionType {
+                    previous: prior,
+                    repo_file: None,
+                }),
+            },
+            UncertainPublicationKind::State,
+            "state_publication_uncertain",
+        );
+        drop(authority);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove state uncertainty test directory");
     }
 
     #[test]
