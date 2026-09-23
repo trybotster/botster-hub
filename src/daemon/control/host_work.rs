@@ -273,6 +273,28 @@ pub(crate) struct PackageRecoveryRequired {
     _permit: HostWorkPermit,
 }
 
+fn host_operation_label(request: &DaemonRequest) -> &'static str {
+    use crate::PackageAction;
+
+    let action = match request {
+        DaemonRequest::InstallPackageRegistryEntry { .. }
+        | DaemonRequest::InstallPackageLocalPath { .. } => PackageAction::Install,
+        DaemonRequest::ShowPackage { .. } => PackageAction::Show,
+        DaemonRequest::SetPackageConfiguration { .. } => PackageAction::Configure,
+        DaemonRequest::ReloadPackage { .. } => PackageAction::Reload,
+        DaemonRequest::EnablePackageLocalPath { .. } | DaemonRequest::EnablePackage { .. } => {
+            PackageAction::Enable
+        }
+        DaemonRequest::DisablePackage { .. } => PackageAction::Disable,
+        DaemonRequest::RemovePackage { .. } => PackageAction::Remove,
+        DaemonRequest::CheckPackageUpdate { .. } => PackageAction::CheckUpdate,
+        DaemonRequest::PreviewPackageUpdate { .. } => PackageAction::PreviewUpdate,
+        DaemonRequest::ApplyPackageUpdate { .. } => PackageAction::ApplyUpdate,
+        _ => return "host_execution",
+    };
+    crate::daemon_projection::package_action_label(action)
+}
+
 /// Route one supported host request. A `None` result leaves the request with its existing family.
 pub(crate) fn handle(
     daemon: &mut HubDaemon,
@@ -281,6 +303,7 @@ pub(crate) fn handle(
 ) -> Option<ControlStep> {
     let waiter_id = state.current_waiter_id?;
     let must_finish = crate::daemon::control::pending::request_must_finish(&request);
+    let operation = host_operation_label(&request);
     let (base_revision, state_view) = daemon.state_view();
     let packages = daemon.package_registry_view();
     let runtime = daemon.runtime()?;
@@ -401,6 +424,7 @@ pub(crate) fn handle(
             HostMutationContinuation {
                 waiter_id,
                 must_finish,
+                operation,
                 retained_prepare: None,
                 prior_compensation_failure: None,
                 failed_package_effect: None,
@@ -417,6 +441,7 @@ pub(crate) fn handle(
 pub(crate) struct HostMutationContinuation {
     waiter_id: WaiterId,
     must_finish: bool,
+    operation: &'static str,
     retained_prepare: Option<(PreparedMutation, HostWorkPermit)>,
     prior_compensation_failure: Option<HostMutationError>,
     failed_package_effect: Option<(PackageRuntimeEffect, DaemonTransportError)>,
@@ -482,6 +507,7 @@ impl HostMutationContinuation {
         let Self {
             waiter_id,
             must_finish,
+            operation,
             retained_prepare,
             prior_compensation_failure,
             failed_package_effect,
@@ -491,6 +517,7 @@ impl HostMutationContinuation {
         } = self;
         let waiter_id = *waiter_id;
         let must_finish = *must_finish;
+        let operation = *operation;
         if let Some((prepared, permit)) = retained_prepare.take() {
             return admit_or_park_commit(
                 daemon,
@@ -499,6 +526,7 @@ impl HostMutationContinuation {
                 prepared,
                 permit,
                 must_finish,
+                operation,
                 retained_prepare,
                 next_phase,
             );
@@ -575,6 +603,7 @@ impl HostMutationContinuation {
                 state.release_uncertain_reservation(waiter_id);
                 return finish_error(
                     permit,
+                    operation,
                     HostMutationError {
                         code: "host_completion_kind_mismatch".to_string(),
                         message: "the host executor returned a non-mutation result".to_string(),
@@ -686,6 +715,7 @@ impl HostMutationContinuation {
                 prepared,
                 permit,
                 must_finish,
+                operation,
                 retained_prepare,
                 next_phase,
             ),
@@ -695,6 +725,7 @@ impl HostMutationContinuation {
                     release_document(state, waiter_id);
                     return finish_error(
                         permit,
+                        operation,
                         HostMutationError {
                             code: "host_commit_revision_mismatch".to_string(),
                             message:
@@ -761,7 +792,7 @@ impl HostMutationContinuation {
                 release_document(state, waiter_id);
                 match reply {
                     Ok(reply) => finish_reply(permit, reply),
-                    Err(error) => finish_error(permit, error),
+                    Err(error) => finish_error(permit, operation, error),
                 }
             }
             HostMutationResult::PackageEffectFailed {
@@ -865,7 +896,7 @@ impl HostMutationContinuation {
                 | RecoveryOutcome::SpawnTarget { failure, .. }
                 | RecoveryOutcome::RegisteredWorktree { failure, .. } => {
                     release_document(state, waiter_id);
-                    finish_error(permit, failure)
+                    finish_error(permit, operation, failure)
                 }
                 RecoveryOutcome::SessionType {
                     failure,
@@ -875,7 +906,7 @@ impl HostMutationContinuation {
                     release_document(state, waiter_id);
                     let failure =
                         with_compensation_failure(failure, prior_compensation_failure.take());
-                    finish_error(permit, failure)
+                    finish_error(permit, operation, failure)
                 }
                 RecoveryOutcome::SessionType {
                     view,
@@ -911,7 +942,7 @@ impl HostMutationContinuation {
                 if state.document_owner == Some(waiter_id) {
                     release_document(state, waiter_id);
                 }
-                finish_error(permit, error)
+                finish_error(permit, operation, error)
             }
         }
     }
@@ -1020,6 +1051,7 @@ fn admit_or_park_commit(
     prepared: PreparedMutation,
     permit: HostWorkPermit,
     must_finish: bool,
+    operation: &'static str,
     retained: &mut Option<(PreparedMutation, HostWorkPermit)>,
     next_phase: &mut u64,
 ) -> ControlPoll {
@@ -1038,6 +1070,7 @@ fn admit_or_park_commit(
         wake_next_document_waiter(state);
         return finish_error(
             permit,
+            operation,
             HostMutationError {
                 code: "package_recovery_required".to_string(),
                 message: "package recovery is required before this prepared mutation can commit"
@@ -1056,6 +1089,7 @@ fn admit_or_park_commit(
                 release_document(state, waiter_id);
                 return finish_error(
                     permit,
+                    operation,
                     HostMutationError {
                         code: "state_publication_slot_occupied".to_string(),
                         message: "another unresolved state publication owns the retention cell"
@@ -1084,6 +1118,7 @@ fn admit_or_park_commit(
             wake_next_document_waiter(state);
             finish_error(
                 permit,
+                operation,
                 HostMutationError {
                     code: "host_prepared_revision_stale".to_string(),
                     message: "the Hub state changed while the host mutation was prepared"
@@ -1306,9 +1341,13 @@ fn finish_reply(permit: HostWorkPermit, reply: crate::host_mutations::HostReply)
     ControlPoll::ReadyHost(Ok(reply.response), charge)
 }
 
-fn finish_error(permit: HostWorkPermit, error: HostMutationError) -> ControlPoll {
+fn finish_error(
+    permit: HostWorkPermit,
+    operation: &'static str,
+    error: HostMutationError,
+) -> ControlPoll {
     let charge = permit.into_prepared_charge(0);
-    ControlPoll::ReadyHost(Ok(host_error_response(error)), charge)
+    ControlPoll::ReadyHost(Ok(host_error_response(operation, error)), charge)
 }
 
 fn finish_transport_error(permit: HostWorkPermit, error: DaemonTransportError) -> ControlPoll {
@@ -1316,8 +1355,8 @@ fn finish_transport_error(permit: HostWorkPermit, error: DaemonTransportError) -
     ControlPoll::ReadyHost(Err(error), charge)
 }
 
-fn host_error_response(error: HostMutationError) -> DaemonResponse {
-    error_response(&error.code, "host_execution", &error.message)
+fn host_error_response(operation: &str, error: HostMutationError) -> DaemonResponse {
+    error_response(&error.code, operation, &error.message)
 }
 
 fn submit_error_response(error: HostSubmitError) -> DaemonResponse {
@@ -1573,6 +1612,7 @@ mod tests {
     use crate::host_executor::HostCompletion;
     use crate::host_mutations::{ExternalEffectCause, RollbackDescriptor};
     use crate::persistence::{ExternalFileIntent, FileCommitOutcome, FileHubStateStore};
+    use crate::runtime::package_effect::HostPackageCleanup;
     use crate::session_types::SessionTypeError;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1599,6 +1639,284 @@ mod tests {
             HubDaemon::start(config).expect("start test daemon"),
             directory,
         )
+    }
+
+    #[test]
+    fn host_operation_label_classifies_package_requests_and_preserves_generic_requests() {
+        assert_eq!(
+            host_operation_label(&DaemonRequest::ShowPackage {
+                package_name: "test.plugin".to_string(),
+            }),
+            "show"
+        );
+        assert_eq!(
+            host_operation_label(&DaemonRequest::SetPackageConfiguration {
+                package_name: "test.plugin".to_string(),
+                values: Default::default(),
+            }),
+            "configure"
+        );
+        assert_eq!(
+            host_operation_label(&DaemonRequest::EnablePackage {
+                package_name: "test.plugin".to_string(),
+            }),
+            "enable"
+        );
+        assert_eq!(
+            host_operation_label(&DaemonRequest::RefreshLocalPackages),
+            "host_execution"
+        );
+        assert_eq!(
+            host_operation_label(&DaemonRequest::ListSpawnTargets),
+            "host_execution"
+        );
+    }
+
+    #[test]
+    fn later_package_failure_keeps_its_action_and_non_package_failure_stays_generic() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        for (index, operation, result) in [
+            (
+                0_u64,
+                "enable",
+                HostMutationResult::PackageEffectApplied {
+                    reply: Err(HostMutationError {
+                        code: "package_effect_failed".to_string(),
+                        message: "test failure".to_string(),
+                    }),
+                    cleanup: HostPackageCleanup::default(),
+                },
+            ),
+            (
+                1_u64,
+                "host_execution",
+                HostMutationResult::Failed(HostMutationError {
+                    code: "host_read_failed".to_string(),
+                    message: "test failure".to_string(),
+                }),
+            ),
+        ] {
+            let waiter_id = WaiterId(100 + index);
+            let mut state = DaemonControlState::default();
+            state.document_owner = Some(waiter_id);
+            let permit = daemon
+                .runtime()
+                .expect("runtime")
+                .host_executor()
+                .try_reserve()
+                .expect("reserve Host slot");
+            state.host_completions.insert(
+                waiter_id,
+                HostCompletion::from_parts(
+                    HostJobIdentity::first(waiter_id),
+                    HostResult::Mutation(result),
+                    permit,
+                ),
+            );
+            let mut continuation = HostMutationContinuation {
+                waiter_id,
+                must_finish: index == 0,
+                operation,
+                retained_prepare: None,
+                prior_compensation_failure: None,
+                failed_package_effect: None,
+                next_phase: 2,
+                family_work: None,
+                event_cleanup: None,
+            };
+            let ControlPoll::ReadyHost(Ok(response), charge) =
+                continuation.poll(&mut daemon, &mut state)
+            else {
+                panic!("Host failure must return an operator error");
+            };
+            let error = response.error.expect("operator error");
+            assert_eq!(error.operation, operation);
+            assert_eq!(error.request_id, format!("daemon-{operation}"));
+            assert_eq!(error.diagnostics[0].operation.as_deref(), Some(operation));
+            assert_eq!(
+                response.diagnostics[0].operation.as_deref(),
+                Some(operation)
+            );
+            drop(charge);
+            assert_eq!(state.document_owner, None);
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove Host label test directory");
+    }
+
+    fn assert_retained_admission_label(
+        daemon: &mut HubDaemon,
+        mut prepared: PreparedMutation,
+        operation: &'static str,
+        waiter_id: WaiterId,
+    ) {
+        prepared.base_revision = daemon.state_view().0 + 1;
+        let mut state = DaemonControlState::default();
+        state.document_owner = Some(WaiterId(waiter_id.0 + 1));
+        let permit = daemon
+            .runtime()
+            .expect("runtime")
+            .host_executor()
+            .try_reserve()
+            .expect("reserve Host slot");
+        state.host_completions.insert(
+            waiter_id,
+            HostCompletion::from_parts(
+                HostJobIdentity::first(waiter_id),
+                HostResult::Mutation(HostMutationResult::Prepared(prepared)),
+                permit,
+            ),
+        );
+        let mut continuation = HostMutationContinuation {
+            waiter_id,
+            must_finish: true,
+            operation,
+            retained_prepare: None,
+            prior_compensation_failure: None,
+            failed_package_effect: None,
+            next_phase: 2,
+            family_work: None,
+            event_cleanup: None,
+        };
+        assert!(matches!(
+            continuation.poll(daemon, &mut state),
+            ControlPoll::Pending
+        ));
+        assert!(continuation.retained_prepare.is_some());
+        assert!(state.document_waiters.contains(&waiter_id));
+        state.document_owner = None;
+        let ControlPoll::ReadyHost(Ok(response), charge) =
+            continuation.poll(daemon, &mut state)
+        else {
+            panic!("stale retained preparation must return an operator error");
+        };
+        let error = response.error.expect("operator error");
+        assert_eq!(error.code, "host_prepared_revision_stale");
+        assert_eq!(error.operation, operation);
+        assert_eq!(error.request_id, format!("daemon-{operation}"));
+        assert_eq!(error.diagnostics[0].operation.as_deref(), Some(operation));
+        assert_eq!(
+            response.diagnostics[0].operation.as_deref(),
+            Some(operation)
+        );
+        drop(charge);
+    }
+
+    #[test]
+    fn retained_prepared_admission_keeps_its_operation_after_document_contention() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let (revision, view) = daemon.state_view();
+        let request = DaemonRequest::CreateSpawnTarget {
+            target_id: Some("retained-label-target".to_string()),
+            label: None,
+            root: std::env::current_dir().expect("current directory"),
+            enabled: false,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: Default::default(),
+        };
+        let HostMutationResult::Prepared(prepared) = crate::host_mutations::execute(
+            HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+                request,
+                base_revision: revision,
+                authority: daemon
+                    .runtime()
+                    .expect("runtime")
+                    .state_authority()
+                    .expect("File authority"),
+                state: view,
+                packages: daemon.package_registry_view(),
+                data_directory: directory.clone(),
+            }),
+            None,
+        ) else {
+            panic!("spawn target preparation must succeed");
+        };
+        assert_retained_admission_label(&mut daemon, prepared, "host_execution", WaiterId(102));
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove retained label test directory");
+    }
+
+    #[test]
+    fn retained_package_admission_keeps_configure_after_document_contention() {
+        use crate::packages::{HubPackageEvents, HubPackageManifest, PackageProvenance};
+        use botster_core::{
+            ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, PackageConfigurationSchema,
+            PackageSource,
+        };
+
+        let (mut daemon, directory) = recovery_test_daemon();
+        let mut packages = crate::PackageRegistry::new(botster_core::CapabilitySet::new());
+        packages
+            .install(
+                HubPackageManifest {
+                    name: "retained.plugin".to_string(),
+                    version: "1.0.0".to_string(),
+                    kind: ExtensionKind::Plugin,
+                    botster: ">=0.1.0".to_string(),
+                    source: Some(PackageSource::Git {
+                        repo: "https://example.invalid/retained.git".to_string(),
+                        reference: "v1.0.0".to_string(),
+                    }),
+                    capabilities: Vec::new(),
+                    entrypoints: vec![ExtensionEntrypoint {
+                        runtime: ExtensionRuntime::Lua,
+                        path: "plugin.lua".to_string(),
+                        bootstrap: false,
+                    }],
+                    dependencies: Vec::new(),
+                    features: Vec::new(),
+                    host_profile: None,
+                    configuration: Some(PackageConfigurationSchema {
+                        groups: Vec::new(),
+                        fields: Vec::new(),
+                    }),
+                    runnable_entrypoints: Vec::new(),
+                    surfaces: Vec::new(),
+                    navigation: Vec::new(),
+                    events: HubPackageEvents::default(),
+                },
+                PackageProvenance {
+                    source: "test".to_string(),
+                    checksum: None,
+                },
+                "retained admission test",
+            )
+            .expect("install package fixture");
+        let (revision, prior) = daemon.state_view();
+        let authority = daemon
+            .runtime()
+            .expect("runtime")
+            .state_authority()
+            .expect("File authority");
+        let budget = authority.budget();
+        let mut matched = (*prior).clone();
+        matched.package_registry = packages.snapshot();
+        let state = crate::shared_view::SharedView::try_new(&budget, matched, 1)
+            .expect("matched state view fits");
+        let packages = crate::shared_view::SharedView::try_new(&budget, packages, 1)
+            .expect("package view fits");
+        let mut entrypoints = crate::entrypoint_supervisor::EntrypointSupervisor::default();
+        let HostMutationResult::Prepared(prepared) = crate::host_mutations::execute(
+            HostMutationCommand::Prepare(HostPrepare::Package {
+                request: DaemonRequest::SetPackageConfiguration {
+                    package_name: "retained.plugin".to_string(),
+                    values: Default::default(),
+                },
+                base_revision: revision,
+                authority: authority.clone(),
+                state,
+                packages,
+                data_directory: directory.clone(),
+            }),
+            Some(&mut entrypoints),
+        ) else {
+            panic!("package configuration preparation must succeed");
+        };
+        assert_retained_admission_label(&mut daemon, prepared, "configure", WaiterId(104));
+        drop(authority);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove retained package test directory");
     }
 
     #[test]
@@ -1651,6 +1969,7 @@ mod tests {
             let mut continuation = HostMutationContinuation {
                 waiter_id,
                 must_finish: false,
+                operation: "host_execution",
                 retained_prepare: None,
                 prior_compensation_failure: None,
                 failed_package_effect: None,
@@ -1705,6 +2024,7 @@ mod tests {
         let mut continuation = HostMutationContinuation {
             waiter_id,
             must_finish: false,
+            operation: "host_execution",
             retained_prepare: None,
             prior_compensation_failure: None,
             failed_package_effect: None,
