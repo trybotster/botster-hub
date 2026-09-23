@@ -2087,6 +2087,37 @@ Root retains integration and publication ownership. This recovery does not autho
 
 ## Completion gate
 
+### September 23 verification update
+
+Recovery checkpoint `b3545c33` removes the unused cleanup suppression mechanism.
+Its 17 distinct focused tests passed. This does not establish full acceptance.
+The first workspace run passed 1,295 tests across completed binaries, then stopped in the lifecycle suite after a fixture hung.
+That interrupted run exited 130. Later test binaries did not complete.
+
+Checkpoint `00f5d8e3` corrects three incompatible-daemon fixtures to use the framed protocol and bounded waits.
+The three focused fixture tests passed. Production source did not change in this checkpoint.
+Both checkpoints are pushed on `delivery/durable-recovery-20260921`.
+
+The next workspace run used `./test.sh --locked --offline -- --test-threads=2`.
+The Hub library reported 1,200 passed and two failed. The run exited 101 before later test binaries ran.
+The packaged candidate came from `b3545c33`; the test source came from `00f5d8e3`.
+The raw log is `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/fixture-correction-full-suite-00f5d8e3.log`.
+Its SHA-256 is `cc6a5b0fdcb545f76c5034a144ee223b191ee9fec8cb2d8d37a84f6bd9a9e6e6`.
+
+- Agent 001b owns the Host-permit diagnostic for `prepared_snapshots_and_fanout_progress_when_host_capacity_is_full`.
+  The assertion observed one outstanding permit instead of zero.
+  Root reviewed the test-only diagnostic and authorized one build and one focused run.
+  A zero initial count makes that diagnostic inconclusive. Production behavior remains unchanged.
+- Agent 001e owns the read-only WebRTC analysis for `remote_closed_subscription_keeps_host_sibling_live`.
+  The test observed `usage_failed` instead of `remote_close`.
+  Source analysis identifies a possible channel-removal window between a successful send and the usage query.
+  The failing run does not record that ordering. The original assertion remains required.
+  The next action is a bounded typed-error proposal and a deterministic regression design.
+
+Neither failure has a verified baseline attribution. Neither failure is classified as pre-existing or fixed.
+Async-spawn integration, ordinary spawn materialization, recovery acceptance, and final production-path verification remain open.
+No installation or runtime replacement is authorized.
+
 This phase completes only when integration, required product behavior, architecture findings, and measured acceptance are resolved or explicitly returned for a user decision.
 The final report separates completed work, evidence, known limits, and remaining product choices.
 Neither a green test count nor clean source formatting is a substitute for this gate.
