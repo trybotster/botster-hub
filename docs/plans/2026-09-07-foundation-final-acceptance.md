@@ -2243,6 +2243,27 @@ The failure reports a 10-second entity-frame timeout at `common.rs:1024`, with `
 Root inspected both raw logs. This timeout does not identify which frame was missing or prove an ordering defect.
 Agent 001b owns the bounded wait diagnosis. Agent 001e checks the runtime evidence independently.
 The pressure result closes only this focused scenario. Full acceptance remains open.
+
+The subscriber diagnostic then confirmed all setup responses and initial snapshots. The final wait received one additional stale snapshot.
+It reported one resync attempt and zero degradations. Source review found that snapshot convergence could clear the subscriber retry need.
+Moving MarkResync after draining alone would reset attempts and could create unbounded retries. The accepted correction preserves the existing cycle instead.
+Checkpoint `8d9cc48e29df8fadfca5b77d45457b662928042d` retains a per-pass catch-up observation and preserves retry state across snapshot processing.
+The existing delivery owner serializes target registration and traversal. The correction adds no queue, limit, or owner-side subscriber scan.
+Exact target checks exclude terminating and replaced subscriptions. Real publish behavior remains unchanged.
+The correction retains resync charges while needed and tests release on convergence and degradation.
+The reviewed six-file diff compiled. Eleven exact library tests passed, one invocation each. The commit is pushed.
+Root and the reviewer verified the clean candidate at `g2-candidate-8d9cc48e-20260923` against Hub `8d9cc48e` and Core `053148f6`.
+Three exact lifecycle tests then passed, each with one passed, zero failed, and 322 filtered tests:
+
+- Subscriber catch-up: 9.49 seconds; raw log SHA-256 `44e3b6dfd765d4f15b1382bf86a5d1b2207e3791892c3a822972c9862394e7a1`.
+- Stagnant provider without a family gap: 15.61 seconds; SHA-256 `3eb9d432286f5db96c98e30bb4e19938ef9b27e0a7938f05ef5eec975c7ddbba`.
+- Original pressure case: 15.13 seconds; SHA-256 `7dade79b79063f9023c516dd6e0242a2b669c6f260ed1bbdd290bf18a6f62354`.
+
+Root inspected the raw result lines and recorded commands. Independent runtime evidence review is pending.
+The stagnant test checks eight new attempts, one new degradation, stable counters for three seconds, and no rollback or Error for A.
+These focused passes do not establish repeat stability or full acceptance. Strict lint and the full suite remain open.
+Agent 001b now audits the remaining protocol/constants and CLI schema failures without edits. Agent 001e verifies the runtime evidence.
+The candidate build reported warnings; attribution remains unverified. No installation or running-daemon replacement occurred.
 The old candidate must not supply runtime evidence for this production change.
 The evidence packet is `g2-implementation-review.md` in the evidence directory above.
 The retry compile log SHA-256 is `cb24e49cc131bfca7358e736c9b85e905f8bf03dad73502551d0829562b8ff60`.
