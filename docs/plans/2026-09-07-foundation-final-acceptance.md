@@ -2181,7 +2181,27 @@ The earlier hash was superseded after the sibling cleanup test retained the reti
 Root sent the corrected hash to the reviewer. The writer must keep this diff unchanged during review.
 The review checks provider-loss delivery, retained terminal intent, capacity notifications, disconnect accounting, and outstanding publications.
 The sibling test uses one cleanup guard and two owner rows. It does not use a live Unix socket.
-No G2 build or test result exists yet. Source acceptance precedes focused verification and a fresh production candidate.
+The initial G2 review exposed a worker-send race. Clearing a publication flag cannot revoke a worker that already passed its send check.
+The correction retains terminal intent until the exact running Host job produces its completion receipt.
+The owner rejects new delivery arms and uses the existing completion route to wake subscriber delivery.
+Cancellation does not release a running job's retirement fence.
+
+The first compile failed with E0502 in WebRTC signaling. No tests ran in that attempt.
+The implementer moved the shared notification-handle clone before the mutable runtime borrow.
+The retry compiled the library and lifecycle targets successfully. Nine exact library tests passed, one invocation each.
+The reviewer checked the source, raw logs, and artifact hashes. This evidence does not establish repeat stability.
+The tests cover a real Host submission and completion route, a malformed receipt, and a stopped-executor rejection.
+Ready-state delivery and retry after a Full rejection remain untested.
+The lifecycle target compiled but did not run. The live sibling test remains unverified.
+
+Checkpoint `15e7fa0f08a0568945e799113f259ddc214d4c2b` contains the 12 reviewed files and is pushed on the recovery branch.
+The staged diff SHA-256 was `daa40dfc968ee01903e6507e4cbd2b0d029cf4b6df65c206057f29095e4eafe1`.
+The implementer reported a clean worktree after the commit and started a fresh candidate build.
+The next gate is candidate verification, followed by the two corrected package tests and the same-connection sibling test.
+The old candidate must not supply runtime evidence for this production change.
+The evidence packet is `g2-implementation-review.md` in the evidence directory above.
+The retry compile log SHA-256 is `cb24e49cc131bfca7358e736c9b85e905f8bf03dad73502551d0829562b8ff60`.
+The focused log SHA-256 is `57b2450b711ec3c28a11592eecc26ab01df810335697c2aa96def692b56275f0`.
 
 The remaining failure groups cover entity resynchronization, protocol constants, CLI schema expectations, operation labels,
 the terminal-path source guard, shutdown during update checks, chunk reassembly, and deterministic WebRTC failure evidence.
