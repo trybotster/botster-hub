@@ -6356,12 +6356,29 @@ fn daemon_package_entity_second_subscriber_behind_snapshot_does_not_roll_advance
     let mut sub_a =
         botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-a")
             .expect("subscribe a");
-    let _ = sub_a.next_frame().expect("a snapshot");
-    let _ = mutation_action(
+    let a_snapshot = sub_a.next_frame().expect("a snapshot");
+    assert!(
+        matches!(
+            &a_snapshot,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq: 0,
+                ..
+            }
+        ),
+        "unexpected A snapshot: {a_snapshot:?}"
+    );
+    let published = mutation_action(
         &endpoint,
         "project-pipelines.publish_seq",
         serde_json::json!({ "seq": 1, "id": "row-1" }),
     );
+    let published_payload = published
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .unwrap_or_else(|| panic!("missing publish response: {published:?}"));
+    assert_eq!(published_payload["status"], "accepted", "{published:?}");
+    assert_eq!(published_payload["last_accepted_seq"], 1, "{published:?}");
     let _ = wait_for_entity_frame(&mut sub_a, Duration::from_secs(5), |frame| {
         matches!(
             frame,
@@ -6385,23 +6402,57 @@ fn daemon_package_entity_second_subscriber_behind_snapshot_does_not_roll_advance
     // set_provider_seq to 0 without clearing rows — but provider still returns
     // seq variable. set_provider_seq lowers seq for provider only while fanout
     // state keeps last_accepted=1. Then sub B's snapshot has S=0 < floor.
-    let _ = mutation_action(
+    let lowered = mutation_action(
         &endpoint,
         "project-pipelines.set_provider_seq",
         serde_json::json!({ "seq": 0 }),
     );
+    assert_eq!(
+        lowered.kind,
+        botster_hub_client::DaemonResponseKind::PluginActionResult,
+        "{lowered:?}"
+    );
+    assert_eq!(
+        lowered
+            .plugin_action_result
+            .as_ref()
+            .expect("lower action result")
+            .state,
+        botster_ui_contract::UiActionResultState::Accepted,
+        "{lowered:?}"
+    );
+    assert_eq!(
+        lowered
+            .plugin_action_result
+            .as_ref()
+            .and_then(|result| result.payload.as_ref())
+            .map(|payload| &payload["seq"]),
+        Some(&serde_json::json!(0)),
+        "{lowered:?}"
+    );
 
+    let before_b = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("status before B subscribe");
+    let degraded_before_b = before_b
+        .status
+        .as_ref()
+        .expect("status body")
+        .lifecycle_counters
+        .package_entity_resync_degraded;
     let mut sub_b =
         botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-b")
             .expect("subscribe b");
     let b_snapshot = sub_b.next_frame().expect("b snapshot");
-    assert!(matches!(
-        b_snapshot,
-        botster_hub_client::DaemonEntityFrame::Snapshot {
-            snapshot_seq: 0,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &b_snapshot,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq: 0,
+                ..
+            }
+        ),
+        "unexpected B snapshot: {b_snapshot:?}"
+    );
 
     // Sub A must not receive the behind snapshot.
     sub_a
@@ -6426,20 +6477,299 @@ fn daemon_package_entity_second_subscriber_behind_snapshot_does_not_roll_advance
     }
 
     // Restore live provider truth and allow B to catch up.
-    let _ = mutation_action(
+    let before_restore =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before provider restore");
+    assert_eq!(
+        before_restore
+            .status
+            .as_ref()
+            .expect("status body")
+            .lifecycle_counters
+            .package_entity_resync_degraded,
+        degraded_before_b,
+        "B's bounded cycle degraded before provider restore"
+    );
+    let restored = mutation_action(
         &endpoint,
         "project-pipelines.set_provider_seq",
         serde_json::json!({ "seq": 1 }),
     );
-    let _ = wait_for_entity_frame(&mut sub_b, Duration::from_secs(10), |frame| {
+    assert_eq!(
+        restored.kind,
+        botster_hub_client::DaemonResponseKind::PluginActionResult,
+        "{restored:?}"
+    );
+    assert_eq!(
+        restored
+            .plugin_action_result
+            .as_ref()
+            .expect("restore action result")
+            .state,
+        botster_ui_contract::UiActionResultState::Accepted,
+        "{restored:?}"
+    );
+    assert_eq!(
+        restored
+            .plugin_action_result
+            .as_ref()
+            .and_then(|result| result.payload.as_ref())
+            .map(|payload| &payload["seq"]),
+        Some(&serde_json::json!(1)),
+        "{restored:?}"
+    );
+    let started = Instant::now();
+    let mut seen_frames = Vec::new();
+    let mut total_frames = 0_u64;
+    loop {
+        let remaining = Duration::from_secs(10).saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            let status = botster_hub_client::request(
+                &endpoint,
+                botster_hub_client::DaemonRequest::Status,
+            )
+            .expect("status after B catch-up timeout");
+            let counters = &status.status.as_ref().expect("status body").lifecycle_counters;
+            let evidence = format!(
+                "timed out waiting for B catch-up entity frame; frames={total_frames}, first_frames={seen_frames:?}, resync_attempts={}, resync_degraded={}",
+                counters.package_entity_resync_attempts,
+                counters.package_entity_resync_degraded
+            );
+            let (resource, probe) = classify_budget_expiry("entity_frame", None, Some(&evidence));
+            panic!(
+                "{}",
+                format_harness_budget_expired(
+                    "entity_frame",
+                    Duration::from_secs(10),
+                    resource,
+                    probe,
+                    &evidence
+                )
+            );
+        }
+        sub_b
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(200))))
+            .expect("B catch-up read timeout");
+        match sub_b.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Snapshot { snapshot_seq, .. })
+                if snapshot_seq >= 1 =>
+            {
+                break;
+            }
+            Ok(frame) => {
+                total_frames = total_frames.saturating_add(1);
+                if seen_frames.len() < 16 {
+                    let summary = match frame {
+                        botster_hub_client::DaemonEntityFrame::Snapshot {
+                            snapshot_seq, ..
+                        } => format!("snapshot:{snapshot_seq}"),
+                        botster_hub_client::DaemonEntityFrame::Upsert {
+                            snapshot_seq, ..
+                        } => format!("upsert:{snapshot_seq}"),
+                        botster_hub_client::DaemonEntityFrame::Patch {
+                            snapshot_seq, ..
+                        } => format!("patch:{snapshot_seq}"),
+                        botster_hub_client::DaemonEntityFrame::Remove {
+                            snapshot_seq, ..
+                        } => format!("remove:{snapshot_seq}"),
+                        botster_hub_client::DaemonEntityFrame::Error { code, .. } => {
+                            format!("error:{code}")
+                        }
+                    };
+                    seen_frames.push(summary);
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("timed out")
+                    && !message.contains("WouldBlock")
+                    && !message.contains("Resource temporarily unavailable")
+                    && !message.contains("os error 35")
+                    && !message.contains("os error 11")
+                {
+                    panic!("entity frame error: {error}");
+                }
+            }
+        }
+    }
+
+    let _ = sub_a.unsubscribe();
+    let _ = sub_b.unsubscribe();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_behind_second_subscriber_degrades_without_family_gap() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-two-sub-stale");
+    let package_dir = unique_test_dir("pkg-entity-two-sub-stale-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut sub_a =
+        botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-a")
+            .expect("subscribe a");
+    assert!(matches!(
+        sub_a.next_frame().expect("a snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ..
+        }
+    ));
+    let published = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "row-1" }),
+    );
+    let payload = published
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .unwrap_or_else(|| panic!("missing publish response: {published:?}"));
+    assert_eq!(payload["status"], "accepted", "{published:?}");
+    assert_eq!(payload["last_accepted_seq"], 1, "{published:?}");
+    let _ = wait_for_entity_frame(&mut sub_a, Duration::from_secs(5), |frame| {
         matches!(
             frame,
-            botster_hub_client::DaemonEntityFrame::Snapshot {
-                snapshot_seq,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                snapshot_seq: 1,
                 ..
-            } if *snapshot_seq >= 1
+            }
         )
     });
+    let lowered = mutation_action(
+        &endpoint,
+        "project-pipelines.set_provider_seq",
+        serde_json::json!({ "seq": 0 }),
+    );
+    let lowered_result = lowered
+        .plugin_action_result
+        .as_ref()
+        .unwrap_or_else(|| panic!("missing lower action result: {lowered:?}"));
+    assert_eq!(
+        lowered_result.state,
+        botster_ui_contract::UiActionResultState::Accepted,
+        "{lowered:?}"
+    );
+    assert_eq!(
+        lowered_result.payload.as_ref().map(|payload| &payload["seq"]),
+        Some(&serde_json::json!(0)),
+        "{lowered:?}"
+    );
+    let before_b = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("status before B subscribe");
+    let baseline = &before_b.status.as_ref().expect("status body").lifecycle_counters;
+    let attempts_before_b = baseline.package_entity_resync_attempts;
+    let degraded_before_b = baseline.package_entity_resync_degraded;
+    let mut sub_b =
+        botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-b")
+            .expect("subscribe b");
+    let b_snapshot = sub_b.next_frame().expect("b snapshot");
+    assert!(
+        matches!(
+            &b_snapshot,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq: 0,
+                ..
+            }
+        ),
+        "unexpected B snapshot: {b_snapshot:?}"
+    );
+
+    let started = Instant::now();
+    let mut attempts = 0;
+    let mut degraded = 0;
+    while started.elapsed() < Duration::from_secs(20) {
+        let status =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status under stale second subscriber");
+        let counters = &status.status.as_ref().expect("status body").lifecycle_counters;
+        attempts = counters.package_entity_resync_attempts;
+        degraded = counters.package_entity_resync_degraded;
+        if degraded > degraded_before_b {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if degraded == degraded_before_b {
+        let mut frames = Vec::new();
+        for _ in 0..16 {
+            sub_b
+                .set_read_timeout(Some(Duration::from_millis(1)))
+                .expect("bound B census read");
+            match sub_b.next_frame() {
+                Ok(botster_hub_client::DaemonEntityFrame::Snapshot { snapshot_seq, .. }) => {
+                    frames.push(format!("snapshot:{snapshot_seq}"));
+                }
+                Ok(frame) => frames.push(format!("{frame:?}")),
+                Err(_) => break,
+            }
+        }
+        panic!(
+            "behind B did not degrade within 20s; frames={frames:?}, resync_attempts={attempts}, attempts_before_b={attempts_before_b}, resync_degraded={degraded}, degraded_before_b={degraded_before_b}"
+        );
+    }
+    assert_eq!(
+        attempts.saturating_sub(attempts_before_b),
+        8,
+        "stale B uses one bounded attempt cycle"
+    );
+    assert_eq!(degraded.saturating_sub(degraded_before_b), 1);
+    let post = Instant::now();
+    while post.elapsed() < Duration::from_secs(3) {
+        let status =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after B degradation");
+        let counters = &status.status.as_ref().expect("status body").lifecycle_counters;
+        assert_eq!(counters.package_entity_resync_attempts, attempts);
+        assert_eq!(counters.package_entity_resync_degraded, degraded);
+        thread::sleep(Duration::from_millis(50));
+    }
+    let rollback_started = Instant::now();
+    loop {
+        let remaining = Duration::from_millis(400).saturating_sub(rollback_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        sub_a
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(100))))
+            .expect("bound A rollback check");
+        match sub_a.next_frame() {
+            Ok(
+                botster_hub_client::DaemonEntityFrame::Snapshot { snapshot_seq, .. }
+                | botster_hub_client::DaemonEntityFrame::Upsert { snapshot_seq, .. }
+                | botster_hub_client::DaemonEntityFrame::Patch { snapshot_seq, .. }
+                | botster_hub_client::DaemonEntityFrame::Remove { snapshot_seq, .. },
+            ) => {
+                assert!(snapshot_seq >= 1, "A rolled back to {snapshot_seq}");
+            }
+            Ok(botster_hub_client::DaemonEntityFrame::Error { code, message, .. }) => {
+                panic!("A received entity error {code}: {message}");
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("timed out")
+                    && !message.contains("WouldBlock")
+                    && !message.contains("Resource temporarily unavailable")
+                    && !message.contains("os error 35")
+                    && !message.contains("os error 11")
+                {
+                    panic!("A rollback read failed: {error}");
+                }
+            }
+        }
+    }
 
     let _ = sub_a.unsubscribe();
     let _ = sub_b.unsubscribe();

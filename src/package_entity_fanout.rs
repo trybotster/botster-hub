@@ -657,20 +657,21 @@ impl PackageEntityFamilyState {
     ) -> PackageEntityFamilyProgress {
         self.high_water_seq = self.high_water_seq.max(snapshot_seq);
         self.last_accepted_seq = self.last_accepted_seq.max(snapshot_seq);
-        self.recompute_resync_need(now);
+        self.recompute_resync_need(now, true);
         self.provider_snapshot_progress()
     }
 
     /// Apply at most one provider snapshot transition step.
     pub fn step_provider_snapshot(&mut self, now: Instant) -> PackageEntityFamilyStep {
         let mut work = FamilySnapshotWork::default();
-        self.step_provider_snapshot_into(now, &mut work);
+        self.step_provider_snapshot_into(now, false, &mut work);
         work.step.expect("the snapshot step completed")
     }
 
     pub(crate) fn step_provider_snapshot_into(
         &mut self,
         now: Instant,
+        preserve_resync_need: bool,
         work: &mut FamilySnapshotWork,
     ) {
         assert!(work.step.is_none() && work.resync_lease.is_none());
@@ -707,12 +708,12 @@ impl PackageEntityFamilyState {
                 self.last_accepted_seq = seq;
                 self.high_water_seq = self.high_water_seq.max(seq);
             }
-            self.recompute_resync_need(now);
+            self.recompute_resync_need(now, preserve_resync_need);
             return;
         }
 
-        self.recompute_resync_need(now);
-        if self.converged() && !self.resync.leases.is_empty() {
+        self.recompute_resync_need(now, preserve_resync_need);
+        if self.converged() && !preserve_resync_need && !self.resync.leases.is_empty() {
             let family_token = self.causal_token.expect("resync lease has a family token");
             work.resync_lease = self.resync.leases.pop_first();
             let scope_id = work
@@ -769,11 +770,11 @@ impl PackageEntityFamilyState {
         self.after_publish_progress(now);
     }
 
-    pub fn recompute_resync_need(&mut self, now: Instant) {
+    pub fn recompute_resync_need(&mut self, now: Instant, preserve_resync_need: bool) {
         let gap_or_high_water = !self.converged();
         if gap_or_high_water {
             self.resync.mark_needed(now);
-        } else {
+        } else if !preserve_resync_need {
             // Always clear degraded on convergence, even when needed was already false.
             self.resync.clear_needed();
             self.resync.clear_degraded_on_progress();
@@ -1086,7 +1087,7 @@ mod tests {
         family.resync.leases.insert(17, None);
         let mut work = FamilySnapshotWork::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            family.step_provider_snapshot_into(Instant::now(), &mut work);
+            family.step_provider_snapshot_into(Instant::now(), false, &mut work);
         }));
         assert!(result.is_err());
         assert!(family.resync.leases.contains_key(&17));
@@ -1133,7 +1134,7 @@ mod tests {
         assert!(charged.1 > 0);
         let mut work = FamilySnapshotWork::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            family.step_provider_snapshot_into(Instant::now(), &mut work);
+            family.step_provider_snapshot_into(Instant::now(), false, &mut work);
             panic!("failure after the resync record leaves the family");
         }));
         assert!(result.is_err());
@@ -1589,7 +1590,7 @@ mod tests {
         assert!(state.remember_resync_lease(402));
 
         let progress = state.begin_provider_snapshot_seq(5, now);
-        assert!(!progress.needed);
+        assert!(progress.needed);
         assert!(progress.has_step_work);
         assert_eq!(
             state.step_provider_snapshot(now),
@@ -1614,6 +1615,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn stale_snapshot_early_step_preserves_resync_cycle() {
+        let now = Instant::now();
+        let mut state = PackageEntityFamilyState {
+            last_accepted_seq: 1,
+            high_water_seq: 1,
+            ..Default::default()
+        };
+        state.resync.rearm(now);
+        state.resync.record_attempt(now);
+        state.pending_by_seq.insert(1, pending_mutation(1, "old"));
+
+        assert!(state.begin_provider_snapshot_seq(0, now).needed);
+        let mut work = FamilySnapshotWork::default();
+        state.step_provider_snapshot_into(now, true, &mut work);
+        assert!(matches!(
+            work.step,
+            Some(PackageEntityFamilyStep::Discarded { .. })
+        ));
+        assert_eq!(state.resync.attempts, 1);
+        assert!(state.resync.needed);
     }
 
     #[test]

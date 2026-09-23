@@ -314,6 +314,23 @@ pub(crate) fn next_package_entity_target(
         .map(|(_, target)| std::sync::Arc::clone(target))
 }
 
+/// Read catch-up state only for the exact live target.
+pub(crate) fn exact_package_entity_target_catching_up(
+    state: &DaemonControlState,
+    target: &std::sync::Arc<crate::plugin_entity::Target>,
+) -> bool {
+    state
+        .entity_subscriptions
+        .get(&target.subscription_id)
+        .is_some_and(|subscription| {
+            !subscription.terminating
+                && subscription.package_catching_up
+                && subscription.package_delivery.as_ref().is_some_and(|delivery| {
+                    std::sync::Arc::ptr_eq(target, &delivery.target)
+                })
+        })
+}
+
 /// Arm one publication only when the current subscription needs the payload.
 pub(crate) fn arm_package_entity_delivery(
     state: &mut DaemonControlState,
@@ -2647,6 +2664,7 @@ mod tests {
             None,
         )
         .expect("install provider subscription");
+        assert!(exact_package_entity_target_catching_up(&state, &target));
         let identity =
             crate::owner_identity::OwnerWorkIdentity::first(crate::owner_identity::WaiterId(904));
         let (live, _) =
@@ -2660,6 +2678,7 @@ mod tests {
 
         retire_unloaded_entity_subscriptions(&mut state, |_| false);
         assert!(state.entity_subscriptions["retiring"].terminating);
+        assert!(!exact_package_entity_target_catching_up(&state, &target));
         assert!(!live.load(Ordering::Acquire));
         assert!(!state.plugin_entities.targets.contains_key("retiring"));
         assert!(arm_package_entity_delivery(&mut state, &target, identity, 1, true, 1).is_none());
@@ -3173,6 +3192,7 @@ mod tests {
             target
         };
         let old_target = install(&mut state);
+        assert!(exact_package_entity_target_catching_up(&state, &old_target));
         let identity =
             crate::owner_identity::OwnerWorkIdentity::first(crate::owner_identity::WaiterId(904));
         let (live, _) =
@@ -3180,6 +3200,8 @@ mod tests {
         crate::daemon::control::entities::remove_entity_subscription(&mut state, "sub");
         assert!(!live.load(Ordering::Acquire));
         let new_target = install(&mut state);
+        assert!(!exact_package_entity_target_catching_up(&state, &old_target));
+        assert!(exact_package_entity_target_catching_up(&state, &new_target));
         assert!(!complete_package_entity_delivery(
             &mut state,
             &old_target,
