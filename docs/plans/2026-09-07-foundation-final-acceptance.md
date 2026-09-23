@@ -2300,7 +2300,18 @@ The retry build passed. All four exact library tests passed, each with one test 
 Root checked the raw result lines. Reviewer 001e verified the unchanged diff, six log hashes, and both test binaries.
 The retry log SHA-256 is `d75e86c55e04982601f91cf1661d5ce2eaabe0b4308060fccca8241b9f7ebde7`.
 Evidence remains in `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/g5-operation-label`.
-Root authorized the scoped commit, push, and fresh candidate build. Publication and lifecycle verification remain pending.
+The reviewed correction is committed and pushed as `609dbb0e46b515e6a846c136ce39cb29a10159fa`.
+Root and reviewer 001e verified the fresh matched candidate. The first lifecycle test passed its install-operation check.
+It then failed the local-path exclusion assertion. The other two lifecycle selectors did not run.
+A test-only diagnostic confirmed that the Host message included the manifest path through `PackageRegistryError.package_name`.
+This is a newly reached acceptance failure. Its historical origin remains unverified.
+The Host formatter bypassed the existing `package_error_display_name` policy in `daemon_projection.rs`.
+Root and reviewer 001e accepted bounded reuse of that helper, with its refresh exception unchanged.
+The three-file diff is `098a518feecf7669b42bc32325681e87099297e6af40a7de6d6ccfb3e9c1f099`.
+Its library build passed. The new Host policy test and the existing projection test each executed one test and passed.
+Root checked both result logs. Independent evidence review is pending.
+Root conditionally authorized the scoped commit, push, and fresh candidate build after that review.
+Reason-payload sanitization is outside this correction. The separate CLI Package Display site remains an unverified follow-up candidate.
 The formatting check failed. Baseline attribution remains unverified; no strict formatting acceptance is claimed.
 The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
 
