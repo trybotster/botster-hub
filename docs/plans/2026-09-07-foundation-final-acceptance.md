@@ -2213,8 +2213,19 @@ The sibling result verifies new delivery after the neighboring subscription reti
 These selected results do not establish repeat stability, a full-suite pass, or installation readiness.
 The candidate manifest names Hub `f1510e35` and Core `053148f6`.
 The candidate README records commands, artifact hashes, and raw log hashes.
-The next bounded work is the stale-provider resynchronization test, followed by the advanced-subscriber ordering test.
-The implementer must stop at the first failure and diagnose before changing source.
+The stale-provider resynchronization test failed on this candidate. The advanced-subscriber ordering test did not run.
+A test-only diagnostic confirmed the initial snapshot at sequence zero and both publication responses.
+The seed returned `accepted` with `last_accepted_seq=1`. The gap returned `resync_scheduled` with `high_water_seq=20`.
+The unchanged 20-second condition then failed with `attempts=40, degraded=0`.
+The exact invocation reported zero passed, one failed, and 321 filtered tests in 27.93 seconds. It exited 101.
+The diagnostic diff SHA-256 is `5fd5c84485965b03e8d5afa867456e8c01e808270c605fb04b7f3d33131f4934`.
+The test binary SHA-256 is `4768793fff734f6684c5db64916c59b692b884a5aaf6dba78a9c627ee73bd3e8`.
+The candidate directory contains `pressure-discriminator.log`, with SHA-256
+`7bae3e36ac447babc40a6b1c5b1f423f0e8630b5c278f4a52ba03cc03223b844`.
+Root inspected the raw failure. The reviewer checked the log and the diagnostic response fields.
+Agent 001b must trace retry-state transitions before proposing a correction. Agent 001e must review that trace independently.
+The aggregate attempt counter does not establish which per-family reset path ran.
+No additional wake, changed limit, or production correction is accepted from this result alone.
 The old candidate must not supply runtime evidence for this production change.
 The evidence packet is `g2-implementation-review.md` in the evidence directory above.
 The retry compile log SHA-256 is `cb24e49cc131bfca7358e736c9b85e905f8bf03dad73502551d0829562b8ff60`.
