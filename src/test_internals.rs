@@ -285,12 +285,15 @@ use botster_core::{
 };
 
 use crate::data_plane::driver::CoreTicket;
+use crate::persistence::{FileCommitError, FileCommitOutcome};
 use crate::runtime::{
     AttachBindPlan, BindRoutePlan, HubRuntime, attach_and_bind_on_core, attach_route_on_core,
     bind_route_on_core,
 };
-use crate::shared_view::SharedViewBudget;
-use crate::{FileHubStateStore, HubConfig, HubState, HubStateStoreResult};
+use crate::shared_view::SharedView;
+use crate::{
+    FileHubStateStore, HubConfig, HubState, HubStateStore, HubStateStoreError, HubStateStoreResult,
+};
 
 /// Test-only durable state fixture writes through the reserved production path.
 pub trait TestHubStateStoreExt {
@@ -307,10 +310,26 @@ impl TestHubStateStoreExt for FileHubStateStore {
         config: &HubConfig,
         update: impl FnOnce(&mut HubState),
     ) -> HubStateStoreResult<HubState> {
-        let mut state = self.load_for_update(config)?;
+        let (mut state, Some(mut authority)) = self.load_retained(config)? else {
+            unreachable!("File load returns authority")
+        };
+        let prior = SharedView::from_reserved(
+            state.clone(),
+            authority.take_startup_charge().expect("startup charge"),
+        );
         update(&mut state);
-        let prepared = self.prepare_shared(state, &SharedViewBudget::new())?;
-        self.commit_shared(prepared).map(|state| (*state).clone())
+        let outcome = self.save_retained_startup_state(&authority, 0, Some(prior), state);
+        match outcome {
+            Ok(FileCommitOutcome::Synced { state, .. }) => Ok((*state).clone()),
+            Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+                Err(HubStateStoreError::PublishedUncertain(write))
+            }
+            Err(FileCommitError::Preparation(error))
+            | Err(FileCommitError::BeforePublication { error, .. }) => Err(error),
+            Err(FileCommitError::Stale(_)) | Err(FileCommitError::RevisionExhausted(_)) => {
+                unreachable!("fixture startup revision is fixed")
+            }
+        }
     }
 }
 

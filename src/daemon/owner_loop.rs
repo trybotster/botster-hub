@@ -1721,6 +1721,23 @@ impl TerminalLifecycle {
     }
 }
 
+/// One allocation made before a File commit starts. Publication fills this cell in place.
+pub(crate) struct UncertainPublicationCell {
+    waiter_id: crate::owner_identity::WaiterId,
+    write: Option<crate::persistence::HubStateUncertainWrite>,
+    rollback: Option<crate::host_mutations::RollbackDescriptor>,
+    cleanup: Option<UncertainPublicationCleanup>,
+    owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
+}
+
+pub(crate) enum UncertainPublicationCleanup {
+    PackageRestore {
+        effect: crate::host_mutations::PackageRuntimeEffect,
+        original: crate::daemon::error::DaemonTransportError,
+    },
+    ManagedGit(crate::managed_git_worktrees::PreparedManagedWorktree),
+}
+
 pub(crate) struct DaemonControlState {
     pub(crate) coordination_fault: Option<crate::daemon::control::coordination::CoordinationFault>,
     pub(crate) coordination_waiting_for_owner: bool,
@@ -1771,6 +1788,8 @@ pub(crate) struct DaemonControlState {
         crate::owner_identity::WaiterId,
         crate::daemon::control::host_work::HostRecoveryRequired,
     >,
+    /// Pre-admitted ownership for one File write. Terminal disposition remains unresolved.
+    pub(crate) uncertain_publication: Option<Box<UncertainPublicationCell>>,
     pub(crate) family_cleanup_waiters: BTreeMap<crate::owner_identity::WaiterId, u64>,
     causal_wake_after: Option<crate::owner_identity::WaiterId>,
     causal_wake_through: Option<crate::owner_identity::WaiterId>,
@@ -1814,6 +1833,106 @@ pub(crate) struct DaemonControlState {
             >,
         >,
     >,
+}
+
+impl DaemonControlState {
+    /// Claim the sole cell before a Host write. Occupied refusal starts no write.
+    pub(crate) fn reserve_uncertain_publication(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> bool {
+        if self.uncertain_publication.is_some() {
+            return false;
+        }
+        self.uncertain_publication = Some(Box::new(UncertainPublicationCell {
+            waiter_id,
+            write: None,
+            rollback: None,
+            cleanup: None,
+            owner_permit: None,
+        }));
+        true
+    }
+
+    /// Release a claim only when no write reached uncertain publication.
+    pub(crate) fn release_uncertain_reservation(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) {
+        if self
+            .uncertain_publication
+            .as_ref()
+            .is_some_and(|cell| cell.waiter_id == waiter_id && cell.write.is_none())
+        {
+            self.uncertain_publication = None;
+        }
+    }
+
+    /// Move a published result into the cell that was claimed before the write.
+    pub(crate) fn retain_uncertain_publication(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+        write: crate::persistence::HubStateUncertainWrite,
+        rollback: Option<crate::host_mutations::RollbackDescriptor>,
+        cleanup: Option<UncertainPublicationCleanup>,
+    ) {
+        let cell = self
+            .uncertain_publication
+            .as_mut()
+            .expect("uncertain publication has a pre-admitted cell");
+        assert_eq!(
+            cell.waiter_id, waiter_id,
+            "publication cell belongs to the writer"
+        );
+        assert!(
+            cell.write.is_none(),
+            "publication cell cannot be overwritten"
+        );
+        cell.write = Some(write);
+        cell.rollback = rollback;
+        cell.cleanup = cleanup;
+    }
+
+    /// The control reply can retire only after its unresolved Owner permit moves here.
+    pub(crate) fn retain_uncertain_owner_permit(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+        permit: crate::daemon::owner_budget::OwnerPermit,
+    ) {
+        let cell = self
+            .uncertain_publication
+            .as_mut()
+            .expect("uncertain publication has a pre-admitted cell");
+        assert_eq!(
+            cell.waiter_id, waiter_id,
+            "publication cell belongs to the writer"
+        );
+        assert!(
+            cell.write.is_some(),
+            "Owner permit follows uncertain publication"
+        );
+        assert!(cell.owner_permit.is_none(), "Owner permit moves only once");
+        cell.owner_permit = Some(permit);
+    }
+
+    pub(crate) fn has_uncertain_publication(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> bool {
+        self.uncertain_publication
+            .as_ref()
+            .is_some_and(|cell| cell.waiter_id == waiter_id && cell.write.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_uncertain_owner_permit(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> bool {
+        self.uncertain_publication
+            .as_ref()
+            .is_some_and(|cell| cell.waiter_id == waiter_id && cell.owner_permit.is_some())
+    }
 }
 
 impl fmt::Debug for DaemonControlState {
@@ -1886,6 +2005,7 @@ impl Default for DaemonControlState {
             causal_wake_active: false,
             causal_wake_again: false,
             host_recovery: BTreeMap::new(),
+            uncertain_publication: None,
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
             host_completion_drain_pending: false,
@@ -6032,8 +6152,13 @@ mod tests {
     ) {
         let live = daemon.package_registry().snapshot();
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let authority = daemon
+            .runtime()
+            .expect("running runtime")
+            .state_authority()
+            .expect("File authority");
         let durable = store
-            .load_or_initialize(config)
+            .load_for_update(&authority, config)
             .expect("load durable hub state")
             .package_registry;
         (live, durable)

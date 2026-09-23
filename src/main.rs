@@ -9,17 +9,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use botster_core::{
-    CoreSessionMetadata, RequestId, ResizePayload, SessionId, SessionLifecycleState,
-    SessionSpawnRequest, SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
+    CoreSessionMetadata, RequestId, ResizePayload, SessionId, SessionSpawnRequest,
+    SpawnEnvironment, SpawnWorkingDirectory, SubscriptionId,
 };
 use botster_hub::{
     DaemonApp, DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage,
     DaemonPackageActionStatus, DaemonPackagePin, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonSpawnTarget, DaemonStatus, DaemonWorktree, DataDirectoryOption,
-    HubClientApi, HubClientRequest, HubClientResponseBody, HubDaemon, HubDaemonState, HubRuntime,
-    HubStartupOptions, HubStateLoadSource, RuntimeEnvironment, SessionDefaults, TransportBindings,
-    daemon_transport_request, daemon_transport_request_for_doctor, host_profile,
-    installation_identity, serve_daemon, serve_mcp_stdio, software_identity, stream_attach,
+    DaemonSession, DaemonSpawnTarget, DaemonStatus, DaemonWorktree, DataDirectoryOption, HubDaemon,
+    HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource, RuntimeEnvironment,
+    SessionDefaults, TransportBindings, daemon_transport_request,
+    daemon_transport_request_for_doctor, host_profile, installation_identity, serve_daemon,
+    serve_mcp_stdio, software_identity, stream_attach,
 };
 use botster_hub_client::{
     DaemonDiagnostic, DaemonPackageUpdateStatus, DaemonSessionTypeDefinition,
@@ -2387,37 +2387,24 @@ fn operator_packages(args: Vec<String>, providers_only: bool) -> Result<(), Oper
 
 fn operator_inspect(args: Vec<String>) -> Result<(), OperatorError> {
     let command = InspectCommand::parse(args)?;
-    let mut daemon = HubDaemon::start(explicit_config(command.data_directory)?)?;
-    let packages = daemon.package_registry().clone();
-    let api = HubClientApi::local_operator("botster-hub-cli");
-    let runtime = daemon
-        .runtime_mut()
-        .ok_or(OperatorError::DaemonNotRunning)?;
-    let response = api
-        .handle_request(
-            runtime,
-            &packages,
-            HubClientRequest::ListSessions {
-                request_id: request_id("cli-inspect-sessions"),
-            },
-        )
-        .wait(runtime)?;
-    let HubClientResponseBody::Sessions(sessions) = response.body else {
+    let config = explicit_config(command.data_directory)?;
+    let response = daemon_transport_request(&config, DaemonRequest::ListSessions)?;
+    if response.kind != DaemonResponseKind::Sessions {
         return Err(OperatorError::UnexpectedResponse("sessions"));
-    };
+    }
 
     println!("inspect=session");
-    if let Some(session) = sessions
+    if let Some(session) = response
+        .sessions
         .into_iter()
-        .find(|session| session.session_id == command.session_id)
+        .find(|session| session.session_id == command.session_id.0)
     {
-        println!("session_id={}", session.session_id.0);
-        println!("lifecycle={}", session_lifecycle_label(&session.lifecycle));
+        println!("session_id={}", session.session_id);
+        println!("lifecycle={}", session.lifecycle);
     } else {
         println!("session_id={}", command.session_id.0);
         println!("found=false");
     }
-    daemon.stop();
     Ok(())
 }
 
@@ -3212,20 +3199,6 @@ fn print_package_decision(decision: &botster_hub::DaemonPackageDecision) {
     println!("action={}", decision.action);
     println!("state={}", decision.state);
     println!("classification={}", decision.classification);
-}
-
-fn request_id(value: &str) -> RequestId {
-    RequestId(value.to_string())
-}
-
-fn session_lifecycle_label(state: &SessionLifecycleState) -> &'static str {
-    match state {
-        SessionLifecycleState::Starting => "starting",
-        SessionLifecycleState::Running => "running",
-        SessionLifecycleState::Stopping => "stopping",
-        SessionLifecycleState::Exited { .. } => "exited",
-        SessionLifecycleState::Failed { .. } => "failed",
-    }
 }
 
 struct DataArgs {

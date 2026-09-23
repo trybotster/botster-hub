@@ -3,14 +3,14 @@
 //! The hub persists product and policy state here while `botster-core` remains
 //! the owner of reusable session, transport, package, and admission mechanics.
 //! Version 4 is a single local JSON file intended for the local runtime. It is a
-//! single-writer store: atomic rename keeps the previous committed file intact
-//! when a write fails before rename, but concurrent hub processes can still
-//! produce last-writer-wins updates.
+//! single-writer store. Retained directory ownership excludes another writer.
+//! A write that reaches rename has a distinct published outcome.
 
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, Write};
+#[cfg(test)]
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -25,14 +25,16 @@ use crate::config::{
 };
 use crate::credentials::{CredentialKeyPurpose, CredentialProviderKind};
 use crate::packages::PackageRegistrySnapshot;
+use crate::recovery::state_directory::{
+    StateDirectoryError, StateDirectoryOwnership, StateDocumentCommit,
+};
 use crate::session_types::PackageSessionType;
-use crate::shared_view::{SharedView, SharedViewBudget};
+use crate::shared_view::{SharedView, SharedViewBudget, SharedViewCharge};
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::Worktree;
 
 const HUB_STATE_SCHEMA_VERSION: u16 = 4;
 const HUB_STATE_FILE_NAME: &str = "hub-state.json";
-const HUB_STATE_TEMP_FILE_NAME: &str = "hub-state.json.tmp";
 
 /// Persistence buckets the host profile must govern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +317,14 @@ pub trait HubStateStore {
     /// Load existing state or create a current default when no file exists.
     fn load_or_initialize(&self, config: &HubConfig) -> HubStateStoreResult<HubState>;
 
+    /// Custom stores keep their existing load behavior and return no File authority.
+    fn load_retained(
+        &self,
+        config: &HubConfig,
+    ) -> HubStateStoreResult<(HubState, Option<HubStateAuthority>)> {
+        self.load_or_initialize(config).map(|state| (state, None))
+    }
+
     /// Save state while startup has exclusive ownership and no shared view exists.
     fn save_exclusive_startup_state(&self, state: &HubState) -> HubStateStoreResult<()>;
 }
@@ -323,11 +333,123 @@ pub trait HubStateStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHubStateStore {
     path: PathBuf,
-    temporary_path: PathBuf,
 }
 
+/// One File document lineage. Clones share one directory lock and view budget.
+pub struct HubStateAuthority {
+    store_path: PathBuf,
+    directory: StateDirectoryOwnership,
+    budget: Arc<SharedViewBudget>,
+    startup_charge: Option<SharedViewCharge>,
+}
+
+impl HubStateAuthority {
+    pub(crate) fn store(&self) -> FileHubStateStore {
+        FileHubStateStore {
+            path: self.store_path.clone(),
+        }
+    }
+
+    fn clone_for_write(&self) -> Self {
+        Self {
+            store_path: self.store_path.clone(),
+            directory: self.directory.clone(),
+            budget: Arc::clone(&self.budget),
+            startup_charge: None,
+        }
+    }
+
+    pub(crate) fn budget(&self) -> Arc<SharedViewBudget> {
+        Arc::clone(&self.budget)
+    }
+
+    /// Runtime moves this charge into its first published view.
+    pub(crate) fn take_startup_charge(&mut self) -> Option<SharedViewCharge> {
+        self.startup_charge.take()
+    }
+}
+
+impl fmt::Debug for HubStateAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HubStateAuthority")
+            .field("store_path", &self.store_path)
+            .field("directory", &self.directory)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub enum HubStatePublicationCause {
+    DirectorySync(io::Error),
+    DirectoryChanged,
+}
+
+#[derive(Debug)]
+struct FileWriteEvidence {
+    candidate: SharedView<HubState>,
+    prior: Option<SharedView<HubState>>,
+    authority: HubStateAuthority,
+    base_revision: u64,
+    committed_revision: u64,
+    cause: Option<HubStatePublicationCause>,
+}
+
+/// Evidence owned by the caller after a write reached rename without a clean result.
+#[derive(Debug)]
+#[must_use]
+pub struct HubStateUncertainWrite(Box<FileWriteEvidence>);
+
+impl HubStateUncertainWrite {
+    pub fn cause(&self) -> &HubStatePublicationCause {
+        self.0.cause.as_ref().expect("published cause is set")
+    }
+
+    pub fn candidate(&self) -> &HubState {
+        &self.0.candidate
+    }
+
+    pub fn prior(&self) -> Option<&HubState> {
+        self.0.prior.as_deref()
+    }
+
+    pub fn base_revision(&self) -> u64 {
+        self.0.base_revision
+    }
+
+    pub fn committed_revision(&self) -> u64 {
+        self.0.committed_revision
+    }
+
+    pub(crate) fn authority(&self) -> &HubStateAuthority {
+        &self.0.authority
+    }
+}
+
+#[derive(Debug)]
+#[must_use]
+pub(crate) enum FileCommitOutcome {
+    Synced {
+        state: SharedView<HubState>,
+        revision: u64,
+    },
+    PublishedUncertain(HubStateUncertainWrite),
+}
+
+#[derive(Debug)]
+pub(crate) enum FileCommitError {
+    Preparation(HubStateStoreError),
+    Stale(PreparedHubStateWrite),
+    RevisionExhausted(PreparedHubStateWrite),
+    BeforePublication {
+        error: HubStateStoreError,
+        prepared: PreparedHubStateWrite,
+    },
+}
+
+#[derive(Debug)]
 pub(crate) struct PreparedHubStateWrite {
-    state: SharedView<HubState>,
+    evidence: Box<FileWriteEvidence>,
     bytes: Vec<u8>,
 }
 
@@ -338,7 +460,6 @@ impl FileHubStateStore {
         let data_directory = data_directory.as_ref();
         Self {
             path: data_directory.join(HUB_STATE_FILE_NAME),
-            temporary_path: data_directory.join(HUB_STATE_TEMP_FILE_NAME),
         }
     }
 
@@ -355,100 +476,224 @@ impl FileHubStateStore {
         config: &HubConfig,
         update: impl FnOnce(&mut HubState),
     ) -> HubStateStoreResult<HubState> {
-        let mut state = self.load_for_update(config)?;
+        let (mut state, Some(mut authority)) = self.load_retained(config)? else {
+            unreachable!("File load returns authority")
+        };
+        let prior = SharedView::from_reserved(
+            state.clone(),
+            authority.take_startup_charge().expect("startup charge"),
+        );
         update(&mut state);
-        let prepared = self.prepare_shared(state, &SharedViewBudget::new())?;
-        self.commit_shared(prepared).map(|state| (*state).clone())
+        let prepared =
+            self.prepare_shared(&authority, 0, Some(prior), state, &authority.budget())?;
+        match self.commit_shared(prepared, 0) {
+            Ok(FileCommitOutcome::Synced { state, .. }) => Ok((*state).clone()),
+            Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+                Err(HubStateStoreError::PublishedUncertain(write))
+            }
+            Err(FileCommitError::Preparation(error))
+            | Err(FileCommitError::BeforePublication { error, .. }) => Err(error),
+            Err(FileCommitError::Stale(_)) => Err(HubStateStoreError::StaleRevision),
+            Err(FileCommitError::RevisionExhausted(_)) => {
+                Err(HubStateStoreError::RevisionExhausted)
+            }
+        }
     }
 
-    fn write_atomically(&self, state: &HubState) -> HubStateStoreResult<()> {
-        let bytes = serde_json::to_vec_pretty(state).map_err(HubStateStoreError::Serialize)?;
-        self.write_prepared_atomically(&bytes)?;
+    fn check_authority(&self, authority: &HubStateAuthority) -> HubStateStoreResult<()> {
+        if authority.store_path != self.path {
+            return Err(HubStateStoreError::AuthorityMismatch);
+        }
         Ok(())
     }
 
-    fn write_prepared_atomically(&self, bytes: &[u8]) -> HubStateStoreResult<()> {
-        self.write_temporary_file(bytes)?;
-        fs::rename(&self.temporary_path, &self.path).map_err(HubStateStoreError::Io)?;
-        Ok(())
-    }
-
-    fn write_temporary_file(&self, bytes: &[u8]) -> HubStateStoreResult<()> {
+    fn acquire_authority(&self) -> HubStateStoreResult<HubStateAuthority> {
         let parent = self
             .path
             .parent()
             .ok_or(HubStateStoreError::MissingParent)?;
-        fs::create_dir_all(parent).map_err(HubStateStoreError::Io)?;
-
-        let mut temporary = File::create(&self.temporary_path).map_err(HubStateStoreError::Io)?;
-        temporary.write_all(bytes).map_err(HubStateStoreError::Io)?;
-        temporary.sync_all().map_err(HubStateStoreError::Io)?;
-        Ok(())
+        let directory = StateDirectoryOwnership::acquire(parent).map_err(map_directory_error)?;
+        Ok(HubStateAuthority {
+            store_path: self.path.clone(),
+            directory,
+            budget: SharedViewBudget::new(),
+            startup_charge: None,
+        })
     }
 
     #[cfg(test)]
-    fn save_with_injected_failure(&self, state: &HubState) -> HubStateStoreResult<()> {
-        let bytes = serde_json::to_vec_pretty(state).map_err(HubStateStoreError::Serialize)?;
-        self.write_temporary_file(&bytes)?;
-        Err(HubStateStoreError::InjectedWriteFailure)
+    pub(crate) fn acquire_test_authority(&self) -> HubStateStoreResult<HubStateAuthority> {
+        self.acquire_authority()
+    }
+
+    /// Save startup state through the authority acquired before the initial load.
+    /// The caller supplies its exclusive startup revision. This method does not
+    /// compare that revision with a concurrent owner; normal updates use
+    /// `prepare_shared` and `commit_shared` with the current Host revision.
+    pub(crate) fn save_retained_startup_state(
+        &self,
+        authority: &HubStateAuthority,
+        base_revision: u64,
+        prior: Option<SharedView<HubState>>,
+        candidate: HubState,
+    ) -> Result<FileCommitOutcome, FileCommitError> {
+        let budget = authority.budget();
+        let prepared = self
+            .prepare_shared(authority, base_revision, prior, candidate, &budget)
+            .map_err(FileCommitError::Preparation)?;
+        self.commit_shared(prepared, base_revision)
     }
 
     /// Load the update base without creating a state file when it is absent.
-    pub(crate) fn load_for_update(&self, config: &HubConfig) -> HubStateStoreResult<HubState> {
-        match fs::read(&self.path) {
+    pub(crate) fn load_for_update(
+        &self,
+        authority: &HubStateAuthority,
+        config: &HubConfig,
+    ) -> HubStateStoreResult<HubState> {
+        self.check_authority(authority)?;
+        match authority.directory.read_document() {
             Ok(bytes) => decode_hub_state(&bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(StateDirectoryError::DocumentRead(error))
+                if error.kind() == io::ErrorKind::NotFound =>
+            {
                 Ok(HubState::from_config(config))
             }
-            Err(error) => Err(HubStateStoreError::Io(error)),
+            Err(error) => Err(map_directory_error(error)),
         }
     }
 
-    /// Reserve the candidate view before the durable write starts.
+    /// Update state under one exclusive owner. The caller supplies the current
+    /// revision; this helper has no separate revision check between preparation
+    /// and commit. Use separate prepare and commit calls to reject stale work.
     pub(crate) fn update_shared(
         &self,
-        config: &HubConfig,
+        authority: &HubStateAuthority,
+        base_revision: u64,
+        prior: SharedView<HubState>,
         budget: &Arc<SharedViewBudget>,
         update: impl FnOnce(&mut HubState),
-    ) -> HubStateStoreResult<SharedView<HubState>> {
-        let mut state = self.load_for_update(config)?;
+    ) -> Result<FileCommitOutcome, FileCommitError> {
+        let mut state = (*prior).clone();
         update(&mut state);
-        let prepared = self.prepare_shared(state, budget)?;
-        self.commit_shared(prepared)
+        let prepared = self
+            .prepare_shared(authority, base_revision, Some(prior), state, budget)
+            .map_err(FileCommitError::Preparation)?;
+        self.commit_shared(prepared, base_revision)
     }
 
     pub(crate) fn prepare_shared(
         &self,
+        authority: &HubStateAuthority,
+        base_revision: u64,
+        prior: Option<SharedView<HubState>>,
         state: HubState,
         budget: &Arc<SharedViewBudget>,
     ) -> HubStateStoreResult<PreparedHubStateWrite> {
+        self.check_authority(authority)?;
+        if !Arc::ptr_eq(budget, &authority.budget) {
+            return Err(HubStateStoreError::AuthorityMismatch);
+        }
         state
             .validate_version()
             .map_err(HubStateStoreError::State)?;
         // The durable pretty JSON is larger than compact JSON. Its existing
         // byte length is therefore one conservative logical view charge.
         let bytes = serde_json::to_vec_pretty(&state).map_err(HubStateStoreError::Serialize)?;
-        let view = SharedView::try_new(budget, state, bytes.len()).map_err(|error| {
-            HubStateStoreError::ViewCapacity {
-                requested: error.requested,
-                available: error.available,
-            }
-        })?;
-        Ok(PreparedHubStateWrite { state: view, bytes })
+        let charge =
+            budget
+                .reserve(bytes.len())
+                .map_err(|error| HubStateStoreError::ViewCapacity {
+                    requested: error.requested,
+                    available: error.available,
+                })?;
+        Ok(self.prepare_shared_with_charge(authority, base_revision, prior, state, bytes, charge))
+    }
+
+    fn prepare_shared_with_charge(
+        &self,
+        authority: &HubStateAuthority,
+        base_revision: u64,
+        prior: Option<SharedView<HubState>>,
+        state: HubState,
+        bytes: Vec<u8>,
+        charge: SharedViewCharge,
+    ) -> PreparedHubStateWrite {
+        let view = SharedView::from_reserved(state, charge);
+        let evidence = Box::new(FileWriteEvidence {
+            candidate: view,
+            prior,
+            authority: authority.clone_for_write(),
+            base_revision,
+            committed_revision: base_revision,
+            cause: None,
+        });
+        PreparedHubStateWrite { evidence, bytes }
     }
 
     pub(crate) fn commit_shared(
         &self,
         prepared: PreparedHubStateWrite,
-    ) -> HubStateStoreResult<SharedView<HubState>> {
-        let PreparedHubStateWrite { state, bytes, .. } = prepared;
-        #[cfg(test)]
-        if save_failure_is_due(&self.path) {
-            self.write_temporary_file(&bytes)?;
-            return Err(HubStateStoreError::InjectedWriteFailure);
+        current_revision: u64,
+    ) -> Result<FileCommitOutcome, FileCommitError> {
+        if current_revision != prepared.evidence.base_revision {
+            return Err(FileCommitError::Stale(prepared));
         }
-        self.write_prepared_atomically(&bytes)?;
-        Ok(state)
+        let Some(revision) = current_revision.checked_add(1) else {
+            return Err(FileCommitError::RevisionExhausted(prepared));
+        };
+        if let Err(error) = self.check_authority(&prepared.evidence.authority) {
+            return Err(FileCommitError::BeforePublication { error, prepared });
+        }
+        let mut prepared = prepared;
+        prepared.evidence.committed_revision = revision;
+        #[cfg(test)]
+        let result = if save_failure_is_due(&self.path) {
+            prepared
+                .evidence
+                .authority
+                .directory
+                .write_document_with_pre_rename_failure_for_test(&prepared.bytes)
+        } else if sync_failure_is_due(&self.path) {
+            prepared
+                .evidence
+                .authority
+                .directory
+                .write_document_with_sync_failure_for_test(&prepared.bytes)
+        } else {
+            prepared
+                .evidence
+                .authority
+                .directory
+                .write_document(&prepared.bytes)
+        };
+        #[cfg(not(test))]
+        let result = prepared
+            .evidence
+            .authority
+            .directory
+            .write_document(&prepared.bytes);
+        match result {
+            Err(error) => Err(FileCommitError::BeforePublication {
+                error: map_directory_error(error),
+                prepared,
+            }),
+            Ok(StateDocumentCommit::Synced) => Ok(FileCommitOutcome::Synced {
+                state: prepared.evidence.candidate.clone(),
+                revision,
+            }),
+            Ok(StateDocumentCommit::SyncedDirectoryChanged(_)) => {
+                prepared.evidence.cause = Some(HubStatePublicationCause::DirectoryChanged);
+                Ok(FileCommitOutcome::PublishedUncertain(
+                    HubStateUncertainWrite(prepared.evidence),
+                ))
+            }
+            Ok(StateDocumentCommit::RenamedSyncFailed(error)) => {
+                prepared.evidence.cause = Some(HubStatePublicationCause::DirectorySync(error));
+                Ok(FileCommitOutcome::PublishedUncertain(
+                    HubStateUncertainWrite(prepared.evidence),
+                ))
+            }
+        }
     }
 
     /// Fail the next `save` after writing the temporary file, before rename.
@@ -468,12 +713,34 @@ impl FileHubStateStore {
                 successful_saves,
             );
     }
+
+    #[cfg(test)]
+    pub(crate) fn inject_next_directory_sync_failure(data_directory: impl AsRef<Path>) {
+        sync_failures()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(data_directory.as_ref().join(HUB_STATE_FILE_NAME));
+    }
 }
 
 #[cfg(test)]
 fn save_failures() -> &'static Mutex<std::collections::BTreeMap<PathBuf, u32>> {
     static FAILURES: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, u32>>> = OnceLock::new();
     FAILURES.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn sync_failures() -> &'static Mutex<std::collections::BTreeSet<PathBuf>> {
+    static FAILURES: OnceLock<Mutex<std::collections::BTreeSet<PathBuf>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn sync_failure_is_due(path: &Path) -> bool {
+    sync_failures()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(path)
 }
 
 #[cfg(test)]
@@ -493,28 +760,92 @@ fn save_failure_is_due(path: &Path) -> bool {
     }
 }
 
+fn map_directory_error(error: StateDirectoryError) -> HubStateStoreError {
+    match error {
+        StateDirectoryError::Io(error) | StateDirectoryError::DocumentRead(error) => {
+            HubStateStoreError::Io(error)
+        }
+        StateDirectoryError::Owned(path) => HubStateStoreError::Owned(path),
+        StateDirectoryError::Replaced => HubStateStoreError::DirectoryChanged,
+        StateDirectoryError::Quarantined(_) => HubStateStoreError::Quarantined,
+        StateDirectoryError::InvalidTemporaryFile => HubStateStoreError::InvalidTemporaryFile,
+        #[cfg(test)]
+        StateDirectoryError::InjectedWriteFailure => HubStateStoreError::InjectedWriteFailure,
+    }
+}
+
 impl HubStateStore for FileHubStateStore {
-    fn load_or_initialize(&self, config: &HubConfig) -> HubStateStoreResult<HubState> {
-        match fs::read(&self.path) {
-            Ok(bytes) => decode_hub_state(&bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let state = HubState::from_config(config);
-                self.save_exclusive_startup_state(&state)?;
-                Ok(state)
+    fn load_or_initialize(&self, _config: &HubConfig) -> HubStateStoreResult<HubState> {
+        Err(HubStateStoreError::AuthorityRequired)
+    }
+
+    fn load_retained(
+        &self,
+        config: &HubConfig,
+    ) -> HubStateStoreResult<(HubState, Option<HubStateAuthority>)> {
+        let mut authority = self.acquire_authority()?;
+        match authority.directory.read_document() {
+            Ok(bytes) => {
+                let state = decode_hub_state(&bytes)?;
+                let logical_bytes = serde_json::to_vec_pretty(&state)
+                    .map_err(HubStateStoreError::Serialize)?
+                    .len();
+                authority.startup_charge =
+                    Some(authority.budget.reserve(logical_bytes).map_err(|error| {
+                        HubStateStoreError::ViewCapacity {
+                            requested: error.requested,
+                            available: error.available,
+                        }
+                    })?);
+                Ok((state, Some(authority)))
             }
-            Err(error) => Err(HubStateStoreError::Io(error)),
+            Err(StateDirectoryError::DocumentRead(error))
+                if error.kind() == io::ErrorKind::NotFound =>
+            {
+                let state = HubState::from_config(config);
+                let bytes =
+                    serde_json::to_vec_pretty(&state).map_err(HubStateStoreError::Serialize)?;
+                authority.startup_charge =
+                    Some(authority.budget.reserve(bytes.len()).map_err(|error| {
+                        HubStateStoreError::ViewCapacity {
+                            requested: error.requested,
+                            available: error.available,
+                        }
+                    })?);
+                let candidate_charge = authority.budget.reserve(bytes.len()).map_err(|error| {
+                    HubStateStoreError::ViewCapacity {
+                        requested: error.requested,
+                        available: error.available,
+                    }
+                })?;
+                let candidate = state.clone();
+                let prepared = self.prepare_shared_with_charge(
+                    &authority,
+                    0,
+                    None,
+                    candidate,
+                    bytes,
+                    candidate_charge,
+                );
+                match self.commit_shared(prepared, 0) {
+                    Ok(FileCommitOutcome::Synced { .. }) => Ok((state, Some(authority))),
+                    Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+                        Err(HubStateStoreError::PublishedUncertain(write))
+                    }
+                    Err(FileCommitError::Preparation(error))
+                    | Err(FileCommitError::BeforePublication { error, .. }) => Err(error),
+                    Err(FileCommitError::Stale(_)) => Err(HubStateStoreError::StaleRevision),
+                    Err(FileCommitError::RevisionExhausted(_)) => {
+                        Err(HubStateStoreError::RevisionExhausted)
+                    }
+                }
+            }
+            Err(error) => Err(map_directory_error(error)),
         }
     }
 
-    fn save_exclusive_startup_state(&self, state: &HubState) -> HubStateStoreResult<()> {
-        state
-            .validate_version()
-            .map_err(HubStateStoreError::State)?;
-        #[cfg(test)]
-        if save_failure_is_due(&self.path) {
-            return self.save_with_injected_failure(state);
-        }
-        self.write_atomically(state)
+    fn save_exclusive_startup_state(&self, _state: &HubState) -> HubStateStoreResult<()> {
+        Err(HubStateStoreError::AuthorityRequired)
     }
 }
 
@@ -562,6 +893,24 @@ struct HubStatePackageSpan<'a> {
 /// Typed storage boundary errors.
 #[derive(Debug)]
 pub enum HubStateStoreError {
+    /// A File operation requires the authority returned by a retained load.
+    AuthorityRequired,
+    /// The authority belongs to another File path or view budget.
+    AuthorityMismatch,
+    /// The prepared revision no longer matches the owner revision.
+    StaleRevision,
+    /// The owner revision cannot advance.
+    RevisionExhausted,
+    /// Another owner holds the state directory.
+    Owned(PathBuf),
+    /// The retained directory pathname no longer identifies its descriptor.
+    DirectoryChanged,
+    /// A published write paused further writes through this authority.
+    Quarantined,
+    /// A temporary file did not have exclusive regular-file identity.
+    InvalidTemporaryFile,
+    /// A state write reached rename without a clean commit result.
+    PublishedUncertain(HubStateUncertainWrite),
     /// State file path did not have a parent directory.
     MissingParent,
     /// Filesystem error while reading or writing durable state.
@@ -582,6 +931,28 @@ pub enum HubStateStoreError {
 impl fmt::Display for HubStateStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AuthorityRequired => {
+                formatter.write_str("File state requires retained authority")
+            }
+            Self::AuthorityMismatch => {
+                formatter.write_str("File state authority does not match the store or view budget")
+            }
+            Self::StaleRevision => formatter.write_str("prepared Hub state revision is stale"),
+            Self::RevisionExhausted => formatter.write_str("Hub state revision cannot advance"),
+            Self::Owned(path) => write!(
+                formatter,
+                "state directory {} already has a writer",
+                path.display()
+            ),
+            Self::DirectoryChanged => formatter.write_str("state directory changed during a write"),
+            Self::Quarantined => {
+                formatter.write_str("state directory writes are paused after uncertain publication")
+            }
+            Self::InvalidTemporaryFile => formatter
+                .write_str("state temporary file is not an exclusively linked regular file"),
+            Self::PublishedUncertain(write) => {
+                write!(formatter, "state write reached rename: {:?}", write.cause())
+            }
             Self::MissingParent => write!(formatter, "hub state file has no parent directory"),
             Self::Io(error) => write!(formatter, "hub state filesystem error: {error}"),
             Self::Serialize(error) => write!(formatter, "hub state serialization error: {error}"),
@@ -605,10 +976,22 @@ impl fmt::Display for HubStateStoreError {
 impl Error for HubStateStoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::PublishedUncertain(write) => match write.cause() {
+                HubStatePublicationCause::DirectorySync(error) => Some(error),
+                HubStatePublicationCause::DirectoryChanged => None,
+            },
             Self::Io(error) => Some(error),
             Self::Serialize(error) | Self::Corrupt(error) => Some(error),
             Self::State(error) => Some(error),
-            Self::ViewCapacity { .. } => None,
+            Self::AuthorityRequired
+            | Self::AuthorityMismatch
+            | Self::StaleRevision
+            | Self::RevisionExhausted
+            | Self::Owned(_)
+            | Self::DirectoryChanged
+            | Self::Quarantined
+            | Self::InvalidTemporaryFile
+            | Self::ViewCapacity { .. } => None,
             #[cfg(test)]
             Self::MissingParent | Self::InjectedWriteFailure => None,
             #[cfg(not(test))]
@@ -657,6 +1040,13 @@ mod tests {
         }
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .expect("build test config")
+    }
+
+    fn load_file_state(
+        store: &FileHubStateStore,
+        config: &HubConfig,
+    ) -> HubStateStoreResult<HubState> {
+        store.load_retained(config).map(|(state, _authority)| state)
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
@@ -754,16 +1144,212 @@ mod tests {
     }
 
     #[test]
+    fn retained_file_store_owns_load_commit_and_published_uncertainty() {
+        let config = test_config("retained-file-store");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        assert!(matches!(
+            store.load_or_initialize(&config),
+            Err(HubStateStoreError::AuthorityRequired)
+        ));
+        assert!(matches!(
+            store.save_exclusive_startup_state(&HubState::from_config(&config)),
+            Err(HubStateStoreError::AuthorityRequired)
+        ));
+        assert!(!config.data_directory.exists());
+
+        let (state, Some(mut authority)) = store.load_retained(&config).unwrap() else {
+            panic!("File load must return its authority");
+        };
+        assert!(matches!(
+            store.load_retained(&config),
+            Err(HubStateStoreError::Owned(_))
+        ));
+        let prior = SharedView::from_reserved(
+            state,
+            authority.take_startup_charge().expect("startup charge"),
+        );
+        assert!(authority.take_startup_charge().is_none());
+        assert!(authority.budget().used() > 0);
+        let mut candidate = (*prior).clone();
+        candidate.session_type_generation = 1;
+        let prepared = store
+            .prepare_shared(&authority, 0, Some(prior), candidate, &authority.budget())
+            .unwrap();
+        let FileCommitOutcome::Synced {
+            state: confirmed,
+            revision: 1,
+        } = store.commit_shared(prepared, 0).unwrap()
+        else {
+            panic!("first commit must synchronize");
+        };
+
+        let mut uncertain_candidate = (*confirmed).clone();
+        uncertain_candidate.session_type_generation = 2;
+        let prepared = store
+            .prepare_shared(
+                &authority,
+                1,
+                Some(confirmed.clone()),
+                uncertain_candidate,
+                &authority.budget(),
+            )
+            .unwrap();
+        FileHubStateStore::inject_next_directory_sync_failure(&config.data_directory);
+        let FileCommitOutcome::PublishedUncertain(uncertain) =
+            store.commit_shared(prepared, 1).unwrap()
+        else {
+            panic!("rename plus sync failure must preserve owned uncertainty");
+        };
+        assert!(matches!(
+            uncertain.cause(),
+            HubStatePublicationCause::DirectorySync(_)
+        ));
+        assert_eq!(uncertain.base_revision(), 1);
+        assert_eq!(uncertain.committed_revision(), 2);
+        assert_eq!(uncertain.prior().unwrap().session_type_generation, 1);
+        assert_eq!(uncertain.candidate().session_type_generation, 2);
+        assert_eq!(
+            decode_hub_state(&authority.directory.read_document().unwrap())
+                .unwrap()
+                .session_type_generation,
+            2
+        );
+
+        let mut later = (*confirmed).clone();
+        later.session_type_generation = 3;
+        let prepared = store
+            .prepare_shared(&authority, 1, Some(confirmed), later, &authority.budget())
+            .unwrap();
+        assert!(matches!(
+            store.commit_shared(prepared, 1),
+            Err(FileCommitError::BeforePublication {
+                error: HubStateStoreError::Quarantined,
+                ..
+            })
+        ));
+        assert!(!config.data_directory.join("hub-state.json.tmp").exists());
+        drop(uncertain);
+        drop(authority);
+    }
+
+    #[test]
+    fn retained_file_store_rejects_mismatched_store_and_budget_before_io() {
+        let config = test_config("retained-authority-mismatch");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let other_directory = config.data_directory.join("other");
+        let other_store = FileHubStateStore::for_data_directory(&other_directory);
+        let (state, Some(authority)) = store.load_retained(&config).unwrap() else {
+            panic!("File load must return its authority");
+        };
+
+        assert!(matches!(
+            other_store.prepare_shared(&authority, 0, None, state.clone(), &authority.budget()),
+            Err(HubStateStoreError::AuthorityMismatch)
+        ));
+        assert!(!other_directory.exists());
+
+        let other_budget = SharedViewBudget::new();
+        assert!(matches!(
+            store.prepare_shared(&authority, 0, None, state, &other_budget),
+            Err(HubStateStoreError::AuthorityMismatch)
+        ));
+        assert!(!store.path().with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn retained_initialization_returns_owned_uncertainty_after_rename() {
+        let config = test_config("retained-initial-uncertainty");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        FileHubStateStore::inject_next_directory_sync_failure(&config.data_directory);
+
+        let HubStateStoreError::PublishedUncertain(write) =
+            store.load_retained(&config).unwrap_err()
+        else {
+            panic!("initial rename must return owned uncertainty");
+        };
+        assert!(matches!(
+            write.cause(),
+            HubStatePublicationCause::DirectorySync(_)
+        ));
+        assert!(write.prior().is_none());
+        assert_eq!(write.base_revision(), 0);
+        assert_eq!(write.committed_revision(), 1);
+        assert_eq!(
+            decode_hub_state(&write.authority().directory.read_document().unwrap()).unwrap(),
+            *write.candidate()
+        );
+        assert!(matches!(
+            store.load_retained(&config),
+            Err(HubStateStoreError::Owned(_))
+        ));
+        drop(write);
+    }
+
+    #[test]
+    fn retained_startup_save_uses_exclusive_revision_and_normal_commit_checks_current() {
+        let config = test_config("retained-startup-save");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let (state, Some(mut authority)) = store.load_retained(&config).unwrap() else {
+            panic!("File load must return its authority");
+        };
+        let prior = SharedView::from_reserved(
+            state,
+            authority.take_startup_charge().expect("startup charge"),
+        );
+        let mut candidate = (*prior).clone();
+        candidate.session_type_generation = 1;
+        let FileCommitOutcome::Synced {
+            state: current,
+            revision: 1,
+        } = store
+            .save_retained_startup_state(&authority, 0, Some(prior), candidate)
+            .unwrap()
+        else {
+            panic!("exclusive startup save must synchronize");
+        };
+        let committed = authority.directory.read_document().unwrap();
+        let mut later = (*current).clone();
+        later.session_type_generation = 2;
+        let prepared = store
+            .prepare_shared(&authority, 1, Some(current), later, &authority.budget())
+            .unwrap();
+        assert!(matches!(
+            store.commit_shared(prepared, 0),
+            Err(FileCommitError::Stale(_))
+        ));
+        assert_eq!(authority.directory.read_document().unwrap(), committed);
+    }
+
+    #[test]
+    fn custom_store_default_retained_load_keeps_existing_contract() {
+        struct CustomStore(HubState);
+
+        impl HubStateStore for CustomStore {
+            fn load_or_initialize(&self, _config: &HubConfig) -> HubStateStoreResult<HubState> {
+                Ok(self.0.clone())
+            }
+
+            fn save_exclusive_startup_state(&self, _state: &HubState) -> HubStateStoreResult<()> {
+                Ok(())
+            }
+        }
+
+        let config = test_config("custom-retained-default");
+        let expected = HubState::from_config(&config);
+        let store = CustomStore(expected.clone());
+        let (loaded, authority) = store.load_retained(&config).unwrap();
+        assert_eq!(loaded, expected);
+        assert!(authority.is_none());
+        store.save_exclusive_startup_state(&loaded).unwrap();
+    }
+
+    #[test]
     fn file_store_creates_and_loads_default_v2_state() {
         let config = test_config("creates-default");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
 
-        let state = store
-            .load_or_initialize(&config)
-            .expect("initialize default state");
-        let reopened = store
-            .load_or_initialize(&config)
-            .expect("load committed state");
+        let state = load_file_state(&store, &config).expect("initialize default state");
+        let reopened = load_file_state(&store, &config).expect("load committed state");
 
         assert_eq!(state.schema_version, HUB_STATE_SCHEMA_VERSION);
         assert_eq!(reopened, state);
@@ -807,8 +1393,7 @@ mod tests {
         )
         .expect("write legacy-shaped state");
 
-        let reopened = store
-            .load_or_initialize(&config)
+        let reopened = load_file_state(&store, &config)
             .expect("load current state with omitted optional collections");
 
         assert!(reopened.device_session_type_sources.is_empty());
@@ -845,7 +1430,7 @@ mod tests {
         .expect("write v2 state");
 
         assert!(matches!(
-            store.load_or_initialize(&config),
+            load_file_state(&store, &config),
             Err(HubStateStoreError::State(
                 HubStateError::UnsupportedVersion(2)
             ))
@@ -879,7 +1464,7 @@ mod tests {
         .expect("write v1 state");
 
         assert!(matches!(
-            store.load_or_initialize(&config),
+            load_file_state(&store, &config),
             Err(HubStateStoreError::State(
                 HubStateError::UnsupportedVersion(1)
             ))
@@ -945,9 +1530,7 @@ mod tests {
         assert!(!raw_state.contains(concat!("/", "Users", "/")));
         assert!(!raw_state.contains("@example.com"));
 
-        let reopened = FileHubStateStore::for_data_directory(&config.data_directory)
-            .load_or_initialize(&config)
-            .expect("load browser trust metadata");
+        let reopened = load_file_state(&store, &config).expect("load browser trust metadata");
         assert_eq!(reopened.credential_keys.len(), 1);
         assert_eq!(reopened.trusted_browser_identities.len(), 1);
         assert_eq!(reopened.bootstrap_grants.len(), 1);
@@ -1099,9 +1682,7 @@ mod tests {
             .expect("persist registry state");
 
         let reopened_store = FileHubStateStore::for_data_directory(&config.data_directory);
-        let reopened = reopened_store
-            .load_or_initialize(&config)
-            .expect("load registry state");
+        let reopened = load_file_state(&reopened_store, &config).expect("load registry state");
 
         assert_eq!(reopened.package_registry.records.len(), 1);
         assert_eq!(reopened.schema_version, HUB_STATE_SCHEMA_VERSION);
@@ -1164,7 +1745,7 @@ mod tests {
         assert!(!raw_state.contains("write_only"));
         assert!(!raw_state.contains("super-secret-token"));
 
-        let reopened = store.load_or_initialize(&config).expect("reopen state");
+        let reopened = load_file_state(&store, &config).expect("reopen state");
         let restored =
             PackageRegistry::from_snapshot(reopened.package_registry).expect("restore registry");
         let view = restored
@@ -1213,9 +1794,7 @@ mod tests {
             })
             .expect("persist runnable entrypoint state");
 
-        let reopened = FileHubStateStore::for_data_directory(&config.data_directory)
-            .load_or_initialize(&config)
-            .expect("load runnable entrypoint state");
+        let reopened = load_file_state(&store, &config).expect("load runnable entrypoint state");
         let entrypoint = &reopened.package_registry.records[0].runnable_entrypoints[0];
 
         assert_eq!(entrypoint.id, "web");
@@ -1231,9 +1810,13 @@ mod tests {
     fn file_store_updates_state_atomically() {
         let config = test_config("atomic");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
-        let original = store
-            .load_or_initialize(&config)
-            .expect("initialize original state");
+        let (original, Some(mut authority)) = store.load_retained(&config).unwrap() else {
+            panic!("File load must return its authority");
+        };
+        let prior = SharedView::from_reserved(
+            original.clone(),
+            authority.take_startup_charge().expect("startup charge"),
+        );
         let mut next = original.clone();
         next.audit_history.push(HubAuditEntry {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1242,13 +1825,20 @@ mod tests {
             reason: "prove interrupted write preserves old state".to_string(),
         });
 
-        let error = store
-            .save_with_injected_failure(&next)
-            .expect_err("injected failure should stop before rename");
-        assert!(matches!(error, HubStateStoreError::InjectedWriteFailure));
+        let prepared = store
+            .prepare_shared(&authority, 0, Some(prior), next, &authority.budget())
+            .unwrap();
+        FileHubStateStore::inject_next_save_failure(&config.data_directory);
+        assert!(matches!(
+            store.commit_shared(prepared, 0),
+            Err(FileCommitError::BeforePublication {
+                error: HubStateStoreError::InjectedWriteFailure,
+                ..
+            })
+        ));
+        drop(authority);
 
-        let reopened = store
-            .load_or_initialize(&config)
+        let reopened = load_file_state(&store, &config)
             .expect("old state still loads after interrupted write");
         assert_eq!(reopened, original);
     }
@@ -1260,9 +1850,7 @@ mod tests {
         fs::create_dir_all(&config.data_directory).expect("create test data dir");
         fs::write(store.path(), b"{not json").expect("write corrupt state");
 
-        let error = store
-            .load_or_initialize(&config)
-            .expect_err("corrupt state should fail");
+        let error = load_file_state(&store, &config).expect_err("corrupt state should fail");
 
         assert!(matches!(error, HubStateStoreError::Corrupt(_)));
     }
@@ -1280,9 +1868,7 @@ mod tests {
         )
         .expect("write unsupported state");
 
-        let error = store
-            .load_or_initialize(&config)
-            .expect_err("unsupported version should fail");
+        let error = load_file_state(&store, &config).expect_err("unsupported version should fail");
 
         assert!(matches!(
             error,
@@ -1294,17 +1880,18 @@ mod tests {
     fn shared_view_capacity_failure_preserves_the_committed_file() {
         let config = test_config("shared-view-capacity");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
-        let initial = HubState::from_config(&config);
-        store
-            .save_exclusive_startup_state(&initial)
-            .expect("save initial state");
+        let (initial, Some(mut authority)) = store.load_retained(&config).unwrap() else {
+            panic!("File load must return its authority");
+        };
         let committed = fs::read(store.path()).expect("read initial state");
+        drop(authority.take_startup_charge());
         let budget = SharedViewBudget::with_capacity(1);
+        authority.budget = Arc::clone(&budget);
+        let mut candidate = initial;
+        candidate.session_type_generation = 1;
 
         let error = store
-            .update_shared(&config, &budget, |state| {
-                state.session_type_generation = 1;
-            })
+            .prepare_shared(&authority, 0, None, candidate, &budget)
             .expect_err("candidate view must exceed one byte");
 
         assert!(matches!(error, HubStateStoreError::ViewCapacity { .. }));

@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use crate::persistence::{FileHubStateStore, HubState, HubStateStoreError, PreparedHubStateWrite};
+use crate::persistence::{
+    FileCommitError, FileCommitOutcome, FileHubStateStore, HubState, HubStateAuthority,
+    HubStateStoreError, HubStateUncertainWrite, PreparedHubStateWrite,
+};
 use crate::shared_view::{SharedView, SharedViewBudget};
 
 use super::record::{AttemptId, ManagedIdentity, Phase, RecordError, RecoveryPolicy};
@@ -44,6 +47,12 @@ pub(crate) enum RecoveryCommitError {
         attempt: AttemptId,
         phase: Phase,
     },
+    /// Rename completed without a clean directory result. No receipt is issued.
+    PublishedUncertain {
+        write: HubStateUncertainWrite,
+        attempt: AttemptId,
+        phase: Phase,
+    },
 }
 
 impl std::fmt::Debug for PreparedRecoveryWrite {
@@ -76,7 +85,9 @@ impl PreparedRecoveryWrite {
     /// Prepare an intent on Host. G1 allocation admission remains an integration gate.
     pub(crate) fn admit(
         store: &FileHubStateStore,
+        authority: &HubStateAuthority,
         base_revision: u64,
+        prior: SharedView<HubState>,
         mut candidate: HubState,
         budget: &Arc<SharedViewBudget>,
         session_id: String,
@@ -94,7 +105,7 @@ impl PreparedRecoveryWrite {
             .expect("admitted record")
             .phase;
         let write = store
-            .prepare_shared(candidate, budget)
+            .prepare_shared(authority, base_revision, Some(prior), candidate, budget)
             .map_err(RecoveryWriteError::Store)?;
         Ok(Self {
             store: store.clone(),
@@ -107,7 +118,9 @@ impl PreparedRecoveryWrite {
 
     pub(crate) fn transition(
         store: &FileHubStateStore,
+        authority: &HubStateAuthority,
         base_revision: u64,
+        prior: SharedView<HubState>,
         mut candidate: HubState,
         budget: &Arc<SharedViewBudget>,
         attempt: AttemptId,
@@ -119,7 +132,7 @@ impl PreparedRecoveryWrite {
             .transition(&attempt, session_id, phase)
             .map_err(RecoveryWriteError::Record)?;
         let write = store
-            .prepare_shared(candidate, budget)
+            .prepare_shared(authority, base_revision, Some(prior), candidate, budget)
             .map_err(RecoveryWriteError::Store)?;
         Ok(Self {
             store: store.clone(),
@@ -140,24 +153,54 @@ impl PreparedRecoveryWrite {
         if current_revision != self.base_revision {
             return Err(RecoveryCommitError::Stale(self));
         }
-        let Some(committed_revision) = self.base_revision.checked_add(1) else {
+        if self.base_revision.checked_add(1).is_none() {
             return Err(RecoveryCommitError::RevisionExhausted(self));
-        };
-        let state = match self.store.commit_shared(self.write) {
-            Ok(state) => state,
-            Err(error) => {
+        }
+        let PreparedRecoveryWrite {
+            store,
+            base_revision,
+            write,
+            attempt,
+            phase,
+        } = self;
+        match store.commit_shared(write, current_revision) {
+            Ok(FileCommitOutcome::Synced { state, revision }) => Ok(DurableReceipt {
+                state,
+                attempt,
+                phase,
+                committed_revision: revision,
+            }),
+            Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+                Err(RecoveryCommitError::PublishedUncertain {
+                    write,
+                    attempt,
+                    phase,
+                })
+            }
+            Err(FileCommitError::Stale(write)) => Err(RecoveryCommitError::Stale(Self {
+                store,
+                base_revision,
+                write,
+                attempt,
+                phase,
+            })),
+            Err(FileCommitError::RevisionExhausted(write)) => {
+                Err(RecoveryCommitError::RevisionExhausted(Self {
+                    store,
+                    base_revision,
+                    write,
+                    attempt,
+                    phase,
+                }))
+            }
+            Err(FileCommitError::Preparation(error))
+            | Err(FileCommitError::BeforePublication { error, .. }) => {
                 return Err(RecoveryCommitError::Write {
                     error,
-                    attempt: self.attempt,
-                    phase: self.phase,
+                    attempt,
+                    phase,
                 });
             }
-        };
-        Ok(DurableReceipt {
-            state,
-            attempt: self.attempt,
-            phase: self.phase,
-            committed_revision,
-        })
+        }
     }
 }

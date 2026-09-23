@@ -285,7 +285,19 @@ pub(crate) fn handle(
     let packages = daemon.package_registry_view();
     let runtime = daemon.runtime()?;
     let config = runtime.config().clone();
+    let authority = runtime.state_authority();
     let data_directory = config.data_directory.clone();
+    if authority.is_none()
+        && (is_package_prepare(&request)
+            || is_spawn_target_prepare(&request)
+            || is_session_type_prepare(&request))
+    {
+        return Some(ControlStep::ready(error_response(
+            "state_authority_required",
+            "hub_state",
+            "a durable Host mutation requires retained File state authority",
+        )));
+    }
     let command = if matches!(request, DaemonRequest::IssueLocalWebrtcBootstrap { .. }) {
         HostMutationCommand::ValidateBootstrap {
             request,
@@ -308,6 +320,9 @@ pub(crate) fn handle(
         HostMutationCommand::Prepare(HostPrepare::Package {
             request,
             base_revision,
+            authority: authority
+                .clone()
+                .expect("File host mutation retains its state authority"),
             state: state_view,
             packages,
             data_directory,
@@ -321,6 +336,9 @@ pub(crate) fn handle(
         HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
             request,
             base_revision,
+            authority: authority
+                .clone()
+                .expect("File host mutation retains its state authority"),
             state: state_view,
             packages,
             data_directory,
@@ -349,6 +367,7 @@ pub(crate) fn handle(
         HostMutationCommand::Prepare(HostPrepare::SessionType {
             request,
             base_revision,
+            authority: authority.expect("File host mutation retains its state authority"),
             config,
             state: state_view,
             packages,
@@ -553,6 +572,7 @@ impl HostMutationContinuation {
             } else if let HostResult::Mutation(result) = result {
                 result
             } else {
+                state.release_uncertain_reservation(waiter_id);
                 return finish_error(
                     permit,
                     HostMutationError {
@@ -564,6 +584,9 @@ impl HostMutationContinuation {
             (result, permit)
         };
         let mut result = result;
+        if !matches!(result, HostMutationResult::PublishedUncertain { .. }) {
+            state.release_uncertain_reservation(waiter_id);
+        }
         if let Some(cleanup) = package_event_cleanup(&mut result) {
             if !cleanup.event_plane_faults.is_empty() {
                 return retain_event_cleanup(state, waiter_id, result, None, None, Some(permit));
@@ -627,6 +650,23 @@ impl HostMutationContinuation {
                 ControlPoll::Ready(response)
             }
             HostMutationResult::ReadReady(reply) => finish_reply(permit, reply),
+            HostMutationResult::PublishedUncertain { write, rollback } => {
+                let cleanup = failed_package_effect.take().map(|(effect, original)| {
+                    crate::daemon::owner_loop::UncertainPublicationCleanup::PackageRestore {
+                        effect,
+                        original,
+                    }
+                });
+                state.retain_uncertain_publication(waiter_id, write, rollback, cleanup);
+                release_document(state, waiter_id);
+                // Host work completed. The unresolved Owner permit moves in pending.rs.
+                drop(permit);
+                ControlPoll::Ready(Ok(error_response(
+                    "state_publication_uncertain",
+                    "hub_state",
+                    "the state write reached publication without a confirmed durable result",
+                )))
+            }
             HostMutationResult::Prepared(prepared) => admit_or_park_commit(
                 daemon,
                 state,
@@ -712,9 +752,15 @@ impl HostMutationContinuation {
                 let runtime = daemon
                     .runtime()
                     .expect("package recovery retains its runtime");
-                if let Some(restore) =
-                    effect.restore_command(runtime.config().data_directory.clone())
-                {
+                let (base_revision, current_state) = daemon.state_view();
+                if let Some(restore) = effect.restore_command(
+                    runtime.config().data_directory.clone(),
+                    base_revision,
+                    runtime
+                        .state_authority()
+                        .expect("File package restore retains its state authority"),
+                    current_state,
+                ) {
                     submit_package_restore(
                         daemon,
                         state,
@@ -868,6 +914,22 @@ fn submit_package_restore(
         };
         return retain_package_recovery(state, waiter_id, effect, original, failure, permit);
     }
+    if !state.reserve_uncertain_publication(waiter_id) {
+        release_document(state, waiter_id);
+        let failure = PackageRollbackFailure {
+            step: "restore_admission",
+            package_name: None,
+            error: Box::new(DaemonTransportError::Protocol(
+                "another unresolved state publication owns the retention cell",
+            )),
+        };
+        let _ = retain_package_recovery(state, waiter_id, effect, original, failure, permit);
+        return ControlPoll::Ready(Ok(error_response(
+            "state_publication_slot_occupied",
+            "hub_state",
+            "another unresolved state publication owns the retention cell",
+        )));
+    }
 
     // The document reservation remains held through the first whole-state
     // restore. No code can replay this snapshot after reservation release.
@@ -885,6 +947,9 @@ fn submit_package_restore(
     }) = state.host_recovery.get_mut(&waiter_id)
     {
         *package_restore = failed_package_effect.take();
+    }
+    if !matches!(poll, ControlPoll::Pending) {
+        state.release_uncertain_reservation(waiter_id);
     }
     poll
 }
@@ -962,14 +1027,31 @@ fn admit_or_park_commit(
         prepared.base_revision,
         daemon.state_view().0,
     ) {
-        DocumentAdmission::Granted => submit_phase(
-            daemon,
-            state,
-            waiter_id,
-            HostMutationCommand::Commit(HostCommit { prepared }),
-            permit,
-            next_phase,
-        ),
+        DocumentAdmission::Granted => {
+            if !state.reserve_uncertain_publication(waiter_id) {
+                release_document(state, waiter_id);
+                return finish_error(
+                    permit,
+                    HostMutationError {
+                        code: "state_publication_slot_occupied".to_string(),
+                        message: "another unresolved state publication owns the retention cell"
+                            .to_string(),
+                    },
+                );
+            }
+            let poll = submit_phase(
+                daemon,
+                state,
+                waiter_id,
+                HostMutationCommand::Commit(HostCommit { prepared }),
+                permit,
+                next_phase,
+            );
+            if !matches!(poll, ControlPoll::Pending) {
+                state.release_uncertain_reservation(waiter_id);
+            }
+            poll
+        }
         DocumentAdmission::Busy => {
             *retained = Some((prepared, permit));
             ControlPoll::Pending
@@ -1568,6 +1650,13 @@ mod tests {
             previous_packages: previous_packages.clone(),
         };
         let restore = HostPackageRestore {
+            base_revision: daemon.state_view().0,
+            authority: daemon
+                .runtime()
+                .expect("runtime")
+                .state_authority()
+                .expect("File runtime authority"),
+            current_state: previous_state.clone(),
             previous_state,
             previous_packages,
             data_directory: directory.clone(),
