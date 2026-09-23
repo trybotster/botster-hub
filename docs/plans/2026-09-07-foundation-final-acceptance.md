@@ -2226,6 +2226,23 @@ Root inspected the raw failure. The reviewer checked the log and the diagnostic 
 Agent 001b must trace retry-state transitions before proposing a correction. Agent 001e must review that trace independently.
 The aggregate attempt counter does not establish which per-family reset path ran.
 No additional wake, changed limit, or production correction is accepted from this result alone.
+
+The subsequent source trace found that every below-floor snapshot called `rearm_resync`, including a resynchronization response.
+That call reset the per-family attempt count. The aggregate counter continued to increase.
+Checkpoint `10b139418dfbce07b253eace44c52a6d562e0d3d` preserves attempts for stale Resync snapshots and retains rearm for stale new Subscribe snapshots.
+The correction preserves the generation guard and refreshes returned progress after rearm. It changes no timeout, limit, or wake mechanism.
+The first compile failed on a missing mutable borrow. The mechanical correction compiled successfully.
+Three exact library tests passed, one invocation each. The reviewer accepted the source and raw evidence at that scope.
+The checkpoint contains only the three reviewed files and is pushed. The worktree was clean for the candidate build.
+Root and the reviewer verified the fresh candidate manifest and binary hashes in `g2-candidate-10b13941-20260923`.
+The pressure lifecycle test passed against this candidate: one passed, zero failed, 321 filtered, 18.18 seconds.
+Its raw log SHA-256 is `e9c8f2ce8b2f403e1a21af5407cc5ec90c70fb36e22b6f7addd9862206ae0866`.
+The advanced-subscriber lifecycle test then failed: zero passed, one failed, 321 filtered, 16.25 seconds.
+Its raw log SHA-256 is `de996f555b40a1dcaa21196e2f0ba8d78c26b042614f1cf5bfde4ffae080f62d`.
+The failure reports a 10-second entity-frame timeout at `common.rs:1024`, with `probe=unconfirmed`.
+Root inspected both raw logs. This timeout does not identify which frame was missing or prove an ordering defect.
+Agent 001b owns the bounded wait diagnosis. Agent 001e checks the runtime evidence independently.
+The pressure result closes only this focused scenario. Full acceptance remains open.
 The old candidate must not supply runtime evidence for this production change.
 The evidence packet is `g2-implementation-review.md` in the evidence directory above.
 The retry compile log SHA-256 is `cb24e49cc131bfca7358e736c9b85e905f8bf03dad73502551d0829562b8ff60`.
