@@ -1,12 +1,25 @@
 # Foundation integration and final acceptance
 
-Status: spawn checkpoint `b7864ff9` and recovery checkpoint `4bd98717` are pushed. Full foundation acceptance remains open.
+Status: spawn checkpoint `b7864ff9` and recovery checkpoint `5b030dd2` are pushed. Full foundation acceptance remains open.
 
 ## Current handoff — September 22
 
 This section supersedes the earlier status and assignment statements below.
 
 ### Latest checkpoint and verification results
+
+The following update supersedes the earlier recovery publication and test statements in this section.
+
+- Recovery checkpoint `2212710f760eaa148588f3f2a50edc719d75071a` contains the reviewed journal and effect-retention changes. Checkpoint `5b030dd26c4cf32a8850224582d6642f6306f1e3` adds four reviewed test-file corrections. Both checkpoints are pushed.
+- The configured workspace run used `./test.sh --locked --offline -- --test-threads=2`, `BOTSTER_ENV=test`, approved socket access, and a matched candidate. The Hub library reported 1185 passes and 14 failures. Cargo stopped before the other five workspace members ran. The raw log SHA256 is `80f9e467fbd9d79382c383308a7ce27c33878c0dab87adfe58c0cbb0ccec463b`.
+- Thirteen failures stopped at an obsolete worker fixture. One test expected a retry after unresolved intent. Writer 001b corrected these test prerequisites in `sessions.rs` and `owner_loop.rs`. Reviewer 001e accepted the test-only patch. The patch remains uncommitted and frozen.
+- The corrected artifact SHA256 is `784837bc274008db7b67a3f3ab76c801664201ab3579ca4387d57b9f4dd669f5`. Focused selectors 1–6 passed. Selector 7, `ensure_worktree_and_spawn_reuse_after_undelivered_keeps_the_created_worktree`, failed at the directory-existence assertion. Hub reported reuse, but the reported directory was absent. Selectors 8–14 did not run.
+- The focused log is `/private/tmp/botster-recovery-targeted-tests-20260922.log`. Its SHA256 is `638cf08ad4fab43f8c1750a06cd0bd3170b8ff5a3423208c952627545c3bda0d`. This failure reaches the worktree-preservation invariant. It is not a candidate setup failure.
+- Root checked the test and cleanup source. The test waits for a directory and an empty input queue; it does not establish queued cleanup. A later cleanup enqueue removes suppression recorded by cancellation. Writer 001b must propose a deterministic regression and an ownership correction. Reviewer 001e must check cancellation before enqueue, after enqueue, and after rollback submission. No production edit or new run is assigned yet. Baseline attribution remains unverified.
+- A separate interface defect remains open: `file_commit_error` maps distinct recovery outcomes to `hub_state_commit_failed`. A later correction must preserve typed outcomes without parsing display text.
+- The compiler slot is free. Startup-path policy, complete daemon spawning, crash/restart proof, remaining workspace tests, strict verification, integration, and matched-client verification remain open. No deployment or production acceptance is claimed.
+
+Earlier checkpoint details follow.
 
 - Spawn checkpoint `b7864ff947e22fe48b49eb27c286543fabfffa61` contains all 28 reviewed code/test files. Writer 001b reports a successful non-force push to `delivery/async-spawn-20260921`. Local evidence remains untracked. No deployment occurred.
 - The complete spawn patch matches the tested tree. The earlier partial file proposal omitted required dependencies and was rejected. Review established that the shared Lua changes belong to this spawn work; no separate safety checkpoint is required.
