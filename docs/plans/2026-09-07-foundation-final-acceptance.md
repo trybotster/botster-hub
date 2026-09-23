@@ -1,10 +1,25 @@
 # Foundation integration and final acceptance
 
-Status: spawn checkpoint `a8884a5f` and recovery checkpoint `4bd98717` are pushed. Full foundation acceptance remains open.
+Status: spawn checkpoint `b7864ff9` and recovery checkpoint `4bd98717` are pushed. Full foundation acceptance remains open.
 
 ## Current handoff — September 22
 
 This section supersedes the earlier status and assignment statements below.
+
+### Latest checkpoint and verification results
+
+- Spawn checkpoint `b7864ff947e22fe48b49eb27c286543fabfffa61` contains all 28 reviewed code/test files. Writer 001b reports a successful non-force push to `delivery/async-spawn-20260921`. Local evidence remains untracked. No deployment occurred.
+- The complete spawn patch matches the tested tree. The earlier partial file proposal omitted required dependencies and was rejected. Review established that the shared Lua changes belong to this spawn work; no separate safety checkpoint is required.
+- The exact final-output parity test passed on artifact `138b00a4163cd9433534a0c285ffc67b36bcc2c9e0846170a79f4162aa870151`. A direct rerun recorded the command and actual numeric exit 0 after the first run omitted those records. Full daemon spawning remains unproved; the production path still returns `Unavailable` pending the startup-path decision.
+- Recovery's combined journal and repository-effect repair passed source review and compilation. All six focused tests passed on artifact `403f7bc79c91e7a25b1f20b1b4b02a55ff2710643710f25c8bd83910522831b4`. Root checked all six result lines and the artifact hash. These include actual `HostMutationContinuation::poll` regressions for both uncertainty variants.
+- Recovery retains live external-effect evidence and the owner permit in the existing preallocated cell. Durable terminal disposal does not imply permission to release an active operation's permit. The repair preserves receipts across uncertain outcomes and distinguishes repository uncertainty from state publication.
+- Earlier repository tests failed before the intended assertions because the fixture lacked an initial state file and used a noncanonical fault-injection key. Reviewed test corrections resolved those setup problems. The failed logs remain preserved.
+- Recovery's exact 10-file checkpoint is accepted for conditional commit/push after the full library suite result and a six-test rerun with complete invocation records. The source freeze is tracked diff `21cf43463c77d0acac7fb0d67b441a33511403daad6a13b71cb8778bc60fd720` plus journal `f91dee202f76903b4d18f93e2549c435b47a01a3b409281d25b649d67316274a`. No publication is yet confirmed.
+- Remaining gates include full daemon spawning, real daemon interruption/restart verification, reconciliation policy, integration, and matched-client verification. No negative control or strict gate has run. No production acceptance is claimed.
+
+### Earlier handoff details
+
+The results above supersede build-slot and publication statements in this subsection.
 
 - Recovery: the append-only intent/completion protocol passed design review. Implementation is active. Unresolved intent prevents restart writes. Automatic rollback, evidence deletion, migration, and deployment remain excluded.
 - Recovery: checkpoint `4bd98717` is pushed. Root verified its four focused tests. These tests establish live retention, not crash recovery.
