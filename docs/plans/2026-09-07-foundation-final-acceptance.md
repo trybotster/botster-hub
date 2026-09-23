@@ -1,8 +1,23 @@
 # Foundation integration and final acceptance
 
-Status: spawn checkpoint `a8884a5f` and recovery checkpoint `3bc264a8` are pushed. Full foundation acceptance remains open.
+Status: spawn checkpoint `a8884a5f` and recovery checkpoint `4bd98717` are pushed. Full foundation acceptance remains open.
 
-## Current checkpoint — September 22
+## Current handoff — September 22
+
+This section supersedes the earlier status and assignment statements below.
+
+- Recovery: the append-only intent/completion protocol passed design review. Implementation is active. Unresolved intent prevents restart writes. Automatic rollback, evidence deletion, migration, and deployment remain excluded.
+- Recovery: checkpoint `4bd98717` is pushed. Root verified its four focused tests. These tests establish live retention, not crash recovery.
+- Recovery: the new journal source passed one no-run build with Rust 1.97.0, jobs 2, incremental disabled, and locked/offline dependencies. No tests ran. Reviewer 001e accepted tracked diff `b56302f7cf41caa39cbefdc46e08ab94ea7ee08620bcad60b55c05915017dbc7` and untracked journal hash `47a281e8dec94fb10dceb28e652570bf85c9e362e4a28abde679de23f4ef80ad` before compilation.
+- Root verified diagnostic log hash `7e831171e16afff06fe092c568ab205d05dd45bb8ee7e67880c63535aeb15477` at `/private/tmp/botster-recovery-file-diagnostic-20260922.log`. Root verified artifact hash `11211add575dcb643efc994c3042097b7cab624223522775cbbde357a314f45f`. The build reported 83 library warnings and 42 test-library warnings, including 27 duplicates.
+- Recovery writer 001d reports a direct user restriction against editing `managed_git.rs`. This restriction takes precedence over Root's earlier assignment. Its two response sites still need the existing `write.cause().client_error()` mapping. The file owner must be resolved before this integration change.
+- Spawn: six focused tests passed on artifact `638f7fb0c6c1d62b4f2eb7d541d915b0bca9e20df0eb01a3c91bef05a02c9191`. They cover scratch reuse, queue ordering, two failure paths, and two charged-loader paths. They do not prove successful daemon spawning.
+- Spawn: reviewer 0018 accepted the subsequent allowance bundle, operation wrapper, Core binding, and final Host failure lifetime correction. Writer 001b now holds the compiler slot for one diagnostic no-run build. Recovery released that slot after its successful build.
+- Startup-captured cwd and executable paths remain an unanswered user decision. No startup-path policy is silently selected.
+- Next decisive checks: complete spawn materialization and exercise two real daemon session IDs; exercise the recovery journal across crash/restart boundaries. Repository-effect ordering and the managed-git mappings remain open. No integration merge, activation, or production acceptance is claimed.
+- Follow-up: assess typed charged-payload transfers after the spawn checkpoint. Repeated tuple lifetime defects justify this assessment, but no new abstraction is approved by this entry.
+
+## Earlier checkpoint — September 22
 
 This checkpoint supersedes older assignment and build-status statements below.
 
@@ -32,9 +47,9 @@ Recovery evidence: `/Users/jasonconigliari/botster-evidence/durable-recovery-202
 The next decisive checks are a reachable spawn lifecycle and the coordinated recovery caller migration.
 Final matched-client verification, production activation, and full foundation acceptance remain open.
 
-## Current orchestration ledger — September 21
+## Historical orchestration ledger — September 21
 
-This section is the current status and assignment record. The dated sections below preserve history, not current assignments.
+This section preserves the earlier status and assignment record. The current handoff above takes precedence.
 Root owns this section. Root updates it at assignments, accepted checkpoints, blockers, user decisions, and handoffs.
 Agent acknowledgments do not require new entries. Raw evidence stays in persistent evidence directories.
 Each accepted checkpoint must identify its source, review, executed checks, evidence location, and remaining limits.
