@@ -61,7 +61,7 @@ pub(crate) const LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH: u32 = (LOCAL_WEBRTC_MAX_FRAM
 pub(crate) trait LocalWebrtcDataChannel: Send + Sync {
     async fn local_set_buffered_amount_low_threshold(&self, threshold: u32) -> Result<(), String>;
     async fn local_set_buffered_amount_high_threshold(&self, threshold: u32) -> Result<(), String>;
-    async fn local_outstanding_bytes(&self) -> Result<usize, String> {
+    async fn local_outstanding_bytes(&self) -> Result<usize, webrtc::error::Error> {
         Ok(0)
     }
     async fn local_send_text(&self, text: &str) -> Result<(), String>;
@@ -87,10 +87,8 @@ where
             .map_err(|error| error.to_string())
     }
 
-    async fn local_outstanding_bytes(&self) -> Result<usize, String> {
-        self.outstanding_bytes()
-            .await
-            .map_err(|error| error.to_string())
+    async fn local_outstanding_bytes(&self) -> Result<usize, webrtc::error::Error> {
+        self.outstanding_bytes().await
     }
 
     async fn local_send_text(&self, text: &str) -> Result<(), String> {
