@@ -6471,24 +6471,58 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
         "pressure",
     )
     .expect("subscribe");
-    let _ = held.next_frame().expect("snapshot");
+    let initial = held.next_frame().expect("snapshot");
+    assert!(
+        matches!(
+            &initial,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq,
+                ..
+            } if *snapshot_seq == 0
+        ),
+        "unexpected initial snapshot: {initial:?}"
+    );
 
     // Force outside-window resync need while provider stays at 0.
-    let _ = mutation_action(
+    let seed = mutation_action(
         &endpoint,
         "project-pipelines.publish_seq",
         serde_json::json!({ "seq": 1, "id": "seed" }),
     );
-    let _ = mutation_action(
+    let seed_payload = seed
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .unwrap_or_else(|| panic!("missing seed payload: {seed:?}"));
+    assert_eq!(seed_payload["status"], "accepted", "seed response: {seed:?}");
+    assert_eq!(seed_payload["last_accepted_seq"], 1, "seed response: {seed:?}");
+    let outside = mutation_action(
         &endpoint,
         "project-pipelines.publish_seq",
         serde_json::json!({ "seq": 20, "id": "high" }),
+    );
+    let outside_payload = outside
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .unwrap_or_else(|| panic!("missing outside-window payload: {outside:?}"));
+    assert_eq!(
+        outside_payload["status"],
+        "resync_scheduled",
+        "outside-window response: {outside:?}"
+    );
+    assert_eq!(
+        outside_payload["high_water_seq"],
+        20,
+        "outside-window response: {outside:?}"
     );
 
     // Poll Status repeatedly while resync runs under backoff; daemon must stay responsive.
     let started = Instant::now();
     let mut saw_degraded = false;
     let mut attempts_at_degraded = 0_u64;
+    let mut observed_attempts = 0_u64;
+    let mut observed_degraded = 0_u64;
     while started.elapsed() < Duration::from_secs(20) {
         let status =
             botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
@@ -6500,6 +6534,8 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
             .expect("status body")
             .lifecycle_counters
             .clone();
+        observed_attempts = counters.package_entity_resync_attempts;
+        observed_degraded = counters.package_entity_resync_degraded;
         if counters.package_entity_resync_degraded > 0 {
             saw_degraded = true;
             attempts_at_degraded = counters.package_entity_resync_attempts;
@@ -6514,7 +6550,7 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
     }
     assert!(
         saw_degraded,
-        "stale provider must enter resync_degraded under max attempts"
+        "stale provider must enter resync_degraded under max attempts; attempts={observed_attempts}, degraded={observed_degraded}"
     );
     // Unchanged catching_up / stale provider must not start another attempt cycle.
     let post = Instant::now();

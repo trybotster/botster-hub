@@ -1536,13 +1536,28 @@ pub(super) fn step(
                 .family
                 .as_ref()
                 .expect("a prepared snapshot has a family");
+            let origin = match &entry.kind {
+                super::PendingPluginEntityKind::Subscribe(_) => {
+                    crate::runtime::entity_model::SnapshotOrigin::Subscribe
+                }
+                super::PendingPluginEntityKind::Resync { .. } => {
+                    crate::runtime::entity_model::SnapshotOrigin::Resync
+                }
+                super::PendingPluginEntityKind::Fanout { .. } => {
+                    unreachable!("fanout bypasses snapshot begin")
+                }
+                super::PendingPluginEntityKind::Disposing => unreachable!("disposed entity work"),
+            };
             entry.work.model_operation = Some(crate::runtime::entity_model::Operation::Family {
                 name: Some(Arc::clone(family)),
                 expected_generation: entry
                     .work
                     .family_generation
                     .expect("snapshot begin retains its generation"),
-                action: crate::runtime::entity_model::FamilyAction::BeginSnapshot(sequence),
+                action: crate::runtime::entity_model::FamilyAction::BeginSnapshot {
+                    sequence,
+                    origin,
+                },
                 progress: None,
             });
             entry.work.model_purpose = Some(ModelPurpose::BeginSnapshot);
