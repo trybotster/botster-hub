@@ -418,6 +418,7 @@ mod tests {
                 Operation::StepSnapshot {
                     name: Some(Arc::new("p.item".into())),
                     expected_generation: 7,
+                    preserve_resync_need: false,
                     generation: None,
                     retained: FamilySnapshotWork::default(),
                 },
@@ -1033,6 +1034,7 @@ pub(crate) enum Operation {
     StepSnapshot {
         name: Option<Arc<String>>,
         expected_generation: u64,
+        preserve_resync_need: bool,
         generation: Option<u64>,
         retained: FamilySnapshotWork,
     },
@@ -1978,6 +1980,7 @@ impl Work {
             Operation::StepSnapshot {
                 name,
                 expected_generation,
+                preserve_resync_need,
                 generation,
                 retained,
             } => {
@@ -1988,7 +1991,7 @@ impl Work {
                     .is_some_and(|family| family.generation == *expected_generation);
                 if *valid {
                     *resync_changed = true;
-                    *generation = Some(model.step_snapshot_into(name, retained));
+                    *generation = Some(model.step_snapshot_into(name, *preserve_resync_need, retained));
                 }
                 if let Some(PackageEntityFamilyStep::ReleaseResync {
                     scope_id,
