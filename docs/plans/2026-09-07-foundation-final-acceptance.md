@@ -2281,7 +2281,8 @@ The reviewer verified all fifteen log hashes, both test binaries, and the curren
 Root read the evidence packet and checked the raw result lines. Root accepted this focused checkpoint.
 The packet is `managed-recovery-20260922/g3-g4-test-only-fixture-run.md` under `/Users/jasonconigliari/botster-evidence`.
 Its SHA-256 is `5b70f7fdf8c3507b2ad685063c116d088e39413f603b341a59a84168875a1bed`.
-Agent 001b owns the scoped commit and push. Publication is pending confirmation.
+Agent 001b committed and pushed `abe4ceb6f3ca4604304a437a7546b82e1dd19d7e` with only the four reviewed test files.
+The writer reported that HEAD equals the remote branch and the worktree is clean.
 Agent 001b and reviewer 001e next trace G5 operation labels through Host failure and restoration paths.
 The compiler slot is free. No G5 source change is authorized before the premise review.
 The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
