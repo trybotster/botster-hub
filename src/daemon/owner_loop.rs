@@ -66,6 +66,7 @@ enum BackgroundWork {
     Coordination,
     EventOwner,
     ManagedSpawn,
+    OrdinarySpawn,
     PluginReady,
     PluginEntityReady,
     Deadline,
@@ -73,6 +74,9 @@ enum BackgroundWork {
     PumpObserve,
     InventoryReconcile,
 }
+
+/// Three maintenance reads plus pump observation and inventory reconciliation.
+pub(crate) const BACKGROUND_CORE_WORK_CLASSES: usize = 5;
 
 fn causal_waiter_upper_bound(
     state: &DaemonControlState,
@@ -230,6 +234,63 @@ fn maintenance_core_work(kind: MaintenanceSliceKind) -> Option<BackgroundWork> {
     }
 }
 
+#[cfg(test)]
+mod background_core_capacity_tests {
+    use super::*;
+
+    fn registers_core_phase(work: BackgroundWork) -> bool {
+        match work {
+            BackgroundWork::Maintenance(kind) => maintenance_core_work(kind).is_some(),
+            BackgroundWork::PumpObserve | BackgroundWork::InventoryReconcile => true,
+            BackgroundWork::DataPlaneProgress
+            | BackgroundWork::CoreCompletion
+            | BackgroundWork::HostCompletion
+            | BackgroundWork::CausalProgress
+            | BackgroundWork::CausalDrain
+            | BackgroundWork::EntityPublish
+            | BackgroundWork::Coordination
+            | BackgroundWork::EventOwner
+            | BackgroundWork::ManagedSpawn
+            | BackgroundWork::OrdinarySpawn
+            | BackgroundWork::PluginReady
+            | BackgroundWork::PluginEntityReady
+            | BackgroundWork::Deadline => false,
+        }
+    }
+
+    #[test]
+    fn background_core_work_classes_match_reserved_phase_capacity() {
+        let maintenance = [
+            MaintenanceSliceKind::Observe,
+            MaintenanceSliceKind::JournalPull,
+            MaintenanceSliceKind::Baseline,
+        ];
+        assert!(maintenance.iter().all(|kind| registers_core_phase(
+            BackgroundWork::Maintenance(*kind)
+        )));
+        assert_eq!(
+            MaintenanceSliceKind::ALL
+                .iter()
+                .filter(|kind| registers_core_phase(BackgroundWork::Maintenance(**kind)))
+                .count(),
+            maintenance.len()
+        );
+        let classes = [
+            BackgroundWork::Maintenance(MaintenanceSliceKind::Observe),
+            BackgroundWork::Maintenance(MaintenanceSliceKind::JournalPull),
+            BackgroundWork::Maintenance(MaintenanceSliceKind::Baseline),
+            BackgroundWork::PumpObserve,
+            BackgroundWork::InventoryReconcile,
+        ];
+        assert!(classes.iter().copied().all(registers_core_phase));
+        assert_eq!(classes.len(), BACKGROUND_CORE_WORK_CLASSES);
+        assert_eq!(
+            crate::data_plane::driver::CORE_OWNER_COMPLETION_CAPACITY,
+            crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY * 2 + classes.len()
+        );
+    }
+}
+
 fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule::ReadyClass {
     use crate::daemon::owner_schedule::ReadyClass;
 
@@ -239,7 +300,8 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
         }
         BackgroundWork::HostCompletion
         | BackgroundWork::CausalProgress
-        | BackgroundWork::ManagedSpawn => ReadyClass::HostCompletion,
+        | BackgroundWork::ManagedSpawn
+        | BackgroundWork::OrdinarySpawn => ReadyClass::HostCompletion,
         BackgroundWork::EventOwner
         | BackgroundWork::Coordination
         | BackgroundWork::EntityPublish
@@ -447,6 +509,9 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         }
         if runtime.take_managed_spawn_notification() {
             mark_background_ready(state, BackgroundWork::ManagedSpawn);
+        }
+        if runtime.take_ordinary_spawn_notification() {
+            mark_background_ready(state, BackgroundWork::OrdinarySpawn);
         }
     }
     let completed = state.plugin_result_budget.take_completion_notification();
@@ -855,6 +920,9 @@ pub(crate) fn run_background_ready_item(
         }
         BackgroundWork::ManagedSpawn => {
             crate::daemon::control::managed_git::accept_one(daemon, state);
+        }
+        BackgroundWork::OrdinarySpawn => {
+            crate::daemon::control::session_spawn::accept_one(daemon, state);
         }
         BackgroundWork::PluginReady => {
             if let Some(waiter_id) = state.plugin_controls.take_ready_waiters(1).pop() {
@@ -5985,6 +6053,7 @@ mod tests {
                     | crate::daemon::control::pending::ControlPoll::StatusResponseRefused {
                         ..
                     }
+                    | crate::daemon::control::pending::ControlPoll::DeliverSessionType(_)
                     | crate::daemon::control::pending::ControlPoll::FinishedInternal => {
                         panic!("package helper must not receive a status response")
                     }
@@ -10120,6 +10189,9 @@ return botster.register({tools = {{
                 }
                 | crate::daemon::control::pending::ControlPoll::StatusResponseRefused { .. } => {
                     panic!("attach helper must not receive a status response")
+                }
+                crate::daemon::control::pending::ControlPoll::DeliverSessionType(_) => {
+                    panic!("attach helper must not receive a session-type delivery")
                 }
                 crate::daemon::control::pending::ControlPoll::Again => continue,
                 crate::daemon::control::pending::ControlPoll::Ready(response) => {

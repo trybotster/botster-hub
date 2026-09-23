@@ -16,6 +16,7 @@ pub(crate) mod plugins;
 pub(crate) mod reply;
 pub(crate) mod request;
 pub(crate) mod session_types;
+pub(crate) mod session_spawn;
 pub(crate) mod sessions;
 pub(crate) mod status;
 pub(crate) mod webrtc;

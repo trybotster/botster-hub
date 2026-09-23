@@ -1,17 +1,26 @@
 //! Project admitted JSON into an ordinary spawn request.
 
 use std::collections::BTreeMap;
+use std::fmt::{self, Write};
+use std::sync::Arc;
 
 use botster_core::{PluginKey, SessionId};
+use mlua::{Lua, Value as LuaValue};
 use serde_json::Value;
 
-use crate::lua_memory::{LuaCallbackCharge, layout};
+use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount, layout};
 use crate::session_types::{SessionTypeContextInput, SessionTypeRequest};
 
 /// The JSON builder keeps its original allowance open through projection.
-struct JsonInput {
+pub(super) struct JsonInput {
     value: Value,
     storage: LuaCallbackCharge,
+}
+
+impl JsonInput {
+    pub(super) fn new(value: Value, storage: LuaCallbackCharge) -> Self {
+        Self { value, storage }
+    }
 }
 
 /// The original request retains P after JSON storage J is destroyed.
@@ -20,6 +29,57 @@ pub(crate) struct SpawnInput {
     session_type_id: String,
     request: SessionTypeRequest,
     variable: LuaCallbackCharge,
+}
+
+impl SpawnInput {
+    pub(crate) fn into_parts(self) -> (PluginKey, String, SessionTypeRequest, LuaCallbackCharge) {
+        (
+            self.plugin_key,
+            self.session_type_id,
+            self.request,
+            self.variable,
+        )
+    }
+}
+
+/// Admit J plus build scratch K, then project P while J remains live.
+pub(super) fn admit(
+    lua: &Lua,
+    args: &LuaValue,
+    plugin_key: &PluginKey,
+    memory: &Arc<LuaMemoryAccount>,
+    capacity: &mlua::String,
+) -> Result<SpawnInput, super::callback::CallbackFailure> {
+    let mut parent = memory
+        .reserve_callback_total(0)
+        .map_err(|_| super::callback::CallbackFailure::Raise(capacity.clone()))?;
+    let admission = match super::lua_json::value_size_scoped(memory, lua, args) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return Err(super::lua_json::raise_admission_error(
+                error, lua, parent, capacity,
+            ));
+        }
+    };
+    let json_and_scratch = admission
+        .json_bytes
+        .checked_add(admission.scratch_peak)
+        .ok_or_else(|| super::callback::CallbackFailure::Raise(capacity.clone()))?;
+    parent
+        .grow(json_and_scratch)
+        .map_err(|_| super::callback::CallbackFailure::Raise(capacity.clone()))?;
+    let value = match admission.build_scoped(lua, args, &mut parent) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(super::lua_json::raise_admission_error(
+                super::AdmissionError::Runtime(error),
+                lua,
+                parent,
+                capacity,
+            ));
+        }
+    };
+    project(JsonInput::new(value, parent), plugin_key).map_err(|error| error.raise(lua, capacity))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,9 +92,77 @@ enum ProjectionError {
 }
 
 /// Keep JSON and its allowance until the callback finishes error conversion.
-struct ProjectionFailure {
+pub(super) struct ProjectionFailure {
     input: JsonInput,
     reason: ProjectionError,
+}
+
+struct CountedMessage(usize);
+
+impl Write for CountedMessage {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 = self.0.checked_add(text.len()).ok_or(fmt::Error)?;
+        Ok(())
+    }
+}
+
+impl ProjectionFailure {
+    fn write_message(&self, output: &mut impl Write) -> fmt::Result {
+        match self.reason {
+            ProjectionError::MissingSessionType => {
+                output.write_str("session_types.spawn requires session_type_id")
+            }
+            ProjectionError::ContextNotObject => {
+                output.write_str("session_types.spawn context must be an object")
+            }
+            ProjectionError::MapNotObject(field) => {
+                write!(output, "session_types.spawn {field} must be an object")
+            }
+            ProjectionError::MapValueNotString { field, index } => {
+                let map = if field == "environment" {
+                    self.input.value.get("environment")
+                } else {
+                    self.input
+                        .value
+                        .get("context")
+                        .and_then(|context| context.get("metadata"))
+                }
+                .and_then(Value::as_object)
+                .expect("the failed map remains in the charged JSON");
+                let key = map
+                    .iter()
+                    .nth(index)
+                    .map(|(key, _)| key.as_str())
+                    .expect("the failed key remains in the charged JSON");
+                write!(output, "session_types.spawn {field}.{key} must be a string")
+            }
+            ProjectionError::Capacity => Err(fmt::Error),
+        }
+    }
+
+    /// Build the exact old error text while JSON and its allowance remain live.
+    pub(super) fn raise(
+        mut self,
+        lua: &Lua,
+        capacity: &mlua::String,
+    ) -> super::callback::CallbackFailure {
+        if self.reason == ProjectionError::Capacity {
+            return super::callback::CallbackFailure::Raise(capacity.clone());
+        }
+        let mut counted = CountedMessage(0);
+        if self.write_message(&mut counted).is_err() || self.input.storage.grow(counted.0).is_err()
+        {
+            return super::callback::CallbackFailure::Raise(capacity.clone());
+        }
+        let mut message = String::with_capacity(counted.0);
+        if self.write_message(&mut message).is_err() {
+            return super::callback::CallbackFailure::Raise(capacity.clone());
+        }
+        let raised = lua.create_string(&message).ok();
+        drop(message);
+        drop(self);
+        super::callback::CallbackFailure::Raise(raised.unwrap_or_else(|| capacity.clone()))
+    }
 }
 
 fn optional_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -126,7 +254,10 @@ fn copy_map(value: Option<&Value>) -> BTreeMap<String, String> {
     result
 }
 
-fn project(mut input: JsonInput, plugin_key: &PluginKey) -> Result<SpawnInput, ProjectionFailure> {
+pub(super) fn project(
+    mut input: JsonInput,
+    plugin_key: &PluginKey,
+) -> Result<SpawnInput, ProjectionFailure> {
     let bytes = match projection_bytes(&input.value, plugin_key) {
         Ok(bytes) => bytes,
         Err(reason) => return Err(ProjectionFailure { input, reason }),
@@ -257,5 +388,112 @@ mod tests {
                 index: 0
             })
         );
+    }
+
+    #[test]
+    fn projection_error_raises_exact_message_after_releasing_json() {
+        let value = serde_json::json!({
+            "id": "worker",
+            "environment": {"BROKEN": false}
+        });
+        let (json_input, memory) = input(value.clone(), 64 * 1024);
+        let failure = match project(json_input, &PluginKey("plugin".into())) {
+            Err(failure) => failure,
+            Ok(_) => panic!("the invalid environment must refuse"),
+        };
+        let lua = Lua::new();
+        let capacity = lua.create_string("capacity").unwrap();
+        let super::super::callback::CallbackFailure::Raise(message) =
+            failure.raise(&lua, &capacity)
+        else {
+            panic!("the charged error must use the Lua Raise path");
+        };
+        assert_eq!(
+            message.to_str().unwrap(),
+            "session_types.spawn environment.BROKEN must be a string"
+        );
+        assert_eq!(memory.usage().1, 0);
+
+        // J alone fits. The Rust error String does not fit beside J.
+        let json_bytes = super::super::lua_json::retained_bytes(&value).unwrap();
+        let (json_input, memory) = input(value, json_bytes);
+        let failure = match project(json_input, &PluginKey("plugin".into())) {
+            Err(failure) => failure,
+            Ok(_) => panic!("the invalid environment must refuse"),
+        };
+        let super::super::callback::CallbackFailure::Raise(message) =
+            failure.raise(&lua, &capacity)
+        else {
+            panic!("the capacity error must use the Lua Raise path");
+        };
+        assert_eq!(message.to_str().unwrap(), "capacity");
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn staged_lua_admission_retains_only_projected_input() {
+        let lua = Lua::new();
+        let args = lua
+            .load("return {id='worker', session_id='first', environment={FIRST='one'}}")
+            .eval::<LuaValue>()
+            .unwrap();
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 64 * 1024,
+            total_vm_bytes: 64 * 1024,
+            per_callback_bytes: 64 * 1024,
+            total_callback_bytes: 64 * 1024,
+        })
+        .unwrap();
+        let capacity = lua.create_string("capacity").unwrap();
+        let input = match admit(&lua, &args, &PluginKey("plugin".into()), &memory, &capacity) {
+            Ok(input) => input,
+            Err(_) => panic!("the staged input must fit"),
+        };
+        assert_eq!(input.session_type_id, "worker");
+        assert_eq!(
+            input.request.session_id.as_ref().unwrap().0.as_str(),
+            "first"
+        );
+        assert_eq!(memory.usage().1, input.variable.bytes());
+        drop(input);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn staged_lua_admission_reuses_released_scratch_capacity() {
+        use mlua::LuaSerdeExt;
+
+        let lua = Lua::new();
+        let args = lua
+            .load("return {id='worker', session_id='first', environment={FIRST='one'}}")
+            .eval::<LuaValue>()
+            .unwrap();
+        let plugin = PluginKey("plugin".into());
+        let large = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 64 * 1024,
+            total_vm_bytes: 64 * 1024,
+            per_callback_bytes: 64 * 1024,
+            total_callback_bytes: 64 * 1024,
+        })
+        .unwrap();
+        let admission = super::super::lua_json::value_size_scoped(&large, &lua, &args).unwrap();
+        let json: Value = lua.from_value(args.clone()).unwrap();
+        let projection = projection_bytes(&json, &plugin).unwrap();
+        assert!(admission.scratch_peak > 0);
+        assert!(projection > 0);
+        let limit = admission.json_bytes + projection.max(admission.scratch_peak);
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 64 * 1024,
+            total_vm_bytes: 64 * 1024,
+            per_callback_bytes: limit,
+            total_callback_bytes: limit,
+        })
+        .unwrap();
+        let capacity = lua.create_string("capacity").unwrap();
+        let input = admit(&lua, &args, &plugin, &memory, &capacity)
+            .unwrap_or_else(|_| panic!("J+P fits after K is released"));
+        assert_eq!(input.session_type_id, "worker");
+        drop(input);
+        assert_eq!(memory.usage().1, 0);
     }
 }

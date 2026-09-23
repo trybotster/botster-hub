@@ -1,12 +1,13 @@
 //! Successful-path storage and schema-position error candidates.
 //! The production decoder retains authority over errors and validation.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 
 use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
-use super::PackageSessionType;
+use super::{PackageSessionType, PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory};
 use super::content_budget::{ContentContainer, ContentStorage};
 use super::materialization_error::ErrorTrack;
 use super::materialization_timeline::Track;
@@ -23,6 +24,34 @@ pub(super) enum Shape {
     Environment,
     Execution,
     WorkingDirectory,
+}
+
+trait CountedFieldType {
+    const SHAPE: Shape;
+}
+
+impl CountedFieldType for String {
+    const SHAPE: Shape = Shape::String;
+}
+
+impl CountedFieldType for Option<String> {
+    const SHAPE: Shape = Shape::OptionalString;
+}
+
+impl CountedFieldType for Vec<String> {
+    const SHAPE: Shape = Shape::Strings;
+}
+
+impl CountedFieldType for BTreeMap<String, String> {
+    const SHAPE: Shape = Shape::Environment;
+}
+
+impl CountedFieldType for PackageSessionTypeExecution {
+    const SHAPE: Shape = Shape::Execution;
+}
+
+impl CountedFieldType for PackageSessionTypeWorkingDirectory {
+    const SHAPE: Shape = Shape::WorkingDirectory;
 }
 
 #[derive(Default)]
@@ -73,25 +102,45 @@ impl DefinitionStorage {
     }
 }
 
+// One declaration supplies the count dispatch and its exhaustive type guard.
+// Adding a PackageSessionType field now requires updating the parser mirror.
+macro_rules! counted_definition_fields {
+    ($( $field:ident : $field_type:ty ),+ $(,)?) => {
+        const FIELDS: [(&str, Shape); counted_definition_fields!(@count $( $field )+)] = [
+            $( (stringify!($field), <$field_type as CountedFieldType>::SHAPE), )+
+        ];
+
+        #[allow(dead_code)]
+        fn assert_counted_definition_fields(definition: &PackageSessionType) {
+            let PackageSessionType { $( $field, )+ } = definition;
+            $( let _: &$field_type = $field; )+
+        }
+    };
+    (@count $( $field:ident )+) => {
+        <[()]>::len(&[$( counted_definition_fields!(@unit $field) ),+])
+    };
+    (@unit $field:ident) => { () };
+}
+
 // The order is the declaration order in PackageSessionType, including defaults.
-const FIELDS: [(&str, Shape); 16] = [
-    ("id", Shape::String),
-    ("label", Shape::String),
-    ("description", Shape::OptionalString),
-    ("icon", Shape::OptionalString),
-    ("role", Shape::String),
-    ("interaction", Shape::String),
-    ("traits", Shape::Strings),
-    ("lifecycle", Shape::String),
-    ("execution", Shape::Execution),
-    ("command", Shape::String),
-    ("args", Shape::Strings),
-    ("working_directory", Shape::WorkingDirectory),
-    ("environment", Shape::Environment),
-    ("allowed_environment_overrides", Shape::Strings),
-    ("context", Shape::Strings),
-    ("target_id", Shape::OptionalString),
-];
+counted_definition_fields! {
+    id: String,
+    label: String,
+    description: Option<String>,
+    icon: Option<String>,
+    role: String,
+    interaction: String,
+    traits: Vec<String>,
+    lifecycle: String,
+    execution: PackageSessionTypeExecution,
+    command: String,
+    args: Vec<String>,
+    working_directory: PackageSessionTypeWorkingDirectory,
+    environment: BTreeMap<String, String>,
+    allowed_environment_overrides: Vec<String>,
+    context: Vec<String>,
+    target_id: Option<String>,
+}
 
 struct KeySeed;
 

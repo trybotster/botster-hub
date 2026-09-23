@@ -512,7 +512,7 @@ where
                 ),
             ))),
         };
-        let (framed, response_kind) = match reply {
+        let (framed, response_kind, delivery_receipt) = match reply {
             ControlReply::EncodedPlugin {
                 kind,
                 encoded_frame,
@@ -522,9 +522,13 @@ where
                     framed_encoded_daemon_response(stream_key, &request_id, &encoded_frame);
                 drop(encoded_frame);
                 drop(charge);
-                (framed, kind)
+                (framed, kind, None)
             }
-            ControlReply::Typed { response, charge } => {
+            ControlReply::Typed {
+                response,
+                charge,
+                delivery,
+            } => {
                 let response = response.unwrap_or_else(|error| {
                     correlated_response_with_diagnostic(
                         &request_id,
@@ -555,7 +559,7 @@ where
                 let kind = response.kind;
                 drop(response);
                 drop(charge);
-                (framed, kind)
+                (framed, kind, delivery)
             }
         };
         let Ok(frames) = framed else {
@@ -574,6 +578,11 @@ where
             peer_state,
         )
         .await;
+        if delivery.is_ok() {
+            if let Some(receipt) = delivery_receipt {
+                receipt.delivered();
+            }
+        }
         if let Some(response_delivery_tx) = response_delivery_tx {
             let _ = response_delivery_tx.send(());
         }

@@ -11,7 +11,7 @@ use botster_core::{
 };
 use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_core_daemon::{
-    CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError, PendingOperationId,
+    CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError,
     SpawnSessionRequest,
 };
 use botster_hub_client::{
@@ -278,7 +278,6 @@ fn handle_daemon_spawn(
     };
     let mut reservation: Option<SessionReservation> = None;
     let mut spawn_error: Option<CoreDaemonError> = None;
-    let mut reserve_operation_id: Option<PendingOperationId> = None;
     ControlStep::pending_spawn(move |daemon, state| {
         loop {
             match stage {
@@ -375,18 +374,14 @@ fn handle_daemon_spawn(
                         }
                     }
                 }
-                Stage::Reserve => match {
-                    let result = poll_spawn_ticket(&mut tracker, daemon);
-                    // Poll can accept begin and lose completion in the same call.
-                    reserve_operation_id = tracker.accepted_id();
-                    result
-                } {
+                Stage::Reserve => match poll_spawn_ticket(&mut tracker, daemon) {
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
                     CoreTicketPoll::Refused => {
                         return ControlPoll::Ready(Ok(overloaded_core("reserve_session", &id.0)));
                     }
                     CoreTicketPoll::Lost => {
-                        let Some(reserve_id) = reserve_operation_id else {
+                        // Poll can accept begin and lose completion in the same call.
+                        let Some(reserve_id) = tracker.accepted_id() else {
                             return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
                         };
                         let Some(runtime) = daemon.runtime() else {
@@ -1935,7 +1930,12 @@ mod tests {
         let start = runtime
             .spawn_prepared_managed_session(&pending, &prepared, waiter)
             .unwrap();
-        let session_id = start.context.session_id.clone();
+        let session_id = start
+            .context
+            .as_ref()
+            .expect("the prepared managed spawn retains its context")
+            .session_id
+            .clone();
         let operation =
             crate::daemon::control::managed_git::ManagedSpawnOperation::test_spawn_phase(
                 waiter, pending, prepared, start,
@@ -2294,12 +2294,17 @@ mod tests {
             values: Default::default(),
         };
         let other = crate::session_types::HubSessionContext {
-            context_id: "other-ctx".into(),
+            context_id: "live-ctx".into(),
             session_id: SessionId("s1-live".into()),
             values: Default::default(),
         };
-        runtime.publish_spawn_context(&live).unwrap();
-        runtime.retract_spawn_context(&other);
+        let live_identity = runtime.test_publish_spawn_context(&live);
+        let other_identity = botster_core::SessionAdmission::default()
+            .reserve(other.session_id.clone())
+            .unwrap()
+            .identity();
+        assert_ne!(live_identity, other_identity);
+        runtime.retract_spawn_context(&other, other_identity);
         assert_eq!(
             runtime
                 .test_session_context("s1-live")
@@ -3050,8 +3055,7 @@ sys.exit(0)
         daemon
             .runtime()
             .unwrap()
-            .publish_spawn_context(&live)
-            .unwrap();
+            .test_publish_spawn_context(&live);
         let package_root = root.join("p1-plugin");
         let record = plugin_spawn_package(&package_root);
         let refused = daemon.runtime().unwrap().test_plugin_spawn(
@@ -3270,16 +3274,15 @@ sys.exit(0)
             session_id: SessionId("s1-abandon".into()),
             values: Default::default(),
         };
-        daemon
+        let identity = daemon
             .runtime()
             .unwrap()
-            .publish_spawn_context(&live)
-            .unwrap();
+            .test_publish_spawn_context(&live);
         daemon
             .runtime()
             .unwrap()
             .session_type_spawner()
-            .abandon_session_type_spawn("s1-abandon".into());
+            .abandon_session_type_spawn("s1-abandon".into(), identity);
         daemon.runtime().unwrap().test_fulfill_plugin_spawns();
         assert!(
             daemon
@@ -3741,8 +3744,7 @@ sys.exit(0)
         daemon
             .runtime()
             .unwrap()
-            .publish_spawn_context(&live)
-            .unwrap();
+            .test_publish_spawn_context(&live);
         let refused = daemon.runtime().unwrap().test_plugin_spawn(
             "p1.plugin",
             "agent",

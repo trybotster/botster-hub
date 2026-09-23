@@ -630,7 +630,10 @@ impl SessionTypeCatalogCache {
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
             | HostResult::Failed { generation, .. } => *generation,
-            HostResult::EntityModelComplete(_)
+            // A materialization result cannot satisfy a catalog identity.
+            // The mismatch path drops its payload and attached charge together.
+            HostResult::OrdinarySessionTypeMaterialized(_)
+            | HostResult::EntityModelComplete(_)
             | HostResult::PluginEntity(_)
             | HostResult::EventOwner(_)
             | HostResult::ClientEventCleanup(_)
@@ -698,7 +701,8 @@ impl SessionTypeCatalogCache {
                 self.generation = None;
                 self.failure = Some((generation, error));
             }
-            HostResult::EntityModelComplete(_)
+            HostResult::OrdinarySessionTypeMaterialized(_)
+            | HostResult::EntityModelComplete(_)
             | HostResult::PluginEntity(_)
             | HostResult::EventOwner(_)
             | HostResult::ClientEventCleanup(_)

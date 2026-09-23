@@ -39,7 +39,8 @@ pub(crate) const CORE_REQUEST_CAPACITY: usize = 64;
 /// Each admitted owner waiter can register one two-phase Core operation.
 /// The owner permit bound therefore also bounds every unconsumed identity.
 pub(crate) const CORE_OWNER_COMPLETION_CAPACITY: usize =
-    crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY * 2;
+    crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY * 2
+        + crate::daemon::owner_loop::BACKGROUND_CORE_WORK_CLASSES;
 const CORE_REQUESTS_PER_TURN: usize = CORE_REQUEST_CAPACITY;
 const STOP_ACTION_SHUTDOWN: u8 = 0;
 const STOP_ACTION_RELEASE_FOR_RESTART: u8 = 1;
@@ -2061,6 +2062,7 @@ mod tests {
         assert_eq!(
             CORE_OWNER_COMPLETION_CAPACITY,
             crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY * 2
+                + crate::daemon::owner_loop::BACKGROUND_CORE_WORK_CLASSES
         );
         let wake = CoreCompletionWake::new();
 
@@ -2072,7 +2074,18 @@ mod tests {
                 2
             );
         }
-        assert!(wake.register_phases(WaiterId(u64::MAX), 1).is_none());
+        for offset in 0..crate::daemon::owner_loop::BACKGROUND_CORE_WORK_CLASSES {
+            assert!(wake
+                .register_phases(WaiterId(u64::MAX - offset as u64), 1)
+                .is_some());
+        }
+        assert!(
+            wake.register_phases(
+                WaiterId(u64::MAX - crate::daemon::owner_loop::BACKGROUND_CORE_WORK_CLASSES as u64),
+                1
+            )
+            .is_none()
+        );
         for waiter in 1..=crate::daemon::owner_budget::OWNER_BUDGET_CAPACITY {
             assert_eq!(wake.retire_waiter(WaiterId(waiter as u64)), 2);
         }

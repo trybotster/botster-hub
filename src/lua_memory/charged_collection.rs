@@ -74,7 +74,18 @@ impl<T> ChargedVecDeque<T> {
         Ok(())
     }
 
-    #[cfg(test)]
+    /// Return the funded item unchanged when the queue cannot grow.
+    pub(crate) fn try_push_back_owned(
+        &mut self,
+        item: T,
+    ) -> Result<(), (LuaMemoryCapacityError, T)> {
+        if let Err(error) = self.prepare_push() {
+            return Err((error, item));
+        }
+        self.buf.push_back(item);
+        Ok(())
+    }
+
     pub(crate) fn front(&self) -> Option<&T> {
         self.buf.front()
     }
@@ -478,6 +489,19 @@ mod tests {
             total_callback_bytes: total.max(1),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn refused_queue_growth_returns_the_item() {
+        let memory = account(1);
+        let mut queue = ChargedVecDeque::<u64>::new(Arc::clone(&memory));
+        let (error, item) = queue
+            .try_push_back_owned(42)
+            .expect_err("one byte cannot fund a u64 slot");
+        assert_eq!(item, 42);
+        assert!(error.requested >= std::mem::size_of::<u64>());
+        assert!(queue.is_empty());
+        assert_eq!(memory.usage().1, 0);
     }
 
     fn slot() -> usize {
