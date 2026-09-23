@@ -139,7 +139,7 @@ impl ControlContinuation {
             Self::Coordination(work, _) => work.take_terminal_parts(runtime, identity, completion),
             Self::HostMutation(work) => work.take_terminal_parts(identity, completion),
             Self::Status(work) => work.take_terminal_parts(identity, completion),
-            Self::ManagedSpawn(work) => work.take_terminal_parts(identity, completion),
+            Self::ManagedSpawn(work) => work.take_terminal_parts(runtime, identity, completion),
             Self::Callback(_) | Self::SpawnCallback(_) | Self::Terminal(..) => None,
         }
     }

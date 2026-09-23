@@ -10121,24 +10121,27 @@ return botster.register({tools = {{
 
     #[test]
     fn session_type_generation_advances_only_after_successful_commit() {
+        let write_types_package = |package_dir: &std::path::Path| {
+            write_package_control_manifest(
+                package_dir,
+                "types.plugin",
+                serde_json::json!({
+                    "session_types": [{
+                        "id": "init",
+                        "label": "Mutate agent",
+                        "role": "botster.agent",
+                        "interaction": "interactive",
+                        "traits": ["test"],
+                        "lifecycle": "task",
+                        "command": "bin/init.sh"
+                    }]
+                }),
+            );
+        };
         let root = unique_package_control_dir("session-type-generation");
         let data_directory = root.join("data");
         let package_dir = root.join("types.plugin");
-        write_package_control_manifest(
-            &package_dir,
-            "types.plugin",
-            serde_json::json!({
-                "session_types": [{
-                    "id": "init",
-                    "label": "Mutate agent",
-                    "role": "botster.agent",
-                    "interaction": "interactive",
-                    "traits": ["test"],
-                    "lifecycle": "task",
-                    "command": "bin/init.sh"
-                }]
-            }),
-        );
+        write_types_package(&package_dir);
         let config = package_control_config(data_directory);
         let mut daemon = HubDaemon::start(config.clone()).expect("start generation daemon");
         drive_package_request(
@@ -10173,23 +10176,67 @@ return botster.register({tools = {{
             generation_after_install
         );
 
-        drive_package_request(
+        let refused_retry = drive_package_request(
             &mut daemon,
             DaemonRequest::EnablePackage {
                 package_name: "types.plugin".to_string(),
             },
         )
-        .expect("enable types package");
-        assert!(
+        .expect("typed retry refusal");
+        let refusal = refused_retry.error.as_ref().expect("retry must be refused");
+        assert_eq!(refusal.code, "hub_state_commit_failed");
+        // This message distinguishes journal quarantine from the first write failure.
+        assert_eq!(
+            refusal.message,
+            "recovery required: recovery_journal_quarantined"
+        );
+        assert_eq!(
             daemon
                 .runtime()
                 .expect("runtime")
                 .state()
-                .session_type_generation
-                > generation_after_install,
-            "successful enable must advance session-type generation after commit"
+                .session_type_generation,
+            generation_after_install
         );
         daemon.stop();
+
+        let clean_root = unique_package_control_dir("session-type-generation-clean");
+        let clean_package = clean_root.join("types.plugin");
+        write_types_package(&clean_package);
+        let clean_config = package_control_config(clean_root.join("data"));
+        let mut clean_daemon =
+            HubDaemon::start(clean_config).expect("start clean generation daemon");
+        drive_package_request(
+            &mut clean_daemon,
+            DaemonRequest::InstallPackageLocalPath { path: clean_package },
+        )
+        .expect("install clean types package");
+        let clean_generation_after_install = clean_daemon
+            .runtime()
+            .expect("runtime")
+            .state()
+            .session_type_generation;
+        let enabled = drive_package_request(
+            &mut clean_daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "types.plugin".to_string(),
+            },
+        )
+        .expect("enable clean types package");
+        assert!(
+            enabled.error.is_none(),
+            "clean enable must succeed: {enabled:?}"
+        );
+        assert!(
+            clean_daemon
+                .runtime()
+                .expect("runtime")
+                .state()
+                .session_type_generation
+                > clean_generation_after_install,
+            "successful enable must advance session-type generation after commit"
+        );
+        clean_daemon.stop();
     }
 
     /// Owner-loop wiring for the reconcile read: attach a route through the
