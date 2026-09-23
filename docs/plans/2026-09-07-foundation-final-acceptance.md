@@ -2321,7 +2321,7 @@ Reason-payload sanitization is outside this correction. The separate CLI Package
 The formatting check failed. Baseline attribution remains unverified; no strict formatting acceptance is claimed.
 The build reported 45 warnings, including 30 duplicates. Attribution and strict lint remain open.
 
-### G6 source guard: source accepted; execution pending
+### G6 source guard: focused verification accepted; publication pending
 
 The old guard treats all Lua references outside two files as forbidden. Newer ownership contracts require typed bridge consumers.
 The correction preserves the recursive source scan and the explicit terminal file checks.
@@ -2336,7 +2336,15 @@ The patch resides in `/Users/jasonconigliari/botster-evidence/managed-recovery-2
 Agent 001b owns the sole compiler slot for Rust 1.97, jobs 2, incremental 0, locked/offline.
 The next checks are six exact helper tests, the outer guard, and two existing terminal behavior tests.
 Each invocation must execute one test. The writer must stop at the first failure and preserve the evidence.
-The terminal tests use the verified `db3dc263` candidate. No G6 execution result is accepted yet.
+The build passed. All nine exact tests passed, each with one executed test and 328 filtered tests.
+The compiled list contains 329 tests, including the six new helper tests.
+The terminal tests used the verified `db3dc263` candidate. The WebRTC output test passed in 11.77 seconds.
+Root inspected the commands and raw results. Root and reviewer 001e verified every entry in `SHA256SUMS`.
+The test binary SHA-256 is `015283d1ab1f47c9092fbb971a7cdaf58d7e0538dcdd484c498497aa219f0e2b`.
+Reviewer 001e accepted the focused evidence. The writer released the compiler slot.
+Root authorized the three-file checkpoint commit and push. Publication confirmation remains pending.
+Agent 001b next diagnoses the G7 shutdown timeout and cancelled-read failure without source changes.
+These passes establish only the tested behavior. They do not establish full acceptance.
 
 The remaining failure groups cover the terminal-path source guard, shutdown during update checks,
 chunk reassembly, and deterministic WebRTC failure evidence.
