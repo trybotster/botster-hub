@@ -2197,7 +2197,24 @@ The lifecycle target compiled but did not run. The live sibling test remains unv
 Checkpoint `15e7fa0f08a0568945e799113f259ddc214d4c2b` contains the 12 reviewed files and is pushed on the recovery branch.
 The staged diff SHA-256 was `daa40dfc968ee01903e6507e4cbd2b0d029cf4b6df65c206057f29095e4eafe1`.
 The implementer reported a clean worktree after the commit and started a fresh candidate build.
-The next gate is candidate verification, followed by the two corrected package tests and the same-connection sibling test.
+The initial candidate passed the two corrected package tests but failed the same-connection sibling test.
+The diagnostic confirmed that CreateSessionType succeeded before the sibling read timed out.
+Source review identified a missing SubscriberDelivery notification after a committed session-type generation change.
+Checkpoint `f1510e358455d171b69224b28f48e87e44453d34` adds that notification only when the generation changes.
+The checkpoint is reviewed and pushed. It also corrects test setup that left startup notifications set.
+Five isolated notification tests passed after the corrections. The two capacity tests clear all startup maintenance bits.
+Earlier notification claims that relied on initial readiness are superseded by these isolated results.
+The earlier single-turn failure's exact scheduling cause was not measured.
+
+The fresh candidate at `g2-candidate-f1510e35-20260923` passed all three selected lifecycle tests:
+provider reconnect, provider removal with a terminal Error, and sibling delivery on the same Unix connection.
+Each invocation executed one test and exited zero. Root and the reviewer inspected the raw evidence.
+The sibling result verifies new delivery after the neighboring subscription retires on that same connection.
+These selected results do not establish repeat stability, a full-suite pass, or installation readiness.
+The candidate manifest names Hub `f1510e35` and Core `053148f6`.
+The candidate README records commands, artifact hashes, and raw log hashes.
+The next bounded work is the stale-provider resynchronization test, followed by the advanced-subscriber ordering test.
+The implementer must stop at the first failure and diagnose before changing source.
 The old candidate must not supply runtime evidence for this production change.
 The evidence packet is `g2-implementation-review.md` in the evidence directory above.
 The retry compile log SHA-256 is `cb24e49cc131bfca7358e736c9b85e905f8bf03dad73502551d0829562b8ff60`.
