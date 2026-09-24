@@ -4,6 +4,16 @@ Status: ordinary-spawn checkpoint `5c01a95d` is pushed. Real daemon success and 
 
 ## Current delivery status — September 23
 
+Latest capacity result: test-only patch `b025a409f5e87889e550957be7bd2225057e83d36bccfa36667d711a2959badf` passed against pushed checkpoint `ebaf8b3b`.
+The input unit passed one test. The matched daemon test passed one test, with 328 filtered tests.
+The daemon returned the complete semantic refusal for a 100,000-byte key and the exact render-capacity refusal for a 1,100,000-byte key.
+Root checked both raw results, the patch hash, and both binary hashes against the candidate manifest.
+Evidence is under `/Users/jasonconigliari/botster-evidence/ordinary-render-capacity-20260923/`. The initial relink mismatch is preserved separately.
+The input unit measured J=1,102,107, K=1,100,948, and retained P=1,100,815 bytes. J is released before Host processing.
+The earlier threshold calculation incorrectly retained J after projection. Source review corrected that premise before the run.
+Future capacity calculations must follow buffer destruction and remaining parent capacity, not reuse an earlier peak as retained storage.
+This closes the tested render-capacity refusal requirement without changing production limits. Abandonment and conversion-refusal verification are next.
+
 Latest refusal result: test-only patch `7f4eee6adf29b5079a743bcedae0d366da0ee1ea91b610df86950141b909779b` passed against checkpoint `5c01a95d`.
 The real daemon test passed one test, with 328 filtered tests. Root checked the raw log, manifest, and test patch hash.
 The test checks exact missing-type Host and occupied-ID Core refusal messages through Lua after two successful spawns.
