@@ -90,6 +90,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         parent,
         receipt,
         runtime.config(),
+        runtime.startup_materialization_paths(),
         runtime.state(),
         pending.package_records,
         pending.plugin_key,
@@ -175,6 +176,7 @@ fn send_unavailable(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Host,
+    HostReceipt,
     Ready,
     Core,
     Delivery,
@@ -185,14 +187,16 @@ enum Phase {
 }
 
 enum AdmittedFailure {
-    Refused(String, crate::lua_memory::LuaCallbackCharge),
+    Refused(String, crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge),
     Unavailable(&'static str),
 }
 
 impl AdmittedFailure {
     fn into_delivery(self) -> AdmittedSpawnDelivery {
         match self {
-            Self::Refused(message, variable) => AdmittedSpawnDelivery::refused(message, variable),
+            Self::Refused(message, variable, lua_render) => {
+                AdmittedSpawnDelivery::refused(message, variable, lua_render)
+            }
             Self::Unavailable(reason) => AdmittedSpawnDelivery::Unavailable(reason),
         }
     }
@@ -378,21 +382,21 @@ impl SessionTypeSpawnOperation {
                             completed,
                         ) => {
                             completed.receipt.publish(());
-                            self.host_receipt = None;
                             match completed.result {
                                 Ok(product) => {
                                     self.product = Some(product);
-                                    self.phase = Phase::Ready;
-                                    return ControlPoll::Again;
+                                    self.phase = Phase::HostReceipt;
+                                    return ControlPoll::Pending;
                                 }
                                 Err(crate::session_types::ChargedMaterializationFailure::Semantic(
                                     failure,
                                 )) => {
                                     if let Some(response) = self.plugin_response.take() {
-                                        let (error, variable) = failure.into_parts();
+                                        let (error, variable, lua_render) = failure.into_parts();
                                         let delivery = AdmittedSpawnDelivery::refused(
                                             error.message,
                                             variable,
+                                            lua_render,
                                         );
                                         if let Err(refusal) = response.try_send(delivery) {
                                             drop(refusal);
@@ -414,6 +418,24 @@ impl SessionTypeSpawnOperation {
                     self.phase = Phase::Done;
                     return ControlPoll::FinishedInternal;
                 }
+                Phase::HostReceipt => {
+                    let receipt = self.host_receipt.as_mut().expect("Host receipt exists");
+                    match receipt.poll() {
+                        CoreTicketPoll::Pending => return ControlPoll::Pending,
+                        CoreTicketPoll::Ready(()) => {
+                            self.host_receipt = None;
+                            self.phase = Phase::Ready;
+                            return ControlPoll::Again;
+                        }
+                        CoreTicketPoll::Refused | CoreTicketPoll::Lost => {
+                            self.product = None;
+                            self.host_receipt = None;
+                            self.send_unavailable("Host completion receipt unavailable");
+                            self.phase = Phase::Done;
+                            return ControlPoll::FinishedInternal;
+                        }
+                    }
+                }
                 Phase::Ready => {
                     let product = self.product.take().expect("charged spawn product exists");
                     self.start =
@@ -429,12 +451,14 @@ impl SessionTypeSpawnOperation {
                                 self.admitted_failure = Some(
                                     start
                                         .charged_plugin_failure(&failure)
-                                        .map(|(message, charge)| {
-                                            AdmittedFailure::Refused(message, charge)
+                                        .map(|(message, charge, lua_render)| {
+                                            AdmittedFailure::Refused(message, charge, lua_render)
                                         })
-                                        .unwrap_or(AdmittedFailure::Unavailable(
-                                            crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
-                                        )),
+                                        .unwrap_or_else(|| {
+                                            AdmittedFailure::Unavailable(
+                                                crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+                                            )
+                                        }),
                                 );
                             } else {
                                 self.failure = Some(core_operator_error(
@@ -653,19 +677,27 @@ mod admitted_failure_tests {
         )
         .unwrap();
         let message = "session type spawn failed: occupied".to_string();
-        let charge = memory.reserve_callback_total(message.len()).unwrap();
+        let render_bytes = crate::session_types::lua_spawn_refusal_render_bytes(&message).unwrap();
+        let mut parent = memory
+            .reserve_callback_total(message.len() + render_bytes)
+            .unwrap();
+        let charge = parent.split_fixed(message.len()).unwrap();
+        let lua_render = parent.split_fixed(render_bytes).unwrap();
+        drop(parent);
         let mut response = Some(sender);
-        let mut failure = Some(AdmittedFailure::Refused(message.clone(), charge));
+        let mut failure = Some(AdmittedFailure::Refused(message, charge, lua_render));
         assert!(deliver_confirmed_admitted_failure(&mut response, &mut failure));
         assert!(response.is_none());
         assert!(failure.is_none());
         let delivery = receiver.recv_timeout(Duration::ZERO).unwrap();
-        let AdmittedSpawnDelivery::Refused { message: actual, _variable } = delivery else {
+        let AdmittedSpawnDelivery::Refused { message: actual, _variable, _lua_render } = delivery else {
             panic!("Core failure must deliver its charged text");
         };
-        assert_eq!(actual, message);
+        assert_eq!(actual, "session type spawn failed: occupied");
+        assert_eq!(_lua_render.bytes(), crate::session_types::lua_spawn_refusal_render_bytes(&actual).unwrap());
         drop(actual);
         drop(_variable);
+        drop(_lua_render);
         drop(receiver);
         assert_eq!(memory.usage().1, 0);
     }

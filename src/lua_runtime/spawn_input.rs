@@ -79,7 +79,8 @@ pub(super) fn admit(
             ));
         }
     };
-    project(JsonInput::new(value, parent), plugin_key).map_err(|error| error.raise(lua, capacity))
+    project(JsonInput::new(value, parent), plugin_key)
+        .map_err(|error| error.raise(lua, capacity))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

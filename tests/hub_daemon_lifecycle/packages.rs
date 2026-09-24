@@ -4253,6 +4253,135 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
 }
 
 #[test]
+fn live_daemon_lua_tool_spawns_two_ordinary_sessions() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("ordinary-two-data");
+    let package_dir = unique_short_test_dir("ordinary-two-package");
+    fs::create_dir_all(package_dir.join("bin")).expect("create ordinary package");
+    fs::write(
+        package_dir.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {{
+    name = "ordinary.two_spawns",
+    description = "Spawn two ordinary sessions through the daemon owner.",
+    handler = "two_spawns",
+    call = function(args)
+      local first = botster.capabilities.session_types.spawn({
+        session_type_id = "ordinary.two/init",
+        session_id = "ordinary-first",
+        environment = { BOTSTER_MODE = "first" },
+        context = { prompt = "first prompt" },
+      })
+      local second = botster.capabilities.session_types.spawn({
+        session_type_id = "ordinary.two/init",
+        session_id = "ordinary-second",
+        environment = { BOTSTER_MODE = "second" },
+        context = { prompt = "second prompt" },
+      })
+      return { first = first, second = second }
+    end,
+  }},
+})
+"#,
+    )
+    .expect("write ordinary Lua tool");
+    let script = package_dir.join("bin/init.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\" \"$PWD\" \"$1\" > \"spawn-$BOTSTER_SESSION_ID.txt\"\n\"$BOTSTER_HUB_BIN\" context --key prompt > \"context-$BOTSTER_SESSION_ID.json\"\nsleep 1\n",
+    )
+    .expect("write ordinary session command");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("make ordinary session command executable");
+    let source_root = fs::canonicalize(&package_dir).expect("canonical ordinary package root");
+    fs::write(
+        package_dir.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "ordinary.two",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.clone() },
+            "capabilities": [
+                { "surface": "mcp" },
+                { "surface": "session_actions", "scope": "session_type_spawn" }
+            ],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "session_types": [{
+                "id": "init",
+                "label": "Ordinary agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "traits": ["test"],
+                "lifecycle": "task",
+                "command": "bin/init.sh",
+                "args": ["command-argument"],
+                "environment": { "BOTSTER_MODE": "default" },
+                "allowed_environment_overrides": ["BOTSTER_MODE"],
+                "context": ["prompt"]
+            }]
+        }))
+        .expect("serialize ordinary package"),
+    )
+    .expect("write ordinary package manifest");
+
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "ordinary two-session daemon cleanup");
+    let config = explicit_config(&data_dir);
+    let enabled = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath { path: package_dir.clone() },
+    )
+    .expect("enable ordinary package");
+    assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision);
+    let response = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "ordinary.two_spawns".to_string(),
+            arguments: serde_json::json!({}),
+        },
+    )
+    .expect("call ordinary Lua tool through daemon");
+    if response.kind != botster_hub::DaemonResponseKind::PluginMcpToolResult {
+        let output = daemon.shutdown_at(&data_dir);
+        panic!(
+            "ordinary Lua tool failed: {response:?}; daemon stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert_eq!(response.kind, botster_hub::DaemonResponseKind::PluginMcpToolResult, "{response:?}");
+    for (key, id, mode, prompt) in [
+        ("first", "ordinary-first", "first", "first prompt"),
+        ("second", "ordinary-second", "second", "second prompt"),
+    ] {
+        assert_eq!(response.plugin_tool_result[key]["session_id"], id, "{response:?}");
+        assert_eq!(response.plugin_tool_result[key]["context_id"], format!("ctx-{id}"));
+        let output = package_dir.join(format!("spawn-{id}.txt"));
+        let context = package_dir.join(format!("context-{id}.json"));
+        let expected_output = format!(
+            "{id}|{mode}|{}|command-argument\n",
+            source_root.display(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && (fs::read_to_string(&output).ok().as_deref() != Some(expected_output.as_str())
+                || !fs::read_to_string(&context)
+                    .is_ok_and(|contents| contents.contains(prompt)))
+        {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            fs::read_to_string(&output).expect("ordinary session command output"),
+            expected_output,
+        );
+        assert!(
+            fs::read_to_string(&context).expect("ordinary session context").contains(prompt),
+            "{id} must read its own context",
+        );
+    }
+}
+
+#[test]
 fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("managed-live");

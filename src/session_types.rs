@@ -275,7 +275,6 @@ impl std::fmt::Debug for ChargedSessionTypeMaterialization {
 }
 
 /// Host owns the charged input and the checked materializer until it returns.
-/// This type has no production constructor until the complete parser bound is proved.
 pub(crate) struct SpawnHostWork {
     run: Box<
         dyn FnOnce()
@@ -299,6 +298,7 @@ impl SpawnHostWork {
         mut parent: crate::lua_memory::LuaCallbackCharge,
         receipt: crate::data_plane::driver::CoreReplyPublisher<()>,
         config: &HubConfig,
+        startup_paths: &StartupMaterializationPaths,
         state: crate::runtime::HubStateView,
         package_records: Arc<Vec<PackageRecord>>,
         plugin_key: botster_core::PluginKey,
@@ -312,7 +312,7 @@ impl SpawnHostWork {
             crate::data_plane::driver::CoreReplyPublisher<()>,
         ),
     > {
-        let config = match ChargedMaterializationConfig::from_config(config, &mut parent) {
+        let config = match ChargedMaterializationConfig::from_config(config, startup_paths, &mut parent) {
             Ok(config) => config,
             Err(reason) => return Err((reason, parent, receipt)),
         };
@@ -382,13 +382,50 @@ pub(crate) struct ChargedSessionTypeFailure {
     error: SessionTypeError,
     // The message and any retained materialization input precede this charge.
     _variable: crate::lua_memory::LuaCallbackCharge,
+    lua_render: Option<crate::lua_memory::LuaCallbackCharge>,
+}
+
+pub(crate) const LUA_SPAWN_REFUSAL_PREFIX: &str = "session_types.spawn failed: ";
+
+pub(crate) fn lua_spawn_refusal_render_bytes(message: &str) -> Option<usize> {
+    LUA_SPAWN_REFUSAL_PREFIX.len().checked_add(message.len())
 }
 
 impl ChargedSessionTypeFailure {
+    fn fund_lua_render(
+        mut self,
+        parent: &mut crate::lua_memory::LuaCallbackCharge,
+    ) -> Result<Self, Self> {
+        let Some(bytes) = lua_spawn_refusal_render_bytes(&self.error.message) else {
+            return Err(self);
+        };
+        if parent.grow(bytes).is_err() {
+            return Err(self);
+        }
+        self.lua_render = parent.split_fixed(bytes);
+        if self.lua_render.is_none() {
+            return Err(self);
+        }
+        Ok(self)
+    }
+
     pub(crate) fn into_parts(
         self,
-    ) -> (SessionTypeError, crate::lua_memory::LuaCallbackCharge) {
-        (self.error, self._variable)
+    ) -> (SessionTypeError, crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge) {
+        (self.error, self._variable, self.lua_render.expect("Lua refusal render was funded"))
+    }
+}
+
+fn semantic_materialization_failure(
+    failure: ChargedSessionTypeFailure,
+    parent: &mut crate::lua_memory::LuaCallbackCharge,
+) -> ChargedMaterializationFailure {
+    match failure.fund_lua_render(parent) {
+        Ok(failure) => ChargedMaterializationFailure::Semantic(failure),
+        Err(failure) => {
+            drop(failure);
+            ChargedMaterializationFailure::Capacity("Lua refusal render capacity exhausted")
+        }
     }
 }
 
@@ -464,21 +501,53 @@ impl<'a> From<&'a HubConfig> for MaterializationConfigView<'a> {
     }
 }
 
-/// Host owns these five config values and their allocation charge.
-#[allow(dead_code)]
+/// Hub startup fixes process paths before an ordinary spawn enters Host.
+pub(crate) struct StartupMaterializationPaths {
+    data_directory: String,
+    session_directory: String,
+    hub_socket: String,
+    hub_bin: Option<String>,
+}
+
+impl StartupMaterializationPaths {
+    pub(crate) fn capture(config: &HubConfig) -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let absolute = |path: &Path| {
+            if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
+        };
+        let data_directory = absolute(&config.data_directory);
+        let session_directory = data_directory.join("sessions");
+        let hub_socket = config.transports.local_socket.as_ref()
+            .map(|socket| absolute(&socket.path).display().to_string())
+            .unwrap_or_default();
+        let hub_bin = std::env::current_exe().ok().map(|path| path.display().to_string());
+        Self {
+            data_directory: data_directory.display().to_string(),
+            session_directory: session_directory.display().to_string(),
+            hub_socket,
+            hub_bin,
+        }
+    }
+}
+
+/// Host owns config values and startup path copies with one allocation charge.
 struct ChargedMaterializationConfig {
     data_directory: PathBuf,
     shell: String,
     initial_rows: u16,
     initial_cols: u16,
     local_socket: Option<PathBuf>,
+    data_directory_text: String,
+    session_directory_text: String,
+    hub_socket_text: String,
+    hub_bin_text: Option<String>,
     _storage: crate::lua_memory::LuaCallbackCharge,
 }
 
-#[allow(dead_code)]
 impl ChargedMaterializationConfig {
     fn from_config(
         config: &HubConfig,
+        startup_paths: &StartupMaterializationPaths,
         parent: &mut crate::lua_memory::LuaCallbackCharge,
     ) -> Result<Self, &'static str> {
         let view = MaterializationConfigView::from(config);
@@ -494,6 +563,10 @@ impl ChargedMaterializationConfig {
                         .map_or(0, |path| path.as_os_str().as_encoded_bytes().len()),
                 )
             })
+            .and_then(|bytes| bytes.checked_add(startup_paths.data_directory.len()))
+            .and_then(|bytes| bytes.checked_add(startup_paths.session_directory.len()))
+            .and_then(|bytes| bytes.checked_add(startup_paths.hub_socket.len()))
+            .and_then(|bytes| bytes.checked_add(startup_paths.hub_bin.as_ref().map_or(0, String::len)))
             .ok_or("materialization config size overflow")?;
         parent
             .grow(bytes)
@@ -501,6 +574,10 @@ impl ChargedMaterializationConfig {
         let data_directory = view.data_directory.to_path_buf();
         let shell = view.shell.to_string();
         let local_socket = view.local_socket.map(Path::to_path_buf);
+        let data_directory_text = startup_paths.data_directory.clone();
+        let session_directory_text = startup_paths.session_directory.clone();
+        let hub_socket_text = startup_paths.hub_socket.clone();
+        let hub_bin_text = startup_paths.hub_bin.clone();
         let storage = parent
             .split_fixed(bytes)
             .ok_or("materialization config transfer failed")?;
@@ -510,6 +587,10 @@ impl ChargedMaterializationConfig {
             initial_rows: view.initial_rows,
             initial_cols: view.initial_cols,
             local_socket,
+            data_directory_text,
+            session_directory_text,
+            hub_socket_text,
+            hub_bin_text,
             _storage: storage,
         })
     }
@@ -521,6 +602,15 @@ impl ChargedMaterializationConfig {
             initial_rows: self.initial_rows,
             initial_cols: self.initial_cols,
             local_socket: self.local_socket.as_deref(),
+        }
+    }
+
+    fn paths(&self) -> MaterializationPathText<'_> {
+        MaterializationPathText {
+            data_directory: &self.data_directory_text,
+            session_directory: &self.session_directory_text,
+            hub_socket: &self.hub_socket_text,
+            hub_bin: self.hub_bin_text.as_deref(),
         }
     }
 }
@@ -1441,6 +1531,7 @@ impl ChargedSourceSessionTypes {
                 return Err(ChargedSourceResolveFailure::Semantic(ChargedSessionTypeFailure {
                     error,
                     _variable: storage,
+                    lua_render: None,
                 }));
             }
         };
@@ -1542,6 +1633,7 @@ fn funded_source_error(
     Some(ChargedSessionTypeFailure {
         error: SessionTypeError::new(kind, message.value),
         _variable: variable,
+        lua_render: None,
     })
 }
 
@@ -1555,12 +1647,14 @@ impl ChargedSourceLoadFailure {
             Self::Validation { error, _storage } => Ok(ChargedSessionTypeFailure {
                 error,
                 _variable: _storage,
+                lua_render: None,
             }),
             Self::Parse(ChargedRepoParseFailure::Invalid(wrapped)) => {
                 let (error, variable) = wrapped.into_parts();
                 Ok(ChargedSessionTypeFailure {
                     error,
                     _variable: variable,
+                    lua_render: None,
                 })
             }
             Self::Read(ChargedRepoReadFailure::TooLarge) => funded_source_error(
@@ -1647,7 +1741,7 @@ fn materialize_ordinary_charged(
         Ok(sources) => sources,
         Err(error) => {
             return Err(match error.into_semantic_failure(&mut parent) {
-                Ok(failure) => ChargedMaterializationFailure::Semantic(failure),
+                Ok(failure) => semantic_materialization_failure(failure, &mut parent),
                 Err(ChargedSourceLoadFailure::Capacity(reason))
                 | Err(ChargedSourceLoadFailure::Read(ChargedRepoReadFailure::Capacity(reason)))
                 | Err(ChargedSourceLoadFailure::Parse(ChargedRepoParseFailure::Capacity(reason))) => {
@@ -1672,7 +1766,7 @@ fn materialize_ordinary_charged(
                     "session type source capacity exhausted",
                 ),
                 ChargedSourceResolveFailure::Semantic(failure) => {
-                    ChargedMaterializationFailure::Semantic(failure)
+                    semantic_materialization_failure(failure, &mut parent)
                 }
             };
             drop(sources);
@@ -1688,7 +1782,7 @@ fn materialize_ordinary_charged(
         Ok(environment) => environment,
         Err(error) => {
             let failure = match error.into_charged(&mut parent) {
-                Ok(failure) => ChargedMaterializationFailure::Semantic(failure),
+                Ok(failure) => semantic_materialization_failure(failure, &mut parent),
                 Err(reason) => ChargedMaterializationFailure::Capacity(reason),
             };
             drop(row);
@@ -1707,7 +1801,7 @@ fn materialize_ordinary_charged(
         Ok(prefix) => prefix,
         Err(error) => {
             let failure = match error.into_charged(&mut parent) {
-                Ok(failure) => ChargedMaterializationFailure::Semantic(failure),
+                Ok(failure) => semantic_materialization_failure(failure, &mut parent),
                 Err(reason) => ChargedMaterializationFailure::Capacity(reason),
             };
             drop(environment);
@@ -1750,20 +1844,69 @@ fn materialize_ordinary_charged(
             return Err(ChargedMaterializationFailure::Capacity(reason));
         }
     };
-    // Source, row, environment, prefix, execution, and metadata charges overlap.
-    // The remaining output must admit its peak before its first allocation.
-    drop(metadata);
-    drop(execution);
-    drop(prefix);
-    drop(environment);
-    drop(environment_storage);
-    drop(row);
-    drop(row_storage);
+    let paths = config.paths();
+    let context = match charged_context(
+        &mut parent,
+        &prefix,
+        &sources.sources[index].root,
+        request.context,
+        &sources.sources[index].session_type.context,
+        paths,
+    ) {
+        Ok(context) => context,
+        Err(reason) => {
+            drop(metadata);
+            drop(execution);
+            drop(prefix);
+            drop(environment);
+            drop(environment_storage);
+            drop(row);
+            drop(row_storage);
+            drop(sources);
+            drop(config);
+            return Err(ChargedMaterializationFailure::Capacity(reason));
+        }
+    };
+    let mut environment = environment;
+    let environment_injection = match charged_inject_context_environment(
+        &mut parent,
+        &mut environment,
+        &prefix,
+        paths,
+    ) {
+        Ok(injection) => injection,
+        Err(reason) => {
+            drop(context);
+            drop(metadata);
+            drop(execution);
+            drop(prefix);
+            drop(environment);
+            drop(environment_storage);
+            drop(row);
+            drop(row_storage);
+            drop(sources);
+            drop(config);
+            return Err(ChargedMaterializationFailure::Capacity(reason));
+        }
+    };
+    let result = charged_final_materialization(
+        parent,
+        row_storage,
+        environment_storage,
+        environment_injection,
+        row,
+        environment,
+        prefix,
+        execution,
+        metadata,
+        context,
+        config.initial_rows,
+        config.initial_cols,
+    )
+    .map_err(ChargedMaterializationFailure::Capacity);
     drop(sources);
     drop(config);
-    Err(ChargedMaterializationFailure::Unavailable(
-        "charged output requires the startup path policy",
-    ))
+    result
 }
 
 /// Return effective session types after applying package < device < repo precedence.
@@ -3082,7 +3225,7 @@ struct ChargedSessionTypeMetadata {
     _storage: crate::lua_memory::LuaCallbackCharge,
 }
 
-/// These borrowed values must come from the reviewed startup path policy.
+/// These borrowed values come from copies charged before Host admission.
 #[derive(Clone, Copy)]
 struct MaterializationPathText<'a> {
     data_directory: &'a str,
@@ -3281,20 +3424,19 @@ fn charged_context(
     })
 }
 
-/// Finish the output after a reviewed startup policy supplies the path text.
+/// Finish the output after startup paths and source values are charged.
 /// Every copy is admitted while all source and output payloads remain live.
-#[allow(dead_code)]
 fn charged_final_materialization(
     mut parent: crate::lua_memory::LuaCallbackCharge,
-    mut row: HubSessionType,
     row_storage: crate::lua_memory::LuaCallbackCharge,
-    environment: BTreeMap<String, String>,
     environment_storage: crate::lua_memory::LuaCallbackCharge,
+    environment_injection: crate::lua_memory::LuaCallbackCharge,
+    mut row: HubSessionType,
+    environment: BTreeMap<String, String>,
     prefix: ChargedDeterministicPrefix,
     execution: ChargedExecution,
     metadata: ChargedSessionTypeMetadata,
     context: ChargedSessionTypeContext,
-    environment_injection: crate::lua_memory::LuaCallbackCharge,
     initial_rows: u16,
     initial_cols: u16,
 ) -> Result<ChargedSessionTypeMaterialization, &'static str> {
@@ -4057,6 +4199,66 @@ mod source_selection_tests {
     use crate::persistence::DeviceSessionTypeSource;
 
     #[test]
+    fn semantic_refusal_funds_its_lua_render_from_the_open_parent() {
+        let message = "bad".to_string();
+        let render_bytes = lua_spawn_refusal_render_bytes(&message).unwrap();
+        let total = message.capacity() + render_bytes;
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: total,
+            total_callback_bytes: total,
+        })
+        .unwrap();
+        let mut parent = memory.reserve_callback_total(message.capacity()).unwrap();
+        let storage = parent.split_fixed(message.capacity()).unwrap();
+        let failure = ChargedSessionTypeFailure {
+            error: SessionTypeError::new("invalid_session_type", message),
+            _variable: storage,
+            lua_render: None,
+        };
+        let ChargedMaterializationFailure::Semantic(failure) =
+            semantic_materialization_failure(failure, &mut parent)
+        else {
+            panic!("the exact refusal bytes must fit");
+        };
+        let (error, storage, render) = failure.into_parts();
+        assert_eq!(error.message, "bad");
+        assert_eq!(render.bytes(), render_bytes);
+        drop(error);
+        drop(storage);
+        drop(render);
+        drop(parent);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn semantic_refusal_render_capacity_releases_the_message() {
+        let message = "bad".to_string();
+        let total = message.capacity() + lua_spawn_refusal_render_bytes(&message).unwrap() - 1;
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: total,
+            total_callback_bytes: total,
+        })
+        .unwrap();
+        let mut parent = memory.reserve_callback_total(message.capacity()).unwrap();
+        let storage = parent.split_fixed(message.capacity()).unwrap();
+        let failure = ChargedSessionTypeFailure {
+            error: SessionTypeError::new("invalid_session_type", message),
+            _variable: storage,
+            lua_render: None,
+        };
+        assert!(matches!(
+            semantic_materialization_failure(failure, &mut parent),
+            ChargedMaterializationFailure::Capacity(_)
+        ));
+        drop(parent);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
     fn charged_config_projection_preserves_materialization_values() {
         let config = HubStartupOptions {
             data_directory: DataDirectoryOption::Explicit(
@@ -4074,7 +4276,8 @@ mod source_selection_tests {
         })
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
-        let projected = ChargedMaterializationConfig::from_config(&config, &mut parent).unwrap();
+        let startup_paths = StartupMaterializationPaths::capture(&config);
+        let projected = ChargedMaterializationConfig::from_config(&config, &startup_paths, &mut parent).unwrap();
         let borrowed = MaterializationConfigView::from(&config);
         let owned = projected.view();
         assert_eq!(owned.data_directory, borrowed.data_directory);
@@ -4714,8 +4917,8 @@ mod source_selection_tests {
             &mut parent, &mut environment, &prefix, paths,
         ).unwrap();
         let charged = charged_final_materialization(
-            parent, row, row_storage, environment, environment_storage, prefix, execution,
-            metadata, context, environment_injection,
+            parent, row_storage, environment_storage, environment_injection, row, environment,
+            prefix, execution, metadata, context,
             config.session_defaults.initial_rows, config.session_defaults.initial_cols,
         ).unwrap();
         let (materialized, allowance) = charged.into_parts();

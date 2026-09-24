@@ -2587,23 +2587,21 @@ fn session_types_table(
                 }
                 crate::runtime::AdmittedSpawnDelivery::Refused {
                     message,
-                    mut _variable,
+                    _variable,
+                    _lua_render,
                 } => {
                     let raised = (|| -> Result<mlua::String, callback::CallbackFailure> {
-                        const PREFIX: &str = "session_types.spawn failed: ";
-                        let bytes = PREFIX.len().checked_add(message.len()).ok_or_else(|| {
-                            callback::CallbackFailure::Raise(spawn_capacity.clone())
-                        })?;
-                        _variable.grow(bytes).map_err(|_| {
+                        let bytes = crate::session_types::lua_spawn_refusal_render_bytes(&message).ok_or_else(|| {
                             callback::CallbackFailure::Raise(spawn_capacity.clone())
                         })?;
                         let mut failure = String::with_capacity(bytes);
-                        failure.push_str(PREFIX);
+                        failure.push_str(crate::session_types::LUA_SPAWN_REFUSAL_PREFIX);
                         failure.push_str(&message);
                         lua.create_string(&failure).map_err(callback::CallbackFailure::Error)
                     })();
                     drop(message);
                     drop(_variable);
+                    drop(_lua_render);
                     Err(callback::CallbackFailure::Raise(raised?))
                 }
                 crate::runtime::AdmittedSpawnDelivery::Unavailable(reason) => {

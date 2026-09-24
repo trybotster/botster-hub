@@ -126,6 +126,7 @@ struct CreatedWorktreeCleanup {
 
 pub struct HubRuntime {
     config: HubConfig,
+    startup_materialization_paths: crate::session_types::StartupMaterializationPaths,
     lua_memory: Arc<crate::lua_memory::LuaMemoryAccount>,
     #[cfg(test)]
     lua_plugin_runtimes:
@@ -412,6 +413,7 @@ pub(crate) enum AdmittedSpawnDelivery {
     Refused {
         message: String,
         _variable: crate::lua_memory::LuaCallbackCharge,
+        _lua_render: crate::lua_memory::LuaCallbackCharge,
     },
 }
 
@@ -419,10 +421,12 @@ impl AdmittedSpawnDelivery {
     pub(crate) fn refused(
         message: String,
         variable: crate::lua_memory::LuaCallbackCharge,
+        lua_render: crate::lua_memory::LuaCallbackCharge,
     ) -> Self {
         Self::Refused {
             message,
             _variable: variable,
+            _lua_render: lua_render,
         }
     }
 
@@ -582,6 +586,8 @@ impl HubRuntime {
     /// # Errors
     /// Returns an error when memory policy is invalid or the plugin database cannot be opened.
     pub fn new(config: HubConfig) -> HubRuntimeResult<Self> {
+        let startup_materialization_paths =
+            crate::session_types::StartupMaterializationPaths::capture(&config);
         let lua_memory = crate::lua_memory::LuaMemoryAccount::new(
             crate::config::lua_memory_limits(),
         )
@@ -617,6 +623,7 @@ impl HubRuntime {
             next_provider_token: Cell::new(1),
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
+            startup_materialization_paths,
             lua_memory,
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
@@ -769,6 +776,8 @@ impl HubRuntime {
         publication: HubStatePublication,
         state_authority: Option<Arc<HubStateAuthority>>,
     ) -> HubRuntimeResult<Self> {
+        let startup_materialization_paths =
+            crate::session_types::StartupMaterializationPaths::capture(&config);
         let lua_memory = crate::lua_memory::LuaMemoryAccount::new(
             crate::config::lua_memory_limits(),
         )
@@ -803,6 +812,7 @@ impl HubRuntime {
             next_provider_token: Cell::new(1),
             package_entity_resync_changed: std::cell::Cell::new(false),
             config,
+            startup_materialization_paths,
             lua_memory,
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
@@ -870,6 +880,12 @@ impl HubRuntime {
     #[must_use]
     pub const fn config(&self) -> &HubConfig {
         &self.config
+    }
+
+    pub(crate) fn startup_materialization_paths(
+        &self,
+    ) -> &crate::session_types::StartupMaterializationPaths {
+        &self.startup_materialization_paths
     }
 
     /// Return the concrete local capability runtime owned by this hub.
@@ -5293,9 +5309,9 @@ impl HubSessionTypeSpawner {
         }
         let (plugin_key, session_type_id, request, mut parent) = input.into_parts();
         let bytes = crate::lua_memory::layout::single_reply_bytes::<AdmittedSpawnDelivery>(true)
-            .ok_or(std::borrow::Cow::Borrowed(
-                crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
-            ))?;
+            .ok_or_else(|| {
+                std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
+            })?;
         parent.grow(bytes).map_err(|_| {
             std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
         })?;
@@ -5315,14 +5331,17 @@ impl HubSessionTypeSpawner {
             response: OrdinarySpawnReply::Admitted(response),
             parent: Some(parent),
         };
-        {
+        let queued = {
             let mut queue = self.pending.lock().map_err(|_| {
                 std::borrow::Cow::Borrowed("session-type spawn queue lock poisoned")
             })?;
-            queue.try_push_back_owned(item).map_err(|(_, item)| {
-                drop(item);
-                std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
-            })?;
+            queue.try_push_back_owned(item)
+        };
+        if let Err((_, item)) = queued {
+            drop(item);
+            return Err(std::borrow::Cow::Borrowed(
+                crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+            ));
         }
         self.publish_session_type_spawn();
         receiver
