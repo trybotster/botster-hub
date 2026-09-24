@@ -1,6 +1,6 @@
 # Foundation integration and final acceptance
 
-Status: checkpoint `8507cf22` is pushed. Focused corrections address seven of eight workspace failures. The remaining failure did not reproduce in isolation. Full workspace acceptance remains open.
+Status: checkpoint `b801d673` is pushed. The full run passes all library and main tests, then stops at an incomplete ownership matrix. Full workspace acceptance remains open.
 
 ## Current delivery status — September 23
 
@@ -110,6 +110,20 @@ Evidence resides in `/Users/jasonconigliari/botster-evidence/entity-resync-test-
 The exact `client_event_cleanup_unix_sibling_wakes_during_blocked_reclamation` test passed once in isolation, as recorded in `shed-busy-owner.log`.
 That is non-reproduction, not a cause or a fix. An unrelated contention test also passed and does not resolve this failure.
 The next gate is a new copied candidate build and the full workspace run with two test threads, matching the earlier gate.
+
+### Full gate at `b801d673`
+
+The clean candidate build completed with exit 0. Its manifest records Hub `b801d673fd142edcad3a65b2cbc7fb74f988bbfd` and Core `891e220295427fd93991638d7c62ba40fa25d4ae`.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/foundation-full-gate-20260923-b801d673/`.
+The full command passed 1370 library tests and 34 main tests. The earlier subscription test passed in this run; its original failure cause remains unknown.
+The ownership integration target passed nine tests and failed one. The command exited 101 before later targets and workspace members ran.
+Root read the failing matrix comparison. `EntitySubscriptionCapacityReleased` is missing from the dispatcher-owned list.
+Root verified its direct handler in `src/daemon/control.rs` and assigned the one-entry test correction to writer 001b.
+The writer must run the complete ten-test ownership target while preserving exact-once and negative ownership checks. No production change is required for this finding.
+The one-entry correction at patch `39f4352a426d6245a21e4dce59131c638f31ff4e9c2f1f5788ad73f9f212b10f` passed all ten ownership tests.
+Root checked the exact diff and `matrix-focused.log`. The negative and exact-once checks remain unchanged.
+The next full run can reuse the verified `b801d673` candidate copies because only the test matrix and this log changed after that build.
+The report must name both the newer test-source commit and the unchanged candidate revision. It must not relabel the manifest.
 
 Latest capacity result: test-only patch `b025a409f5e87889e550957be7bd2225057e83d36bccfa36667d711a2959badf` passed against pushed checkpoint `ebaf8b3b`.
 The input unit passed one test. The matched daemon test passed one test, with 328 filtered tests.
