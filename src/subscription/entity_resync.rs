@@ -893,6 +893,7 @@ mod tests {
             .unwrap()
             .mark_package_entity_resync_needed("family");
         crate::daemon::owner_loop::publish_completion_wakes(&daemon, &mut state);
+        assert!(state.maintenance.wakes.take(MaintenanceSliceKind::ProviderResync));
         crate::daemon::owner_loop::arm_package_entity_resync_deadline(
             &mut state,
             Some(Instant::now() + Duration::from_secs(1)),
@@ -902,15 +903,35 @@ mod tests {
             .runtime()
             .unwrap()
             .begin_package_entity_provider_snapshot("family", 1);
+        let pending_attempt = daemon
+            .runtime()
+            .unwrap()
+            .package_entity_resync_next_attempt("family");
+        assert!(pending_attempt.is_some());
         crate::daemon::owner_loop::publish_completion_wakes(&daemon, &mut state);
         assert!(state.package_entity_resync_scan.deadline_key.is_none());
         assert!(state.deadlines.is_empty());
-        assert_eq!(
+        assert!(state.package_entity_resync_scan.changed);
+        assert!(state.maintenance.wakes.take(MaintenanceSliceKind::ProviderResync));
+        state.maintenance.wakes.mark(MaintenanceSliceKind::ProviderResync);
+        let limit = Instant::now() + Duration::from_secs(3);
+        loop {
+            crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+            if !state.package_entity_resync_scan.changed
+                && !state.package_entity_resync_scan.running
+            {
+                break;
+            }
+            assert!(Instant::now() < limit, "the owner must finish the fresh resync scan");
+            std::thread::yield_now();
+        }
+        assert!(
             daemon
                 .runtime()
                 .unwrap()
-                .package_entity_resync_next_attempt("family"),
-            None
+                .package_entity_resync_next_attempt("family")
+                .is_some(),
+            "the scan must retain the need until provider delivery"
         );
         daemon.stop();
         std::fs::remove_dir_all(directory).expect("remove the resync test directory");
