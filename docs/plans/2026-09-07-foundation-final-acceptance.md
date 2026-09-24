@@ -1,6 +1,6 @@
 # Foundation integration and final acceptance
 
-Status: checkpoint `71398de6` is pushed. Focused verification resolves six of eight workspace failures. Two remain, and full foundation acceptance remains open.
+Status: checkpoint `8507cf22` is pushed. Focused corrections address seven of eight workspace failures. The remaining failure did not reproduce in isolation. Full workspace acceptance remains open.
 
 ## Current delivery status — September 23
 
@@ -98,6 +98,18 @@ The controls used the current in-process test library with the copied Hub `0db57
 They do not establish current packaged-Hub acceptance. The earlier unexpected-spawn result remains the pre-fix capability regression.
 The two obsolete runtime tests and three unused test helpers were removed. The replacements exercise the charged daemon path.
 The resync deadline fixture and subscription setup failure remain from the eight-failure workspace gate. A full workspace rerun remains required.
+
+### Resync fixture and subscription diagnostic
+
+The first resync revision proved obsolete timer removal, fresh readiness, and owner scan completion, but still expected the model need to clear.
+Source tracing showed that beginning a provider snapshot preserves that need. This fixture does not complete provider delivery.
+The corrected test preserves the timer and wake assertions, drives owner turns, and requires the model need to remain present without fixing a timestamp.
+Reviewer 001e accepted test-only patch `aeb9a7eb8e3954fc218d217318cfcc69aba37e47824469caa0971ce611988b02`.
+Root checked the unchanged hash and `provider-floor-revised.log`: one test passed, with 1369 filtered out. No production scheduling code changed.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/entity-resync-test-20260923/`. The earlier failed expectation remains in `provider-floor.log`.
+The exact `client_event_cleanup_unix_sibling_wakes_during_blocked_reclamation` test passed once in isolation, as recorded in `shed-busy-owner.log`.
+That is non-reproduction, not a cause or a fix. An unrelated contention test also passed and does not resolve this failure.
+The next gate is a new copied candidate build and the full workspace run with two test threads, matching the earlier gate.
 
 Latest capacity result: test-only patch `b025a409f5e87889e550957be7bd2225057e83d36bccfa36667d711a2959badf` passed against pushed checkpoint `ebaf8b3b`.
 The input unit passed one test. The matched daemon test passed one test, with 328 filtered tests.
