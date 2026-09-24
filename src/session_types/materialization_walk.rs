@@ -967,7 +967,7 @@ mod tests {
             format!(r#""policy":"relative","extra":{nested}"#),
         ] {
             let input = format!(
-                r#"{{"session_types":[{{"working_directory":{{{fields},"path":"sub\u002fdir"}}}}]}}"#
+                r#"{{"session_types":[{{"id":"agent","label":"Agent","role":"agent","interaction":"interactive","lifecycle":"persistent","command":"agent","working_directory":{{{fields},"path":"sub\u002fdir"}}}}]}}"#
             );
             let counted = count_fixture(input.as_bytes());
             assert!(counted.result.is_ok());
