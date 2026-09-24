@@ -365,7 +365,8 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
     let home = unique_test_dir("shutdown-hub-maintenance-home");
     let receipt = home.join(".botster/installations/botster-hub.json");
     fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
-    let (source_url, accepted_rx, release_fixture) = spawn_timeout_release_metadata_fixture();
+    let (source_url, accepted_rx, cancel_fixture, fixture_finished, release_fixture) =
+        spawn_timeout_release_metadata_fixture();
     fs::write(
         &receipt,
         serde_json::to_vec(&managed_receipt(&source_url)).expect("serialize receipt"),
@@ -374,15 +375,37 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
     let child = start_cli_daemon_with_home(&data_dir, &home);
     let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
     let update_endpoint = endpoint.clone();
-    let update = thread::spawn(move || {
-        botster_hub_client::request(
+    let (update_tx, update_rx) = mpsc::channel();
+    let update_thread = thread::spawn(move || {
+        let result = botster_hub_client::request(
             &update_endpoint,
             botster_hub_client::DaemonRequest::CheckHubUpdate,
-        )
+        );
+        let _ = update_tx.send(result);
     });
-    accepted_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("provider observes in-flight update check");
+    if let Err(accept_error) = accepted_rx.recv_timeout(Duration::from_secs(2)) {
+        let early_update = update_rx.try_recv().ok();
+        let _ = cancel_fixture.send(());
+        let fixture_exit = fixture_finished.recv_timeout(Duration::from_secs(3));
+        if !matches!(&fixture_exit, Err(mpsc::RecvTimeoutError::Timeout)) {
+            release_fixture
+                .join()
+                .expect("timeout release fixture exits");
+        }
+        let daemon_shutdown = shutdown_cli_daemon(&data_dir, child);
+        let update_outcome =
+            early_update.or_else(|| update_rx.recv_timeout(Duration::from_secs(5)).ok());
+        let update_reported = update_outcome.is_some();
+        if update_reported {
+            update_thread.join().expect("update request thread exits");
+        }
+        fs::remove_dir_all(&data_dir).expect("remove maintenance data dir");
+        fs::remove_dir_all(&home).expect("remove maintenance home");
+        panic!(
+            "provider observes in-flight update check: {accept_error}; update_reported={update_reported}; fixture_exit={fixture_exit:?}; daemon_shutdown={:?}",
+            daemon_shutdown.status
+        );
+    }
 
     let started = Instant::now();
     let shutdown = request_cli_daemon_shutdown(&data_dir).expect("request daemon shutdown");
@@ -393,18 +416,22 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
         started.elapsed()
     );
     assert!(daemon.status.success());
-    let update = update
-        .join()
-        .expect("update request thread exits")
+    let update = update_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("update request thread reports result")
         .expect("in-flight caller receives typed shutdown outcome")
         .hub_update
         .expect("shutdown update payload");
+    update_thread.join().expect("update request thread exits");
     assert_eq!(
         update.state,
         botster_hub_client::DaemonHubUpdateState::Unavailable
     );
     assert_eq!(update.reason.as_deref(), Some("daemon_shutdown"));
     assert_eq!(update.action.as_deref(), Some("retry"));
+    fixture_finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout release fixture completes");
     release_fixture
         .join()
         .expect("timeout release fixture exits");
