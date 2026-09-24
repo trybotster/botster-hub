@@ -2577,7 +2577,7 @@ pub(crate) fn local_webrtc_bounded_stderr_tail(stderr: &[u8], data_dir: &Path) -
 fn test_chunk(index: u32, count: u32, payload: &str, total_bytes: usize) -> String {
     serde_json::json!({
         "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
-        "delivery_kind": "daemon_response",
+        "delivery_kind": "server_frame",
         "message_id": "reassembly-test",
         "chunk_index": index,
         "chunk_count": count,
