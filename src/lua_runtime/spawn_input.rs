@@ -32,12 +32,16 @@ pub(crate) struct SpawnInput {
 }
 
 impl SpawnInput {
-    pub(crate) fn into_parts(self) -> (PluginKey, String, SessionTypeRequest, LuaCallbackCharge) {
+    pub(crate) fn plugin_key(&self) -> &PluginKey {
+        &self.plugin_key
+    }
+
+    pub(crate) fn into_parts(self) -> (LuaCallbackCharge, PluginKey, String, SessionTypeRequest) {
         (
+            self.variable,
             self.plugin_key,
             self.session_type_id,
             self.request,
-            self.variable,
         )
     }
 }
@@ -529,7 +533,7 @@ mod tests {
         let capacity = lua.create_string("capacity").unwrap();
         let input = admit(&lua, &args, &plugin, &memory, &capacity)
             .unwrap_or_else(|_| panic!("the staged input must fit the existing callback cap"));
-        let (_, _, request, retained) = input.into_parts();
+        let (retained, _, _, request) = input.into_parts();
         assert_eq!(request.environment.keys().next().unwrap().len(), 1100000);
         assert_eq!(retained.bytes(), projection);
         assert_eq!(memory.usage().1, projection);
