@@ -1,6 +1,6 @@
 # Foundation integration and final acceptance
 
-Status: checkpoint `0db57795` is pushed. Focused verification resolves three of eight workspace failures. Five remain, and full foundation acceptance remains open.
+Status: checkpoint `57bb3339` is pushed. Focused verification resolves four of eight workspace failures. Four remain, and full foundation acceptance remains open.
 
 ## Current delivery status — September 23
 
@@ -55,11 +55,22 @@ The writer corrected one assertion description after that hash. Final patch `893
 The integration loop proves row residency across owner turns without a new wake. The helper unit separately checks one-shot delivery.
 Root reproduced the final hash. The writer reports no other change from `047210cb`; no tests have started yet.
 Focused verification then passed at patch `8935234`. Root read the raw logs and checked the unchanged source hash.
-The three migrated session-control tests each passed. The retained-owner case completed in 0.50 seconds instead of reaching the handler timeout.
-The admitted-failure group passed three tests. The owner-conversion group passed four tests. These results cover ten distinct tests with the three migrated fixtures.
+Two migrated session-control tests and one replacement test passed. The retained-owner replacement completed in 0.50 seconds instead of reaching the handler timeout.
+The admitted-failure group passed three tests. The owner-conversion group passed four tests. These results cover ten distinct tests with the three session-control fixtures.
 The two new tests also passed individually; those repeated executions do not add distinct coverage.
 The compile completed with 55 warnings. This checkpoint does not establish warning-free lint or full workspace success.
 Five failures from the workspace gate remain. The next work covers the runtime fixtures, parser fixture, resync deadline fixture, and subscription setup failure.
+Root committed and pushed `57bb3339`. Writer 001b may now correct the parser fixture and migrate the two runtime fixtures.
+Reviewer 001e withdrew a proposed rerun after checking the three printed test names. All three admitted-failure tests already ran.
+Review rule: check printed test names before using filtered counts to infer missing coverage.
+
+### Parser fixture correction
+
+The unknown working-directory content fixture omitted six required session-type fields.
+Writer 001b added those fields without changing either unknown-field order or any accounting assertion. Production parsing remains unchanged.
+Root checked the one-line diff at hash `a038ca4cab2418a8f51b6edb204518c01286c28b7979fc89686c966114f6d3c8` against `57bb3339`.
+The focused test passed once, with 1369 tests filtered out. Root read `/Users/jasonconigliari/botster-evidence/parser-fixture-20260923/focused.log`.
+The two runtime fixtures, resync deadline fixture, and subscription setup failure remain open. Full workspace verification must run again after these corrections.
 
 Latest capacity result: test-only patch `b025a409f5e87889e550957be7bd2225057e83d36bccfa36667d711a2959badf` passed against pushed checkpoint `ebaf8b3b`.
 The input unit passed one test. The matched daemon test passed one test, with 328 filtered tests.
