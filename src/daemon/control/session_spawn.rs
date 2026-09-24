@@ -506,8 +506,7 @@ impl SessionTypeSpawnOperation {
                                 self.phase = Phase::Conversion;
                                 if let Err(refusal) = response.try_send(delivery) {
                                     drop(refusal);
-                                    self.phase = Phase::Cleanup;
-                                    return ControlPoll::Again;
+                                    return ControlPoll::Pending;
                                 }
                                 return ControlPoll::Pending;
                             }
@@ -722,5 +721,302 @@ mod admitted_failure_tests {
             drop(receiver);
             assert_eq!(memory.usage().1, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_conversion_lifecycle_tests {
+    use super::*;
+    use std::ops::{Deref, DerefMut};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use botster_core::{SessionId, SessionReservationRelease};
+    use botster_core_daemon::CoreCompletion;
+
+    use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
+    use crate::data_plane::driver::{CoreTicketPoll, retained_reply_bytes};
+    use crate::lua_memory::{LuaMemoryAccount, layout};
+    use crate::owner_identity::{OwnerWorkIdentity, WaiterId};
+    use crate::runtime::{SpawnConversionOutcome, spawn_reply_channel};
+
+    #[derive(Clone, Copy)]
+    enum Case {
+        ExplicitAbandonment,
+        RegistrationRefusal,
+        DroppedReceiver,
+    }
+
+    struct TestDaemon {
+        daemon: HubDaemon,
+        root: PathBuf,
+        session_id: SessionId,
+    }
+
+    impl Deref for TestDaemon {
+        type Target = HubDaemon;
+
+        fn deref(&self) -> &Self::Target {
+            &self.daemon
+        }
+    }
+
+    impl DerefMut for TestDaemon {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.daemon
+        }
+    }
+
+    impl Drop for TestDaemon {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.daemon.runtime() {
+                let _ = runtime.shutdown_session_for_test(self.session_id.clone());
+            }
+            self.daemon.stop();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn collect(
+        runtime: &crate::HubRuntime,
+        receiver: &mut tokio::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage>,
+        waiter_id: WaiterId,
+        phases: &[u64],
+    ) {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut found = executor
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut found = Vec::new();
+                    while found.len() < phases.len() {
+                        let identities = runtime.take_owner_core_completions(64);
+                        for identity in identities {
+                            if identity.waiter_id == waiter_id {
+                                found.push(identity);
+                            }
+                        }
+                        if found.len() < phases.len() {
+                            receiver.recv().await.expect("Core must wake its owner");
+                        }
+                    }
+                    found
+                })
+                .await
+                .expect("Core must complete the expected phase")
+            });
+        found.sort();
+        assert_eq!(
+            found,
+            phases
+                .iter()
+                .map(|phase| OwnerWorkIdentity {
+                    waiter_id,
+                    phase: *phase,
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    fn finish_cleanup(
+        operation: &mut SessionTypeSpawnOperation,
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        wake: &mut tokio::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage>,
+        waiter_id: WaiterId,
+    ) {
+        let mut phase = 6;
+        for _ in 0..12 {
+            match operation.poll(daemon, state) {
+                ControlPoll::Again => {}
+                ControlPoll::Pending => {
+                    collect(
+                        daemon.runtime().expect("runtime remains live"),
+                        wake,
+                        waiter_id,
+                        &[phase, phase + 1],
+                    );
+                    phase += 2;
+                }
+                ControlPoll::FinishedInternal => return,
+                _ => panic!("owner cleanup must not report success"),
+            }
+        }
+        panic!("owner cleanup did not confirm exact Core release");
+    }
+
+    fn run(case: Case) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("ordinary-owner-conversion-{}-{number}", std::process::id());
+        let root = std::env::temp_dir().join(&name);
+        let session_id = SessionId(name);
+        let config = HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(root.clone()),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        let mut daemon = TestDaemon {
+            daemon: HubDaemon::start(config).expect("start isolated owner runtime"),
+            root,
+            session_id: session_id.clone(),
+        };
+        let runtime = daemon.runtime().unwrap();
+        let memory: Arc<LuaMemoryAccount> = runtime.test_lua_memory();
+        let waiter_id = runtime.next_waiter_id().unwrap();
+        let context_id = format!("ctx-{}", session_id.0);
+        let (wake_sender, mut wake) = tokio::sync::mpsc::channel(64);
+        runtime.bind_data_plane_owner_wake(wake_sender);
+        let mut parent = memory.reserve_callback_total(0).unwrap();
+        let reply_bytes = layout::single_reply_bytes::<AdmittedSpawnDelivery>(true).unwrap();
+        parent.grow(reply_bytes).unwrap();
+        let reply_charge = parent.split_fixed(reply_bytes).unwrap();
+        let (sender, receiver) = spawn_reply_channel(reply_charge).unwrap();
+        let retirement = runtime.coordination_retirement(waiter_id);
+        let start = runtime.test_begin_ordinary_owner_spawn(waiter_id, session_id.clone(), parent);
+        let mut operation = SessionTypeSpawnOperation {
+            waiter_id,
+            request_id: String::new(),
+            product: None,
+            start: Some(start),
+            delivery: None,
+            conversion: None,
+            host_receipt: None,
+            plugin_response: Some(sender),
+            admitted_failure: None,
+            failure: None,
+            phase: Phase::Core,
+            retirement,
+        };
+        let mut state = DaemonControlState::default();
+        collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[1, 2]);
+        assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Pending));
+        collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[3, 4]);
+        assert_eq!(
+            daemon.runtime().unwrap().session_context(&context_id).unwrap().session_id,
+            session_id,
+        );
+        let original = operation
+            .start
+            .as_ref()
+            .unwrap()
+            .test_reservation_identity()
+            .expect("the Core reservation exists");
+
+        match case {
+            Case::ExplicitAbandonment => {
+                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Pending));
+                let delivery = receiver.recv_timeout(Duration::ZERO).unwrap();
+                let AdmittedSpawnDelivery::Spawned {
+                    result,
+                    conversion,
+                    _variable,
+                } = delivery else {
+                    panic!("Core success must reach Lua conversion")
+                };
+                assert_eq!(result.reservation_identity, Some(original));
+                conversion.abandon();
+                drop(result);
+                drop(_variable);
+                drop(receiver);
+                collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[5]);
+                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Again));
+            }
+            Case::RegistrationRefusal => {
+                let bytes = retained_reply_bytes::<SpawnConversionOutcome>().unwrap();
+                let charge = memory.reserve_callback_total(bytes).unwrap();
+                let (blocker, receipt) = daemon
+                    .runtime()
+                    .unwrap()
+                    .session_spawn_conversion_reply(&operation.retirement, charge)
+                    .unwrap();
+                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Again));
+                assert!(matches!(receiver.recv_timeout(Duration::ZERO), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+                receipt.abandon();
+                collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[5]);
+                drop(blocker);
+                finish_cleanup(&mut operation, &mut daemon, &mut state, &mut wake, waiter_id);
+                let AdmittedSpawnDelivery::Unavailable(reason) =
+                    receiver.recv_timeout(Duration::ZERO).unwrap()
+                else {
+                    panic!("confirmed cleanup must deliver an unavailable reason")
+                };
+                assert_eq!(reason, "conversion receipt registration refused");
+                drop(receiver);
+            }
+            Case::DroppedReceiver => {
+                drop(receiver);
+                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Pending));
+                assert!(
+                    matches!(operation.phase, Phase::Conversion),
+                    "a lost delivery must wait for its conversion receipt before Core cleanup",
+                );
+                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Pending));
+                collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[5]);
+                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Again));
+            }
+        }
+        if !matches!(case, Case::RegistrationRefusal) {
+            finish_cleanup(&mut operation, &mut daemon, &mut state, &mut wake, waiter_id);
+        }
+        assert!(matches!(operation.phase, Phase::Done));
+        assert_eq!(daemon.runtime().unwrap().session_context(&context_id), None);
+        assert_eq!(daemon.runtime().unwrap().session_context(&session_id.0), None);
+        assert_eq!(
+            operation.start.as_ref().unwrap().test_reservation_identity(),
+            Some(original),
+            "cleanup must retain the exact released generation until retirement",
+        );
+        let next_waiter = daemon.runtime().unwrap().next_waiter_id().unwrap();
+        let next_retirement = daemon.runtime().unwrap().coordination_retirement(next_waiter);
+        let mut next_reserve = daemon
+            .runtime()
+            .unwrap()
+            .begin_reserve_session_for_owner(next_waiter, session_id);
+        collect(daemon.runtime().unwrap(), &mut wake, next_waiter, &[1, 2]);
+        let CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+            result: Ok(next_reservation),
+            ..
+        })) = next_reserve.poll(daemon.runtime().unwrap()) else {
+            panic!("the next waiter must reserve the released session id");
+        };
+        assert_ne!(next_reservation.identity(), original);
+        let mut next_release = daemon
+            .runtime()
+            .unwrap()
+            .begin_release_session_reservation_for_owner(next_waiter, next_reservation);
+        collect(daemon.runtime().unwrap(), &mut wake, next_waiter, &[3, 4]);
+        assert!(matches!(
+            next_release.poll(daemon.runtime().unwrap()),
+            CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                result: Ok(SessionReservationRelease::Released),
+                ..
+            }))
+        ));
+        drop(next_retirement);
+        drop(operation);
+        drop(next_reserve);
+        drop(next_release);
+        drop(daemon);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn explicit_conversion_abandonment_confirms_owner_cleanup() {
+        run(Case::ExplicitAbandonment);
+    }
+
+    #[test]
+    fn registration_refusal_confirms_cleanup_before_unavailable_delivery() {
+        run(Case::RegistrationRefusal);
+    }
+
+    #[test]
+    fn dropped_delivery_receiver_confirms_owner_cleanup() {
+        run(Case::DroppedReceiver);
     }
 }
