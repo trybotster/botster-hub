@@ -1,6 +1,6 @@
 # Foundation integration and final acceptance
 
-Status: checkpoint `b801d673` is pushed. The full run passes all library and main tests, then stops at an incomplete ownership matrix. Full workspace acceptance remains open.
+Status: checkpoint `945dbb60` is pushed. The full rerun passes the ownership matrix, then stops at a client test that requires the daemon owner. Full workspace acceptance remains open.
 
 ## Current delivery status — September 23
 
@@ -124,6 +124,31 @@ The one-entry correction at patch `39f4352a426d6245a21e4dce59131c638f31ff4e9c2f1
 Root checked the exact diff and `matrix-focused.log`. The negative and exact-once checks remain unchanged.
 The next full run can reuse the verified `b801d673` candidate copies because only the test matrix and this log changed after that build.
 The report must name both the newer test-source commit and the unchanged candidate revision. It must not relabel the manifest.
+
+The rerun used test source `945dbb605a96f2df42b50660a593d164ba6be0ff` and the unchanged candidate at `b801d673`.
+It passed 1370 library tests, 34 main tests, ten ownership tests, four external-construction tests, and fourteen capability tests.
+The client API target passed 34 tests and failed `session_types_resolve_spawn_context_and_reject_unadmitted_reads`.
+At line 1254, the test expected an ownerless session-type spawn to succeed. Production returned the required daemon-owner error.
+Root read the raw failure and the test call. Writer 001b must propose a test correction that preserves context and admission assertions.
+Reviewer 001e must check the real owner path and existing runtime-only rejection coverage. No production admission change is authorized for this finding.
+The run exited 101. Later targets and workspace members remain unverified.
+The log is `test-after-matrix.log` in the same evidence directory.
+Its SHA-256 is `d06677dc8ba6cb697284476a3e97d88b0a471a6edfa9fb8ab7babc5771911cb9`.
+The writer reported a clean worktree and unchanged candidate hashes. No deployment occurred.
+
+Root and reviewer 001e accepted test-only patch `7d39badb223d56cc3d633f52f716a24ac970124cc2f795be3f0e800647f3c31f` for focused verification.
+The client test now checks the ownerless rejection, including the operation, request ID, and message. Its resolve assertions remain unchanged.
+The existing daemon test gains a context read after spawning. Its script-output check remains unchanged.
+The unadmitted client read now targets an absent session. It establishes admission denial, not denial against an existing session.
+The first focused command omitted the candidate environment paths and failed before the new assertion. This setup failure does not evaluate the patch.
+Root directed writer 001b to preserve that log and rerun with all three verified candidate paths. The writer holds the compiler slot.
+Later test commands must reuse the complete candidate environment instead of reconstructing a partial command.
+Both corrected commands passed with one test executed each. The client test filtered 34 tests; the daemon test filtered 328 tests.
+Root read both raw results and verified both log hashes. The source patch remained unchanged, and `git diff --check` passed.
+The logs are `client-context-focused-candidate.log` and `daemon-context-focused-candidate.log` in the same evidence directory.
+Their SHA-256 values are `35d90348316b633b7bb4ee2f071794ab09cd05091416c5ca5ff8705be86af4b1` and `2d9f55ce34d2c3006cdec9bbd8d94c6ee3b19955755ee925391e8497cf1455c5` respectively.
+These focused passes close the test migration checkpoint. They do not establish full workspace acceptance.
+The next action is to commit the two test files and this log, then rerun the full gate with the unchanged verified candidate.
 
 Latest capacity result: test-only patch `b025a409f5e87889e550957be7bd2225057e83d36bccfa36667d711a2959badf` passed against pushed checkpoint `ebaf8b3b`.
 The input unit passed one test. The matched daemon test passed one test, with 328 filtered tests.
