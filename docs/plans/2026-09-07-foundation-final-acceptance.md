@@ -9,9 +9,11 @@ The recent recovery fixes passed their focused checks. They do not establish int
 The two existing agents now inspect integration between spawn `b7864ff9` and recovery `9168c1de` without source changes.
 Root retains integration ownership. No merge or deployment is in progress.
 
-Ordinary charged spawn still returns `Unavailable` in async `session_types.rs`, pending its startup-path input policy.
-Root asked Jason to approve startup-captured working-directory and executable paths, with the existing lookup-failure behavior.
-That question does not block independent merge analysis. Capturing paths alone does not prove memory admission.
+Ordinary charged spawn still returns `Unavailable` in async `session_types.rs`; implementation of its startup-path input remains open.
+Jason approved startup-captured working-directory and executable paths on September 23.
+Relative spawn paths use the captured working directory even if the process directory later changes.
+Directory lookup failure retains the `.` fallback. Executable lookup failure omits `BOTSTER_HUB_BIN`.
+This decision resolves path semantics. Capturing paths alone does not prove memory admission.
 Integration must preserve durable write authority, journal retention, spawn receipts, cleanup identities, and subscription retry behavior.
 The first daemon acceptance test must exercise the actual charged Lua path, not only a similarly named synchronous path.
 
