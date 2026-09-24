@@ -2367,9 +2367,25 @@ The writer confirmed the exact remote head and a clean worktree. The commit cont
 The isolated shutdown test failed against the verified `db3dc263` candidate at the provider-accept timeout in `shutdown.rs:385`.
 The run executed one test and lasted 9.32 seconds. It failed before requesting shutdown.
 This failure does not require the full suite. Its cause remains unresolved; no timeout change is authorized.
-Agent 001b owns the receipt and request trace. The next check must establish why the provider receives no connection.
+The diagnostic run established `receipt_build_revision_mismatch` and an early typed `invalid_installation_receipt` result.
+The fixture hardcoded `release1`; the verified candidate carried a different embedded revision. Production correctly refused the receipt before fetching.
+The test-only correction reads the verified binary's stateless `version` output with the existing two-second command bound.
+It updates the stale fixture comment and preserves production validation, remote release fixtures, and existing timeout assertions.
+Temporary verbose diagnostics were removed. Test-owned fixture cancellation and bounded result waits remain.
 
-The remaining failure work covers shutdown during update checks and CLI WebRTC failure-format coverage.
+All four shared-helper tests passed, each with one test executed and 328 filtered tests.
+The shutdown test passed in 11.04 seconds and reached the provider-accept and shutdown assertions.
+The managed-authority, provider-states, and stalled-busy tests passed in 5.86, 5.77, and 5.67 seconds respectively.
+Root and reviewer 001e verified all fifteen entries in `correction-SHA256SUMS`.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/g7-shutdown-diagnostic-20260923`.
+The accepted patch SHA-256 is `03272d10389fecb360e54dcaeb2f15a60a252f5fe883f194150f80a6b205d8b6`.
+Agent 001b committed and pushed `3eaf621a1dc224135e3f3bb5ab8a0503ba991d1d` with only `cli.rs` and `shutdown.rs` test changes.
+The writer confirmed the exact remote head and a clean worktree.
+The focused shutdown checkpoint is closed. Full-suite and strict-gate acceptance remain open.
+`cargo fmt --all --check` failed outside these two files. Baseline attribution remains unverified.
+Reviewer 001e now inspects the formatting differences. Agent 001b investigates existing CLI WebRTC failure paths without edits.
+
+The remaining G7 coverage gap is CLI WebRTC failure-format coverage.
 The selected WebRTC test design must prove an incomplete response and read the record through the real owner consumer.
 CLI failure-format coverage remains open. The test design does not close that requirement.
 
