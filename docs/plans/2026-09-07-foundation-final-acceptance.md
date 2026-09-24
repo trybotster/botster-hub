@@ -1,6 +1,6 @@
 # Foundation integration and final acceptance
 
-Status: checkpoint `63d64248` is pushed. Real daemon success, Host/Core refusal, and render-capacity checks pass. Full foundation acceptance remains open.
+Status: checkpoint `97bed3ca` is pushed. Focused owner cleanup checks also pass. Full foundation acceptance remains open.
 
 ## Current delivery status — September 23
 
@@ -49,6 +49,39 @@ These results close the tested owner cleanup cases. They do not establish full d
 Reviewer 001e accepted the four results and source hash for commit. The original green process check retained its summary but not its raw listing.
 Root requested a new timestamped check with its raw listing. This later check must not be presented as the original check.
 The next bounded source task is relative-device-root startup stability. Recovery and the wider acceptance gates remain open.
+Root verified and pushed `97bed3ca1f49895a78f4abd656f3b2c2b8cf54a4`. Its source diff matches the accepted green hash.
+
+### Relative device roots: corrected premise
+
+The initial proposal cited a later process working-directory change. No production caller that changes that directory has been identified.
+Root paused implementation when the reviewer challenged this premise.
+Root then found a concrete lexical mismatch in `charged_deterministic_prefix`: an absolute requested directory cannot start with a relative source root.
+Reviewer 001e confirmed this false-refusal mechanism. The writer must verify the request entry path and preserve a failing regression before correction.
+The bounded correction anchors relative device roots to the captured startup directory in charged materialization.
+It preserves stored roots and absolute roots. Funding must cover both the temporary anchored path and its source copy while both exist.
+Tests must exercise the actual charged materializer, the admitted working directory, absolute-root behavior, unchanged durable data, and charge retirement.
+This task does not establish restart repair or relative executable launch behavior. Those claims require separate evidence.
+Writer 001b owns `session_types.rs`. Reviewer 001e checks funding and the regression. Root owns this plan.
+The request entry check confirmed that Lua `spawn_input.rs` preserves the requested cwd in `SessionTypeRequest`.
+Test-only patch `d6cafbcabc53ef36dd8a27f8b69212c8f589e0acbfa6bc726ef59e23066ea4e5` ran both materialization cases before correction.
+The absolute-root control passed one test, with 1364 filtered tests. The relative-root test failed one test with the same filtered count.
+Root checked the exact panic: `absolute cwd beneath device root was refused: cwd_not_admitted`.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/relative-device-root-20260923/`. The writer now prepares the bounded correction for funding review.
+Review replaced a sealed temporary charge with open-parent funding. The code drops the temporary path before subtracting only its bytes from current usage.
+This preserves source-copy charges on success and refusal. The new accounting fixture uses distinct IDs and checks validation capacity before testing clone refusal.
+An E0277 test compile failure ran no tests. The writer corrected only the assertion and retained that log separately.
+At patch `48be55e5fe61088d002ce7ee5062dc0b8321a285e59588d7f3f5eefdbbabe069`, four relative-root tests and four existing/control tests passed.
+The existing prefix comparison test failed during context environment construction, before its cwd refusal assertion.
+The writer reproduced that same failure from archived commit `97bed3ca1f49895a78f4abd656f3b2c2b8cf54a4` in `/tmp/botster-relative-root-baseline.wNEV9R`.
+Root checked the baseline log: one test failed at `session_types.rs:4819` with `the charged context environment must fit`.
+The fixture reuses one callback parent across 18 independent cases. The authorized fixture correction creates a fresh parent for each case and final refusal.
+The correction must preserve the 64 KiB limit and every behavioral assertion. Production code remains unchanged by this fixture correction.
+Final source patch `4b740209644dc6f9979773923cee50b2a8b0e54b2fb54983545a4af51fff7da8` contains that fixture correction.
+The corrected prefix test passed one test, with 1367 filtered tests. Root checked `green-prefix-cwd-fresh-parent.log` and the final source hash.
+The earlier eight passing tests remain evidence for unchanged production code; the later fixture-only change does not alter their paths.
+The anchor refusal test checks temporary headroom recovery, not an independent specification of the source-copy byte formula.
+Root did not assign a new task for accidental cross-case ceiling consumption in the old fixture. Independent cases now use independent callback parents.
+Within-callback anchor release remains covered by the new accounting regressions. Child launch and restart behavior remain outside this checkpoint's evidence.
 
 Latest refusal result: test-only patch `7f4eee6adf29b5079a743bcedae0d366da0ee1ea91b610df86950141b909779b` passed against checkpoint `5c01a95d`.
 The real daemon test passed one test, with 328 filtered tests. Root checked the raw log, manifest, and test patch hash.
