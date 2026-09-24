@@ -4254,6 +4254,8 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
 
 #[test]
 fn live_daemon_lua_tool_spawns_two_ordinary_sessions() {
+    use std::os::unix::fs::FileTypeExt;
+
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("ordinary-two-data");
     let package_dir = unique_short_test_dir("ordinary-two-package");
@@ -4281,6 +4283,26 @@ return botster.register({
       })
       return { first = first, second = second }
     end,
+  }, {
+    name = "ordinary.host_refusal",
+    description = "Report a missing ordinary session type.",
+    handler = "host_refusal",
+    call = function(args)
+      return botster.capabilities.session_types.spawn({
+        session_type_id = "ordinary.two/missing",
+        session_id = "ordinary-missing",
+      })
+    end,
+  }, {
+    name = "ordinary.core_refusal",
+    description = "Report an occupied ordinary session ID.",
+    handler = "core_refusal",
+    call = function(args)
+      return botster.capabilities.session_types.spawn({
+        session_type_id = "ordinary.two/init",
+        session_id = "ordinary-first",
+      })
+    end,
   }},
 })
 "#,
@@ -4289,7 +4311,7 @@ return botster.register({
     let script = package_dir.join("bin/init.sh");
     fs::write(
         &script,
-        "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\" \"$PWD\" \"$1\" > \"spawn-$BOTSTER_SESSION_ID.txt\"\n\"$BOTSTER_HUB_BIN\" context --key prompt > \"context-$BOTSTER_SESSION_ID.json\"\nsleep 1\n",
+        "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$BOTSTER_SESSION_ID\" \"$BOTSTER_MODE\" \"$PWD\" \"$1\" > \"spawn-$BOTSTER_SESSION_ID.txt\"\n\"$BOTSTER_HUB_BIN\" context --key prompt > \"context-$BOTSTER_SESSION_ID.json\"\nmkfifo \"hold-$BOTSTER_SESSION_ID.fifo\"\nread _ < \"hold-$BOTSTER_SESSION_ID.fifo\"\n",
     )
     .expect("write ordinary session command");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
@@ -4358,6 +4380,7 @@ return botster.register({
         assert_eq!(response.plugin_tool_result[key]["context_id"], format!("ctx-{id}"));
         let output = package_dir.join(format!("spawn-{id}.txt"));
         let context = package_dir.join(format!("context-{id}.json"));
+        let hold = package_dir.join(format!("hold-{id}.fifo"));
         let expected_output = format!(
             "{id}|{mode}|{}|command-argument\n",
             source_root.display(),
@@ -4366,7 +4389,8 @@ return botster.register({
         while std::time::Instant::now() < deadline
             && (fs::read_to_string(&output).ok().as_deref() != Some(expected_output.as_str())
                 || !fs::read_to_string(&context)
-                    .is_ok_and(|contents| contents.contains(prompt)))
+                    .is_ok_and(|contents| contents.contains(prompt))
+                || !fs::symlink_metadata(&hold).is_ok_and(|entry| entry.file_type().is_fifo()))
         {
             thread::sleep(Duration::from_millis(25));
         }
@@ -4378,7 +4402,37 @@ return botster.register({
             fs::read_to_string(&context).expect("ordinary session context").contains(prompt),
             "{id} must read its own context",
         );
+        assert!(
+            fs::symlink_metadata(&hold).is_ok_and(|entry| entry.file_type().is_fifo()),
+            "{id} must remain held for the refusal checks",
+        );
     }
+    for (tool, expected) in [
+        (
+            "ordinary.host_refusal",
+            "runtime error: session_types.spawn failed: session type was not found",
+        ),
+        (
+            "ordinary.core_refusal",
+            "runtime error: session_types.spawn failed: session type spawn failed: session reservation refused: Occupied",
+        ),
+    ] {
+        let refused = botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::PluginMcpCallTool {
+                name: tool.to_string(),
+                arguments: serde_json::json!({}),
+            },
+        )
+        .expect("call ordinary refusal tool through daemon");
+        assert_eq!(refused.kind, botster_hub::DaemonResponseKind::OperatorError);
+        assert_eq!(
+            refused.error.as_ref().expect("Lua refusal has an operator error").message,
+            expected,
+            "{tool} must report the exact producer reason",
+        );
+    }
+    daemon.shutdown();
 }
 
 #[test]
