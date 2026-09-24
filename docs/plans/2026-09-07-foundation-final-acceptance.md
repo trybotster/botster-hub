@@ -1,8 +1,65 @@
 # Foundation integration and final acceptance
 
-Status: checkpoint `97bed3ca` is pushed. Focused owner cleanup checks also pass. Full foundation acceptance remains open.
+Status: checkpoint `0db57795` is pushed. Focused verification resolves three of eight workspace failures. Five remain, and full foundation acceptance remains open.
 
 ## Current delivery status — September 23
+
+### Full workspace gate at `0db57795`
+
+Root verified and pushed `0db57795480d65aa60a502c29e6a2d0df286794b`. The candidate build completed with exit 0 from a clean worktree.
+The copied candidate manifest records that Hub revision and Core `891e220295427fd93991638d7c62ba40fa25d4ae`.
+Root and reviewer 001e independently verified the copied binary hashes. The wrapper also verified the manifest.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/foundation-workspace-20260923/`.
+The gate used Rust 1.97.0, locked offline dependencies, two build jobs, incremental compilation disabled, and two test threads.
+The 31 Lua build-contract checks passed. The Hub library then ran 1368 tests: 1360 passed and eight failed in 96.36 seconds.
+The command exited 101 before testing the other workspace members. Full workspace acceptance remains open.
+
+The eight failures form the current verification queue:
+
+- Three session-control tests received `session-type spawn requires the daemon owner` instead of reaching their intended checks.
+- `client_event_cleanup_unix_sibling_wakes_during_blocked_reclamation` received `shed_busy` while subscribing.
+- `inflight_spawn_cancels_reserved_slot_on_fulfill_err` did not receive the expected error text.
+- `inflight_spawn_refuses_before_taking_retained_tokens` received queue-capacity refusal instead of callback-memory refusal.
+- `working_directory_unknown_content_uses_the_tagged_tree_charge` failed its parse-success assertion.
+- `provider_floor_progress_removes_an_obsolete_retry_deadline` retained a deadline where the test expected none.
+
+Root inspected the raw failure block. Baseline attribution for these failures remains unverified.
+Writer 001b owns the three session-control fixture corrections in `src/daemon/control/sessions.rs` and the sole compiler slot.
+The writer must route requests through the daemon owner while preserving duplicate-ID, context, and retained-token checks.
+Reviewer 001e investigates the other five failures read-only. Root owns classification and integration.
+No production ownership requirement or capacity limit may change to satisfy these tests.
+
+### Owner fixture migration and unresolved cleanup
+
+Writer 001b migrated the three session-control fixtures through a charged Lua tool and daemon owner turns.
+The Occupied and unrelated-worktree checks passed individually. The retained-cleanup check reached the 30-second plugin timeout instead of `cleanup_unconfirmed`.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/sessions-owner-test-migration-20260923/`.
+The later wake-receiver correction has not run. Earlier passing results do not verify that correction.
+Root inspected both cleanup implementations. `CleanupStage::Unresolved` has no transition, and the owner delivers failures only after `Confirmed`.
+The old shared-token retry assertion conflicts with the approved daemon ownership contract. The exact owner row now retains the reservation.
+Root assigned a bounded design: deliver the existing charged plugin refusal once while retaining the unresolved stage, identity, charge, and owner permit.
+The design must preserve confirmed cleanup before ordinary refusal delivery. It must not change CLI disposition or add automatic cleanup retry.
+Writer 001b prepares the design. Reviewer 001e checks response loss, memory refusal, repeated polls, and terminal drain before production edits.
+The replacement test must prove that the exact obligation survives response delivery and a second unrelated spawn.
+Recovery completion remains open. A plugin error response will not establish cleanup or recovery completion.
+Root narrowed implementation to `Phase::Core` failures with the typed `RetainedUnconfirmed` disposition and a plugin sender.
+Only that case may deliver its existing charged refusal or capacity fallback before confirmed cleanup. The row then enters Cleanup without retirement.
+Other failure gates and terminal polling remain unchanged. Root rejected unconditional delivery from every Unresolved cleanup path.
+Writer 001b may implement this correction and add a test-only accessor for the exact reservation identity.
+Reviewer 001e will review the patch before focused tests. No new product decision is required for this bounded correction.
+Reviewer 001e accepted the source scope. Root verified revised patch `047210cb9852afb7b25061e35df0f4e0c7258e1f7808b7865d84c55d9c835d0b` after a test API correction.
+Root authorized focused tests for the three migrated fixtures, the negative delivery check, the dropped-receiver helper, and the existing owner conversion cases.
+The negative check requires no response from the Core phase for an Occupied failure. Aggregate memory checks do not measure an individual row's charge.
+Writer 001b holds the sole compiler slot. Test results remain pending.
+The writer corrected one assertion description after that hash. Final patch `8935234ddc2d60d6813673e24c5802aed0e3e508e7158bb1cd9cff175c3fc020` is compiling.
+The integration loop proves row residency across owner turns without a new wake. The helper unit separately checks one-shot delivery.
+Root reproduced the final hash. The writer reports no other change from `047210cb`; no tests have started yet.
+Focused verification then passed at patch `8935234`. Root read the raw logs and checked the unchanged source hash.
+The three migrated session-control tests each passed. The retained-owner case completed in 0.50 seconds instead of reaching the handler timeout.
+The admitted-failure group passed three tests. The owner-conversion group passed four tests. These results cover ten distinct tests with the three migrated fixtures.
+The two new tests also passed individually; those repeated executions do not add distinct coverage.
+The compile completed with 55 warnings. This checkpoint does not establish warning-free lint or full workspace success.
+Five failures from the workspace gate remain. The next work covers the runtime fixtures, parser fixture, resync deadline fixture, and subscription setup failure.
 
 Latest capacity result: test-only patch `b025a409f5e87889e550957be7bd2225057e83d36bccfa36667d711a2959badf` passed against pushed checkpoint `ebaf8b3b`.
 The input unit passed one test. The matched daemon test passed one test, with 328 filtered tests.

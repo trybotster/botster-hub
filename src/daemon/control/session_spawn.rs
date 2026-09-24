@@ -1,5 +1,6 @@
 //! A retained owner row for one ordinary session-type spawn.
 
+use botster_core::SessionReservationRelease;
 use botster_hub_client::DaemonResponse;
 
 use std::time::Instant;
@@ -202,8 +203,9 @@ impl AdmittedFailure {
     }
 }
 
-/// A confirmed Core cleanup can answer the worker without a daemon reply channel.
-fn deliver_confirmed_admitted_failure(
+/// The caller has confirmed cleanup or has a typed RetainedUnconfirmed failure
+/// while the owner row keeps its exact Core stage.
+fn deliver_admitted_failure(
     response: &mut Option<SpawnReplySender<AdmittedSpawnDelivery>>,
     failure: &mut Option<AdmittedFailure>,
 ) -> bool {
@@ -272,6 +274,15 @@ impl std::ops::DerefMut for ChargedSessionTypeOperation {
 
 #[allow(dead_code)] // Production admission waits for the charged parser proof.
 impl SessionTypeSpawnOperation {
+    #[cfg(test)]
+    pub(crate) fn test_reservation_identity(
+        &self,
+    ) -> Option<botster_core::SessionReservationIdentity> {
+        self.start
+            .as_ref()
+            .and_then(SessionTypeSpawnStart::test_reservation_identity)
+    }
+
     pub(crate) fn waits_for_host(&self) -> bool {
         self.phase == Phase::Host
     }
@@ -447,6 +458,8 @@ impl SessionTypeSpawnOperation {
                     match start.poll(runtime) {
                         PluginSpawnPoll::Pending => return ControlPoll::Pending,
                         PluginSpawnPoll::Ready(Err(failure)) => {
+                            let retained_unconfirmed = failure.disposition
+                                == Some(SessionReservationRelease::RetainedUnconfirmed);
                             if self.plugin_response.is_some() {
                                 self.admitted_failure = Some(
                                     start
@@ -466,6 +479,12 @@ impl SessionTypeSpawnOperation {
                                     &self.request_id,
                                     &failure.error,
                                 ));
+                            }
+                            if retained_unconfirmed && self.plugin_response.is_some() {
+                                deliver_admitted_failure(
+                                    &mut self.plugin_response,
+                                    &mut self.admitted_failure,
+                                );
                             }
                             self.phase = Phase::Cleanup;
                             return ControlPoll::Again;
@@ -579,7 +598,7 @@ impl SessionTypeSpawnOperation {
                         }
                         SessionSpawnCleanupPoll::Confirmed => {
                             self.phase = Phase::Done;
-                            if deliver_confirmed_admitted_failure(
+                            if deliver_admitted_failure(
                                 &mut self.plugin_response,
                                 &mut self.admitted_failure,
                             ) {
@@ -685,7 +704,7 @@ mod admitted_failure_tests {
         drop(parent);
         let mut response = Some(sender);
         let mut failure = Some(AdmittedFailure::Refused(message, charge, lua_render));
-        assert!(deliver_confirmed_admitted_failure(&mut response, &mut failure));
+        assert!(deliver_admitted_failure(&mut response, &mut failure));
         assert!(response.is_none());
         assert!(failure.is_none());
         let delivery = receiver.recv_timeout(Duration::ZERO).unwrap();
@@ -715,12 +734,39 @@ mod admitted_failure_tests {
             .unwrap();
             let mut response = Some(sender);
             let mut failure = Some(AdmittedFailure::Unavailable(reason));
-            assert!(deliver_confirmed_admitted_failure(&mut response, &mut failure));
+            assert!(deliver_admitted_failure(&mut response, &mut failure));
             let delivery = receiver.recv_timeout(Duration::ZERO).unwrap();
             assert!(matches!(delivery, AdmittedSpawnDelivery::Unavailable(actual) if actual == reason));
             drop(receiver);
             assert_eq!(memory.usage().1, 0);
         }
+    }
+
+    #[test]
+    fn dropped_receiver_disposes_one_charged_refusal_without_dropping_owner_charge() {
+        let memory = memory();
+        let owner_charge = memory.reserve_callback_total(73).unwrap();
+        let reply_bytes = layout::single_reply_bytes::<AdmittedSpawnDelivery>(true).unwrap();
+        let (sender, receiver) = crate::runtime::spawn_reply_channel(
+            memory.reserve_callback_total(reply_bytes).unwrap(),
+        )
+        .unwrap();
+        let message = "cleanup_unconfirmed: worker exited".to_string();
+        let render_bytes = crate::session_types::lua_spawn_refusal_render_bytes(&message).unwrap();
+        let mut parent = memory
+            .reserve_callback_total(message.len() + render_bytes)
+            .unwrap();
+        let variable = parent.split_fixed(message.len()).unwrap();
+        let lua_render = parent.split_fixed(render_bytes).unwrap();
+        drop(parent);
+        drop(receiver);
+        let mut response = Some(sender);
+        let mut failure = Some(AdmittedFailure::Refused(message, variable, lua_render));
+        assert!(deliver_admitted_failure(&mut response, &mut failure));
+        assert!(!deliver_admitted_failure(&mut response, &mut failure));
+        assert_eq!(memory.usage().1, owner_charge.bytes());
+        drop(owner_charge);
+        assert_eq!(memory.usage().1, 0);
     }
 }
 
@@ -846,6 +892,93 @@ mod owner_conversion_lifecycle_tests {
             }
         }
         panic!("owner cleanup did not confirm exact Core release");
+    }
+
+    #[test]
+    fn occupied_reservation_waits_for_confirmed_cleanup_before_refusal() {
+        let name = format!("ordinary-owner-occupied-{}", std::process::id());
+        let root = std::env::temp_dir().join(&name);
+        let session_id = SessionId(name);
+        let config = HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(root.clone()),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        let mut daemon = TestDaemon {
+            daemon: HubDaemon::start(config).unwrap(),
+            root,
+            session_id: session_id.clone(),
+        };
+        let runtime = daemon.runtime().unwrap();
+        let memory = runtime.test_lua_memory();
+        let (wake_sender, mut wake) = tokio::sync::mpsc::channel(64);
+        runtime.bind_data_plane_owner_wake(wake_sender);
+        let first_waiter = runtime.next_waiter_id().unwrap();
+        let mut first = runtime.begin_reserve_session_for_owner(first_waiter, session_id.clone());
+        collect(runtime, &mut wake, first_waiter, &[1, 2]);
+        let CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+            result: Ok(reservation),
+            ..
+        })) = first.poll(runtime)
+        else {
+            panic!("the first reservation must occupy the ID");
+        };
+
+        let waiter_id = runtime.next_waiter_id().unwrap();
+        let retirement = runtime.coordination_retirement(waiter_id);
+        let bytes = layout::single_reply_bytes::<AdmittedSpawnDelivery>(true).unwrap();
+        let (sender, receiver) = spawn_reply_channel(
+            memory.reserve_callback_total(bytes).unwrap(),
+        )
+        .unwrap();
+        let parent = memory.reserve_callback_total(0).unwrap();
+        let start = runtime.test_begin_ordinary_owner_spawn(waiter_id, session_id, parent);
+        let mut operation = SessionTypeSpawnOperation {
+            waiter_id,
+            request_id: String::new(),
+            product: None,
+            start: Some(start),
+            delivery: None,
+            conversion: None,
+            host_receipt: None,
+            plugin_response: Some(sender),
+            admitted_failure: None,
+            failure: None,
+            phase: Phase::Core,
+            retirement,
+        };
+        let mut state = DaemonControlState::default();
+        collect(runtime, &mut wake, waiter_id, &[1, 2]);
+        assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Again));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::ZERO),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::FinishedInternal));
+        let AdmittedSpawnDelivery::Refused { message, _variable, _lua_render } =
+            receiver.recv_timeout(Duration::ZERO).unwrap()
+        else {
+            panic!("confirmed cleanup must deliver the occupied refusal");
+        };
+        assert!(message.to_ascii_lowercase().contains("occupied"));
+        drop(message);
+        drop(_variable);
+        drop(_lua_render);
+        drop(receiver);
+
+        let mut release = daemon
+            .runtime()
+            .unwrap()
+            .begin_release_session_reservation_for_owner(first_waiter, reservation);
+        collect(daemon.runtime().unwrap(), &mut wake, first_waiter, &[3, 4]);
+        assert!(matches!(
+            release.poll(daemon.runtime().unwrap()),
+            CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                result: Ok(SessionReservationRelease::Released),
+                ..
+            }))
+        ));
     }
 
     fn run(case: Case) {

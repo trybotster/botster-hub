@@ -3044,6 +3044,97 @@ sys.exit(0)
         .expect("plugin spawn package record")
     }
 
+    fn load_plugin_spawn_tool(
+        daemon: &mut crate::HubDaemon,
+        root: &std::path::Path,
+        mut record: crate::packages::PackageRecord,
+    ) -> tokio::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage> {
+        std::fs::write(
+            root.join("plugin.lua"),
+            r#"
+return botster.register({
+  tools = {{
+    name = "p1.spawn",
+    description = "Spawn the test session type.",
+    handler = "spawn",
+    call = function(args)
+      return botster.capabilities.session_types.spawn(args)
+    end,
+  }},
+})
+"#,
+        )
+        .expect("write spawn tool");
+        record.manifest.capabilities.push(botster_core::Capability {
+            surface: botster_core::CapabilitySurface::Mcp,
+            scope: None,
+        });
+        record.manifest.entrypoints = serde_json::from_value(serde_json::json!([
+            { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+        ]))
+        .expect("Lua entrypoint");
+        let mut snapshot = crate::packages::PackageRegistrySnapshot::empty();
+        snapshot.records.push(record);
+        let registry = crate::packages::PackageRegistry::from_snapshot(snapshot)
+            .expect("admit spawn tool package");
+        daemon
+            .runtime_mut()
+            .unwrap()
+            .load_lua_plugin_package(&registry, "p1.plugin")
+            .expect("load spawn tool");
+        let (owner_wake, owner_rx) = tokio::sync::mpsc::channel(64);
+        let runtime = daemon.runtime().unwrap();
+        runtime.bind_data_plane_owner_wake(owner_wake.clone());
+        runtime.bind_host_owner_wake(owner_wake.clone());
+        runtime.bind_managed_spawn_owner_wake(owner_wake);
+        owner_rx
+    }
+
+    fn invoke_plugin_spawn_tool(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        owner_rx: &mut tokio::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage>,
+        session_id: &str,
+        target_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let runtime = daemon.runtime().unwrap();
+        let mut args = serde_json::json!({
+            "session_type_id": "p1.plugin/agent",
+            "session_id": session_id,
+        });
+        if let Some(target_id) = target_id {
+            args["target_id"] = serde_json::json!(target_id);
+        }
+        let request = runtime
+            .prepare_plugin_mcp_tool(
+                crate::McpCallRequest {
+                    name: "p1.spawn".into(),
+                    arguments: args,
+                },
+                botster_core::RequestId(format!("plugin-spawn-{session_id}")),
+                None,
+            )
+            .expect("prepare spawn tool");
+        let lifecycle = runtime.plugin_lifecycle_handle();
+        let outcome = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || lifecycle.invoke(request).result);
+            let deadline = Instant::now() + Duration::from_secs(35);
+            while !worker.is_finished() {
+                while owner_rx.try_recv().is_ok() {}
+                pump_core(daemon, state);
+                assert!(
+                    Instant::now() < deadline,
+                    "plugin spawn worker did not finish after owner turns; pending_rows={}",
+                    state.pending_requests.len()
+                );
+                std::thread::yield_now();
+            }
+            worker.join().expect("join plugin spawn worker")
+        });
+        crate::runtime::HubRuntime::complete_plugin_mcp_tool(outcome)
+            .map_err(|error| error.message)
+    }
+
     #[test]
     fn plugin_occupied_spawn_leaves_live_session_context() {
         let worker = matched_worker_path();
@@ -3061,14 +3152,13 @@ sys.exit(0)
             .test_publish_spawn_context(&live);
         let package_root = root.join("p1-plugin");
         let record = plugin_spawn_package(&package_root);
-        let refused = daemon.runtime().unwrap().test_plugin_spawn(
-            "p1.plugin",
-            "agent",
-            crate::session_types::SessionTypeRequest {
-                session_id: Some(SessionId("s1-plugin-live".into())),
-                ..crate::session_types::SessionTypeRequest::default()
-            },
-            vec![record],
+        let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
+        let refused = invoke_plugin_spawn_tool(
+            &mut daemon,
+            &mut state,
+            &mut owner_rx,
+            "s1-plugin-live",
+            None,
         );
         let refused = refused.expect_err("plugin spawn must refuse Occupied");
         assert!(
@@ -3095,7 +3185,7 @@ sys.exit(0)
     }
 
     #[test]
-    fn plugin_retained_token_is_retried_by_the_next_plugin_spawn() {
+    fn plugin_unconfirmed_spawn_keeps_its_owner_row_across_the_next_spawn() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3105,19 +3195,18 @@ sys.exit(0)
             std::process::id()
         ));
         let worker = write_frame_exit_worker(&worker_root);
-        let (mut daemon, _state, root) = spawn_fixture_with_worker("plugin-retry", Some(worker));
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("plugin-retry", Some(worker));
         let package_root = root.join("p1-plugin");
         let record = plugin_spawn_package(&package_root);
-        let first = daemon.runtime().unwrap().test_plugin_spawn(
-            "p1.plugin",
-            "agent",
-            crate::session_types::SessionTypeRequest {
-                session_id: Some(SessionId("s1-plugin-retry-a".into())),
-                ..crate::session_types::SessionTypeRequest::default()
-            },
-            vec![record.clone()],
+        let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
+        let first = invoke_plugin_spawn_tool(
+            &mut daemon,
+            &mut state,
+            &mut owner_rx,
+            "s1-plugin-retry-a",
+            None,
         );
-        let first = first.expect_err("first plugin spawn must retain unconfirmed");
+        let first = first.expect_err("first plugin spawn must report unconfirmed cleanup");
         assert!(
             first.contains("cleanup_unconfirmed"),
             "first plugin spawn must report cleanup_unconfirmed: {first}"
@@ -3129,21 +3218,44 @@ sys.exit(0)
                 .test_release_session_reservation_begins(),
             1
         );
-        let held = daemon.runtime().unwrap().retained_reservations();
-        assert_eq!(
-            held.len(),
-            1,
-            "plugin spawn must retain the unconfirmed token"
+        assert!(
+            daemon.runtime().unwrap().retained_reservations().is_empty(),
+            "the owner row holds the reservation, not the legacy token store"
         );
-        let token = held[0].clone();
-        let second = daemon.runtime().unwrap().test_plugin_spawn(
-            "p1.plugin",
-            "agent",
-            crate::session_types::SessionTypeRequest {
-                session_id: Some(SessionId("s1-plugin-retry-b".into())),
-                ..crate::session_types::SessionTypeRequest::default()
-            },
-            vec![record],
+        assert_eq!(state.pending_requests.len(), 1);
+        let (first_waiter, first_identity) = state
+            .pending_requests
+            .iter()
+            .find_map(|(waiter, entry)| match &entry.continuation {
+                crate::daemon::control::pending::ControlContinuation::SessionType(operation) => {
+                    operation.test_reservation_identity().map(|identity| (*waiter, identity))
+                }
+                _ => None,
+            })
+            .expect("the first owner row retains its exact reservation");
+        let first_charge = daemon.runtime().unwrap().test_lua_memory().usage().1;
+        assert!(first_charge > 0, "the callback account remains charged");
+        for _ in 0..4 {
+            pump_core(&mut daemon, &mut state);
+            let entry = state
+                .pending_requests
+                .get(&first_waiter)
+                .expect("owner turns retain the first row without a new wake");
+            assert!(entry.must_finish);
+            assert!(entry.permit.is_some());
+            let crate::daemon::control::pending::ControlContinuation::SessionType(operation) =
+                &entry.continuation
+            else {
+                panic!("the first row remains a session-type spawn");
+            };
+            assert_eq!(operation.test_reservation_identity(), Some(first_identity));
+        }
+        let second = invoke_plugin_spawn_tool(
+            &mut daemon,
+            &mut state,
+            &mut owner_rx,
+            "s1-plugin-retry-b",
+            None,
         );
         let second = second.expect_err("second plugin spawn must fail");
         assert!(
@@ -3155,17 +3267,25 @@ sys.exit(0)
                 .runtime()
                 .unwrap()
                 .test_release_session_reservation_begins(),
-            3,
-            "second spawn must release the held token then its own reservation"
+            2,
+            "the second spawn releases only its own reservation"
         );
+        let first_row = state
+            .pending_requests
+            .get(&first_waiter)
+            .expect("the second spawn must not retire the first owner row");
+        assert!(first_row.must_finish);
+        assert!(first_row.permit.is_some());
+        let crate::daemon::control::pending::ControlContinuation::SessionType(operation) =
+            &first_row.continuation
+        else {
+            panic!("the first owner row keeps its session-type stage");
+        };
+        assert_eq!(operation.test_reservation_identity(), Some(first_identity));
+        assert_eq!(state.pending_requests.len(), 2);
         assert!(
-            daemon
-                .runtime()
-                .unwrap()
-                .retained_reservations()
-                .iter()
-                .any(|kept| kept == &token),
-            "next plugin spawn must retry and keep the unconfirmed token"
+            daemon.runtime().unwrap().test_lua_memory().usage().1 >= first_charge,
+            "aggregate callback usage must not fall across the second spawn"
         );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
@@ -3745,14 +3865,14 @@ sys.exit(0)
             .runtime()
             .unwrap()
             .test_publish_spawn_context(&live);
-        let refused = daemon.runtime().unwrap().test_plugin_spawn(
-            "p1.plugin",
-            "agent",
-            crate::session_types::SessionTypeRequest {
-                session_id: Some(SessionId(first.session_id.clone())),
-                ..crate::session_types::SessionTypeRequest::default()
-            },
-            vec![record],
+        let package_root = root.join("p1-plugin");
+        let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
+        let refused = invoke_plugin_spawn_tool(
+            &mut daemon,
+            &mut state,
+            &mut owner_rx,
+            &first.session_id,
+            Some("t1"),
         );
         let refused = refused.expect_err("Occupied must refuse");
         assert!(
