@@ -1,8 +1,16 @@
 # Foundation integration and final acceptance
 
-Status: integration checkpoint `2f026a44` is pushed. The first matched ordinary-spawn daemon test now passes. Full foundation acceptance remains open.
+Status: ordinary-spawn checkpoint `5c01a95d` is pushed. Real daemon success and Host/Core refusal checks pass. Full foundation acceptance remains open.
 
 ## Current delivery status — September 23
+
+Latest refusal result: test-only patch `7f4eee6adf29b5079a743bcedae0d366da0ee1ea91b610df86950141b909779b` passed against checkpoint `5c01a95d`.
+The real daemon test passed one test, with 328 filtered tests. Root checked the raw log, manifest, and test patch hash.
+The test checks exact missing-type Host and occupied-ID Core refusal messages through Lua after two successful spawns.
+Per-session FIFO holds replace a timed sleep. The test does not open the FIFOs; daemon shutdown performs session cleanup.
+Successful completion includes the existing owned-child absence check. The reviewer accepted the test source before this run.
+Evidence is under `/Users/jasonconigliari/botster-evidence/ordinary-lua-refusals-20260923/`.
+Render-capacity refusal, abandonment, conversion refusal, relative-device-root stability, and the wider acceptance gates remain open.
 
 Latest result: source/tests patch `f8921ddd78fe3807266262dbca32630bb66e018f5b062717333c502d494a7ac0` passes the first ordinary-spawn daemon requirement.
 The driver handoff test passed one test. The real daemon test passed one test, with 328 filtered tests.
