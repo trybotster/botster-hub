@@ -42,8 +42,9 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{Receiver as AsyncReceiver, Sender as AsyncSender, channel, default_runtime};
 
 use crate::support::{
-    candidate_hub_binary_path, candidate_session_worker_binary_path, recovering_mutex_guard,
-    validate_cli_daemon_shutdown, wait_for_cli_daemon_shutdown,
+    cached_candidate_session_worker_binary_path, candidate_hub_binary_path,
+    candidate_session_worker_binary_path, recovering_mutex_guard, validate_cli_daemon_shutdown,
+    wait_for_cli_daemon_shutdown,
 };
 
 use super::*;
@@ -378,19 +379,22 @@ pub(crate) fn worker_belongs_to_data_dir(
         .is_some_and(|canon| worker.command.contains(canon.to_string_lossy().as_ref()))
 }
 
-pub(crate) fn worker_executable_from_this_worktree(worker: &SessionWorkerProcessIdentity) -> bool {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+pub(crate) fn worker_executable_is_validated_candidate(
+    worker: &SessionWorkerProcessIdentity,
+) -> bool {
     let argv0 = worker.command.split_whitespace().next().unwrap_or("");
-    if argv0.is_empty() {
+    let executable = Path::new(argv0);
+    if !executable.is_absolute()
+        || executable.file_name().and_then(|name| name.to_str()) != Some("botster-session-worker")
+    {
         return false;
     }
-    let exe = Path::new(argv0);
-    if exe.starts_with(root) {
-        return true;
-    }
-    match (exe.canonicalize(), root.canonicalize()) {
-        (Ok(exe), Ok(root)) => exe.starts_with(root),
-        _ => worker.command.contains(&root.display().to_string()),
+    let Some(candidate) = cached_candidate_session_worker_binary_path() else {
+        return false;
+    };
+    match (executable.canonicalize(), candidate.canonicalize()) {
+        (Ok(observed), Ok(candidate)) => observed == candidate,
+        _ => false,
     }
 }
 
@@ -405,7 +409,7 @@ pub(crate) fn capture_new_session_workers_for_data_dir(
             let Some(command_pid) = identity.pid else {
                 continue;
             };
-            let Some(worker_pid) = worktree_session_worker_ancestor(command_pid) else {
+            let Some(worker_pid) = validated_candidate_session_worker_ancestor(command_pid) else {
                 continue;
             };
             if before_pids.contains(&worker_pid) {
@@ -486,7 +490,8 @@ pub(crate) fn capture_new_session_workers_for_marked_pty(
         let live_ours: Vec<SessionWorkerProcessIdentity> = session_worker_process_identities()?
             .into_iter()
             .filter(|worker| {
-                !before_pids.contains(&worker.pid) && worker_executable_from_this_worktree(worker)
+                !before_pids.contains(&worker.pid)
+                    && worker_executable_is_validated_candidate(worker)
             })
             .collect();
         let mut live_alive = Vec::new();
@@ -980,7 +985,7 @@ pub(crate) fn live_session_workers_for_data_dir(
     Ok(session_worker_process_identities()?
         .into_iter()
         .filter(|worker| {
-            worker_executable_from_this_worktree(worker)
+            worker_executable_is_validated_candidate(worker)
                 && worker_belongs_to_data_dir(worker, data_dir)
         })
         .collect())

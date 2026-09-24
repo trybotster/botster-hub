@@ -383,8 +383,12 @@ return botster.register({ handlers = {
         botster_hub_client::DaemonResponseKind::PackageDecision
     );
     assert!(
-        held.next_frame().is_err(),
-        "disabled provider subscription must close"
+        matches!(
+            held.next_frame(),
+            Ok(botster_hub_client::DaemonEntityFrame::Error { code, .. })
+                if code == "entity_provider_unloaded"
+        ),
+        "disabled provider subscription must receive a terminal error"
     );
     let cleanup_deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -848,8 +852,10 @@ fn foreground_terminal_app_open_absolutizes_relative_runtime_paths() {
 }
 
 #[test]
-fn cli_inspect_reports_not_found_for_fresh_in_process_daemon() {
+fn cli_inspect_reports_not_found_from_running_daemon() {
+    let _guard = daemon_test_guard();
     let data_dir = unique_test_dir("cli-inspect");
+    let daemon = start_cli_daemon(&data_dir);
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("inspect")
         .arg("--data-dir")
@@ -868,6 +874,27 @@ fn cli_inspect_reports_not_found_for_fresh_in_process_daemon() {
     assert!(stdout.contains("session_id=runtime-session"));
     assert!(stdout.contains("found=false"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));
+    daemon.shutdown();
+}
+
+#[test]
+fn cli_inspect_reports_daemon_unavailable_without_initializing_storage() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_test_dir("cli-inspect-offline");
+    assert!(!data_dir.exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+        .arg("inspect")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("runtime-session")
+        .output()
+        .expect("run botster-hub inspect without daemon");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf8");
+    assert!(stderr.contains("daemon not running"));
+    assert!(!data_dir.exists());
+    assert!(!data_dir.join("hub-state.json").exists());
 }
 
 #[test]
@@ -4201,9 +4228,11 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
     );
 
     shutdown_cli_daemon(&data_dir, child);
-    let state = FileHubStateStore::for_data_directory(&data_dir)
-        .load_or_initialize(&explicit_config(&data_dir))
+    let store = FileHubStateStore::for_data_directory(&data_dir);
+    let (state, authority) = store
+        .load_retained(&explicit_config(&data_dir))
         .expect("load persisted hub state after registry install");
+    let authority = authority.expect("File reload retains state authority");
     let restored = PackageRegistry::from_snapshot(state.package_registry)
         .expect("restore package registry snapshot");
     let record = restored.package("runtime.git").expect("restored package");
@@ -4220,6 +4249,7 @@ fn daemon_packages_registry_fixture_preview_and_install_flow() {
         record.pin.as_ref().expect("pin").rev.as_deref(),
         Some("abc123")
     );
+    drop(authority);
 }
 
 #[test]
@@ -4482,9 +4512,9 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(!invalid.status.success());
     let text = command_output_text(&invalid);
     assert!(text.contains("response=operator_error"));
-    assert!(text.contains("operation=install"));
+    assert!(text.contains("operation=install"), "{text}");
     assert!(text.contains("InvalidLocalManifest"));
-    assert!(!text.contains(invalid_dir.to_string_lossy().as_ref()));
+    assert!(!text.contains(invalid_dir.to_string_lossy().as_ref()), "{text}");
     assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
 
     let incompatible = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -4499,7 +4529,7 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(!incompatible.status.success());
     let text = command_output_text(&incompatible);
     assert!(text.contains("response=operator_error"));
-    assert!(text.contains("operation=install"));
+    assert!(text.contains("operation=install"), "{text}");
     assert!(text.contains("BotsterCompatibility"));
     assert!(!text.contains(incompatible_dir.to_string_lossy().as_ref()));
     assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
@@ -4530,7 +4560,7 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(!duplicate.status.success());
     let text = command_output_text(&duplicate);
     assert!(text.contains("response=operator_error"));
-    assert!(text.contains("operation=install"));
+    assert!(text.contains("operation=install"), "{text}");
     assert!(text.contains("AlreadyInstalled"));
     assert!(!text.contains(duplicate_dir.to_string_lossy().as_ref()));
     assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
@@ -4560,7 +4590,7 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(!denied_enable.status.success());
     let text = command_output_text(&denied_enable);
     assert!(text.contains("response=operator_error"));
-    assert!(text.contains("operation=enable"));
+    assert!(text.contains("operation=enable"), "{text}");
     assert!(text.contains("UngrantedCapability"));
 
     let missing_show = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -4574,7 +4604,7 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(!missing_show.status.success());
     let text = command_output_text(&missing_show);
     assert!(text.contains("response=operator_error"));
-    assert!(text.contains("operation=show"));
+    assert!(text.contains("operation=show"), "{text}");
     assert!(text.contains("PackageNotInstalled"));
     assert!(text.contains("runtime.missing-plugin"));
     assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
@@ -4590,7 +4620,7 @@ fn cli_packages_local_path_diagnostics_are_actionable() {
     assert!(!missing_remove.status.success());
     let text = command_output_text(&missing_remove);
     assert!(text.contains("response=operator_error"));
-    assert!(text.contains("operation=remove"));
+    assert!(text.contains("operation=remove"), "{text}");
     assert!(text.contains("PackageNotInstalled"));
     assert!(text.contains("runtime.missing-plugin"));
     assert!(!text.contains(data_dir.to_string_lossy().as_ref()));
@@ -4716,7 +4746,7 @@ fn cli_packages_deny_botster_workspaces_mismatched_plugin_db_namespace() {
     assert!(!enable.status.success());
     let text = command_output_text(&enable);
     assert!(text.contains("response=operator_error"));
-    assert!(text.contains("operation=enable"));
+    assert!(text.contains("operation=enable"), "{text}");
     assert!(text.contains("UngrantedCapability"));
     assert!(text.contains("other-plugin"));
     assert!(!text.contains(package_dir.to_string_lossy().as_ref()));
@@ -6031,7 +6061,7 @@ fn daemon_package_entity_publish_gap_pending_then_accepts_in_order() {
 }
 
 #[test]
-fn daemon_package_entity_publish_unload_closes_held_subscription() {
+fn daemon_package_entity_publish_unload_sends_terminal_error() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("pkg-entity-unload");
     let package_dir = unique_test_dir("pkg-entity-unload-pkg");
@@ -6070,8 +6100,12 @@ fn daemon_package_entity_publish_unload_closes_held_subscription() {
     held.set_read_timeout(Some(Duration::from_secs(2)))
         .expect("timeout");
     assert!(
-        held.next_frame().is_err(),
-        "disabled package subscription must close"
+        matches!(
+            held.next_frame(),
+            Ok(botster_hub_client::DaemonEntityFrame::Error { code, .. })
+                if code == "entity_provider_unloaded"
+        ),
+        "disabled package subscription must receive a terminal error"
     );
     let cleanup_deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -6090,6 +6124,134 @@ fn daemon_package_entity_publish_unload_closes_held_subscription() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_provider_retirement_preserves_sibling_on_one_unix_connection() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-sibling");
+    let package_dir = unique_test_dir("pkg-entity-sibling-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = daemon_endpoint(&config);
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut connection =
+        botster_hub_client::DaemonConnection::connect(&endpoint).expect("shared Unix connection");
+    connection
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound shared connection reads");
+    for (entity_type, subscription_id) in [
+        ("project-pipelines.membership", "retiring-on-shared"),
+        ("session_type", "surviving-on-shared"),
+    ] {
+        let response = connection
+            .request(&botster_hub_client::DaemonRequest::SubscribeEntities {
+                entity_type: entity_type.to_string(),
+                subscription_id: subscription_id.to_string(),
+            })
+            .expect("subscribe on shared connection");
+        assert_eq!(
+            response.kind,
+            botster_hub_client::DaemonResponseKind::EntitySubscribed
+        );
+    }
+    let mut snapshots = std::collections::BTreeSet::new();
+    while snapshots.len() < 2 {
+        match connection.next_frame().expect("shared initial entity frame") {
+            botster_hub_client::DaemonUnixMuxFrame::Server(
+                botster_hub_client::ServerFrame::Entity {
+                    entity: botster_hub_client::DaemonEntityFrame::Snapshot {
+                        subscription_id,
+                        ..
+                    },
+                },
+            ) => {
+                snapshots.insert(subscription_id);
+            }
+            other => panic!("unexpected shared initial frame: {other:?}"),
+        }
+    }
+    assert_eq!(
+        snapshots,
+        std::collections::BTreeSet::from([
+            "retiring-on-shared".to_string(),
+            "surviving-on-shared".to_string(),
+        ])
+    );
+
+    let disabled = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::DisablePackage {
+            package_name: "project-pipelines".to_string(),
+        },
+    )
+    .expect("disable provider on another connection");
+    assert_eq!(
+        disabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision
+    );
+    assert!(matches!(
+        connection.next_frame().expect("retiring provider terminal frame"),
+        botster_hub_client::DaemonUnixMuxFrame::Server(
+            botster_hub_client::ServerFrame::Entity {
+                entity: botster_hub_client::DaemonEntityFrame::Error {
+                    subscription_id,
+                    code,
+                    ..
+                },
+            },
+        ) if subscription_id == "retiring-on-shared" && code == "entity_provider_unloaded"
+    ));
+
+    let definition = botster_hub_client::DaemonSessionTypeDefinition {
+        id: "g2-sibling".to_string(),
+        label: "G2 sibling".to_string(),
+        description: None,
+        icon: None,
+        role: "botster.accessory".to_string(),
+        interaction: "interactive".to_string(),
+        traits: vec!["terminal".to_string()],
+        lifecycle: "persistent".to_string(),
+        execution: botster_hub_client::DaemonSessionTypeExecution::RelativeExecutable,
+        command: "bin/accessory.sh".to_string(),
+        args: Vec::new(),
+        working_directory: botster_hub_client::DaemonSessionTypeWorkingDirectory::Relative {
+            path: "nested/dir".to_string(),
+        },
+        environment: BTreeMap::new(),
+        allowed_environment_overrides: Vec::new(),
+        context: Vec::new(),
+        target_id: None,
+    };
+    let created = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSessionType {
+            source: botster_hub_client::DaemonSessionTypeMutationSource::Device,
+            definition,
+        },
+    )
+    .expect("create sibling session type");
+    assert_eq!(
+        created.kind,
+        botster_hub_client::DaemonResponseKind::SessionTypes,
+        "sibling session type mutation response: {created:?}"
+    );
+    assert!(matches!(
+        connection.next_frame().expect("surviving sibling update"),
+        botster_hub_client::DaemonUnixMuxFrame::Server(
+            botster_hub_client::ServerFrame::Entity {
+                entity: botster_hub_client::DaemonEntityFrame::Upsert {
+                    subscription_id,
+                    id,
+                    ..
+                },
+            },
+        ) if subscription_id == "surviving-on-shared" && id == "device/g2-sibling"
+    ));
+    drop(connection);
     shutdown_cli_daemon(&data_dir, child);
 }
 
@@ -6194,12 +6356,29 @@ fn daemon_package_entity_second_subscriber_behind_snapshot_does_not_roll_advance
     let mut sub_a =
         botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-a")
             .expect("subscribe a");
-    let _ = sub_a.next_frame().expect("a snapshot");
-    let _ = mutation_action(
+    let a_snapshot = sub_a.next_frame().expect("a snapshot");
+    assert!(
+        matches!(
+            &a_snapshot,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq: 0,
+                ..
+            }
+        ),
+        "unexpected A snapshot: {a_snapshot:?}"
+    );
+    let published = mutation_action(
         &endpoint,
         "project-pipelines.publish_seq",
         serde_json::json!({ "seq": 1, "id": "row-1" }),
     );
+    let published_payload = published
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .unwrap_or_else(|| panic!("missing publish response: {published:?}"));
+    assert_eq!(published_payload["status"], "accepted", "{published:?}");
+    assert_eq!(published_payload["last_accepted_seq"], 1, "{published:?}");
     let _ = wait_for_entity_frame(&mut sub_a, Duration::from_secs(5), |frame| {
         matches!(
             frame,
@@ -6223,23 +6402,57 @@ fn daemon_package_entity_second_subscriber_behind_snapshot_does_not_roll_advance
     // set_provider_seq to 0 without clearing rows — but provider still returns
     // seq variable. set_provider_seq lowers seq for provider only while fanout
     // state keeps last_accepted=1. Then sub B's snapshot has S=0 < floor.
-    let _ = mutation_action(
+    let lowered = mutation_action(
         &endpoint,
         "project-pipelines.set_provider_seq",
         serde_json::json!({ "seq": 0 }),
     );
+    assert_eq!(
+        lowered.kind,
+        botster_hub_client::DaemonResponseKind::PluginActionResult,
+        "{lowered:?}"
+    );
+    assert_eq!(
+        lowered
+            .plugin_action_result
+            .as_ref()
+            .expect("lower action result")
+            .state,
+        botster_ui_contract::UiActionResultState::Accepted,
+        "{lowered:?}"
+    );
+    assert_eq!(
+        lowered
+            .plugin_action_result
+            .as_ref()
+            .and_then(|result| result.payload.as_ref())
+            .map(|payload| &payload["seq"]),
+        Some(&serde_json::json!(0)),
+        "{lowered:?}"
+    );
 
+    let before_b = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("status before B subscribe");
+    let degraded_before_b = before_b
+        .status
+        .as_ref()
+        .expect("status body")
+        .lifecycle_counters
+        .package_entity_resync_degraded;
     let mut sub_b =
         botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-b")
             .expect("subscribe b");
     let b_snapshot = sub_b.next_frame().expect("b snapshot");
-    assert!(matches!(
-        b_snapshot,
-        botster_hub_client::DaemonEntityFrame::Snapshot {
-            snapshot_seq: 0,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &b_snapshot,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq: 0,
+                ..
+            }
+        ),
+        "unexpected B snapshot: {b_snapshot:?}"
+    );
 
     // Sub A must not receive the behind snapshot.
     sub_a
@@ -6264,20 +6477,299 @@ fn daemon_package_entity_second_subscriber_behind_snapshot_does_not_roll_advance
     }
 
     // Restore live provider truth and allow B to catch up.
-    let _ = mutation_action(
+    let before_restore =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+            .expect("status before provider restore");
+    assert_eq!(
+        before_restore
+            .status
+            .as_ref()
+            .expect("status body")
+            .lifecycle_counters
+            .package_entity_resync_degraded,
+        degraded_before_b,
+        "B's bounded cycle degraded before provider restore"
+    );
+    let restored = mutation_action(
         &endpoint,
         "project-pipelines.set_provider_seq",
         serde_json::json!({ "seq": 1 }),
     );
-    let _ = wait_for_entity_frame(&mut sub_b, Duration::from_secs(10), |frame| {
+    assert_eq!(
+        restored.kind,
+        botster_hub_client::DaemonResponseKind::PluginActionResult,
+        "{restored:?}"
+    );
+    assert_eq!(
+        restored
+            .plugin_action_result
+            .as_ref()
+            .expect("restore action result")
+            .state,
+        botster_ui_contract::UiActionResultState::Accepted,
+        "{restored:?}"
+    );
+    assert_eq!(
+        restored
+            .plugin_action_result
+            .as_ref()
+            .and_then(|result| result.payload.as_ref())
+            .map(|payload| &payload["seq"]),
+        Some(&serde_json::json!(1)),
+        "{restored:?}"
+    );
+    let started = Instant::now();
+    let mut seen_frames = Vec::new();
+    let mut total_frames = 0_u64;
+    loop {
+        let remaining = Duration::from_secs(10).saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            let status = botster_hub_client::request(
+                &endpoint,
+                botster_hub_client::DaemonRequest::Status,
+            )
+            .expect("status after B catch-up timeout");
+            let counters = &status.status.as_ref().expect("status body").lifecycle_counters;
+            let evidence = format!(
+                "timed out waiting for B catch-up entity frame; frames={total_frames}, first_frames={seen_frames:?}, resync_attempts={}, resync_degraded={}",
+                counters.package_entity_resync_attempts,
+                counters.package_entity_resync_degraded
+            );
+            let (resource, probe) = classify_budget_expiry("entity_frame", None, Some(&evidence));
+            panic!(
+                "{}",
+                format_harness_budget_expired(
+                    "entity_frame",
+                    Duration::from_secs(10),
+                    resource,
+                    probe,
+                    &evidence
+                )
+            );
+        }
+        sub_b
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(200))))
+            .expect("B catch-up read timeout");
+        match sub_b.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Snapshot { snapshot_seq, .. })
+                if snapshot_seq >= 1 =>
+            {
+                break;
+            }
+            Ok(frame) => {
+                total_frames = total_frames.saturating_add(1);
+                if seen_frames.len() < 16 {
+                    let summary = match frame {
+                        botster_hub_client::DaemonEntityFrame::Snapshot {
+                            snapshot_seq, ..
+                        } => format!("snapshot:{snapshot_seq}"),
+                        botster_hub_client::DaemonEntityFrame::Upsert {
+                            snapshot_seq, ..
+                        } => format!("upsert:{snapshot_seq}"),
+                        botster_hub_client::DaemonEntityFrame::Patch {
+                            snapshot_seq, ..
+                        } => format!("patch:{snapshot_seq}"),
+                        botster_hub_client::DaemonEntityFrame::Remove {
+                            snapshot_seq, ..
+                        } => format!("remove:{snapshot_seq}"),
+                        botster_hub_client::DaemonEntityFrame::Error { code, .. } => {
+                            format!("error:{code}")
+                        }
+                    };
+                    seen_frames.push(summary);
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("timed out")
+                    && !message.contains("WouldBlock")
+                    && !message.contains("Resource temporarily unavailable")
+                    && !message.contains("os error 35")
+                    && !message.contains("os error 11")
+                {
+                    panic!("entity frame error: {error}");
+                }
+            }
+        }
+    }
+
+    let _ = sub_a.unsubscribe();
+    let _ = sub_b.unsubscribe();
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+#[test]
+fn daemon_package_entity_behind_second_subscriber_degrades_without_family_gap() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("pkg-entity-two-sub-stale");
+    let package_dir = unique_test_dir("pkg-entity-two-sub-stale-pkg");
+    write_package_entity_mutation_plugin(&package_dir, "live");
+    let config = explicit_config(&data_dir);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("socket")
+            .path
+            .clone(),
+    );
+    let child = start_cli_daemon(&data_dir);
+    enable_mutation_package(&endpoint, package_dir);
+
+    let mut sub_a =
+        botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-a")
+            .expect("subscribe a");
+    assert!(matches!(
+        sub_a.next_frame().expect("a snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot {
+            snapshot_seq: 0,
+            ..
+        }
+    ));
+    let published = mutation_action(
+        &endpoint,
+        "project-pipelines.publish_seq",
+        serde_json::json!({ "seq": 1, "id": "row-1" }),
+    );
+    let payload = published
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .unwrap_or_else(|| panic!("missing publish response: {published:?}"));
+    assert_eq!(payload["status"], "accepted", "{published:?}");
+    assert_eq!(payload["last_accepted_seq"], 1, "{published:?}");
+    let _ = wait_for_entity_frame(&mut sub_a, Duration::from_secs(5), |frame| {
         matches!(
             frame,
-            botster_hub_client::DaemonEntityFrame::Snapshot {
-                snapshot_seq,
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                snapshot_seq: 1,
                 ..
-            } if *snapshot_seq >= 1
+            }
         )
     });
+    let lowered = mutation_action(
+        &endpoint,
+        "project-pipelines.set_provider_seq",
+        serde_json::json!({ "seq": 0 }),
+    );
+    let lowered_result = lowered
+        .plugin_action_result
+        .as_ref()
+        .unwrap_or_else(|| panic!("missing lower action result: {lowered:?}"));
+    assert_eq!(
+        lowered_result.state,
+        botster_ui_contract::UiActionResultState::Accepted,
+        "{lowered:?}"
+    );
+    assert_eq!(
+        lowered_result.payload.as_ref().map(|payload| &payload["seq"]),
+        Some(&serde_json::json!(0)),
+        "{lowered:?}"
+    );
+    let before_b = botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("status before B subscribe");
+    let baseline = &before_b.status.as_ref().expect("status body").lifecycle_counters;
+    let attempts_before_b = baseline.package_entity_resync_attempts;
+    let degraded_before_b = baseline.package_entity_resync_degraded;
+    let mut sub_b =
+        botster_hub_client::subscribe_entities(&endpoint, "project-pipelines.membership", "sub-b")
+            .expect("subscribe b");
+    let b_snapshot = sub_b.next_frame().expect("b snapshot");
+    assert!(
+        matches!(
+            &b_snapshot,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq: 0,
+                ..
+            }
+        ),
+        "unexpected B snapshot: {b_snapshot:?}"
+    );
+
+    let started = Instant::now();
+    let mut attempts = 0;
+    let mut degraded = 0;
+    while started.elapsed() < Duration::from_secs(20) {
+        let status =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status under stale second subscriber");
+        let counters = &status.status.as_ref().expect("status body").lifecycle_counters;
+        attempts = counters.package_entity_resync_attempts;
+        degraded = counters.package_entity_resync_degraded;
+        if degraded > degraded_before_b {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if degraded == degraded_before_b {
+        let mut frames = Vec::new();
+        for _ in 0..16 {
+            sub_b
+                .set_read_timeout(Some(Duration::from_millis(1)))
+                .expect("bound B census read");
+            match sub_b.next_frame() {
+                Ok(botster_hub_client::DaemonEntityFrame::Snapshot { snapshot_seq, .. }) => {
+                    frames.push(format!("snapshot:{snapshot_seq}"));
+                }
+                Ok(frame) => frames.push(format!("{frame:?}")),
+                Err(_) => break,
+            }
+        }
+        panic!(
+            "behind B did not degrade within 20s; frames={frames:?}, resync_attempts={attempts}, attempts_before_b={attempts_before_b}, resync_degraded={degraded}, degraded_before_b={degraded_before_b}"
+        );
+    }
+    assert_eq!(
+        attempts.saturating_sub(attempts_before_b),
+        8,
+        "stale B uses one bounded attempt cycle"
+    );
+    assert_eq!(degraded.saturating_sub(degraded_before_b), 1);
+    let post = Instant::now();
+    while post.elapsed() < Duration::from_secs(3) {
+        let status =
+            botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
+                .expect("status after B degradation");
+        let counters = &status.status.as_ref().expect("status body").lifecycle_counters;
+        assert_eq!(counters.package_entity_resync_attempts, attempts);
+        assert_eq!(counters.package_entity_resync_degraded, degraded);
+        thread::sleep(Duration::from_millis(50));
+    }
+    let rollback_started = Instant::now();
+    loop {
+        let remaining = Duration::from_millis(400).saturating_sub(rollback_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        sub_a
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(100))))
+            .expect("bound A rollback check");
+        match sub_a.next_frame() {
+            Ok(
+                botster_hub_client::DaemonEntityFrame::Snapshot { snapshot_seq, .. }
+                | botster_hub_client::DaemonEntityFrame::Upsert { snapshot_seq, .. }
+                | botster_hub_client::DaemonEntityFrame::Patch { snapshot_seq, .. }
+                | botster_hub_client::DaemonEntityFrame::Remove { snapshot_seq, .. },
+            ) => {
+                assert!(snapshot_seq >= 1, "A rolled back to {snapshot_seq}");
+            }
+            Ok(botster_hub_client::DaemonEntityFrame::Error { code, message, .. }) => {
+                panic!("A received entity error {code}: {message}");
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("timed out")
+                    && !message.contains("WouldBlock")
+                    && !message.contains("Resource temporarily unavailable")
+                    && !message.contains("os error 35")
+                    && !message.contains("os error 11")
+                {
+                    panic!("A rollback read failed: {error}");
+                }
+            }
+        }
+    }
 
     let _ = sub_a.unsubscribe();
     let _ = sub_b.unsubscribe();
@@ -6309,24 +6801,58 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
         "pressure",
     )
     .expect("subscribe");
-    let _ = held.next_frame().expect("snapshot");
+    let initial = held.next_frame().expect("snapshot");
+    assert!(
+        matches!(
+            &initial,
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq,
+                ..
+            } if *snapshot_seq == 0
+        ),
+        "unexpected initial snapshot: {initial:?}"
+    );
 
     // Force outside-window resync need while provider stays at 0.
-    let _ = mutation_action(
+    let seed = mutation_action(
         &endpoint,
         "project-pipelines.publish_seq",
         serde_json::json!({ "seq": 1, "id": "seed" }),
     );
-    let _ = mutation_action(
+    let seed_payload = seed
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .unwrap_or_else(|| panic!("missing seed payload: {seed:?}"));
+    assert_eq!(seed_payload["status"], "accepted", "seed response: {seed:?}");
+    assert_eq!(seed_payload["last_accepted_seq"], 1, "seed response: {seed:?}");
+    let outside = mutation_action(
         &endpoint,
         "project-pipelines.publish_seq",
         serde_json::json!({ "seq": 20, "id": "high" }),
+    );
+    let outside_payload = outside
+        .plugin_action_result
+        .as_ref()
+        .and_then(|result| result.payload.as_ref())
+        .unwrap_or_else(|| panic!("missing outside-window payload: {outside:?}"));
+    assert_eq!(
+        outside_payload["status"],
+        "resync_scheduled",
+        "outside-window response: {outside:?}"
+    );
+    assert_eq!(
+        outside_payload["high_water_seq"],
+        20,
+        "outside-window response: {outside:?}"
     );
 
     // Poll Status repeatedly while resync runs under backoff; daemon must stay responsive.
     let started = Instant::now();
     let mut saw_degraded = false;
     let mut attempts_at_degraded = 0_u64;
+    let mut observed_attempts = 0_u64;
+    let mut observed_degraded = 0_u64;
     while started.elapsed() < Duration::from_secs(20) {
         let status =
             botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
@@ -6338,6 +6864,8 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
             .expect("status body")
             .lifecycle_counters
             .clone();
+        observed_attempts = counters.package_entity_resync_attempts;
+        observed_degraded = counters.package_entity_resync_degraded;
         if counters.package_entity_resync_degraded > 0 {
             saw_degraded = true;
             attempts_at_degraded = counters.package_entity_resync_attempts;
@@ -6352,7 +6880,7 @@ fn daemon_package_entity_resync_under_stale_provider_is_pressure_bounded() {
     }
     assert!(
         saw_degraded,
-        "stale provider must enter resync_degraded under max attempts"
+        "stale provider must enter resync_degraded under max attempts; attempts={observed_attempts}, degraded={observed_degraded}"
     );
     // Unchanged catching_up / stale provider must not start another attempt cycle.
     let post = Instant::now();

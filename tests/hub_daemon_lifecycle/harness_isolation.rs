@@ -12,6 +12,58 @@ fn wait_for_registry_worker(data_dir: &Path) -> RegistryWorkerIdentity {
 }
 
 #[test]
+fn worker_classifier_accepts_only_validated_candidate() {
+    let candidate = candidate_session_worker_binary_path();
+    let worker = SessionWorkerProcessIdentity {
+        pid: 0,
+        command: format!("{} --data-dir /tmp/example", candidate.display()),
+        shell_descendant_pids: Vec::new(),
+    };
+    assert!(worker_executable_is_validated_candidate(&worker));
+
+    let unrelated_dir = unique_short_test_dir("gxc");
+    fs::create_dir_all(&unrelated_dir).expect("create unrelated executable directory");
+    let unrelated = unrelated_dir.join("botster-session-worker");
+    std::os::unix::fs::symlink("/bin/echo", &unrelated)
+        .expect("create unrelated executable with worker basename");
+    let unrelated_worker = SessionWorkerProcessIdentity {
+        pid: 0,
+        command: format!("{} --data-dir /tmp/example", unrelated.display()),
+        shell_descendant_pids: Vec::new(),
+    };
+    assert!(
+        !worker_executable_is_validated_candidate(&unrelated_worker),
+        "an unrelated executable with the worker basename must be refused"
+    );
+}
+
+#[test]
+fn explicit_shutdown_attributes_cleanup_taint_to_originating_test() {
+    let _lock = daemon_test_guard();
+    let data_dir = unique_short_test_dir("gxa");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let daemon = start_cli_daemon(&data_dir);
+    let _taint = ScopedHarnessTaint::inject("injected explicit shutdown taint");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        daemon.shutdown_at(&data_dir)
+    }));
+    let panic = result.expect_err("explicit shutdown must report cleanup taint");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("taint panic message");
+    assert!(
+        message.contains("environment_tainted: injected explicit shutdown taint"),
+        "explicit shutdown must report the original taint: {message}"
+    );
+    assert!(
+        !daemon_socket_path(&data_dir).exists(),
+        "explicit shutdown must remove the daemon socket before reporting taint"
+    );
+}
+
+#[test]
 fn unique_test_dirs_include_process_id() {
     let first = unique_test_dir("pid-unique");
     let second = unique_test_dir("pid-unique");
@@ -146,7 +198,8 @@ fn guard_cleanup_after_panic_reaps_worker_socket_and_hub() {
     );
     let identity = wait_for_registry_worker(&data_dir);
     let command_pid = identity.pid.expect("panic-test command pid");
-    let worker_pid = worktree_session_worker_ancestor(command_pid).unwrap_or(command_pid);
+    let worker_pid =
+        validated_candidate_session_worker_ancestor(command_pid).unwrap_or(command_pid);
     let command_pgid = process_snapshot(command_pid)
         .map(|snapshot| snapshot.pgid)
         .unwrap_or(command_pid);
@@ -466,7 +519,8 @@ fn transfer_mode_keeps_worker_until_successor_cleans() {
     .expect("spawn transfer session");
     let identity = wait_for_registry_worker(&data_dir);
     let command_pid = identity.pid.expect("transfer command pid");
-    let worker_pid = worktree_session_worker_ancestor(command_pid).unwrap_or(command_pid);
+    let worker_pid =
+        validated_candidate_session_worker_ancestor(command_pid).unwrap_or(command_pid);
     wait_for_process_snapshot(command_pid, "own setsid", |snapshot| {
         snapshot.pgid != first.id() && snapshot.sid != first.id().to_string()
     });
@@ -502,7 +556,8 @@ fn guard_proof_requires_worker_pid_when_argv_omits_data_dir() {
     .expect("spawn argv-omit session");
     let identity = wait_for_registry_worker(&data_dir);
     let command_pid = identity.pid.expect("argv-omit command pid");
-    let worker_pid = worktree_session_worker_ancestor(command_pid).expect("worktree worker ancestor");
+    let worker_pid = validated_candidate_session_worker_ancestor(command_pid)
+        .expect("validated candidate worker ancestor");
     wait_for_process_snapshot(command_pid, "own setsid", |snapshot| {
         snapshot.pgid != daemon.id() && snapshot.sid != daemon.id().to_string()
     });

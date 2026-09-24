@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::mem;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use botster_core::{
     PackageConfigurationValue, PackageSource, RunnableEntrypointKind, RunnableEntrypointLaunchMode,
@@ -48,13 +49,17 @@ use crate::host_executor::HOST_PREPARED_BYTE_CAPACITY;
 use crate::packages::{
     PackageAction, PackageAdmissionReason, PackageDecision, PackageRegistryError, PackageState,
 };
-use crate::persistence::{FileHubStateStore, HubState, PreparedHubStateWrite};
+use crate::persistence::{
+    ExternalFileIntent, FileCommitError, FileCommitOutcome, FileHubStateStore, HubState,
+    HubStateAuthority, HubStateStoreError, HubStateUncertainWrite, PendingFileCommit,
+    PreparedHubStateWrite,
+};
 use crate::runtime::package_effect::{HostPackageCleanup, HostPackageRuntime};
 use crate::session_types::{
-    PackageSessionType, RepoSessionTypeFileSnapshot, SessionTypeMutation,
-    SessionTypeMutationSource, commit_repo_session_type_mutation,
-    list_session_types_with_staged_repo, restore_repo_session_type_file,
-    snapshot_repo_session_type_file,
+    PackageSessionType, RepoSessionTypeFileCommit, RepoSessionTypeFileSnapshot, SessionTypeError,
+    SessionTypeMutation, SessionTypeMutationSource, commit_repo_session_type_bytes,
+    encode_repo_session_type_bytes, list_session_types_with_staged_repo,
+    restore_repo_session_type_file, snapshot_repo_session_type_file,
 };
 use crate::shared_view::SharedView;
 use crate::{
@@ -207,6 +212,7 @@ pub(crate) enum HostPrepare {
     Package {
         request: DaemonRequest,
         base_revision: u64,
+        authority: Arc<HubStateAuthority>,
         state: SharedView<HubState>,
         packages: SharedView<PackageRegistry>,
         data_directory: PathBuf,
@@ -214,6 +220,7 @@ pub(crate) enum HostPrepare {
     ManagedWorktree {
         worktree: crate::Worktree,
         base_revision: u64,
+        authority: Arc<HubStateAuthority>,
         state: SharedView<HubState>,
         data_directory: PathBuf,
         superseded: Option<Box<PreparedMutation>>,
@@ -221,6 +228,7 @@ pub(crate) enum HostPrepare {
     RemoveManagedWorktree {
         worktree_id: String,
         base_revision: u64,
+        authority: Arc<HubStateAuthority>,
         state: SharedView<HubState>,
         data_directory: PathBuf,
         superseded: Option<Box<PreparedMutation>>,
@@ -228,6 +236,7 @@ pub(crate) enum HostPrepare {
     SpawnTarget {
         request: DaemonRequest,
         base_revision: u64,
+        authority: Arc<HubStateAuthority>,
         state: SharedView<HubState>,
         packages: SharedView<PackageRegistry>,
         data_directory: PathBuf,
@@ -235,6 +244,7 @@ pub(crate) enum HostPrepare {
     SessionType {
         request: DaemonRequest,
         base_revision: u64,
+        authority: Arc<HubStateAuthority>,
         config: HubConfig,
         state: SharedView<HubState>,
         packages: SharedView<PackageRegistry>,
@@ -255,6 +265,9 @@ pub(crate) struct HostRecover {
 
 /// A durable package rollback after an owner-only runtime effect failed.
 pub(crate) struct HostPackageRestore {
+    pub(crate) base_revision: u64,
+    pub(crate) authority: Arc<HubStateAuthority>,
+    pub(crate) current_state: SharedView<HubState>,
     pub(crate) previous_state: SharedView<HubState>,
     pub(crate) previous_packages: SharedView<PackageRegistry>,
     pub(crate) data_directory: PathBuf,
@@ -310,6 +323,15 @@ pub(crate) enum HostMutationResult {
     ReadReady(HostReply),
     Prepared(PreparedMutation),
     Committed(CommittedView),
+    PublishedUncertain {
+        write: HubStateUncertainWrite,
+        rollback: Option<RollbackDescriptor>,
+    },
+    ExternalEffectUncertain {
+        pending: PendingFileCommit,
+        rollback: RollbackDescriptor,
+        cause: ExternalEffectCause,
+    },
     Recovered(RecoveryOutcome),
     PackageRestored(RestoredPackageView),
     PackageRestoreFailed(crate::HubStateStoreError),
@@ -338,6 +360,14 @@ impl std::fmt::Debug for HostMutationResult {
                 .debug_struct("Committed")
                 .field("committed_revision", &committed.committed_revision)
                 .finish_non_exhaustive(),
+            Self::PublishedUncertain { write, .. } => formatter
+                .debug_tuple("PublishedUncertain")
+                .field(write)
+                .finish(),
+            Self::ExternalEffectUncertain { cause, .. } => formatter
+                .debug_tuple("ExternalEffectUncertain")
+                .field(cause)
+                .finish(),
             Self::Recovered(_) => formatter.write_str("Recovered(..)"),
             Self::PackageRestored(_) => formatter.write_str("PackageRestored(..)"),
             Self::PackageRestoreFailed(error) => formatter
@@ -433,21 +463,47 @@ fn execute_package_runtime_restore(
 
 fn execute_package_restore(restore: HostPackageRestore) -> HostMutationResult {
     let HostPackageRestore {
+        base_revision,
+        authority,
+        current_state,
         previous_state,
         previous_packages,
         data_directory,
     } = restore;
     let store = FileHubStateStore::for_data_directory(data_directory);
-    let write = match store.prepare_shared((*previous_state).clone(), &previous_state.budget()) {
+    let write = match store.prepare_shared(
+        &authority,
+        base_revision,
+        Some(current_state),
+        (*previous_state).clone(),
+        &previous_state.budget(),
+    ) {
         Ok(write) => write,
         Err(error) => return HostMutationResult::PackageRestoreFailed(error),
     };
-    match store.commit_shared(write) {
-        Ok(view) => HostMutationResult::PackageRestored(RestoredPackageView {
-            view,
-            packages: previous_packages,
-        }),
-        Err(error) => HostMutationResult::PackageRestoreFailed(error),
+    match store.commit_shared(write, base_revision) {
+        Ok(FileCommitOutcome::Synced { state: view, .. }) => {
+            HostMutationResult::PackageRestored(RestoredPackageView {
+                view,
+                packages: previous_packages,
+            })
+        }
+        Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+            HostMutationResult::PublishedUncertain {
+                write,
+                rollback: None,
+            }
+        }
+        Err(FileCommitError::Preparation(error))
+        | Err(FileCommitError::BeforePublication { error, .. }) => {
+            HostMutationResult::PackageRestoreFailed(error)
+        }
+        Err(FileCommitError::Stale(_)) => {
+            HostMutationResult::PackageRestoreFailed(crate::HubStateStoreError::StaleRevision)
+        }
+        Err(FileCommitError::RevisionExhausted(_)) => {
+            HostMutationResult::PackageRestoreFailed(crate::HubStateStoreError::RevisionExhausted)
+        }
     }
 }
 
@@ -537,7 +593,13 @@ pub(crate) enum PackageRuntimeEffect {
 }
 
 impl PackageRuntimeEffect {
-    pub(crate) fn restore_command(&self, data_directory: PathBuf) -> Option<HostPackageRestore> {
+    pub(crate) fn restore_command(
+        &self,
+        data_directory: PathBuf,
+        base_revision: u64,
+        authority: Arc<HubStateAuthority>,
+        current_state: SharedView<HubState>,
+    ) -> Option<HostPackageRestore> {
         let (previous_state, previous_packages) = match self {
             Self::Enable {
                 previous_state,
@@ -557,6 +619,9 @@ impl PackageRuntimeEffect {
             Self::Disable { .. } | Self::Remove { .. } => return None,
         };
         Some(HostPackageRestore {
+            base_revision,
+            authority,
+            current_state,
             previous_state,
             previous_packages,
             data_directory,
@@ -645,6 +710,27 @@ pub(crate) enum SessionTypeRecovery {
 pub(crate) struct HostMutationError {
     pub(crate) code: String,
     pub(crate) message: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum ExternalEffectCause {
+    RepoPublicationSyncUnconfirmed(SessionTypeError),
+    RepoSyncedStateRefused(HubStateStoreError),
+}
+
+impl ExternalEffectCause {
+    pub(crate) fn client_error(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::RepoPublicationSyncUnconfirmed(_) => (
+                "repo_session_type_publication_uncertain",
+                "the repository file was renamed, but its synchronization is unconfirmed; Hub state was not written",
+            ),
+            Self::RepoSyncedStateRefused(_) => (
+                "repo_session_type_state_refused",
+                "the repository file is synchronized, but the Hub state write was refused",
+            ),
+        }
+    }
 }
 
 impl HostMutationError {
@@ -1257,12 +1343,14 @@ fn execute_prepare(
         HostPrepare::Package {
             request,
             base_revision,
+            authority,
             state,
             packages,
             data_directory,
         } => prepare_package(
             request,
             base_revision,
+            authority,
             state,
             packages,
             entrypoints
@@ -1273,13 +1361,22 @@ fn execute_prepare(
         HostPrepare::SpawnTarget {
             request,
             base_revision,
+            authority,
             state,
             packages,
             data_directory,
-        } => prepare_spawn_target(request, base_revision, state, packages, data_directory),
+        } => prepare_spawn_target(
+            request,
+            base_revision,
+            authority,
+            state,
+            packages,
+            data_directory,
+        ),
         HostPrepare::SessionType {
             request,
             base_revision,
+            authority,
             config,
             state,
             packages,
@@ -1287,6 +1384,7 @@ fn execute_prepare(
         } => prepare_session_type(
             request,
             base_revision,
+            authority,
             config,
             state,
             packages,
@@ -1295,24 +1393,36 @@ fn execute_prepare(
         HostPrepare::ManagedWorktree {
             worktree,
             base_revision,
+            authority,
             state,
             data_directory,
             superseded,
         } => {
-            let result =
-                prepare_managed_worktree_record(worktree, base_revision, state, data_directory);
+            let result = prepare_managed_worktree_record(
+                worktree,
+                base_revision,
+                authority,
+                state,
+                data_directory,
+            );
             drop(superseded);
             result
         }
         HostPrepare::RemoveManagedWorktree {
             worktree_id,
             base_revision,
+            authority,
             state,
             data_directory,
             superseded,
         } => {
-            let result =
-                prepare_managed_worktree_removal(worktree_id, base_revision, state, data_directory);
+            let result = prepare_managed_worktree_removal(
+                worktree_id,
+                base_revision,
+                authority,
+                state,
+                data_directory,
+            );
             drop(superseded);
             result
         }
@@ -1322,6 +1432,7 @@ fn execute_prepare(
 fn prepare_managed_worktree_removal(
     worktree_id: String,
     base_revision: u64,
+    authority: Arc<HubStateAuthority>,
     state: SharedView<HubState>,
     data_directory: PathBuf,
 ) -> Result<PreparedMutation, HostMutationError> {
@@ -1331,6 +1442,7 @@ fn prepare_managed_worktree_removal(
     });
     prepare_state_change(
         base_revision,
+        authority,
         state,
         candidate,
         data_directory,
@@ -1344,6 +1456,7 @@ fn prepare_managed_worktree_removal(
 fn prepare_managed_worktree_record(
     worktree: crate::Worktree,
     base_revision: u64,
+    authority: Arc<HubStateAuthority>,
     state: SharedView<HubState>,
     data_directory: PathBuf,
 ) -> Result<PreparedMutation, HostMutationError> {
@@ -1368,6 +1481,7 @@ fn prepare_managed_worktree_record(
     }
     prepare_state_change(
         base_revision,
+        authority,
         state,
         candidate,
         data_directory,
@@ -1381,6 +1495,7 @@ fn prepare_managed_worktree_record(
 fn prepare_package(
     request: DaemonRequest,
     base_revision: u64,
+    authority: Arc<HubStateAuthority>,
     state: SharedView<HubState>,
     packages: SharedView<PackageRegistry>,
     entrypoint_processes: Vec<EntrypointProcessSnapshot>,
@@ -1590,6 +1705,7 @@ fn prepare_package(
         )?;
     prepare_state_change(
         base_revision,
+        authority,
         state,
         candidate_state,
         data_directory,
@@ -1603,6 +1719,7 @@ fn prepare_package(
 fn prepare_spawn_target(
     request: DaemonRequest,
     base_revision: u64,
+    authority: Arc<HubStateAuthority>,
     state: SharedView<HubState>,
     packages: SharedView<PackageRegistry>,
     data_directory: PathBuf,
@@ -1767,6 +1884,7 @@ fn prepare_spawn_target(
     };
     prepare_state_change(
         base_revision,
+        authority,
         state,
         candidate,
         data_directory,
@@ -1780,6 +1898,7 @@ fn prepare_spawn_target(
 fn prepare_session_type(
     request: DaemonRequest,
     base_revision: u64,
+    authority: Arc<HubStateAuthority>,
     config: HubConfig,
     state: SharedView<HubState>,
     packages: SharedView<PackageRegistry>,
@@ -1866,7 +1985,13 @@ fn prepare_session_type(
     }
     let store = FileHubStateStore::for_data_directory(data_directory);
     let write = store
-        .prepare_shared(candidate, &state.budget())
+        .prepare_shared(
+            &authority,
+            base_revision,
+            Some(state.clone()),
+            candidate,
+            &state.budget(),
+        )
         .map_err(|error| HostMutationError::new("hub_state_prepare_failed", error.to_string()))?;
     Ok(PreparedMutation {
         base_revision,
@@ -1890,6 +2015,7 @@ fn prepare_session_type(
 
 fn prepare_state_change(
     base_revision: u64,
+    authority: Arc<HubStateAuthority>,
     previous: SharedView<HubState>,
     candidate: HubState,
     data_directory: PathBuf,
@@ -1913,7 +2039,13 @@ fn prepare_state_change(
     }
     let store = FileHubStateStore::for_data_directory(data_directory);
     let write = store
-        .prepare_shared(candidate, &previous.budget())
+        .prepare_shared(
+            &authority,
+            base_revision,
+            Some(previous.clone()),
+            candidate,
+            &previous.budget(),
+        )
         .map_err(|error| HostMutationError::new("hub_state_prepare_failed", error.to_string()))?;
     let change = PreparedStateChange {
         store,
@@ -2021,16 +2153,25 @@ fn execute_commit(commit: HostCommit) -> HostMutationResult {
         packages,
         package_effect,
     } = into_state_change(change);
-    match store.commit_shared(write) {
-        Ok(view) => HostMutationResult::Committed(CommittedView {
-            committed_revision,
+    match store.commit_shared(write, base_revision) {
+        Ok(FileCommitOutcome::Synced {
+            state: view,
+            revision,
+        }) => HostMutationResult::Committed(CommittedView {
+            committed_revision: revision,
             view,
             packages,
             package_effect,
             reply,
         }),
+        Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+            HostMutationResult::PublishedUncertain {
+                write,
+                rollback: None,
+            }
+        }
         Err(error) => {
-            let failure = HostMutationError::new("hub_state_commit_failed", error.to_string());
+            let failure = file_commit_error(error);
             HostMutationResult::Recovered(execute_recovery(HostRecover { rollback, failure }))
         }
     }
@@ -2051,25 +2192,129 @@ fn execute_session_type_commit(
     } = state;
     debug_assert!(packages.is_none());
     debug_assert!(package_effect.is_none());
-    if let Err(error) = commit_repo_session_type_mutation(repo_write) {
-        return HostMutationResult::Recovered(execute_recovery(HostRecover {
+    let Some((root, definitions)) = repo_write else {
+        return finish_session_type_state_commit(
+            store.commit_shared(write, committed_revision - 1),
             rollback,
-            failure: session_type_error(error),
-        }));
+            reply,
+        );
+    };
+    let RollbackDescriptor::SessionType {
+        repo_file: Some(repo_prior),
+        ..
+    } = &rollback
+    else {
+        return HostMutationResult::Failed(HostMutationError::new(
+            "repo_session_type_recovery_required",
+            "repository file prior evidence is missing",
+        ));
+    };
+    if repo_prior.root != root {
+        return HostMutationResult::Failed(HostMutationError::new(
+            "repo_session_type_recovery_required",
+            "repository file root changed after preparation",
+        ));
     }
-    match store.commit_shared(write) {
-        Ok(view) => HostMutationResult::Committed(CommittedView {
-            committed_revision,
+    let current_prior = match snapshot_repo_session_type_file(&root, HOST_PREPARED_BYTE_CAPACITY) {
+        Ok(prior) => prior,
+        Err(error) => return HostMutationResult::Failed(session_type_error(error)),
+    };
+    if current_prior != repo_prior.prior {
+        return HostMutationResult::Failed(HostMutationError::new(
+            "repo_session_type_recovery_required",
+            "repository file changed after preparation",
+        ));
+    }
+    let repo_bytes = match encode_repo_session_type_bytes(&definitions) {
+        Ok(bytes) => bytes,
+        Err(error) => return HostMutationResult::Failed(session_type_error(error)),
+    };
+    let external_path = root.join(".botster/session-types.json");
+    let prior_bytes = match &repo_prior.prior {
+        RepoSessionTypeFileSnapshot::Missing => None,
+        RepoSessionTypeFileSnapshot::Present(bytes) => Some(bytes.as_slice()),
+    };
+    let pending = match store.begin_shared_effect(
+        write,
+        committed_revision - 1,
+        Some(ExternalFileIntent {
+            path: &external_path,
+            prior: prior_bytes,
+            candidate: &repo_bytes,
+        }),
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            return HostMutationResult::Failed(HostMutationError::new(
+                "repo_session_type_recovery_required",
+                file_commit_error(error).message,
+            ));
+        }
+    };
+    match commit_repo_session_type_bytes(&root, &repo_bytes) {
+        Ok(RepoSessionTypeFileCommit::Synced) => {}
+        Ok(RepoSessionTypeFileCommit::PublishedUncertain(error)) => {
+            return HostMutationResult::ExternalEffectUncertain {
+                pending,
+                rollback,
+                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed(error),
+            };
+        }
+        Err(error) => {
+            return HostMutationResult::Failed(HostMutationError::new(
+                "repo_session_type_recovery_required",
+                error.message,
+            ));
+        }
+    }
+    match store.commit_shared_effect(pending) {
+        Ok(outcome) => finish_session_type_state_commit(Ok(outcome), rollback, reply),
+        Err(failure) => HostMutationResult::ExternalEffectUncertain {
+            pending: failure.pending,
+            rollback,
+            cause: ExternalEffectCause::RepoSyncedStateRefused(failure.error),
+        },
+    }
+}
+
+fn finish_session_type_state_commit(
+    result: Result<FileCommitOutcome, FileCommitError>,
+    rollback: RollbackDescriptor,
+    reply: HostReply,
+) -> HostMutationResult {
+    match result {
+        Ok(FileCommitOutcome::Synced {
+            state: view,
+            revision,
+        }) => HostMutationResult::Committed(CommittedView {
+            committed_revision: revision,
             view,
             packages: None,
             package_effect: None,
             reply,
         }),
+        Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+            HostMutationResult::PublishedUncertain {
+                write,
+                rollback: Some(rollback),
+            }
+        }
         Err(error) => HostMutationResult::Recovered(execute_recovery(HostRecover {
             rollback,
-            failure: HostMutationError::new("hub_state_commit_failed", error.to_string()),
+            failure: file_commit_error(error),
         })),
     }
+}
+
+fn file_commit_error(error: FileCommitError) -> HostMutationError {
+    let detail = match error {
+        FileCommitError::Preparation(error) | FileCommitError::BeforePublication { error, .. } => {
+            error.to_string()
+        }
+        FileCommitError::Stale(_) => "prepared state revision is stale".to_string(),
+        FileCommitError::RevisionExhausted(_) => "Hub state revision cannot advance".to_string(),
+    };
+    HostMutationError::new("hub_state_commit_failed", detail)
 }
 
 fn execute_recovery(recover: HostRecover) -> RecoveryOutcome {
@@ -2290,11 +2535,12 @@ fn daemon_error(error: DaemonTransportError) -> HostMutationError {
 }
 
 fn package_error(error: PackageRegistryError) -> HostMutationError {
+    let package_name = crate::daemon_projection::package_error_display_name(&error);
     HostMutationError::new(
         "package_policy_rejected",
         format!(
             "package {} was rejected: {:?}",
-            error.package_name, error.reason
+            package_name, error.reason
         ),
     )
 }
@@ -2397,7 +2643,6 @@ mod tests {
 
     use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
     use crate::packages::{HubPackageEvents, HubPackageManifest, PackageProvenance};
-    use crate::shared_view::SharedViewBudget;
     use botster_core::{
         ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, PackageConfigurationField,
         PackageConfigurationFieldType, PackageConfigurationSchema, PackageSource,
@@ -2406,7 +2651,14 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn inputs(name: &str) -> (SharedView<HubState>, SharedView<PackageRegistry>, PathBuf) {
+    fn inputs(
+        name: &str,
+    ) -> (
+        SharedView<HubState>,
+        SharedView<PackageRegistry>,
+        PathBuf,
+        Arc<HubStateAuthority>,
+    ) {
         let data_directory = unique_test_dir(name);
         let config = HubStartupOptions {
             data_directory: DataDirectoryOption::Explicit(data_directory.clone()),
@@ -2414,14 +2666,42 @@ mod tests {
         }
         .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
         .expect("build host mutation test config");
-        let budget = SharedViewBudget::new();
+        let authority = Arc::new(
+            FileHubStateStore::for_data_directory(&data_directory)
+                .acquire_test_authority()
+                .expect("acquire host mutation test authority"),
+        );
+        let budget = authority.budget();
         let packages = PackageRegistry::new(botster_core::CapabilitySet::new());
         let state = HubState::from_config(&config);
         (
             SharedView::try_new(&budget, state, 1).expect("state view fits"),
             SharedView::try_new(&budget, packages, 1).expect("package view fits"),
             data_directory,
+            authority,
         )
+    }
+
+    fn persisted_inputs(
+        name: &str,
+    ) -> (
+        SharedView<HubState>,
+        SharedView<PackageRegistry>,
+        PathBuf,
+        Arc<HubStateAuthority>,
+    ) {
+        let (state, packages, data_directory, authority) = inputs(name);
+        let store = FileHubStateStore::for_data_directory(&data_directory);
+        let prepared = store
+            .prepare_shared(&authority, 0, None, (*state).clone(), &authority.budget())
+            .expect("prepare initial state fixture");
+        let FileCommitOutcome::Synced { state, .. } = store
+            .commit_shared(prepared, 0)
+            .expect("commit initial state fixture")
+        else {
+            panic!("initial state fixture must synchronize");
+        };
+        (state, packages, data_directory, authority)
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
@@ -2467,8 +2747,51 @@ mod tests {
         }
     }
 
-    fn package_inputs(name: &str) -> (SharedView<HubState>, SharedView<PackageRegistry>, PathBuf) {
-        let (state, _empty_packages, data_directory) = inputs(name);
+    #[test]
+    fn host_package_error_uses_existing_display_name_policy() {
+        let path = "/private/local-package/botster-package.json";
+        for reason in [
+            PackageAdmissionReason::InvalidLocalManifest("invalid JSON".to_string()),
+            PackageAdmissionReason::UnsafeLocalPath("path unavailable".to_string()),
+        ] {
+            let error = PackageRegistryError::without_record(
+                path,
+                PackageAction::Install,
+                reason,
+                "install local package".to_string(),
+            );
+            let response = package_error(error);
+            assert_eq!(response.code, "package_policy_rejected");
+            assert!(response.message.starts_with("package <local-package> was rejected: "));
+            assert!(!response.message.contains(path));
+        }
+
+        let named = package_error(PackageRegistryError::without_record(
+            "named.plugin",
+            PackageAction::Install,
+            PackageAdmissionReason::AlreadyInstalled,
+            "install package".to_string(),
+        ));
+        assert!(named.message.contains("package named.plugin was rejected"));
+
+        let refresh = package_error(PackageRegistryError::without_record(
+            path,
+            PackageAction::Show,
+            PackageAdmissionReason::InvalidLocalManifest("invalid JSON".to_string()),
+            "refresh local package registrations".to_string(),
+        ));
+        assert!(refresh.message.contains(path));
+    }
+
+    fn package_inputs(
+        name: &str,
+    ) -> (
+        SharedView<HubState>,
+        SharedView<PackageRegistry>,
+        PathBuf,
+        Arc<HubStateAuthority>,
+    ) {
+        let (state, _empty_packages, data_directory, authority) = inputs(name);
         let mut packages = PackageRegistry::new(botster_core::CapabilitySet::new());
         packages
             .install(
@@ -2519,11 +2842,12 @@ mod tests {
             .expect("install package fixture");
         let mut matched_state = (*state).clone();
         matched_state.package_registry = packages.snapshot();
-        let budget = SharedViewBudget::new();
+        let budget = authority.budget();
         (
             SharedView::try_new(&budget, matched_state, 1).expect("state view fits"),
             SharedView::try_new(&budget, packages, 1).expect("package view fits"),
             data_directory,
+            authority,
         )
     }
 
@@ -2535,8 +2859,9 @@ mod tests {
         SharedView<PackageRegistry>,
         PathBuf,
         String,
+        Arc<HubStateAuthority>,
     ) {
-        let (state, packages, data_directory) = inputs(name);
+        let (state, packages, data_directory, authority) = inputs(name);
         let repo_root = data_directory.join("repo");
         fs::create_dir_all(&repo_root).expect("create repository fixture");
         let config = HubStartupOptions {
@@ -2560,13 +2885,24 @@ mod tests {
             },
         )
         .expect("create admitted target fixture");
-        let budget = SharedViewBudget::new();
+        let budget = authority.budget();
+        let store = FileHubStateStore::for_data_directory(&data_directory);
+        let prepared = store
+            .prepare_shared(&authority, 0, None, candidate, &budget)
+            .expect("prepare initial state fixture");
+        let crate::persistence::FileCommitOutcome::Synced { state, .. } = store
+            .commit_shared(prepared, 0)
+            .expect("commit initial state fixture")
+        else {
+            panic!("initial state fixture must synchronize");
+        };
         (
             config,
-            SharedView::try_new(&budget, candidate, 1).expect("state view fits"),
+            state,
             packages,
             data_directory,
             target_id,
+            authority,
         )
     }
 
@@ -2599,7 +2935,7 @@ mod tests {
 
     #[test]
     fn read_owns_input_and_has_a_deterministic_checked_reply() {
-        let (state, _packages, _directory) = inputs("owned-read");
+        let (state, _packages, _directory, _authority) = inputs("owned-read");
         let target_id = String::from("owned-target");
         let request = DaemonRequest::ValidateSpawnTarget {
             target_id: target_id.clone(),
@@ -2635,7 +2971,7 @@ mod tests {
 
     #[test]
     fn package_read_uses_the_owned_registry_view() {
-        let (_state, packages, directory) = inputs("package-read");
+        let (_state, packages, directory, _authority) = inputs("package-read");
         let config = test_config(directory);
         let HostMutationResult::ReadReady(reply) =
             execute(HostMutationCommand::Read(HostRead::Package {
@@ -2652,7 +2988,7 @@ mod tests {
 
     #[test]
     fn package_read_routes_each_immutable_package_request() {
-        let (_state, packages, data_directory) = package_inputs("package-read-routes");
+        let (_state, packages, data_directory, _authority) = package_inputs("package-read-routes");
         let config = test_config(data_directory.clone());
         let missing_registry = data_directory.join("missing-registry.json");
         let requests = vec![
@@ -2698,7 +3034,7 @@ mod tests {
 
     #[test]
     fn package_prepare_returns_typed_runtime_effects() {
-        let (state, packages, data_directory) = package_inputs("package-effects");
+        let (state, packages, data_directory, authority) = package_inputs("package-effects");
         let requests = vec![
             DaemonRequest::EnablePackage {
                 package_name: "configured.plugin".to_string(),
@@ -2716,6 +3052,7 @@ mod tests {
                 execute(HostMutationCommand::Prepare(HostPrepare::Package {
                     request,
                     base_revision: 3,
+                    authority: authority.clone(),
                     state: state.clone(),
                     packages: packages.clone(),
                     data_directory: data_directory.clone(),
@@ -2739,7 +3076,8 @@ mod tests {
 
     #[test]
     fn refresh_effect_retains_exact_compensation_inputs() {
-        let (state, packages, data_directory) = package_inputs("package-refresh-compensation");
+        let (state, packages, data_directory, authority) =
+            package_inputs("package-refresh-compensation");
         let snapshot = EntrypointProcessSnapshot {
             package_name: "configured.plugin".to_string(),
             entrypoint_id: "worker".to_string(),
@@ -2754,6 +3092,7 @@ mod tests {
         let prepared = prepare_package(
             DaemonRequest::RefreshLocalPackages,
             5,
+            authority,
             state.clone(),
             packages.clone(),
             vec![snapshot],
@@ -2782,7 +3121,7 @@ mod tests {
 
     #[test]
     fn package_prepare_routes_each_filesystem_mutation() {
-        let (state, packages, data_directory) = package_inputs("package-prepare-routes");
+        let (state, packages, data_directory, authority) = package_inputs("package-prepare-routes");
         let missing_path = data_directory.join("missing-package");
         let requests = vec![
             DaemonRequest::InstallPackageRegistryEntry {
@@ -2805,6 +3144,7 @@ mod tests {
             let result = execute(HostMutationCommand::Prepare(HostPrepare::Package {
                 request,
                 base_revision: 3,
+                authority: authority.clone(),
                 state: state.clone(),
                 packages: packages.clone(),
                 data_directory: data_directory.clone(),
@@ -2817,7 +3157,7 @@ mod tests {
 
     #[test]
     fn session_type_read_uses_the_owned_state_and_registry_views() {
-        let (config, state, packages, data_directory, _target_id) =
+        let (config, state, packages, data_directory, _target_id, _authority) =
             session_type_inputs("session-type-read");
         let HostMutationResult::ReadReady(reply) =
             execute(HostMutationCommand::Read(HostRead::SessionType {
@@ -2836,7 +3176,7 @@ mod tests {
 
     #[test]
     fn package_configuration_prepare_keeps_the_base_registry_unchanged() {
-        let (state, packages, data_directory) = package_inputs("package-prepare");
+        let (state, packages, data_directory, authority) = package_inputs("package-prepare");
         let original_snapshot = packages.snapshot();
         let value = PackageConfigurationValue::String {
             value: "updated".to_string(),
@@ -2851,6 +3191,7 @@ mod tests {
                     )]),
                 },
                 base_revision: 9,
+                authority,
                 state,
                 packages: packages.clone(),
                 data_directory,
@@ -2872,13 +3213,14 @@ mod tests {
 
     #[test]
     fn prepare_retains_revision_and_does_not_mutate_or_write_the_base() {
-        let (state, packages, data_directory) = inputs("prepare-only");
+        let (state, packages, data_directory, authority) = inputs("prepare-only");
         let original = (*state).clone();
         let state_path = data_directory.join("hub-state.json");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
                 request: create_target_request("prepared-target".to_string()),
                 base_revision: 41,
+                authority,
                 state: state.clone(),
                 packages,
                 data_directory,
@@ -2899,11 +3241,12 @@ mod tests {
 
     #[test]
     fn commit_publishes_the_candidate_and_advances_one_revision() {
-        let (state, packages, data_directory) = inputs("commit");
+        let (state, packages, data_directory, authority) = persisted_inputs("commit");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
                 request: create_target_request("committed-target".to_string()),
                 base_revision: 7,
+                authority,
                 state,
                 packages,
                 data_directory: data_directory.clone(),
@@ -2931,12 +3274,15 @@ mod tests {
 
     #[test]
     fn failed_atomic_commit_returns_the_typed_previous_view() {
-        let (state, packages, data_directory) = inputs("recover");
+        let (state, packages, data_directory, authority) = persisted_inputs("recover");
         let expected = (*state).clone();
+        let prior_bytes =
+            fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
                 request: create_target_request("recovered-target".to_string()),
                 base_revision: 2,
+                authority,
                 state,
                 packages,
                 data_directory: data_directory.clone(),
@@ -2952,19 +3298,57 @@ mod tests {
         };
         assert_eq!(*view, expected);
         assert_eq!(failure.code, "hub_state_commit_failed");
-        assert!(!data_directory.join("hub-state.json").exists());
+        assert_eq!(
+            fs::read(data_directory.join("hub-state.json")).expect("read unchanged state"),
+            prior_bytes
+        );
+        fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
+    }
+
+    #[test]
+    fn uncertain_commit_keeps_both_views_and_does_not_run_recovery() {
+        let (state, packages, data_directory, authority) = persisted_inputs("uncertain-commit");
+        let expected = (*state).clone();
+        let HostMutationResult::Prepared(prepared) =
+            execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+                request: create_target_request("uncertain-target".to_string()),
+                base_revision: 2,
+                authority,
+                state,
+                packages,
+                data_directory: data_directory.clone(),
+            }))
+        else {
+            panic!("spawn-target preparation must succeed");
+        };
+        FileHubStateStore::inject_next_directory_sync_failure(&data_directory);
+        let HostMutationResult::PublishedUncertain { write, rollback } =
+            execute(HostMutationCommand::Commit(HostCommit { prepared }))
+        else {
+            panic!("directory sync failure must return the uncertain write");
+        };
+        assert_eq!(write.base_revision(), 2);
+        assert_eq!(write.committed_revision(), 3);
+        assert!(rollback.is_none());
+        assert_eq!(write.prior(), Some(&expected));
+        assert_eq!(
+            write.candidate().spawn_targets[0].target_id,
+            "uncertain-target"
+        );
+        drop(write);
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
     #[test]
     fn repo_session_type_commit_writes_the_repo_before_publishing_state() {
-        let (config, state, packages, data_directory, target_id) =
+        let (config, state, packages, data_directory, target_id, authority) =
             session_type_inputs("session-type-commit");
         let repo_file = data_directory.join("repo/.botster/session-types.json");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
                 request: session_type_create_request(target_id),
                 base_revision: 11,
+                authority,
                 config,
                 state,
                 packages,
@@ -2990,15 +3374,17 @@ mod tests {
     }
 
     #[test]
-    fn failed_state_commit_restores_the_exact_repo_file_state() {
-        let (config, state, packages, data_directory, target_id) =
+    fn failed_state_commit_keeps_the_repo_effect_and_durable_intent() {
+        let (config, state, packages, data_directory, target_id, authority) =
             session_type_inputs("session-type-recovery");
-        let expected = state.clone();
         let repo_file = data_directory.join("repo/.botster/session-types.json");
+        let prior_state_bytes =
+            fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
                 request: session_type_create_request(target_id),
                 base_revision: 4,
+                authority,
                 config,
                 state,
                 packages,
@@ -3008,23 +3394,139 @@ mod tests {
             panic!("session-type prepare must succeed");
         };
         FileHubStateStore::inject_next_save_failure(&data_directory);
-        let HostMutationResult::Recovered(RecoveryOutcome::SessionType {
-            view,
-            failure,
-            recovery: SessionTypeRecovery::Restored,
-        }) = execute(HostMutationCommand::Commit(HostCommit { prepared }))
+        let HostMutationResult::ExternalEffectUncertain {
+            pending,
+            rollback:
+                RollbackDescriptor::SessionType {
+                    repo_file: Some(prior),
+                    ..
+                },
+            cause: ExternalEffectCause::RepoSyncedStateRefused(_),
+        } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
         else {
-            panic!("failed session-type state commit must restore the repository file");
+            panic!("failed state commit must retain the repo effect for reconciliation");
         };
-        assert!(SharedView::ptr_eq(&view, &expected));
-        assert_eq!(failure.code, "hub_state_commit_failed");
-        assert!(!repo_file.exists());
+        assert_eq!(pending.receipt_sequence(), 2);
+        assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
+        assert!(repo_file.is_file());
+        assert!(data_directory.join("hub-recovery.log").is_file());
+        assert_eq!(
+            fs::read(data_directory.join("hub-state.json")).expect("read retained state"),
+            prior_state_bytes
+        );
+        drop(pending);
+        assert!(matches!(
+            crate::recovery::journal::RecoveryJournal::scan(
+                crate::recovery::state_directory::StateDirectoryOwnership::acquire(&data_directory)
+                    .expect("reopen state directory"),
+                true,
+            ),
+            Err(crate::recovery::journal::JournalError::Unresolved(2))
+        ));
+        fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
+    }
+
+    #[test]
+    fn uncertain_session_type_commit_retains_repo_file_rollback() {
+        let (config, state, packages, data_directory, target_id, authority) =
+            session_type_inputs("session-type-uncertain");
+        let repo_file = data_directory.join("repo/.botster/session-types.json");
+        let HostMutationResult::Prepared(prepared) =
+            execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
+                request: session_type_create_request(target_id),
+                base_revision: 4,
+                authority,
+                config,
+                state,
+                packages,
+                data_directory: data_directory.clone(),
+            }))
+        else {
+            panic!("session-type preparation must succeed");
+        };
+        FileHubStateStore::inject_next_directory_sync_failure(&data_directory);
+        let HostMutationResult::PublishedUncertain {
+            write,
+            rollback:
+                Some(RollbackDescriptor::SessionType {
+                    repo_file: Some(prior),
+                    ..
+                }),
+        } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
+        else {
+            panic!("uncertain state publication must retain the repo rollback");
+        };
+        assert!(repo_file.is_file());
+        assert_eq!(write.candidate().session_type_generation, 1);
+        assert_eq!(
+            fs::canonicalize(prior.root.join(".botster/session-types.json"))
+                .expect("canonicalize retained repo file"),
+            fs::canonicalize(&repo_file).expect("canonicalize fixture repo file"),
+        );
+        assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
+        drop(write);
+        fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
+    }
+
+    #[test]
+    fn repo_directory_sync_failure_retains_the_intent_and_prior_file() {
+        let (config, state, packages, data_directory, target_id, authority) =
+            session_type_inputs("repo-directory-sync-uncertain");
+        let root = data_directory.join("repo");
+        let repo_file = root.join(".botster/session-types.json");
+        let prior_state_bytes =
+            fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
+        let HostMutationResult::Prepared(prepared) =
+            execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
+                request: session_type_create_request(target_id),
+                base_revision: 4,
+                authority,
+                config,
+                state,
+                packages,
+                data_directory: data_directory.clone(),
+            }))
+        else {
+            panic!("session-type preparation must succeed");
+        };
+        crate::session_types::inject_next_repo_directory_sync_failure(&root);
+        let HostMutationResult::ExternalEffectUncertain {
+            pending,
+            rollback:
+                RollbackDescriptor::SessionType {
+                    repo_file: Some(prior),
+                    ..
+                },
+            cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed(error),
+        } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
+        else {
+            panic!("repo rename with failed directory sync must retain uncertainty");
+        };
+        assert_eq!(error.kind, "repo_session_type_sync_uncertain");
+        assert_eq!(pending.receipt_sequence(), 2);
+        assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
+        assert!(repo_file.is_file());
+        assert!(data_directory.join("hub-recovery.log").is_file());
+        assert_eq!(
+            fs::read(data_directory.join("hub-state.json")).expect("read retained state"),
+            prior_state_bytes
+        );
+        drop(pending);
+        assert!(matches!(
+            crate::recovery::journal::RecoveryJournal::scan(
+                crate::recovery::state_directory::StateDirectoryOwnership::acquire(&data_directory)
+                    .expect("reopen state directory"),
+                true,
+            ),
+            Err(crate::recovery::journal::JournalError::Unresolved(2))
+        ));
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
     #[test]
     fn failed_session_type_compensation_retains_its_rollback() {
-        let (state, _packages, data_directory) = inputs("session-type-partial-recovery");
+        let (state, _packages, data_directory, _authority) =
+            inputs("session-type-partial-recovery");
         let unavailable_root = data_directory.join("unavailable-repo");
         let failure = HostMutationError::new("commit_failed", "commit failed");
         let HostMutationResult::Recovered(RecoveryOutcome::SessionType {
@@ -3060,7 +3562,7 @@ mod tests {
 
     #[test]
     fn explicit_recovery_preserves_its_typed_family() {
-        let (state, _packages, _directory) = inputs("explicit-recovery");
+        let (state, _packages, _directory, _authority) = inputs("explicit-recovery");
         let failure = HostMutationError::new("commit_failed", "commit failed");
         let HostMutationResult::Recovered(RecoveryOutcome::RegisteredWorktree {
             view,
@@ -3086,11 +3588,12 @@ mod tests {
 
     #[test]
     fn family_mismatch_is_rejected_before_commit() {
-        let (state, packages, data_directory) = inputs("family-mismatch");
+        let (state, packages, data_directory, authority) = inputs("family-mismatch");
         let HostMutationResult::Prepared(mut prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
                 request: create_target_request("mismatch-target".to_string()),
                 base_revision: 1,
+                authority,
                 state: state.clone(),
                 packages,
                 data_directory,

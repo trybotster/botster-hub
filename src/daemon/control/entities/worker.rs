@@ -42,6 +42,7 @@ pub(super) struct EntityWork {
     generation_checked: Option<bool>,
     deferred_completion: Option<(HostJobIdentity, Completion)>,
     resync_pending: bool,
+    catchup_seen: bool,
     cancel_resync_recorded: bool,
 }
 
@@ -213,6 +214,7 @@ impl EntityWork {
             generation_checked: None,
             deferred_completion: None,
             resync_pending: false,
+            catchup_seen: false,
             cancel_resync_recorded: false,
         }
     }
@@ -519,6 +521,20 @@ mod tests {
             Some((_, Completion::Reclaimed))
         ));
         assert_reserved_slots(&executor, 0);
+    }
+
+    #[test]
+    fn cancelling_a_running_delivery_does_not_release_its_completion_fence() {
+        let identity = HostJobIdentity::first(WaiterId(703));
+        let mut work = EntityWork::new(None);
+        work.phase = Phase::Running(identity);
+        let publication = Arc::new(AtomicBool::new(true));
+        work.publication = Some(Arc::clone(&publication));
+
+        work.cancel();
+
+        assert!(work.accepts(identity));
+        assert!(!publication.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1186,7 +1202,8 @@ pub(super) fn step(
     entry: &mut super::PendingPluginEntity,
 ) -> Step {
     use crate::subscription::entity::{
-        arm_package_entity_delivery, complete_package_entity_delivery, next_package_entity_target,
+        arm_package_entity_delivery, complete_package_entity_delivery,
+        exact_package_entity_target_catching_up, next_package_entity_target,
     };
     let Some(runtime) = daemon.runtime() else {
         entry.work.cancel();
@@ -1326,6 +1343,7 @@ pub(super) fn step(
                 );
                 if catching_up && generation_is_current {
                     entry.work.resync_pending = true;
+                    entry.work.catchup_seen = true;
                     if let Some(finish) = &mut entry.work.finish {
                         finish.scheduled_resync = true;
                     }
@@ -1522,13 +1540,28 @@ pub(super) fn step(
                 .family
                 .as_ref()
                 .expect("a prepared snapshot has a family");
+            let origin = match &entry.kind {
+                super::PendingPluginEntityKind::Subscribe(_) => {
+                    crate::runtime::entity_model::SnapshotOrigin::Subscribe
+                }
+                super::PendingPluginEntityKind::Resync { .. } => {
+                    crate::runtime::entity_model::SnapshotOrigin::Resync
+                }
+                super::PendingPluginEntityKind::Fanout { .. } => {
+                    unreachable!("fanout bypasses snapshot begin")
+                }
+                super::PendingPluginEntityKind::Disposing => unreachable!("disposed entity work"),
+            };
             entry.work.model_operation = Some(crate::runtime::entity_model::Operation::Family {
                 name: Some(Arc::clone(family)),
                 expected_generation: entry
                     .work
                     .family_generation
                     .expect("snapshot begin retains its generation"),
-                action: crate::runtime::entity_model::FamilyAction::BeginSnapshot(sequence),
+                action: crate::runtime::entity_model::FamilyAction::BeginSnapshot {
+                    sequence,
+                    origin,
+                },
                 progress: None,
             });
             entry.work.model_purpose = Some(ModelPurpose::BeginSnapshot);
@@ -1586,12 +1619,9 @@ pub(super) fn step(
                 entry.work.snapshot,
                 entry.work.floor,
             ) else {
-                if state
-                    .entity_subscriptions
-                    .get(&target.subscription_id)
-                    .is_some_and(|subscription| subscription.package_catching_up)
-                {
+                if exact_package_entity_target_catching_up(state, &target) {
                     entry.work.resync_pending = true;
+                    entry.work.catchup_seen = true;
                     if let Some(finish) = &mut entry.work.finish {
                         finish.scheduled_resync = true;
                     }
@@ -1626,6 +1656,10 @@ pub(super) fn step(
                         .work
                         .family_generation
                         .expect("snapshot drain retains its generation"),
+                    preserve_resync_need: matches!(
+                        &entry.kind,
+                        super::PendingPluginEntityKind::Subscribe(_)
+                    ) || entry.work.catchup_seen,
                     generation: None,
                     retained: Default::default(),
                 });

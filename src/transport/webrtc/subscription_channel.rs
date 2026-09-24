@@ -624,6 +624,7 @@ async fn run_bound_entity_channel<C>(
             biased;
             frame = receiver.recv() => {
                 let Some(entity) = frame else { break };
+                route.peer_state.entity_capacity_wake.publish();
                 let (frames, retained_delivery) = match entity {
                     crate::entity_delivery::EntityDelivery::Typed(entity) => (framed_server_frame(stream_key, &ServerFrame::Entity { entity }), None),
                     crate::entity_delivery::EntityDelivery::Encoded(delivery) => {
@@ -847,17 +848,26 @@ where
     tokio::time::timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND, data_channel.local_close()).await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageQueryFailure {
+    ChannelClosed,
+    Other,
+}
+
 async fn publish_channel_usage<C>(
     data_channel: &C,
     usage: &std::sync::atomic::AtomicUsize,
-) -> Result<(), ()>
+) -> Result<(), UsageQueryFailure>
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
     let bytes = data_channel
         .local_outstanding_bytes()
         .await
-        .map_err(|_| ())?;
+        .map_err(|error| match error {
+            webrtc::error::Error::ErrDataChannelClosed => UsageQueryFailure::ChannelClosed,
+            _ => UsageQueryFailure::Other,
+        })?;
     usage.store(bytes, std::sync::atomic::Ordering::Release);
     Ok(())
 }
@@ -944,14 +954,18 @@ where
     }
     .await;
     // Cancellation keeps the conservative count until this refresh succeeds.
-    let published = publish_channel_usage(data_channel, usage)
-        .await
-        .map_err(|()| TerminalDriverExit::UsageFailed);
+    let published = publish_channel_usage(data_channel, usage).await;
     let outcome = sent?;
     if outcome == TerminalFlushOutcome::ChannelClosed {
         return Ok(outcome);
     }
-    published?;
+    match published {
+        Ok(()) => {}
+        Err(UsageQueryFailure::ChannelClosed) => {
+            return Ok(TerminalFlushOutcome::ChannelClosed);
+        }
+        Err(UsageQueryFailure::Other) => return Err(TerminalDriverExit::UsageFailed),
+    }
     let _ = handle.complete_active();
     Ok(TerminalFlushOutcome::Ready)
 }
@@ -1044,6 +1058,53 @@ mod tests {
     #[test]
     fn terminal_send_error_stays_send_failed() {
         check_terminal_send_failure(false, false, TerminalDriverExit::SendFailed);
+    }
+
+    #[test]
+    fn terminal_closed_usage_query_enters_close_grace_after_send() {
+        check_terminal_usage_query_failure(true, Ok(TerminalFlushOutcome::ChannelClosed));
+    }
+
+    #[test]
+    fn terminal_other_usage_query_error_stays_usage_failed_after_send() {
+        check_terminal_usage_query_failure(false, Err(TerminalDriverExit::UsageFailed));
+    }
+
+    fn check_terminal_usage_query_failure(
+        closed: bool,
+        expected: Result<TerminalFlushOutcome, TerminalDriverExit>,
+    ) {
+        let channel = FakeDataChannel::default();
+        channel.usage_closed.store(closed, Ordering::Release);
+        channel.usage_fails.store(!closed, Ordering::Release);
+        let (mut adapter, handle) =
+            crate::transport::webrtc::adapter::WebRtcTerminalAdapter::pair();
+        adapter
+            .try_write(&test_frame(b"pending output"))
+            .expect("queue terminal output");
+        let key = AesGcmKey::from_slice(&[20; 32]).expect("test key");
+        let initial_usage = 17;
+        let usage = std::sync::atomic::AtomicUsize::new(initial_usage);
+        let mut next_message_id = 1;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build the usage-query runtime");
+        let result = runtime.block_on(flush_subscription_adapter_frames(
+            &channel,
+            &key,
+            &handle,
+            &usage,
+            &mut next_message_id,
+        ));
+        assert_eq!(result, expected);
+        let sent = channel.sent_binary.lock().expect("sent chunks");
+        assert_eq!(sent.len(), 1);
+        let sent_bytes = sent.iter().map(Vec::len).sum::<usize>();
+        assert!(channel.usage_entered.load(Ordering::Acquire));
+        assert_eq!(usage.load(Ordering::Acquire), initial_usage + sent_bytes);
+        assert!(handle.snapshot_active().is_some());
+        assert_eq!(next_message_id, 2);
     }
 
     fn check_terminal_send_failure(

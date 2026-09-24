@@ -36,6 +36,7 @@ mlua = { version = "=0.11.6", features = ["lua54", "vendored", "serialize", "sen
 serde = { version = "=1.0.228", features = ["derive"] }
 # Re-audit Lua allocation bounds before changing this pin. See script/check-lua-memory-build-contract.
 serde_json = { version = "=1.0.150", features = ["raw_value"] }
+sha2 = "=0.11.0"
 semver = "1.0.28"
 signal-hook = "0.4.4"
 shell-words = "1.1.1"

@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::mpsc::{self, SyncSender};
 use std::time::{Duration, Instant};
@@ -25,6 +27,7 @@ use crate::HubDaemon;
 use crate::admission::budgets::DAEMON_MAX_FRAME_BYTES;
 use crate::client_api_dto::response::daemon_response_base;
 use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
+use crate::daemon::control::message::{ControlMessage, ControlSender};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_turn::{OwnerTurnBudget, OwnerTurnCharge};
 use crate::host_executor::{
@@ -35,6 +38,46 @@ use crate::host_executor::{
 const SESSION_DELIVERY_MAX_ITEMS: usize = 16;
 const SESSION_DELIVERY_MAX_BYTES: usize = 64 * 1024;
 const SESSION_DELIVERY_MAX_ELAPSED: Duration = Duration::from_millis(8);
+
+/// A transport publishes queue capacity before it can block on a frame write.
+#[derive(Debug, Clone)]
+pub(crate) struct EntitySubscriptionCapacityWake(Arc<EntitySubscriptionCapacityWakeInner>);
+
+#[derive(Debug, Default)]
+struct EntitySubscriptionCapacityWakeInner {
+    pending: AtomicBool,
+    owner: Mutex<Option<ControlSender>>,
+}
+
+impl Default for EntitySubscriptionCapacityWake {
+    fn default() -> Self {
+        Self(Arc::new(EntitySubscriptionCapacityWakeInner::default()))
+    }
+}
+
+impl EntitySubscriptionCapacityWake {
+    pub(crate) fn bind(&self, sender: ControlSender) {
+        let mut owner = self.0.owner.lock().unwrap_or_else(|error| error.into_inner());
+        *owner = Some(sender.clone());
+        let pending = self.0.pending.load(Ordering::Acquire);
+        drop(owner);
+        if pending {
+            let _ = sender.try_send(ControlMessage::EntitySubscriptionCapacityReleased);
+        }
+    }
+
+    pub(crate) fn publish(&self) {
+        self.0.pending.store(true, Ordering::Release);
+        let owner = self.0.owner.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        if let Some(owner) = owner {
+            let _ = owner.try_send(ControlMessage::EntitySubscriptionCapacityReleased);
+        }
+    }
+
+    pub(crate) fn take(&self) -> bool {
+        self.0.pending.swap(false, Ordering::AcqRel)
+    }
+}
 
 struct DeliveryPage {
     items: usize,
@@ -150,6 +193,8 @@ pub(crate) struct EntitySubscriptionState {
     /// rebuilt off the owner; the first delivered catalog is its snapshot.
     awaiting_initial_snapshot: bool,
     resync_reason: Option<String>,
+    /// A provider disappeared; retry its terminal frame after queue capacity returns.
+    terminating: bool,
     /// Local WebRTC grant that owns this subscription, when registered over DataChannel.
     /// Used so PeerClosed can sweep rows that arrived after cleanup_once's id snapshot.
     pub(crate) owner_grant_id: Option<String>,
@@ -229,6 +274,7 @@ pub(crate) fn install_package_entity_subscription(
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id,
             package_last_applied_seq: None,
             package_catching_up: true,
@@ -268,6 +314,23 @@ pub(crate) fn next_package_entity_target(
         .map(|(_, target)| std::sync::Arc::clone(target))
 }
 
+/// Read catch-up state only for the exact live target.
+pub(crate) fn exact_package_entity_target_catching_up(
+    state: &DaemonControlState,
+    target: &std::sync::Arc<crate::plugin_entity::Target>,
+) -> bool {
+    state
+        .entity_subscriptions
+        .get(&target.subscription_id)
+        .is_some_and(|subscription| {
+            !subscription.terminating
+                && subscription.package_catching_up
+                && subscription.package_delivery.as_ref().is_some_and(|delivery| {
+                    std::sync::Arc::ptr_eq(target, &delivery.target)
+                })
+        })
+}
+
 /// Arm one publication only when the current subscription needs the payload.
 pub(crate) fn arm_package_entity_delivery(
     state: &mut DaemonControlState,
@@ -283,6 +346,9 @@ pub(crate) fn arm_package_entity_delivery(
     let subscription = state
         .entity_subscriptions
         .get_mut(&target.subscription_id)?;
+    if subscription.terminating {
+        return None;
+    }
     let delivery = subscription.package_delivery.as_mut()?;
     if !std::sync::Arc::ptr_eq(target, &delivery.target) {
         return None;
@@ -341,6 +407,13 @@ pub(crate) fn complete_package_entity_delivery(
         return false;
     }
     delivery.publication = None;
+    if subscription.terminating {
+        state
+            .maintenance
+            .wakes
+            .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
+        return false;
+    }
     use crate::plugin_entity::DeliveryStatus;
     match status {
         DeliveryStatus::Sent => {
@@ -865,6 +938,7 @@ pub(crate) fn register_builtin_entity_subscription(
                 definition_entities: entities,
                 awaiting_initial_snapshot,
                 resync_reason: None,
+                terminating: false,
                 owner_grant_id,
                 package_last_applied_seq: None,
                 package_catching_up: false,
@@ -902,6 +976,7 @@ pub(crate) fn register_builtin_entity_subscription(
         definition_entities: BTreeMap::new(),
         awaiting_initial_snapshot: false,
         resync_reason: None,
+        terminating: false,
         owner_grant_id,
         package_last_applied_seq: None,
         package_catching_up: false,
@@ -1107,6 +1182,49 @@ fn with_session_type_snapshot_seq(
     }
 }
 
+fn retire_unloaded_entity_subscriptions(
+    state: &mut DaemonControlState,
+    has_provider_family: impl Fn(&str) -> bool,
+) {
+    let before = state.entity_subscriptions.len();
+    state.entity_subscriptions.retain(|id, subscription| {
+        if subscription.entity_type == "session"
+            || subscription.entity_type == "session_type"
+            || (!subscription.terminating && has_provider_family(&subscription.entity_type))
+        {
+            return true;
+        }
+        subscription.terminating = true;
+        state.plugin_entities.targets.remove(id);
+        if let Some(publication) = subscription
+            .package_delivery
+            .as_ref()
+            .and_then(|delivery| delivery.publication.as_ref())
+        {
+            publication
+                .live
+                .store(false, std::sync::atomic::Ordering::Release);
+            if state
+                .plugin_entities
+                .accepts_host_completion(publication.identity)
+            {
+                return true;
+            }
+        }
+        let error = DaemonEntityFrame::Error {
+            subscription_id: id.clone(),
+            entity_type: subscription.entity_type.clone(),
+            code: "entity_provider_unloaded".to_string(),
+            message: "entity provider was unloaded".to_string(),
+        };
+        match subscription.sender.try_send_kind(error) {
+            Ok(()) | Err(EntityFrameTrySendError::Disconnected) => false,
+            Err(EntityFrameTrySendError::Full(_)) => true,
+        }
+    });
+    note_released_entity_generations(state, before);
+}
+
 pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
     if state.entity_subscriptions.is_empty() {
         return;
@@ -1117,16 +1235,9 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
         state.lifecycle_counters.live_entity_subscriptions = 0;
         return;
     };
-    state.entity_subscriptions.retain(|id, subscription| {
-        let keep = subscription.entity_type == "session"
-            || subscription.entity_type == "session_type"
-            || runtime.has_plugin_entity_provider_family(&subscription.entity_type);
-        if !keep {
-            state.plugin_entities.targets.remove(id);
-        }
-        keep
+    retire_unloaded_entity_subscriptions(state, |entity_type| {
+        runtime.has_plugin_entity_provider_family(entity_type)
     });
-    state.lifecycle_counters.live_entity_subscriptions = state.entity_subscriptions.len() as u64;
 
     if state
         .entity_subscriptions
@@ -1436,7 +1547,25 @@ fn route_host_completion_mode(
         .accepts_host_completion(completion.identity)
     {
         let waiter = completion.identity.waiter_id;
+        let wake_retirement = state
+            .plugin_entities
+            .running_delivery_target(completion.identity)
+            .and_then(|id| state.entity_subscriptions.get(id))
+            .is_some_and(|subscription| {
+                subscription.terminating
+                    && subscription
+                        .package_delivery
+                        .as_ref()
+                        .and_then(|delivery| delivery.publication.as_ref())
+                        .is_some_and(|publication| publication.identity == completion.identity)
+            });
         state.plugin_entities.retain_host_completion(completion);
+        if wake_retirement {
+            state
+                .maintenance
+                .wakes
+                .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
+        }
         crate::daemon::control::entities::mark_plugin_entity_ready(
             state,
             waiter,
@@ -2343,6 +2472,517 @@ mod tests {
     use crate::daemon::owner_loop::DaemonControlState;
     use crate::owner_identity::WaiterIdSource;
 
+    fn retirement_subscription(
+        sender: mpsc::SyncSender<DaemonEntityFrame>,
+        entity_type: &str,
+    ) -> EntitySubscriptionState {
+        EntitySubscriptionState {
+            sender: EntityFrameSender::Blocking(sender),
+            entity_type: entity_type.to_string(),
+            cursor: None,
+            entities: BTreeMap::new(),
+            definition_generation: 0,
+            definition_entities: BTreeMap::new(),
+            awaiting_initial_snapshot: false,
+            resync_reason: None,
+            terminating: false,
+            owner_grant_id: None,
+            package_last_applied_seq: None,
+            package_catching_up: false,
+            package_delivery: None,
+            delivery_after: None,
+            delivery_phase: DeliveryPhase::Removes,
+            next_seq: 0,
+            assembled_items: Vec::new(),
+            assembled_item_bytes: 0,
+            needs_delivery: false,
+        }
+    }
+
+    fn queued_retirement_frame(subscription_id: &str) -> DaemonEntityFrame {
+        DaemonEntityFrame::Error {
+            subscription_id: subscription_id.to_string(),
+            entity_type: "queued.family".to_string(),
+            code: "queued".to_string(),
+            message: "queued frame".to_string(),
+        }
+    }
+
+    fn retirement_daemon(label: &str) -> (HubDaemon, std::path::PathBuf) {
+        let data_directory = std::env::temp_dir().join(format!(
+            "botster-hub-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: label.to_string(),
+                display_name: "Entity Retirement Test".to_string(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(data_directory.clone()),
+            transports: crate::TransportBindings::default(),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build retirement config");
+        (HubDaemon::start(config).expect("start retirement daemon"), data_directory)
+    }
+
+    #[test]
+    fn provider_retirement_waits_for_one_dequeue_without_other_owner_work() {
+        let (mut daemon, data_directory) = retirement_daemon("retire-after-dequeue");
+        let mut state = DaemonControlState::default();
+        for kind in crate::daemon_maintenance::MaintenanceSliceKind::ALL {
+            assert!(state.maintenance.wakes.take(kind));
+        }
+        assert!(!state.maintenance.wakes.has_any());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
+        state.entity_subscriptions.insert(
+            "retiring".to_string(),
+            retirement_subscription(sender, "retiring.family"),
+        );
+        state.lifecycle_counters.live_entity_subscriptions = 1;
+
+        retire_unloaded_entity_subscriptions(&mut state, |_| false);
+        assert!(state.entity_subscriptions["retiring"].terminating);
+        assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 1);
+        assert_eq!(state.released_entity_generations, 0);
+
+        receiver.recv().expect("drain exactly one queued frame");
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        state.entity_capacity_wake.bind(control_tx);
+        assert!(!state.maintenance.wakes.has_any());
+        state.entity_capacity_wake.publish();
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(ControlMessage::EntitySubscriptionCapacityReleased)
+        ));
+        crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+        assert!(!state.entity_subscriptions.contains_key("retiring"));
+        assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 0);
+        assert_eq!(state.released_entity_generations, 1);
+        assert!(matches!(
+            receiver.recv().expect("terminal frame after capacity"),
+            DaemonEntityFrame::Error { code, .. } if code == "entity_provider_unloaded"
+        ));
+        daemon.stop();
+        drop(daemon);
+        fs::remove_dir_all(data_directory).expect("remove retirement data directory");
+    }
+
+    #[test]
+    fn full_control_queue_keeps_entity_capacity_flag_until_owner_turn() {
+        let (mut daemon, data_directory) = retirement_daemon("retire-full-control");
+        let mut state = DaemonControlState::default();
+        for kind in crate::daemon_maintenance::MaintenanceSliceKind::ALL {
+            assert!(state.maintenance.wakes.take(kind));
+        }
+        assert!(!state.maintenance.wakes.has_any());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
+        state.entity_subscriptions.insert(
+            "retiring".to_string(),
+            retirement_subscription(sender, "retiring.family"),
+        );
+        state.lifecycle_counters.live_entity_subscriptions = 1;
+        retire_unloaded_entity_subscriptions(&mut state, |_| false);
+        receiver.recv().expect("release subscriber queue capacity");
+
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        state.entity_capacity_wake.bind(control_tx.clone());
+        control_tx.try_send(ControlMessage::DataPlaneProgress).expect("fill control queue");
+        assert!(!state.maintenance.wakes.has_any());
+        state.entity_capacity_wake.publish();
+        assert!(matches!(control_rx.try_recv(), Ok(ControlMessage::DataPlaneProgress)));
+        assert!(control_rx.try_recv().is_err(), "capacity notice was dropped");
+        crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
+        assert!(!state.entity_subscriptions.contains_key("retiring"));
+        assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 0);
+        assert!(matches!(
+            receiver.recv().expect("terminal frame after dropped notice"),
+            DaemonEntityFrame::Error { code, .. } if code == "entity_provider_unloaded"
+        ));
+        daemon.stop();
+        drop(daemon);
+        fs::remove_dir_all(data_directory).expect("remove retirement data directory");
+    }
+
+    #[test]
+    fn provider_reload_does_not_revive_a_terminating_subscription() {
+        let mut state = DaemonControlState::default();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
+        state.entity_subscriptions.insert(
+            "retiring".to_string(),
+            retirement_subscription(sender, "retiring.family"),
+        );
+        state.lifecycle_counters.live_entity_subscriptions = 1;
+        retire_unloaded_entity_subscriptions(&mut state, |_| false);
+        assert!(state.entity_subscriptions["retiring"].terminating);
+        receiver.recv().expect("release subscriber queue capacity");
+
+        retire_unloaded_entity_subscriptions(&mut state, |_| true);
+        assert!(!state.entity_subscriptions.contains_key("retiring"));
+        assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 0);
+        assert_eq!(state.released_entity_generations, 1);
+        assert!(matches!(
+            receiver.recv().expect("terminal frame survives reload"),
+            DaemonEntityFrame::Error { code, .. } if code == "entity_provider_unloaded"
+        ));
+    }
+
+    #[test]
+    fn held_target_cannot_rearm_after_terminal_intent() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let mut state = DaemonControlState::default();
+        let delivery = crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery;
+        assert!(state.maintenance.wakes.take(delivery));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let target = Arc::new(crate::plugin_entity::Target {
+            subscription_id: "retiring".to_string(),
+            entity_type: "retiring.family".to_string(),
+            sender: EntityFrameSender::Async(sender.clone()),
+        });
+        install_package_entity_subscription(
+            &mut state,
+            crate::plugin_entity::Registration {
+                subscription_id: "retiring".to_string(),
+                target_key: "retiring".to_string(),
+                entity_type: "retiring.family".to_string(),
+                reservation: crate::admission::reservations::PreparedSubscriptionIdentity::new(
+                    "retiring".to_string(),
+                ),
+            },
+            Arc::clone(&target),
+            None,
+        )
+        .expect("install provider subscription");
+        assert!(exact_package_entity_target_catching_up(&state, &target));
+        let identity =
+            crate::owner_identity::OwnerWorkIdentity::first(crate::owner_identity::WaiterId(904));
+        let (live, _) =
+            arm_package_entity_delivery(&mut state, &target, identity, 1, true, 1)
+                .expect("arm held target");
+        sender
+            .try_send(crate::entity_delivery::EntityDelivery::Typed(
+                queued_retirement_frame("retiring"),
+            ))
+            .expect("fill the subscriber queue");
+
+        retire_unloaded_entity_subscriptions(&mut state, |_| false);
+        assert!(state.entity_subscriptions["retiring"].terminating);
+        assert!(!exact_package_entity_target_catching_up(&state, &target));
+        assert!(!live.load(Ordering::Acquire));
+        assert!(!state.plugin_entities.targets.contains_key("retiring"));
+        assert!(arm_package_entity_delivery(&mut state, &target, identity, 1, true, 1).is_none());
+        assert!(!state.maintenance.wakes.take(delivery));
+        assert!(!complete_package_entity_delivery(
+            &mut state,
+            &target,
+            identity,
+            1,
+            true,
+            1,
+            crate::plugin_entity::DeliveryStatus::Sent,
+        ));
+        assert_eq!(state.entity_subscriptions["retiring"].package_last_applied_seq, None);
+        assert!(state.maintenance.wakes.take(delivery));
+        receiver.try_recv().expect("drain queued frame");
+        retire_unloaded_entity_subscriptions(&mut state, |_| true);
+        assert!(!state.entity_subscriptions.contains_key("retiring"));
+        assert!(matches!(
+            receiver.try_recv().expect("terminal frame after held work"),
+            crate::entity_delivery::EntityDelivery::Typed(DaemonEntityFrame::Error { code, .. })
+                if code == "entity_provider_unloaded"
+        ));
+    }
+
+    #[test]
+    fn running_publication_waits_for_the_routed_host_receipt() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        for malformed in [false, true] {
+            let mut state = DaemonControlState::default();
+            let delivery = crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery;
+            assert!(state.maintenance.wakes.take(delivery));
+            let mut executor = crate::host_executor::HostExecutor::new();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+            let target = Arc::new(crate::plugin_entity::Target {
+                subscription_id: "retiring".to_string(),
+                entity_type: "retiring.family".to_string(),
+                sender: EntityFrameSender::Async(sender),
+            });
+            install_package_entity_subscription(
+                &mut state,
+                crate::plugin_entity::Registration {
+                    subscription_id: "retiring".to_string(),
+                    target_key: "retiring".to_string(),
+                    entity_type: "retiring.family".to_string(),
+                    reservation: crate::admission::reservations::PreparedSubscriptionIdentity::new(
+                        "retiring".to_string(),
+                    ),
+                },
+                Arc::clone(&target),
+                None,
+            )
+            .expect("install provider subscription");
+            let waiter = crate::owner_identity::WaiterId(if malformed { 906 } else { 905 });
+            let expected = crate::owner_identity::OwnerWorkIdentity::first(waiter);
+            let (live, _) = arm_package_entity_delivery(
+                &mut state, &target, expected, 1, true, 1,
+            )
+            .expect("arm running publication");
+            let command = if malformed {
+                crate::plugin_entity::Command::Discard {
+                    payload: None,
+                    registration: None,
+                    reservation_identity: None,
+                }
+            } else {
+                crate::plugin_entity::Command::Deliver {
+                    payload: crate::plugin_entity::Payload::mutation(
+                        crate::package_entity_fanout::PackageEntityMutation::Upsert {
+                            admission: None,
+                            entity_type: "retiring.family".to_string(),
+                            snapshot_seq: 1,
+                            id: "one".to_string(),
+                            entity: serde_json::json!({"id": "one"}),
+                        },
+                    ),
+                    target: Arc::clone(&target),
+                    publication_live: Arc::clone(&live),
+                    budget: crate::shared_view::SharedViewBudget::new(),
+                    resync_reason: None,
+                }
+            };
+            let permit = state.budget.reserve().expect("reserve owner row");
+            let identity = state.plugin_entities.test_insert_delivery_work(
+                waiter, permit, Arc::clone(&target), Arc::clone(&live),
+                &mut executor, command, false,
+            );
+            assert_eq!(identity, expected);
+            assert!(state.plugin_entities.accepts_host_completion(identity));
+
+            retire_unloaded_entity_subscriptions(&mut state, |_| false);
+            assert!(state.entity_subscriptions["retiring"].terminating);
+            assert!(!live.load(Ordering::Acquire));
+            assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 1);
+            while let Ok(frame) = receiver.try_recv() {
+                assert!(!matches!(frame,
+                    crate::entity_delivery::EntityDelivery::Typed(DaemonEntityFrame::Error { .. })
+                ), "terminal must wait for the Host receipt");
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let completion = loop {
+                match executor.poll_completion() {
+                    crate::host_executor::HostCompletionPoll::Ready(completion) => break completion,
+                    crate::host_executor::HostCompletionPoll::Empty => {
+                        assert!(Instant::now() < deadline, "Host receipt must arrive");
+                        std::thread::yield_now();
+                    }
+                    crate::host_executor::HostCompletionPoll::Stopped => {
+                        panic!("Host executor stopped before its receipt")
+                    }
+                }
+            };
+            assert_eq!(completion.identity, identity);
+            if malformed {
+                assert!(matches!(&completion.result,
+                    crate::host_executor::HostResult::PluginEntity(
+                        crate::plugin_entity::Completion::Reclaimed
+                    )
+                ));
+            }
+            assert!(!state.maintenance.wakes.take(delivery));
+            route_host_completion(&mut state, completion);
+            assert!(state.maintenance.wakes.take(delivery));
+            retire_unloaded_entity_subscriptions(&mut state, |_| false);
+            assert!(!state.entity_subscriptions.contains_key("retiring"));
+            assert_eq!(state.released_entity_generations, 1);
+            let mut terminal = false;
+            while let Ok(frame) = receiver.try_recv() {
+                assert!(!terminal, "no frame may follow the terminal Error");
+                if matches!(frame,
+                    crate::entity_delivery::EntityDelivery::Typed(
+                        DaemonEntityFrame::Error { code, .. }
+                    ) if code == "entity_provider_unloaded"
+                ) {
+                    terminal = true;
+                }
+            }
+            assert!(terminal, "terminal follows the exact Host receipt");
+        }
+    }
+
+    #[test]
+    fn rejected_delivery_does_not_hold_the_terminal_frame() {
+        use std::sync::Arc;
+
+        let mut state = DaemonControlState::default();
+        let mut executor = crate::host_executor::HostExecutor::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let target = Arc::new(crate::plugin_entity::Target {
+            subscription_id: "retiring".to_string(),
+            entity_type: "retiring.family".to_string(),
+            sender: EntityFrameSender::Async(sender),
+        });
+        install_package_entity_subscription(
+            &mut state,
+            crate::plugin_entity::Registration {
+                subscription_id: "retiring".to_string(),
+                target_key: "retiring".to_string(),
+                entity_type: "retiring.family".to_string(),
+                reservation: crate::admission::reservations::PreparedSubscriptionIdentity::new(
+                    "retiring".to_string(),
+                ),
+            },
+            Arc::clone(&target),
+            None,
+        )
+        .expect("install provider subscription");
+        let waiter = crate::owner_identity::WaiterId(907);
+        let expected = crate::owner_identity::OwnerWorkIdentity::first(waiter);
+        let (live, _) = arm_package_entity_delivery(
+            &mut state, &target, expected, 1, true, 1,
+        )
+        .expect("arm publication");
+        let permit = state.budget.reserve().expect("reserve owner row");
+        let identity = state.plugin_entities.test_insert_delivery_work(
+            waiter, permit, Arc::clone(&target), Arc::clone(&live),
+            &mut executor,
+            crate::plugin_entity::Command::Discard {
+                payload: None,
+                registration: None,
+                reservation_identity: None,
+            },
+            true,
+        );
+        assert_eq!(identity, expected);
+        assert!(!state.plugin_entities.accepts_host_completion(identity));
+
+        retire_unloaded_entity_subscriptions(&mut state, |_| false);
+        assert!(!state.entity_subscriptions.contains_key("retiring"));
+        assert_eq!(state.released_entity_generations, 1);
+        assert!(matches!(
+            receiver.try_recv().expect("rejected submission has no Host receipt"),
+            crate::entity_delivery::EntityDelivery::Typed(DaemonEntityFrame::Error { code, .. })
+                if code == "entity_provider_unloaded"
+        ));
+    }
+
+    #[test]
+    fn provider_retirement_keeps_a_shared_connection_sibling() {
+        use crate::transport::unix::connection::{
+            ConnectionCleanupGuard, ConnectionTerminalReason, handle_connection_cleanup,
+        };
+        let (mut daemon, data_directory) = retirement_daemon("retire-sibling");
+        let mut state = DaemonControlState::default();
+        let (retiring_tx, retiring_rx) = mpsc::sync_channel(1);
+        let (sibling_tx, sibling_rx) = mpsc::sync_channel(1);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        let cleanup_permit = control_tx.clone().try_reserve_owned().expect("cleanup permit");
+        let permit = state.budget.reserve_connection().expect("connection permit");
+        let mut guard = ConnectionCleanupGuard::new(
+            cleanup_permit,
+            "shared-client".to_string(),
+            ConnectionTerminalReason::Eof,
+            permit,
+        );
+        guard.add_entity_subscription("retiring".to_string());
+        guard.add_entity_subscription("sibling".to_string());
+        state.entity_subscriptions.insert(
+            "retiring".to_string(),
+            retirement_subscription(retiring_tx, "retiring.family"),
+        );
+        state.entity_subscriptions.insert(
+            "sibling".to_string(),
+            retirement_subscription(sibling_tx, "live.family"),
+        );
+        state.lifecycle_counters.live_entity_subscriptions = 2;
+        retire_unloaded_entity_subscriptions(&mut state, |family| family == "live.family");
+        assert!(!state.entity_subscriptions.contains_key("retiring"));
+        assert!(state.entity_subscriptions.contains_key("sibling"));
+        assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 1);
+        assert_eq!(state.released_entity_generations, 1);
+        assert!(matches!(
+            retiring_rx.recv().expect("retired sibling terminal frame"),
+            DaemonEntityFrame::Error { code, .. } if code == "entity_provider_unloaded"
+        ));
+        state.entity_subscriptions["sibling"]
+            .send_frame_for_test(queued_retirement_frame("sibling"))
+            .expect("surviving sibling sender remains live");
+        assert!(matches!(
+            sibling_rx.recv().expect("surviving sibling delivery"),
+            DaemonEntityFrame::Error { code, .. } if code == "queued"
+        ));
+        drop(guard);
+        let ControlMessage::ConnectionCleanup(cleanup) = control_rx.try_recv().expect("cleanup")
+        else {
+            panic!("shared connection must publish ConnectionCleanup");
+        };
+        handle_connection_cleanup(&mut daemon, &mut state, control_tx, cleanup);
+        assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 0);
+        assert_eq!(state.released_entity_generations, 2);
+        daemon.stop();
+        drop(daemon);
+        fs::remove_dir_all(data_directory).expect("remove retirement data directory");
+    }
+
+    #[test]
+    fn confirmed_unix_disconnect_retires_terminating_subscription() {
+        use crate::transport::unix::connection::{
+            ConnectionCleanupGuard, ConnectionTerminalReason, handle_connection_cleanup,
+        };
+        let (mut daemon, data_directory) = retirement_daemon("retire-disconnect");
+        let mut state = DaemonControlState::default();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
+        state.entity_subscriptions.insert(
+            "retiring".to_string(),
+            retirement_subscription(sender, "retiring.family"),
+        );
+        state.lifecycle_counters.live_entity_subscriptions = 1;
+        retire_unloaded_entity_subscriptions(&mut state, |_| false);
+        assert!(state.entity_subscriptions["retiring"].terminating);
+
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        let cleanup_permit = control_tx.clone().try_reserve_owned().expect("cleanup permit");
+        let permit = state.budget.reserve_connection().expect("connection permit");
+        let mut guard = ConnectionCleanupGuard::new(
+            cleanup_permit,
+            "retiring-client".to_string(),
+            ConnectionTerminalReason::Eof,
+            permit,
+        );
+        guard.add_entity_subscription("retiring".to_string());
+        drop(guard);
+        let ControlMessage::ConnectionCleanup(cleanup) = control_rx.try_recv().expect("cleanup")
+        else {
+            panic!("disconnect must publish ConnectionCleanup");
+        };
+        handle_connection_cleanup(&mut daemon, &mut state, control_tx, cleanup);
+        assert!(!state.entity_subscriptions.contains_key("retiring"));
+        assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 0);
+        assert_eq!(state.released_entity_generations, 1);
+        assert!(matches!(
+            receiver.recv().expect("original queued frame remains"),
+            DaemonEntityFrame::Error { code, .. } if code == "queued"
+        ));
+        daemon.stop();
+        drop(daemon);
+        fs::remove_dir_all(data_directory).expect("remove retirement data directory");
+    }
+
     #[test]
     fn terminal_catalog_keeps_its_own_identity_after_waiter_exhaustion() {
         let executor = HostExecutor::new();
@@ -2552,6 +3192,7 @@ mod tests {
             target
         };
         let old_target = install(&mut state);
+        assert!(exact_package_entity_target_catching_up(&state, &old_target));
         let identity =
             crate::owner_identity::OwnerWorkIdentity::first(crate::owner_identity::WaiterId(904));
         let (live, _) =
@@ -2559,6 +3200,8 @@ mod tests {
         crate::daemon::control::entities::remove_entity_subscription(&mut state, "sub");
         assert!(!live.load(Ordering::Acquire));
         let new_target = install(&mut state);
+        assert!(!exact_package_entity_target_catching_up(&state, &old_target));
+        assert!(exact_package_entity_target_catching_up(&state, &new_target));
         assert!(!complete_package_entity_delivery(
             &mut state,
             &old_target,
@@ -3125,6 +3768,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: Some(overflow_reason.clone()),
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -3197,6 +3841,7 @@ mod tests {
                 definition_entities: BTreeMap::new(),
                 awaiting_initial_snapshot: false,
                 resync_reason: Some("subscriber_overflow".to_string()),
+                terminating: false,
                 owner_grant_id: None,
                 package_last_applied_seq: None,
                 package_catching_up: false,
@@ -3249,6 +3894,7 @@ mod tests {
             awaiting_initial_snapshot: false,
             definition_entities,
             resync_reason,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -3464,6 +4110,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: Some(overflow_reason.clone()),
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -3558,6 +4205,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -3633,6 +4281,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -3703,6 +4352,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -3784,6 +4434,7 @@ mod tests {
                 definition_entities: BTreeMap::new(),
                 awaiting_initial_snapshot: false,
                 resync_reason: None,
+                terminating: false,
                 owner_grant_id: None,
                 package_last_applied_seq: None,
                 package_catching_up: false,
@@ -3850,6 +4501,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -3948,6 +4600,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -4044,6 +4697,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -4122,6 +4776,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -4182,6 +4837,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -4280,6 +4936,7 @@ mod tests {
                     definition_entities: BTreeMap::new(),
                     awaiting_initial_snapshot: false,
                     resync_reason: None,
+                    terminating: false,
                     owner_grant_id: None,
                     package_last_applied_seq: None,
                     package_catching_up: false,
@@ -4345,6 +5002,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,
@@ -4428,6 +5086,7 @@ mod tests {
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
+            terminating: false,
             owner_grant_id: None,
             package_last_applied_seq: None,
             package_catching_up: false,

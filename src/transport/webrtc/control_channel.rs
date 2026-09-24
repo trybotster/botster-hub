@@ -61,7 +61,7 @@ pub(crate) const LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH: u32 = (LOCAL_WEBRTC_MAX_FRAM
 pub(crate) trait LocalWebrtcDataChannel: Send + Sync {
     async fn local_set_buffered_amount_low_threshold(&self, threshold: u32) -> Result<(), String>;
     async fn local_set_buffered_amount_high_threshold(&self, threshold: u32) -> Result<(), String>;
-    async fn local_outstanding_bytes(&self) -> Result<usize, String> {
+    async fn local_outstanding_bytes(&self) -> Result<usize, webrtc::error::Error> {
         Ok(0)
     }
     async fn local_send_text(&self, text: &str) -> Result<(), String>;
@@ -87,10 +87,8 @@ where
             .map_err(|error| error.to_string())
     }
 
-    async fn local_outstanding_bytes(&self) -> Result<usize, String> {
-        self.outstanding_bytes()
-            .await
-            .map_err(|error| error.to_string())
+    async fn local_outstanding_bytes(&self) -> Result<usize, webrtc::error::Error> {
+        self.outstanding_bytes().await
     }
 
     async fn local_send_text(&self, text: &str) -> Result<(), String> {
@@ -1120,6 +1118,197 @@ mod tests {
         });
         responder.join().unwrap();
         (data_channel, failure)
+    }
+
+    #[test]
+    fn channel_close_during_first_status_chunk_retains_owner_terminal_progress() {
+        struct ReleaseBlockedSend {
+            data_channel: Arc<FakeDataChannel>,
+            peer_state: Arc<LocalWebrtcPeerState>,
+        }
+        impl Drop for ReleaseBlockedSend {
+            fn drop(&mut self) {
+                self.data_channel.send_hangs.store(false, Ordering::Release);
+                self.data_channel.send_notify.notify_waiters();
+                self.peer_state
+                    .publish_peer_terminal(LocalWebrtcTerminalCause::ChannelClosed);
+            }
+        }
+
+        reset_test_request_ids();
+        let mut harness = PeerHarness::new("status-send-close-record");
+        let live_peer = harness.signal_peer("http://127.0.0.1:41822");
+        let grant_id = live_peer.grant_id.clone();
+        let key = live_peer.stream_key.clone();
+        let data_channel = Arc::new(FakeDataChannel::default());
+        data_channel.push_event(encrypted_hello_event(&key, &webrtc_adapter_hello()));
+        let (runtime_tx, mut runtime_rx) = tokio_mpsc::channel(64);
+        let peer_state = Arc::new(LocalWebrtcPeerState::new(
+            grant_id.clone(),
+            runtime_tx.clone(),
+        ));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let driver = runtime.spawn({
+            let data_channel = Arc::clone(&data_channel);
+            let peer_state = Arc::clone(&peer_state);
+            let key = key.clone();
+            async move {
+                run_data_channel(
+                    data_channel.as_ref(),
+                    &key,
+                    peer_state.as_ref(),
+                    &runtime_tx,
+                )
+                .await
+            }
+        });
+        let _release = ReleaseBlockedSend {
+            data_channel: Arc::clone(&data_channel),
+            peer_state: Arc::clone(&peer_state),
+        };
+
+        // Finish the complete HelloAck before arming the response-send hang.
+        let ack_frames = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let sent = data_channel.sent.lock().unwrap().clone();
+                    if let Some(first) = sent.first() {
+                        let first: DaemonLocalWebrtcDeliveryChunk =
+                            serde_json::from_str(first).expect("parse first HelloAck chunk");
+                        if sent.len() >= first.chunk_count as usize {
+                            break sent;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("complete HelloAck delivery")
+        });
+        let first: DaemonLocalWebrtcDeliveryChunk =
+            serde_json::from_str(&ack_frames[0]).expect("parse HelloAck chunk");
+        assert!(first.chunk_count > 0);
+        assert_eq!(ack_frames.len(), first.chunk_count as usize);
+        let mut encrypted = String::new();
+        for (index, frame) in ack_frames.iter().enumerate() {
+            let chunk: DaemonLocalWebrtcDeliveryChunk =
+                serde_json::from_str(frame).expect("parse HelloAck chunk");
+            assert_eq!(chunk.message_id, first.message_id);
+            assert_eq!(chunk.chunk_index as usize, index);
+            assert_eq!(chunk.chunk_count, first.chunk_count);
+            encrypted.push_str(&chunk.payload);
+        }
+        let envelope: AesGcmEnvelope = serde_json::from_str(&encrypted).expect("HelloAck envelope");
+        let plaintext = decrypt_aes_gcm(&key, &envelope).expect("decrypt HelloAck");
+        assert!(matches!(
+            serde_json::from_slice::<ServerFrame>(&plaintext).expect("decode HelloAck"),
+            ServerFrame::HelloAck { .. }
+        ));
+
+        data_channel.send_entered.store(false, Ordering::Release);
+        data_channel.send_hangs.store(true, Ordering::Release);
+        data_channel.push_event(encrypted_request_event(&key, &DaemonRequest::Status));
+        let registration @ ControlMessage::RegisterWebrtcAdmission { .. } =
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), runtime_rx.recv())
+                    .await
+                    .expect("Hello registration reaches owner")
+                    .expect("owner channel remains open")
+            })
+        else {
+            panic!("Hello must register its admission before Status");
+        };
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            registration,
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .has_webrtc_admission_row(&grant_id)
+        );
+        let ControlMessage::Request {
+            request,
+            transport_request_id,
+            reply_tx,
+            ..
+        } = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), runtime_rx.recv())
+                .await
+                .expect("Status request reaches owner")
+                .expect("owner channel remains open")
+        })
+        else {
+            panic!("Status must reach the owner");
+        };
+        assert_eq!(*request, DaemonRequest::Status);
+        let request_id = transport_request_id.expect("Status request id");
+        let response = response_with_diagnostic(DaemonDiagnostic::connected("status-fixture"));
+        let expected_chunks = framed_daemon_response(&key, &request_id, &response)
+            .expect("frame Status response")
+            .len();
+        assert!(expected_chunks > 0);
+        reply_tx.send(Ok(response)).expect("reply to Status");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !data_channel.send_entered.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first Status chunk enters blocked send")
+        });
+        assert!(data_channel.sent.lock().unwrap().len() == ack_frames.len());
+        peer_state.publish_peer_terminal(LocalWebrtcTerminalCause::ChannelClosed);
+        let failure = runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), driver)
+                    .await
+                    .expect("channel driver exits after terminal close")
+                    .expect("channel driver task")
+            })
+            .expect("blocked Status send must fail");
+        assert_eq!(failure.cause, LocalWebrtcTerminalCause::ChannelClosed);
+
+        let message = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), runtime_rx.recv())
+                .await
+                .expect("peer close reaches owner")
+                .expect("owner channel remains open")
+        });
+        assert!(
+            matches!(&message, ControlMessage::LocalWebrtcPeerClosed { grant_id: closed, .. } if closed == &grant_id)
+        );
+        handle_control_message(
+            &mut harness.daemon,
+            &mut harness.state,
+            &harness.transport_handle,
+            harness.control_tx.clone(),
+            message,
+        );
+        let record = harness
+            .daemon
+            .local_webrtc()
+            .terminal_records()
+            .into_iter()
+            .find(|record| record.grant_id == grant_id)
+            .expect("owner retains sender terminal record");
+        assert_eq!(record.request_operation, "status");
+        assert_eq!(record.cause, "channel_closed");
+        assert_eq!(record.channel_terminal_signal, "on_close");
+        assert_eq!(record.total_chunks, expected_chunks);
+        assert_eq!(record.next_chunk_index, 0);
+        assert_eq!(record.last_sent_chunk_index, None);
+        live_peer.close_offer();
+        harness.cleanup();
     }
 
     fn run_shutdown_response_delivery_case(

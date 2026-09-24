@@ -351,6 +351,68 @@ impl PluginEntityState {
             .is_some_and(|entry| entry.work.accepts(identity))
     }
 
+    /// Find the exact delivery target before this Host receipt changes its phase.
+    pub(crate) fn running_delivery_target(
+        &self,
+        identity: crate::host_executor::HostJobIdentity,
+    ) -> Option<&str> {
+        let request = self.by_waiter.get(&identity.waiter_id)?;
+        let entry = self.pending.get(request)?;
+        if !entry.work.accepts(identity) {
+            return None;
+        }
+        entry
+            .work
+            .delivery_target
+            .as_ref()
+            .map(|target| target.subscription_id.as_str())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_insert_delivery_work(
+        &mut self,
+        waiter: crate::owner_identity::WaiterId,
+        permit: OwnerPermit,
+        target: std::sync::Arc<crate::plugin_entity::Target>,
+        publication: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        executor: &mut crate::host_executor::HostExecutor,
+        command: crate::plugin_entity::Command,
+        reject: bool,
+    ) -> crate::host_executor::HostJobIdentity {
+        let mut work = worker::EntityWork::new(None);
+        work.stage = worker::Stage::Deliver;
+        work.delivery_target = Some(target);
+        work.publication = Some(publication);
+        assert!(matches!(work.reserve(executor, waiter), worker::Advance::Waiting));
+        let identity = work.ready_identity().expect("reserved delivery identity");
+        if reject {
+            executor.test_stop_submissions();
+        }
+        let advance = work.submit(executor, command);
+        assert!(matches!(
+            (reject, advance),
+            (false, worker::Advance::Submitted) | (true, worker::Advance::Degraded)
+        ));
+        let request_id = format!("test-entity-{}", waiter.0);
+        self.by_waiter.insert(waiter, request_id.clone());
+        self.pending.insert(
+            request_id.clone(),
+            PendingPluginEntity {
+                terminal: None,
+                request_id,
+                waiter_id: waiter,
+                ready_key: None,
+                deadline_key: None,
+                identity: None,
+                invocation: None,
+                kind: PendingPluginEntityKind::Fanout { permit },
+                result: None,
+                work,
+            },
+        );
+        identity
+    }
+
     pub(crate) fn retain_host_completion(
         &mut self,
         completion: crate::host_executor::HostCompletion,

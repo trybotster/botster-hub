@@ -70,8 +70,6 @@ pub(crate) const WEBRTC_INBOUND_MAX_FRAMES: usize = 128;
 pub(crate) const WEBRTC_INBOUND_MAX_BYTES: usize = 512 * 1024;
 pub(crate) const WEBRTC_PENDING_HOST_EVENTS_MAX: usize = 128;
 pub(crate) const WEBRTC_PENDING_HOST_EVENTS_MAX_BYTES: usize = 512 * 1024;
-pub(crate) const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str =
-    "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
 pub(crate) struct LocalWebrtcOffererHandler {
     pub(crate) gather_complete_tx: AsyncSender<()>,
     pub(crate) connected_tx: AsyncSender<()>,
@@ -2577,7 +2575,7 @@ pub(crate) fn local_webrtc_bounded_stderr_tail(stderr: &[u8], data_dir: &Path) -
 fn test_chunk(index: u32, count: u32, payload: &str, total_bytes: usize) -> String {
     serde_json::json!({
         "version": botster_hub_client::LOCAL_WEBRTC_DELIVERY_CHUNK_VERSION,
-        "delivery_kind": "daemon_response",
+        "delivery_kind": "server_frame",
         "message_id": "reassembly-test",
         "chunk_index": index,
         "chunk_count": count,

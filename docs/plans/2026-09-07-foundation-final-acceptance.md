@@ -6,8 +6,13 @@ Status: spawn checkpoint `b7864ff9` and recovery checkpoint `9168c1de` are pushe
 
 This summary supersedes historical assignments below. Detailed evidence remains in the later checkpoint entries.
 The recent recovery fixes passed their focused checks. They do not establish integrated production readiness.
-The two existing agents now inspect integration between spawn `b7864ff9` and recovery `9168c1de` without source changes.
-Root retains integration ownership. No merge or deployment is in progress.
+Writer 001b staged the recovery merge onto integration `456235d4`. Reviewer 001e checks the merged authority callers.
+The source patch SHA256 is `faa5741d8155ec8f3112b001b8da440b572b84ad81c3e282e2583acd10b2db4e`.
+The six conflict files match recovery `9168c1de`. No unmerged entries remain. The staged whitespace check passes.
+Root checked retained authority through runtime loading and startup saves. The merged owner loop matches recovery.
+Reviewer 001e accepted the conflict resolutions and authority callers against the actual staged files.
+This checkpoint has not compiled. The next step is the merge commit, then the async merge and combined verification.
+Root retains integration ownership. No deployment is in progress.
 
 Ordinary charged spawn still returns `Unavailable` in async `session_types.rs`; implementation of its startup-path input remains open.
 Jason approved startup-captured working-directory and executable paths on September 23.

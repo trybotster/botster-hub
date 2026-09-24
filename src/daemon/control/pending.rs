@@ -139,7 +139,7 @@ impl ControlContinuation {
             Self::Coordination(work, _) => work.take_terminal_parts(runtime, identity, completion),
             Self::HostMutation(work) => work.take_terminal_parts(identity, completion),
             Self::Status(work) => work.take_terminal_parts(identity, completion),
-            Self::ManagedSpawn(work) => work.take_terminal_parts(identity, completion),
+            Self::ManagedSpawn(work) => work.take_terminal_parts(runtime, identity, completion),
             Self::Callback(_) | Self::SpawnCallback(_) | Self::Terminal(..) => None,
         }
     }
@@ -807,6 +807,13 @@ pub(crate) fn poll_ready_request_item(
         state.current_waiter_id = Some(waiter_id);
         let poll = entry.continuation.poll(daemon, state);
         state.current_waiter_id = None;
+        if state.has_uncertain_publication(waiter_id) {
+            let permit = entry
+                .permit
+                .take()
+                .expect("uncertain publication retains its original Owner permit");
+            state.retain_uncertain_owner_permit(waiter_id, permit);
+        }
         let reply = match poll {
             ControlPoll::FinishedInternal => {
                 debug_assert!(entry.retire.is_none());
@@ -1546,5 +1553,124 @@ mod tests {
         assert!(!state.owner_ready.is_empty());
         daemon.stop();
         std::fs::remove_dir_all(directory).expect("remove owner ready test directory");
+    }
+
+    fn uncertain_publication_keeps_owner_permit(internal_completion: bool) {
+        let (mut daemon, directory) = test_daemon(if internal_completion {
+            "uncertain-internal"
+        } else {
+            "uncertain-closed-reply"
+        });
+        let mut state = DaemonControlState::default();
+        let waiter_id = WaiterId(1);
+        assert!(state.reserve_uncertain_publication(waiter_id));
+        let (revision, prior) = daemon.state_view();
+        let authority = daemon
+            .runtime()
+            .expect("runtime")
+            .state_authority()
+            .expect("File authority");
+        let store = authority.store();
+        let prepared = store
+            .prepare_shared(
+                &authority,
+                revision,
+                Some(prior.clone()),
+                (*prior).clone(),
+                &prior.budget(),
+            )
+            .expect("prepare state write");
+        crate::FileHubStateStore::inject_next_directory_sync_failure(&directory);
+        let crate::persistence::FileCommitOutcome::PublishedUncertain(write) = store
+            .commit_shared(prepared, revision)
+            .expect("commit state write")
+        else {
+            panic!("directory sync failure must retain the uncertain write");
+        };
+        let mut write = Some(write);
+        let permit = state.budget.reserve().expect("reserve Owner permit");
+        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+        drop(reply_rx);
+        state.pending_requests.insert(
+            waiter_id,
+            PendingControlRequest {
+                waiter_id,
+                ready_class: ReadyClass::HostCompletion,
+                ready_key: None,
+                deadline_key: None,
+                last_core_phase: 0,
+                last_host_phase: 0,
+                completion: OwnerRequestCompletion::default(),
+                reply_tx,
+                response_delivery_rx: None,
+                grant_id: None,
+                client: None,
+                core_retirement: None,
+                permit: Some(permit),
+                must_finish: true,
+                past_deadline: false,
+                continuation: ControlContinuation::callback(move |_, state| {
+                    state.retain_uncertain_publication(
+                        waiter_id,
+                        write.take().expect("one uncertain completion"),
+                        None,
+                        None,
+                    );
+                    if internal_completion {
+                        ControlPoll::FinishedInternal
+                    } else {
+                        ControlPoll::Ready(Ok(
+                            crate::client_api_dto::response::daemon_response_base(
+                                DaemonResponseKind::OperatorError,
+                            ),
+                        ))
+                    }
+                }),
+                retire: None,
+            },
+        );
+        assert!(mark_owner_ready(
+            &mut state,
+            waiter_id,
+            ReadyClass::HostCompletion,
+            READY_HOST_COMPLETION,
+        ));
+        let item = state
+            .owner_ready
+            .pop_next()
+            .expect("ready uncertain completion");
+        let mut sent = false;
+        assert!(!poll_ready_request_item(
+            &mut daemon,
+            &mut state,
+            item,
+            &mut |_, _, entry, reply| {
+                sent = true;
+                assert!(entry.permit.is_none());
+                let _ = crate::daemon::owner_loop::send_control_reply(
+                    entry.reply_tx,
+                    reply,
+                    entry.response_delivery_rx,
+                );
+                false
+            },
+        ));
+        assert_eq!(sent, !internal_completion);
+        assert!(state.has_uncertain_owner_permit(waiter_id));
+        assert_eq!(state.budget.outstanding(), 1);
+        assert!(state.pending_requests.is_empty());
+        drop(state);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove owner ready test directory");
+    }
+
+    #[test]
+    fn uncertain_publication_keeps_owner_permit_after_closed_reply() {
+        uncertain_publication_keeps_owner_permit(false);
+    }
+
+    #[test]
+    fn uncertain_publication_keeps_owner_permit_after_internal_completion() {
+        uncertain_publication_keeps_owner_permit(true);
     }
 }

@@ -42,8 +42,8 @@ use crate::subscription::attach_routes::{
     record_attached_subscription_change,
 };
 use crate::subscription::entity::{
-    EntitySubscriptionState, drive_entity_subscriptions, drive_package_entity_fanout,
-    seed_lifecycle_reconciliation,
+    EntitySubscriptionCapacityWake, EntitySubscriptionState, drive_entity_subscriptions,
+    drive_package_entity_fanout, seed_lifecycle_reconciliation,
 };
 use crate::subscription::entity_resync::drive_package_entity_resync;
 use crate::transport::unix::connection::{
@@ -363,6 +363,12 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
 /// Read persistent notification bits before the owner can block.
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    if state.entity_capacity_wake.take() {
+        state
+            .maintenance
+            .wakes
+            .mark(MaintenanceSliceKind::SubscriberDelivery);
+    }
     if state.budget.take_capacity_notification() {
         if state.coordination_waiting_for_owner && state.coordination_fault.is_none() {
             state.coordination_waiting_for_owner = false;
@@ -986,6 +992,7 @@ fn run_control_ingress_item(
                 .accepted_connections
                 .saturating_add(1);
             let tx = control_tx.clone();
+            let entity_capacity_wake = state.entity_capacity_wake.clone();
             let shutdown = shutdown_tx.subscribe();
             state.lifecycle_counters.live_connections =
                 state.lifecycle_counters.live_connections.saturating_add(1);
@@ -996,7 +1003,14 @@ fn run_control_ingress_item(
             connection_tasks.push(transport_runtime.spawn(async move {
                 let _admission_permit = admission_permit;
                 if let Err(error) =
-                    handle_connection_async(stream, tx, cleanup_permit, shutdown, connection_permit)
+                    handle_connection_async(
+                        stream,
+                        tx,
+                        entity_capacity_wake,
+                        cleanup_permit,
+                        shutdown,
+                        connection_permit,
+                    )
                         .await
                 {
                     eprintln!("botster-hub daemon connection error: {error}");
@@ -1102,6 +1116,10 @@ fn serve_daemon_inner(
     control_state
         .plugin_result_budget
         .bind_owner_wake(control_tx.clone());
+    control_state.entity_capacity_wake.bind(control_tx.clone());
+    daemon
+        .local_webrtc()
+        .bind_entity_capacity_wake(control_state.entity_capacity_wake.clone());
     if let Some(runtime) = daemon.runtime() {
         runtime.install_plugin_completion_notifier(
             control_state.plugin_result_budget.completion_notifier(),
@@ -1721,6 +1739,38 @@ impl TerminalLifecycle {
     }
 }
 
+/// One allocation made before a File commit starts. Publication fills this cell in place.
+pub(crate) struct UncertainPublicationCell {
+    waiter_id: crate::owner_identity::WaiterId,
+    write: Option<UncertainPublicationPayload>,
+    rollback: Option<crate::host_mutations::RollbackDescriptor>,
+    cleanup: Option<UncertainPublicationCleanup>,
+    owner_permit: Option<crate::daemon::owner_budget::OwnerPermit>,
+}
+
+enum UncertainPublicationPayload {
+    State(crate::persistence::HubStateUncertainWrite),
+    External {
+        pending: crate::persistence::PendingFileCommit,
+        cause: crate::host_mutations::ExternalEffectCause,
+    },
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UncertainPublicationKind {
+    State,
+    External,
+}
+
+pub(crate) enum UncertainPublicationCleanup {
+    PackageRestore {
+        effect: crate::host_mutations::PackageRuntimeEffect,
+        original: crate::daemon::error::DaemonTransportError,
+    },
+    ManagedGit(crate::managed_git_worktrees::PreparedManagedWorktree),
+}
+
 pub(crate) struct DaemonControlState {
     pub(crate) coordination_fault: Option<crate::daemon::control::coordination::CoordinationFault>,
     pub(crate) coordination_waiting_for_owner: bool,
@@ -1735,6 +1785,7 @@ pub(crate) struct DaemonControlState {
     pub(crate) drain_cursors: BTreeMap<String, u64>,
     pub(crate) egress_diagnostics: DaemonEgressDiagnostics,
     pub(crate) entity_subscriptions: BTreeMap<String, EntitySubscriptionState>,
+    pub(crate) entity_capacity_wake: EntitySubscriptionCapacityWake,
     pub(crate) event_plane: std::sync::Arc<crate::subscription::package_events::ClientEventPlane>,
     pub(crate) client_events: crate::daemon::client_events::ClientEvents,
     pub(crate) pending_runtime: PendingRuntimeState,
@@ -1771,6 +1822,8 @@ pub(crate) struct DaemonControlState {
         crate::owner_identity::WaiterId,
         crate::daemon::control::host_work::HostRecoveryRequired,
     >,
+    /// Pre-admitted ownership for one File write. Terminal disposition remains unresolved.
+    pub(crate) uncertain_publication: Option<Box<UncertainPublicationCell>>,
     pub(crate) family_cleanup_waiters: BTreeMap<crate::owner_identity::WaiterId, u64>,
     causal_wake_after: Option<crate::owner_identity::WaiterId>,
     causal_wake_through: Option<crate::owner_identity::WaiterId>,
@@ -1816,6 +1869,147 @@ pub(crate) struct DaemonControlState {
     >,
 }
 
+impl DaemonControlState {
+    /// Claim the sole cell before a Host write. Occupied refusal starts no write.
+    pub(crate) fn reserve_uncertain_publication(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> bool {
+        if self.uncertain_publication.is_some() {
+            return false;
+        }
+        self.uncertain_publication = Some(Box::new(UncertainPublicationCell {
+            waiter_id,
+            write: None,
+            rollback: None,
+            cleanup: None,
+            owner_permit: None,
+        }));
+        true
+    }
+
+    /// Release a claim only when no write reached uncertain publication.
+    pub(crate) fn release_uncertain_reservation(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) {
+        if self
+            .uncertain_publication
+            .as_ref()
+            .is_some_and(|cell| cell.waiter_id == waiter_id && cell.write.is_none())
+        {
+            self.uncertain_publication = None;
+        }
+    }
+
+    /// Move a published result into the cell that was claimed before the write.
+    pub(crate) fn retain_uncertain_publication(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+        write: crate::persistence::HubStateUncertainWrite,
+        rollback: Option<crate::host_mutations::RollbackDescriptor>,
+        cleanup: Option<UncertainPublicationCleanup>,
+    ) {
+        let cell = self
+            .uncertain_publication
+            .as_mut()
+            .expect("uncertain publication has a pre-admitted cell");
+        assert_eq!(
+            cell.waiter_id, waiter_id,
+            "publication cell belongs to the writer"
+        );
+        assert!(
+            cell.write.is_none(),
+            "publication cell cannot be overwritten"
+        );
+        cell.write = Some(UncertainPublicationPayload::State(write));
+        cell.rollback = rollback;
+        cell.cleanup = cleanup;
+    }
+
+    /// Retain an unresolved external effect in the cell claimed before Host commit.
+    pub(crate) fn retain_uncertain_external(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+        pending: crate::persistence::PendingFileCommit,
+        rollback: crate::host_mutations::RollbackDescriptor,
+        cause: crate::host_mutations::ExternalEffectCause,
+    ) {
+        let cell = self
+            .uncertain_publication
+            .as_mut()
+            .expect("uncertain publication has a pre-admitted cell");
+        assert_eq!(
+            cell.waiter_id, waiter_id,
+            "publication cell belongs to the writer"
+        );
+        assert!(
+            cell.write.is_none(),
+            "publication cell cannot be overwritten"
+        );
+        cell.write = Some(UncertainPublicationPayload::External { pending, cause });
+        cell.rollback = Some(rollback);
+    }
+
+    /// Read the exact waiter's retained kind and rollback presence in tests.
+    #[cfg(test)]
+    pub(crate) fn uncertain_publication_for_test(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> Option<(UncertainPublicationKind, bool)> {
+        let cell = self.uncertain_publication.as_ref()?;
+        if cell.waiter_id != waiter_id {
+            return None;
+        }
+        let kind = match cell.write.as_ref()? {
+            UncertainPublicationPayload::State(_) => UncertainPublicationKind::State,
+            UncertainPublicationPayload::External { .. } => UncertainPublicationKind::External,
+        };
+        Some((kind, cell.rollback.is_some()))
+    }
+
+    /// The control reply can retire only after its unresolved Owner permit moves here.
+    pub(crate) fn retain_uncertain_owner_permit(
+        &mut self,
+        waiter_id: crate::owner_identity::WaiterId,
+        permit: crate::daemon::owner_budget::OwnerPermit,
+    ) {
+        let cell = self
+            .uncertain_publication
+            .as_mut()
+            .expect("uncertain publication has a pre-admitted cell");
+        assert_eq!(
+            cell.waiter_id, waiter_id,
+            "publication cell belongs to the writer"
+        );
+        assert!(
+            cell.write.is_some(),
+            "Owner permit follows uncertain publication"
+        );
+        assert!(cell.owner_permit.is_none(), "Owner permit moves only once");
+        cell.owner_permit = Some(permit);
+    }
+
+    pub(crate) fn has_uncertain_publication(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> bool {
+        self.uncertain_publication
+            .as_ref()
+            .is_some_and(|cell| cell.waiter_id == waiter_id && cell.write.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_uncertain_owner_permit(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) -> bool {
+        self.uncertain_publication
+            .as_ref()
+            .is_some_and(|cell| cell.waiter_id == waiter_id && cell.owner_permit.is_some())
+    }
+}
+
 impl fmt::Debug for DaemonControlState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1856,6 +2050,7 @@ impl Default for DaemonControlState {
             drain_cursors: BTreeMap::new(),
             egress_diagnostics: DaemonEgressDiagnostics::default(),
             entity_subscriptions: BTreeMap::new(),
+            entity_capacity_wake: EntitySubscriptionCapacityWake::default(),
             client_events: crate::daemon::client_events::ClientEvents::default(),
             event_plane: std::sync::Arc::new(
                 crate::subscription::package_events::ClientEventPlane::default(),
@@ -1886,6 +2081,7 @@ impl Default for DaemonControlState {
             causal_wake_active: false,
             causal_wake_again: false,
             host_recovery: BTreeMap::new(),
+            uncertain_publication: None,
             document_owner: None,
             document_waiters: std::collections::BTreeSet::new(),
             host_completion_drain_pending: false,
@@ -2692,6 +2888,7 @@ mod tests {
             runtime.block_on(handle_connection_async(
                 stream,
                 connection_tx,
+                EntitySubscriptionCapacityWake::default(),
                 cleanup_permit,
                 shutdown_rx,
                 permit,
@@ -6032,8 +6229,13 @@ mod tests {
     ) {
         let live = daemon.package_registry().snapshot();
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let authority = daemon
+            .runtime()
+            .expect("running runtime")
+            .state_authority()
+            .expect("File authority");
         let durable = store
-            .load_or_initialize(config)
+            .load_for_update(&authority, config)
             .expect("load durable hub state")
             .package_registry;
         (live, durable)
@@ -6948,7 +7150,6 @@ return botster.register({ handlers = {{
                     .is_none()
             );
         }
-        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
         let decode = |delivery| match delivery {
             crate::entity_delivery::EntityDelivery::Typed(frame) => frame,
             crate::entity_delivery::EntityDelivery::Encoded(frame) => frame.into_typed(),
@@ -6966,6 +7167,16 @@ return botster.register({ handlers = {{
                 "the sequence-1 mutation is superseded"
             );
         }
+        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        while daemon.runtime().unwrap().host_executor().outstanding() != 0 {
+            assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+            assert!(
+                Instant::now() < drain_deadline,
+                "Host work must retire after snapshots and fanout complete"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(daemon.runtime().unwrap().host_executor().outstanding(), 0);
         let bridge = daemon.runtime().unwrap().entity_publish_bridge();
         let publication = bridge.test_queue_publish(
             botster_core::PluginKey("owner-entity-gate".into()),
@@ -9940,24 +10151,27 @@ return botster.register({tools = {{
 
     #[test]
     fn session_type_generation_advances_only_after_successful_commit() {
+        let write_types_package = |package_dir: &std::path::Path| {
+            write_package_control_manifest(
+                package_dir,
+                "types.plugin",
+                serde_json::json!({
+                    "session_types": [{
+                        "id": "init",
+                        "label": "Mutate agent",
+                        "role": "botster.agent",
+                        "interaction": "interactive",
+                        "traits": ["test"],
+                        "lifecycle": "task",
+                        "command": "bin/init.sh"
+                    }]
+                }),
+            );
+        };
         let root = unique_package_control_dir("session-type-generation");
         let data_directory = root.join("data");
         let package_dir = root.join("types.plugin");
-        write_package_control_manifest(
-            &package_dir,
-            "types.plugin",
-            serde_json::json!({
-                "session_types": [{
-                    "id": "init",
-                    "label": "Mutate agent",
-                    "role": "botster.agent",
-                    "interaction": "interactive",
-                    "traits": ["test"],
-                    "lifecycle": "task",
-                    "command": "bin/init.sh"
-                }]
-            }),
-        );
+        write_types_package(&package_dir);
         let config = package_control_config(data_directory);
         let mut daemon = HubDaemon::start(config.clone()).expect("start generation daemon");
         drive_package_request(
@@ -9992,23 +10206,67 @@ return botster.register({tools = {{
             generation_after_install
         );
 
-        drive_package_request(
+        let refused_retry = drive_package_request(
             &mut daemon,
             DaemonRequest::EnablePackage {
                 package_name: "types.plugin".to_string(),
             },
         )
-        .expect("enable types package");
-        assert!(
+        .expect("typed retry refusal");
+        let refusal = refused_retry.error.as_ref().expect("retry must be refused");
+        assert_eq!(refusal.code, "hub_state_commit_failed");
+        // This message distinguishes journal quarantine from the first write failure.
+        assert_eq!(
+            refusal.message,
+            "recovery required: recovery_journal_quarantined"
+        );
+        assert_eq!(
             daemon
                 .runtime()
                 .expect("runtime")
                 .state()
-                .session_type_generation
-                > generation_after_install,
-            "successful enable must advance session-type generation after commit"
+                .session_type_generation,
+            generation_after_install
         );
         daemon.stop();
+
+        let clean_root = unique_package_control_dir("session-type-generation-clean");
+        let clean_package = clean_root.join("types.plugin");
+        write_types_package(&clean_package);
+        let clean_config = package_control_config(clean_root.join("data"));
+        let mut clean_daemon =
+            HubDaemon::start(clean_config).expect("start clean generation daemon");
+        drive_package_request(
+            &mut clean_daemon,
+            DaemonRequest::InstallPackageLocalPath { path: clean_package },
+        )
+        .expect("install clean types package");
+        let clean_generation_after_install = clean_daemon
+            .runtime()
+            .expect("runtime")
+            .state()
+            .session_type_generation;
+        let enabled = drive_package_request(
+            &mut clean_daemon,
+            DaemonRequest::EnablePackage {
+                package_name: "types.plugin".to_string(),
+            },
+        )
+        .expect("enable clean types package");
+        assert!(
+            enabled.error.is_none(),
+            "clean enable must succeed: {enabled:?}"
+        );
+        assert!(
+            clean_daemon
+                .runtime()
+                .expect("runtime")
+                .state()
+                .session_type_generation
+                > clean_generation_after_install,
+            "successful enable must advance session-type generation after commit"
+        );
+        clean_daemon.stop();
     }
 
     /// Owner-loop wiring for the reconcile read: attach a route through the
