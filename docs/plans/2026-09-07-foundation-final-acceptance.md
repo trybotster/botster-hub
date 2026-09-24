@@ -1,6 +1,29 @@
 # Foundation integration and final acceptance
 
-Status: spawn checkpoint `b7864ff9` and recovery checkpoint `d45c90da` are pushed. Full foundation acceptance remains open.
+Status: spawn checkpoint `b7864ff9` and recovery checkpoint `9168c1de` are pushed. Full foundation acceptance remains open.
+
+## Current delivery status — September 23
+
+This summary supersedes historical assignments below. Detailed evidence remains in the later checkpoint entries.
+The recent recovery fixes passed their focused checks. They do not establish integrated production readiness.
+The two existing agents now inspect integration between spawn `b7864ff9` and recovery `9168c1de` without source changes.
+Root retains integration ownership. No merge or deployment is in progress.
+
+Ordinary charged spawn still returns `Unavailable` in async `session_types.rs`, pending its startup-path input policy.
+Root asked Jason to approve startup-captured working-directory and executable paths, with the existing lookup-failure behavior.
+That question does not block independent merge analysis. Capturing paths alone does not prove memory admission.
+Integration must preserve durable write authority, journal retention, spawn receipts, cleanup identities, and subscription retry behavior.
+The first daemon acceptance test must exercise the actual charged Lua path, not only a similarly named synchronous path.
+
+The G8 test checkpoint is pushed as `9168c1de334dcc85e0a1b060f2446c5ccca7ead5`.
+Four binary formatter tests and the unchanged CLI success smoke passed, each executing one test.
+Root and reviewer 001e verified all nineteen checksum entries in `g8-cli-webrtc-20260923` under the existing evidence directory.
+The checkpoint removes an obsolete CLI fault-injection test and its unused wiring. It adds no production fault hook.
+Formatter checks do not prove end-to-end CLI failure output or retained-record lookup on CLI failure. Those requirements remain open.
+
+Other open gates include complete spawn materialization, crash/restart recovery, typed recovery errors, integration,
+the full workspace suite, formatting and lint, and verification with matched artifacts and real clients.
+Formatting differences remain unattributed. No production-ready claim, installation, deployment, or daemon replacement is authorized by this summary.
 
 ## Current handoff — September 22
 
