@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::{DataDirectoryOption, HubStartupOptions, RuntimeEnvironment};
 use crate::persistence::{
-    FileHubStateStore, HubState, HubStateError, HubStateStore, HubStateStoreError,
+    FileCommitOutcome, FileHubStateStore, HubState, HubStateAuthority, HubStateError,
+    HubStateStore, HubStateStoreError,
 };
-use crate::shared_view::SharedViewBudget;
+use crate::shared_view::SharedView;
 
 use super::record::*;
 use super::store::{PreparedRecoveryWrite, RecoveryCommitError};
@@ -41,7 +42,44 @@ impl Fixture {
     }
 
     fn state(&self) -> HubState {
-        self.store.load_or_initialize(&self.config).unwrap()
+        self.store.load_retained(&self.config).unwrap().0
+    }
+
+    fn replace_initialized_document(&self, bytes: &[u8]) {
+        if !self.directory.join("hub-recovery.log").exists() {
+            let _ = self.state();
+        }
+        fs::write(self.store.path(), bytes).expect("replace initialized test document");
+    }
+
+    fn retained_view(&self) -> (SharedView<HubState>, HubStateAuthority) {
+        let (state, Some(mut authority)) = self.store.load_retained(&self.config).unwrap() else {
+            panic!("File load must return authority");
+        };
+        let view = SharedView::from_reserved(
+            state,
+            authority.take_startup_charge().expect("startup charge"),
+        );
+        (view, authority)
+    }
+
+    fn reject_both_load_paths(&self, bytes: &[u8], expected: HubStateError) {
+        self.replace_initialized_document(
+            &serde_json::to_vec(&HubState::from_config(&self.config)).unwrap(),
+        );
+        let (prior, authority) = self.retained_view();
+        self.replace_initialized_document(bytes);
+        assert!(matches!(
+            self.store.load_for_update(&authority, &self.config),
+            Err(HubStateStoreError::State(error)) if error == expected
+        ));
+        drop(prior);
+        drop(authority);
+        assert!(matches!(
+            self.store.load_retained(&self.config),
+            Err(HubStateStoreError::State(error)) if error == expected
+        ));
+        assert_eq!(fs::read(self.store.path()).unwrap(), bytes);
     }
 }
 
@@ -223,12 +261,14 @@ fn terminal_classification_matches_absence_of_permitted_successors() {
 #[test]
 fn interrupted_intent_reload_retains_exact_ownership() {
     let fixture = Fixture::new();
-    let state = fixture.state();
-    let budget = SharedViewBudget::with_capacity(1024 * 1024);
+    let (state, authority) = fixture.retained_view();
+    let budget = authority.budget();
     let prepared = PreparedRecoveryWrite::admit(
         &fixture.store,
+        &authority,
         0,
-        state,
+        state.clone(),
+        (*state).clone(),
         &budget,
         "session-a".into(),
         None,
@@ -243,6 +283,8 @@ fn interrupted_intent_reload_retains_exact_ownership() {
     );
     assert_eq!(receipt.committed_revision(), 1);
     drop(receipt);
+    drop(authority);
+    drop(state);
     let reopened = fixture.state();
     let record = &reopened.recovery.records[0];
     assert_eq!(
@@ -256,15 +298,17 @@ fn interrupted_intent_reload_retains_exact_ownership() {
 #[test]
 fn interrupted_effect_preserves_unrelated_resource_and_reports_marker_mismatch() {
     let fixture = Fixture::new();
-    let state = fixture.state();
+    let (state, authority) = fixture.retained_view();
     let identity = managed(&fixture);
     let unrelated = fixture.directory.join("unrelated");
     fs::write(&unrelated, b"keep").unwrap();
-    let budget = SharedViewBudget::with_capacity(1024 * 1024);
+    let budget = authority.budget();
     let receipt = PreparedRecoveryWrite::admit(
         &fixture.store,
+        &authority,
         0,
-        state,
+        state.clone(),
+        (*state).clone(),
         &budget,
         "session-a".into(),
         Some(identity.clone()),
@@ -276,22 +320,38 @@ fn interrupted_effect_preserves_unrelated_resource_and_reports_marker_mismatch()
     // Simulate an effect after commit, then lose the completion before its write.
     fs::create_dir(&identity.path).unwrap();
     let marker = serde_json::to_string(receipt.attempt()).unwrap();
-    fixture
+    let mut with_worktree = (**receipt.state()).clone();
+    with_worktree.worktrees.push(crate::worktrees::Worktree {
+        worktree_id: identity.worktree_id.clone(),
+        target_id: identity.target_id.clone(),
+        label: identity.branch.clone(),
+        path: identity.path.clone(),
+        status: "present".into(),
+        management: "hub_managed_git".into(),
+        git: None,
+        metadata: std::collections::BTreeMap::from([("recovery_attempt".into(), marker)]),
+    });
+    let prepared = fixture
         .store
-        .update_test_fixture(&fixture.config, |state| {
-            state.worktrees.push(crate::worktrees::Worktree {
-                worktree_id: identity.worktree_id.clone(),
-                target_id: identity.target_id.clone(),
-                label: identity.branch.clone(),
-                path: identity.path.clone(),
-                status: "present".into(),
-                management: "hub_managed_git".into(),
-                git: None,
-                metadata: std::collections::BTreeMap::from([("recovery_attempt".into(), marker)]),
-            });
-        })
+        .prepare_shared(
+            &authority,
+            1,
+            Some(receipt.state().clone()),
+            with_worktree,
+            &budget,
+        )
         .unwrap();
+    let FileCommitOutcome::Synced {
+        state: with_worktree,
+        ..
+    } = fixture.store.commit_shared(prepared, 1).unwrap()
+    else {
+        panic!("worktree fixture write must synchronize");
+    };
     drop(receipt);
+    drop(authority);
+    drop(state);
+    drop(with_worktree);
     let reopened = fixture.state();
     let record = &reopened.recovery.records[0];
     assert_eq!(
@@ -302,15 +362,28 @@ fn interrupted_effect_preserves_unrelated_resource_and_reports_marker_mismatch()
         host_id: record.attempt.host_id.clone(),
         sequence: 99,
     };
-    fixture
+    let (current, authority) = fixture.retained_view();
+    let mut changed = (*current).clone();
+    changed.worktrees[0].metadata.insert(
+        "recovery_attempt".into(),
+        serde_json::to_string(&replacement).unwrap(),
+    );
+    let prepared = fixture
         .store
-        .update_test_fixture(&fixture.config, |state| {
-            state.worktrees[0].metadata.insert(
-                "recovery_attempt".into(),
-                serde_json::to_string(&replacement).unwrap(),
-            );
-        })
+        .prepare_shared(
+            &authority,
+            2,
+            Some(current.clone()),
+            changed,
+            &authority.budget(),
+        )
         .unwrap();
+    assert!(matches!(
+        fixture.store.commit_shared(prepared, 2),
+        Ok(FileCommitOutcome::Synced { .. })
+    ));
+    drop(authority);
+    drop(current);
     let replaced = fixture.state();
     let disk_marker: AttemptId =
         serde_json::from_str(&replaced.worktrees[0].metadata["recovery_attempt"]).unwrap();
@@ -328,13 +401,15 @@ fn interrupted_effect_preserves_unrelated_resource_and_reports_marker_mismatch()
 #[test]
 fn failed_write_returns_no_receipt_and_preserves_committed_bytes() {
     let fixture = Fixture::new();
-    let state = fixture.state();
+    let (state, authority) = fixture.retained_view();
     let bytes = fs::read(fixture.store.path()).unwrap();
-    let budget = SharedViewBudget::with_capacity(1024 * 1024);
+    let budget = authority.budget();
     let prepared = PreparedRecoveryWrite::admit(
         &fixture.store,
+        &authority,
         0,
-        state,
+        state.clone(),
+        (*state).clone(),
         &budget,
         "session-a".into(),
         None,
@@ -355,7 +430,15 @@ fn failed_write_returns_no_receipt_and_preserves_committed_bytes() {
     ));
     assert_eq!(effects, 0);
     assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
-    assert!(fixture.state().recovery.records.is_empty());
+    drop(authority);
+    drop(state);
+    assert!(matches!(
+        fixture.store.load_retained(&fixture.config),
+        Err(HubStateStoreError::RecoveryRequired {
+            reason: "recovery_intent_unresolved",
+            sequence: Some(2),
+        })
+    ));
 }
 
 #[test]
@@ -438,11 +521,14 @@ fn exact_receipts_gate_transitions_and_restart_does_not_authorize_rollback() {
 #[test]
 fn effect_completion_round_trip_stays_unresolved_without_receipt() {
     let fixture = Fixture::new();
-    let budget = SharedViewBudget::with_capacity(1024 * 1024);
+    let (state, authority) = fixture.retained_view();
+    let budget = authority.budget();
     let receipt = PreparedRecoveryWrite::admit(
         &fixture.store,
+        &authority,
         0,
-        fixture.state(),
+        state.clone(),
+        (*state).clone(),
         &budget,
         "session".into(),
         None,
@@ -453,7 +539,9 @@ fn effect_completion_round_trip_stays_unresolved_without_receipt() {
     .unwrap();
     PreparedRecoveryWrite::transition(
         &fixture.store,
+        &authority,
         1,
+        receipt.state().clone(),
         (**receipt.state()).clone(),
         &budget,
         receipt.attempt().clone(),
@@ -463,6 +551,9 @@ fn effect_completion_round_trip_stays_unresolved_without_receipt() {
     .unwrap()
     .commit(1)
     .unwrap();
+    drop(receipt);
+    drop(authority);
+    drop(state);
     let state = fixture.state();
     let record = &state.recovery.records[0];
     assert_eq!(
@@ -528,21 +619,49 @@ fn schema_three_migrates_both_load_paths_without_mutating_disk() {
     value["session_type_generation"] = 71.into();
     value.as_object_mut().unwrap().remove("recovery");
     let bytes = serde_json::to_vec(&value).unwrap();
-    fs::write(fixture.store.path(), &bytes).unwrap();
+    fixture.replace_initialized_document(&bytes);
     let loaded = fixture.state();
     assert_eq!(loaded.schema_version, 4);
     assert_eq!(loaded.session_type_generation, 71);
     assert_eq!(loaded.recovery, RecoveryLedger::default());
+    let (prior, authority) = fixture.retained_view();
     assert_eq!(
-        fixture.store.load_for_update(&fixture.config).unwrap(),
+        fixture
+            .store
+            .load_for_update(&authority, &fixture.config)
+            .unwrap(),
         loaded
     );
     assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
     FileHubStateStore::inject_next_save_failure(&fixture.directory);
-    assert!(fixture.store.save_exclusive_startup_state(&loaded).is_err());
+    assert!(
+        fixture
+            .store
+            .save_retained_startup_state(&authority, 0, Some(prior.clone()), loaded.clone())
+            .is_err()
+    );
     assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
-    fixture.store.save_exclusive_startup_state(&loaded).unwrap();
-    assert_eq!(fixture.state(), loaded);
+    drop(prior);
+    drop(authority);
+    assert!(matches!(
+        fixture.store.load_retained(&fixture.config),
+        Err(HubStateStoreError::RecoveryRequired {
+            reason: "recovery_intent_unresolved",
+            sequence: Some(2),
+        })
+    ));
+
+    let successful = Fixture::new();
+    successful.replace_initialized_document(&bytes);
+    let (prior, authority) = successful.retained_view();
+    assert!(matches!(
+        successful
+            .store
+            .save_retained_startup_state(&authority, 0, Some(prior), loaded.clone()),
+        Ok(FileCommitOutcome::Synced { .. })
+    ));
+    drop(authority);
+    assert_eq!(successful.state(), loaded);
 }
 
 #[test]
@@ -555,49 +674,18 @@ fn ambiguous_old_recovery_and_future_schema_fail_closed() {
         .unwrap();
     state.schema_version = 3;
     let bytes = serde_json::to_vec(&state).unwrap();
-    fs::write(fixture.store.path(), &bytes).unwrap();
-    assert!(matches!(
-        fixture.store.load_or_initialize(&fixture.config),
-        Err(HubStateStoreError::State(
-            HubStateError::InvalidRecoveryState
-        ))
-    ));
-    assert!(fixture.store.load_for_update(&fixture.config).is_err());
-    assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
+    fixture.reject_both_load_paths(&bytes, HubStateError::InvalidRecoveryState);
     let mut missing = serde_json::to_value(HubState::from_config(&fixture.config)).unwrap();
     missing.as_object_mut().unwrap().remove("recovery");
     let missing_bytes = serde_json::to_vec(&missing).unwrap();
-    fs::write(fixture.store.path(), &missing_bytes).unwrap();
-    assert!(matches!(
-        fixture.store.load_for_update(&fixture.config),
-        Err(HubStateStoreError::State(
-            HubStateError::InvalidRecoveryState
-        ))
-    ));
-    assert!(fixture.store.load_or_initialize(&fixture.config).is_err());
-    assert_eq!(fs::read(fixture.store.path()).unwrap(), missing_bytes);
+    fixture.reject_both_load_paths(&missing_bytes, HubStateError::InvalidRecoveryState);
     state.schema_version = 4;
     state.recovery.records[0].phase = Phase::ReceiptRecorded(Receipt::ConversionAcknowledged);
     let contradictory_bytes = serde_json::to_vec(&state).unwrap();
-    fs::write(fixture.store.path(), &contradictory_bytes).unwrap();
-    assert!(matches!(
-        fixture.store.load_for_update(&fixture.config),
-        Err(HubStateStoreError::State(
-            HubStateError::InvalidRecoveryState
-        ))
-    ));
-    assert!(fixture.store.load_or_initialize(&fixture.config).is_err());
-    assert_eq!(fs::read(fixture.store.path()).unwrap(), contradictory_bytes);
-    fs::write(fixture.store.path(), b"{\"schema_version\":99}").unwrap();
-    assert!(matches!(
-        fixture.store.load_for_update(&fixture.config),
-        Err(HubStateStoreError::State(
-            HubStateError::UnsupportedVersion(99)
-        ))
-    ));
-    assert_eq!(
-        fs::read(fixture.store.path()).unwrap(),
-        b"{\"schema_version\":99}"
+    fixture.reject_both_load_paths(&contradictory_bytes, HubStateError::InvalidRecoveryState);
+    fixture.reject_both_load_paths(
+        b"{\"schema_version\":99}",
+        HubStateError::UnsupportedVersion(99),
     );
 }
 
@@ -637,13 +725,15 @@ fn recovery_clone_walk_counts_every_owned_field() {
 #[test]
 fn stale_preparation_returns_ownership_without_changing_disk() {
     let fixture = Fixture::new();
-    let state = fixture.state();
+    let (state, authority) = fixture.retained_view();
     let before = fs::read(fixture.store.path()).unwrap();
-    let budget = SharedViewBudget::with_capacity(1024 * 1024);
+    let budget = authority.budget();
     let prepared = PreparedRecoveryWrite::admit(
         &fixture.store,
+        &authority,
         0,
-        state,
+        state.clone(),
+        (*state).clone(),
         &budget,
         "session".into(),
         None,
@@ -657,6 +747,7 @@ fn stale_preparation_returns_ownership_without_changing_disk() {
     assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
     assert!(budget.used() > 0);
     drop(returned);
+    drop(state);
     assert_eq!(budget.used(), 0);
 }
 

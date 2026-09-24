@@ -72,7 +72,10 @@ use crate::package_event_router::{
     CausalAdmitResult, CausalOp, EventPlaneStatus, EventSubscription, LeaseIdentity,
 };
 use crate::packages::{PackageRecord, PackageRegistry, PackageRegistryError, PackageState};
-use crate::persistence::{FileHubStateStore, HubState, HubStateStore, HubStateStoreError};
+use crate::persistence::{
+    FileCommitError, FileCommitOutcome, FileHubStateStore, HubState, HubStateAuthority,
+    HubStateStore, HubStateStoreError,
+};
 use crate::session_types::{
     EnsuredManagedWorktree, HubSessionContext, ManagedSessionTypeRequest, SessionTypeRequest,
     materialize_managed_session_type, materialize_session_type, show_session_type_for_target,
@@ -129,6 +132,7 @@ pub struct HubRuntime {
     // Readers clone the current Arc under this short lock. Publication swaps
     // one Arc, so the owner never clones a durable state collection.
     state: SharedHubState,
+    state_authority: Option<Arc<HubStateAuthority>>,
     core_daemon: SharedCoreDaemon,
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
     inflight_plugin_core:
@@ -136,12 +140,13 @@ pub struct HubRuntime {
     retained_plugin_reservations: Mutex<Vec<SessionReservation>>,
     created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
     confirmed_worktree_rollbacks: Mutex<Vec<crate::managed_git_worktrees::PreparedManagedWorktree>>,
-    suppressed_created_worktree_rollbacks: Arc<Mutex<BTreeSet<String>>>,
     submitted_created_worktree_rollbacks: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     rollback_git_hold: Mutex<Option<Arc<crate::host_executor::TestHostGate>>>,
     #[cfg(test)]
     managed_accept_ones: AtomicUsize,
+    #[cfg(test)]
+    inherited_managed_cleanup_transfers: AtomicUsize,
     #[cfg(test)]
     retry_retained_again_on_pending: AtomicBool,
     #[cfg(test)]
@@ -229,6 +234,10 @@ impl HubStatePublication {
         Ok(Self(RwLock::new(PublishedHubState { revision: 0, state })))
     }
 
+    pub(crate) fn from_retained(state: SharedView<HubState>, revision: u64) -> Self {
+        Self(RwLock::new(PublishedHubState { revision, state }))
+    }
+
     pub(crate) fn snapshot(&self) -> (u64, SharedView<HubState>) {
         let published = self.0.read().expect("hub state lock");
         (published.revision, published.state.clone())
@@ -308,6 +317,7 @@ pub struct HubSessionTypeSpawner {
     managed: Mutex<VecDeque<PendingManagedSessionSpawn>>,
     managed_pending: AtomicBool,
     managed_owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
+    managed_active: Mutex<BTreeMap<String, crate::owner_identity::WaiterId>>,
     abandoned: Mutex<Vec<String>>,
 }
 
@@ -505,6 +515,7 @@ impl HubRuntime {
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
             state,
+            state_authority: None,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(
@@ -513,12 +524,13 @@ impl HubRuntime {
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
-            suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
             submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             rollback_git_hold: Mutex::new(None),
             #[cfg(test)]
             managed_accept_ones: AtomicUsize::new(0),
+            #[cfg(test)]
+            inherited_managed_cleanup_transfers: AtomicUsize::new(0),
             #[cfg(test)]
             retry_retained_again_on_pending: AtomicBool::new(false),
             #[cfg(test)]
@@ -561,20 +573,12 @@ impl HubRuntime {
         config: HubConfig,
         store: &impl HubStateStore,
     ) -> HubRuntimeResult<Self> {
-        let mut state = store.load_or_initialize(&config)?;
-        if adopt_unrecorded_managed_worktrees(
-            &state.spawn_targets,
-            &mut state.worktrees,
-            &managed_worktree_root(&config),
-        ) {
-            store.save_exclusive_startup_state(&state)?;
-        }
-        validate_hub_credentials(
-            &state,
+        Self::load_from_store_with_credentials(
+            config,
+            store,
             CredentialProviderKind::OsKeychain,
             &OsKeychainCredentialStore::new(),
-        )?;
-        Self::from_validated_state(config, state)
+        )
     }
 
     /// Load durable hub state with an explicit credential store.
@@ -588,19 +592,77 @@ impl HubRuntime {
         provider_kind: CredentialProviderKind,
         credential_store: &impl botster_core::CredentialStore,
     ) -> HubRuntimeResult<Self> {
-        let mut state = store.load_or_initialize(&config)?;
-        if adopt_unrecorded_managed_worktrees(
-            &state.spawn_targets,
-            &mut state.worktrees,
-            &managed_worktree_root(&config),
-        ) {
-            store.save_exclusive_startup_state(&state)?;
-        }
-        validate_hub_credentials(&state, provider_kind, credential_store)?;
-        Self::from_validated_state(config, state)
+        let (state, authority) = store.load_retained(&config)?;
+        let (publication, authority) = if let Some(mut authority) = authority {
+            let prior = SharedView::from_reserved(
+                state,
+                authority
+                    .take_startup_charge()
+                    .expect("File retained load reserves its startup view"),
+            );
+            let mut candidate = (*prior).clone();
+            let (view, revision) = if adopt_unrecorded_managed_worktrees(
+                &candidate.spawn_targets,
+                &mut candidate.worktrees,
+                &managed_worktree_root(&config),
+            ) {
+                match authority.store().save_retained_startup_state(
+                    &authority,
+                    0,
+                    Some(prior),
+                    candidate,
+                ) {
+                    Ok(FileCommitOutcome::Synced { state, revision }) => (state, revision),
+                    Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+                        return Err(HubRuntimeError::State(
+                            HubStateStoreError::PublishedUncertain(write),
+                        ));
+                    }
+                    Err(FileCommitError::Preparation(error))
+                    | Err(FileCommitError::BeforePublication { error, .. }) => {
+                        return Err(HubRuntimeError::State(error));
+                    }
+                    Err(FileCommitError::Stale(_)) => {
+                        return Err(HubRuntimeError::State(HubStateStoreError::StaleRevision));
+                    }
+                    Err(FileCommitError::RevisionExhausted(_)) => {
+                        return Err(HubRuntimeError::State(
+                            HubStateStoreError::RevisionExhausted,
+                        ));
+                    }
+                }
+            } else {
+                (prior, 0)
+            };
+            validate_hub_credentials(&view, provider_kind, credential_store)?;
+            (
+                HubStatePublication::from_retained(view, revision),
+                Some(Arc::new(authority)),
+            )
+        } else {
+            let mut state = state;
+            if adopt_unrecorded_managed_worktrees(
+                &state.spawn_targets,
+                &mut state.worktrees,
+                &managed_worktree_root(&config),
+            ) {
+                store.save_exclusive_startup_state(&state)?;
+            }
+            validate_hub_credentials(&state, provider_kind, credential_store)?;
+            (HubStatePublication::new(state)?, None)
+        };
+        Self::from_initialized_state(config, publication, authority)
     }
 
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
+        Self::from_initialized_state(config, HubStatePublication::new(state)?, None)
+    }
+
+    fn from_initialized_state(
+        config: HubConfig,
+        publication: HubStatePublication,
+        state_authority: Option<Arc<HubStateAuthority>>,
+    ) -> HubRuntimeResult<Self> {
         let lua_memory = crate::lua_memory::LuaMemoryAccount::new(
             crate::config::lua_memory_limits(),
         )
@@ -609,7 +671,7 @@ impl HubRuntime {
                 field: "lua_memory",
             })
         })?;
-        let state = Arc::new(HubStatePublication::new(state)?);
+        let state = Arc::new(publication);
         let core_config = core_daemon_config(&config);
         let plugin_worker_config = config.plugin_worker_config();
         let plugin_lifecycle = HubPluginLifecycle::with_config(plugin_worker_config);
@@ -639,6 +701,7 @@ impl HubRuntime {
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
             state,
+            state_authority,
             core_daemon,
             detached_operations: Mutex::new(Vec::new()),
             inflight_plugin_core: Mutex::new(
@@ -647,12 +710,13 @@ impl HubRuntime {
             retained_plugin_reservations: Mutex::new(Vec::new()),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
-            suppressed_created_worktree_rollbacks: Arc::new(Mutex::new(BTreeSet::new())),
             submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             rollback_git_hold: Mutex::new(None),
             #[cfg(test)]
             managed_accept_ones: AtomicUsize::new(0),
+            #[cfg(test)]
+            inherited_managed_cleanup_transfers: AtomicUsize::new(0),
             #[cfg(test)]
             retry_retained_again_on_pending: AtomicBool::new(false),
             #[cfg(test)]
@@ -734,6 +798,10 @@ impl HubRuntime {
     /// Return the shared state publication used by daemon and plugin readers.
     pub(crate) fn state_publication(&self) -> SharedHubState {
         Arc::clone(&self.state)
+    }
+
+    pub(crate) fn state_authority(&self) -> Option<Arc<HubStateAuthority>> {
+        self.state_authority.as_ref().map(Arc::clone)
     }
 
     /// Publish durable hub state after an owner-thread mutation.
@@ -1835,9 +1903,6 @@ impl HubRuntime {
         )
         .map_err(|error| ManagedGitError::new(error.kind, error.message))?;
         drop(state);
-        if !prepared.created_worktree {
-            self.cancel_created_worktree_cleanup(&prepared.worktree_id);
-        }
         self.retry_retained_reservation_releases();
         self.retry_created_worktree_releases();
         let context = materialized.context.clone();
@@ -1919,9 +1984,6 @@ impl HubRuntime {
         if !prepared.created_worktree {
             return;
         }
-        if let Ok(mut suppressed) = self.suppressed_created_worktree_rollbacks.lock() {
-            suppressed.remove(&prepared.worktree_id);
-        }
         if let Ok(mut cleanups) = self.created_worktree_cleanups.lock()
             && !cleanups
                 .iter()
@@ -1941,50 +2003,6 @@ impl HubRuntime {
             });
         }
         self.retry_created_worktree_releases();
-    }
-
-    pub(crate) fn cancel_created_worktree_cleanup(&self, worktree_id: &str) {
-        let mut detached = Vec::new();
-        if let Ok(mut cleanups) = self.created_worktree_cleanups.lock() {
-            let mut keep = Vec::new();
-            for mut cleanup in cleanups.drain(..) {
-                if cleanup.worktree_id != worktree_id {
-                    keep.push(cleanup);
-                    continue;
-                }
-                if let Some(tracker) = cleanup.shutdown.take() {
-                    detached.push(tracker);
-                }
-                if let Some(tracker) = cleanup.remove.take() {
-                    detached.push(tracker);
-                }
-                let tracker = cleanup.release.take().unwrap_or_else(|| {
-                    self.begin_release_session_reservation(cleanup.reservation.clone())
-                });
-                detached.push(tracker);
-            }
-            *cleanups = keep;
-        }
-        if let Ok(mut confirmed) = self.confirmed_worktree_rollbacks.lock() {
-            confirmed.retain(|prepared| prepared.worktree_id != worktree_id);
-        }
-        if let Ok(mut suppressed) = self.suppressed_created_worktree_rollbacks.lock() {
-            suppressed.insert(worktree_id.to_string());
-        }
-        if let Ok(mut held) = self.detached_operations.lock() {
-            held.extend(detached);
-        }
-    }
-
-    pub(crate) fn created_worktree_rollback_suppressed(&self, worktree_id: &str) -> bool {
-        self.suppressed_created_worktree_rollbacks
-            .lock()
-            .ok()
-            .is_some_and(|held| held.contains(worktree_id))
-    }
-
-    pub(crate) fn created_worktree_rollback_suppressions(&self) -> Arc<Mutex<BTreeSet<String>>> {
-        Arc::clone(&self.suppressed_created_worktree_rollbacks)
     }
 
     pub(crate) fn begin_submitted_worktree_rollback(&self, worktree_id: &str) {
@@ -2168,6 +2186,38 @@ impl HubRuntime {
                     Some(held.remove(0))
                 }
             })
+    }
+
+    pub(crate) fn created_worktree_cleanup_active(&self, worktree_id: &str) -> bool {
+        self.created_worktree_cleanups
+            .lock()
+            .is_ok_and(|held| held.iter().any(|cleanup| cleanup.worktree_id == worktree_id))
+    }
+
+    pub(crate) fn take_confirmed_worktree_rollback(
+        &self,
+        worktree_id: &str,
+    ) -> Option<crate::managed_git_worktrees::PreparedManagedWorktree> {
+        let mut held = self.confirmed_worktree_rollbacks.lock().ok()?;
+        let index = held.iter().position(|prepared| prepared.worktree_id == worktree_id)?;
+        Some(held.remove(index))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_inherited_managed_cleanup_transfer(&self) {
+        self.inherited_managed_cleanup_transfers
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_inherited_managed_cleanup_transfers(&self) -> usize {
+        self.inherited_managed_cleanup_transfers.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn confirmed_worktree_rollback_exists(&self, worktree_id: &str) -> bool {
+        self.confirmed_worktree_rollbacks
+            .lock()
+            .is_ok_and(|held| held.iter().any(|prepared| prepared.worktree_id == worktree_id))
     }
 
     pub(crate) fn wake_remaining_confirmed_worktree_rollbacks(&self) {
@@ -4778,6 +4828,34 @@ impl HubRuntime {
 }
 
 impl HubSessionTypeSpawner {
+    pub(crate) fn managed_attempt_active(&self, worktree_id: &str) -> bool {
+        self.managed_active
+            .lock()
+            .is_ok_and(|held| held.contains_key(worktree_id))
+    }
+
+    pub(crate) fn begin_managed_attempt(
+        &self,
+        worktree_id: String,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) {
+        let mut held = self.managed_active.lock().expect("managed attempt lock");
+        assert!(held.insert(worktree_id, waiter_id).is_none());
+    }
+
+    pub(crate) fn finish_managed_attempt(
+        &self,
+        worktree_id: &str,
+        waiter_id: crate::owner_identity::WaiterId,
+    ) {
+        let mut held = self.managed_active.lock().expect("managed attempt lock");
+        if held.get(worktree_id) == Some(&waiter_id) {
+            held.remove(worktree_id);
+        }
+        drop(held);
+        self.publish_managed_spawn();
+    }
+
     /// Host destroys queued payloads after all scoped producers stop.
     pub(crate) fn dispose_terminal_pending(&self) -> bool {
         let queues = {
@@ -4870,6 +4948,7 @@ impl HubSessionTypeSpawner {
             managed: Mutex::new(VecDeque::new()),
             managed_pending: AtomicBool::new(false),
             managed_owner: Mutex::new(None),
+            managed_active: Mutex::new(BTreeMap::new()),
             abandoned: Mutex::new(Vec::new()),
         }
     }
@@ -4906,8 +4985,27 @@ impl HubSessionTypeSpawner {
         request: ManagedSessionTypeRequest,
         package_records: Vec<PackageRecord>,
     ) {
+        drop(self.test_enqueue_managed_with_reply(
+            plugin_key,
+            target_id,
+            branch,
+            session_type_id,
+            request,
+            package_records,
+        ));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_enqueue_managed_with_reply(
+        &self,
+        plugin_key: PluginKey,
+        target_id: String,
+        branch: String,
+        session_type_id: String,
+        request: ManagedSessionTypeRequest,
+        package_records: Vec<PackageRecord>,
+    ) -> mpsc::Receiver<Result<PluginManagedSessionSpawned, ManagedGitError>> {
         let (response, receiver) = mpsc::channel();
-        drop(receiver);
         self.managed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4923,6 +5021,7 @@ impl HubSessionTypeSpawner {
                 _dispose_probe: None,
             });
         self.publish_managed_spawn();
+        receiver
     }
 
     fn take_abandoned(&self) -> Vec<String> {

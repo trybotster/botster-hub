@@ -4726,7 +4726,7 @@ mod tests {
     fn source_update_requirement_rejects_old_daemon_and_accepts_current_daemon() {
         let requirement = DaemonCompatibilityRequirement::for_hub_source_update();
         let mut previous_daemon = DaemonCompatibility::current();
-        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon.conformance_fixture_revision = 48;
         previous_daemon
             .features
             .retain(|feature| feature != FEATURE_HUB_SOURCE_UPDATE);
@@ -4735,7 +4735,7 @@ mod tests {
             .expect_err("a source-update client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
             "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
-            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+            48
         )));
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
@@ -4767,7 +4767,7 @@ mod tests {
     fn ready_then_history_requirement_rejects_old_daemon_and_accepts_current_daemon() {
         let requirement = DaemonCompatibilityRequirement::for_ready_then_history_attach();
         let mut previous_daemon = DaemonCompatibility::current();
-        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon.conformance_fixture_revision = 48;
         previous_daemon.features.retain(|feature| {
             feature != botster_terminal_protocol::FEATURE_SNAPSHOT_DELIVERY_READY_THEN_HISTORY
         });
@@ -4776,7 +4776,7 @@ mod tests {
             .expect_err("a ready-then-history client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
             "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
-            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+            48
         )));
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
@@ -4803,7 +4803,7 @@ mod tests {
     fn unix_terminal_adapter_requirement_rejects_old_daemon_and_accepts_current_daemon() {
         let requirement = DaemonCompatibilityRequirement::for_unix_terminal_adapter();
         let mut previous_daemon = DaemonCompatibility::current();
-        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon.conformance_fixture_revision = 48;
         previous_daemon
             .features
             .retain(|feature| feature != FEATURE_UNIX_TERMINAL_ADAPTER);
@@ -4812,7 +4812,7 @@ mod tests {
             .expect_err("a unix-adapter client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
             "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
-            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+            48
         )));
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
@@ -4844,7 +4844,7 @@ mod tests {
     fn webrtc_terminal_adapter_requirement_rejects_old_daemon_and_accepts_current_daemon() {
         let requirement = DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
         let mut previous_daemon = DaemonCompatibility::current();
-        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon.conformance_fixture_revision = 48;
         previous_daemon
             .features
             .retain(|feature| feature != FEATURE_WEBRTC_TERMINAL_ADAPTER);
@@ -4853,7 +4853,7 @@ mod tests {
             .expect_err("a webrtc-adapter client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
             "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
-            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+            48
         )));
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
@@ -4936,7 +4936,7 @@ mod tests {
     fn attach_occupancy_requirement_rejects_old_daemon_and_accepts_current_daemon() {
         let requirement = DaemonCompatibilityRequirement::for_attach_occupancy();
         let mut previous_daemon = DaemonCompatibility::current();
-        previous_daemon.conformance_fixture_revision = DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION;
+        previous_daemon.conformance_fixture_revision = 48;
         previous_daemon
             .features
             .retain(|feature| feature != FEATURE_ATTACH_OCCUPANCY);
@@ -4945,7 +4945,7 @@ mod tests {
             .expect_err("an occupancy client must reject an old daemon");
         assert!(error.diagnostic.contains(&format!(
             "unsupported conformance fixture revision {}; requires at least {CONFORMANCE_FIXTURE_REVISION}",
-            DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION
+            48
         )));
 
         previous_daemon.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
@@ -5134,15 +5134,22 @@ mod tests {
             daemon
         };
         ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous)
-            .expect("default requirement still accepts the previous descriptor");
+            .expect("default requirement accepts the current revision without the optional feature");
         let requirement = DaemonCompatibilityRequirement::for_package_event_subscriptions();
-        let error = ensure_compatible(&requirement, &previous)
-            .expect_err("event requirement rejects the previous descriptor");
+        let mut old_revision = previous.clone();
+        old_revision.conformance_fixture_revision = 48;
+        let error = ensure_compatible(&requirement, &old_revision)
+            .expect_err("event requirement rejects revision 48");
         assert!(
             error
                 .diagnostic
                 .contains("unsupported conformance fixture revision")
         );
+        let error = ensure_compatible(&requirement, &previous)
+            .expect_err("event requirement rejects the missing feature at revision 49");
+        assert!(error
+            .diagnostic
+            .contains("missing required feature(s): package_event_subscriptions"));
         let mut current = previous;
         current.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
         current
@@ -6067,9 +6074,9 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueKind ="));
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
-        assert_eq!(PROTOCOL_VERSION, 8);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 48);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 36);
+        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 49);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 49);
     }
 
     #[test]

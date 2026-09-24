@@ -365,7 +365,8 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
     let home = unique_test_dir("shutdown-hub-maintenance-home");
     let receipt = home.join(".botster/installations/botster-hub.json");
     fs::create_dir_all(receipt.parent().expect("receipt parent")).expect("create receipt parent");
-    let (source_url, accepted_rx, release_fixture) = spawn_timeout_release_metadata_fixture();
+    let (source_url, accepted_rx, cancel_fixture, fixture_finished, release_fixture) =
+        spawn_timeout_release_metadata_fixture();
     fs::write(
         &receipt,
         serde_json::to_vec(&managed_receipt(&source_url)).expect("serialize receipt"),
@@ -374,15 +375,37 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
     let child = start_cli_daemon_with_home(&data_dir, &home);
     let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
     let update_endpoint = endpoint.clone();
-    let update = thread::spawn(move || {
-        botster_hub_client::request(
+    let (update_tx, update_rx) = mpsc::channel();
+    let update_thread = thread::spawn(move || {
+        let result = botster_hub_client::request(
             &update_endpoint,
             botster_hub_client::DaemonRequest::CheckHubUpdate,
-        )
+        );
+        let _ = update_tx.send(result);
     });
-    accepted_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("provider observes in-flight update check");
+    if let Err(accept_error) = accepted_rx.recv_timeout(Duration::from_secs(2)) {
+        let early_update = update_rx.try_recv().ok();
+        let _ = cancel_fixture.send(());
+        let fixture_exit = fixture_finished.recv_timeout(Duration::from_secs(3));
+        if !matches!(&fixture_exit, Err(mpsc::RecvTimeoutError::Timeout)) {
+            release_fixture
+                .join()
+                .expect("timeout release fixture exits");
+        }
+        let daemon_shutdown = shutdown_cli_daemon(&data_dir, child);
+        let update_outcome =
+            early_update.or_else(|| update_rx.recv_timeout(Duration::from_secs(5)).ok());
+        let update_reported = update_outcome.is_some();
+        if update_reported {
+            update_thread.join().expect("update request thread exits");
+        }
+        fs::remove_dir_all(&data_dir).expect("remove maintenance data dir");
+        fs::remove_dir_all(&home).expect("remove maintenance home");
+        panic!(
+            "provider observes in-flight update check: {accept_error}; update_reported={update_reported}; fixture_exit={fixture_exit:?}; daemon_shutdown={:?}",
+            daemon_shutdown.status
+        );
+    }
 
     let started = Instant::now();
     let shutdown = request_cli_daemon_shutdown(&data_dir).expect("request daemon shutdown");
@@ -393,18 +416,22 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
         started.elapsed()
     );
     assert!(daemon.status.success());
-    let update = update
-        .join()
-        .expect("update request thread exits")
+    let update = update_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("update request thread reports result")
         .expect("in-flight caller receives typed shutdown outcome")
         .hub_update
         .expect("shutdown update payload");
+    update_thread.join().expect("update request thread exits");
     assert_eq!(
         update.state,
         botster_hub_client::DaemonHubUpdateState::Unavailable
     );
     assert_eq!(update.reason.as_deref(), Some("daemon_shutdown"));
     assert_eq!(update.action.as_deref(), Some("retry"));
+    fixture_finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout release fixture completes");
     release_fixture
         .join()
         .expect("timeout release fixture exits");
@@ -1044,6 +1071,11 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
         failed_data_dir.join("hub-state.json"),
     )
     .expect("copy installed package state into fresh failed-start directory");
+    fs::copy(
+        data_dir.join("hub-recovery.log"),
+        failed_data_dir.join("hub-recovery.log"),
+    )
+    .expect("copy matching recovery journal into fresh failed-start directory");
     fs::remove_dir_all(&web_package_dir).expect("remove installed web checkout");
 
     let failed = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
@@ -1625,6 +1657,106 @@ fn cli_home_runtime_start_does_not_reuse_dead_pid_metadata_and_rebinds_leftover_
     );
 }
 
+const INCOMPATIBLE_FIXTURE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct IncompatibleDaemonFixture {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<usize>>,
+}
+
+impl IncompatibleDaemonFixture {
+    fn bind(socket_path: &Path) -> Self {
+        let listener = UnixListener::bind(socket_path).expect("bind fake incompatible daemon");
+        listener
+            .set_nonblocking(true)
+            .expect("set fake listener nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let mut accepted = 0;
+            while !thread_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("accept fake daemon connection: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set fake daemon read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("set fake daemon write timeout");
+                let raw = botster_hub_client::DaemonUnixFrameReader::new()
+                    .read_raw_frame(&mut stream, botster_hub_client::MAX_UNIX_FRAME_BYTES)
+                    .expect("read framed client hello");
+                let frame = botster_hub_client::decode_unix_frame::<botster_hub_client::ClientFrame>(
+                    &raw,
+                )
+                .expect("decode framed client hello");
+                match frame {
+                    botster_hub_client::DaemonUnixFrame::Control(
+                        botster_hub_client::ClientFrame::Hello { hello },
+                    ) => {
+                        assert_eq!(hello.protocol, botster_hub_client::PROTOCOL);
+                        assert_eq!(
+                            hello.compatibility.protocol_version,
+                            botster_hub_client::PROTOCOL_VERSION
+                        );
+                    }
+                    other => panic!("expected framed client hello, got {other:?}"),
+                }
+                let mut compatibility = botster_hub_client::DaemonCompatibility::current();
+                compatibility.protocol_version = 0;
+                assert_ne!(
+                    compatibility.protocol_version,
+                    botster_hub_client::PROTOCOL_VERSION
+                );
+                botster_hub_client::write_server_frame(
+                    &mut stream,
+                    &botster_hub_client::ServerFrame::HelloAck {
+                        ack: botster_hub_client::DaemonHelloAck {
+                            protocol: botster_hub_client::PROTOCOL.to_string(),
+                            compatibility,
+                            terminal_compatibility: None,
+                            diagnostics: Vec::new(),
+                        },
+                    },
+                )
+                .expect("write framed incompatible hello ack");
+                accepted += 1;
+            }
+            accepted
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self, expected_connections: usize) {
+        self.stop.store(true, Ordering::Release);
+        let accepted = self
+            .handle
+            .take()
+            .expect("fake daemon thread")
+            .join()
+            .expect("fake daemon thread completed");
+        assert_eq!(accepted, expected_connections);
+    }
+}
+
+impl Drop for IncompatibleDaemonFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[test]
 fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
     let _guard = daemon_test_guard();
@@ -1638,28 +1770,16 @@ fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
         .path
         .clone();
     fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("create socket parent");
-    let listener = UnixListener::bind(&socket_path).expect("bind fake incompatible daemon");
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        ready_tx.send(()).expect("send listener ready");
-        for _ in 0..2 {
-            let Ok((mut stream, _addr)) = listener.accept() else {
-                break;
-            };
-            let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
-            let mut hello = String::new();
-            let _ = reader.read_line(&mut hello);
-            let _ = stream.write_all(b"{\"protocol\":\"botster-hub-daemon-v1\"}\n");
-        }
-    });
-    ready_rx.recv().expect("fake listener ready");
+    let fixture = IncompatibleDaemonFixture::bind(&socket_path);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("up")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .output()
-        .expect("run botster-hub up against incompatible daemon");
+    let mut up_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    up_command.arg("up").arg("--data-dir").arg(&data_dir);
+    let output = run_command_with_timeout_diagnostics(
+        "up against incompatible daemon",
+        up_command,
+        INCOMPATIBLE_FIXTURE_COMMAND_TIMEOUT,
+    )
+    .output;
     assert!(
         !output.status.success(),
         "up unexpectedly succeeded: {}",
@@ -1677,12 +1797,14 @@ fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
         "up must not delete a connectable socket on compatibility failure"
     );
 
-    let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .arg("down")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .output()
-        .expect("run botster-hub down against incompatible daemon");
+    let mut down_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    down_command.arg("down").arg("--data-dir").arg(&data_dir);
+    let down = run_command_with_timeout_diagnostics(
+        "down against incompatible daemon",
+        down_command,
+        INCOMPATIBLE_FIXTURE_COMMAND_TIMEOUT,
+    )
+    .output;
     assert!(
         !down.status.success(),
         "down unexpectedly succeeded: {}",
@@ -1693,7 +1815,7 @@ fn cli_local_runtime_up_refuses_unowned_incompatible_daemon() {
     assert!(down_text.contains("Stop the running botster-hub process directly"));
     assert!(down_text.contains("remove the stale local socket"));
 
-    handle.join().expect("fake incompatible daemon thread");
+    fixture.finish(2);
     let _ = fs::remove_file(socket_path);
 }
 
@@ -1711,32 +1833,30 @@ fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
         .path
         .clone();
     fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("create socket parent");
-    let listener = UnixListener::bind(&socket_path).expect("bind fake incompatible daemon");
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        ready_tx.send(()).expect("send listener ready");
-        for _ in 0..2 {
-            let Ok((mut stream, _addr)) = listener.accept() else {
-                break;
-            };
-            let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
-            let mut hello = String::new();
-            let _ = reader.read_line(&mut hello);
-            let _ = stream.write_all(b"{\"protocol\":\"botster-hub-daemon-v1\"}\n");
-        }
-    });
-    ready_rx.recv().expect("fake listener ready");
+    let fixture = IncompatibleDaemonFixture::bind(&socket_path);
 
-    let mut decoy = ChildCleanup::spawn_non_botster_decoy();
+    let mut decoy = ChildCleanup {
+        child: Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn input-owned non-botster decoy"),
+    };
     write_local_runtime_daemon_metadata(&data_dir, decoy.id());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let mut up_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    up_command
         .env("HOME", &home)
         .env_remove("BOTSTER_HUB_DATA_DIR")
         .env_remove("XDG_DATA_HOME")
-        .arg("up")
-        .output()
-        .expect("run botster-hub up against forged daemon metadata");
+        .arg("up");
+    let output = run_command_with_timeout_diagnostics(
+        "up against forged daemon metadata",
+        up_command,
+        INCOMPATIBLE_FIXTURE_COMMAND_TIMEOUT,
+    )
+    .output;
     assert!(
         !output.status.success(),
         "up unexpectedly recovered forged metadata: {}",
@@ -1751,13 +1871,18 @@ fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
         "up must not delete a connectable socket when metadata pid is not botster-owned"
     );
 
-    let down = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let mut down_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    down_command
         .env("HOME", &home)
         .env_remove("BOTSTER_HUB_DATA_DIR")
         .env_remove("XDG_DATA_HOME")
-        .arg("down")
-        .output()
-        .expect("run botster-hub down against forged daemon metadata");
+        .arg("down");
+    let down = run_command_with_timeout_diagnostics(
+        "down against forged daemon metadata",
+        down_command,
+        INCOMPATIBLE_FIXTURE_COMMAND_TIMEOUT,
+    )
+    .output;
     assert!(
         !down.status.success(),
         "down unexpectedly recovered forged metadata: {}",
@@ -1772,7 +1897,7 @@ fn cli_local_runtime_refuses_forged_metadata_for_live_non_botster_pid() {
         "down must not delete a connectable socket when metadata pid is not botster-owned"
     );
 
-    handle.join().expect("fake incompatible daemon thread");
+    fixture.finish(2);
     let _ = fs::remove_file(socket_path);
 }
 
@@ -1789,26 +1914,19 @@ fn cli_doctor_reports_incompatible_stale_daemon_without_deleting_socket() {
         .path
         .clone();
     fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("create socket parent");
-    let listener = UnixListener::bind(&socket_path).expect("bind fake incompatible daemon");
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        ready_tx.send(()).expect("send listener ready");
-        let Ok((mut stream, _addr)) = listener.accept() else {
-            return;
-        };
-        let mut reader = BufReader::new(stream.try_clone().expect("clone fake stream"));
-        let mut hello = String::new();
-        let _ = reader.read_line(&mut hello);
-        let _ = stream.write_all(b"{\"protocol\":\"botster-hub-daemon-v1\"}\n");
-    });
-    ready_rx.recv().expect("fake listener ready");
+    let fixture = IncompatibleDaemonFixture::bind(&socket_path);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let mut doctor_command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    doctor_command
         .arg("doctor")
         .arg("--data-dir")
-        .arg(&data_dir)
-        .output()
-        .expect("run botster-hub doctor against incompatible daemon");
+        .arg(&data_dir);
+    let output = run_command_with_timeout_diagnostics(
+        "doctor against incompatible daemon",
+        doctor_command,
+        INCOMPATIBLE_FIXTURE_COMMAND_TIMEOUT,
+    )
+    .output;
     assert!(
         !output.status.success(),
         "doctor unexpectedly succeeded: {}",
@@ -1823,7 +1941,7 @@ fn cli_doctor_reports_incompatible_stale_daemon_without_deleting_socket() {
         "doctor must not delete a connectable socket on compatibility failure"
     );
 
-    handle.join().expect("fake incompatible daemon thread");
+    fixture.finish(1);
     let _ = fs::remove_file(socket_path);
 }
 
@@ -1863,11 +1981,14 @@ fn daemon_starts_empty_state_reports_status_uses_core_and_stops_idempotently() {
     let stopped_again = daemon.stop();
     assert_eq!(stopped_again, stopped);
 
-    let reopened = store
-        .load_or_initialize(&config)
+    drop(daemon);
+    let (reopened, authority) = store
+        .load_retained(&config)
         .expect("reload committed daemon state");
+    let authority = authority.expect("File reload retains state authority");
     assert_eq!(reopened.schema_version, 4);
     assert_eq!(reopened.host.id, "hub-daemon-test");
+    drop(authority);
 }
 
 #[test]
@@ -2187,11 +2308,14 @@ fn daemon_restores_existing_provider_policy_records_through_snapshot_admission()
     assert_eq!(status.schema_version, 4);
 
     daemon.stop();
-    let reopened = store
-        .load_or_initialize(&config)
+    drop(daemon);
+    let (reopened, authority) = store
+        .load_retained(&config)
         .expect("reload existing state after stop");
+    let authority = authority.expect("File reload retains state authority");
     assert_eq!(reopened.package_registry.records.len(), 1);
     assert!(reopened.package_registry.records[0].is_enabled());
+    drop(authority);
 }
 
 #[test]
@@ -2214,7 +2338,7 @@ fn cli_start_and_status_print_scrubbed_lifecycle_status() {
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
     assert!(stdout.contains("event=status"));
     assert!(stdout.contains("lifecycle_state=running"));
-    assert!(stdout.contains("schema_version=3"));
+    assert!(stdout.contains("schema_version=4"));
     assert!(stdout.contains("core_initialized=true"));
     assert!(stdout.contains("state_source=initialized"));
     assert!(!stdout.contains(data_dir.to_string_lossy().as_ref()));

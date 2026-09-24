@@ -273,6 +273,28 @@ pub(crate) struct PackageRecoveryRequired {
     _permit: HostWorkPermit,
 }
 
+fn host_operation_label(request: &DaemonRequest) -> &'static str {
+    use crate::PackageAction;
+
+    let action = match request {
+        DaemonRequest::InstallPackageRegistryEntry { .. }
+        | DaemonRequest::InstallPackageLocalPath { .. } => PackageAction::Install,
+        DaemonRequest::ShowPackage { .. } => PackageAction::Show,
+        DaemonRequest::SetPackageConfiguration { .. } => PackageAction::Configure,
+        DaemonRequest::ReloadPackage { .. } => PackageAction::Reload,
+        DaemonRequest::EnablePackageLocalPath { .. } | DaemonRequest::EnablePackage { .. } => {
+            PackageAction::Enable
+        }
+        DaemonRequest::DisablePackage { .. } => PackageAction::Disable,
+        DaemonRequest::RemovePackage { .. } => PackageAction::Remove,
+        DaemonRequest::CheckPackageUpdate { .. } => PackageAction::CheckUpdate,
+        DaemonRequest::PreviewPackageUpdate { .. } => PackageAction::PreviewUpdate,
+        DaemonRequest::ApplyPackageUpdate { .. } => PackageAction::ApplyUpdate,
+        _ => return "host_execution",
+    };
+    crate::daemon_projection::package_action_label(action)
+}
+
 /// Route one supported host request. A `None` result leaves the request with its existing family.
 pub(crate) fn handle(
     daemon: &mut HubDaemon,
@@ -281,11 +303,24 @@ pub(crate) fn handle(
 ) -> Option<ControlStep> {
     let waiter_id = state.current_waiter_id?;
     let must_finish = crate::daemon::control::pending::request_must_finish(&request);
+    let operation = host_operation_label(&request);
     let (base_revision, state_view) = daemon.state_view();
     let packages = daemon.package_registry_view();
     let runtime = daemon.runtime()?;
     let config = runtime.config().clone();
+    let authority = runtime.state_authority();
     let data_directory = config.data_directory.clone();
+    if authority.is_none()
+        && (is_package_prepare(&request)
+            || is_spawn_target_prepare(&request)
+            || is_session_type_prepare(&request))
+    {
+        return Some(ControlStep::ready(error_response(
+            "state_authority_required",
+            "hub_state",
+            "a durable Host mutation requires retained File state authority",
+        )));
+    }
     let command = if matches!(request, DaemonRequest::IssueLocalWebrtcBootstrap { .. }) {
         HostMutationCommand::ValidateBootstrap {
             request,
@@ -308,6 +343,9 @@ pub(crate) fn handle(
         HostMutationCommand::Prepare(HostPrepare::Package {
             request,
             base_revision,
+            authority: authority
+                .clone()
+                .expect("File host mutation retains its state authority"),
             state: state_view,
             packages,
             data_directory,
@@ -321,6 +359,9 @@ pub(crate) fn handle(
         HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
             request,
             base_revision,
+            authority: authority
+                .clone()
+                .expect("File host mutation retains its state authority"),
             state: state_view,
             packages,
             data_directory,
@@ -349,6 +390,7 @@ pub(crate) fn handle(
         HostMutationCommand::Prepare(HostPrepare::SessionType {
             request,
             base_revision,
+            authority: authority.expect("File host mutation retains its state authority"),
             config,
             state: state_view,
             packages,
@@ -382,6 +424,7 @@ pub(crate) fn handle(
             HostMutationContinuation {
                 waiter_id,
                 must_finish,
+                operation,
                 retained_prepare: None,
                 prior_compensation_failure: None,
                 failed_package_effect: None,
@@ -398,6 +441,7 @@ pub(crate) fn handle(
 pub(crate) struct HostMutationContinuation {
     waiter_id: WaiterId,
     must_finish: bool,
+    operation: &'static str,
     retained_prepare: Option<(PreparedMutation, HostWorkPermit)>,
     prior_compensation_failure: Option<HostMutationError>,
     failed_package_effect: Option<(PackageRuntimeEffect, DaemonTransportError)>,
@@ -463,6 +507,7 @@ impl HostMutationContinuation {
         let Self {
             waiter_id,
             must_finish,
+            operation,
             retained_prepare,
             prior_compensation_failure,
             failed_package_effect,
@@ -472,6 +517,7 @@ impl HostMutationContinuation {
         } = self;
         let waiter_id = *waiter_id;
         let must_finish = *must_finish;
+        let operation = *operation;
         if let Some((prepared, permit)) = retained_prepare.take() {
             return admit_or_park_commit(
                 daemon,
@@ -480,6 +526,7 @@ impl HostMutationContinuation {
                 prepared,
                 permit,
                 must_finish,
+                operation,
                 retained_prepare,
                 next_phase,
             );
@@ -553,8 +600,10 @@ impl HostMutationContinuation {
             } else if let HostResult::Mutation(result) = result {
                 result
             } else {
+                state.release_uncertain_reservation(waiter_id);
                 return finish_error(
                     permit,
+                    operation,
                     HostMutationError {
                         code: "host_completion_kind_mismatch".to_string(),
                         message: "the host executor returned a non-mutation result".to_string(),
@@ -564,6 +613,13 @@ impl HostMutationContinuation {
             (result, permit)
         };
         let mut result = result;
+        if !matches!(
+            result,
+            HostMutationResult::PublishedUncertain { .. }
+                | HostMutationResult::ExternalEffectUncertain { .. }
+        ) {
+            state.release_uncertain_reservation(waiter_id);
+        }
         if let Some(cleanup) = package_event_cleanup(&mut result) {
             if !cleanup.event_plane_faults.is_empty() {
                 return retain_event_cleanup(state, waiter_id, result, None, None, Some(permit));
@@ -627,6 +683,31 @@ impl HostMutationContinuation {
                 ControlPoll::Ready(response)
             }
             HostMutationResult::ReadReady(reply) => finish_reply(permit, reply),
+            HostMutationResult::PublishedUncertain { write, rollback } => {
+                let (code, message) = write.cause().client_error();
+                let cleanup = failed_package_effect.take().map(|(effect, original)| {
+                    crate::daemon::owner_loop::UncertainPublicationCleanup::PackageRestore {
+                        effect,
+                        original,
+                    }
+                });
+                state.retain_uncertain_publication(waiter_id, write, rollback, cleanup);
+                release_document(state, waiter_id);
+                // Host work completed. The unresolved Owner permit moves in pending.rs.
+                drop(permit);
+                ControlPoll::Ready(Ok(error_response(code, "hub_state", message)))
+            }
+            HostMutationResult::ExternalEffectUncertain {
+                pending,
+                rollback,
+                cause,
+            } => {
+                let (code, message) = cause.client_error();
+                state.retain_uncertain_external(waiter_id, pending, rollback, cause);
+                release_document(state, waiter_id);
+                drop(permit);
+                ControlPoll::Ready(Ok(error_response(code, "repo_session_type", message)))
+            }
             HostMutationResult::Prepared(prepared) => admit_or_park_commit(
                 daemon,
                 state,
@@ -634,15 +715,17 @@ impl HostMutationContinuation {
                 prepared,
                 permit,
                 must_finish,
+                operation,
                 retained_prepare,
                 next_phase,
             ),
             HostMutationResult::Committed(committed) => {
-                let current_revision = daemon.state_view().0;
+                let (current_revision, current_state) = daemon.state_view();
                 if committed.committed_revision != current_revision.saturating_add(1) {
                     release_document(state, waiter_id);
                     return finish_error(
                         permit,
+                        operation,
                         HostMutationError {
                             code: "host_commit_revision_mismatch".to_string(),
                             message:
@@ -651,9 +734,17 @@ impl HostMutationContinuation {
                         },
                     );
                 }
+                let session_type_generation_changed = current_state.session_type_generation
+                    != committed.view.session_type_generation;
                 daemon.publish_state(committed.view);
                 if let Some(packages) = committed.packages {
                     daemon.publish_package_registry_view(packages);
+                }
+                if session_type_generation_changed {
+                    state
+                        .maintenance
+                        .wakes
+                        .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
                 }
                 if let Some(effect) = committed.package_effect {
                     let runtime = daemon
@@ -694,10 +785,14 @@ impl HostMutationContinuation {
                     .runtime_mut()
                     .expect("package effect retains its runtime")
                     .apply_host_package_cleanup(cleanup);
+                state
+                    .maintenance
+                    .wakes
+                    .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
                 release_document(state, waiter_id);
                 match reply {
                     Ok(reply) => finish_reply(permit, reply),
-                    Err(error) => finish_error(permit, error),
+                    Err(error) => finish_error(permit, operation, error),
                 }
             }
             HostMutationResult::PackageEffectFailed {
@@ -712,9 +807,15 @@ impl HostMutationContinuation {
                 let runtime = daemon
                     .runtime()
                     .expect("package recovery retains its runtime");
-                if let Some(restore) =
-                    effect.restore_command(runtime.config().data_directory.clone())
-                {
+                let (base_revision, current_state) = daemon.state_view();
+                if let Some(restore) = effect.restore_command(
+                    runtime.config().data_directory.clone(),
+                    base_revision,
+                    runtime
+                        .state_authority()
+                        .expect("File package restore retains its state authority"),
+                    current_state,
+                ) {
                     submit_package_restore(
                         daemon,
                         state,
@@ -795,7 +896,7 @@ impl HostMutationContinuation {
                 | RecoveryOutcome::SpawnTarget { failure, .. }
                 | RecoveryOutcome::RegisteredWorktree { failure, .. } => {
                     release_document(state, waiter_id);
-                    finish_error(permit, failure)
+                    finish_error(permit, operation, failure)
                 }
                 RecoveryOutcome::SessionType {
                     failure,
@@ -805,7 +906,7 @@ impl HostMutationContinuation {
                     release_document(state, waiter_id);
                     let failure =
                         with_compensation_failure(failure, prior_compensation_failure.take());
-                    finish_error(permit, failure)
+                    finish_error(permit, operation, failure)
                 }
                 RecoveryOutcome::SessionType {
                     view,
@@ -841,7 +942,7 @@ impl HostMutationContinuation {
                 if state.document_owner == Some(waiter_id) {
                     release_document(state, waiter_id);
                 }
-                finish_error(permit, error)
+                finish_error(permit, operation, error)
             }
         }
     }
@@ -868,6 +969,22 @@ fn submit_package_restore(
         };
         return retain_package_recovery(state, waiter_id, effect, original, failure, permit);
     }
+    if !state.reserve_uncertain_publication(waiter_id) {
+        release_document(state, waiter_id);
+        let failure = PackageRollbackFailure {
+            step: "restore_admission",
+            package_name: None,
+            error: Box::new(DaemonTransportError::Protocol(
+                "another unresolved state publication owns the retention cell",
+            )),
+        };
+        let _ = retain_package_recovery(state, waiter_id, effect, original, failure, permit);
+        return ControlPoll::Ready(Ok(error_response(
+            "state_publication_slot_occupied",
+            "hub_state",
+            "another unresolved state publication owns the retention cell",
+        )));
+    }
 
     // The document reservation remains held through the first whole-state
     // restore. No code can replay this snapshot after reservation release.
@@ -885,6 +1002,9 @@ fn submit_package_restore(
     }) = state.host_recovery.get_mut(&waiter_id)
     {
         *package_restore = failed_package_effect.take();
+    }
+    if !matches!(poll, ControlPoll::Pending) {
+        state.release_uncertain_reservation(waiter_id);
     }
     poll
 }
@@ -931,6 +1051,7 @@ fn admit_or_park_commit(
     prepared: PreparedMutation,
     permit: HostWorkPermit,
     must_finish: bool,
+    operation: &'static str,
     retained: &mut Option<(PreparedMutation, HostWorkPermit)>,
     next_phase: &mut u64,
 ) -> ControlPoll {
@@ -949,6 +1070,7 @@ fn admit_or_park_commit(
         wake_next_document_waiter(state);
         return finish_error(
             permit,
+            operation,
             HostMutationError {
                 code: "package_recovery_required".to_string(),
                 message: "package recovery is required before this prepared mutation can commit"
@@ -962,14 +1084,32 @@ fn admit_or_park_commit(
         prepared.base_revision,
         daemon.state_view().0,
     ) {
-        DocumentAdmission::Granted => submit_phase(
-            daemon,
-            state,
-            waiter_id,
-            HostMutationCommand::Commit(HostCommit { prepared }),
-            permit,
-            next_phase,
-        ),
+        DocumentAdmission::Granted => {
+            if !state.reserve_uncertain_publication(waiter_id) {
+                release_document(state, waiter_id);
+                return finish_error(
+                    permit,
+                    operation,
+                    HostMutationError {
+                        code: "state_publication_slot_occupied".to_string(),
+                        message: "another unresolved state publication owns the retention cell"
+                            .to_string(),
+                    },
+                );
+            }
+            let poll = submit_phase(
+                daemon,
+                state,
+                waiter_id,
+                HostMutationCommand::Commit(HostCommit { prepared }),
+                permit,
+                next_phase,
+            );
+            if !matches!(poll, ControlPoll::Pending) {
+                state.release_uncertain_reservation(waiter_id);
+            }
+            poll
+        }
         DocumentAdmission::Busy => {
             *retained = Some((prepared, permit));
             ControlPoll::Pending
@@ -978,6 +1118,7 @@ fn admit_or_park_commit(
             wake_next_document_waiter(state);
             finish_error(
                 permit,
+                operation,
                 HostMutationError {
                     code: "host_prepared_revision_stale".to_string(),
                     message: "the Hub state changed while the host mutation was prepared"
@@ -1200,9 +1341,13 @@ fn finish_reply(permit: HostWorkPermit, reply: crate::host_mutations::HostReply)
     ControlPoll::ReadyHost(Ok(reply.response), charge)
 }
 
-fn finish_error(permit: HostWorkPermit, error: HostMutationError) -> ControlPoll {
+fn finish_error(
+    permit: HostWorkPermit,
+    operation: &'static str,
+    error: HostMutationError,
+) -> ControlPoll {
     let charge = permit.into_prepared_charge(0);
-    ControlPoll::ReadyHost(Ok(host_error_response(error)), charge)
+    ControlPoll::ReadyHost(Ok(host_error_response(operation, error)), charge)
 }
 
 fn finish_transport_error(permit: HostWorkPermit, error: DaemonTransportError) -> ControlPoll {
@@ -1210,8 +1355,8 @@ fn finish_transport_error(permit: HostWorkPermit, error: DaemonTransportError) -
     ControlPoll::ReadyHost(Err(error), charge)
 }
 
-fn host_error_response(error: HostMutationError) -> DaemonResponse {
-    error_response(&error.code, "host_execution", &error.message)
+fn host_error_response(operation: &str, error: HostMutationError) -> DaemonResponse {
+    error_response(&error.code, operation, &error.message)
 }
 
 fn submit_error_response(error: HostSubmitError) -> DaemonResponse {
@@ -1463,6 +1608,12 @@ fn is_session_type_prepare(request: &DaemonRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::owner_loop::UncertainPublicationKind;
+    use crate::host_executor::HostCompletion;
+    use crate::host_mutations::{ExternalEffectCause, RollbackDescriptor};
+    use crate::persistence::{ExternalFileIntent, FileCommitOutcome, FileHubStateStore};
+    use crate::runtime::package_effect::HostPackageCleanup;
+    use crate::session_types::SessionTypeError;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn recovery_test_daemon() -> (HubDaemon, std::path::PathBuf) {
@@ -1488,6 +1639,507 @@ mod tests {
             HubDaemon::start(config).expect("start test daemon"),
             directory,
         )
+    }
+
+    #[test]
+    fn host_operation_label_classifies_package_requests_and_preserves_generic_requests() {
+        assert_eq!(
+            host_operation_label(&DaemonRequest::ShowPackage {
+                package_name: "test.plugin".to_string(),
+            }),
+            "show"
+        );
+        assert_eq!(
+            host_operation_label(&DaemonRequest::SetPackageConfiguration {
+                package_name: "test.plugin".to_string(),
+                values: Default::default(),
+            }),
+            "configure"
+        );
+        assert_eq!(
+            host_operation_label(&DaemonRequest::EnablePackage {
+                package_name: "test.plugin".to_string(),
+            }),
+            "enable"
+        );
+        assert_eq!(
+            host_operation_label(&DaemonRequest::RefreshLocalPackages),
+            "host_execution"
+        );
+        assert_eq!(
+            host_operation_label(&DaemonRequest::ListSpawnTargets),
+            "host_execution"
+        );
+    }
+
+    #[test]
+    fn later_package_failure_keeps_its_action_and_non_package_failure_stays_generic() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        for (index, operation, result) in [
+            (
+                0_u64,
+                "enable",
+                HostMutationResult::PackageEffectApplied {
+                    reply: Err(HostMutationError {
+                        code: "package_effect_failed".to_string(),
+                        message: "test failure".to_string(),
+                    }),
+                    cleanup: HostPackageCleanup::default(),
+                },
+            ),
+            (
+                1_u64,
+                "host_execution",
+                HostMutationResult::Failed(HostMutationError {
+                    code: "host_read_failed".to_string(),
+                    message: "test failure".to_string(),
+                }),
+            ),
+        ] {
+            let waiter_id = WaiterId(100 + index);
+            let mut state = DaemonControlState::default();
+            state.document_owner = Some(waiter_id);
+            let permit = daemon
+                .runtime()
+                .expect("runtime")
+                .host_executor()
+                .try_reserve()
+                .expect("reserve Host slot");
+            state.host_completions.insert(
+                waiter_id,
+                HostCompletion::from_parts(
+                    HostJobIdentity::first(waiter_id),
+                    HostResult::Mutation(result),
+                    permit,
+                ),
+            );
+            let mut continuation = HostMutationContinuation {
+                waiter_id,
+                must_finish: index == 0,
+                operation,
+                retained_prepare: None,
+                prior_compensation_failure: None,
+                failed_package_effect: None,
+                next_phase: 2,
+                family_work: None,
+                event_cleanup: None,
+            };
+            let ControlPoll::ReadyHost(Ok(response), charge) =
+                continuation.poll(&mut daemon, &mut state)
+            else {
+                panic!("Host failure must return an operator error");
+            };
+            let error = response.error.expect("operator error");
+            assert_eq!(error.operation, operation);
+            assert_eq!(error.request_id, format!("daemon-{operation}"));
+            assert_eq!(error.diagnostics[0].operation.as_deref(), Some(operation));
+            assert_eq!(
+                response.diagnostics[0].operation.as_deref(),
+                Some(operation)
+            );
+            drop(charge);
+            assert_eq!(state.document_owner, None);
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove Host label test directory");
+    }
+
+    fn assert_retained_admission_label(
+        daemon: &mut HubDaemon,
+        mut prepared: PreparedMutation,
+        operation: &'static str,
+        waiter_id: WaiterId,
+    ) {
+        prepared.base_revision = daemon.state_view().0 + 1;
+        let mut state = DaemonControlState::default();
+        state.document_owner = Some(WaiterId(waiter_id.0 + 1));
+        let permit = daemon
+            .runtime()
+            .expect("runtime")
+            .host_executor()
+            .try_reserve()
+            .expect("reserve Host slot");
+        state.host_completions.insert(
+            waiter_id,
+            HostCompletion::from_parts(
+                HostJobIdentity::first(waiter_id),
+                HostResult::Mutation(HostMutationResult::Prepared(prepared)),
+                permit,
+            ),
+        );
+        let mut continuation = HostMutationContinuation {
+            waiter_id,
+            must_finish: true,
+            operation,
+            retained_prepare: None,
+            prior_compensation_failure: None,
+            failed_package_effect: None,
+            next_phase: 2,
+            family_work: None,
+            event_cleanup: None,
+        };
+        assert!(matches!(
+            continuation.poll(daemon, &mut state),
+            ControlPoll::Pending
+        ));
+        assert!(continuation.retained_prepare.is_some());
+        assert!(state.document_waiters.contains(&waiter_id));
+        state.document_owner = None;
+        let ControlPoll::ReadyHost(Ok(response), charge) =
+            continuation.poll(daemon, &mut state)
+        else {
+            panic!("stale retained preparation must return an operator error");
+        };
+        let error = response.error.expect("operator error");
+        assert_eq!(error.code, "host_prepared_revision_stale");
+        assert_eq!(error.operation, operation);
+        assert_eq!(error.request_id, format!("daemon-{operation}"));
+        assert_eq!(error.diagnostics[0].operation.as_deref(), Some(operation));
+        assert_eq!(
+            response.diagnostics[0].operation.as_deref(),
+            Some(operation)
+        );
+        drop(charge);
+    }
+
+    #[test]
+    fn retained_prepared_admission_keeps_its_operation_after_document_contention() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let (revision, view) = daemon.state_view();
+        let request = DaemonRequest::CreateSpawnTarget {
+            target_id: Some("retained-label-target".to_string()),
+            label: None,
+            root: std::env::current_dir().expect("current directory"),
+            enabled: false,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: Default::default(),
+        };
+        let HostMutationResult::Prepared(prepared) = crate::host_mutations::execute(
+            HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+                request,
+                base_revision: revision,
+                authority: daemon
+                    .runtime()
+                    .expect("runtime")
+                    .state_authority()
+                    .expect("File authority"),
+                state: view,
+                packages: daemon.package_registry_view(),
+                data_directory: directory.clone(),
+            }),
+            None,
+        ) else {
+            panic!("spawn target preparation must succeed");
+        };
+        assert_retained_admission_label(&mut daemon, prepared, "host_execution", WaiterId(102));
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove retained label test directory");
+    }
+
+    #[test]
+    fn retained_package_admission_keeps_configure_after_document_contention() {
+        use crate::packages::{HubPackageEvents, HubPackageManifest, PackageProvenance};
+        use botster_core::{
+            ExtensionEntrypoint, ExtensionKind, ExtensionRuntime, PackageConfigurationSchema,
+            PackageSource,
+        };
+
+        let (mut daemon, directory) = recovery_test_daemon();
+        let mut packages = crate::PackageRegistry::new(botster_core::CapabilitySet::new());
+        packages
+            .install(
+                HubPackageManifest {
+                    name: "retained.plugin".to_string(),
+                    version: "1.0.0".to_string(),
+                    kind: ExtensionKind::Plugin,
+                    botster: ">=0.1.0".to_string(),
+                    source: Some(PackageSource::Git {
+                        repo: "https://example.invalid/retained.git".to_string(),
+                        reference: "v1.0.0".to_string(),
+                    }),
+                    capabilities: Vec::new(),
+                    entrypoints: vec![ExtensionEntrypoint {
+                        runtime: ExtensionRuntime::Lua,
+                        path: "plugin.lua".to_string(),
+                        bootstrap: false,
+                    }],
+                    dependencies: Vec::new(),
+                    features: Vec::new(),
+                    host_profile: None,
+                    configuration: Some(PackageConfigurationSchema {
+                        groups: Vec::new(),
+                        fields: Vec::new(),
+                    }),
+                    runnable_entrypoints: Vec::new(),
+                    surfaces: Vec::new(),
+                    navigation: Vec::new(),
+                    events: HubPackageEvents::default(),
+                },
+                PackageProvenance {
+                    source: "test".to_string(),
+                    checksum: None,
+                },
+                "retained admission test",
+            )
+            .expect("install package fixture");
+        let (revision, prior) = daemon.state_view();
+        let authority = daemon
+            .runtime()
+            .expect("runtime")
+            .state_authority()
+            .expect("File authority");
+        let budget = authority.budget();
+        let mut matched = (*prior).clone();
+        matched.package_registry = packages.snapshot();
+        let state = crate::shared_view::SharedView::try_new(&budget, matched, 1)
+            .expect("matched state view fits");
+        let packages = crate::shared_view::SharedView::try_new(&budget, packages, 1)
+            .expect("package view fits");
+        let mut entrypoints = crate::entrypoint_supervisor::EntrypointSupervisor::default();
+        let HostMutationResult::Prepared(prepared) = crate::host_mutations::execute(
+            HostMutationCommand::Prepare(HostPrepare::Package {
+                request: DaemonRequest::SetPackageConfiguration {
+                    package_name: "retained.plugin".to_string(),
+                    values: Default::default(),
+                },
+                base_revision: revision,
+                authority: authority.clone(),
+                state,
+                packages,
+                data_directory: directory.clone(),
+            }),
+            Some(&mut entrypoints),
+        ) else {
+            panic!("package configuration preparation must succeed");
+        };
+        assert_retained_admission_label(&mut daemon, prepared, "configure", WaiterId(104));
+        drop(authority);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove retained package test directory");
+    }
+
+    #[test]
+    fn committed_session_type_generation_change_wakes_subscriber_delivery() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let mut state = DaemonControlState::default();
+        let delivery = crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery;
+        assert!(state.maintenance.wakes.take(delivery));
+        for (index, changed) in [false, true].into_iter().enumerate() {
+            let (revision, prior) = daemon.state_view();
+            let mut next = (*prior).clone();
+            if changed {
+                next.session_type_generation += 1;
+            }
+            let view = daemon
+                .runtime()
+                .expect("runtime")
+                .prepare_state(next)
+                .expect("prepare committed view");
+            let waiter_id = WaiterId(90 + index as u64);
+            state.document_owner = Some(waiter_id);
+            let permit = daemon
+                .runtime()
+                .expect("runtime")
+                .host_executor()
+                .try_reserve()
+                .expect("reserve Host slot");
+            let reply = crate::host_mutations::HostReply::try_new(
+                crate::client_api_dto::response::daemon_response_base(
+                    botster_hub_client::DaemonResponseKind::SessionTypes,
+                ),
+            )
+            .expect("bounded session type reply");
+            state.host_completions.insert(
+                waiter_id,
+                HostCompletion::from_parts(
+                    HostJobIdentity::first(waiter_id),
+                    HostResult::Mutation(HostMutationResult::Committed(
+                        crate::host_mutations::CommittedView {
+                            committed_revision: revision + 1,
+                            view,
+                            packages: None,
+                            package_effect: None,
+                            reply,
+                        },
+                    )),
+                    permit,
+                ),
+            );
+            let mut continuation = HostMutationContinuation {
+                waiter_id,
+                must_finish: false,
+                operation: "host_execution",
+                retained_prepare: None,
+                prior_compensation_failure: None,
+                failed_package_effect: None,
+                next_phase: 2,
+                family_work: None,
+                event_cleanup: None,
+            };
+            assert!(!state.maintenance.wakes.take(delivery));
+            let ControlPoll::ReadyHost(Ok(response), charge) =
+                continuation.poll(&mut daemon, &mut state)
+            else {
+                panic!("committed session type view must return its reply");
+            };
+            assert_eq!(
+                response.kind,
+                botster_hub_client::DaemonResponseKind::SessionTypes
+            );
+            drop(charge);
+            assert_eq!(state.maintenance.wakes.take(delivery), changed);
+        }
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove generation wake test directory");
+    }
+
+    fn poll_uncertain_result(
+        daemon: &mut HubDaemon,
+        result: HostMutationResult,
+        expected_kind: UncertainPublicationKind,
+        expected_error: &str,
+    ) {
+        let waiter_id = WaiterId(82);
+        let next_waiter = WaiterId(83);
+        let later_waiter = WaiterId(84);
+        let mut state = DaemonControlState::default();
+        assert!(state.reserve_uncertain_publication(waiter_id));
+        state.document_owner = Some(waiter_id);
+        state.document_waiters = [next_waiter, later_waiter].into_iter().collect();
+        let permit = daemon
+            .runtime()
+            .expect("runtime")
+            .host_executor()
+            .try_reserve()
+            .expect("reserve host work");
+        state.host_completions.insert(
+            waiter_id,
+            HostCompletion::from_parts(
+                HostJobIdentity::first(waiter_id),
+                HostResult::Mutation(result),
+                permit,
+            ),
+        );
+        let mut continuation = HostMutationContinuation {
+            waiter_id,
+            must_finish: false,
+            operation: "host_execution",
+            retained_prepare: None,
+            prior_compensation_failure: None,
+            failed_package_effect: None,
+            next_phase: 2,
+            family_work: None,
+            event_cleanup: None,
+        };
+        let poll = continuation.poll(daemon, &mut state);
+        assert!(matches!(
+            poll,
+            ControlPoll::Ready(Ok(response))
+                if response.error.as_ref().is_some_and(|error| error.code == expected_error)
+        ));
+        assert_eq!(
+            state.uncertain_publication_for_test(waiter_id),
+            Some((expected_kind, true))
+        );
+        assert_eq!(state.uncertain_publication_for_test(next_waiter), None);
+        assert_eq!(state.document_owner, None);
+        assert_eq!(state.document_waiters, [later_waiter].into_iter().collect());
+    }
+
+    #[test]
+    fn external_uncertainty_uses_the_host_completion_cell_and_releases_one_document_waiter() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let (revision, prior) = daemon.state_view();
+        let authority = daemon
+            .runtime()
+            .expect("runtime")
+            .state_authority()
+            .expect("File authority");
+        let store = FileHubStateStore::for_data_directory(&directory);
+        let prepared = store
+            .prepare_shared(
+                &authority,
+                revision,
+                Some(prior.clone()),
+                (*prior).clone(),
+                &authority.budget(),
+            )
+            .expect("prepare state write");
+        let external_path = directory.join("repo/.botster/session-types.json");
+        let pending = store
+            .begin_shared_effect(
+                prepared,
+                revision,
+                Some(ExternalFileIntent {
+                    path: &external_path,
+                    prior: None,
+                    candidate: b"candidate repo bytes",
+                }),
+            )
+            .expect("synchronize real external intent");
+        poll_uncertain_result(
+            &mut daemon,
+            HostMutationResult::ExternalEffectUncertain {
+                pending,
+                rollback: RollbackDescriptor::SessionType {
+                    previous: prior,
+                    repo_file: None,
+                },
+                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed(SessionTypeError::new(
+                    "repo_session_type_sync_uncertain",
+                    "test uncertainty",
+                )),
+            },
+            UncertainPublicationKind::External,
+            "repo_session_type_publication_uncertain",
+        );
+        drop(authority);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove external uncertainty test directory");
+    }
+
+    #[test]
+    fn state_uncertainty_uses_the_host_completion_cell_and_releases_one_document_waiter() {
+        let (mut daemon, directory) = recovery_test_daemon();
+        let (revision, prior) = daemon.state_view();
+        let authority = daemon
+            .runtime()
+            .expect("runtime")
+            .state_authority()
+            .expect("File authority");
+        let store = FileHubStateStore::for_data_directory(&directory);
+        let prepared = store
+            .prepare_shared(
+                &authority,
+                revision,
+                Some(prior.clone()),
+                (*prior).clone(),
+                &authority.budget(),
+            )
+            .expect("prepare state write");
+        FileHubStateStore::inject_next_directory_sync_failure(&directory);
+        let FileCommitOutcome::PublishedUncertain(write) = store
+            .commit_shared(prepared, revision)
+            .expect("state write reached rename")
+        else {
+            panic!("state directory sync must remain uncertain");
+        };
+        poll_uncertain_result(
+            &mut daemon,
+            HostMutationResult::PublishedUncertain {
+                write,
+                rollback: Some(RollbackDescriptor::SessionType {
+                    previous: prior,
+                    repo_file: None,
+                }),
+            },
+            UncertainPublicationKind::State,
+            "state_publication_uncertain",
+        );
+        drop(authority);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).expect("remove state uncertainty test directory");
     }
 
     #[test]
@@ -1568,6 +2220,13 @@ mod tests {
             previous_packages: previous_packages.clone(),
         };
         let restore = HostPackageRestore {
+            base_revision: daemon.state_view().0,
+            authority: daemon
+                .runtime()
+                .expect("runtime")
+                .state_authority()
+                .expect("File runtime authority"),
+            current_state: previous_state.clone(),
             previous_state,
             previous_packages,
             data_directory: directory.clone(),

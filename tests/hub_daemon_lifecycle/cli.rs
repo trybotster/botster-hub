@@ -126,10 +126,29 @@ pub(crate) fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> PanicS
 /// A schema-2 managed installation receipt for real-daemon fixtures.
 ///
 /// Schema 1 is cold-turkey rejected, so every fixture carries the full schema-2
-/// shape. The daemon under test is a development build with no embedded build
-/// revision, so `build_revision` agreement is skipped rather than failed: a
-/// value cannot disagree with the absence of one.
+/// shape. The verified candidate binary reports its embedded revision through
+/// the stateless `version` command. An unstamped binary accepts any sanitized
+/// receipt revision, so the fixture uses `release1` in that case.
 pub(crate) fn managed_receipt(source_url: &str) -> serde_json::Value {
+    let mut command = Command::new(candidate_hub_binary_path());
+    command.arg("version");
+    let version = run_command_with_timeout_diagnostics(
+        "candidate Hub version",
+        command,
+        Duration::from_secs(2),
+    );
+    assert!(version.output.status.success(), "{}", version.diagnostics());
+    let version_text =
+        String::from_utf8(version.output.stdout).expect("candidate version is UTF-8");
+    let embedded_revision = version_text
+        .lines()
+        .find_map(|line| line.strip_prefix("build_revision="))
+        .expect("candidate version reports build revision");
+    let build_revision = if embedded_revision == "unknown" {
+        "release1"
+    } else {
+        embedded_revision
+    };
     serde_json::json!({
         "schema_version": 2,
         "product_id": "botster-hub",
@@ -138,7 +157,7 @@ pub(crate) fn managed_receipt(source_url: &str) -> serde_json::Value {
         "release_channel": "stable",
         "provider": "http_json",
         "source_url": source_url,
-        "build_revision": "release1",
+        "build_revision": build_revision,
         "artifacts": [
             {"name": "botster-hub", "sha256": "a".repeat(64), "size": 1024},
             {"name": "botster-session-worker", "sha256": "b".repeat(64), "size": 2048}
@@ -252,21 +271,51 @@ pub(crate) fn spawn_stalled_release_metadata_fixture(
     )
 }
 
-pub(crate) fn spawn_timeout_release_metadata_fixture()
--> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
+pub(crate) fn spawn_timeout_release_metadata_fixture() -> (
+    String,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    mpsc::Receiver<()>,
+    thread::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind timeout release fixture");
+    listener
+        .set_nonblocking(true)
+        .expect("set timeout fixture nonblocking");
     let address = listener.local_addr().expect("timeout fixture address");
     let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept timeout release request");
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if !matches!(
+                        cancel_rx.recv_timeout(Duration::from_millis(10)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        let _ = finished_tx.send(());
+                        return;
+                    }
+                }
+                Err(error) => panic!("accept timeout release request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout fixture read timeout");
         let mut request = [0_u8; 4096];
         let _ = stream.read(&mut request);
-        accepted_tx.send(()).expect("report timeout request");
-        thread::sleep(Duration::from_secs(4));
+        let _ = accepted_tx.send(());
+        let _ = cancel_rx.recv_timeout(Duration::from_secs(4));
+        let _ = finished_tx.send(());
     });
     (
         format!("http://{address}/botster-hub.json"),
         accepted_rx,
+        cancel_tx,
+        finished_rx,
         handle,
     )
 }
@@ -405,6 +454,7 @@ impl PanicSafeCliDaemon {
             record_harness_taint(format!("{}: {error}", self.panic_context));
             panic!("{error}");
         }
+        check_harness_taint();
         output
     }
 
@@ -657,38 +707,15 @@ pub(crate) fn run_local_runtime_smoke(
     _workspaces_package_path: &Path,
     _web_port: u16,
 ) -> Output {
-    run_local_runtime_smoke_with_fault(
-        data_dir,
-        _project_pipelines_package_path,
-        web_package_path,
-        tui_package_path,
-        _workspaces_package_path,
-        _web_port,
-        None,
-    )
-}
-
-pub(crate) fn run_local_runtime_smoke_with_fault(
-    data_dir: &Path,
-    _project_pipelines_package_path: &Path,
-    web_package_path: &Path,
-    tui_package_path: &Path,
-    _workspaces_package_path: &Path,
-    _web_port: u16,
-    close_operation: Option<&str>,
-) -> Output {
     ensure_runtime_packages(data_dir, web_package_path, tui_package_path);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-    command
+    Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("smoke")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--session-worker-bin")
-        .arg(session_worker_binary_path());
-    if let Some(operation) = close_operation {
-        command.env(TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV, operation);
-    }
-    command.output().expect("run botster-hub smoke")
+        .arg(session_worker_binary_path())
+        .output()
+        .expect("run botster-hub smoke")
 }
 
 pub(crate) fn ensure_runtime_packages(

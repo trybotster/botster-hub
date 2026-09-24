@@ -373,18 +373,19 @@ impl PackageEntities {
 
     pub(super) fn step_snapshot(&mut self, name: &str) -> (u64, PackageEntityFamilyStep) {
         let mut work = crate::package_entity_fanout::FamilySnapshotWork::default();
-        let generation = self.step_snapshot_into(name, &mut work);
+        let generation = self.step_snapshot_into(name, false, &mut work);
         (generation, work.step.expect("snapshot step completed"))
     }
 
     pub(super) fn step_snapshot_into(
         &mut self,
         name: &str,
+        preserve_resync_need: bool,
         work: &mut crate::package_entity_fanout::FamilySnapshotWork,
     ) -> u64 {
         let family = self.family(name);
         let generation = family.generation;
-        family.step_provider_snapshot_into(Instant::now(), work);
+        family.step_provider_snapshot_into(Instant::now(), preserve_resync_need, work);
         self.index_resync_releases(name);
         generation
     }
@@ -440,5 +441,128 @@ impl PackageEntities {
             });
         }
         self.index_resync_releases(name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_model_snapshot_preserves_catchup_attempts_and_releases_lease_at_degradation() {
+        let mut model = PackageEntities::default();
+        let family = model.family("p.item");
+        family.causal_token = Some(17);
+        family.last_accepted_seq = 1;
+        family.high_water_seq = 1;
+        family.resync.rearm(Instant::now());
+        family.resync.leases.insert(401, None);
+        model.index_resync_releases("p.item");
+
+        let max_attempts = crate::package_entity_fanout::PACKAGE_ENTITY_RESYNC_MAX_ATTEMPTS;
+        for attempt in 1..=max_attempts {
+            assert_eq!(model.record_resync_attempt("p.item"), attempt == max_attempts);
+            if attempt < max_attempts {
+                let resync = &model.families["p.item"].resync;
+                let before = (
+                    resync.attempts,
+                    resync.needed,
+                    resync.degraded,
+                    resync.last_attempt_at,
+                    resync.next_eligible_at,
+                    resync.next_attempt_at(),
+                );
+                let progress = model.begin_snapshot("p.item", 0);
+                assert!(progress.needed);
+                let resync = &model.families["p.item"].resync;
+                assert_eq!(
+                    (
+                        resync.attempts,
+                        resync.needed,
+                        resync.degraded,
+                        resync.last_attempt_at,
+                        resync.next_eligible_at,
+                        resync.next_attempt_at(),
+                    ),
+                    before
+                );
+                let mut work = crate::package_entity_fanout::FamilySnapshotWork::default();
+                model.step_snapshot_into("p.item", true, &mut work);
+                assert!(matches!(
+                    work.step,
+                    Some(PackageEntityFamilyStep::Complete(_))
+                ));
+                let family = &model.families["p.item"];
+                let resync = &family.resync;
+                assert_eq!(
+                    (
+                        resync.attempts,
+                        resync.needed,
+                        resync.degraded,
+                        resync.last_attempt_at,
+                        resync.next_eligible_at,
+                        resync.next_attempt_at(),
+                    ),
+                    before
+                );
+                assert!(family.resync.leases.contains_key(&401));
+                assert!(model.take_resync_release("p.item", false).is_none());
+            }
+        }
+
+        let degraded = &model.families["p.item"].resync;
+        assert_eq!(degraded.attempts, max_attempts);
+        assert!(degraded.degraded);
+        assert!(!degraded.needed);
+        // This is a Resync model Begin. A new stale Subscribe rearms by design.
+        model.begin_snapshot("p.item", 0);
+        let mut work = crate::package_entity_fanout::FamilySnapshotWork::default();
+        model.step_snapshot_into("p.item", true, &mut work);
+        let degraded = &model.families["p.item"].resync;
+        assert_eq!(degraded.attempts, max_attempts);
+        assert!(degraded.degraded);
+        assert!(!degraded.needed);
+        assert!(matches!(
+            model.take_resync_release("p.item", true),
+            Some(CausalOp::Release {
+                scope_id: 401,
+                identity: LeaseIdentity::ProviderResyncNeed { family_token: 17 }
+            })
+        ));
+        assert!(model.families["p.item"].resync.leases.is_empty());
+    }
+
+    #[test]
+    fn caught_up_snapshot_releases_held_resync_lease() {
+        let mut model = PackageEntities::default();
+        let family = model.family("p.item");
+        family.causal_token = Some(17);
+        family.last_accepted_seq = 1;
+        family.high_water_seq = 1;
+        family.resync.rearm(Instant::now());
+        family.resync.leases.insert(401, None);
+
+        model.begin_snapshot("p.item", 0);
+        let mut behind = crate::package_entity_fanout::FamilySnapshotWork::default();
+        model.step_snapshot_into("p.item", true, &mut behind);
+        assert!(matches!(
+            behind.step,
+            Some(PackageEntityFamilyStep::Complete(_))
+        ));
+        assert!(model.families["p.item"].resync.needed);
+        assert!(model.families["p.item"].resync.leases.contains_key(&401));
+
+        model.begin_snapshot("p.item", 1);
+        let mut caught_up = crate::package_entity_fanout::FamilySnapshotWork::default();
+        model.step_snapshot_into("p.item", false, &mut caught_up);
+        assert!(matches!(
+            caught_up.step,
+            Some(PackageEntityFamilyStep::ReleaseResync {
+                scope_id: 401,
+                family_token: 17,
+            })
+        ));
+        assert!(!model.families["p.item"].resync.needed);
+        assert!(model.families["p.item"].resync.leases.is_empty());
     }
 }

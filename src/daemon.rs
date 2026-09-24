@@ -27,7 +27,9 @@ use crate::config::HubConfig;
 use crate::packages::{
     PackageClassification, PackageRegistry, PackageRegistrySnapshotError, PackageState,
 };
-use crate::persistence::{FileHubStateStore, HubState, HubStateStoreError};
+use crate::persistence::{
+    FileCommitError, FileCommitOutcome, FileHubStateStore, HubState, HubStateStoreError,
+};
 use crate::runtime::{HubRuntime, HubRuntimeError, SharedHubState};
 use crate::shared_view::SharedView;
 use crate::transport::webrtc::LocalWebrtcTransport;
@@ -118,9 +120,34 @@ impl HubDaemon {
             reserve_package_registry(&runtime.shared_view_budget(), package_registry)?;
         if !decisions.is_empty() {
             let snapshot = package_registry.snapshot();
-            state = store.update_shared(&config, &runtime.shared_view_budget(), |state| {
-                state.package_registry = snapshot;
-            })?;
+            let authority = runtime
+                .state_authority()
+                .ok_or(HubDaemonError::State(HubStateStoreError::AuthorityRequired))?;
+            let (revision, prior) = runtime.state_publication().snapshot();
+            state = match store.update_shared(
+                &authority,
+                revision,
+                prior,
+                &runtime.shared_view_budget(),
+                |state| state.package_registry = snapshot,
+            ) {
+                Ok(FileCommitOutcome::Synced { state, .. }) => state,
+                Ok(FileCommitOutcome::PublishedUncertain(write)) => {
+                    return Err(HubDaemonError::State(
+                        HubStateStoreError::PublishedUncertain(write),
+                    ));
+                }
+                Err(FileCommitError::Preparation(error))
+                | Err(FileCommitError::BeforePublication { error, .. }) => {
+                    return Err(HubDaemonError::State(error));
+                }
+                Err(FileCommitError::Stale(_)) => {
+                    return Err(HubDaemonError::State(HubStateStoreError::StaleRevision));
+                }
+                Err(FileCommitError::RevisionExhausted(_)) => {
+                    return Err(HubDaemonError::State(HubStateStoreError::RevisionExhausted));
+                }
+            };
             runtime.publish_state_view(state.clone());
         }
         load_enabled_local_plugins(&mut runtime, &package_registry)?;
@@ -631,11 +658,19 @@ mod tests {
             .expect("publish startup package registry");
         let snapshot = daemon.package_registry().snapshot();
         let runtime = daemon.runtime().expect("initial runtime");
-        FileHubStateStore::for_data_directory(&config.data_directory)
-            .update_shared(&config, &runtime.shared_view_budget(), |state| {
-                state.package_registry = snapshot;
-            })
+        let authority = runtime.state_authority().expect("File authority");
+        let (revision, prior) = runtime.state_publication().snapshot();
+        let outcome = FileHubStateStore::for_data_directory(&config.data_directory)
+            .update_shared(
+                &authority,
+                revision,
+                prior,
+                &runtime.shared_view_budget(),
+                |state| state.package_registry = snapshot,
+            )
             .expect("persist startup package registry");
+        assert!(matches!(outcome, FileCommitOutcome::Synced { .. }));
+        drop(authority);
         daemon.stop();
 
         let mut restarted = HubDaemon::start(config).expect("start with isolated package failure");

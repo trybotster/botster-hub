@@ -929,7 +929,7 @@ fn unix_adapter_feature_does_not_raise_default_requirement() {
         botster_hub_client::DaemonCompatibilityRequirement::for_unix_terminal_adapter();
     botster_hub_client::ensure_compatible(&adapter_requirement, &previous)
         .expect_err("the unix adapter requirement must fail closed without the feature");
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 8);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 9);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1651,7 +1651,7 @@ fn terminal_subscription_closed_feature_does_not_raise_default_requirement() {
         .expect("default clients still accept a daemon without terminal_subscription_closed");
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
-        36
+        49
     );
     const _: () = assert!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION >= 45);
 }

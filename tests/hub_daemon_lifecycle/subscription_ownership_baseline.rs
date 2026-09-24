@@ -404,14 +404,12 @@ fn terminal_adapter_contract_is_duplex_at_the_locked_core_pin() {
 #[test]
 fn no_lua_dispatch_in_terminal_input_or_output() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut lua_importers = Vec::new();
     for entry in ["src/lib.rs", "src/runtime.rs"] {
         let source = hub_source(entry);
         assert!(
             source.contains("lua_runtime"),
             "{entry} must remain a lua_runtime import site"
         );
-        lua_importers.push(entry);
     }
     for entry in [
         "src/transport/webrtc.rs",
@@ -455,10 +453,7 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
         "src/client_api.rs",
     ] {
         let source = hub_source(entry);
-        assert!(
-            !source.contains("lua_runtime"),
-            "{entry} must stay out of Lua dispatch; importers={lua_importers:?}"
-        );
+        check_lua_boundary(&root, entry, &source).unwrap_or_else(|error| panic!("{error}"));
     }
     let mut extra = Vec::new();
     let src = root.join("src");
@@ -484,8 +479,8 @@ fn no_lua_dispatch_in_terminal_input_or_output() {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("read rust file");
-            if source.contains("lua_runtime") {
-                extra.push(rel);
+            if let Err(error) = check_lua_boundary(&root, &rel, &source) {
+                extra.push(error);
             }
         }
     }

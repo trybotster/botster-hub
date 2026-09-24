@@ -140,6 +140,13 @@ pub(crate) fn dispatch_control_message(
             crate::daemon::owner_loop::publish_completion_wakes(daemon, state);
             false
         }
+        ControlMessage::EntitySubscriptionCapacityReleased => {
+            state
+                .maintenance
+                .wakes
+                .mark(crate::daemon_maintenance::MaintenanceSliceKind::SubscriberDelivery);
+            false
+        }
     }
 }
 
