@@ -11,7 +11,17 @@ The source patch SHA256 is `faa5741d8155ec8f3112b001b8da440b572b84ad81c3e282e258
 The six conflict files match recovery `9168c1de`. No unmerged entries remain. The staged whitespace check passes.
 Root checked retained authority through runtime loading and startup saves. The merged owner loop matches recovery.
 Reviewer 001e accepted the conflict resolutions and authority callers against the actual staged files.
-This checkpoint has not compiled. The next step is the merge commit, then the async merge and combined verification.
+Root committed and pushed the recovery merge as `6e606521`.
+Writer 001b then staged the async merge. Its 28-file patch SHA256 is `892b1202a9861c129e5598bb7cc6d8f535e470063e6ab5ba86978b5aeeb8e1eb`.
+All twelve conflict paths are resolved. The staged whitespace check passes. No unmerged entries remain.
+Reviewer 001e accepted the combined cleanup, authority, and spawn delivery joins against the staged files at source scope.
+Compilation exited 101 with two integration errors: a duplicate `local_reply_for_owner` method and cleanup access to optional context.
+Writer 001b removed the duplicate and derived the cleanup session ID from the retained reservation.
+Reviewer 001e accepted both corrections in patch `d2734daff7dfddbe400846dbad9041599151e22d27beddea58def3f64acaf1fa`.
+The release gate remains unchanged. The v2 compilation exited 0 and produced the Hub library, binary, and lifecycle test executables.
+Root checked the raw log and exit file. No tests ran. Compiler warnings remain; this result does not establish the strict lint gate.
+The build resolves the recorded Core dependency `891e220295427fd93991638d7c62ba40fa25d4ae`, not Core main `053148f6`.
+Startup-path implementation and the real daemon spawn test follow this integration check.
 Root retains integration ownership. No deployment is in progress.
 
 Ordinary charged spawn still returns `Unavailable` in async `session_types.rs`; implementation of its startup-path input remains open.

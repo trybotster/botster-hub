@@ -497,7 +497,11 @@ async fn deliver_completed_request(
     completed: CompletedRequest,
 ) -> DaemonTransportResult<Option<ConnectionTerminalReason>> {
     match completed.response {
-        ControlReply::Typed { response, charge } => {
+        ControlReply::Typed {
+            response,
+            charge,
+            delivery,
+        } => {
             let response = response?;
             cleanup.apply_subscription_change(
                 completed.projection.attached_subscription_change(&response),
@@ -511,11 +515,12 @@ async fn deliver_completed_request(
                 }
                 None => {}
             }
-            mux_write.enqueue_response(
+            mux_write.enqueue_response_with_receipt(
                 &completed.request_id,
                 response,
                 completed.response_delivery_tx,
                 completed.close_after,
+                delivery,
             )?;
             drop(charge);
         }

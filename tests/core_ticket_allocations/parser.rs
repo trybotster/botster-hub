@@ -2,7 +2,7 @@
 
 use super::*;
 use botster_hub::test_internals::parser_probe::{
-    Case, PreparedProbe, ProbePhase, definition_layout, environment_node_bound,
+    definition_layout, environment_node_bound, Case, PreparedProbe, ProbePhase,
 };
 use std::path::Path;
 
@@ -12,7 +12,12 @@ fn mark_parser(phase: ProbePhase) {
     record(MARK, 0, 0, 0, 0, 0);
 }
 
-fn report_parser(case: Case, equal: bool, output: &mut impl Write) -> Result<(), String> {
+fn report_parser(
+    case: Case,
+    equal: bool,
+    model_peak: Result<usize, &'static str>,
+    output: &mut impl Write,
+) -> Result<(), String> {
     let count = NEXT.load(Ordering::Acquire);
     let overflow = OVERFLOW.load(Ordering::Acquire);
     let allocation_failed = ALLOCATION_FAILED.load(Ordering::Acquire);
@@ -20,6 +25,7 @@ fn report_parser(case: Case, equal: bool, output: &mut impl Write) -> Result<(),
     let mut live_bytes = 0usize;
     let mut peak_bytes = 0usize;
     let mut growth_funding = 0usize;
+    let mut parse_growth_funding = 0usize;
     let mut moved = 0usize;
     let mut in_place = 0usize;
     let mut faults = Vec::new();
@@ -54,6 +60,13 @@ fn report_parser(case: Case, equal: bool, output: &mut impl Write) -> Result<(),
                     .checked_add(size)
                     .ok_or("growth funding overflow")?,
             );
+            if phase == ProbePhase::Parse as usize {
+                parse_growth_funding = parse_growth_funding.max(
+                    live_bytes
+                        .checked_add(size)
+                        .ok_or("parser growth funding overflow")?,
+                );
+            }
         }
         if kind == DEALLOC || kind == REALLOC {
             let old_pointer = if kind == DEALLOC { pointer } else { previous };
@@ -93,6 +106,22 @@ fn report_parser(case: Case, equal: bool, output: &mut impl Write) -> Result<(),
     }
     writeln!(output, "summary,{},peak_live_requested_bytes,{peak_bytes},growth_funding_bytes,{growth_funding},moved_reallocations,{moved},in_place_reallocations,{in_place},remaining_allocations,{},remaining_bytes,{live_bytes},physical_allocator_peak,unmeasured", case.name(), live.len())
         .map_err(|error| error.to_string())?;
+    writeln!(
+        output,
+        "parser_model,{},counted_peak,{model_peak:?},measured_parse_growth_funding,{parse_growth_funding}",
+        case.name()
+    )
+    .map_err(|error| error.to_string())?;
+    match model_peak {
+        Ok(bound) if bound >= parse_growth_funding => {}
+        Ok(bound) => faults.push(format!(
+            "parser model {bound} is below measured parse growth {parse_growth_funding}"
+        )),
+        Err(error) => faults.push(format!("parser model failed: {error}")),
+    }
+    if count == 0 || parse_growth_funding == 0 {
+        faults.push("the parser allocation recorder captured no Parse growth".into());
+    }
     if overflow {
         faults.push("the fixed event buffer overflowed".into());
     }
@@ -136,6 +165,7 @@ fn run_cases(directory: &Path, output: &mut impl Write) -> Result<(), String> {
         let fixture_directory = directory.join(case.name());
         // Fixture construction and the production control occur outside capture.
         let probe = PreparedProbe::prepare(case, &fixture_directory)?;
+        let model_peak = probe.counted_parser_peak();
         std::fs::write(
             fixture_directory.join("expected.json"),
             serde_json::to_vec_pretty(&probe.expected_json()).map_err(|error| error.to_string())?,
@@ -149,7 +179,7 @@ fn run_cases(directory: &Path, output: &mut impl Write) -> Result<(), String> {
         RECORDING.store(true, Ordering::Release);
         let equal = probe.run(mark_parser);
         RECORDING.store(false, Ordering::Release);
-        report_parser(case, equal, output)?;
+        report_parser(case, equal, model_peak, output)?;
     }
     writeln!(output, "complete,{}", Case::ALL.len()).map_err(|error| error.to_string())?;
     output.flush().map_err(|error| error.to_string())

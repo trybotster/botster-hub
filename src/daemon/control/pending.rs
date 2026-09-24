@@ -63,6 +63,8 @@ pub(crate) enum ControlPoll {
         DaemonTransportResult<DaemonResponse>,
         crate::host_executor::HostPreparedCharge,
     ),
+    /// The owner keeps a session-type stage until local delivery is known.
+    DeliverSessionType(ControlReply),
 }
 
 /// Retained Host work has a typed owner so terminal disposal can extract its original permit.
@@ -77,6 +79,7 @@ pub(crate) enum ControlContinuation {
     HostMutation(Box<super::host_work::HostMutationContinuation>),
     Status(Box<super::status::StatusContinuation>),
     ManagedSpawn(Box<super::managed_git::ManagedSpawnOperation>),
+    SessionType(super::session_spawn::ChargedSessionTypeOperation),
     Terminal(
         Box<TerminalContinuation>,
         #[allow(dead_code)] // disposal lease retained until the terminal row drops
@@ -124,6 +127,7 @@ impl ControlContinuation {
             Self::HostMutation(work) => work.poll(daemon, state),
             Self::Status(work) => work.poll(daemon, state),
             Self::ManagedSpawn(work) => work.poll(daemon, state),
+            Self::SessionType(work) => work.poll(daemon, state),
             Self::Terminal(..) => panic!("terminal requests cannot resume normal execution"),
         }
     }
@@ -140,6 +144,7 @@ impl ControlContinuation {
             Self::HostMutation(work) => work.take_terminal_parts(identity, completion),
             Self::Status(work) => work.take_terminal_parts(identity, completion),
             Self::ManagedSpawn(work) => work.take_terminal_parts(runtime, identity, completion),
+            Self::SessionType(work) => work.take_terminal_parts(completion),
             Self::Callback(_) | Self::SpawnCallback(_) | Self::Terminal(..) => None,
         }
     }
@@ -197,6 +202,33 @@ pub(crate) fn dispose_terminal_requests(
 ) {
     state.pending_requests.retain(|waiter_id, entry| {
         let mut completion = state.host_completions.remove(waiter_id);
+        if let ControlContinuation::SessionType(work) = &mut entry.continuation {
+            if let Some(parts) = work.take_terminal_parts(&mut completion) {
+                let parts = parts.with_payload(TerminalOwnerPayload {
+                    completion: std::mem::take(&mut entry.completion),
+                    reply: entry.reply_tx.take(),
+                    response_delivery: entry.response_delivery_rx.take(),
+                    grant_id: entry.grant_id.take(),
+                    client: entry.client.take(),
+                    retire: entry.retire.take(),
+                });
+                entry.continuation.begin_terminal(parts);
+            } else if work.waits_for_host() {
+                if let Some(completion) = completion {
+                    state.host_completions.insert(*waiter_id, completion);
+                }
+                return true;
+            } else {
+                if !work.poll_terminal(runtime) {
+                    return true;
+                }
+                drop(entry.core_retirement.take());
+                if let Some(permit) = entry.permit.take() {
+                    state.budget.release(permit);
+                }
+                return false;
+            }
+        }
         let identity = crate::host_executor::HostJobIdentity {
             waiter_id: *waiter_id,
             phase: entry.last_host_phase,
@@ -585,7 +617,9 @@ pub(crate) fn absorb_core_completions(
         // The collector and ticket still require the exact waiter and phase.
         let spawn = matches!(
             entry.continuation,
-            ControlContinuation::SpawnCallback(_) | ControlContinuation::ManagedSpawn(_)
+            ControlContinuation::SpawnCallback(_)
+                | ControlContinuation::ManagedSpawn(_)
+                | ControlContinuation::SessionType(_)
         );
         let accepted = if spawn {
             identity.phase > entry.last_core_phase
@@ -896,6 +930,12 @@ pub(crate) fn poll_ready_request_item(
                 None
             }
             ControlPoll::ReadyHost(response, charge) => Some(ControlReply::host(response, charge)),
+            ControlPoll::DeliverSessionType(reply) => {
+                let sent = entry.reply_tx.take().send_reply(reply);
+                // A refused reply drops its receipt and wakes this retained row.
+                drop(sent);
+                None
+            }
         };
         if let Some(reply) = reply {
             if reasons.contains(READY_DEADLINE) && entry.must_finish {
