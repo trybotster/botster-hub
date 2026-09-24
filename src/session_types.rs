@@ -503,6 +503,7 @@ impl<'a> From<&'a HubConfig> for MaterializationConfigView<'a> {
 
 /// Hub startup fixes process paths before an ordinary spawn enters Host.
 pub(crate) struct StartupMaterializationPaths {
+    cwd: PathBuf,
     data_directory: String,
     session_directory: String,
     hub_socket: String,
@@ -522,6 +523,7 @@ impl StartupMaterializationPaths {
             .unwrap_or_default();
         let hub_bin = std::env::current_exe().ok().map(|path| path.display().to_string());
         Self {
+            cwd,
             data_directory: data_directory.display().to_string(),
             session_directory: session_directory.display().to_string(),
             hub_socket,
@@ -532,6 +534,7 @@ impl StartupMaterializationPaths {
 
 /// Host owns config values and startup path copies with one allocation charge.
 struct ChargedMaterializationConfig {
+    startup_cwd: PathBuf,
     data_directory: PathBuf,
     shell: String,
     initial_rows: u16,
@@ -556,7 +559,8 @@ impl ChargedMaterializationConfig {
             .as_os_str()
             .as_encoded_bytes()
             .len()
-            .checked_add(view.shell.len())
+            .checked_add(startup_paths.cwd.as_os_str().as_encoded_bytes().len())
+            .and_then(|bytes| bytes.checked_add(view.shell.len()))
             .and_then(|bytes| {
                 bytes.checked_add(
                     view.local_socket
@@ -571,6 +575,7 @@ impl ChargedMaterializationConfig {
         parent
             .grow(bytes)
             .map_err(|_| "materialization config capacity exhausted")?;
+        let startup_cwd = startup_paths.cwd.clone();
         let data_directory = view.data_directory.to_path_buf();
         let shell = view.shell.to_string();
         let local_socket = view.local_socket.map(Path::to_path_buf);
@@ -582,6 +587,7 @@ impl ChargedMaterializationConfig {
             .split_fixed(bytes)
             .ok_or("materialization config transfer failed")?;
         Ok(Self {
+            startup_cwd,
             data_directory,
             shell,
             initial_rows: view.initial_rows,
@@ -1416,24 +1422,67 @@ impl<'a> ChargedSourceBuilder<'a> {
         Ok(())
     }
 
-    fn push_device_sources(&mut self, state: &HubState) -> Result<(), ChargedSourceLoadFailure> {
+    fn push_device_sources(
+        &mut self,
+        state: &HubState,
+        startup_cwd: &Path,
+    ) -> Result<(), ChargedSourceLoadFailure> {
         for device in &state.device_session_type_sources {
             self.validate(|| {
                 validate_session_types(&device.session_types).map_err(|message| {
                     SessionTypeError::new("invalid_device_session_types", message)
                 })
             })?;
-            for definition in &device.session_types {
-                self.push(
-                    SessionTypeSourceRank::Device,
-                    DEVICE_SESSION_TYPE_SOURCE,
-                    DEVICE_SESSION_TYPE_SOURCE,
-                    &device.root,
-                    definition,
-                    true,
-                )
-                .map_err(ChargedSourceLoadFailure::Capacity)?;
+            let (anchored, temporary_bytes) = if device.root.is_absolute() {
+                (None, 0)
+            } else {
+                let bytes = startup_cwd
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len()
+                    .checked_add(1)
+                    .and_then(|bytes| {
+                        bytes.checked_add(device.root.as_os_str().as_encoded_bytes().len())
+                    })
+                    .ok_or(ChargedSourceLoadFailure::Capacity(
+                        "device source root size overflow",
+                    ))?;
+                self.parent
+                    .grow(bytes)
+                    .map_err(|_| ChargedSourceLoadFailure::Capacity(
+                        "device source root capacity exhausted",
+                    ))?;
+                let mut root = PathBuf::with_capacity(bytes);
+                root.push(startup_cwd);
+                root.push(&device.root);
+                (Some(root), bytes)
+            };
+            let root = anchored
+                .as_ref()
+                .map_or(device.root.as_path(), PathBuf::as_path);
+            let result = (|| {
+                for definition in &device.session_types {
+                    self.push(
+                        SessionTypeSourceRank::Device,
+                        DEVICE_SESSION_TYPE_SOURCE,
+                        DEVICE_SESSION_TYPE_SOURCE,
+                        root,
+                        definition,
+                        true,
+                    )?;
+                }
+                Ok(())
+            })();
+            drop(anchored);
+            if temporary_bytes != 0 {
+                let retained = self
+                    .parent
+                    .bytes()
+                    .checked_sub(temporary_bytes)
+                    .expect("the parent still owns the device source root");
+                assert!(self.parent.shrink_to(retained));
             }
+            result.map_err(ChargedSourceLoadFailure::Capacity)?;
         }
         Ok(())
     }
@@ -1712,11 +1761,12 @@ impl ChargedSourceLoadFailure {
 fn load_charged_sources(
     records: &[PackageRecord],
     state: &HubState,
+    startup_cwd: &Path,
     parent: &mut crate::lua_memory::LuaCallbackCharge,
 ) -> Result<ChargedSourceSessionTypes, ChargedSourceLoadFailure> {
     let mut builder = ChargedSourceBuilder::new(parent);
     builder.push_package_records(records)?;
-    builder.push_device_sources(state)?;
+    builder.push_device_sources(state, startup_cwd)?;
     for target in state.spawn_targets.iter().filter(|target| target.enabled) {
         builder.push_repo_file(&target.root, &target.target_id)?;
     }
@@ -1737,7 +1787,7 @@ fn materialize_ordinary_charged(
     session_type_id: &str,
     request: SessionTypeRequest,
 ) -> Result<ChargedSessionTypeMaterialization, ChargedMaterializationFailure> {
-    let sources = match load_charged_sources(package_records, state, &mut parent) {
+    let sources = match load_charged_sources(package_records, state, &config.startup_cwd, &mut parent) {
         Ok(sources) => sources,
         Err(error) => {
             return Err(match error.into_semantic_failure(&mut parent) {
@@ -4625,6 +4675,179 @@ mod source_selection_tests {
         }
     }
 
+    fn charged_device_root_with_absolute_cwd(
+        relative_root: bool,
+        captured_cwd: Option<PathBuf>,
+    ) {
+        let startup_cwd = captured_cwd
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::env::current_dir().expect("test process has a working directory"));
+        let data_directory = PathBuf::from("relative-device-root-test-data");
+        let stored_root = data_directory.join("session-types");
+        let expected_root = startup_cwd.join(&stored_root);
+        let config = HubStartupOptions {
+            data_directory: DataDirectoryOption::Explicit(data_directory),
+            ..HubStartupOptions::default()
+        }
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .unwrap();
+        let mut state = HubState::from_config(&config);
+        let durable_root = if relative_root {
+            stored_root
+        } else {
+            expected_root.clone()
+        };
+        state.device_session_type_sources = vec![DeviceSessionTypeSource {
+            root: durable_root.clone(),
+            session_types: vec![definition("device")],
+        }];
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: 8 * 1024 * 1024,
+            total_callback_bytes: 8 * 1024 * 1024,
+        })
+        .unwrap();
+        let mut parent = memory.reserve_callback_total(0).unwrap();
+        let mut startup_paths = StartupMaterializationPaths::capture(&config);
+        if captured_cwd.is_some() {
+            startup_paths.cwd = startup_cwd.clone();
+        }
+        let charged_config =
+            ChargedMaterializationConfig::from_config(&config, &startup_paths, &mut parent)
+                .unwrap();
+        let expected_cwd = expected_root.join("nested/work");
+        let request = SessionTypeRequest {
+            cwd: Some(expected_cwd.display().to_string()),
+            ..SessionTypeRequest::default()
+        };
+        let charged = match materialize_ordinary_charged(
+            parent,
+            charged_config,
+            &state,
+            &[],
+            &botster_core::PluginKey("device-root-test".into()),
+            "worker",
+            request,
+        ) {
+            Ok(charged) => charged,
+            Err(ChargedMaterializationFailure::Semantic(failure)) => {
+                let kind = failure.error.kind;
+                drop(failure);
+                assert_eq!(memory.usage().1, 0);
+                panic!("absolute cwd beneath device root was refused: {kind}");
+            }
+            Err(failure) => panic!("charged device materialization failed: {failure:?}"),
+        };
+        let (materialized, allowance) = charged.into_parts();
+        assert_eq!(
+            materialized.resolved.executable,
+            expected_root.join("bin/worker").display().to_string(),
+        );
+        assert_eq!(
+            materialized.resolved.working_directory,
+            expected_cwd.display().to_string(),
+        );
+        assert_eq!(state.device_session_type_sources[0].root, durable_root);
+        drop(materialized);
+        drop(allowance);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn charged_relative_device_root_accepts_absolute_cwd_beneath_it() {
+        charged_device_root_with_absolute_cwd(true, None);
+    }
+
+    #[test]
+    fn charged_absolute_device_root_preserves_absolute_cwd() {
+        charged_device_root_with_absolute_cwd(false, None);
+    }
+
+    #[test]
+    fn charged_relative_device_root_uses_captured_cwd() {
+        let captured_cwd = std::env::temp_dir().join("botster-captured-device-startup");
+        assert_ne!(captured_cwd, std::env::current_dir().unwrap());
+        charged_device_root_with_absolute_cwd(true, Some(captured_cwd));
+    }
+
+    #[test]
+    fn charged_relative_device_anchor_retires_without_clone_loss() {
+        let mut fixture = Fixture::new("relative-anchor-success");
+        fixture.state.device_session_type_sources[0].root = PathBuf::from("relative/device");
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: 8 * 1024 * 1024,
+            total_callback_bytes: 8 * 1024 * 1024,
+        })
+        .unwrap();
+        let mut parent = memory.reserve_callback_total(0).unwrap();
+        let mut builder = ChargedSourceBuilder::new(&mut parent);
+        assert!(builder
+            .push_device_sources(&fixture.state, &fixture.root)
+            .is_ok(), "the charged device source must clone");
+        assert_eq!(builder.sources.len(), 1);
+        assert!(builder.reserved > 0);
+        assert_eq!(builder.parent.bytes(), builder.reserved);
+        drop(builder);
+        assert!(parent.shrink_to(0));
+        drop(parent);
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
+    fn charged_relative_device_anchor_refunds_headroom_after_clone_refusal() {
+        let mut fixture = Fixture::new("relative-anchor-refusal");
+        let relative_root = PathBuf::from("r".repeat(1024));
+        let anchored_root = fixture.root.join(&relative_root);
+        let mut first = definition("first");
+        first.id = "first".into();
+        let mut second = definition("second");
+        second.id = "second".into();
+        fixture.state.device_session_type_sources[0] = DeviceSessionTypeSource {
+            root: relative_root.clone(),
+            session_types: vec![first.clone(), second],
+        };
+        let anchor_bytes = fixture.root.as_os_str().as_encoded_bytes().len()
+            + 1
+            + relative_root.as_os_str().as_encoded_bytes().len();
+        let first_clone = vector_growth_peak::<SourceSessionType>(1).unwrap()
+            - vector_growth_peak::<SourceSessionType>(0).unwrap()
+            + source_parts_clone_peak(
+                DEVICE_SESSION_TYPE_SOURCE,
+                DEVICE_SESSION_TYPE_SOURCE,
+                &anchored_root,
+                &first,
+            )
+            .unwrap();
+        let capacity = anchor_bytes + first_clone;
+        assert!(capacity >= materialization_error::construction_error_storage_bytes(None).unwrap());
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: capacity,
+            total_callback_bytes: capacity,
+        })
+        .unwrap();
+        let mut parent = memory.reserve_callback_total(0).unwrap();
+        let mut builder = ChargedSourceBuilder::new(&mut parent);
+        assert!(matches!(
+            builder.push_device_sources(&fixture.state, &fixture.root),
+            Err(ChargedSourceLoadFailure::Capacity("source clone capacity exhausted"))
+        ));
+        assert_eq!(builder.sources.len(), 1);
+        assert_eq!(builder.reserved, first_clone);
+        assert_eq!(builder.parent.bytes(), first_clone);
+        builder.parent.grow(anchor_bytes).expect("the temporary headroom returns");
+        assert!(builder.parent.shrink_to(first_clone));
+        drop(builder);
+        assert!(parent.shrink_to(0));
+        drop(parent);
+        assert_eq!(memory.usage().1, 0);
+    }
+
     #[test]
     fn charged_loader_keeps_device_and_repo_sources_after_reads() {
         let mut fixture = Fixture::new("charged-all-sources");
@@ -4637,7 +4860,7 @@ mod source_selection_tests {
         })
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
-        let sources = match load_charged_sources(&[], &fixture.state, &mut parent) {
+        let sources = match load_charged_sources(&[], &fixture.state, &fixture.root, &mut parent) {
             Ok(sources) => sources,
             Err(_) => panic!("the charged source set must load"),
         };
@@ -4665,7 +4888,7 @@ mod source_selection_tests {
         })
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
-        let sources = load_charged_sources(&[], &fixture.state, &mut parent).unwrap_or_else(|_| {
+        let sources = load_charged_sources(&[], &fixture.state, &fixture.root, &mut parent).unwrap_or_else(|_| {
             panic!("the complete charged source set must load")
         });
         let (winner, expected_row, expected_target) = resolve_materialization_source(
@@ -4704,7 +4927,6 @@ mod source_selection_tests {
             total_callback_bytes: 64 * 1024,
         })
         .unwrap();
-        let mut parent = memory.reserve_callback_total(0).unwrap();
         for rank in [
             SessionTypeSourceRank::Package,
             SessionTypeSourceRank::Device,
@@ -4745,6 +4967,7 @@ mod source_selection_tests {
                         ..SessionTypeRequest::default()
                     },
                 ] {
+                    let mut parent = memory.reserve_callback_total(0).unwrap();
                     let row = effective_session_type_row(&source, std::iter::once(&source));
                     let ordinary = materialize_session_type_from_resolved(
                         (&config).into(),
@@ -4831,9 +5054,12 @@ mod source_selection_tests {
                     drop(metadata);
                     drop(execution);
                     drop(prefix);
+                    drop(parent);
+                    assert_eq!(memory.usage().1, 0);
                 }
             }
         }
+        let mut parent = memory.reserve_callback_total(0).unwrap();
         let source = source(SessionTypeSourceRank::Package, "prefix-source");
         let invalid = SessionTypeRequest {
             cwd: Some("/elsewhere".into()),
