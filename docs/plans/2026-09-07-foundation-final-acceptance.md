@@ -2347,8 +2347,29 @@ The writer confirmed the exact remote head. Root verified the local commit, chan
 Agent 001b next diagnoses the G7 shutdown timeout and cancelled-read failure without source changes.
 These passes establish only the tested behavior. They do not establish full acceptance.
 
-The remaining failure groups cover the terminal-path source guard, shutdown during update checks,
-chunk reassembly, and deterministic WebRTC failure evidence.
+### G7: two focused passes; shutdown diagnosis open
+
+The cancellation fixture used obsolete `daemon_response` instead of `server_frame`. Parsing failed before the intended timeout.
+The correction changes that test string only. The exact cancellation test passed with one test executed and 328 filtered.
+The new WebRTC test completes HelloAck before blocking the Status response send, then publishes the channel-close signal.
+It dispatches the actual admission and close messages through the owner and checks the retained terminal record.
+The exact library test passed with one test executed and 1225 filtered. It proves zero of one response chunk was sent.
+It does not prove partial multi-chunk delivery. The sender diagnostic and owner-record assertions provide separate evidence.
+
+Root rejected the first patch because its receive helper discarded the required admission message.
+The revised patch uses direct bounded receives. The shared helper and production behavior remain unchanged.
+The accepted patch SHA-256 is `2cb80c98278357b9739d11fcb2b2384d5c4ae639df4462b38b0eca4d2016e0bb`.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/managed-recovery-20260922/g7-diagnosis-20260923`.
+Root read the three result logs. Reviewer 001e accepted the two focused passes and verified the checksum packet.
+Root verified all twelve checksum entries. Agent 001b committed and pushed `37aa15b8fe7351faa9c3f46cc78674a0027546bb`.
+The writer confirmed the exact remote head and a clean worktree. The commit contains only the two reviewed test files.
+
+The isolated shutdown test failed against the verified `db3dc263` candidate at the provider-accept timeout in `shutdown.rs:385`.
+The run executed one test and lasted 9.32 seconds. It failed before requesting shutdown.
+This failure does not require the full suite. Its cause remains unresolved; no timeout change is authorized.
+Agent 001b owns the receipt and request trace. The next check must establish why the provider receives no connection.
+
+The remaining failure work covers shutdown during update checks and CLI WebRTC failure-format coverage.
 The selected WebRTC test design must prove an incomplete response and read the record through the real owner consumer.
 CLI failure-format coverage remains open. The test design does not close that requirement.
 
