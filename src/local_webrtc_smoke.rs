@@ -741,3 +741,48 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::local_webrtc_response_progress_error;
+
+    #[test]
+    fn response_error_reports_channel_close_before_first_chunk() {
+        assert_eq!(
+            local_webrtc_response_progress_error("status", "channel_closed", &None),
+            "local WebRTC response incomplete: operation=status cause=channel_closed message_id=pending next_chunk=0 expected_chunks=pending"
+        );
+    }
+
+    #[test]
+    fn response_error_reports_timeout_before_first_chunk() {
+        assert_eq!(
+            local_webrtc_response_progress_error("status", "response_timeout", &None),
+            "local WebRTC response incomplete: operation=status cause=response_timeout message_id=pending next_chunk=0 expected_chunks=pending"
+        );
+    }
+
+    #[test]
+    fn response_error_reports_channel_close_after_partial_chunks() {
+        assert_eq!(
+            local_webrtc_response_progress_error(
+                "read_screen",
+                "channel_closed",
+                &Some(("response-7".to_string(), 1, 3)),
+            ),
+            "local WebRTC response incomplete: operation=read_screen cause=channel_closed message_id=response-7 next_chunk=1 expected_chunks=3"
+        );
+    }
+
+    #[test]
+    fn response_error_reports_timeout_after_partial_chunks() {
+        assert_eq!(
+            local_webrtc_response_progress_error(
+                "read_screen",
+                "response_timeout",
+                &Some(("response-7".to_string(), 1, 3)),
+            ),
+            "local WebRTC response incomplete: operation=read_screen cause=response_timeout message_id=response-7 next_chunk=1 expected_chunks=3"
+        );
+    }
+}

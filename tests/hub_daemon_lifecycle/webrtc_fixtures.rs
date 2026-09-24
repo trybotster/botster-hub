@@ -70,8 +70,6 @@ pub(crate) const WEBRTC_INBOUND_MAX_FRAMES: usize = 128;
 pub(crate) const WEBRTC_INBOUND_MAX_BYTES: usize = 512 * 1024;
 pub(crate) const WEBRTC_PENDING_HOST_EVENTS_MAX: usize = 128;
 pub(crate) const WEBRTC_PENDING_HOST_EVENTS_MAX_BYTES: usize = 512 * 1024;
-pub(crate) const TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV: &str =
-    "BOTSTER_HUB_TEST_CLOSE_LOCAL_WEBRTC_OPERATION";
 pub(crate) struct LocalWebrtcOffererHandler {
     pub(crate) gather_complete_tx: AsyncSender<()>,
     pub(crate) connected_tx: AsyncSender<()>,
