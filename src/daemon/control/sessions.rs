@@ -3097,6 +3097,19 @@ return botster.register({
         session_id: &str,
         target_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
+        invoke_plugin_spawn_tool_with_capacity_hold(
+            daemon, state, owner_rx, session_id, target_id, false,
+        )
+    }
+
+    fn invoke_plugin_spawn_tool_with_capacity_hold(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        owner_rx: &mut tokio::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage>,
+        session_id: &str,
+        target_id: Option<&str>,
+        hold_remaining_capacity: bool,
+    ) -> Result<serde_json::Value, String> {
         let runtime = daemon.runtime().unwrap();
         let mut args = serde_json::json!({
             "session_type_id": "p1.plugin/agent",
@@ -3115,6 +3128,17 @@ return botster.register({
                 None,
             )
             .expect("prepare spawn tool");
+        let capacity_hold = hold_remaining_capacity.then(|| {
+            let memory = runtime.test_lua_memory();
+            let remaining = memory
+                .limits()
+                .total_callback_bytes
+                .checked_sub(memory.usage().1)
+                .expect("callback usage stays within the limit");
+            memory
+                .reserve_shared_callback_storage(remaining)
+                .expect("hold remaining capacity after MCP setup")
+        });
         let lifecycle = runtime.plugin_lifecycle_handle();
         let outcome = std::thread::scope(|scope| {
             let worker = scope.spawn(move || lifecycle.invoke(request).result);
@@ -3131,8 +3155,146 @@ return botster.register({
             }
             worker.join().expect("join plugin spawn worker")
         });
+        drop(capacity_hold);
         crate::runtime::HubRuntime::complete_plugin_mcp_tool(outcome)
             .map_err(|error| error.message)
+    }
+
+    #[test]
+    fn plugin_spawn_capacity_refuses_before_a_new_owner_row() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let worker_root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "s1-plugin-capacity-worker-{}-{stamp}",
+            std::process::id()
+        ));
+        let worker = write_frame_exit_worker(&worker_root);
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("plugin-capacity", Some(worker));
+        let package_root = root.join("p1-plugin");
+        let record = plugin_spawn_package(&package_root);
+        let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
+        let first = invoke_plugin_spawn_tool(
+            &mut daemon,
+            &mut state,
+            &mut owner_rx,
+            "s1-plugin-capacity-held",
+            None,
+        )
+        .expect_err("the first spawn must retain its owner row");
+        assert!(first.contains("cleanup_unconfirmed"), "{first}");
+        assert_eq!(state.pending_requests.len(), 1);
+        let (first_waiter, first_identity) = state
+            .pending_requests
+            .iter()
+            .find_map(|(waiter, entry)| match &entry.continuation {
+                crate::daemon::control::pending::ControlContinuation::SessionType(operation) => {
+                    operation.test_reservation_identity().map(|identity| (*waiter, identity))
+                }
+                _ => None,
+            })
+            .expect("the first owner row retains its reservation");
+        let release_count = daemon
+            .runtime()
+            .unwrap()
+            .test_release_session_reservation_begins();
+        let refused = invoke_plugin_spawn_tool_with_capacity_hold(
+            &mut daemon,
+            &mut state,
+            &mut owner_rx,
+            "s1-plugin-capacity-refused",
+            None,
+            true,
+        )
+        .expect_err("spawn admission must refuse callback capacity");
+        assert!(
+            refused.contains(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED),
+            "spawn admission returned {refused}"
+        );
+        assert_eq!(state.pending_requests.len(), 1);
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_release_session_reservation_begins(),
+            release_count,
+            "capacity refusal must not retry cleanup"
+        );
+        let waiter = daemon.runtime().unwrap().next_waiter_id().unwrap();
+        let mut reserve = daemon.runtime().unwrap().begin_reserve_session_for_owner(
+            waiter,
+            SessionId("s1-plugin-capacity-refused".into()),
+        );
+        let reservation = wait_reservation(&mut daemon, &mut state, &mut reserve);
+        let mut release = daemon
+            .runtime()
+            .unwrap()
+            .begin_release_session_reservation_for_owner(waiter, reservation);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "test reservation release stalled");
+            drive_ready_test_turn(&mut daemon, &mut state);
+            match release.poll(daemon.runtime().unwrap()) {
+                CoreTicketPoll::Pending => std::thread::yield_now(),
+                CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                    result: Ok(SessionReservationRelease::Released),
+                    ..
+                })) => break,
+                other => panic!("test reservation release did not confirm: {other:?}"),
+            }
+        }
+        let first_row = state
+            .pending_requests
+            .get(&first_waiter)
+            .expect("capacity refusal must keep the first owner row");
+        assert!(first_row.must_finish);
+        assert!(first_row.permit.is_some());
+        let crate::daemon::control::pending::ControlContinuation::SessionType(operation) =
+            &first_row.continuation
+        else {
+            panic!("the first owner row keeps its session-type stage");
+        };
+        assert_eq!(operation.test_reservation_identity(), Some(first_identity));
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(worker_root);
+    }
+
+    #[test]
+    fn plugin_spawn_missing_capability_reuses_callback_capacity() {
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("plugin-capability", None);
+        let package_root = root.join("p1-plugin");
+        let mut record = plugin_spawn_package(&package_root);
+        record.manifest.capabilities.clear();
+        let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
+        let baseline = daemon.runtime().unwrap().test_lua_memory().usage().1;
+        for session_id in ["s1-plugin-capability-a", "s1-plugin-capability-b"] {
+            let refused = invoke_plugin_spawn_tool(
+                &mut daemon,
+                &mut state,
+                &mut owner_rx,
+                session_id,
+                None,
+            )
+            .expect_err("MCP-only package must refuse session-type spawn");
+            assert!(refused.contains("session_type_spawn capability"), "{refused}");
+            assert!(state.pending_requests.is_empty());
+            assert_eq!(
+                daemon
+                    .runtime()
+                    .unwrap()
+                    .test_release_session_reservation_begins(),
+                0
+            );
+            assert_eq!(daemon.runtime().unwrap().test_lua_memory().usage().1, baseline);
+        }
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(package_root);
     }
 
     #[test]

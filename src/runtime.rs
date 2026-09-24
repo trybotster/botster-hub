@@ -3024,17 +3024,6 @@ impl HubRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_retained_reservation_takes(&self) -> usize {
-        self.retained_reservation_takes
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_inflight_reserved(&self) -> usize {
-        self.inflight_plugin_core.lock().unwrap().reserved()
-    }
-
-    #[cfg(test)]
     pub(crate) fn test_inflight_capacity(&self) -> usize {
         self.inflight_plugin_core.lock().unwrap().capacity()
     }
@@ -4106,47 +4095,6 @@ impl HubRuntime {
     #[cfg(test)]
     pub(crate) fn test_fulfill_plugin_spawns(&self) {
         self.fulfill_pending_session_type_spawns();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_plugin_spawn(
-        &self,
-        plugin_key: &str,
-        session_type_id: &str,
-        request: crate::session_types::SessionTypeRequest,
-        package_records: Vec<crate::packages::PackageRecord>,
-    ) -> Result<PluginSessionTypeSpawned, String> {
-        let (response, receiver) = mpsc::channel();
-        self.session_type_spawner
-            .pending
-            .lock()
-            .map_err(|_| "session type spawn queue lock poisoned".to_string())?
-            .try_push_back(PendingSessionTypeSpawn {
-                plugin_key: PluginKey(plugin_key.into()),
-                session_type_id: session_type_id.into(),
-                request,
-                package_records: Arc::new(package_records),
-                response: OrdinarySpawnReply::Legacy(response),
-                parent: None,
-                _dispose_probe: None,
-            })
-            .map_err(|_| "session type spawn queue capacity exhausted".to_string())?;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            self.fulfill_pending_session_type_spawns();
-            match receiver.try_recv() {
-                Ok(result) => return result.map_err(|error| error.into_owned()),
-                Err(mpsc::TryRecvError::Empty) => {
-                    if Instant::now() >= deadline {
-                        return Err("plugin session type spawn timed out".to_string());
-                    }
-                    thread::yield_now();
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err("plugin session type spawn disconnected".to_string());
-                }
-            }
-        }
     }
 
     pub(crate) fn retained_reservations(&self) -> Vec<SessionReservation> {
@@ -5307,7 +5255,12 @@ impl HubSessionTypeSpawner {
                 "session-type spawn requires the daemon owner",
             ));
         }
-        let (plugin_key, session_type_id, request, mut parent) = input.into_parts();
+        if !package_allows_session_type_spawn(&package_records, input.plugin_key()) {
+            return Err(std::borrow::Cow::Borrowed(
+                "plugin package lacks session_type_spawn capability",
+            ));
+        }
+        let (mut parent, plugin_key, session_type_id, request) = input.into_parts();
         let bytes = crate::lua_memory::layout::single_reply_bytes::<AdmittedSpawnDelivery>(true)
             .ok_or_else(|| {
                 std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
@@ -7151,54 +7104,6 @@ pub(crate) mod tests {
             ),
             "unexpected reply: {reply:?}"
         );
-    }
-
-    #[test]
-    fn inflight_spawn_refuses_before_taking_retained_tokens() {
-        let runtime = family_runtime("inflight-spawn-cap");
-        let _hold = occupy_inflight_and_freeze_remainder(&runtime, "inflight-spawn-fill");
-        let takes_before = runtime.test_retained_reservation_takes();
-        let error = runtime
-            .test_plugin_spawn(
-                "test.plugin",
-                "agent",
-                crate::session_types::SessionTypeRequest {
-                    target_id: None,
-                    session_id: None,
-                    cwd: None,
-                    environment: BTreeMap::new(),
-                    context: crate::session_types::SessionTypeContextInput::default(),
-                },
-                Vec::new(),
-            )
-            .expect_err("capacity must refuse before reserve");
-        assert_eq!(error, crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED);
-        assert_eq!(runtime.test_retained_reservation_takes(), takes_before);
-    }
-
-    #[test]
-    fn inflight_spawn_cancels_reserved_slot_on_fulfill_err() {
-        let runtime = family_runtime("inflight-spawn-cancel");
-        let request = crate::session_types::SessionTypeRequest {
-            target_id: None,
-            session_id: None,
-            cwd: None,
-            environment: BTreeMap::new(),
-            context: crate::session_types::SessionTypeContextInput::default(),
-        };
-        let error = runtime
-            .test_plugin_spawn("test.plugin", "agent", request.clone(), Vec::new())
-            .expect_err("missing session_type_spawn capability");
-        assert!(error.contains("session_type_spawn"));
-        assert_eq!(runtime.test_inflight_reserved(), 0);
-        let cap = runtime.test_inflight_capacity();
-        assert!(cap >= 1);
-        let error = runtime
-            .test_plugin_spawn("test.plugin", "agent", request, Vec::new())
-            .expect_err("second missing capability reuses the slot");
-        assert!(error.contains("session_type_spawn"));
-        assert_eq!(runtime.test_inflight_reserved(), 0);
-        assert_eq!(runtime.test_inflight_capacity(), cap);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Foundation integration and final acceptance
 
-Status: checkpoint `57bb3339` is pushed. Focused verification resolves four of eight workspace failures. Four remain, and full foundation acceptance remains open.
+Status: checkpoint `71398de6` is pushed. Focused verification resolves six of eight workspace failures. Two remain, and full foundation acceptance remains open.
 
 ## Current delivery status — September 23
 
@@ -71,6 +71,33 @@ Writer 001b added those fields without changing either unknown-field order or an
 Root checked the one-line diff at hash `a038ca4cab2418a8f51b6edb204518c01286c28b7979fc89686c966114f6d3c8` against `57bb3339`.
 The focused test passed once, with 1369 tests filtered out. Root read `/Users/jasonconigliari/botster-evidence/parser-fixture-20260923/focused.log`.
 The two runtime fixtures, resync deadline fixture, and subscription setup failure remain open. Full workspace verification must run again after these corrections.
+
+### Capability enforcement finding during runtime test replacement
+
+The replacement capacity test passed once at patch `ffb4b2af47b8f5ceee4bb9b15f1cb429b1e95e30059e61b00cb62a499ac64d28`.
+The first capability run stopped in fixture setup because `BOTSTER_HUB_BIN` was missing. It did not test capability enforcement.
+The worker-free rerun reached Lua and unexpectedly created `s1-plugin-capability-a` despite the removed manifest grant.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/runtime-test-migration-20260923/`; `capability-rerun.log` preserves the reached failure.
+Root and reviewer 001e traced an omitted check: `spawn_admitted` does not call the existing `package_allows_session_type_spawn` predicate.
+The predicate's existing caller is the legacy fulfillment path. The charged daemon path bypasses that check.
+This is a blocker to existing capability enforcement, not a new policy requirement. The test must not change its expected refusal.
+Root authorized writer 001b to reuse the predicate before reply-channel construction or queue insertion and return the existing borrowed refusal.
+The charged input must retain funding until it drops. Owner requirements, other gates, and limits remain unchanged.
+The writer must check cleanup of the unexpected test session before another run. Focused capability and capacity tests must verify the correction.
+The writer reported that the unexpected session had exited and neither recorded PID remained. The writer preserved evidence and removed only its exact test root.
+Source review moved the capability check before `input.into_parts()`, using a borrowed `plugin_key` accessor on the intact request.
+Root and reviewer 001e accepted patch `152ee0438aac867e51ebfc7a758632c35d96024f6af0ab19fdc93f53d868d0aa`. Focused tests are authorized.
+Review also found a separate accounting defect on the reachable reply-funding refusal after tuple destructuring.
+The last tuple binding is the charge, so local destruction releases that charge before the request payload. Charge destruction immediately credits the shared account.
+Root assigned a minimal tuple-order correction after the current test run: bind the charge first so it drops last. The production caller and test caller must both change.
+This finding blocks existing accounting acceptance. It does not authorize new limits or a new accounting mechanism.
+Root and reviewer accepted the tuple-order correction at combined patch `4828bac21c8591dcdc471a6f669ab268fdd19c3d2cb79a7570c51c2ee851cfc5`.
+Root checked the unchanged hash and five final logs: capability, capacity, Occupied context, and unrelated worktree each passed once; input accounting passed seven tests.
+These are 11 distinct focused tests. The tuple-order lifetime claim follows source destruction order; these runs do not measure a concurrent accounting window.
+The controls used the current in-process test library with the copied Hub `0db57795` / Core `891e220` worker pair and its verified manifest.
+They do not establish current packaged-Hub acceptance. The earlier unexpected-spawn result remains the pre-fix capability regression.
+The two obsolete runtime tests and three unused test helpers were removed. The replacements exercise the charged daemon path.
+The resync deadline fixture and subscription setup failure remain from the eight-failure workspace gate. A full workspace rerun remains required.
 
 Latest capacity result: test-only patch `b025a409f5e87889e550957be7bd2225057e83d36bccfa36667d711a2959badf` passed against pushed checkpoint `ebaf8b3b`.
 The input unit passed one test. The matched daemon test passed one test, with 328 filtered tests.
