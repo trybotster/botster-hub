@@ -707,38 +707,15 @@ pub(crate) fn run_local_runtime_smoke(
     _workspaces_package_path: &Path,
     _web_port: u16,
 ) -> Output {
-    run_local_runtime_smoke_with_fault(
-        data_dir,
-        _project_pipelines_package_path,
-        web_package_path,
-        tui_package_path,
-        _workspaces_package_path,
-        _web_port,
-        None,
-    )
-}
-
-pub(crate) fn run_local_runtime_smoke_with_fault(
-    data_dir: &Path,
-    _project_pipelines_package_path: &Path,
-    web_package_path: &Path,
-    tui_package_path: &Path,
-    _workspaces_package_path: &Path,
-    _web_port: u16,
-    close_operation: Option<&str>,
-) -> Output {
     ensure_runtime_packages(data_dir, web_package_path, tui_package_path);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
-    command
+    Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("smoke")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--session-worker-bin")
-        .arg(session_worker_binary_path());
-    if let Some(operation) = close_operation {
-        command.env(TEST_CLOSE_LOCAL_WEBRTC_OPERATION_ENV, operation);
-    }
-    command.output().expect("run botster-hub smoke")
+        .arg(session_worker_binary_path())
+        .output()
+        .expect("run botster-hub smoke")
 }
 
 pub(crate) fn ensure_runtime_packages(

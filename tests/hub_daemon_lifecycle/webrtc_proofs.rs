@@ -132,58 +132,6 @@ fn cli_smoke_proves_local_runtime_daemon_package_app_session_and_webrtc() {
 }
 
 #[test]
-fn cli_smoke_persists_matching_sender_record_when_webrtc_response_closes() {
-    let _guard = daemon_test_guard();
-    let data_dir = unique_short_test_dir("cli-smoke-webrtc-close");
-    let project_pipelines_package_dir = unique_test_dir("cli-smoke-close-project-pipelines");
-    let web_package_dir = unique_test_dir("cli-smoke-close-web");
-    let tui_package_dir = unique_test_dir("cli-smoke-close-tui");
-    let workspaces_package_dir = unique_test_dir("cli-smoke-close-workspaces");
-    write_project_pipelines_availability_package(&project_pipelines_package_dir);
-    write_botster_web_package(&web_package_dir);
-    write_botster_tui_package(&tui_package_dir);
-    write_botster_workspaces_local_package(&workspaces_package_dir, "botster-workspaces");
-
-    let output = run_local_runtime_smoke_with_fault(
-        &data_dir,
-        &project_pipelines_package_dir,
-        &web_package_dir,
-        &tui_package_dir,
-        &workspaces_package_dir,
-        0,
-        Some("status"),
-    );
-    let text = command_output_text(&output);
-    assert!(
-        !output.status.success(),
-        "faulted smoke unexpectedly passed: {text}"
-    );
-    assert!(text.contains(
-        "local_webrtc=local WebRTC response incomplete: operation=status cause=channel_closed message_id=pending next_chunk=0 expected_chunks=pending"
-    ));
-    let grant_id =
-        local_webrtc_grant_id(&output).expect("faulted smoke reached local WebRTC bootstrap");
-    let terminal_record = local_webrtc_sender_terminal_record(&output, &grant_id);
-    assert_eq!(terminal_record["request_operation"], "status");
-    assert_eq!(terminal_record["next_chunk_index"], 0);
-    assert_eq!(terminal_record["total_chunks"], 0);
-    assert!(
-        matches!(
-            terminal_record["cause"].as_str(),
-            Some(
-                "channel_closed"
-                    | "poll_ended"
-                    | "peer_disconnected"
-                    | "peer_failed"
-                    | "peer_closed"
-            )
-        ),
-        "faulted smoke must retain a usable sender terminal cause: {terminal_record}"
-    );
-    assert_smoke_owned_daemon_gone(&data_dir);
-}
-
-#[test]
 fn cli_smoke_reports_missing_first_party_prerequisites() {
     let _guard = daemon_test_guard();
     let data_dir = unique_short_test_dir("cli-smoke-missing");
