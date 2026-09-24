@@ -1247,6 +1247,25 @@ fn daemon_spawns_session_type_and_script_reads_botster_context() {
     )
     .expect("spawn session type");
     assert_eq!(spawn.kind, botster_hub::DaemonResponseKind::Spawned);
+    assert_eq!(spawn.sessions.len(), 1);
+    assert_eq!(spawn.sessions[0].session_id, "session-type-context");
+
+    let context = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ReadSessionContext {
+            session_id: "session-type-context".to_string(),
+            context_id: None,
+            key: Some("prompt".to_string()),
+        },
+    )
+    .expect("read spawned session context");
+    assert_eq!(context.kind, botster_hub::DaemonResponseKind::SessionContext);
+    let context = context.session_context.expect("session context response");
+    assert_eq!(context.session_id, "session-type-context");
+    assert_eq!(
+        context.values.get("prompt").map(String::as_str),
+        Some("pipeline prompt")
+    );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let context_output = package_root.join("context-output.json");

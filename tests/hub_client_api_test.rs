@@ -1097,7 +1097,7 @@ fn app_surface(id: &str, title: &str) -> PackageSurfaceDescriptor {
 }
 
 #[test]
-fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
+fn session_types_resolve_and_reject_ownerless_spawn_and_unadmitted_reads() {
     let package_root =
         std::path::PathBuf::from("target/botster-hub-test-data/client-api-session-type-package");
     let _ = fs::remove_dir_all(&package_root);
@@ -1232,12 +1232,13 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
     );
     assert!(resolved.environment.contains_key("BOTSTER_CONTEXT_ID"));
 
-    let spawn = api
+    let spawn_request_id = request_id("spawn-session-type");
+    let ownerless_spawn = api
         .handle_request(
             &mut runtime,
             &packages,
             HubClientRequest::SpawnSessionType {
-                request_id: request_id("spawn-session-type"),
+                request_id: spawn_request_id.clone(),
                 session_type_id: "init".to_string(),
                 session_type_request: botster_hub::SessionTypeRequest {
                     session_id: Some(SessionId("session-type-api-session".to_string())),
@@ -1251,32 +1252,16 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
             },
         )
         .wait(&runtime)
-        .expect("spawn session type");
-    let HubClientResponseBody::Spawned(spawned) = spawn.body else {
-        panic!("spawned response expected");
-    };
-    assert_eq!(spawned.session.session_id.0, "session-type-api-session");
-
-    let context = api
-        .handle_request(
-            &mut runtime,
-            &packages,
-            HubClientRequest::ReadSessionContext {
-                request_id: request_id("read-session-context"),
-                session_id: SessionId("session-type-api-session".to_string()),
-                context_id: None,
-                key: Some("prompt".to_string()),
-            },
-        )
-        .wait(&runtime)
-        .expect("read session context");
-    let HubClientResponseBody::SessionContext(context) = context.body else {
-        panic!("context response expected");
-    };
-    assert_eq!(
-        context.values.get("prompt").map(String::as_str),
-        Some("hello from spawn")
-    );
+        .expect_err("session type spawning requires the daemon control owner");
+    assert!(matches!(
+        ownerless_spawn,
+        HubClientError::InvalidRequest {
+            request_id,
+            operation: HubClientOperation::SpawnSessionType,
+            message,
+        } if request_id == spawn_request_id
+            && message == "session type spawning requires the daemon control owner"
+    ));
 
     let unadmitted = HubClientApi::new(
         HubClientIdentity {
@@ -1291,13 +1276,14 @@ fn session_types_resolve_spawn_context_and_reject_unadmitted_reads() {
             &packages,
             HubClientRequest::ReadSessionContext {
                 request_id: request_id("unadmitted-context-read"),
-                session_id: SessionId("session-type-api-session".to_string()),
+                session_id: SessionId("absent-session".to_string()),
                 context_id: None,
                 key: None,
             },
         )
         .wait(&runtime)
         .expect_err("unadmitted context reads are denied");
+    // Admission rejects this request before the absent context is looked up.
     assert!(matches!(denied, HubClientError::AdmissionDenied { .. }));
 }
 
