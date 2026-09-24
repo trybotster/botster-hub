@@ -170,6 +170,53 @@ pub(crate) enum SessionSpawnCleanupPoll {
 }
 
 impl HubRuntime {
+    #[cfg(test)]
+    pub(crate) fn test_begin_ordinary_owner_spawn(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        session_id: SessionId,
+        parent: crate::lua_memory::LuaCallbackCharge,
+    ) -> SessionTypeSpawnStart {
+        let context_id = format!("ctx-{}", session_id.0);
+        let binding = CoreBinding::Owner {
+            waiter_id,
+            allowance: crate::session_types::ChargedMaterializationAllowance::empty_for_test(
+                parent,
+            ),
+        };
+        let tracker = binding.begin(self, CoreOperation::ReserveSession(session_id.clone()));
+        SessionTypeSpawnStart {
+            tracker,
+            stage: PluginSpawnStage::Reserve,
+            reservation: None,
+            spawn: SpawnSessionRequest {
+                request: crate::client_api::spawn_request(
+                    self,
+                    RequestId(format!("owner-test-{}", session_id.0)),
+                    session_id.clone(),
+                    "sleep 30".into(),
+                ),
+                metadata: crate::client_api::client_session_metadata(),
+            },
+            spawn_error: None,
+            reserve_operation_id: None,
+            retry_tokens: Vec::new(),
+            retry_keep: Vec::new(),
+            context_published: false,
+            context: Some(HubSessionContext {
+                context_id: context_id.clone(),
+                session_id,
+                values: BTreeMap::from([("prompt".into(), "owner test".into())]),
+            }),
+            session_type_id: "ordinary.owner-test".into(),
+            context_id,
+            context_keys: vec!["prompt".into()],
+            abandon_requested: false,
+            cleanup: CleanupStage::SpawnPending,
+            binding,
+        }
+    }
+
     pub(crate) fn session_spawn_host_reply(
         &self,
         retirement: &crate::data_plane::driver::CoreWaiterRetirement,
@@ -371,6 +418,15 @@ impl HubRuntime {
             }
             failure.error
         })
+    }
+}
+
+#[cfg(test)]
+impl SessionTypeSpawnStart {
+    pub(crate) fn test_reservation_identity(
+        &self,
+    ) -> Option<botster_core::SessionReservationIdentity> {
+        self.reservation.as_ref().map(SessionReservation::identity)
     }
 }
 

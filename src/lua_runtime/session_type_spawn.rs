@@ -209,7 +209,9 @@ mod tests {
 
         let account = delivery_memory();
         let lua = Lua::new();
-        let failure = lua.create_string("conversion failed").unwrap();
+        let failure = lua
+            .create_string("session_types.spawn could not allocate its Lua result")
+            .unwrap();
         let mut spawned = delivery_spawned();
         spawned.context_id = "large-context-".repeat(4096);
         let (fixture, receipt) = SpawnReceiptFixture::new(&account);
@@ -223,7 +225,14 @@ mod tests {
         let result =
             convert_session_type_spawn_delivery(&lua, &account, &spawned, receipt, &failure);
         lua.set_memory_limit(0).unwrap();
-        assert!(matches!(result.unwrap(), Value::String(ref value) if value == &failure));
+        let Value::String(actual) = result.unwrap() else {
+            panic!("Lua allocation failure must return its precreated string")
+        };
+        assert_eq!(
+            actual.to_str().unwrap(),
+            "session_types.spawn could not allocate its Lua result",
+        );
+        assert_eq!(actual, failure);
         assert_eq!(account.usage().1, receipt_bytes);
         fixture.assert_outcome(SpawnConversionOutcome::Abandoned);
         assert_eq!(account.usage().1, 0);

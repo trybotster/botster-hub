@@ -1,6 +1,6 @@
 # Foundation integration and final acceptance
 
-Status: ordinary-spawn checkpoint `5c01a95d` is pushed. Real daemon success and Host/Core refusal checks pass. Full foundation acceptance remains open.
+Status: checkpoint `63d64248` is pushed. Real daemon success, Host/Core refusal, and render-capacity checks pass. Full foundation acceptance remains open.
 
 ## Current delivery status — September 23
 
@@ -9,10 +9,46 @@ The input unit passed one test. The matched daemon test passed one test, with 32
 The daemon returned the complete semantic refusal for a 100,000-byte key and the exact render-capacity refusal for a 1,100,000-byte key.
 Root checked both raw results, the patch hash, and both binary hashes against the candidate manifest.
 Evidence is under `/Users/jasonconigliari/botster-evidence/ordinary-render-capacity-20260923/`. The initial relink mismatch is preserved separately.
+The writer reports that `cargo build` produced a 114,701,488-byte Hub binary; the later `cargo test` relink produced 114,703,184 bytes.
+Both commands used Rust 1.97.0 and `CARGO_INCREMENTAL=0`. Verbose compiler arguments were not captured; the precise difference remains unexplained.
+The manifest rejected the first run before test execution. The successful rerun used the verified final binary hash with unchanged source.
 The input unit measured J=1,102,107, K=1,100,948, and retained P=1,100,815 bytes. J is released before Host processing.
 The earlier threshold calculation incorrectly retained J after projection. Source review corrected that premise before the run.
 Future capacity calculations must follow buffer destruction and remaining parent capacity, not reuse an earlier peak as retained storage.
 This closes the tested render-capacity refusal requirement without changing production limits. Abandonment and conversion-refusal verification are next.
+Root assigned deterministic owner-level negative tests to writer 001b. Reviewer 001e checks receipt and cleanup ownership.
+Existing public daemon controls do not deterministically force post-spawn Lua allocation failure or conversion-receipt registration refusal.
+The tests must drive the actual owner continuation, completion collector, conversion receipt, and Core release. No production fault hook is authorized.
+Assertions cover allocation failure, dropped delivery or receipt, cleanup before refusal delivery, exact reservation identity, context removal, and charge retirement.
+These tests establish owner-level failure behavior, not black-box daemon fault injection. The successful daemon and ordinary refusal checks remain separate evidence.
+During test implementation, the writer found another same-waiter ordering risk on failed delivery.
+After Core success, the owner registers a conversion receipt. If sending the result fails, it drops the result and immediately enters cleanup.
+Root verified that this path can attempt cleanup before collecting the conversion receipt. Runtime reproduction remains pending.
+The writer must preserve a failing dropped-receiver regression before correction. Root prefers reuse of the existing conversion phase and completion wake.
+This is a blocker to existing abandonment acceptance, not a scope expansion. No limit increase or new collection mechanism is assigned.
+Root reviewed test patch `da04e8e3a1bd8ccd0579d1d2b1341304c39b86f8c8850e7b14fd1469f12da680` and authorized one focused expected-failure run.
+The corrected fixture requires Pending and Conversion after receiver loss. Its panic guard requests session shutdown before daemon stop.
+The writer must check for surviving test processes because the guard ignores shutdown errors.
+The other owner cases cover explicit receipt abandonment and registration refusal. A separate Lua unit covers allocation failure.
+The owner cases also require a new reservation for the same session ID with a different generation, followed by release.
+Writer 001b holds the compiler slot. Reviewer 001e checks the revised source. Production correction waits for the intended failing assertion.
+The first compile failed on an incorrect test import. No test ran. The writer corrected only that import.
+Test patch `49078533c2048812f2fc05f160b6f4aac709fae5135e12b8922df0fca20567c6` then reached the intended dropped-receiver assertion.
+The focused run failed one test, with 1362 filtered tests, because the first poll did not return Pending.
+Root checked the raw failure at `session_spawn.rs:954`. Source inspection identifies the current return as Again.
+The post-run check reported no worktree worker, `sleep 30` process, or test data directory.
+Evidence resides in `/Users/jasonconigliari/botster-evidence/ordinary-conversion-lifecycle-20260923/`.
+The writer will preserve the existing Conversion phase and return Pending after failed delivery. Green cleanup verification remains pending.
+The corrected source/tests patch is `af312ee98751669f11d6b4d5a26cca6aa6731941a2bd54a471f5ced0d0981b97`.
+Root verified this hash and four focused passing logs. Each command executed one test, with 1362 filtered tests.
+The dropped-receiver, explicit-abandonment, and registration-refusal owner tests passed. The separate Lua allocation-failure unit also passed.
+The owner tests confirmed context removal, reservation of the same session ID with a new generation, subsequent release, and zero retained charges.
+The registration-refusal test delivered its exact error only after cleanup. The Lua unit checked the exact allocation error and Abandoned receipt.
+The post-run check found no test-worktree worker, `sleep 30` process, or test data directory.
+These results close the tested owner cleanup cases. They do not establish full dispatcher fault coverage or production readiness.
+Reviewer 001e accepted the four results and source hash for commit. The original green process check retained its summary but not its raw listing.
+Root requested a new timestamped check with its raw listing. This later check must not be presented as the original check.
+The next bounded source task is relative-device-root startup stability. Recovery and the wider acceptance gates remain open.
 
 Latest refusal result: test-only patch `7f4eee6adf29b5079a743bcedae0d366da0ee1ea91b610df86950141b909779b` passed against checkpoint `5c01a95d`.
 The real daemon test passed one test, with 328 filtered tests. Root checked the raw log, manifest, and test patch hash.
@@ -20,7 +56,7 @@ The test checks exact missing-type Host and occupied-ID Core refusal messages th
 Per-session FIFO holds replace a timed sleep. The test does not open the FIFOs; daemon shutdown performs session cleanup.
 Successful completion includes the existing owned-child absence check. The reviewer accepted the test source before this run.
 Evidence is under `/Users/jasonconigliari/botster-evidence/ordinary-lua-refusals-20260923/`.
-Render-capacity refusal, abandonment, conversion refusal, relative-device-root stability, and the wider acceptance gates remain open.
+This refusal checkpoint did not cover abandonment, conversion refusal, or relative-device-root stability. The later capacity checkpoint closes render-capacity refusal only.
 
 Latest result: source/tests patch `f8921ddd78fe3807266262dbca32630bb66e018f5b062717333c502d494a7ac0` passes the first ordinary-spawn daemon requirement.
 The driver handoff test passed one test. The real daemon test passed one test, with 328 filtered tests.
