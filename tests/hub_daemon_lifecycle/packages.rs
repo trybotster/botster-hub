@@ -4303,6 +4303,30 @@ return botster.register({
         session_id = "ordinary-first",
       })
     end,
+  }, {
+    name = "ordinary.semantic_large",
+    description = "Report an unadmitted environment override.",
+    handler = "semantic_large",
+    call = function(args)
+      local name = string.rep("X", 100000)
+      return botster.capabilities.session_types.spawn({
+        session_type_id = "ordinary.two/init",
+        session_id = "ordinary-semantic-large",
+        environment = { [name] = "v" },
+      })
+    end,
+  }, {
+    name = "ordinary.render_capacity",
+    description = "Report the Lua refusal render capacity.",
+    handler = "render_capacity",
+    call = function(args)
+      local name = string.rep("X", 1100000)
+      return botster.capabilities.session_types.spawn({
+        session_type_id = "ordinary.two/init",
+        session_id = "ordinary-render-capacity",
+        environment = { [name] = "v" },
+      })
+    end,
   }},
 })
 "#,
@@ -4432,6 +4456,43 @@ return botster.register({
             "{tool} must report the exact producer reason",
         );
     }
+    let semantic = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "ordinary.semantic_large".to_string(),
+            arguments: serde_json::json!({}),
+        },
+    )
+    .expect("call large semantic refusal through daemon");
+    assert_eq!(semantic.kind, botster_hub::DaemonResponseKind::OperatorError);
+    let expected = format!(
+        "runtime error: session_types.spawn failed: environment override is not admitted: {}",
+        "X".repeat(100000),
+    );
+    let actual = &semantic
+        .error
+        .as_ref()
+        .expect("large semantic refusal has an operator error")
+        .message;
+    let prefix = actual.chars().take(120).collect::<String>();
+    assert_eq!(actual.len(), expected.len(), "actual prefix: {prefix:?}");
+    assert!(
+        actual == &expected,
+        "the smaller key must return its complete semantic refusal; actual prefix: {prefix:?}",
+    );
+    let capacity = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "ordinary.render_capacity".to_string(),
+            arguments: serde_json::json!({}),
+        },
+    )
+    .expect("call render-capacity refusal through daemon");
+    assert_eq!(capacity.kind, botster_hub::DaemonResponseKind::OperatorError);
+    assert_eq!(
+        capacity.error.as_ref().expect("capacity has an operator error").message,
+        "runtime error: Lua refusal render capacity exhausted",
+    );
     daemon.shutdown();
 }
 

@@ -497,4 +497,44 @@ mod tests {
         drop(input);
         assert_eq!(memory.usage().1, 0);
     }
+
+    #[test]
+    fn large_environment_key_fits_both_input_stages() {
+        use mlua::LuaSerdeExt;
+
+        let lua = Lua::new();
+        lua.set_memory_limit(16 * 1024 * 1024).unwrap();
+        let args = lua
+            .load("return {session_type_id='ordinary.two/init', session_id='ordinary-capacity', environment={[string.rep('X', 1100000)]='v'}}")
+            .eval::<LuaValue>()
+            .unwrap();
+        let plugin = PluginKey("ordinary.two".into());
+        let limit = 8 * 1024 * 1024;
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 16 * 1024 * 1024,
+            total_vm_bytes: 16 * 1024 * 1024,
+            per_callback_bytes: limit,
+            total_callback_bytes: limit,
+        })
+        .unwrap();
+        let admission = super::super::lua_json::value_size_scoped(&memory, &lua, &args).unwrap();
+        let json: Value = lua.from_value(args.clone()).unwrap();
+        let projection = projection_bytes(&json, &plugin).unwrap();
+        eprintln!(
+            "large spawn input J={} K={} P={}",
+            admission.json_bytes, admission.scratch_peak, projection,
+        );
+        assert!(admission.json_bytes + admission.scratch_peak < limit);
+        assert!(admission.json_bytes + projection < limit);
+        let capacity = lua.create_string("capacity").unwrap();
+        let input = admit(&lua, &args, &plugin, &memory, &capacity)
+            .unwrap_or_else(|_| panic!("the staged input must fit the existing callback cap"));
+        let (_, _, request, retained) = input.into_parts();
+        assert_eq!(request.environment.keys().next().unwrap().len(), 1100000);
+        assert_eq!(retained.bytes(), projection);
+        assert_eq!(memory.usage().1, projection);
+        drop(request);
+        drop(retained);
+        assert_eq!(memory.usage().1, 0);
+    }
 }
