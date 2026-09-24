@@ -44,6 +44,7 @@
 //! Size-pass scratch is charged before growth (`ChargedVec` overlap). Build
 //! consumes a pre-split reservation and never `reserve_*` again.
 
+use std::fmt::{self, Write};
 use std::mem::size_of;
 use std::os::raw::c_void;
 use std::sync::Arc;
@@ -91,7 +92,28 @@ impl JsonAdmission {
         })
     }
 
-    pub(crate) fn bind(
+    /// Keep J+K on one open charge until build scratch has been destroyed.
+    pub(crate) fn build_scoped(
+        &self,
+        lua: &Lua,
+        value: &Value,
+        entry: &mut LuaCallbackCharge,
+    ) -> Result<serde_json::Value, mlua::Error> {
+        // Keep both Ok and Err on this path so scratch drops before shrink.
+        let built = match value {
+            Value::Table(table) => walk_build(lua, table.clone(), self.stack_cap),
+            other => leaf_build(other),
+        };
+        let retained = entry
+            .bytes()
+            .checked_sub(self.scratch_peak)
+            .expect("the parent admitted J+K before JSON build");
+        assert!(entry.shrink_to(retained));
+        built
+    }
+
+    /// Transfer scratch and seal the entry when no later growth is allowed.
+    pub(crate) fn bind_sealed(
         &self,
         entry: &mut LuaCallbackCharge,
     ) -> Result<PrepaidScratch, super::AdmissionError> {
@@ -111,6 +133,20 @@ impl JsonAdmission {
 }
 
 pub(crate) fn value_size(
+    memory: &Arc<LuaMemoryAccount>,
+    lua: &Lua,
+    value: &Value,
+) -> Result<JsonAdmission, super::AdmissionError> {
+    value_size_scoped(memory, lua, value).map_err(|error| match error {
+        super::AdmissionError::Json(problem) => {
+            super::AdmissionError::Runtime(problem.legacy_error())
+        }
+        other => other,
+    })
+}
+
+/// Preserve an allocation-free description of walker-owned errors for spawn.
+pub(crate) fn value_size_scoped(
     memory: &Arc<LuaMemoryAccount>,
     lua: &Lua,
     value: &Value,
@@ -232,8 +268,8 @@ impl Scratch {
     }
 }
 
-#[derive(Clone, Copy)]
-enum KeyFail {
+#[derive(Clone, Copy, Debug)]
+pub(super) enum KeyFail {
     Integer(i64),
     Number(f64),
     Boolean(bool),
@@ -242,6 +278,132 @@ enum KeyFail {
     Seq,
     Map,
     Unsupported(&'static str),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum JsonProblem {
+    Deserialize(&'static str),
+    Runtime(&'static str),
+    Key(KeyFail),
+    Unsupported(&'static str),
+}
+
+struct CountedMessage(usize);
+
+impl Write for CountedMessage {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 = self.0.checked_add(text.len()).ok_or(fmt::Error)?;
+        Ok(())
+    }
+}
+
+impl JsonProblem {
+    fn write_inner(self, output: &mut impl Write) -> fmt::Result {
+        match self {
+            Self::Deserialize(message) | Self::Runtime(message) => output.write_str(message),
+            Self::Key(fail) => write_key_fail(fail, output),
+            Self::Unsupported(name) => write!(output, "unsupported value type `{name}`"),
+        }
+    }
+
+    fn write_callback_message(self, output: &mut impl Write) -> fmt::Result {
+        if !matches!(self, Self::Runtime(_)) {
+            output.write_str("deserialize error: ")?;
+        }
+        self.write_inner(output)
+    }
+
+    pub(super) fn legacy_error(self) -> mlua::Error {
+        let mut inner = String::new();
+        self.write_inner(&mut inner)
+            .expect("a JSON error descriptor must format");
+        match self {
+            Self::Runtime(_) => mlua::Error::RuntimeError(inner),
+            _ => mlua::Error::DeserializeError(inner),
+        }
+    }
+
+    pub(super) fn raise(
+        self,
+        lua: &Lua,
+        mut parent: LuaCallbackCharge,
+        capacity: &mlua::String,
+    ) -> super::callback::CallbackFailure {
+        let mut counted = CountedMessage(0);
+        if self.write_callback_message(&mut counted).is_err() || parent.grow(counted.0).is_err() {
+            return super::callback::CallbackFailure::Raise(capacity.clone());
+        }
+        let mut message = String::with_capacity(counted.0);
+        if self.write_callback_message(&mut message).is_err() {
+            return super::callback::CallbackFailure::Raise(capacity.clone());
+        }
+        let raised = lua.create_string(&message).ok();
+        drop(message);
+        drop(parent);
+        super::callback::CallbackFailure::Raise(raised.unwrap_or_else(|| capacity.clone()))
+    }
+}
+
+/// Keep the scoped callback parent alive through Rust error formatting.
+pub(super) fn raise_admission_error(
+    error: super::AdmissionError,
+    lua: &Lua,
+    mut parent: LuaCallbackCharge,
+    capacity: &mlua::String,
+) -> super::callback::CallbackFailure {
+    match error {
+        super::AdmissionError::Capacity => {
+            super::callback::CallbackFailure::Raise(capacity.clone())
+        }
+        super::AdmissionError::Json(problem) => problem.raise(lua, parent, capacity),
+        super::AdmissionError::Runtime(error) => {
+            let write_message = |output: &mut dyn Write| match &error {
+                mlua::Error::RuntimeError(message) => output.write_str(message),
+                other => write!(output, "{other}"),
+            };
+            let mut counted = CountedMessage(0);
+            if write_message(&mut counted).is_err() || parent.grow(counted.0).is_err() {
+                return super::callback::CallbackFailure::Raise(capacity.clone());
+            }
+            let mut message = String::with_capacity(counted.0);
+            if write_message(&mut message).is_err() {
+                return super::callback::CallbackFailure::Raise(capacity.clone());
+            }
+            let raised = lua.create_string(&message).ok();
+            drop(message);
+            drop(error);
+            drop(parent);
+            super::callback::CallbackFailure::Raise(raised.unwrap_or_else(|| capacity.clone()))
+        }
+    }
+}
+
+fn write_key_fail(fail: KeyFail, output: &mut impl Write) -> fmt::Result {
+    match fail {
+        KeyFail::Integer(value) => {
+            write!(
+                output,
+                "invalid type: integer `{value}`, expected a string key"
+            )
+        }
+        KeyFail::Number(value) => {
+            write!(
+                output,
+                "invalid type: floating point `{value}`, expected a string key"
+            )
+        }
+        KeyFail::Boolean(value) => {
+            write!(
+                output,
+                "invalid type: boolean `{value}`, expected a string key"
+            )
+        }
+        KeyFail::Nil => output.write_str("invalid type: unit value, expected a string key"),
+        KeyFail::InvalidUtf8 => output.write_str("invalid type: byte array, expected a string key"),
+        KeyFail::Seq => output.write_str("invalid type: sequence, expected a string key"),
+        KeyFail::Map => output.write_str("invalid type: map, expected a string key"),
+        KeyFail::Unsupported(name) => write!(output, "unsupported value type `{name}`"),
+    }
 }
 
 enum CollectedKey {
@@ -334,9 +496,9 @@ fn walk_size(
         match child {
             Child::Table(child) => {
                 if stack.iter().any(|frame| frame.ptr == child.to_pointer()) {
-                    return Err(super::AdmissionError::Runtime(
-                        mlua::Error::DeserializeError("recursive table detected".into()),
-                    ));
+                    return Err(super::AdmissionError::Json(JsonProblem::Deserialize(
+                        "recursive table detected",
+                    )));
                 }
                 push_size_frame(&mut stack, memory, child, array_mt, &mut scratch)?;
             }
@@ -369,8 +531,8 @@ fn walk_size(
             }
         }
     }
-    Err(super::AdmissionError::Runtime(mlua::Error::RuntimeError(
-        "json walk ended without a root".into(),
+    Err(super::AdmissionError::Json(JsonProblem::Runtime(
+        "json walk ended without a root",
     )))
 }
 
@@ -424,7 +586,7 @@ fn push_size_frame(
     scratch: &mut Scratch,
 ) -> Result<(), super::AdmissionError> {
     let ptr = table.to_pointer();
-    let array = is_array(&table, array_mt)?;
+    let array = is_array(&table, array_mt).map_err(super::AdmissionError::Runtime)?;
     let (kind, refs, json) = if array {
         let len = table.raw_len();
         if len > i64::MAX as usize {
@@ -518,6 +680,9 @@ fn take_size_child(
     memory: &Arc<LuaMemoryAccount>,
     scratch: &mut Scratch,
 ) -> Result<Child, super::AdmissionError> {
+    // Pinned mlua raw_get::<Value> cannot return user error text: raw_get
+    // invokes no metamethod and Value::from_lua is infallible. Recheck this
+    // boundary before changing the Value type argument.
     if matches!(&frame.kind, SizeKind::Object { scanned: false, .. }) {
         scan_size_keys(frame, memory, scratch)?;
         if let SizeKind::Object { scanned, .. } = &mut frame.kind {
@@ -529,7 +694,10 @@ fn take_size_child(
             if *next > *len {
                 return Ok(Child::End);
             }
-            let item = frame.table.raw_get::<Value>(index_key(*next))?;
+            let item = frame
+                .table
+                .raw_get::<Value>(index_key(*next))
+                .map_err(super::AdmissionError::Runtime)?;
             *next += 1;
             Ok(child_from_value(item))
         }
@@ -539,10 +707,13 @@ fn take_size_child(
             }
             match keys.get(*next).expect("key cursor") {
                 CollectedKey::Fail(fail) => {
-                    Err(super::AdmissionError::Runtime(raise_key_fail(*fail)))
+                    Err(super::AdmissionError::Json(JsonProblem::Key(*fail)))
                 }
                 CollectedKey::Utf8 { text, .. } => {
-                    let item = frame.table.raw_get::<Value>(text.as_str())?;
+                    let item = frame
+                        .table
+                        .raw_get::<Value>(text.as_str())
+                        .map_err(super::AdmissionError::Runtime)?;
                     frame.pending_key_len = Some(text.len());
                     *next += 1;
                     Ok(child_from_value(item))
@@ -557,10 +728,10 @@ fn scan_size_keys(
     memory: &Arc<LuaMemoryAccount>,
     scratch: &mut Scratch,
 ) -> Result<(), super::AdmissionError> {
-    let table = frame.table.clone();
     let pair_refs = memory
         .reserve_callback_bytes(pair_scan_ref_bytes())
         .map_err(capacity)?;
+    let table = frame.table.clone();
     scratch.add_refs(pair_scan_ref_bytes(), 2);
     for_each_admitted::<Value, Value>(&table, |key, _item| {
         let collected = collect_key(memory, &key)?;
@@ -597,6 +768,8 @@ fn for_each_admitted<K: mlua::FromLua, V: mlua::FromLua>(
     table: &Table,
     mut function: impl FnMut(K, V) -> Result<(), super::AdmissionError>,
 ) -> Result<(), super::AdmissionError> {
+    // The production caller uses Value, Value. Other FromLua types can add
+    // error text, so this generic helper must not imply that their errors fit.
     let mut failure = None;
     let result = table.for_each::<K, V>(|key, value| {
         match function(key, value) {
@@ -611,7 +784,7 @@ fn for_each_admitted<K: mlua::FromLua, V: mlua::FromLua>(
     if let Some(error) = failure {
         return Err(error);
     }
-    result?;
+    result.map_err(super::AdmissionError::Runtime)?;
     Ok(())
 }
 
@@ -686,7 +859,9 @@ fn add_size(frame: &mut SizeFrame, json: usize) -> Result<(), super::AdmissionEr
             let key_len = frame
                 .pending_key_len
                 .take()
-                .ok_or_else(|| mlua::Error::DeserializeError("object child missing key".into()))?;
+                .ok_or(super::AdmissionError::Json(JsonProblem::Deserialize(
+                    "object child missing key",
+                )))?;
             frame.json = frame
                 .json
                 .checked_add(key_len)
@@ -765,31 +940,26 @@ fn collect_key(
     memory: &Arc<LuaMemoryAccount>,
     key: &Value,
 ) -> Result<CollectedKey, super::AdmissionError> {
-    match collect_key_unfunded(key)? {
-        CollectedKey::Utf8 { text, .. } => {
-            let charge = memory
-                .reserve_callback_bytes(text.capacity())
-                .map_err(capacity)?;
-            Ok(CollectedKey::Utf8 {
-                text,
-                _charge: Some(charge),
-            })
+    match key {
+        Value::String(text) => match text.to_str() {
+            Ok(utf8) => {
+                let charge = memory
+                    .reserve_callback_bytes(utf8.len())
+                    .map_err(capacity)?;
+                Ok(copy_key(&utf8, Some(charge)))
+            }
+            Err(_) => Ok(CollectedKey::Fail(KeyFail::InvalidUtf8)),
+        },
+        other => {
+            Ok(collect_key_unfunded(other).expect("non-string key classification cannot fail"))
         }
-        fail => Ok(fail),
     }
 }
 
 fn collect_key_unfunded(key: &Value) -> Result<CollectedKey, mlua::Error> {
     match key {
         Value::String(text) => match text.to_str() {
-            Ok(utf8) => {
-                let mut out = String::with_capacity(utf8.len());
-                out.push_str(&utf8);
-                Ok(CollectedKey::Utf8 {
-                    text: out,
-                    _charge: None,
-                })
-            }
+            Ok(utf8) => Ok(copy_key(&utf8, None)),
             Err(_) => Ok(CollectedKey::Fail(KeyFail::InvalidUtf8)),
         },
         Value::Integer(value) => Ok(CollectedKey::Fail(KeyFail::Integer(*value))),
@@ -805,40 +975,31 @@ fn collect_key_unfunded(key: &Value) -> Result<CollectedKey, mlua::Error> {
     }
 }
 
+fn copy_key(utf8: &str, charge: Option<LuaCallbackCharge>) -> CollectedKey {
+    let mut output = String::with_capacity(utf8.len());
+    output.push_str(utf8);
+    CollectedKey::Utf8 {
+        text: output,
+        _charge: charge,
+    }
+}
+
 fn raise_key_fail(fail: KeyFail) -> mlua::Error {
-    let message = match fail {
-        KeyFail::Integer(value) => {
-            format!("invalid type: integer `{value}`, expected a string key")
-        }
-        KeyFail::Number(value) => {
-            format!("invalid type: floating point `{value}`, expected a string key")
-        }
-        KeyFail::Boolean(value) => {
-            format!("invalid type: boolean `{value}`, expected a string key")
-        }
-        KeyFail::Nil => "invalid type: unit value, expected a string key".to_owned(),
-        KeyFail::InvalidUtf8 => "invalid type: byte array, expected a string key".to_owned(),
-        KeyFail::Seq => "invalid type: sequence, expected a string key".to_owned(),
-        KeyFail::Map => "invalid type: map, expected a string key".to_owned(),
-        KeyFail::Unsupported(name) => {
-            let mut message = String::with_capacity(22 + name.len());
-            message.push_str("unsupported value type `");
-            message.push_str(name);
-            message.push('`');
-            message
-        }
-    };
-    mlua::Error::DeserializeError(message)
+    JsonProblem::Key(fail).legacy_error()
 }
 
 fn leaf_size(value: &Value) -> Result<usize, super::AdmissionError> {
     match value {
         Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Number(_) => Ok(0),
         Value::LightUserData(data) if data.0.is_null() => Ok(0),
-        Value::String(text) => Ok(utf8_len(text)?),
-        Value::Table(_) => Err(super::AdmissionError::Runtime(
-            mlua::Error::DeserializeError("table leaf reached the size walk".into()),
-        )),
+        Value::String(text) => text.to_str().map(|text| text.len()).map_err(|_| {
+            super::AdmissionError::Json(JsonProblem::Deserialize(
+                "invalid type: byte array, expected any valid JSON value",
+            ))
+        }),
+        Value::Table(_) => Err(super::AdmissionError::Json(JsonProblem::Deserialize(
+            "table leaf reached the size walk",
+        ))),
         other => Err(unsupported(other)),
     }
 }
@@ -864,17 +1025,6 @@ fn index_key(index: usize) -> i64 {
     i64::try_from(index).expect("array raw_len already rejected lengths above i64::MAX")
 }
 
-fn utf8_len(text: &mlua::String) -> Result<usize, mlua::Error> {
-    Ok(text
-        .to_str()
-        .map_err(|_| {
-            mlua::Error::DeserializeError(
-                "invalid type: byte array, expected any valid JSON value".into(),
-            )
-        })?
-        .len())
-}
-
 fn utf8_string(text: &mlua::String) -> Result<String, mlua::Error> {
     let utf8 = text.to_str().map_err(|_| {
         mlua::Error::DeserializeError(
@@ -887,7 +1037,7 @@ fn utf8_string(text: &mlua::String) -> Result<String, mlua::Error> {
 }
 
 fn unsupported(value: &Value) -> super::AdmissionError {
-    super::AdmissionError::Runtime(mlua::Error::DeserializeError(unsupported_message(value)))
+    super::AdmissionError::Json(JsonProblem::Unsupported(value.type_name()))
 }
 
 fn unsupported_message(value: &Value) -> String {
@@ -1070,6 +1220,31 @@ mod tests {
         match value_size(&memory(), lua, value) {
             Err(super::super::AdmissionError::Runtime(error)) => error.to_string(),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_size_error_raises_exact_text_and_releases_its_charge() {
+        for source in [
+            "return { fn = function() end }",
+            "local t = {}; t.n = t; return t",
+            "return {[2]=true}",
+            "return {[1.5]=true}",
+            "return { text = string.char(255) }",
+        ] {
+            let (lua, value) = eval(source);
+            let expected = display_size_err(&lua, &value);
+            let account = memory();
+            let parent = account.reserve_callback_total(0).unwrap();
+            let error = value_size_scoped(&account, &lua, &value).unwrap_err();
+            let capacity = lua.create_string("capacity").unwrap();
+            let super::super::callback::CallbackFailure::Raise(message) =
+                raise_admission_error(error, &lua, parent, &capacity)
+            else {
+                panic!("the scoped error must use the Lua Raise path");
+            };
+            assert_eq!(message.to_str().unwrap(), expected, "{source}");
+            assert_eq!(account.usage().1, 0, "{source}");
         }
     }
 

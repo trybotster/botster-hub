@@ -77,7 +77,24 @@ impl MuxWriteState {
         delivery_ack: Option<mpsc::Sender<()>>,
         close_after: bool,
     ) -> DaemonTransportResult<()> {
-        let frame = control_mux_frame(
+        self.enqueue_response_with_receipt(
+            request_id,
+            response,
+            delivery_ack,
+            close_after,
+            None,
+        )
+    }
+
+    pub(crate) fn enqueue_response_with_receipt(
+        &mut self,
+        request_id: &str,
+        response: DaemonResponse,
+        delivery_ack: Option<mpsc::Sender<()>>,
+        close_after: bool,
+        delivery_receipt: Option<crate::runtime::SpawnDeliveryReceipt>,
+    ) -> DaemonTransportResult<()> {
+        let mut frame = control_mux_frame(
             &ServerFrame::Response {
                 request_id: request_id.to_string(),
                 response,
@@ -86,6 +103,7 @@ impl MuxWriteState {
             delivery_ack,
             close_after,
         )?;
+        frame.delivery_receipt = delivery_receipt;
         self.enqueue_response_frame(frame)
     }
 
@@ -102,6 +120,7 @@ impl MuxWriteState {
             complete_envelope: None,
             class: PendingMuxClass::Response,
             delivery_ack,
+            delivery_receipt: None,
             close_after,
         })
     }
@@ -135,6 +154,7 @@ impl MuxWriteState {
                     complete_envelope: None,
                     class: PendingMuxClass::Event,
                     delivery_ack: None,
+                    delivery_receipt: None,
                     close_after: false,
                 });
                 return Ok(());
@@ -212,6 +232,7 @@ pub(crate) struct PendingMuxFrame {
     complete_envelope: Option<UnixTerminalAdapterHandle>,
     class: PendingMuxClass,
     delivery_ack: Option<mpsc::Sender<()>>,
+    delivery_receipt: Option<crate::runtime::SpawnDeliveryReceipt>,
     close_after: bool,
 }
 
@@ -344,6 +365,7 @@ pub(crate) async fn flush_unix_mux_writes(
                 complete_envelope: Some(handle),
                 class: PendingMuxClass::Terminal,
                 delivery_ack: None,
+                delivery_receipt: None,
                 close_after: false,
             });
             if resume_pending_mux_write(writer, write_state).await? == MuxWrite::Pending {
@@ -367,6 +389,7 @@ pub(crate) fn control_mux_frame(
         complete_envelope: None,
         class,
         delivery_ack,
+        delivery_receipt: None,
         close_after,
     })
 }
@@ -417,6 +440,9 @@ pub(crate) async fn resume_pending_mux_write(
             }
             if let Some(delivery_ack) = pending.delivery_ack {
                 let _ = delivery_ack.send(());
+            }
+            if let Some(receipt) = pending.delivery_receipt {
+                receipt.delivered();
             }
             if let Some(handle) = pending.complete_envelope
                 && !handle.is_closed()
@@ -930,6 +956,7 @@ pub(crate) mod mux_write_resume_tests {
             complete_envelope: None,
             class: PendingMuxClass::Terminal,
             delivery_ack: None,
+            delivery_receipt: None,
             close_after: false,
         };
         let result = write_frame_bytes_resumable(&mut writer, &mut pending).await;
@@ -1340,6 +1367,7 @@ pub(crate) mod mux_write_resume_tests {
             complete_envelope: Some(handle.clone()),
             class: PendingMuxClass::Terminal,
             delivery_ack: None,
+            delivery_receipt: None,
             close_after: false,
         };
         handle.close();

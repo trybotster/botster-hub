@@ -169,6 +169,13 @@ fn construction_candidate_bytes(
     Some(construction.max(wrapped))
 }
 
+pub(super) fn formatted_error_storage_bytes(
+    kind_bytes: usize,
+    message_bytes: usize,
+) -> Option<usize> {
+    construction_candidate_bytes(kind_bytes, message_bytes, true)
+}
+
 /// Bound ordinary semantic errors using borrowed input lengths only.
 /// This excludes I/O, parser, managed-spawn, Core, and allocation-refusal errors.
 /// Successful products and other live temporary storage need separate charges.
@@ -223,6 +230,10 @@ pub(super) struct ChargedMaterializationError {
 impl ChargedMaterializationError {
     pub(super) fn error(&self) -> &SessionTypeError {
         &self.error
+    }
+
+    pub(super) fn into_parts(self) -> (SessionTypeError, LuaCallbackCharge) {
+        (self.error, self._storage)
     }
 }
 

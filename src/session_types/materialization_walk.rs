@@ -777,7 +777,7 @@ struct ChargedCountingResult<'input> {
     timeline: Timeline,
     typed_errors: TypedErrorCandidates,
     // Drop the result's error allocation before releasing its charge.
-    _storage: LuaCallbackCharge,
+    _storage: Option<LuaCallbackCharge>,
 }
 
 #[derive(Debug)]
@@ -835,7 +835,15 @@ fn count_with_storage<'input>(
     };
     let requested = counting_workspace_bytes(input).ok_or(CountingRefusal::Arithmetic)?;
     let failure = CountingRefusal::Capacity(capacity_error(requested));
-    let storage = available.split(requested).ok_or(failure)?;
+    let storage = available.split_fixed(requested).ok_or(failure)?;
+    count_prepaid(input, Some(storage))
+}
+
+/// The caller keeps a separate parent charge live for this whole decoder pass.
+fn count_prepaid<'input>(
+    input: &'input [u8],
+    storage: Option<LuaCallbackCharge>,
+) -> Result<ChargedCountingResult<'input>, CountingRefusal> {
     let cursor = Cell::new(Cursor::new(input));
     let timeline = Cell::new(Timeline::default());
     let typed_errors = Cell::new(TypedErrorCandidates::default());
@@ -873,6 +881,28 @@ fn count_with_storage<'input>(
     // Refuse model failures at this boundary, never as typed diagnostics.
     counted.typed_construction_bytes()?;
     Ok(counted)
+}
+
+/// Return the checked typed-parser peak under the caller's open parent.
+/// This is a sizing result, not a construction permit.
+pub(super) fn counted_parser_peak(
+    input: &[u8],
+    parent: &mut LuaCallbackCharge,
+) -> Result<usize, &'static str> {
+    let workspace = counting_workspace_bytes(input)
+        .ok_or("repo session type counting size overflow")?;
+    parent
+        .grow(workspace)
+        .map_err(|_| "repo session type counting capacity exhausted")?;
+    let original = parent.bytes() - workspace;
+    let peak = match count_prepaid(input, None) {
+        Ok(counted) => counted
+            .typed_construction_bytes()
+            .map_err(|_| "repo session type parser peak is unavailable"),
+        Err(_) => Err("repo session type counting capacity exhausted"),
+    };
+    assert!(parent.shrink_to(original));
+    peak
 }
 
 #[cfg(test)]
@@ -927,6 +957,31 @@ mod tests {
         assert!(counted.result.is_ok());
         let element = std::mem::size_of::<serde::__private228::de::Content<'static>>();
         assert!(counted.timeline.maximum >= parent.len() + (4 + 8) * element);
+    }
+
+    #[test]
+    fn working_directory_unknown_content_uses_the_tagged_tree_charge() {
+        let nested = format!("{}0{}", "[".repeat(24), "]".repeat(24));
+        for fields in [
+            format!(r#""extra":{nested},"policy":"relative""#),
+            format!(r#""policy":"relative","extra":{nested}"#),
+        ] {
+            let input = format!(
+                r#"{{"session_types":[{{"working_directory":{{{fields},"path":"sub\u002fdir"}}}}]}}"#
+            );
+            let counted = count_fixture(input.as_bytes());
+            assert!(counted.result.is_ok());
+            let content = std::mem::size_of::<serde::__private228::de::Content<'static>>();
+            // Pinned RawVec starts each one-element Content vector at four slots.
+            assert!(counted.cursor.scratch.capacity > 0);
+            assert!(
+                counted.timeline.maximum >= 24 * 4 * content + counted.cursor.scratch.capacity
+            );
+            assert!(counted.typed_construction_bytes().unwrap() >= counted.timeline.maximum);
+            let parsed =
+                serde_json::from_slice::<super::super::RepoSessionTypesFile>(input.as_bytes());
+            assert!(parsed.is_ok());
+        }
     }
 
     #[test]

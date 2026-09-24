@@ -46,6 +46,7 @@ impl HostError {
 }
 
 pub(crate) enum HostCommand {
+    MaterializeOrdinarySessionType(crate::session_types::SpawnHostWork),
     DeliverCoordinationResponse {
         response: crate::lua_runtime::CoordinationReplySender,
         result: crate::lua_runtime::CoordinationDelivery,
@@ -115,6 +116,7 @@ pub(crate) enum HostCommand {
 impl HostCommand {
     fn generation(&self) -> u64 {
         match self {
+            Self::MaterializeOrdinarySessionType(_) => 0,
             Self::DeliverCoordinationResponse { .. } => 0,
             #[cfg(test)]
             Self::DisposalProbe(_) => 0,
@@ -140,6 +142,9 @@ impl HostCommand {
 impl std::fmt::Debug for HostCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MaterializeOrdinarySessionType(_) => {
+                formatter.write_str("MaterializeOrdinarySessionType")
+            }
             Self::DeliverCoordinationResponse { .. } => {
                 formatter.write_str("DeliverCoordinationResponse")
             }
@@ -206,6 +211,7 @@ pub(crate) struct HostJob {
 
 #[derive(Debug)]
 pub(crate) enum HostResult {
+    OrdinarySessionTypeMaterialized(crate::session_types::SpawnHostCompletion),
     CoordinationResponseDelivered,
     ClientEventCleanup(
         Result<
@@ -253,6 +259,7 @@ pub(crate) enum HostResult {
 impl HostResult {
     fn generation(&self) -> u64 {
         match self {
+            Self::OrdinarySessionTypeMaterialized(_) => 0,
             Self::CoordinationResponseDelivered => 0,
             Self::EntityModelComplete(_) => 0,
             Self::EventOwner(_) | Self::ClientEventCleanup(_) => 0,
@@ -351,6 +358,9 @@ fn normalize_result_size(result: &mut HostResult) {
 
 fn result_logical_bytes(result: &HostResult) -> usize {
     match result {
+        // The callback and Host prepared pools are separate. Retain this
+        // operation's full prepared reservation until the owner consumes it.
+        HostResult::OrdinarySessionTypeMaterialized(_) => HOST_PREPARED_BYTE_CAPACITY,
         HostResult::CoordinationResponseDelivered => 0,
         HostResult::StatusResponsePrepared(prepared) => prepared.logical_bytes(),
         HostResult::StatusResponseDelivered { .. } => 0,
@@ -1110,6 +1120,9 @@ fn execute(
     permit: &mut HostWorkPermit,
 ) -> HostResult {
     match command {
+        HostCommand::MaterializeOrdinarySessionType(work) => {
+            HostResult::OrdinarySessionTypeMaterialized(work.run())
+        }
         HostCommand::DeliverCoordinationResponse {
             response,
             result,

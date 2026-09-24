@@ -185,6 +185,7 @@ pub(crate) enum ControlReply {
     Typed {
         response: DaemonTransportResult<DaemonResponse>,
         charge: Option<RetainedControlCharge>,
+        delivery: Option<crate::runtime::SpawnDeliveryReceipt>,
     },
     EncodedPlugin {
         kind: botster_hub_client::DaemonResponseKind,
@@ -204,6 +205,7 @@ impl ControlReply {
         Self::Typed {
             response,
             charge: None,
+            delivery: None,
         }
     }
 
@@ -214,6 +216,7 @@ impl ControlReply {
         Self::Typed {
             response,
             charge: Some(RetainedControlCharge::Plugin(charge)),
+            delivery: None,
         }
     }
 
@@ -224,6 +227,18 @@ impl ControlReply {
         Self::Typed {
             response,
             charge: Some(RetainedControlCharge::Host(charge)),
+            delivery: None,
+        }
+    }
+
+    pub(crate) fn spawn_delivery(
+        response: DaemonTransportResult<DaemonResponse>,
+        delivery: crate::runtime::SpawnDeliveryReceipt,
+    ) -> Self {
+        Self::Typed {
+            response,
+            charge: None,
+            delivery: Some(delivery),
         }
     }
 
@@ -256,7 +271,14 @@ impl ControlReply {
         Option<Vec<u8>>,
     ) {
         match self {
-            Self::Typed { response, charge } => (response, charge, None),
+            Self::Typed {
+                response,
+                charge,
+                delivery,
+            } => {
+                drop(delivery);
+                (response, charge, None)
+            }
             Self::EncodedPlugin {
                 encoded_frame,
                 charge,

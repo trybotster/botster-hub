@@ -40,6 +40,7 @@ use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktre
 
 mod acknowledge_input;
 mod sandbox;
+pub(crate) mod spawn_input;
 pub(crate) use acknowledge_input::ownership::{
     CoordinationDelivery, CoordinationFailure, CoordinationOutcome as HubCoordinationResponse,
     CoordinationRefusal, CoordinationReply, CoordinationReplySender, CoordinationStorage,
@@ -2537,44 +2538,78 @@ fn session_types_table(
     )?;
     let spawn_templates = session_types.clone();
     let spawn_plugin_key = plugin_key.clone();
-    let spawn_records = package_records.clone();
+    let spawn_records = Arc::new(package_records.clone());
     let spawn_memory = memory.clone();
     let spawn_conversion =
         lua.create_string("session_types.spawn could not allocate its Lua result")?;
     let spawn_capacity = lua.create_string(LUA_CALLBACK_CAPACITY_EXHAUSTED)?;
+    let spawn_requires_owner = lua.create_string("session-type spawn requires the daemon owner")?;
     table.set(
         "spawn",
         callback::create(lua, move |lua, args: Value| {
-            let value = lua.from_value::<serde_json::Value>(args)?;
-            let session_type_id = value
-                .get("session_type_id")
-                .or_else(|| value.get("id"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    mlua::Error::RuntimeError(
-                        "session_types.spawn requires session_type_id".to_string(),
-                    )
-                })?;
-            let request = session_type_request_from_lua(&value)?;
-            match spawn_templates.spawn(
+            let Some(memory) = spawn_memory.as_ref() else {
+                return Err(callback::CallbackFailure::Raise(spawn_requires_owner.clone()));
+            };
+            let input = spawn_input::admit(
+                lua,
+                &args,
                 &spawn_plugin_key,
-                session_type_id,
-                request,
-                spawn_records.clone(),
-            ) {
-                Ok(result) => session_type_spawn::convert_session_type_spawned(
-                    lua,
-                    spawn_memory.as_ref(),
-                    &spawn_templates,
-                    result,
-                    &spawn_conversion,
-                ),
+                memory,
+                &spawn_capacity,
+            )?;
+            let delivery = match spawn_templates.spawn_admitted(input, Arc::clone(&spawn_records)) {
+                Ok(delivery) => delivery,
                 Err(error) if error.as_ref() == LUA_CALLBACK_CAPACITY_EXHAUSTED => {
-                    Ok(Value::String(spawn_capacity.clone()))
+                    return Ok(Value::String(spawn_capacity.clone()));
                 }
-                Err(error) => Err(mlua::Error::RuntimeError(format!(
-                    "session_types.spawn failed: {error}"
-                ))),
+                Err(error) => {
+                    let message = lua.create_string(error.as_ref())?;
+                    return Err(callback::CallbackFailure::Raise(message));
+                }
+            };
+            match delivery {
+                crate::runtime::AdmittedSpawnDelivery::Spawned {
+                    result,
+                    conversion,
+                    _variable,
+                } => {
+                    let converted = session_type_spawn::convert_session_type_spawn_delivery(
+                        lua,
+                        memory,
+                        &result,
+                        conversion,
+                        &spawn_conversion,
+                    )
+                    .map_err(callback::CallbackFailure::Error);
+                    drop(result);
+                    drop(_variable);
+                    converted
+                }
+                crate::runtime::AdmittedSpawnDelivery::Refused {
+                    message,
+                    mut _variable,
+                } => {
+                    let raised = (|| -> Result<mlua::String, callback::CallbackFailure> {
+                        const PREFIX: &str = "session_types.spawn failed: ";
+                        let bytes = PREFIX.len().checked_add(message.len()).ok_or_else(|| {
+                            callback::CallbackFailure::Raise(spawn_capacity.clone())
+                        })?;
+                        _variable.grow(bytes).map_err(|_| {
+                            callback::CallbackFailure::Raise(spawn_capacity.clone())
+                        })?;
+                        let mut failure = String::with_capacity(bytes);
+                        failure.push_str(PREFIX);
+                        failure.push_str(&message);
+                        lua.create_string(&failure).map_err(callback::CallbackFailure::Error)
+                    })();
+                    drop(message);
+                    drop(_variable);
+                    Err(callback::CallbackFailure::Raise(raised?))
+                }
+                crate::runtime::AdmittedSpawnDelivery::Unavailable(reason) => {
+                    let message = lua.create_string(reason)?;
+                    Err(callback::CallbackFailure::Raise(message))
+                }
             }
         })?,
     )?;
@@ -2998,6 +3033,7 @@ pub(crate) fn coordination_table(
                     Err(callback::CallbackFailure::Raise(publish_capacity.clone()))
                 }
                 Err(AdmissionError::Runtime(error)) => Err(error.into()),
+                Err(AdmissionError::Json(problem)) => Err(problem.legacy_error().into()),
             }
         })?,
     )?;
@@ -3029,6 +3065,7 @@ pub(crate) fn coordination_table(
                     Err(callback::CallbackFailure::Raise(drain_capacity.clone()))
                 }
                 Err(AdmissionError::Runtime(error)) => Err(error.into()),
+                Err(AdmissionError::Json(problem)) => Err(problem.legacy_error().into()),
             }
         })?,
     )?;
@@ -3045,12 +3082,7 @@ pub(crate) fn coordination_table(
 pub(crate) enum AdmissionError {
     Capacity,
     Runtime(mlua::Error),
-}
-
-impl From<mlua::Error> for AdmissionError {
-    fn from(error: mlua::Error) -> Self {
-        Self::Runtime(error)
-    }
+    Json(lua_json::JsonProblem),
 }
 
 fn lua_table(args: Value) -> Result<Table, mlua::Error> {
@@ -3092,29 +3124,37 @@ fn admit_publish_operation(
     lua: &Lua,
     args: Value,
 ) -> Result<(PendingCoordinationOperation, LuaCallbackCharge), AdmissionError> {
-    let table = lua_table(args)?;
+    let table = lua_table(args).map_err(AdmissionError::Runtime)?;
     lua_json::value_size(memory, lua, &Value::Table(table.clone()))?;
-    let id = lua_string_bytes(&table, "id")?
-        .ok_or_else(|| mlua::Error::RuntimeError("coordination.publish requires id".into()))?;
+    let id = lua_string_bytes(&table, "id")
+        .map_err(AdmissionError::Runtime)?
+        .ok_or_else(|| {
+            AdmissionError::Runtime(mlua::Error::RuntimeError(
+                "coordination.publish requires id".into(),
+            ))
+        })?;
     let id_bytes = id.as_bytes();
-    let id_text = utf8_slice(&id_bytes)?;
-    let content_type_lua = lua_string_bytes(&table, "content_type")?;
+    let id_text = utf8_slice(&id_bytes).map_err(AdmissionError::Runtime)?;
+    let content_type_lua =
+        lua_string_bytes(&table, "content_type").map_err(AdmissionError::Runtime)?;
     let content_type_bytes = content_type_lua.as_ref().map(mlua::String::as_bytes);
     let content_type = match &content_type_bytes {
-        Some(bytes) => Some(utf8_slice(bytes)?),
+        Some(bytes) => Some(utf8_slice(bytes).map_err(AdmissionError::Runtime)?),
         None => None,
     };
     let content_bytes = content_type
         .map(str::len)
         .unwrap_or("application/json".len());
-    let body_lua = lua_string_bytes(&table, "body")?;
+    let body_lua = lua_string_bytes(&table, "body").map_err(AdmissionError::Runtime)?;
     let body_bytes = body_lua.as_ref().map(mlua::String::as_bytes);
     let body = match &body_bytes {
-        Some(bytes) => Some(utf8_slice(bytes)?),
+        Some(bytes) => Some(utf8_slice(bytes).map_err(AdmissionError::Runtime)?),
         None => None,
     };
     let body_len = body.map(str::len).unwrap_or(0);
-    let extension = table.raw_get::<Value>("extension")?;
+    let extension = table
+        .raw_get::<Value>("extension")
+        .map_err(AdmissionError::Runtime)?;
     let (extension_bytes, extension_admission) = match &extension {
         Value::Nil => (0, None),
         value => {
@@ -3126,21 +3166,30 @@ fn admit_publish_operation(
         .as_ref()
         .map(|admission| admission.scratch_peak)
         .unwrap_or(0);
-    let created_at = lua_u64(table.raw_get::<Value>("created_at")?).unwrap_or(0);
-    let target_table = match table.raw_get::<Value>("target")? {
+    let created_at = lua_u64(
+        table
+            .raw_get::<Value>("created_at")
+            .map_err(AdmissionError::Runtime)?,
+    )
+    .unwrap_or(0);
+    let target_table = match table
+        .raw_get::<Value>("target")
+        .map_err(AdmissionError::Runtime)?
+    {
         Value::Table(target) => target,
         _ => {
-            return Err(
-                mlua::Error::RuntimeError("coordination.publish requires target".into()).into(),
-            );
+            return Err(AdmissionError::Runtime(mlua::Error::RuntimeError(
+                "coordination.publish requires target".into(),
+            )));
         }
     };
-    let (target_kind, first, second) = lua_target_strings(&target_table)?;
+    let (target_kind, first, second) =
+        lua_target_strings(&target_table).map_err(AdmissionError::Runtime)?;
     let first_bytes = first.as_bytes();
-    let first_text = utf8_slice(&first_bytes)?;
+    let first_text = utf8_slice(&first_bytes).map_err(AdmissionError::Runtime)?;
     let second_bytes = second.as_ref().map(mlua::String::as_bytes);
     let second_text = match &second_bytes {
-        Some(bytes) => Some(utf8_slice(bytes)?),
+        Some(bytes) => Some(utf8_slice(bytes).map_err(AdmissionError::Runtime)?),
         None => None,
     };
     let source_len = "plugin:"
@@ -3160,10 +3209,11 @@ fn admit_publish_operation(
         .ok_or(AdmissionError::Capacity)?;
     let mut entry = admit_callback_bytes(memory, payload)?;
     let extension_scratch = match &extension_admission {
-        Some(admission) => Some(admission.bind(&mut entry)?),
+        Some(admission) => Some(admission.bind_sealed(&mut entry)?),
         None => None,
     };
-    let target = envelope_target_from_parts(target_kind, first_text, second_text)?;
+    let target = envelope_target_from_parts(target_kind, first_text, second_text)
+        .map_err(AdmissionError::Runtime)?;
     let content_type = match content_type {
         Some(text) => exact_string(text),
         None => exact_string("application/json"),
@@ -3174,11 +3224,14 @@ fn admit_publish_operation(
     };
     let extension = match extension {
         Value::Nil => None,
-        value => Some(BoundaryJson(lua_json::value_build(
-            lua,
-            &value,
-            extension_scratch.expect("sized extension has prepaid scratch"),
-        )?)),
+        value => Some(BoundaryJson(
+            lua_json::value_build(
+                lua,
+                &value,
+                extension_scratch.expect("sized extension has prepaid scratch"),
+            )
+            .map_err(AdmissionError::Runtime)?,
+        )),
     };
     // Exact-capacity one-slot targets vec: with_capacity(1)+push keeps len==capacity.
     #[allow(clippy::vec_init_then_push)]
@@ -3245,26 +3298,39 @@ fn admit_drain_operation(
     lua: &Lua,
     args: Value,
 ) -> Result<(PendingCoordinationOperation, LuaCallbackCharge), AdmissionError> {
-    let table = lua_table(args)?;
+    let table = lua_table(args).map_err(AdmissionError::Runtime)?;
     lua_json::value_size(memory, lua, &Value::Table(table.clone()))?;
-    let target_table = match table.raw_get::<Value>("target")? {
+    let target_table = match table
+        .raw_get::<Value>("target")
+        .map_err(AdmissionError::Runtime)?
+    {
         Value::Table(target) => target,
         _ => {
-            return Err(
-                mlua::Error::RuntimeError("coordination.drain requires target".into()).into(),
-            );
+            return Err(AdmissionError::Runtime(mlua::Error::RuntimeError(
+                "coordination.drain requires target".into(),
+            )));
         }
     };
-    let (target_kind, first, second) = lua_target_strings(&target_table)?;
+    let (target_kind, first, second) =
+        lua_target_strings(&target_table).map_err(AdmissionError::Runtime)?;
     let first_bytes = first.as_bytes();
-    let first_text = utf8_slice(&first_bytes)?;
+    let first_text = utf8_slice(&first_bytes).map_err(AdmissionError::Runtime)?;
     let second_bytes = second.as_ref().map(mlua::String::as_bytes);
     let second_text = match &second_bytes {
-        Some(bytes) => Some(utf8_slice(bytes)?),
+        Some(bytes) => Some(utf8_slice(bytes).map_err(AdmissionError::Runtime)?),
         None => None,
     };
-    let after = lua_u64(table.raw_get::<Value>("after")?).map(EnvelopeCursor);
-    let limit = match lua_u64(table.raw_get::<Value>("limit")?) {
+    let after = lua_u64(
+        table
+            .raw_get::<Value>("after")
+            .map_err(AdmissionError::Runtime)?,
+    )
+    .map(EnvelopeCursor);
+    let limit = match lua_u64(
+        table
+            .raw_get::<Value>("limit")
+            .map_err(AdmissionError::Runtime)?,
+    ) {
         Some(value) => usize::try_from(value).unwrap_or(16),
         None => 16,
     };
@@ -3276,7 +3342,8 @@ fn admit_drain_operation(
         })
         .ok_or(AdmissionError::Capacity)?;
     let entry = admit_callback_bytes(memory, payload)?;
-    let target = envelope_target_from_parts(target_kind, first_text, second_text)?;
+    let target = envelope_target_from_parts(target_kind, first_text, second_text)
+        .map_err(AdmissionError::Runtime)?;
     Ok((
         PendingCoordinationOperation::Drain {
             target,
