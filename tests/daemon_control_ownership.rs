@@ -534,6 +534,7 @@ const CONTROL_MESSAGE_DISPATCHER_OWNED: &[&str] = &[
     "PluginResultCapacityReleased",
     "CausalProgressPublished",
     "EntityPublishProgress",
+    "EntitySubscriptionCapacityReleased",
     "CoordinationProgress",
 ];
 
