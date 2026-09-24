@@ -1,8 +1,16 @@
 # Foundation integration and final acceptance
 
-Status: spawn checkpoint `b7864ff9` and recovery checkpoint `9168c1de` are pushed. Full foundation acceptance remains open.
+Status: integration checkpoint `2f026a44` is pushed. The first matched ordinary-spawn daemon test now passes. Full foundation acceptance remains open.
 
 ## Current delivery status — September 23
+
+Latest result: source/tests patch `f8921ddd78fe3807266262dbca32630bb66e018f5b062717333c502d494a7ac0` passes the first ordinary-spawn daemon requirement.
+The driver handoff test passed one test. The real daemon test passed one test, with 328 filtered tests.
+One Lua tool spawned two sessions and verified response IDs, command output, environment, working directories, and separate context prompts.
+Root checked both raw logs and the source hash. The writer preserved the initial artifact mismatch and reran with a corrected manifest.
+Evidence is under `/Users/jasonconigliari/botster-evidence/ordinary-host-receipt-20260923/`.
+This closes the first successful ordinary-spawn integration check. It does not close refusal, abandonment, conversion, or recovery acceptance.
+Next: actual Host/Core refusal and capacity tests through Lua, then abandonment, conversion refusal, and relative-device-root startup stability.
 
 This summary supersedes historical assignments below. Detailed evidence remains in the later checkpoint entries.
 The recent recovery fixes passed their focused checks. They do not establish integrated production readiness.
@@ -21,10 +29,67 @@ Reviewer 001e accepted both corrections in patch `d2734daff7dfddbe400846dbad9041
 The release gate remains unchanged. The v2 compilation exited 0 and produced the Hub library, binary, and lifecycle test executables.
 Root checked the raw log and exit file. No tests ran. Compiler warnings remain; this result does not establish the strict lint gate.
 The build resolves the recorded Core dependency `891e220295427fd93991638d7c62ba40fa25d4ae`, not Core main `053148f6`.
-Startup-path implementation and the real daemon spawn test follow this integration check.
+The integration is committed and pushed as `2f026a44`. Root verified all ten build evidence checksums.
+Startup-path wiring and the two-session daemon test are written but remain unaccepted.
+Review found that `charged_final_materialization` releases some allowances before their payloads on early errors.
+Writer 001b corrected destruction order in source patch `7c6b114a5a47b475ff889d49d6644ad95db45cc318cf5aca224d5a6f303fbf4d`.
+Root and reviewer 001e verified the correction. Root authorized a fresh matched candidate build and the exact two-session daemon test.
+The first matched daemon run failed: zero passed, one failed, and 328 filtered tests.
+`PluginMcpCallTool` returned `plugin_tool_failed` with `Lua callback memory capacity exhausted` before the two-result response.
+The candidate records Hub `2f026a44` plus source patch `7c6b114a` and Core `891e2202`. Build and test compilation exited 0.
+The raw test log is `/tmp/ordinary-first-proof-test.log`. The candidate manifest is under `/Users/jasonconigliari/botster-evidence/ordinary-first-proof-20260923/`.
+The first diagnostic passed input and queue admission. It failed before a second spawn began.
+Source review found that both refusal producers return sealed charges. The Lua refusal branch then calls `grow` on that sealed charge.
+That call masks the original refusal with the generic capacity error.
+The second diagnostic identifies the Core spawn refusal path. The exact Core failure reason remains unidentified.
+Root checked the raw log: zero passed, one failed, and 328 filtered tests. The writer reports exit 101.
+The log contains the Core refusal marker followed by the sealed-prefix charge failure marker. No second spawn began.
+Evidence is under `/Users/jasonconigliari/botster-evidence/ordinary-kind-probe-20260923/`.
+Root and reviewer 001e accepted diagnostic patch `e13b4ac28e0eb9c012188f4e563ea670e18b0b1c5282fd2508ea32dd2a174c8d` for one run.
+The diagnostic reports static Host error classes before Lua attempts the invalid charge expansion.
+Writer 001b owns the run and the correction in this integration worktree.
+Both refusal producers must fund the retained message and its overlapping rendered Rust buffer before delivery.
+The correction must use one shared prefix constant. Lua must preserve allocation admission and must not expand sealed charges.
+Producer-specific refusal tests and a genuine capacity refusal test remain required. Diagnostic probes must be removed before acceptance.
+No budget increase or admission bypass is authorized. No new design approval is required for this correction.
+Writer 001b froze the correction as source/tests patch `0c3d423a4d1b4be5e6c64ff09dcc6931689601aec8c4d8322e3cefccdc303e87`.
+The Host funds a separate render charge at the common semantic boundary. The Core producer funds the same rendering requirement.
+Lua retains both sealed charges through rendering and does not expand either charge. The writer removed the diagnostic probes.
+Reviewer 001e accepted Host coverage and Lua lifetime at source scope. Root checked Core arithmetic and all refusal delivery sites.
+Root authorized the matched build, two new funding tests, and the exact two-session daemon test at this frozen patch.
+The new helper tests do not establish producer-to-Lua refusal behavior. Those regressions remain required before acceptance.
+The writer corrected the synthetic delivery test to split both charges from one parent.
+Patch `51270d44cafe9b2ae14d9f2bbd4154a7dcb0d13fda153a722696cd82b207de20` supersedes `0c3d423a` for the authorized run. Production source is unchanged.
+Root checked the revised test. Reviewer 001e also accepted the Core production arithmetic at source scope.
+The writer reports that the matched binary build passed. Unit compilation found a test caller missing the new startup-path argument.
+The writer corrected that test caller. Root checked the call and source/tests hash `22ebd8077fd747fd1d606cccf5b2fe057d9c8e61fbeb9c3c353fb4bac12b40b9`.
+The writer is rerunning focused tests before the daemon test. The failed compile log remains `/tmp/botster-refusal-unit.log`.
+The corrected run completed. Root verified two passing funding tests and the daemon result: zero passed, one failed, and 328 filtered.
+Lua now reports `session_types.spawn failed: session type spawn failed: pending operation limit reached: Spawns`.
+This proves that the exercised Core refusal reaches Lua without the former masking error. It does not prove successful spawning.
+Evidence is under `/Users/jasonconigliari/botster-evidence/ordinary-refusal-funding-20260923/`. The writer reports daemon exit 101.
+Writer 001b traces the refusal producer. Reviewer 001e independently checks reservation and launch admission.
+Pinned Core maps reservation-capacity refusal and pending-spawn saturation to the same displayed error. The exact producer remains unproved.
+No numeric limit increase is authorized as a substitute for this diagnosis.
+The next diagnostic identifies a Hub bridge refusal at `ReserveSession`, before Core admission.
+Root verified that `core_bridge_error` also maps bridge overload to `PendingLimit(Spawns)`.
+`begin_for_owner` refuses registration while the same waiter still has a registered Host reply phase.
+The Host success path published its receipt and entered Core before the completion collector retired that phase.
+Writer 001b adds a nonblocking `HostReceipt` continuation. The existing completion event must resume it after collection.
+The correction must preserve waiter identity, cancellation, receipt-error handling, and shutdown ownership.
+A deterministic Host-to-Core handoff regression and the real daemon test remain required. Reviewer 001e checks the continuation.
+This finding supersedes the earlier inference that the refusal came from Core. No numeric capacity change is needed for this cause.
+The correction and driver regression are frozen as source/tests patch `f8921ddd78fe3807266262dbca32630bb66e018f5b062717333c502d494a7ac0`.
+Root checked publication-before-wake ordering, collection gating, same-waiter readiness, terminal handling, and the new registration test.
+Reviewer 001e accepted the phase mechanism and charge lifetime. Root closed the remaining publication-wake source check.
+The writer has the compiler slot for the focused driver test and a fresh matched two-session daemon run.
+The driver test establishes the registration contract. The daemon test must establish the actual transition.
+Relative explicit data directories also produce relative device source roots. Startup stability for that reachable path remains a follow-up acceptance blocker.
+Abandonment and conversion-refusal tests remain required after the first daemon proof.
 Root retains integration ownership. No deployment is in progress.
 
-Ordinary charged spawn still returns `Unavailable` in async `session_types.rs`; implementation of its startup-path input remains open.
+Startup-path wiring replaces the unconditional ordinary-spawn `Unavailable` result in the current uncommitted integration source.
+The first daemon test has not yet proved successful ordinary spawning.
 Jason approved startup-captured working-directory and executable paths on September 23.
 Relative spawn paths use the captured working directory even if the process directory later changes.
 Directory lookup failure retains the `.` fallback. Executable lookup failure omits `BOTSTER_HUB_BIN`.

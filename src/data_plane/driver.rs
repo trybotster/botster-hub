@@ -1793,6 +1793,37 @@ mod tests {
     }
 
     #[test]
+    fn local_host_receipt_must_be_collected_before_same_waiter_core_begin() {
+        let wake = Arc::new(CoreCompletionWake::new());
+        let waiter_id = WaiterId(72);
+        let retirement = CoreWaiterRetirement {
+            wake: Arc::clone(&wake),
+            waiter_id,
+        };
+        let bytes = retained_reply_bytes::<()>().unwrap();
+        let memory = crate::lua_memory::LuaMemoryAccount::new(crate::lua_memory::LuaMemoryLimits {
+            per_vm_bytes: 1,
+            total_vm_bytes: 1,
+            per_callback_bytes: bytes,
+            total_callback_bytes: bytes,
+        })
+        .unwrap();
+        let charge = memory.reserve_callback_total(bytes).unwrap();
+        let (mut receipt, publisher) = retirement.local_reply(charge).unwrap();
+        assert!(wake.register_phases(waiter_id, 2).is_none());
+        publisher.publish(());
+        assert!(matches!(receipt.poll(), CoreTicketPoll::Pending));
+        assert_eq!(wake.take_identities(1), vec![identity(72, 1)]);
+        assert!(matches!(receipt.poll(), CoreTicketPoll::Ready(())));
+        drop(receipt);
+        let core_phases = wake.register_phases(waiter_id, 2).expect("Core can begin after Host collection");
+        assert_eq!(core_phases, vec![identity(72, 2), identity(72, 3)]);
+        drop(retirement);
+        assert_eq!(wake.live_identity_counts(), (0, 0, 0));
+        assert_eq!(memory.usage().1, 0);
+    }
+
+    #[test]
     fn three_sequential_owner_operations_register_fresh_phases() {
         let wake = Arc::new(CoreCompletionWake::new());
         let waiter_id = WaiterId(73);

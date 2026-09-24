@@ -379,7 +379,7 @@ impl SessionTypeSpawnStart {
     pub(crate) fn charged_plugin_failure(
         &mut self,
         failure: &PluginSpawnFailure,
-    ) -> Option<(String, crate::lua_memory::LuaCallbackCharge)> {
+    ) -> Option<(String, crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge)> {
         use std::fmt::Write;
 
         let CoreBinding::Owner { allowance, .. } = &mut self.binding else {
@@ -393,15 +393,20 @@ impl SessionTypeSpawnStart {
         };
         let mut counted = CountedFailure(prefix.len());
         write!(&mut counted, "{}", failure.error).ok()?;
-        allowance.parent.grow(counted.0).ok()?;
+        let render_bytes = crate::session_types::LUA_SPAWN_REFUSAL_PREFIX
+            .len()
+            .checked_add(counted.0)?;
+        let total_bytes = counted.0.checked_add(render_bytes)?;
+        allowance.parent.grow(total_bytes).ok()?;
         let charge = allowance.parent.split_fixed(counted.0)?;
+        let render_charge = allowance.parent.split_fixed(render_bytes)?;
         let mut message = BoundedFailure {
             value: String::with_capacity(counted.0),
             limit: counted.0,
         };
         message.write_str(prefix).ok()?;
         write!(&mut message, "{}", failure.error).ok()?;
-        Some((message.value, charge))
+        Some((message.value, charge, render_charge))
     }
 
     /// Reserve response copies before finish_session_type_spawn constructs them.
