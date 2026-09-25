@@ -1839,6 +1839,59 @@ fn update_spawn_target_rejects_repoint_to_invalid_repo_session_types() {
     shutdown_cli_daemon(&data_dir, child);
 }
 
+/// Read a session_type subscription after a delivered catalog error until
+/// its recovery snapshot. A catalog error is not terminal; each new failure
+/// may deliver one more error before the snapshot.
+fn next_catalog_recovery_snapshot(
+    subscription: &mut botster_hub_client::DaemonEntitySubscription,
+    context: &str,
+) -> (u64, Vec<serde_json::Value>, Option<String>) {
+    let mut errors = 0;
+    loop {
+        match subscription
+            .next_frame()
+            .unwrap_or_else(|error| panic!("{context}: recovery frame: {error}"))
+        {
+            botster_hub_client::DaemonEntityFrame::Error { ref code, .. }
+                if code == "invalid_repo_session_types" && errors < 8 =>
+            {
+                errors += 1;
+            }
+            botster_hub_client::DaemonEntityFrame::Snapshot {
+                snapshot_seq,
+                items,
+                resync_reason,
+                ..
+            } => return (snapshot_seq, items, resync_reason),
+            other => panic!("{context}: expected a recovery snapshot, got {other:?}"),
+        }
+    }
+}
+
+/// The next frame must be the non-terminal catalog error.
+fn expect_catalog_error(
+    subscription: &mut botster_hub_client::DaemonEntitySubscription,
+    subscription_id: &str,
+) {
+    assert!(matches!(
+        subscription.next_frame().expect("catalog error frame"),
+        botster_hub_client::DaemonEntityFrame::Error {
+            subscription_id: ref id,
+            ref entity_type,
+            ref code,
+            ..
+        } if id == subscription_id
+            && entity_type == "session_type"
+            && code == "invalid_repo_session_types"
+    ));
+}
+
+fn has_session_type(items: &[serde_json::Value], session_type_id: &str) -> bool {
+    items
+        .iter()
+        .any(|item| item["session_type_id"] == session_type_id)
+}
+
 #[test]
 fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
     let _guard = daemon_test_guard();
@@ -1909,6 +1962,9 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
             .map(|error| error.code.as_str()),
         Some("invalid_repo_session_types")
     );
+    // The poisoned read is observed; the held subscription receives the
+    // catalog error and stays open.
+    expect_catalog_error(&mut subscription, "st-poison-delete-sub");
 
     // Non-recovery mutation under already-admitted poison must frame, not disconnect.
     let second_root = unique_short_test_dir("st-poison-delete-second");
@@ -1942,8 +1998,8 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
         Some("invalid_repo_session_types")
     );
 
-    // Subscribe after poison: the Host admits the subscription while it builds
-    // the catalog, then delivers one correlated entity error and retires it.
+    // Subscribe after poison: the Host admits the subscription and delivers
+    // one correlated entity error. The error is not terminal.
     let mut poisoned_subscription = botster_hub_client::subscribe_entities(
         &endpoint,
         "session_type",
@@ -1977,7 +2033,6 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
             "invalid_repo_session_types".to_string()
         )
     );
-    drop(poisoned_subscription);
 
     // Independent recovery case: Delete under poison with no prior disable.
     let deleted = botster_hub::daemon_transport_request(
@@ -1990,17 +2045,22 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
     assert_eq!(deleted.kind, botster_hub::DaemonResponseKind::SpawnTargets);
     assert_eq!(deleted.spawn_targets[0].target_id, "tgt_poison_delete");
 
-    // Forced generation advance is required for subscribers to converge after recovery.
-    assert!(matches!(
-        subscription
-            .next_frame()
-            .expect("remove after poison delete recovery"),
-        botster_hub_client::DaemonEntityFrame::Remove {
-            snapshot_seq,
-            ref id,
-            ..
-        } if snapshot_seq > 1 && id == "tgt_poison_delete/repo-agent"
-    ));
+    // Forced generation advance is required for subscribers to converge after
+    // recovery. A subscriber that received the error gets a replacement
+    // snapshot on the same subscription.
+    let (snapshot_seq, items, resync_reason) =
+        next_catalog_recovery_snapshot(&mut subscription, "held subscription after delete");
+    assert!(snapshot_seq > 1, "recovery snapshot_seq {snapshot_seq}");
+    assert_eq!(resync_reason.as_deref(), Some("invalid_repo_session_types"));
+    assert!(!has_session_type(&items, "tgt_poison_delete/repo-agent"));
+    // The subscriber that opened during the failure gets its initial snapshot.
+    let (_, items, resync_reason) = next_catalog_recovery_snapshot(
+        &mut poisoned_subscription,
+        "late subscription after delete",
+    );
+    assert_eq!(resync_reason, None);
+    assert!(!has_session_type(&items, "tgt_poison_delete/repo-agent"));
+    drop(poisoned_subscription);
 
     let listed = botster_hub::daemon_transport_request(
         &config,
@@ -2024,6 +2084,84 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
     assert_eq!(
         recovered_list.kind,
         botster_hub::DaemonResponseKind::SessionTypes
+    );
+
+    drop(subscription);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+/// A repaired repository file restores the same definitions the subscriber
+/// already had. A delta against that baseline would be empty, so recovery
+/// must send a replacement snapshot that ends the client's error state.
+#[test]
+fn repaired_repo_session_types_recover_a_subscription_with_a_replacement_snapshot() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("st-poison-repair");
+    let target_root = unique_short_test_dir("st-poison-repair-root");
+    fs::create_dir_all(&target_root).expect("create target root");
+    write_repo_session_types_file(
+        &target_root,
+        &complete_repo_session_types_json("repo-agent"),
+    );
+    let config = explicit_config(&data_dir);
+    let endpoint = daemon_endpoint(&config);
+    let child = start_cli_daemon(&data_dir);
+
+    let mut subscription =
+        botster_hub_client::subscribe_entities(&endpoint, "session_type", "st-poison-repair-sub")
+            .expect("subscribe before admit");
+    subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound entity reads");
+    assert!(matches!(
+        subscription.next_frame().expect("initial empty snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot { ref items, .. } if items.is_empty()
+    ));
+    botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::CreateSpawnTarget {
+            target_id: Some("tgt_poison_repair".to_string()),
+            label: Some("Poison Repair".to_string()),
+            root: target_root.clone(),
+            enabled: true,
+            kind: Some("directory".to_string()),
+            base_ref: None,
+            metadata: BTreeMap::new(),
+        },
+    )
+    .expect("admit valid target before poison");
+    assert!(matches!(
+        subscription.next_frame().expect("repo definition upsert"),
+        botster_hub_client::DaemonEntityFrame::Upsert { ref id, .. }
+            if id == "tgt_poison_repair/repo-agent"
+    ));
+
+    write_repo_session_types_file(&target_root, &incomplete_repo_session_types_json());
+    let poisoned = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListSessionTypes,
+    )
+    .expect("list under poison must keep transport open");
+    assert_eq!(poisoned.kind, botster_hub::DaemonResponseKind::OperatorError);
+    expect_catalog_error(&mut subscription, "st-poison-repair-sub");
+
+    // Restore the exact file; the next read observes the repaired catalog.
+    write_repo_session_types_file(
+        &target_root,
+        &complete_repo_session_types_json("repo-agent"),
+    );
+    let repaired = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::ListSessionTypes,
+    )
+    .expect("list after repair");
+    assert_eq!(repaired.kind, botster_hub::DaemonResponseKind::SessionTypes);
+    let (_, items, resync_reason) =
+        next_catalog_recovery_snapshot(&mut subscription, "subscription after repair");
+    assert_eq!(resync_reason.as_deref(), Some("invalid_repo_session_types"));
+    assert!(
+        has_session_type(&items, "tgt_poison_repair/repo-agent"),
+        "the replacement snapshot carries the restored definition: {items:?}"
     );
 
     drop(subscription);
@@ -2099,6 +2237,7 @@ fn poison_recovery_disable_succeeds_under_invalid_repo_session_types() {
             .map(|error| error.code.as_str()),
         Some("invalid_repo_session_types")
     );
+    expect_catalog_error(&mut subscription, "st-poison-disable-sub");
 
     // Independent recovery case: disable under poison (no delete).
     let disabled = botster_hub::daemon_transport_request(
@@ -2117,16 +2256,11 @@ fn poison_recovery_disable_succeeds_under_invalid_repo_session_types() {
     assert_eq!(disabled.kind, botster_hub::DaemonResponseKind::SpawnTargets);
     assert!(!disabled.spawn_targets[0].enabled);
 
-    assert!(matches!(
-        subscription
-            .next_frame()
-            .expect("remove after poison disable recovery"),
-        botster_hub_client::DaemonEntityFrame::Remove {
-            snapshot_seq,
-            ref id,
-            ..
-        } if snapshot_seq > 1 && id == "tgt_poison_disable/repo-agent"
-    ));
+    let (snapshot_seq, items, resync_reason) =
+        next_catalog_recovery_snapshot(&mut subscription, "held subscription after disable");
+    assert!(snapshot_seq > 1, "recovery snapshot_seq {snapshot_seq}");
+    assert_eq!(resync_reason.as_deref(), Some("invalid_repo_session_types"));
+    assert!(!has_session_type(&items, "tgt_poison_disable/repo-agent"));
 
     let recovered_list = botster_hub::daemon_transport_request(
         &config,

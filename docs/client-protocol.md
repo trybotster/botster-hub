@@ -919,7 +919,19 @@ Effective rows expose `source`, `source_name`, `editable`,
 `overridden_sources`, and diagnostics. The built-in `session_type` entity family
 publishes an initial snapshot and ordered upsert/remove deltas at the durable
 generation. It is a Hub-owned lane, distinct from Core-backed `session` and
-plugin-provider families. Spawned `session` rows project session type id/source,
+plugin-provider families.
+
+A session-type catalog error (for example `invalid_repo_session_types` while a
+repository file is being edited) is not terminal for a `session_type`
+subscription. Hub sends one `entity_error` per new failure and keeps the
+subscription open. When a later Host build produces a valid catalog, Hub sends
+a complete `entity_snapshot` on the same subscription. That snapshot replaces
+the client's state, even when the definitions equal the last baseline. A
+subscriber that had a baseline receives it with `resync_reason` set to the
+error code. A subscriber that opened during the failure receives it as its
+initial snapshot. A catalog error never ends the subscription. The oversized
+snapshot `entity_error` (`entity_provider_frame_too_large`) and plugin
+provider unload keep their existing terminal semantics. Spawned `session` rows project session type id/source,
 role, traits, interaction, and lifecycle from Core lifecycle metadata across
 reconnect and restart; missing metadata is explicit absence.
 

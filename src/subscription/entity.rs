@@ -534,6 +534,8 @@ enum SessionTypeCatalogRefresh<'a> {
     /// Durable generation, internal build version, and the catalog.
     Ready(u64, u64, &'a BTreeMap<String, Value>),
     Pending,
+    /// Internal result version and the error. A catalog error is not
+    /// terminal for a session_type subscription.
     Failed(u64, HostError),
 }
 
@@ -627,7 +629,7 @@ impl SessionTypeCatalogCache {
         // the result subscribers can use now.
         if self.generation == Some(generation) {
             if let Some(error) = self.submit_follow_up(daemon, generation, waiter_ids) {
-                return SessionTypeCatalogRefresh::Failed(generation, error);
+                return SessionTypeCatalogRefresh::Failed(self.version, error);
             }
             return SessionTypeCatalogRefresh::Ready(generation, self.version, &self.entities);
         }
@@ -635,7 +637,7 @@ impl SessionTypeCatalogCache {
             && *failed_generation == generation
         {
             if let Some(error) = self.submit_follow_up(daemon, generation, waiter_ids) {
-                return SessionTypeCatalogRefresh::Failed(generation, error);
+                return SessionTypeCatalogRefresh::Failed(self.version, error);
             }
             let error = self
                 .failure
@@ -643,7 +645,7 @@ impl SessionTypeCatalogCache {
                 .expect("catalog failure was checked")
                 .1
                 .clone();
-            return SessionTypeCatalogRefresh::Failed(generation, error);
+            return SessionTypeCatalogRefresh::Failed(self.version, error);
         }
         // Only new build admission waits for a retained reclamation.
         if self.retained_reclamation.is_some() {
@@ -659,22 +661,12 @@ impl SessionTypeCatalogCache {
         };
         let Some(waiter_id) = waiter_ids.next() else {
             drop(permit);
-            self.generation = None;
-            self.failure = Some((
-                generation,
-                HostError {
-                    code: "host_waiter_id_exhausted".to_string(),
-                    message: "host waiter identity capacity is exhausted".to_string(),
-                },
-            ));
-            return SessionTypeCatalogRefresh::Failed(
-                generation,
-                self.failure
-                    .as_ref()
-                    .expect("catalog failure was set")
-                    .1
-                    .clone(),
+            let error = HostError::new(
+                "host_waiter_id_exhausted",
+                "host waiter identity capacity is exhausted",
             );
+            self.install_failure(generation, error.clone());
+            return SessionTypeCatalogRefresh::Failed(self.version, error);
         };
         let identity = HostJobIdentity {
             waiter_id,
@@ -698,7 +690,6 @@ impl SessionTypeCatalogCache {
         );
         if let Err(error) = submitted {
             self.pending = None;
-            self.generation = None;
             let (code, message) = match error.error {
                 HostSubmitError::Full => (
                     "host_executor_full",
@@ -711,15 +702,9 @@ impl SessionTypeCatalogCache {
                     "host executor is unavailable for the catalog build",
                 ),
             };
-            self.failure = Some((generation, HostError::new(code, message)));
-            return SessionTypeCatalogRefresh::Failed(
-                generation,
-                self.failure
-                    .as_ref()
-                    .expect("catalog failure was set")
-                    .1
-                    .clone(),
-            );
+            let error = HostError::new(code, message);
+            self.install_failure(generation, error.clone());
+            return SessionTypeCatalogRefresh::Failed(self.version, error);
         }
         SessionTypeCatalogRefresh::Pending
     }
@@ -773,6 +758,9 @@ impl SessionTypeCatalogCache {
                         "a mutation completion used a catalog identity",
                     ),
                 ));
+                // A new failure result gets its own version. A matching Ready
+                // result still publishes first, so generation is kept.
+                self.version = self.version.saturating_add(1);
                 return true;
             }
         };
@@ -817,10 +805,8 @@ impl SessionTypeCatalogCache {
             HostResult::Failed { generation, error } => {
                 drop(prepared_charge);
                 eprintln!("session type catalog build failed: {}", error.message);
-                self.generation = None;
-                self.failure = Some((generation, error));
+                self.install_failure(generation, error);
                 self.built_observation = build_observation;
-                self.version = self.version.saturating_add(1);
             }
             HostResult::OrdinarySessionTypeMaterialized(_)
             | HostResult::EntityModelComplete(_)
@@ -883,14 +869,13 @@ impl SessionTypeCatalogCache {
         let Some((_, generation)) = self.pending.take() else {
             return false;
         };
-        self.generation = None;
-        self.failure = Some((
+        self.install_failure(
             generation,
             HostError::new(
                 "host_executor_stopped",
                 "host executor stopped before the catalog build completed",
             ),
-        ));
+        );
         true
     }
 
@@ -924,12 +909,11 @@ impl SessionTypeCatalogCache {
         };
         let Some(waiter_id) = waiter_ids.next() else {
             drop(permit);
-            self.generation = None;
             let error = HostError::new(
                 "host_waiter_id_exhausted",
                 "host waiter identity capacity is exhausted",
             );
-            self.failure = Some((generation, error.clone()));
+            self.install_failure(generation, error.clone());
             self.built_observation = self.observation;
             return Some(error);
         };
@@ -967,22 +951,20 @@ impl SessionTypeCatalogCache {
                     "host_executor_stopped",
                     "host executor is unavailable for the catalog build",
                 );
-                self.generation = None;
-                self.failure = Some((generation, error.clone()));
+                self.install_failure(generation, error.clone());
                 self.built_observation = self.observation;
                 Some(error)
             }
         }
     }
 
-    fn clear_failure(&mut self, generation: u64) {
-        if self
-            .failure
-            .as_ref()
-            .is_some_and(|(failed_generation, _)| *failed_generation == generation)
-        {
-            self.failure = None;
-        }
+    /// Install a new failed result. Every installed result gets a distinct
+    /// version, so each subscriber receives a new failure exactly once, and
+    /// repeated reads of the same cached failure keep its version.
+    fn install_failure(&mut self, generation: u64, error: HostError) {
+        self.generation = None;
+        self.failure = Some((generation, error));
+        self.version = self.version.saturating_add(1);
     }
 }
 
@@ -1038,16 +1020,34 @@ pub(crate) fn register_builtin_entity_subscription(
                     Ok(Some((generation, version, entities.clone())))
                 }
                 SessionTypeCatalogRefresh::Pending => Ok(None),
-                SessionTypeCatalogRefresh::Failed(generation, error) => {
-                    Err((generation, error.code.clone(), error.message.clone()))
+                SessionTypeCatalogRefresh::Failed(version, error) => {
+                    Err((version, error.code.clone(), error.message.clone()))
                 }
             }
         };
-        let catalog = match catalog {
-            Ok(catalog) => catalog,
-            Err((generation, code, message)) => {
-                state.session_type_catalog.clear_failure(generation);
-                return Ok(entity_subscription_error(&code, &subscription_id, &message));
+        // A catalog error is not terminal. The subscription opens, receives
+        // the error, and receives its initial snapshot when a later build
+        // succeeds. The failure version is marked only after the error is
+        // sent; a full queue leaves it for the drive to deliver.
+        let (catalog, delivered_failure) = match catalog {
+            Ok(catalog) => (catalog, 0),
+            Err((version, code, message)) => {
+                let error = DaemonEntityFrame::Error {
+                    subscription_id: subscription_id.clone(),
+                    entity_type: entity_type.clone(),
+                    code,
+                    message,
+                };
+                match sender.try_send_kind(error) {
+                    Ok(()) => (None, version),
+                    Err(EntityFrameTrySendError::Full(_)) => {
+                        state.maintenance.try_wake();
+                        (None, 0)
+                    }
+                    Err(EntityFrameTrySendError::Disconnected) => {
+                        return Err(DaemonTransportError::ControlThreadStopped);
+                    }
+                }
             }
         };
         if let Some((generation, _, entities)) = &catalog {
@@ -1072,7 +1072,7 @@ pub(crate) fn register_builtin_entity_subscription(
         let (snapshot_seq, definition_version, entities, awaiting_initial_snapshot) = match catalog
         {
             Some((generation, version, entities)) => (generation, version, entities, false),
-            None => (0, 0, BTreeMap::new(), true),
+            None => (0, delivered_failure, BTreeMap::new(), true),
         };
         state.entity_subscriptions.insert(
             subscription_id.clone(),
@@ -1414,8 +1414,8 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
                     Ok(Some((generation, version, entities)))
                 }
                 SessionTypeCatalogRefresh::Pending => Ok(None),
-                SessionTypeCatalogRefresh::Failed(generation, error) => {
-                    Err((generation, error.code.clone(), error.message.clone()))
+                SessionTypeCatalogRefresh::Failed(version, error) => {
+                    Err((version, error.code.clone(), error.message.clone()))
                 }
             }
         };
@@ -1429,18 +1429,17 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
                 );
             }
             Ok(None) => {}
-            Err((generation, code, message)) => {
+            Err((version, code, message)) => {
                 let before = state.entity_subscriptions.len();
                 let pending = drive_session_type_catalog_failure(
                     &mut state.entity_subscriptions,
+                    version,
                     &code,
                     &message,
                 );
                 note_released_entity_generations(state, before);
                 if pending {
                     state.maintenance.try_wake();
-                } else {
-                    state.session_type_catalog.clear_failure(generation);
                 }
             }
         }
@@ -1858,14 +1857,22 @@ fn publish_catalog_capacity_wake(state: &mut DaemonControlState, owner_turn: &mu
     state.host_capacity_wake_pending = false;
 }
 
+/// Deliver one catalog failure version to each session_type subscriber that
+/// has not received it. A catalog error is not terminal: the subscription
+/// stays open. A subscriber with a delivered baseline gets `resync_reason`,
+/// so the next successful build replaces its state with a full snapshot even
+/// when the definitions equal that baseline. Returns true while a full
+/// subscriber queue still holds back a delivery.
 fn drive_session_type_catalog_failure(
     subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
+    version: u64,
     code: &str,
     message: &str,
 ) -> bool {
     let mut pending = false;
     subscriptions.retain(|subscription_id, subscription| {
-        if subscription.entity_type != "session_type" {
+        if subscription.entity_type != "session_type" || subscription.definition_version == version
+        {
             return true;
         }
         let error = DaemonEntityFrame::Error {
@@ -1875,7 +1882,14 @@ fn drive_session_type_catalog_failure(
             message: message.to_string(),
         };
         match subscription.sender.try_send_kind(error) {
-            Ok(()) | Err(EntityFrameTrySendError::Disconnected) => false,
+            Ok(()) => {
+                subscription.definition_version = version;
+                if !subscription.awaiting_initial_snapshot {
+                    subscription.resync_reason = Some(code.to_string());
+                }
+                true
+            }
+            Err(EntityFrameTrySendError::Disconnected) => false,
             Err(EntityFrameTrySendError::Full(_)) => {
                 pending = true;
                 true
@@ -3572,48 +3586,261 @@ mod tests {
     }
 
     #[test]
-    fn catalog_failure_closes_only_session_type_subscriptions() {
-        let (session_type_sender, session_type_receiver) = mpsc::sync_channel(1);
+    fn catalog_failure_keeps_session_type_subscriptions_and_delivers_each_version_once() {
+        let (accepting_sender, accepting_receiver) = mpsc::sync_channel(4);
+        let (full_sender, full_receiver) = mpsc::sync_channel(1);
         let (session_sender, session_receiver) = mpsc::sync_channel(1);
         let mut session =
             session_type_subscription_state(session_sender, 0, 0, BTreeMap::new(), None);
         session.entity_type = "session".to_string();
+        full_sender
+            .try_send(DaemonEntityFrame::Remove {
+                subscription_id: "full".to_string(),
+                entity_type: "session_type".to_string(),
+                snapshot_seq: 0,
+                id: "filler".to_string(),
+            })
+            .expect("fill the full subscriber's queue");
         let mut subscriptions = BTreeMap::from([
             (
-                "session-type".to_string(),
-                session_type_subscription_state(session_type_sender, 0, 0, BTreeMap::new(), None),
+                "accepting".to_string(),
+                session_type_subscription_state(accepting_sender, 1, 1, BTreeMap::new(), None),
+            ),
+            (
+                "full".to_string(),
+                session_type_subscription_state(full_sender, 1, 1, BTreeMap::new(), None),
             ),
             ("session".to_string(), session),
         ]);
 
-        assert!(!drive_session_type_catalog_failure(
-            &mut subscriptions,
-            "catalog_failed",
-            "catalog failed",
-        ));
-        assert_eq!(subscriptions.len(), 1);
-        assert!(subscriptions.contains_key("session"));
+        assert!(
+            drive_session_type_catalog_failure(
+                &mut subscriptions,
+                7,
+                "catalog_failed",
+                "catalog failed",
+            ),
+            "a full queue keeps the failure pending"
+        );
+        assert_eq!(subscriptions.len(), 3, "a catalog error retires nothing");
         assert!(session_receiver.try_recv().is_err());
         assert!(matches!(
-            session_type_receiver.try_recv(),
+            accepting_receiver.try_recv(),
             Ok(DaemonEntityFrame::Error {
                 ref subscription_id,
                 ref entity_type,
                 ref code,
                 ..
-            }) if subscription_id == "session-type"
+            }) if subscription_id == "accepting"
                 && entity_type == "session_type"
                 && code == "catalog_failed"
         ));
+        let accepting = &subscriptions["accepting"];
+        assert_eq!(accepting.definition_version, 7);
+        assert_eq!(accepting.resync_reason.as_deref(), Some("catalog_failed"));
+        assert_eq!(subscriptions["full"].definition_version, 0);
 
-        let mut cache = SessionTypeCatalogCache {
-            failure: Some((3, HostError::new("catalog_failed", "catalog failed"))),
-            ..SessionTypeCatalogCache::default()
-        };
-        cache.clear_failure(2);
-        assert!(cache.failure.is_some());
-        cache.clear_failure(3);
-        assert!(cache.failure.is_none());
+        // The full subscriber drains; the next drive reaches only it.
+        assert!(matches!(
+            full_receiver.try_recv(),
+            Ok(DaemonEntityFrame::Remove { .. })
+        ));
+        assert!(!drive_session_type_catalog_failure(
+            &mut subscriptions,
+            7,
+            "catalog_failed",
+            "catalog failed",
+        ));
+        assert!(
+            accepting_receiver.try_recv().is_err(),
+            "a delivered failure version is not sent again"
+        );
+        assert!(matches!(
+            full_receiver.try_recv(),
+            Ok(DaemonEntityFrame::Error { ref subscription_id, .. }) if subscription_id == "full"
+        ));
+        assert_eq!(subscriptions["full"].definition_version, 7);
+
+        // Repeated drives of the same cached failure send nothing.
+        assert!(!drive_session_type_catalog_failure(
+            &mut subscriptions,
+            7,
+            "catalog_failed",
+            "catalog failed",
+        ));
+        assert!(accepting_receiver.try_recv().is_err());
+        assert!(full_receiver.try_recv().is_err());
+
+        // A disconnected subscriber retires on a new failure version.
+        drop(full_receiver);
+        assert!(!drive_session_type_catalog_failure(
+            &mut subscriptions,
+            8,
+            "catalog_failed",
+            "catalog failed",
+        ));
+        assert!(!subscriptions.contains_key("full"));
+        assert!(subscriptions.contains_key("accepting"));
+        assert!(matches!(
+            accepting_receiver.try_recv(),
+            Ok(DaemonEntityFrame::Error { .. })
+        ));
+    }
+
+    /// Recovery after a delivered catalog error replaces the subscriber's
+    /// state with a full snapshot, even when the repaired definitions equal
+    /// the last delivered baseline (a plain delta would send nothing).
+    #[test]
+    fn catalog_recovery_to_identical_definitions_sends_a_replacement_snapshot() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let baseline =
+            BTreeMap::from([("agent".to_string(), serde_json::json!({"label": "agent"}))]);
+        let mut subscription =
+            session_type_subscription_state(sender, 1, 3, baseline.clone(), None);
+        subscription.definition_version = 1;
+        let mut subscriptions = BTreeMap::from([("types".to_string(), subscription)]);
+
+        assert!(!drive_session_type_catalog_failure(
+            &mut subscriptions,
+            2,
+            "invalid_repo_session_types",
+            "invalid",
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEntityFrame::Error { .. })
+        ));
+
+        drive_session_type_subscriptions(&mut subscriptions, 1, 3, &baseline);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEntityFrame::Snapshot {
+                snapshot_seq: 4,
+                ref items,
+                ref resync_reason,
+                ..
+            }) if items == &baseline.values().cloned().collect::<Vec<_>>()
+                && resync_reason.as_deref() == Some("invalid_repo_session_types")
+        ));
+        let subscription = &subscriptions["types"];
+        assert!(subscription.resync_reason.is_none());
+        assert_eq!(subscription.definition_version, 3);
+        assert_eq!(subscription.next_seq, 4);
+        drive_session_type_subscriptions(&mut subscriptions, 1, 3, &baseline);
+        assert!(receiver.try_recv().is_err(), "recovery is delivered once");
+    }
+
+    /// A subscriber that has not received a baseline gets the error, then its
+    /// initial snapshot on recovery.
+    #[test]
+    fn catalog_recovery_before_a_baseline_sends_the_initial_snapshot() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut subscription = session_type_subscription_state(sender, 0, 0, BTreeMap::new(), None);
+        subscription.awaiting_initial_snapshot = true;
+        let mut subscriptions = BTreeMap::from([("types".to_string(), subscription)]);
+        assert!(!drive_session_type_catalog_failure(
+            &mut subscriptions,
+            1,
+            "invalid_repo_session_types",
+            "invalid",
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEntityFrame::Error { .. })
+        ));
+        assert!(subscriptions["types"].resync_reason.is_none());
+
+        let entities =
+            BTreeMap::from([("agent".to_string(), serde_json::json!({"label": "agent"}))]);
+        drive_session_type_subscriptions(&mut subscriptions, 5, 2, &entities);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEntityFrame::Snapshot {
+                snapshot_seq: 5,
+                ref resync_reason,
+                ..
+            }) if resync_reason.is_none()
+        ));
+        assert!(!subscriptions["types"].awaiting_initial_snapshot);
+    }
+
+    /// Registration during a cached catalog failure opens the subscription
+    /// and sends the error. The failure version is marked only after the send
+    /// succeeds; a full queue leaves the error pending for the drive.
+    #[test]
+    fn registration_during_a_catalog_failure_opens_and_delivers_the_error() {
+        let (mut daemon, directory) = catalog_test_daemon("catalog-failure-registration");
+        let mut state = DaemonControlState::default();
+        let generation = daemon
+            .runtime()
+            .expect("runtime")
+            .state()
+            .session_type_generation;
+        state.session_type_catalog.install_failure(
+            generation,
+            HostError::new("invalid_repo_session_types", "invalid"),
+        );
+        let version = state.session_type_catalog.version;
+
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let response = register_builtin_entity_subscription(
+            &mut daemon,
+            &mut state,
+            "session_type".to_string(),
+            "accepting".to_string(),
+            EntityFrameSender::Blocking(sender),
+            None,
+        )
+        .expect("register during a catalog failure");
+        assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEntityFrame::Error { ref subscription_id, ref code, .. })
+                if subscription_id == "accepting" && code == "invalid_repo_session_types"
+        ));
+        let accepting = &state.entity_subscriptions["accepting"];
+        assert_eq!(accepting.definition_version, version);
+        assert!(accepting.awaiting_initial_snapshot);
+
+        // A rendezvous channel with no waiting reader reports Full.
+        let (full_sender, _full_receiver) = mpsc::sync_channel(0);
+        let response = register_builtin_entity_subscription(
+            &mut daemon,
+            &mut state,
+            "session_type".to_string(),
+            "full".to_string(),
+            EntityFrameSender::Blocking(full_sender),
+            None,
+        )
+        .expect("register with a full queue");
+        assert_eq!(response.kind, DaemonResponseKind::EntitySubscribed);
+        assert_eq!(
+            state.entity_subscriptions["full"].definition_version, 0,
+            "an unsent failure is not marked delivered"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Every installed failure has its own version; reads of one cached
+    /// failure keep it.
+    #[test]
+    fn every_installed_catalog_failure_advances_the_version() {
+        let waiter_ids = WaiterIdSource::default();
+        let mut cache = SessionTypeCatalogCache::default();
+        cache.install_failure(4, HostError::new("first", "first"));
+        assert_eq!(cache.version, 1);
+        cache.install_failure(4, HostError::new("first", "first"));
+        assert_eq!(cache.version, 2, "an identical failure is a new result");
+        cache.pending = Some((
+            HostJobIdentity {
+                waiter_id: waiter_ids.next().expect("allocate waiter identity"),
+                phase: 1,
+            },
+            4,
+        ));
+        assert!(cache.executor_stopped());
+        assert_eq!(cache.version, 3, "executor_stopped installs a new failure");
     }
 
     #[test]
@@ -6078,7 +6305,15 @@ mod tests {
         state.session_type_catalog.observe_external();
         assert!(matches!(
             state.session_type_catalog.refresh(&daemon, 1, &state.waiter_ids),
-            SessionTypeCatalogRefresh::Failed(1, ref error) if error.code == "invalid_repo_session_types"
+            SessionTypeCatalogRefresh::Failed(0, ref error) if error.code == "invalid_repo_session_types"
+        ));
+        // The follow-up is pending; a second read returns the same failure
+        // version, so no subscriber receives it twice.
+        assert!(matches!(
+            state
+                .session_type_catalog
+                .refresh(&daemon, 1, &state.waiter_ids),
+            SessionTypeCatalogRefresh::Failed(0, _)
         ));
         assert!(state.session_type_catalog.pending.is_some());
         daemon.stop();
@@ -6193,11 +6428,12 @@ mod tests {
             .session_type_catalog
             .refresh(&daemon, 1, &state.waiter_ids)
         {
-            SessionTypeCatalogRefresh::Failed(generation, error) => (generation, error),
+            SessionTypeCatalogRefresh::Failed(version, error) => (version, error),
             _ => panic!("build B's failure must publish"),
         };
         assert!(!drive_session_type_catalog_failure(
             &mut state.entity_subscriptions,
+            failure.0,
             &failure.1.code,
             &failure.1.message,
         ));
@@ -6205,6 +6441,10 @@ mod tests {
             receiver.try_recv(),
             Ok(DaemonEntityFrame::Error { ref code, .. }) if code == "invalid_repo_session_types"
         ));
+        assert!(
+            state.entity_subscriptions.contains_key("session-types"),
+            "the catalog error is not terminal"
+        );
         // The observation made while B ran starts one more build.
         assert_eq!(state.session_type_catalog.pending_observation, 2);
         daemon.stop();
