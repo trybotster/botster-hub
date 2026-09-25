@@ -3298,10 +3298,11 @@ sys.exit(0)
         session_id: &str,
     ) -> botster_hub_client::DaemonResponse {
         let deadline = Instant::now() + Duration::from_secs(10);
-        if state.current_waiter_id.is_none() {
-            state.current_waiter_id = state.waiter_ids.next();
-        }
         loop {
+            // The test pump can clear the owner waiter between requests.
+            if state.current_waiter_id.is_none() {
+                state.current_waiter_id = state.waiter_ids.next();
+            }
             let response = request_until_ready(
                 daemon,
                 state,
@@ -4338,6 +4339,31 @@ return botster.register({
             hub_worktree_ids(&daemon).contains(&spawned.worktree_id),
             "delivered spawn must persist the HubState worktree row"
         );
+        // The delivered managed session's token belongs to its record, and an
+        // authoritative removal releases it.
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .session_reservations()
+                .capture(&spawned.session_id)
+                .is_some()
+        );
+        let removed = remove_when_terminal(&mut daemon, &mut state, &spawned.session_id);
+        assert_eq!(
+            removed.kind,
+            DaemonResponseKind::SessionRemoved,
+            "{removed:?}"
+        );
+        assert!(removed.diagnostics.is_empty(), "{removed:?}");
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .session_reservations()
+                .capture(&spawned.session_id)
+                .is_none()
+        );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4370,6 +4396,7 @@ return botster.register({
             runtime.replace_state(next).expect("admit git target");
         }
         let first_record = record.clone();
+        let third_record = record.clone();
         let spawner = daemon.runtime().unwrap().session_type_spawner();
         let first_spawner = spawner.clone();
         let first = std::thread::spawn(move || {
@@ -4400,6 +4427,60 @@ return botster.register({
         assert!(!second.created_worktree);
         assert_eq!(second.worktree_path, path);
         assert!(std::path::Path::new(&path).exists());
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .session_reservations()
+                .installed_len(),
+            2
+        );
+
+        // A reused-worktree spawn whose caller left has no created-worktree
+        // cleanup; its token still moves to its record, the sole release owner.
+        daemon
+            .runtime()
+            .unwrap()
+            .session_type_spawner()
+            .test_enqueue_managed_disconnected(
+                botster_core::PluginKey("p1.plugin".into()),
+                "t1".into(),
+                "topic".into(),
+                "agent".into(),
+                crate::session_types::ManagedSessionTypeRequest::default(),
+                vec![third_record],
+            );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            pump_core(&mut daemon, &mut state);
+            if daemon
+                .runtime()
+                .unwrap()
+                .session_reservations()
+                .installed_len()
+                == 3
+                && state.pending_requests.is_empty()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "undelivered reused spawn must hand its token to a record; records={}",
+                daemon.runtime().unwrap().session_reservations().len()
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_created_worktree_cleanup_count(),
+            0
+        );
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "a reused worktree is never removed"
+        );
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4609,6 +4690,9 @@ return botster.register({
             );
             std::thread::yield_now();
         }
+        // The created-worktree cleanup owned the token and retired its record
+        // on its confirmed release.
+        assert_eq!(daemon.runtime().unwrap().session_reservations().len(), 0);
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }

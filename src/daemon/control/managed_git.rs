@@ -35,6 +35,9 @@ enum Phase {
     ParkRecord,
     CommitRecord,
     Spawn,
+    /// Delivery succeeded; a removed-during-launch release settles before
+    /// the worktree commit finalizes.
+    Handoff,
     FinalizeCommit,
     FinalizeRollback,
     PrepareRemoval,
@@ -435,6 +438,19 @@ impl ManagedSpawnOperation {
         if self.phase == Phase::Spawn {
             return self.poll_spawn(daemon, state);
         }
+        if self.phase == Phase::Handoff {
+            let Some(runtime) = daemon.runtime() else {
+                return ControlPoll::Pending;
+            };
+            let spawn = self.spawn.as_mut().expect("managed Core spawn exists");
+            if !spawn.poll_handoff(runtime) {
+                return ControlPoll::Pending;
+            }
+            if self.deferred_error.is_some() {
+                return self.finish_deferred_error();
+            }
+            return self.submit_finalize(daemon, state, ManagedWorktreeDecision::Commit, None);
+        }
         let Some(completion) = state.host_completions.remove(&self.waiter_id) else {
             return ControlPoll::Pending;
         };
@@ -448,10 +464,13 @@ impl ManagedSpawnOperation {
             Phase::FinalizeRollback => self.finalized_rollback(daemon, state, result),
             Phase::PrepareRemoval => self.removal_prepared(daemon, state, result),
             Phase::CommitRemoval => self.removal_committed(daemon, state, result),
-            Phase::ParkRecord | Phase::ParkRemoval | Phase::Spawn | Phase::Done => self
-                .finish_reconciliation(
-                    "the managed Git owner received an unexpected host completion",
-                ),
+            Phase::ParkRecord
+            | Phase::ParkRemoval
+            | Phase::Spawn
+            | Phase::Handoff
+            | Phase::Done => self.finish_reconciliation(
+                "the managed Git owner received an unexpected host completion",
+            ),
         }
     }
 
@@ -822,6 +841,12 @@ impl ManagedSpawnOperation {
                         // The live reused session now owns the path. A's Core
                         // reservation was Released before this right transferred.
                         self.inherited_creation = None;
+                        // The delivered session's token moves to its record.
+                        let spawn = self.spawn.as_mut().expect("managed Core spawn exists");
+                        if !spawn.begin_handoff(runtime) {
+                            self.phase = Phase::Handoff;
+                            return ControlPoll::Pending;
+                        }
                         self.submit_finalize(daemon, state, ManagedWorktreeDecision::Commit, None)
                     }
                     Err(crate::runtime::ManagedSpawnDelivery {
@@ -834,10 +859,9 @@ impl ManagedSpawnOperation {
                             "ensure_timed_out",
                             "the managed session caller left before delivery",
                         ));
-                        let outcome = self.finish_deferred_error();
                         drop(spawned);
                         drop(parent);
-                        outcome
+                        self.settle_undelivered_token(runtime)
                     }
                     Err(crate::runtime::ManagedSpawnDelivery { result: Err(_), .. }) => {
                         unreachable!("a successful managed spawn sent an error")
@@ -848,7 +872,7 @@ impl ManagedSpawnOperation {
                 self.queue_undelivered_created_cleanup(runtime, &spawned);
                 runtime.cleanup_managed_session(&spawned);
                 self.deferred_error = Some(timeout_error());
-                self.finish_deferred_error()
+                self.settle_undelivered_token(runtime)
             }
             Err(error) => {
                 self.deferred_error = Some(error);
@@ -864,6 +888,24 @@ impl ManagedSpawnOperation {
                 }
             }
         }
+    }
+
+    /// An undelivered spawn whose token no created-worktree cleanup took
+    /// (a reused worktree) hands the token to its record, so the record is
+    /// the sole release owner. A removal during launch settles here first.
+    fn settle_undelivered_token(&mut self, runtime: &crate::HubRuntime) -> ControlPoll {
+        let spawn = self.spawn.as_mut().expect("managed Core spawn exists");
+        let tracked = spawn
+            .reservation
+            .as_ref()
+            .is_some()
+            .then(|| runtime.created_worktree_cleanup_tracks(spawn.session_id()))
+            .unwrap_or(true);
+        if !tracked && !spawn.begin_handoff(runtime) {
+            self.phase = Phase::Handoff;
+            return ControlPoll::Pending;
+        }
+        self.finish_deferred_error()
     }
 
     fn finalized_commit(

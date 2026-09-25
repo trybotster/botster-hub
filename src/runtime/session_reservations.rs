@@ -210,6 +210,15 @@ impl SessionReservationRecords {
         }
     }
 
+    /// Records that own an installed session's token.
+    #[cfg(test)]
+    pub(crate) fn installed_len(&self) -> usize {
+        lock(&self.records)
+            .values()
+            .filter(|record| matches!(record.state, RecordState::Installed(_)))
+            .count()
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         lock(&self.records).len()
