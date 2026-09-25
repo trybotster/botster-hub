@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -26,8 +26,8 @@ use serde_json::Value;
 use crate::HubDaemon;
 use crate::admission::budgets::DAEMON_MAX_FRAME_BYTES;
 use crate::client_api_dto::response::daemon_response_base;
-use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::control::message::{ControlMessage, ControlSender};
+use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_turn::{OwnerTurnBudget, OwnerTurnCharge};
 use crate::host_executor::{
@@ -57,7 +57,11 @@ impl Default for EntitySubscriptionCapacityWake {
 
 impl EntitySubscriptionCapacityWake {
     pub(crate) fn bind(&self, sender: ControlSender) {
-        let mut owner = self.0.owner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut owner = self
+            .0
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         *owner = Some(sender.clone());
         let pending = self.0.pending.load(Ordering::Acquire);
         drop(owner);
@@ -68,7 +72,12 @@ impl EntitySubscriptionCapacityWake {
 
     pub(crate) fn publish(&self) {
         self.0.pending.store(true, Ordering::Release);
-        let owner = self.0.owner.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let owner = self
+            .0
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
         if let Some(owner) = owner {
             let _ = owner.try_send(ControlMessage::EntitySubscriptionCapacityReleased);
         }
@@ -325,9 +334,10 @@ pub(crate) fn exact_package_entity_target_catching_up(
         .is_some_and(|subscription| {
             !subscription.terminating
                 && subscription.package_catching_up
-                && subscription.package_delivery.as_ref().is_some_and(|delivery| {
-                    std::sync::Arc::ptr_eq(target, &delivery.target)
-                })
+                && subscription
+                    .package_delivery
+                    .as_ref()
+                    .is_some_and(|delivery| std::sync::Arc::ptr_eq(target, &delivery.target))
         })
 }
 
@@ -2533,7 +2543,10 @@ mod tests {
         }
         .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
         .expect("build retirement config");
-        (HubDaemon::start(config).expect("start retirement daemon"), data_directory)
+        (
+            HubDaemon::start(config).expect("start retirement daemon"),
+            data_directory,
+        )
     }
 
     #[test]
@@ -2545,7 +2558,9 @@ mod tests {
         }
         assert!(!state.maintenance.wakes.has_any());
         let (sender, receiver) = mpsc::sync_channel(1);
-        sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
+        sender
+            .send(queued_retirement_frame("retiring"))
+            .expect("fill subscriber queue");
         state.entity_subscriptions.insert(
             "retiring".to_string(),
             retirement_subscription(sender, "retiring.family"),
@@ -2588,7 +2603,9 @@ mod tests {
         }
         assert!(!state.maintenance.wakes.has_any());
         let (sender, receiver) = mpsc::sync_channel(1);
-        sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
+        sender
+            .send(queued_retirement_frame("retiring"))
+            .expect("fill subscriber queue");
         state.entity_subscriptions.insert(
             "retiring".to_string(),
             retirement_subscription(sender, "retiring.family"),
@@ -2599,11 +2616,19 @@ mod tests {
 
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
         state.entity_capacity_wake.bind(control_tx.clone());
-        control_tx.try_send(ControlMessage::DataPlaneProgress).expect("fill control queue");
+        control_tx
+            .try_send(ControlMessage::DataPlaneProgress)
+            .expect("fill control queue");
         assert!(!state.maintenance.wakes.has_any());
         state.entity_capacity_wake.publish();
-        assert!(matches!(control_rx.try_recv(), Ok(ControlMessage::DataPlaneProgress)));
-        assert!(control_rx.try_recv().is_err(), "capacity notice was dropped");
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(ControlMessage::DataPlaneProgress)
+        ));
+        assert!(
+            control_rx.try_recv().is_err(),
+            "capacity notice was dropped"
+        );
         crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
         assert!(!state.entity_subscriptions.contains_key("retiring"));
         assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 0);
@@ -2620,7 +2645,9 @@ mod tests {
     fn provider_reload_does_not_revive_a_terminating_subscription() {
         let mut state = DaemonControlState::default();
         let (sender, receiver) = mpsc::sync_channel(1);
-        sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
+        sender
+            .send(queued_retirement_frame("retiring"))
+            .expect("fill subscriber queue");
         state.entity_subscriptions.insert(
             "retiring".to_string(),
             retirement_subscription(sender, "retiring.family"),
@@ -2671,9 +2698,8 @@ mod tests {
         assert!(exact_package_entity_target_catching_up(&state, &target));
         let identity =
             crate::owner_identity::OwnerWorkIdentity::first(crate::owner_identity::WaiterId(904));
-        let (live, _) =
-            arm_package_entity_delivery(&mut state, &target, identity, 1, true, 1)
-                .expect("arm held target");
+        let (live, _) = arm_package_entity_delivery(&mut state, &target, identity, 1, true, 1)
+            .expect("arm held target");
         sender
             .try_send(crate::entity_delivery::EntityDelivery::Typed(
                 queued_retirement_frame("retiring"),
@@ -2696,7 +2722,10 @@ mod tests {
             1,
             crate::plugin_entity::DeliveryStatus::Sent,
         ));
-        assert_eq!(state.entity_subscriptions["retiring"].package_last_applied_seq, None);
+        assert_eq!(
+            state.entity_subscriptions["retiring"].package_last_applied_seq,
+            None
+        );
         assert!(state.maintenance.wakes.take(delivery));
         receiver.try_recv().expect("drain queued frame");
         retire_unloaded_entity_subscriptions(&mut state, |_| true);
@@ -2741,10 +2770,8 @@ mod tests {
             .expect("install provider subscription");
             let waiter = crate::owner_identity::WaiterId(if malformed { 906 } else { 905 });
             let expected = crate::owner_identity::OwnerWorkIdentity::first(waiter);
-            let (live, _) = arm_package_entity_delivery(
-                &mut state, &target, expected, 1, true, 1,
-            )
-            .expect("arm running publication");
+            let (live, _) = arm_package_entity_delivery(&mut state, &target, expected, 1, true, 1)
+                .expect("arm running publication");
             let command = if malformed {
                 crate::plugin_entity::Command::Discard {
                     payload: None,
@@ -2770,8 +2797,13 @@ mod tests {
             };
             let permit = state.budget.reserve().expect("reserve owner row");
             let identity = state.plugin_entities.test_insert_delivery_work(
-                waiter, permit, Arc::clone(&target), Arc::clone(&live),
-                &mut executor, command, false,
+                waiter,
+                permit,
+                Arc::clone(&target),
+                Arc::clone(&live),
+                &mut executor,
+                command,
+                false,
             );
             assert_eq!(identity, expected);
             assert!(state.plugin_entities.accepts_host_completion(identity));
@@ -2781,15 +2813,23 @@ mod tests {
             assert!(!live.load(Ordering::Acquire));
             assert_eq!(state.lifecycle_counters.live_entity_subscriptions, 1);
             while let Ok(frame) = receiver.try_recv() {
-                assert!(!matches!(frame,
-                    crate::entity_delivery::EntityDelivery::Typed(DaemonEntityFrame::Error { .. })
-                ), "terminal must wait for the Host receipt");
+                assert!(
+                    !matches!(
+                        frame,
+                        crate::entity_delivery::EntityDelivery::Typed(
+                            DaemonEntityFrame::Error { .. }
+                        )
+                    ),
+                    "terminal must wait for the Host receipt"
+                );
             }
 
             let deadline = Instant::now() + Duration::from_secs(5);
             let completion = loop {
                 match executor.poll_completion() {
-                    crate::host_executor::HostCompletionPoll::Ready(completion) => break completion,
+                    crate::host_executor::HostCompletionPoll::Ready(completion) => {
+                        break completion;
+                    }
                     crate::host_executor::HostCompletionPoll::Empty => {
                         assert!(Instant::now() < deadline, "Host receipt must arrive");
                         std::thread::yield_now();
@@ -2801,7 +2841,8 @@ mod tests {
             };
             assert_eq!(completion.identity, identity);
             if malformed {
-                assert!(matches!(&completion.result,
+                assert!(matches!(
+                    &completion.result,
                     crate::host_executor::HostResult::PluginEntity(
                         crate::plugin_entity::Completion::Reclaimed
                     )
@@ -2856,13 +2897,14 @@ mod tests {
         .expect("install provider subscription");
         let waiter = crate::owner_identity::WaiterId(907);
         let expected = crate::owner_identity::OwnerWorkIdentity::first(waiter);
-        let (live, _) = arm_package_entity_delivery(
-            &mut state, &target, expected, 1, true, 1,
-        )
-        .expect("arm publication");
+        let (live, _) = arm_package_entity_delivery(&mut state, &target, expected, 1, true, 1)
+            .expect("arm publication");
         let permit = state.budget.reserve().expect("reserve owner row");
         let identity = state.plugin_entities.test_insert_delivery_work(
-            waiter, permit, Arc::clone(&target), Arc::clone(&live),
+            waiter,
+            permit,
+            Arc::clone(&target),
+            Arc::clone(&live),
             &mut executor,
             crate::plugin_entity::Command::Discard {
                 payload: None,
@@ -2894,8 +2936,14 @@ mod tests {
         let (retiring_tx, retiring_rx) = mpsc::sync_channel(1);
         let (sibling_tx, sibling_rx) = mpsc::sync_channel(1);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
-        let cleanup_permit = control_tx.clone().try_reserve_owned().expect("cleanup permit");
-        let permit = state.budget.reserve_connection().expect("connection permit");
+        let cleanup_permit = control_tx
+            .clone()
+            .try_reserve_owned()
+            .expect("cleanup permit");
+        let permit = state
+            .budget
+            .reserve_connection()
+            .expect("connection permit");
         let mut guard = ConnectionCleanupGuard::new(
             cleanup_permit,
             "shared-client".to_string(),
@@ -2950,7 +2998,9 @@ mod tests {
         let (mut daemon, data_directory) = retirement_daemon("retire-disconnect");
         let mut state = DaemonControlState::default();
         let (sender, receiver) = mpsc::sync_channel(1);
-        sender.send(queued_retirement_frame("retiring")).expect("fill subscriber queue");
+        sender
+            .send(queued_retirement_frame("retiring"))
+            .expect("fill subscriber queue");
         state.entity_subscriptions.insert(
             "retiring".to_string(),
             retirement_subscription(sender, "retiring.family"),
@@ -2960,8 +3010,14 @@ mod tests {
         assert!(state.entity_subscriptions["retiring"].terminating);
 
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
-        let cleanup_permit = control_tx.clone().try_reserve_owned().expect("cleanup permit");
-        let permit = state.budget.reserve_connection().expect("connection permit");
+        let cleanup_permit = control_tx
+            .clone()
+            .try_reserve_owned()
+            .expect("cleanup permit");
+        let permit = state
+            .budget
+            .reserve_connection()
+            .expect("connection permit");
         let mut guard = ConnectionCleanupGuard::new(
             cleanup_permit,
             "retiring-client".to_string(),
@@ -3204,7 +3260,10 @@ mod tests {
         crate::daemon::control::entities::remove_entity_subscription(&mut state, "sub");
         assert!(!live.load(Ordering::Acquire));
         let new_target = install(&mut state);
-        assert!(!exact_package_entity_target_catching_up(&state, &old_target));
+        assert!(!exact_package_entity_target_catching_up(
+            &state,
+            &old_target
+        ));
         assert!(exact_package_entity_target_catching_up(&state, &new_target));
         assert!(!complete_package_entity_delivery(
             &mut state,

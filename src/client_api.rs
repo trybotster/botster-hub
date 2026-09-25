@@ -34,7 +34,7 @@ use crate::packages::{
     PackageRunnableProcessState, PackageRunnableWorkingDirectory, PackageState,
 };
 use crate::runtime::{
-    CoreOperationTracker, PluginSpawnPoll, SessionTypeSpawnStart, STARTUP_CORE_WAIT,
+    CoreOperationTracker, PluginSpawnPoll, STARTUP_CORE_WAIT, SessionTypeSpawnStart,
     core_bridge_error,
 };
 use crate::session_types::{
@@ -947,9 +947,7 @@ impl HubClientApi {
                 let _ = now_seconds;
                 let start = runtime.begin_client_session_type_spawn(materialized, owner_waiter_id);
                 return Ok(HubClientStep::Pending(HubClientPending::session_type(
-                    request_id,
-                    operation,
-                    start,
+                    request_id, operation, start,
                 )));
             }
             HubClientRequest::ReadSessionContext {

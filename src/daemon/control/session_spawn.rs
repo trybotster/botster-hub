@@ -5,26 +5,26 @@ use botster_hub_client::DaemonResponse;
 
 use std::time::Instant;
 
+use crate::HubDaemon;
 use crate::client_api::HubClientSession;
 use crate::client_api_dto::response::daemon_spawned;
 use crate::client_api_dto::session::daemon_session_from_client;
 use crate::daemon::control::pending::{
-    ControlContinuation, ControlPoll, OwnerRequestCompletion, PendingControlRequest,
-    READY_INITIAL, mark_owner_ready,
+    ControlContinuation, ControlPoll, OwnerRequestCompletion, PendingControlRequest, READY_INITIAL,
+    mark_owner_ready,
 };
 use crate::daemon::control::reply::ControlReply;
 use crate::daemon::control::sessions::core_operator_error;
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_schedule::ReadyClass;
 use crate::data_plane::driver::{ChargedCoreTicket, CoreTicketPoll, CoreWaiterRetirement};
+use crate::host_executor::{HostCommand, HostJobIdentity};
 use crate::owner_identity::WaiterId;
 use crate::runtime::{
     AdmittedSpawnDelivery, PluginSpawnPoll, SessionSpawnCleanupPoll, SessionTypeSpawnStart,
     SpawnConversionOutcome, SpawnDeliveryOutcome, SpawnReplySender,
 };
 use crate::session_types::ChargedSessionTypeMaterialization;
-use crate::host_executor::{HostCommand, HostJobIdentity};
-use crate::HubDaemon;
 
 /// Consume one front item and install its owner row before Host work starts.
 pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState) {
@@ -34,7 +34,10 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     let Some(pending) = runtime.take_pending_spawn_for_owner() else {
         return;
     };
-    if matches!(&pending.response, crate::runtime::OrdinarySpawnReply::Legacy(_)) {
+    if matches!(
+        &pending.response,
+        crate::runtime::OrdinarySpawnReply::Legacy(_)
+    ) {
         runtime.accept_legacy_session_type_spawn(pending);
         return;
     }
@@ -56,7 +59,10 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     };
     let Some(host_permit) = runtime.host_executor().try_reserve() else {
         state.budget.release(owner_permit);
-        send_unavailable(response, "the Host executor has no available operation slot");
+        send_unavailable(
+            response,
+            "the Host executor has no available operation slot",
+        );
         return;
     };
     let retirement = runtime.coordination_retirement(waiter_id);
@@ -151,7 +157,10 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     if runtime
         .host_executor()
         .submit(
-            HostJobIdentity { waiter_id, phase: 1 },
+            HostJobIdentity {
+                waiter_id,
+                phase: 1,
+            },
             HostCommand::MaterializeOrdinarySessionType(work),
             host_permit,
         )
@@ -165,10 +174,7 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     mark_owner_ready(state, waiter_id, ReadyClass::HostCompletion, READY_INITIAL);
 }
 
-fn send_unavailable(
-    response: SpawnReplySender<AdmittedSpawnDelivery>,
-    reason: &'static str,
-) {
+fn send_unavailable(response: SpawnReplySender<AdmittedSpawnDelivery>, reason: &'static str) {
     if let Err(refusal) = response.try_send(AdmittedSpawnDelivery::Unavailable(reason)) {
         drop(refusal);
     }
@@ -188,7 +194,11 @@ enum Phase {
 }
 
 enum AdmittedFailure {
-    Refused(String, crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge),
+    Refused(
+        String,
+        crate::lua_memory::LuaCallbackCharge,
+        crate::lua_memory::LuaCallbackCharge,
+    ),
     Unavailable(&'static str),
 }
 
@@ -364,8 +374,7 @@ impl SessionTypeSpawnOperation {
 
     fn send_unavailable(&mut self, reason: &'static str) {
         if let Some(response) = self.plugin_response.take()
-            && let Err(refusal) =
-                response.try_send(AdmittedSpawnDelivery::Unavailable(reason))
+            && let Err(refusal) = response.try_send(AdmittedSpawnDelivery::Unavailable(reason))
         {
             drop(refusal);
         }
@@ -501,7 +510,10 @@ impl SessionTypeSpawnOperation {
                                     return ControlPoll::Again;
                                 };
                                 let Ok((ticket, conversion)) = runtime
-                                    .session_spawn_conversion_reply(&self.retirement, ticket_charge)
+                                    .session_spawn_conversion_reply(
+                                        &self.retirement,
+                                        ticket_charge,
+                                    )
                                 else {
                                     self.admitted_failure = Some(AdmittedFailure::Unavailable(
                                         "conversion receipt registration refused",
@@ -594,7 +606,7 @@ impl SessionTypeSpawnOperation {
                     let start = self.start.as_mut().expect("cleanup owns the Core stage");
                     match start.abandon_and_poll_cleanup(runtime) {
                         SessionSpawnCleanupPoll::Pending | SessionSpawnCleanupPoll::Unresolved => {
-                            return ControlPoll::Pending
+                            return ControlPoll::Pending;
                         }
                         SessionSpawnCleanupPoll::Confirmed => {
                             self.phase = Phase::Done;
@@ -690,10 +702,9 @@ mod admitted_failure_tests {
     fn confirmed_core_failure_delivers_funded_error() {
         let memory = memory();
         let bytes = layout::single_reply_bytes::<AdmittedSpawnDelivery>(true).unwrap();
-        let (sender, receiver) = crate::runtime::spawn_reply_channel(
-            memory.reserve_callback_total(bytes).unwrap(),
-        )
-        .unwrap();
+        let (sender, receiver) =
+            crate::runtime::spawn_reply_channel(memory.reserve_callback_total(bytes).unwrap())
+                .unwrap();
         let message = "session type spawn failed: occupied".to_string();
         let render_bytes = crate::session_types::lua_spawn_refusal_render_bytes(&message).unwrap();
         let mut parent = memory
@@ -708,11 +719,19 @@ mod admitted_failure_tests {
         assert!(response.is_none());
         assert!(failure.is_none());
         let delivery = receiver.recv_timeout(Duration::ZERO).unwrap();
-        let AdmittedSpawnDelivery::Refused { message: actual, _variable, _lua_render } = delivery else {
+        let AdmittedSpawnDelivery::Refused {
+            message: actual,
+            _variable,
+            _lua_render,
+        } = delivery
+        else {
             panic!("Core failure must deliver its charged text");
         };
         assert_eq!(actual, "session type spawn failed: occupied");
-        assert_eq!(_lua_render.bytes(), crate::session_types::lua_spawn_refusal_render_bytes(&actual).unwrap());
+        assert_eq!(
+            _lua_render.bytes(),
+            crate::session_types::lua_spawn_refusal_render_bytes(&actual).unwrap()
+        );
         drop(actual);
         drop(_variable);
         drop(_lua_render);
@@ -728,15 +747,16 @@ mod admitted_failure_tests {
         ] {
             let memory = memory();
             let bytes = layout::single_reply_bytes::<AdmittedSpawnDelivery>(true).unwrap();
-            let (sender, receiver) = crate::runtime::spawn_reply_channel(
-                memory.reserve_callback_total(bytes).unwrap(),
-            )
-            .unwrap();
+            let (sender, receiver) =
+                crate::runtime::spawn_reply_channel(memory.reserve_callback_total(bytes).unwrap())
+                    .unwrap();
             let mut response = Some(sender);
             let mut failure = Some(AdmittedFailure::Unavailable(reason));
             assert!(deliver_admitted_failure(&mut response, &mut failure));
             let delivery = receiver.recv_timeout(Duration::ZERO).unwrap();
-            assert!(matches!(delivery, AdmittedSpawnDelivery::Unavailable(actual) if actual == reason));
+            assert!(
+                matches!(delivery, AdmittedSpawnDelivery::Unavailable(actual) if actual == reason)
+            );
             drop(receiver);
             assert_eq!(memory.usage().1, 0);
         }
@@ -834,26 +854,25 @@ mod owner_conversion_lifecycle_tests {
             .enable_time()
             .build()
             .unwrap();
-        let mut found = executor
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    let mut found = Vec::new();
-                    while found.len() < phases.len() {
-                        let identities = runtime.take_owner_core_completions(64);
-                        for identity in identities {
-                            if identity.waiter_id == waiter_id {
-                                found.push(identity);
-                            }
-                        }
-                        if found.len() < phases.len() {
-                            receiver.recv().await.expect("Core must wake its owner");
+        let mut found = executor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut found = Vec::new();
+                while found.len() < phases.len() {
+                    let identities = runtime.take_owner_core_completions(64);
+                    for identity in identities {
+                        if identity.waiter_id == waiter_id {
+                            found.push(identity);
                         }
                     }
-                    found
-                })
-                .await
-                .expect("Core must complete the expected phase")
-            });
+                    if found.len() < phases.len() {
+                        receiver.recv().await.expect("Core must wake its owner");
+                    }
+                }
+                found
+            })
+            .await
+            .expect("Core must complete the expected phase")
+        });
         found.sort();
         assert_eq!(
             found,
@@ -928,10 +947,8 @@ mod owner_conversion_lifecycle_tests {
         let waiter_id = runtime.next_waiter_id().unwrap();
         let retirement = runtime.coordination_retirement(waiter_id);
         let bytes = layout::single_reply_bytes::<AdmittedSpawnDelivery>(true).unwrap();
-        let (sender, receiver) = spawn_reply_channel(
-            memory.reserve_callback_total(bytes).unwrap(),
-        )
-        .unwrap();
+        let (sender, receiver) =
+            spawn_reply_channel(memory.reserve_callback_total(bytes).unwrap()).unwrap();
         let parent = memory.reserve_callback_total(0).unwrap();
         let start = runtime.test_begin_ordinary_owner_spawn(waiter_id, session_id, parent);
         let mut operation = SessionTypeSpawnOperation {
@@ -950,14 +967,23 @@ mod owner_conversion_lifecycle_tests {
         };
         let mut state = DaemonControlState::default();
         collect(runtime, &mut wake, waiter_id, &[1, 2]);
-        assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Again));
+        assert!(matches!(
+            operation.poll(&mut daemon, &mut state),
+            ControlPoll::Again
+        ));
         assert!(matches!(
             receiver.recv_timeout(Duration::ZERO),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
-        assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::FinishedInternal));
-        let AdmittedSpawnDelivery::Refused { message, _variable, _lua_render } =
-            receiver.recv_timeout(Duration::ZERO).unwrap()
+        assert!(matches!(
+            operation.poll(&mut daemon, &mut state),
+            ControlPoll::FinishedInternal
+        ));
+        let AdmittedSpawnDelivery::Refused {
+            message,
+            _variable,
+            _lua_render,
+        } = receiver.recv_timeout(Duration::ZERO).unwrap()
         else {
             panic!("confirmed cleanup must deliver the occupied refusal");
         };
@@ -1027,10 +1053,18 @@ mod owner_conversion_lifecycle_tests {
         };
         let mut state = DaemonControlState::default();
         collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[1, 2]);
-        assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Pending));
+        assert!(matches!(
+            operation.poll(&mut daemon, &mut state),
+            ControlPoll::Pending
+        ));
         collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[3, 4]);
         assert_eq!(
-            daemon.runtime().unwrap().session_context(&context_id).unwrap().session_id,
+            daemon
+                .runtime()
+                .unwrap()
+                .session_context(&context_id)
+                .unwrap()
+                .session_id,
             session_id,
         );
         let original = operation
@@ -1042,13 +1076,17 @@ mod owner_conversion_lifecycle_tests {
 
         match case {
             Case::ExplicitAbandonment => {
-                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Pending));
+                assert!(matches!(
+                    operation.poll(&mut daemon, &mut state),
+                    ControlPoll::Pending
+                ));
                 let delivery = receiver.recv_timeout(Duration::ZERO).unwrap();
                 let AdmittedSpawnDelivery::Spawned {
                     result,
                     conversion,
                     _variable,
-                } = delivery else {
+                } = delivery
+                else {
                     panic!("Core success must reach Lua conversion")
                 };
                 assert_eq!(result.reservation_identity, Some(original));
@@ -1057,7 +1095,10 @@ mod owner_conversion_lifecycle_tests {
                 drop(_variable);
                 drop(receiver);
                 collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[5]);
-                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Again));
+                assert!(matches!(
+                    operation.poll(&mut daemon, &mut state),
+                    ControlPoll::Again
+                ));
             }
             Case::RegistrationRefusal => {
                 let bytes = retained_reply_bytes::<SpawnConversionOutcome>().unwrap();
@@ -1067,12 +1108,24 @@ mod owner_conversion_lifecycle_tests {
                     .unwrap()
                     .session_spawn_conversion_reply(&operation.retirement, charge)
                     .unwrap();
-                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Again));
-                assert!(matches!(receiver.recv_timeout(Duration::ZERO), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+                assert!(matches!(
+                    operation.poll(&mut daemon, &mut state),
+                    ControlPoll::Again
+                ));
+                assert!(matches!(
+                    receiver.recv_timeout(Duration::ZERO),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ));
                 receipt.abandon();
                 collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[5]);
                 drop(blocker);
-                finish_cleanup(&mut operation, &mut daemon, &mut state, &mut wake, waiter_id);
+                finish_cleanup(
+                    &mut operation,
+                    &mut daemon,
+                    &mut state,
+                    &mut wake,
+                    waiter_id,
+                );
                 let AdmittedSpawnDelivery::Unavailable(reason) =
                     receiver.recv_timeout(Duration::ZERO).unwrap()
                 else {
@@ -1083,29 +1136,54 @@ mod owner_conversion_lifecycle_tests {
             }
             Case::DroppedReceiver => {
                 drop(receiver);
-                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Pending));
+                assert!(matches!(
+                    operation.poll(&mut daemon, &mut state),
+                    ControlPoll::Pending
+                ));
                 assert!(
                     matches!(operation.phase, Phase::Conversion),
                     "a lost delivery must wait for its conversion receipt before Core cleanup",
                 );
-                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Pending));
+                assert!(matches!(
+                    operation.poll(&mut daemon, &mut state),
+                    ControlPoll::Pending
+                ));
                 collect(daemon.runtime().unwrap(), &mut wake, waiter_id, &[5]);
-                assert!(matches!(operation.poll(&mut daemon, &mut state), ControlPoll::Again));
+                assert!(matches!(
+                    operation.poll(&mut daemon, &mut state),
+                    ControlPoll::Again
+                ));
             }
         }
         if !matches!(case, Case::RegistrationRefusal) {
-            finish_cleanup(&mut operation, &mut daemon, &mut state, &mut wake, waiter_id);
+            finish_cleanup(
+                &mut operation,
+                &mut daemon,
+                &mut state,
+                &mut wake,
+                waiter_id,
+            );
         }
         assert!(matches!(operation.phase, Phase::Done));
         assert_eq!(daemon.runtime().unwrap().session_context(&context_id), None);
-        assert_eq!(daemon.runtime().unwrap().session_context(&session_id.0), None);
         assert_eq!(
-            operation.start.as_ref().unwrap().test_reservation_identity(),
+            daemon.runtime().unwrap().session_context(&session_id.0),
+            None
+        );
+        assert_eq!(
+            operation
+                .start
+                .as_ref()
+                .unwrap()
+                .test_reservation_identity(),
             Some(original),
             "cleanup must retain the exact released generation until retirement",
         );
         let next_waiter = daemon.runtime().unwrap().next_waiter_id().unwrap();
-        let next_retirement = daemon.runtime().unwrap().coordination_retirement(next_waiter);
+        let next_retirement = daemon
+            .runtime()
+            .unwrap()
+            .coordination_retirement(next_waiter);
         let mut next_reserve = daemon
             .runtime()
             .unwrap()
@@ -1114,7 +1192,8 @@ mod owner_conversion_lifecycle_tests {
         let CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
             result: Ok(next_reservation),
             ..
-        })) = next_reserve.poll(daemon.runtime().unwrap()) else {
+        })) = next_reserve.poll(daemon.runtime().unwrap())
+        else {
             panic!("the next waiter must reserve the released session id");
         };
         assert_ne!(next_reservation.identity(), original);

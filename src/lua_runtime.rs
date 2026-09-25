@@ -2549,15 +2549,11 @@ fn session_types_table(
         "spawn",
         callback::create(lua, move |lua, args: Value| {
             let Some(memory) = spawn_memory.as_ref() else {
-                return Err(callback::CallbackFailure::Raise(spawn_requires_owner.clone()));
+                return Err(callback::CallbackFailure::Raise(
+                    spawn_requires_owner.clone(),
+                ));
             };
-            let input = spawn_input::admit(
-                lua,
-                &args,
-                &spawn_plugin_key,
-                memory,
-                &spawn_capacity,
-            )?;
+            let input = spawn_input::admit(lua, &args, &spawn_plugin_key, memory, &spawn_capacity)?;
             let delivery = match spawn_templates.spawn_admitted(input, Arc::clone(&spawn_records)) {
                 Ok(delivery) => delivery,
                 Err(error) if error.as_ref() == LUA_CALLBACK_CAPACITY_EXHAUSTED => {
@@ -2592,13 +2588,15 @@ fn session_types_table(
                     _lua_render,
                 } => {
                     let raised = (|| -> Result<mlua::String, callback::CallbackFailure> {
-                        let bytes = crate::session_types::lua_spawn_refusal_render_bytes(&message).ok_or_else(|| {
-                            callback::CallbackFailure::Raise(spawn_capacity.clone())
-                        })?;
+                        let bytes = crate::session_types::lua_spawn_refusal_render_bytes(&message)
+                            .ok_or_else(|| {
+                                callback::CallbackFailure::Raise(spawn_capacity.clone())
+                            })?;
                         let mut failure = String::with_capacity(bytes);
                         failure.push_str(crate::session_types::LUA_SPAWN_REFUSAL_PREFIX);
                         failure.push_str(&message);
-                        lua.create_string(&failure).map_err(callback::CallbackFailure::Error)
+                        lua.create_string(&failure)
+                            .map_err(callback::CallbackFailure::Error)
                     })();
                     drop(message);
                     drop(_variable);

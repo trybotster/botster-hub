@@ -1,9 +1,9 @@
 //! Isolated allocation fixtures for the complete repository definition parser.
 
 use super::{
-    repo_session_types, validate_session_types, PackageSessionType, RepoSessionTypesFile,
-    SessionTypeError, SessionTypeResult, REPO_SESSION_TYPES_FILE,
-    REPO_SESSION_TYPES_FILE_BYTE_CAPACITY,
+    PackageSessionType, REPO_SESSION_TYPES_FILE, REPO_SESSION_TYPES_FILE_BYTE_CAPACITY,
+    RepoSessionTypesFile, SessionTypeError, SessionTypeResult, repo_session_types,
+    validate_session_types,
 };
 use std::path::Path;
 

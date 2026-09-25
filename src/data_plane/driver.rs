@@ -1816,7 +1816,9 @@ mod tests {
         assert_eq!(wake.take_identities(1), vec![identity(72, 1)]);
         assert!(matches!(receipt.poll(), CoreTicketPoll::Ready(())));
         drop(receipt);
-        let core_phases = wake.register_phases(waiter_id, 2).expect("Core can begin after Host collection");
+        let core_phases = wake
+            .register_phases(waiter_id, 2)
+            .expect("Core can begin after Host collection");
         assert_eq!(core_phases, vec![identity(72, 2), identity(72, 3)]);
         drop(retirement);
         assert_eq!(wake.live_identity_counts(), (0, 0, 0));
@@ -2106,9 +2108,10 @@ mod tests {
             );
         }
         for offset in 0..crate::daemon::owner_loop::BACKGROUND_CORE_WORK_CLASSES {
-            assert!(wake
-                .register_phases(WaiterId(u64::MAX - offset as u64), 1)
-                .is_some());
+            assert!(
+                wake.register_phases(WaiterId(u64::MAX - offset as u64), 1)
+                    .is_some()
+            );
         }
         assert!(
             wake.register_phases(

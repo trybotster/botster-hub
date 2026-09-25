@@ -99,7 +99,9 @@ fn accept_confirmed_rollback(
         return;
     };
     let worktree_id = &prepared.worktree_id;
-    if runtime.session_type_spawner().managed_attempt_active(worktree_id)
+    if runtime
+        .session_type_spawner()
+        .managed_attempt_active(worktree_id)
         || runtime.peek_pending_managed_worktree_id().as_deref() == Some(worktree_id)
     {
         runtime.defer_confirmed_worktree_rollback(prepared);
@@ -213,7 +215,9 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
     runtime.retry_created_worktree_releases();
     runtime.reap_detached_core_operations();
     if let Some(worktree_id) = runtime.peek_pending_managed_worktree_id()
-        && (runtime.session_type_spawner().managed_attempt_active(&worktree_id)
+        && (runtime
+            .session_type_spawner()
+            .managed_attempt_active(&worktree_id)
             || runtime.created_worktree_cleanup_active(&worktree_id))
     {
         return;
@@ -407,7 +411,10 @@ impl ManagedSpawnOperation {
         state: &mut DaemonControlState,
     ) -> ControlPoll {
         let outcome = self.poll_inner(daemon, state);
-        if matches!(&outcome, ControlPoll::Ready(_) | ControlPoll::FinishedInternal) {
+        if matches!(
+            &outcome,
+            ControlPoll::Ready(_) | ControlPoll::FinishedInternal
+        ) {
             let runtime = daemon
                 .runtime()
                 .expect("managed completion runs before daemon runtime stop");
@@ -781,7 +788,11 @@ impl ManagedSpawnOperation {
             return self.submit_finalize(daemon, state, ManagedWorktreeDecision::Rollback, None);
         };
         let start = self.spawn.as_mut().expect("managed Core spawn exists");
-        let parent = &mut self.pending.as_mut().expect("managed request exists").parent;
+        let parent = &mut self
+            .pending
+            .as_mut()
+            .expect("managed request exists")
+            .parent;
         let completion = match start.poll(runtime, parent) {
             crate::runtime::PluginSpawnPoll::Pending => return ControlPoll::Pending,
             crate::runtime::PluginSpawnPoll::Ready(result) => result,

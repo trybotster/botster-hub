@@ -383,7 +383,10 @@ impl PluginEntityState {
         work.stage = worker::Stage::Deliver;
         work.delivery_target = Some(target);
         work.publication = Some(publication);
-        assert!(matches!(work.reserve(executor, waiter), worker::Advance::Waiting));
+        assert!(matches!(
+            work.reserve(executor, waiter),
+            worker::Advance::Waiting
+        ));
         let identity = work.ready_identity().expect("reserved delivery identity");
         if reject {
             executor.test_stop_submissions();

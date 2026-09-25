@@ -1991,7 +1991,8 @@ impl Work {
                     .is_some_and(|family| family.generation == *expected_generation);
                 if *valid {
                     *resync_changed = true;
-                    *generation = Some(model.step_snapshot_into(name, *preserve_resync_need, retained));
+                    *generation =
+                        Some(model.step_snapshot_into(name, *preserve_resync_need, retained));
                 }
                 if let Some(PackageEntityFamilyStep::ReleaseResync {
                     scope_id,

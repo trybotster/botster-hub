@@ -493,10 +493,12 @@ impl PendingManagedSessionSpawn {
         match self.response {
             ManagedSpawnReply::Legacy(sender) => {
                 debug_assert!(delivery.parent.is_none());
-                sender.send(delivery.result).map_err(|error| ManagedSpawnDelivery {
-                    result: error.0,
-                    parent: delivery.parent,
-                })
+                sender
+                    .send(delivery.result)
+                    .map_err(|error| ManagedSpawnDelivery {
+                        result: error.0,
+                        parent: delivery.parent,
+                    })
             }
             ManagedSpawnReply::Admitted(sender) => sender.send(delivery).map_err(|error| error.0),
         }
@@ -611,7 +613,9 @@ impl HubRuntime {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
-            session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(&lua_memory))),
+            session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(
+                &lua_memory,
+            ))),
             host_executor: crate::host_executor::HostExecutor::new(),
             coordination_bridge: HubCoordinationBridge::new(Arc::clone(&lua_memory)),
             entity_publish_bridge: HubEntityPublishBridge::new(
@@ -800,7 +804,9 @@ impl HubRuntime {
             capability_runtime: Arc::new(Mutex::new(
                 HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
             )),
-            session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(&lua_memory))),
+            session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(
+                &lua_memory,
+            ))),
             host_executor: crate::host_executor::HostExecutor::new(),
             coordination_bridge: HubCoordinationBridge::new(Arc::clone(&lua_memory)),
             entity_publish_bridge: HubEntityPublishBridge::new(
@@ -2296,9 +2302,10 @@ impl HubRuntime {
     }
 
     pub(crate) fn created_worktree_cleanup_active(&self, worktree_id: &str) -> bool {
-        self.created_worktree_cleanups
-            .lock()
-            .is_ok_and(|held| held.iter().any(|cleanup| cleanup.worktree_id == worktree_id))
+        self.created_worktree_cleanups.lock().is_ok_and(|held| {
+            held.iter()
+                .any(|cleanup| cleanup.worktree_id == worktree_id)
+        })
     }
 
     pub(crate) fn take_confirmed_worktree_rollback(
@@ -2306,7 +2313,9 @@ impl HubRuntime {
         worktree_id: &str,
     ) -> Option<crate::managed_git_worktrees::PreparedManagedWorktree> {
         let mut held = self.confirmed_worktree_rollbacks.lock().ok()?;
-        let index = held.iter().position(|prepared| prepared.worktree_id == worktree_id)?;
+        let index = held
+            .iter()
+            .position(|prepared| prepared.worktree_id == worktree_id)?;
         Some(held.remove(index))
     }
 
@@ -2318,13 +2327,15 @@ impl HubRuntime {
 
     #[cfg(test)]
     pub(crate) fn test_inherited_managed_cleanup_transfers(&self) -> usize {
-        self.inherited_managed_cleanup_transfers.load(Ordering::Acquire)
+        self.inherited_managed_cleanup_transfers
+            .load(Ordering::Acquire)
     }
 
     pub(crate) fn confirmed_worktree_rollback_exists(&self, worktree_id: &str) -> bool {
-        self.confirmed_worktree_rollbacks
-            .lock()
-            .is_ok_and(|held| held.iter().any(|prepared| prepared.worktree_id == worktree_id))
+        self.confirmed_worktree_rollbacks.lock().is_ok_and(|held| {
+            held.iter()
+                .any(|prepared| prepared.worktree_id == worktree_id)
+        })
     }
 
     pub(crate) fn wake_remaining_confirmed_worktree_rollbacks(&self) {
@@ -4109,7 +4120,11 @@ impl HubRuntime {
         &self,
         key: &str,
     ) -> Option<crate::session_types::HubSessionContext> {
-        self.session_contexts.lock().ok()?.get(key).map(|entry| entry.context.clone())
+        self.session_contexts
+            .lock()
+            .ok()?
+            .get(key)
+            .map(|entry| entry.context.clone())
     }
 
     #[cfg(test)]
@@ -4122,7 +4137,8 @@ impl HubRuntime {
             .expect("the isolated test admission accepts the session");
         let bytes = stored_context_bytes(context).unwrap();
         let charge = self.lua_memory.reserve_callback_total(bytes).unwrap();
-        self.publish_spawn_context(context.clone(), &reservation, charge).unwrap();
+        self.publish_spawn_context(context.clone(), &reservation, charge)
+            .unwrap();
         reservation.identity()
     }
 
@@ -4132,8 +4148,9 @@ impl HubRuntime {
         reservation: &SessionReservation,
         charge: crate::lua_memory::LuaCallbackCharge,
     ) -> Result<(), String> {
-        if charge.bytes() < stored_context_bytes(&context)
-            .ok_or_else(|| "session context size overflow".to_string())?
+        if charge.bytes()
+            < stored_context_bytes(&context)
+                .ok_or_else(|| "session context size overflow".to_string())?
         {
             return Err("session context has no allocation allowance".to_string());
         }
@@ -4158,11 +4175,7 @@ impl HubRuntime {
         context: &HubSessionContext,
         identity: botster_core::SessionReservationIdentity,
     ) {
-        self.retract_spawn_context_aliases(
-            &context.context_id,
-            &context.session_id.0,
-            identity,
-        );
+        self.retract_spawn_context_aliases(&context.context_id, &context.session_id.0, identity);
     }
 
     fn retract_spawn_context_aliases(
@@ -4204,9 +4217,11 @@ impl HubRuntime {
         session_id: &str,
         identity: botster_core::SessionReservationIdentity,
     ) -> bool {
-        self.session_contexts
-            .lock()
-            .is_ok_and(|contexts| contexts.get(session_id).is_some_and(|entry| entry.identity == identity))
+        self.session_contexts.lock().is_ok_and(|contexts| {
+            contexts
+                .get(session_id)
+                .is_some_and(|entry| entry.identity == identity)
+        })
     }
 
     pub(crate) fn begin_spawn_for_owner(
@@ -5065,16 +5080,16 @@ impl HubSessionTypeSpawner {
 
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        let account = crate::lua_memory::LuaMemoryAccount::new(
-            crate::config::lua_memory_limits(),
-        )
-        .expect("the test Lua memory limits are valid");
+        let account = crate::lua_memory::LuaMemoryAccount::new(crate::config::lua_memory_limits())
+            .expect("the test Lua memory limits are valid");
         Self::new_with_account(account)
     }
 
     pub(crate) fn new_with_account(account: Arc<crate::lua_memory::LuaMemoryAccount>) -> Self {
         Self {
-            pending: Mutex::new(crate::lua_memory::charged_collection::ChargedVecDeque::new(account)),
+            pending: Mutex::new(crate::lua_memory::charged_collection::ChargedVecDeque::new(
+                account,
+            )),
             ordinary_pending: AtomicBool::new(false),
             managed: Mutex::new(VecDeque::new()),
             managed_pending: AtomicBool::new(false),
@@ -5300,12 +5315,12 @@ impl HubSessionTypeSpawner {
         receiver
             .recv_timeout(Duration::from_millis(SESSION_TYPE_SPAWN_TIMEOUT_MS))
             .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => std::borrow::Cow::Borrowed(
-                    "session-type spawn did not complete before timeout",
-                ),
-                mpsc::RecvTimeoutError::Disconnected => std::borrow::Cow::Borrowed(
-                    "session-type spawn owner dropped its reply",
-                ),
+                mpsc::RecvTimeoutError::Timeout => {
+                    std::borrow::Cow::Borrowed("session-type spawn did not complete before timeout")
+                }
+                mpsc::RecvTimeoutError::Disconnected => {
+                    std::borrow::Cow::Borrowed("session-type spawn owner dropped its reply")
+                }
             })
     }
 
@@ -5420,16 +5435,12 @@ mod ordinary_spawn_queue_tests {
 
     #[test]
     fn owner_takes_legacy_then_admitted_from_one_charged_fifo() {
-        let memory = crate::lua_memory::LuaMemoryAccount::new(
-            crate::config::lua_memory_limits(),
-        )
-        .unwrap();
+        let memory =
+            crate::lua_memory::LuaMemoryAccount::new(crate::config::lua_memory_limits()).unwrap();
         let spawner = HubSessionTypeSpawner::new_with_account(Arc::clone(&memory));
         let (legacy_sender, _legacy_receiver) = mpsc::channel();
-        let channel_bytes = crate::lua_memory::layout::single_reply_bytes::<
-            AdmittedSpawnDelivery,
-        >(true)
-        .unwrap();
+        let channel_bytes =
+            crate::lua_memory::layout::single_reply_bytes::<AdmittedSpawnDelivery>(true).unwrap();
         let channel_charge = memory.reserve_callback_total(channel_bytes).unwrap();
         let (admitted_sender, admitted_receiver) = spawn_reply_channel(channel_charge).unwrap();
         let item = |response, parent| PendingSessionTypeSpawn {
@@ -6209,14 +6220,12 @@ impl ManagedSessionSpawnStart {
                                     }
                                     None => runtime.lua_memory.reserve_callback_total(bytes).ok(),
                                 });
-                            let published = context_charge
-                                .ok_or(())
-                                .and_then(|charge| {
-                                    let context = self.context.take().ok_or(())?;
-                                    runtime
-                                        .publish_spawn_context(context, &reserved, charge)
-                                        .map_err(|_| ())
-                                });
+                            let published = context_charge.ok_or(()).and_then(|charge| {
+                                let context = self.context.take().ok_or(())?;
+                                runtime
+                                    .publish_spawn_context(context, &reserved, charge)
+                                    .map_err(|_| ())
+                            });
                             if published.is_err() {
                                 self.spawn_error = Some(CoreDaemonError::Shutdown);
                                 self.release_or_retain(runtime);
@@ -7139,13 +7148,19 @@ pub(crate) mod tests {
         let first_charge = runtime.lua_memory.usage().1;
         let second_identity = runtime.test_publish_spawn_context(&second);
         assert_ne!(first_identity, second_identity);
-        assert_eq!(runtime.session_context("same-session"), Some(second.clone()));
+        assert_eq!(
+            runtime.session_context("same-session"),
+            Some(second.clone())
+        );
         assert_eq!(runtime.session_context("ctx-first"), Some(first.clone()));
         assert!(runtime.lua_memory.usage().1 > first_charge);
 
         runtime.retract_spawn_context(&first, first_identity);
         assert_eq!(runtime.session_context("ctx-first"), None);
-        assert_eq!(runtime.session_context("same-session"), Some(second.clone()));
+        assert_eq!(
+            runtime.session_context("same-session"),
+            Some(second.clone())
+        );
         assert!(runtime.lua_memory.usage().1 > 0);
 
         runtime.retract_spawn_context(&second, second_identity);

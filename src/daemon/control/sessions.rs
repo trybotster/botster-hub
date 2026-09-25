@@ -11,8 +11,7 @@ use botster_core::{
 };
 use botster_core_daemon::operation::ReservedSpawnResult;
 use botster_core_daemon::{
-    CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError,
-    SpawnSessionRequest,
+    CaptureId, CaptureOwner, CoreCompletion, CoreDaemonError, SpawnSessionRequest,
 };
 use botster_hub_client::{
     DaemonCaptureSnapshot, DaemonDiagnostic, DaemonModeFlags, DaemonOperatorError,
@@ -3156,8 +3155,7 @@ return botster.register({
             worker.join().expect("join plugin spawn worker")
         });
         drop(capacity_hold);
-        crate::runtime::HubRuntime::complete_plugin_mcp_tool(outcome)
-            .map_err(|error| error.message)
+        crate::runtime::HubRuntime::complete_plugin_mcp_tool(outcome).map_err(|error| error.message)
     }
 
     #[test]
@@ -3191,7 +3189,9 @@ return botster.register({
             .iter()
             .find_map(|(waiter, entry)| match &entry.continuation {
                 crate::daemon::control::pending::ControlContinuation::SessionType(operation) => {
-                    operation.test_reservation_identity().map(|identity| (*waiter, identity))
+                    operation
+                        .test_reservation_identity()
+                        .map(|identity| (*waiter, identity))
                 }
                 _ => None,
             })
@@ -3234,7 +3234,10 @@ return botster.register({
             .begin_release_session_reservation_for_owner(waiter, reservation);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            assert!(Instant::now() < deadline, "test reservation release stalled");
+            assert!(
+                Instant::now() < deadline,
+                "test reservation release stalled"
+            );
             drive_ready_test_turn(&mut daemon, &mut state);
             match release.poll(daemon.runtime().unwrap()) {
                 CoreTicketPoll::Pending => std::thread::yield_now(),
@@ -3265,23 +3268,20 @@ return botster.register({
 
     #[test]
     fn plugin_spawn_missing_capability_reuses_callback_capacity() {
-        let (mut daemon, mut state, root) =
-            spawn_fixture_with_worker("plugin-capability", None);
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("plugin-capability", None);
         let package_root = root.join("p1-plugin");
         let mut record = plugin_spawn_package(&package_root);
         record.manifest.capabilities.clear();
         let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
         let baseline = daemon.runtime().unwrap().test_lua_memory().usage().1;
         for session_id in ["s1-plugin-capability-a", "s1-plugin-capability-b"] {
-            let refused = invoke_plugin_spawn_tool(
-                &mut daemon,
-                &mut state,
-                &mut owner_rx,
-                session_id,
-                None,
-            )
-            .expect_err("MCP-only package must refuse session-type spawn");
-            assert!(refused.contains("session_type_spawn capability"), "{refused}");
+            let refused =
+                invoke_plugin_spawn_tool(&mut daemon, &mut state, &mut owner_rx, session_id, None)
+                    .expect_err("MCP-only package must refuse session-type spawn");
+            assert!(
+                refused.contains("session_type_spawn capability"),
+                "{refused}"
+            );
             assert!(state.pending_requests.is_empty());
             assert_eq!(
                 daemon
@@ -3290,7 +3290,10 @@ return botster.register({
                     .test_release_session_reservation_begins(),
                 0
             );
-            assert_eq!(daemon.runtime().unwrap().test_lua_memory().usage().1, baseline);
+            assert_eq!(
+                daemon.runtime().unwrap().test_lua_memory().usage().1,
+                baseline
+            );
         }
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
@@ -3308,10 +3311,7 @@ return botster.register({
             session_id: SessionId("s1-plugin-live".into()),
             values: Default::default(),
         };
-        daemon
-            .runtime()
-            .unwrap()
-            .test_publish_spawn_context(&live);
+        daemon.runtime().unwrap().test_publish_spawn_context(&live);
         let package_root = root.join("p1-plugin");
         let record = plugin_spawn_package(&package_root);
         let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
@@ -3390,7 +3390,9 @@ return botster.register({
             .iter()
             .find_map(|(waiter, entry)| match &entry.continuation {
                 crate::daemon::control::pending::ControlContinuation::SessionType(operation) => {
-                    operation.test_reservation_identity().map(|identity| (*waiter, identity))
+                    operation
+                        .test_reservation_identity()
+                        .map(|identity| (*waiter, identity))
                 }
                 _ => None,
             })
@@ -3559,10 +3561,7 @@ return botster.register({
             session_id: SessionId("s1-abandon".into()),
             values: Default::default(),
         };
-        let identity = daemon
-            .runtime()
-            .unwrap()
-            .test_publish_spawn_context(&live);
+        let identity = daemon.runtime().unwrap().test_publish_spawn_context(&live);
         daemon
             .runtime()
             .unwrap()
@@ -3852,8 +3851,14 @@ return botster.register({
         assert_ne!(a.session_id, b.session_id);
         assert_eq!(a.worktree_id, b.worktree_id);
         assert_eq!(a.worktree_path, b.worktree_path);
-        assert_eq!(usize::from(a.created_worktree) + usize::from(b.created_worktree), 1);
-        assert_eq!(usize::from(a.reused_worktree) + usize::from(b.reused_worktree), 1);
+        assert_eq!(
+            usize::from(a.created_worktree) + usize::from(b.created_worktree),
+            1
+        );
+        assert_eq!(
+            usize::from(a.reused_worktree) + usize::from(b.reused_worktree),
+            1
+        );
         assert!(
             std::path::Path::new(&a.worktree_path).exists(),
             "serial reuse must keep the worktree: {}",
@@ -4023,10 +4028,7 @@ return botster.register({
             session_id: SessionId(first.session_id.clone()),
             values: Default::default(),
         };
-        daemon
-            .runtime()
-            .unwrap()
-            .test_publish_spawn_context(&live);
+        daemon.runtime().unwrap().test_publish_spawn_context(&live);
         let package_root = root.join("p1-plugin");
         let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
         let refused = invoke_plugin_spawn_tool(
@@ -4129,7 +4131,8 @@ return botster.register({
     #[test]
     fn ensure_worktree_and_spawn_undelivered_reuse_rolls_back_original_creation() {
         let worker = matched_worker_path();
-        let (mut daemon, mut state, root, record) = s2_prepare("s2-reuse-undelivered", Some(worker));
+        let (mut daemon, mut state, root, record) =
+            s2_prepare("s2-reuse-undelivered", Some(worker));
         let spawner = daemon.runtime().unwrap().session_type_spawner();
         for package_records in [vec![record.clone()], vec![record]] {
             spawner.test_enqueue_managed_disconnected(
@@ -4146,10 +4149,18 @@ return botster.register({
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             pump_core(&mut daemon, &mut state);
-            if daemon.runtime().unwrap().test_inherited_managed_cleanup_transfers() == 1 {
+            if daemon
+                .runtime()
+                .unwrap()
+                .test_inherited_managed_cleanup_transfers()
+                == 1
+            {
                 break;
             }
-            assert!(Instant::now() < deadline, "reuse did not inherit the original cleanup");
+            assert!(
+                Instant::now() < deadline,
+                "reuse did not inherit the original cleanup"
+            );
             std::thread::yield_now();
         }
         let gone = Instant::now() + Duration::from_secs(20);
@@ -4163,7 +4174,10 @@ return botster.register({
             {
                 break;
             }
-            assert!(Instant::now() < gone, "undelivered reuse did not roll back the original worktree");
+            assert!(
+                Instant::now() < gone,
+                "undelivered reuse did not roll back the original worktree"
+            );
             std::thread::yield_now();
         }
         daemon.stop();
@@ -4200,19 +4214,30 @@ return botster.register({
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     assert!(Instant::now() < deadline, "reuse refusal did not complete");
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("reuse refusal reply disconnected"),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("reuse refusal reply disconnected")
+                }
             }
             std::thread::yield_now();
         };
         assert_ne!(refusal.kind, "spawn_failed");
-        assert_eq!(daemon.runtime().unwrap().test_inherited_managed_cleanup_transfers(), 0);
+        assert_eq!(
+            daemon
+                .runtime()
+                .unwrap()
+                .test_inherited_managed_cleanup_transfers(),
+            0
+        );
         let gone = Instant::now() + Duration::from_secs(20);
         loop {
             pump_core(&mut daemon, &mut state);
             if !walkdir_exists(&managed) && hub_worktree_ids(&daemon).is_empty() {
                 break;
             }
-            assert!(Instant::now() < gone, "refused reuse lost the original cleanup");
+            assert!(
+                Instant::now() < gone,
+                "refused reuse lost the original cleanup"
+            );
             std::thread::yield_now();
         }
         daemon.stop();
@@ -4240,11 +4265,10 @@ return botster.register({
             created_worktree: true,
             created_branch: true,
         };
-        let operation = crate::daemon::control::managed_git::ManagedSpawnOperation::test_inherited_terminal(
-            waiter,
-            prepared,
-            permit,
-        );
+        let operation =
+            crate::daemon::control::managed_git::ManagedSpawnOperation::test_inherited_terminal(
+                waiter, prepared, permit,
+            );
         insert_phase_test_row(
             &mut state,
             waiter,
@@ -4259,7 +4283,10 @@ return botster.register({
         let deadline = Instant::now() + Duration::from_secs(10);
         while !state.pending_requests.is_empty() {
             crate::daemon::control::pending::dispose_terminal_requests(runtime, &mut state);
-            assert!(Instant::now() < deadline, "managed terminal disposal did not finish");
+            assert!(
+                Instant::now() < deadline,
+                "managed terminal disposal did not finish"
+            );
             std::thread::yield_now();
         }
         assert_eq!(runtime.test_confirmed_worktree_rollback_count(), 1);

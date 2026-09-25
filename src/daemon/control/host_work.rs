@@ -734,8 +734,8 @@ impl HostMutationContinuation {
                         },
                     );
                 }
-                let session_type_generation_changed = current_state.session_type_generation
-                    != committed.view.session_type_generation;
+                let session_type_generation_changed =
+                    current_state.session_type_generation != committed.view.session_type_generation;
                 daemon.publish_state(committed.view);
                 if let Some(packages) = committed.packages {
                     daemon.publish_package_registry_view(packages);
@@ -1785,8 +1785,7 @@ mod tests {
         assert!(continuation.retained_prepare.is_some());
         assert!(state.document_waiters.contains(&waiter_id));
         state.document_owner = None;
-        let ControlPoll::ReadyHost(Ok(response), charge) =
-            continuation.poll(daemon, &mut state)
+        let ControlPoll::ReadyHost(Ok(response), charge) = continuation.poll(daemon, &mut state)
         else {
             panic!("stale retained preparation must return an operator error");
         };

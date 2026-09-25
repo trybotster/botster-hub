@@ -2,7 +2,7 @@
 
 use super::*;
 use botster_hub::test_internals::parser_probe::{
-    definition_layout, environment_node_bound, Case, PreparedProbe, ProbePhase,
+    Case, PreparedProbe, ProbePhase, definition_layout, environment_node_bound,
 };
 use std::path::Path;
 

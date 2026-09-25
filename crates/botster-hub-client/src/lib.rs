@@ -5133,8 +5133,9 @@ mod tests {
                 .retain(|feature| feature != FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS);
             daemon
         };
-        ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous)
-            .expect("default requirement accepts the current revision without the optional feature");
+        ensure_compatible(&DaemonCompatibilityRequirement::current(), &previous).expect(
+            "default requirement accepts the current revision without the optional feature",
+        );
         let requirement = DaemonCompatibilityRequirement::for_package_event_subscriptions();
         let mut old_revision = previous.clone();
         old_revision.conformance_fixture_revision = 48;
@@ -5147,9 +5148,11 @@ mod tests {
         );
         let error = ensure_compatible(&requirement, &previous)
             .expect_err("event requirement rejects the missing feature at revision 49");
-        assert!(error
-            .diagnostic
-            .contains("missing required feature(s): package_event_subscriptions"));
+        assert!(
+            error
+                .diagnostic
+                .contains("missing required feature(s): package_event_subscriptions")
+        );
         let mut current = previous;
         current.conformance_fixture_revision = CONFORMANCE_FIXTURE_REVISION;
         current

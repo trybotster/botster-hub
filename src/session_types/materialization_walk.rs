@@ -889,8 +889,8 @@ pub(super) fn counted_parser_peak(
     input: &[u8],
     parent: &mut LuaCallbackCharge,
 ) -> Result<usize, &'static str> {
-    let workspace = counting_workspace_bytes(input)
-        .ok_or("repo session type counting size overflow")?;
+    let workspace =
+        counting_workspace_bytes(input).ok_or("repo session type counting size overflow")?;
     parent
         .grow(workspace)
         .map_err(|_| "repo session type counting capacity exhausted")?;
@@ -974,9 +974,7 @@ mod tests {
             let content = std::mem::size_of::<serde::__private228::de::Content<'static>>();
             // Pinned RawVec starts each one-element Content vector at four slots.
             assert!(counted.cursor.scratch.capacity > 0);
-            assert!(
-                counted.timeline.maximum >= 24 * 4 * content + counted.cursor.scratch.capacity
-            );
+            assert!(counted.timeline.maximum >= 24 * 4 * content + counted.cursor.scratch.capacity);
             assert!(counted.typed_construction_bytes().unwrap() >= counted.timeline.maximum);
             let parsed =
                 serde_json::from_slice::<super::super::RepoSessionTypesFile>(input.as_bytes());
