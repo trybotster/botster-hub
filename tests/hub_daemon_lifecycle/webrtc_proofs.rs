@@ -1528,19 +1528,31 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         observed.contains("drop:after-webrtc-close"),
         "socket client should observe output after WebRTC close, got {observed:?}"
     );
-    let closed_peer_drain = connection
-        .request(&botster_hub_client::DaemonRequest::Status)
-        .expect("drain closed WebRTC subscription");
-    let occupancy_after_close = closed_peer_drain
-        .status
-        .as_ref()
-        .map(|status| status.live_attach_occupancy.clone())
-        .unwrap_or_default();
+    // Peer close reaches the Hub as an ICE Disconnected transition, about
+    // five seconds after the close (traced at t+4.7s). Poll Status within a
+    // bounded budget instead of asserting once after a fixed sleep.
+    let detach_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let occupancy_after_close = loop {
+        let occupancy = connection
+            .request(&botster_hub_client::DaemonRequest::Status)
+            .expect("drain closed WebRTC subscription")
+            .status
+            .map(|status| status.live_attach_occupancy)
+            .unwrap_or_default();
+        if occupancy
+            .iter()
+            .all(|row| row.subscription_id != "local-webrtc-drop-subscription")
+            || std::time::Instant::now() >= detach_deadline
+        {
+            break occupancy;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     assert!(
         occupancy_after_close
             .iter()
             .all(|row| row.subscription_id != "local-webrtc-drop-subscription"),
-        "closed WebRTC peer subscription must not stay attached: {occupancy_after_close:?}"
+        "closed WebRTC peer subscription must detach within 20s: {occupancy_after_close:?}"
     );
 
     let shutdown_session = connection
