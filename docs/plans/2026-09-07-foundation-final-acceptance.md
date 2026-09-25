@@ -55,10 +55,11 @@ Coverage gap (#17): the harness cannot send a control message over a closed WebR
 
 Diagnostics at `77f944da` with the `e295cdea` candidate, one run each (`/Users/jasonconigliari/botster-evidence/diagnostics-20260925/`):
 - #3: the idle reattach returned TerminalAttached, but no attach event arrived, occupancy was empty, and the screen stayed empty. A stale close of the dropped connection may remove the new route. Not verified.
-- #7: during the flood, reconciliation wakes rose (63 → 90) and the entity upsert arrived. The test then failed later: it requires idle reconciliation wakes to rise (observed 350 → 350). That expectation conflicts with the no-polling rule and needs a contract decision.
+- #7: during the flood, reconciliation wakes rose (63 → 90) and the entity upsert arrived. The test then failed later: it requires idle reconciliation wakes to rise (observed 350 → 350). The reviewer classified that lower bound as obsolete: the idle window follows a quiet interval, and no event requires observe or journal work. The assertion is removed; the no-rescan and no-extra-delivery bounds stay. The original flood failure is not proven intermittent, because this diagnostic added an event.
 - #11: a held session_type subscription under poison received the stale generation-1 snapshot, while ListSessionTypes returned `invalid_repo_session_types`. Reviewer trace: `SessionTypeCatalogCache::refresh` returns Ready when the generation matches, so an external repo-file change never invalidates the cache.
 - #12: ShutdownSession returned Events and RemoveSession returned SessionRemoved. The session list and occupancy no longer showed the victim, but the replacement spawn got `reserve_session` Occupied.
-- #14 and #15 passed in isolated single-thread runs. Their two-thread failures are load-sensitive and not reproduced.
+- #14 and #15 failed in the two-thread run and passed in isolated single-thread runs. That is non-reproduction, not a cause; G8 investigates them.
+- #7 follow-up: the flood check now requires a lifecycle change published during the flood to reach a held subscriber, replacing the raw wake-counter increase. The test then reached a new assertion (#7b, `sessions.rs` over-cap admission): the 65th client's hello failed with EINVAL instead of a typed rejection. Not diagnosed.
 
 Queued after the production batch: port #23 (cross-package managed spawn) to the daemon owner path; it depends on #8's tagged success envelope.
 
