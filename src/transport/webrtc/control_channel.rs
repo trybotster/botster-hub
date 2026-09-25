@@ -911,6 +911,16 @@ where
     let Some(event) = take_host_event(peer_state) else {
         return Ok(());
     };
+    if let DaemonEvent::TerminalSubscriptionClosed {
+        subscription_id, ..
+    } = &event
+        && crate::transport::webrtc::adapter::diagr(subscription_id)
+    {
+        crate::transport::webrtc::adapter::diagr_log(format_args!(
+            "control flush close event sub={subscription_id} admitted={}",
+            peer_state.mux.close_events_admitted()
+        ));
+    }
     if matches!(event, DaemonEvent::TerminalSubscriptionClosed { .. })
         && !peer_state.mux.close_events_admitted()
     {

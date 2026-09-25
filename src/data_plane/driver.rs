@@ -1516,6 +1516,16 @@ fn run_loop(
             for state in close_batch {
                 let lookup = core_daemon
                     .session_registry_state(&botster_core::SessionId(state.key.session_id.clone()));
+                if crate::transport::webrtc::adapter::diagr(&state.key.subscription_id) {
+                    crate::transport::webrtc::adapter::diagr_log(format_args!(
+                        "close batch sub={} lookup={:?}",
+                        state.key.subscription_id,
+                        lookup
+                            .as_ref()
+                            .map(|found| format!("{found:?}"))
+                            .map_err(|error| format!("{error:?}"))
+                    ));
+                }
                 match session_close_event_decision(lookup) {
                     Some(emit) => {
                         let key = state.key.clone();

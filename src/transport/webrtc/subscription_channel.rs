@@ -517,8 +517,32 @@ where
     // Per-channel outbound message id; the first Hub-to-client message is 1.
     let mut next_message_id: u64 = 1;
     let mut close_deadline = None;
+    let diagr_route = handle.diagr_route();
+    let mut diagr_turns = 0usize;
+    if let Some(route) = diagr_route.as_ref() {
+        crate::transport::webrtc::adapter::diagr_log(format_args!(
+            "driver start route={route} handle={}",
+            handle.diagr_state()
+        ));
+    }
     loop {
+        if let Some(route) = diagr_route.as_ref() {
+            diagr_turns += 1;
+            if diagr_turns <= 6 {
+                crate::transport::webrtc::adapter::diagr_log(format_args!(
+                    "driver turn={diagr_turns} route={route} handle={}",
+                    handle.diagr_state()
+                ));
+            }
+        }
         if handle.is_closed() {
+            if let Some(route) = diagr_route.as_ref() {
+                crate::transport::webrtc::adapter::diagr_log(format_args!(
+                    "driver exit adapter_closed route={route} turns={diagr_turns} messages_sent={} handle={}",
+                    next_message_id - 1,
+                    handle.diagr_state()
+                ));
+            }
             close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
             return TerminalDriverExit::AdapterClosed;
         }
@@ -540,6 +564,12 @@ where
                         Some(tokio::time::Instant::now() + LOCAL_WEBRTC_PEER_CLOSE_BOUND);
                 }
                 Err(exit) => {
+                    if let Some(route) = diagr_route.as_ref() {
+                        crate::transport::webrtc::adapter::diagr_log(format_args!(
+                            "driver exit flush_error route={route} exit={exit:?} messages_sent={}",
+                            next_message_id - 1
+                        ));
+                    }
                     close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
                     handle.close();
                     return exit;
