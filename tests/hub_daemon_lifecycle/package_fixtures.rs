@@ -260,6 +260,114 @@ return botster.register({
     .expect("write managed Git package manifest");
 }
 
+/// A caller plugin that spawns session types contributed by other packages.
+/// `tool_prefix` keeps tool names distinct when two callers are enabled.
+pub(crate) fn write_cross_package_caller_package(
+    root: &Path,
+    package_name: &str,
+    tool_prefix: &str,
+    allow_managed_spawn: bool,
+) {
+    fs::create_dir_all(root).expect("create cross-package caller root");
+    fs::write(
+        root.join("plugin.lua"),
+        format!(
+            r#"
+return botster.register({{
+  tools = {{
+    {{
+      name = "{tool_prefix}.atomic",
+      description = "Spawn an eligible template contributed by another package.",
+      handler = "atomic",
+      call = function(args)
+        return botster.capabilities.session_types.ensure_worktree_and_spawn(args)
+      end,
+    }},
+    {{
+      name = "{tool_prefix}.inspect",
+      description = "Inspect target-effective templates contributed by another package.",
+      handler = "inspect",
+      call = function(args)
+        return {{
+          list = botster.capabilities.session_types.list({{ target_id = args.target_id }}),
+          shown = botster.capabilities.session_types.show({{
+            target_id = args.target_id,
+            session_type_id = args.session_type_id,
+          }}),
+        }}
+      end,
+    }},
+  }},
+}})
+"#
+        ),
+    )
+    .expect("write cross-package caller plugin");
+    let mut capabilities = vec![serde_json::json!({ "surface": "mcp" })];
+    if allow_managed_spawn {
+        capabilities.push(serde_json::json!({
+            "surface": "session_actions",
+            "scope": "session_type_managed_git_spawn"
+        }));
+    }
+    let source_root = fs::canonicalize(root).expect("canonical cross-package caller root");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": package_name,
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root },
+            "capabilities": capabilities,
+            "entrypoints": [
+                { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
+            ]
+        }))
+        .expect("serialize cross-package caller manifest"),
+    )
+    .expect("write cross-package caller manifest");
+}
+
+/// A package that only contributes a session type pinned to `target_id`. Its
+/// command writes a marker into the spawned worktree.
+pub(crate) fn write_cross_package_template_contributor(root: &Path, target_id: &str) {
+    fs::create_dir_all(root.join("bin")).expect("create template contributor bin");
+    let command = root.join("bin/init.sh");
+    fs::write(
+        &command,
+        "#!/bin/sh\nprintf 'cross-package\\n' > cross-package-executed.txt\n",
+    )
+    .expect("write cross-package template command");
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
+        .expect("make cross-package template command executable");
+    let source_root = fs::canonicalize(root).expect("canonical template contributor root");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "managed-session-type.plugin",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root },
+            "capabilities": [],
+            "entrypoints": [],
+            "session_types": [{
+                "id": "init",
+                "label": "Managed agent",
+                "role": "botster.agent",
+                "interaction": "interactive",
+                "traits": ["test"],
+                "lifecycle": "task",
+                "command": "bin/init.sh",
+                "target_id": target_id
+            }]
+        }))
+        .expect("serialize cross-package template contributor"),
+    )
+    .expect("write cross-package template contributor manifest");
+}
+
 pub(crate) fn write_configurable_local_plugin_package(root: &Path) {
     fs::create_dir_all(root).expect("create configurable package root");
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
