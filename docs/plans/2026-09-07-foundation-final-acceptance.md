@@ -69,6 +69,8 @@ Production batch commits (reviewer accepted; matched-candidate lifecycle proof p
 
 #12 (session id reuse after removal): Hub dropped explicit Core reservation tokens on successful install, so a removed id stayed Occupied. Decision (A): an owner-side record per reserved id, charged to the Hub state SharedView budget before Core reserve, releases the token after an authoritative removal. A live-session count limit (one OwnerPermit per installed session) was considered and NOT added; that limit is a user decision.
 
+#12 commits: `982f089a` ordinary spawn and RemoveSession, `2a5455b9` plugin session-type spawn (owner row and client path), `9514a4a4` managed spawn. Proof limits: the plugin race test pauses after the start consumes Installed, not before the owner consumes it; the managed race is not separately proven; the undelivered managed test proves token ownership transfer, not eventual removal of that session; late Lua-conversion abandonment still only shuts the session down and retracts its context (no removal, no Git rollback), and the installed record keeps release authority until an authoritative removal. The plugin capacity refusal is a coded error string ("session_record_capacity: …"), not a typed field.
+
 Known coverage limits: sustained-flood overlap for #7's event-under-flood check is not proven; #19 proves seeded-state reload, not an owner-path durable commit.
 
 ## Current delivery status — September 23
