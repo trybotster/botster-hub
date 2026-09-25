@@ -153,6 +153,8 @@ pub(crate) struct SessionTypeSpawnStart {
     context_keys: Vec<String>,
     abandon_requested: bool,
     cleanup: CleanupStage,
+    /// Record storage charged before Reserve; registered after Reserve.
+    record_charge: Option<crate::runtime::session_reservations::RecordCharge>,
     // Destroy every payload before the owner binding releases its allowance.
     binding: CoreBinding,
 }
@@ -166,6 +168,8 @@ enum CleanupStage {
     Release,
     Confirmed,
     Unresolved,
+    /// The session was removed while it launched; the handoff releases it.
+    HandoffRelease,
 }
 
 /// Confirmed establishes Core cleanup. Context retirement remains separate.
@@ -182,6 +186,18 @@ impl HubRuntime {
         waiter_id: crate::owner_identity::WaiterId,
         session_id: SessionId,
         parent: crate::lua_memory::LuaCallbackCharge,
+    ) -> SessionTypeSpawnStart {
+        self.test_begin_owner_spawn_with_record(waiter_id, session_id, parent, "sleep 30", None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_begin_owner_spawn_with_record(
+        &self,
+        waiter_id: crate::owner_identity::WaiterId,
+        session_id: SessionId,
+        parent: crate::lua_memory::LuaCallbackCharge,
+        command: &str,
+        record_charge: Option<crate::runtime::session_reservations::RecordCharge>,
     ) -> SessionTypeSpawnStart {
         let context_id = format!("ctx-{}", session_id.0);
         let binding = CoreBinding::Owner {
@@ -200,7 +216,7 @@ impl HubRuntime {
                     self,
                     RequestId(format!("owner-test-{}", session_id.0)),
                     session_id.clone(),
-                    "sleep 30".into(),
+                    command.into(),
                 ),
                 metadata: crate::client_api::client_session_metadata(),
             },
@@ -219,6 +235,7 @@ impl HubRuntime {
             context_keys: vec!["prompt".into()],
             abandon_requested: false,
             cleanup: CleanupStage::SpawnPending,
+            record_charge,
             binding,
         }
     }
@@ -299,14 +316,16 @@ impl HubRuntime {
         drop(state);
         materialized.metadata =
             session_type_plugin_metadata(materialized.metadata, &pending.plugin_key);
-        Ok(self.begin_materialized_session_type_spawn(materialized, CoreBinding::Ownerless))
+        Ok(self.begin_materialized_session_type_spawn(materialized, CoreBinding::Ownerless, None))
     }
 
     /// Start the existing Core stages after the Host worker returns its product.
+    /// The caller charges the reservation record before any Core work.
     pub(crate) fn begin_session_type_spawn_for_owner(
         &self,
         waiter_id: crate::owner_identity::WaiterId,
         product: crate::session_types::ChargedSessionTypeMaterialization,
+        record_charge: crate::runtime::session_reservations::RecordCharge,
     ) -> SessionTypeSpawnStart {
         let (materialized, allowance) = product.into_parts();
         self.begin_materialized_session_type_spawn(
@@ -315,18 +334,22 @@ impl HubRuntime {
                 waiter_id,
                 allowance,
             },
+            Some(record_charge),
         )
     }
 
     /// Direct client callers use the same reservation and context stages.
+    /// The caller charges the reservation record before any Core work.
     pub(crate) fn begin_client_session_type_spawn(
         &self,
         materialized: crate::session_types::MaterializedSessionType,
         waiter_id: crate::owner_identity::WaiterId,
+        record_charge: crate::runtime::session_reservations::RecordCharge,
     ) -> SessionTypeSpawnStart {
         self.begin_materialized_session_type_spawn(
             materialized,
             CoreBinding::ClientOwner(waiter_id),
+            Some(record_charge),
         )
     }
 
@@ -334,6 +357,7 @@ impl HubRuntime {
         &self,
         materialized: crate::session_types::MaterializedSessionType,
         binding: CoreBinding,
+        record_charge: Option<crate::runtime::session_reservations::RecordCharge>,
     ) -> SessionTypeSpawnStart {
         let spawn = SpawnSessionRequest {
             request: materialized.spawn_request,
@@ -373,6 +397,7 @@ impl HubRuntime {
             context_keys: materialized.resolved.context_keys,
             abandon_requested: false,
             cleanup: CleanupStage::SpawnPending,
+            record_charge,
         }
     }
 
@@ -575,6 +600,21 @@ impl SessionTypeSpawnStart {
                         );
                         self.cleanup = CleanupStage::Release;
                     }
+                    // A client's authoritative removal of this exact
+                    // reservation's session also authorizes the release.
+                    _ if self.reservation.as_ref().is_some_and(|held| {
+                        runtime.session_reservations().removed_during_launch(
+                            &self.spawn.request.session_id.0,
+                            held.identity(),
+                        )
+                    }) =>
+                    {
+                        let held = self.reservation.clone().expect("checked reservation");
+                        self.tracker = self
+                            .binding
+                            .begin(runtime, CoreOperation::ReleaseSessionReservation(held));
+                        self.cleanup = CleanupStage::Release;
+                    }
                     // False means the session is still live, not absent.
                     _ => self.cleanup = CleanupStage::Unresolved,
                 },
@@ -583,7 +623,10 @@ impl SessionTypeSpawnStart {
                     CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
                         result: Ok(SessionReservationRelease::Released),
                         ..
-                    })) => self.cleanup = CleanupStage::Confirmed,
+                    })) => {
+                        self.retire_record(runtime);
+                        self.cleanup = CleanupStage::Confirmed;
+                    }
                     _ => self.cleanup = CleanupStage::Unresolved,
                 },
                 CleanupStage::Confirmed => {
@@ -600,6 +643,11 @@ impl SessionTypeSpawnStart {
                     return SessionSpawnCleanupPoll::Confirmed;
                 }
                 CleanupStage::Unresolved => return SessionSpawnCleanupPoll::Unresolved,
+                CleanupStage::HandoffRelease => {
+                    if !self.poll_handoff(runtime) {
+                        return SessionSpawnCleanupPoll::Pending;
+                    }
+                }
             }
         }
     }
@@ -677,6 +725,26 @@ impl SessionTypeSpawnStart {
                             self.reservation = Some(reserved.clone());
                             if self.abandon_requested {
                                 self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                self.release_or_retain(runtime);
+                                continue;
+                            }
+                            // Register before SpawnReserved so any later
+                            // removal of this id finds the record. A record
+                            // that already exists means a lost release
+                            // obligation: do not spawn; release this token.
+                            if let Some(charge) = self.record_charge.take()
+                                && runtime
+                                    .session_reservations()
+                                    .register(charge, reserved.identity())
+                                    .is_err()
+                            {
+                                eprintln!(
+                                    "session reservation record invariant failed for {}",
+                                    self.spawn.request.session_id.0
+                                );
+                                self.spawn_error = Some(CoreDaemonError::SessionReservation(
+                                    SessionReservationRefusal::Occupied,
+                                ));
                                 self.release_or_retain(runtime);
                                 continue;
                             }
@@ -801,6 +869,7 @@ impl SessionTypeSpawnStart {
                         let error = self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
                         match result {
                             Ok(SessionReservationRelease::Released) => {
+                                self.retire_record(runtime);
                                 self.cleanup = CleanupStage::Confirmed;
                                 return spawn_fail(
                                     error,
@@ -840,11 +909,85 @@ impl SessionTypeSpawnStart {
     fn keep_reservation(&mut self, runtime: &HubRuntime) {
         // The daemon row retains the complete unresolved operation.
         // The synchronous path still uses its existing reservation store.
-        if matches!(&self.binding, CoreBinding::Ownerless)
-            && let Some(held) = self.reservation.take()
+        // A client pending ends when it returns, so it hands its token and
+        // record to the retained list here. An owner row keeps the complete
+        // unresolved operation instead.
+        if matches!(
+            &self.binding,
+            CoreBinding::Ownerless | CoreBinding::ClientOwner(_)
+        ) && let Some(held) = self.reservation.take()
         {
+            runtime
+                .session_reservations()
+                .retire(&self.spawn.request.session_id.0, held.identity());
             runtime.retain_reservation(held);
         }
+    }
+
+    /// Delete this token's record (identity-exact; a token that was never
+    /// registered matches no record).
+    fn retire_record(&self, runtime: &HubRuntime) {
+        if let Some(held) = self.reservation.as_ref() {
+            runtime
+                .session_reservations()
+                .retire(&self.spawn.request.session_id.0, held.identity());
+        }
+    }
+
+    /// At a successful handoff, give the installed token to its record.
+    /// Returns `true` when ownership is settled. `false` means the session
+    /// was removed while it launched; poll `poll_handoff` until it settles.
+    pub(crate) fn begin_handoff(&mut self, runtime: &HubRuntime) -> bool {
+        use crate::runtime::session_reservations::Handoff;
+        let Some(token) = self.reservation.take() else {
+            return true;
+        };
+        match runtime
+            .session_reservations()
+            .install(&self.spawn.request.session_id.0, token)
+        {
+            Handoff::Kept => true,
+            Handoff::Unregistered(token) => {
+                runtime.retain_reservation(token);
+                true
+            }
+            Handoff::ReleaseNow(token) => {
+                self.tracker = self.binding.begin(
+                    runtime,
+                    CoreOperation::ReleaseSessionReservation(token.clone()),
+                );
+                self.reservation = Some(token);
+                self.cleanup = CleanupStage::HandoffRelease;
+                false
+            }
+        }
+    }
+
+    /// Settle a removed-during-launch release. Returns `true` when done.
+    pub(crate) fn poll_handoff(&mut self, runtime: &HubRuntime) -> bool {
+        if !matches!(self.cleanup, CleanupStage::HandoffRelease) {
+            return true;
+        }
+        let released = match self.poll_core(runtime) {
+            CoreTicketPoll::Pending => return false,
+            CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                result: Ok(SessionReservationRelease::Released),
+                ..
+            })) => true,
+            _ => false,
+        };
+        self.retire_record(runtime);
+        if let Some(token) = self.reservation.take()
+            && !released
+        {
+            eprintln!(
+                "session {} was already removed; its reservation release is unconfirmed and the token is retained for retry",
+                self.spawn.request.session_id.0
+            );
+            runtime.retain_reservation(token);
+        }
+        self.cleanup = CleanupStage::Confirmed;
+        true
     }
 
     fn continue_retry_or_reserve(&mut self, runtime: &HubRuntime) {
@@ -944,6 +1087,7 @@ mod tests {
             context_keys: Vec::new(),
             abandon_requested: false,
             cleanup: CleanupStage::SpawnPending,
+            record_charge: None,
             binding,
         };
         collect_phases(&runtime, &mut receiver, waiter_id, [1, 2]);

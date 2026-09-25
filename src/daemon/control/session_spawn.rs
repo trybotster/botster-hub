@@ -188,6 +188,8 @@ enum Phase {
     Core,
     Delivery,
     Conversion,
+    /// Delivery succeeded; the reservation token moves to its record.
+    Handoff,
     Cleanup,
     Fault,
     Done,
@@ -246,6 +248,8 @@ pub(crate) struct SessionTypeSpawnOperation {
     admitted_failure: Option<AdmittedFailure>,
     failure: Option<DaemonResponse>,
     phase: Phase,
+    /// The success handoff has asked the record to take the token.
+    handoff_begun: bool,
     // Drop the retirement after every ticket and Core stage.
     retirement: CoreWaiterRetirement,
 }
@@ -333,6 +337,7 @@ impl SessionTypeSpawnOperation {
             admitted_failure: None,
             failure: None,
             phase: Phase::Ready,
+            handoff_begun: false,
             retirement,
         }
     }
@@ -368,8 +373,21 @@ impl SessionTypeSpawnOperation {
             admitted_failure: None,
             failure: None,
             phase: Phase::Host,
+            handoff_begun: false,
             retirement,
         }
+    }
+
+    /// Move the installed token to its record. Returns `true` once settled.
+    fn advance_handoff(&mut self, runtime: &crate::HubRuntime) -> bool {
+        let Some(start) = self.start.as_mut() else {
+            return true;
+        };
+        if !self.handoff_begun {
+            self.handoff_begun = true;
+            return start.begin_handoff(runtime);
+        }
+        start.poll_handoff(runtime)
     }
 
     fn send_unavailable(&mut self, reason: &'static str) {
@@ -462,8 +480,23 @@ impl SessionTypeSpawnOperation {
                 }
                 Phase::Ready => {
                     let product = self.product.take().expect("charged spawn product exists");
-                    self.start =
-                        Some(runtime.begin_session_type_spawn_for_owner(self.waiter_id, product));
+                    // The reservation record is charged before Core reserves
+                    // the id; a refusal leaves nothing to clean up.
+                    let Ok(record_charge) =
+                        runtime.charge_session_reservation(product.session_id())
+                    else {
+                        drop(product);
+                        self.send_unavailable(
+                            "session_record_capacity: the Hub state budget cannot hold the session reservation record",
+                        );
+                        self.phase = Phase::Done;
+                        return ControlPoll::FinishedInternal;
+                    };
+                    self.start = Some(runtime.begin_session_type_spawn_for_owner(
+                        self.waiter_id,
+                        product,
+                        record_charge,
+                    ));
                     self.phase = Phase::Core;
                 }
                 Phase::Core => {
@@ -576,8 +609,8 @@ impl SessionTypeSpawnOperation {
                         CoreTicketPoll::Pending => return ControlPoll::Pending,
                         CoreTicketPoll::Ready(SpawnDeliveryOutcome::Delivered) => {
                             self.delivery = None;
-                            self.phase = Phase::Done;
-                            return ControlPoll::FinishedInternal;
+                            self.phase = Phase::Handoff;
+                            return ControlPoll::Again;
                         }
                         CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
                             // Lost is visible only after the owner collects its identity.
@@ -594,8 +627,8 @@ impl SessionTypeSpawnOperation {
                         CoreTicketPoll::Pending => return ControlPoll::Pending,
                         CoreTicketPoll::Ready(SpawnConversionOutcome::Converted) => {
                             self.conversion = None;
-                            self.phase = Phase::Done;
-                            return ControlPoll::FinishedInternal;
+                            self.phase = Phase::Handoff;
+                            return ControlPoll::Again;
                         }
                         CoreTicketPoll::Ready(SpawnConversionOutcome::Abandoned)
                         | CoreTicketPoll::Lost
@@ -605,6 +638,13 @@ impl SessionTypeSpawnOperation {
                             return ControlPoll::Again;
                         }
                     }
+                }
+                Phase::Handoff => {
+                    if !self.advance_handoff(runtime) {
+                        return ControlPoll::Pending;
+                    }
+                    self.phase = Phase::Done;
+                    return ControlPoll::FinishedInternal;
                 }
                 Phase::Cleanup => {
                     let start = self.start.as_mut().expect("cleanup owns the Core stage");
@@ -641,8 +681,7 @@ impl SessionTypeSpawnOperation {
                 CoreTicketPoll::Pending => return false,
                 CoreTicketPoll::Ready(SpawnDeliveryOutcome::Delivered) => {
                     self.delivery = None;
-                    self.phase = Phase::Done;
-                    return true;
+                    self.phase = Phase::Handoff;
                 }
                 CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
                     self.delivery = None;
@@ -655,8 +694,7 @@ impl SessionTypeSpawnOperation {
                 CoreTicketPoll::Pending => return false,
                 CoreTicketPoll::Ready(SpawnConversionOutcome::Converted) => {
                     self.conversion = None;
-                    self.phase = Phase::Done;
-                    return true;
+                    self.phase = Phase::Handoff;
                 }
                 CoreTicketPoll::Ready(SpawnConversionOutcome::Abandoned)
                 | CoreTicketPoll::Lost
@@ -665,6 +703,12 @@ impl SessionTypeSpawnOperation {
                     self.phase = Phase::Cleanup;
                 }
             }
+        }
+        if self.phase == Phase::Handoff {
+            if !self.advance_handoff(runtime) {
+                return false;
+            }
+            self.phase = Phase::Done;
         }
         if self.phase == Phase::Done {
             return true;
@@ -967,6 +1011,7 @@ mod owner_conversion_lifecycle_tests {
             admitted_failure: None,
             failure: None,
             phase: Phase::Core,
+            handoff_begun: false,
             retirement,
         };
         let mut state = DaemonControlState::default();
@@ -1053,6 +1098,7 @@ mod owner_conversion_lifecycle_tests {
             admitted_failure: None,
             failure: None,
             phase: Phase::Core,
+            handoff_begun: false,
             retirement,
         };
         let mut state = DaemonControlState::default();
