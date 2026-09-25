@@ -411,6 +411,11 @@ pub(crate) fn handle(
         waiter_id,
         phase: 1,
     };
+    let observes_session_type_catalog = matches!(
+        &command,
+        HostMutationCommand::Read(HostRead::SessionType { .. })
+            | HostMutationCommand::Prepare(HostPrepare::SessionType { .. })
+    );
     if let Err(error) =
         runtime
             .host_executor()
@@ -431,6 +436,7 @@ pub(crate) fn handle(
                 next_phase: 2,
                 family_work: None,
                 event_cleanup: None,
+                observes_session_type_catalog,
             },
         )),
         retire: None,
@@ -451,6 +457,10 @@ pub(crate) struct HostMutationContinuation {
         HostMutationResult,
         crate::package_event_router::EventOwnerWorkId,
     )>,
+    /// Session-type reads and prepares may read the repository catalog. Each
+    /// result of such a continuation conservatively counts as an external
+    /// observation of it, even when that phase did not read the file.
+    observes_session_type_catalog: bool,
 }
 
 impl HostMutationContinuation {
@@ -514,6 +524,7 @@ impl HostMutationContinuation {
             next_phase,
             family_work,
             event_cleanup,
+            observes_session_type_catalog,
         } = self;
         let waiter_id = *waiter_id;
         let must_finish = *must_finish;
@@ -614,6 +625,9 @@ impl HostMutationContinuation {
             (result, permit)
         };
         let mut result = result;
+        if *observes_session_type_catalog {
+            crate::subscription::entity::note_session_type_catalog_observation(state);
+        }
         if !matches!(
             result,
             HostMutationResult::PublishedUncertain { .. }
@@ -1748,6 +1762,7 @@ mod tests {
                 next_phase: 2,
                 family_work: None,
                 event_cleanup: None,
+                observes_session_type_catalog: false,
             };
             let ControlPoll::ReadyHost(Ok(response), charge) =
                 continuation.poll(&mut daemon, &mut state)
@@ -1802,6 +1817,7 @@ mod tests {
             next_phase: 2,
             family_work: None,
             event_cleanup: None,
+            observes_session_type_catalog: false,
         };
         assert!(matches!(
             continuation.poll(daemon, &mut state),
@@ -2000,6 +2016,7 @@ mod tests {
                 next_phase: 2,
                 family_work: None,
                 event_cleanup: None,
+                observes_session_type_catalog: false,
             };
             assert!(!state.maintenance.wakes.take(delivery));
             let ControlPoll::ReadyHost(Ok(response), charge) =
@@ -2055,6 +2072,7 @@ mod tests {
             next_phase: 2,
             family_work: None,
             event_cleanup: None,
+            observes_session_type_catalog: false,
         };
         let poll = continuation.poll(daemon, &mut state);
         assert!(matches!(
