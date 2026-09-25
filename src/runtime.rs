@@ -542,6 +542,10 @@ pub(crate) struct ManagedSessionSpawnStart {
     spawn_error: Option<CoreDaemonError>,
     reserve_operation_id: Option<PendingOperationId>,
     context_published: bool,
+    /// Record storage charged before Reserve; registered after Reserve.
+    record_charge: Option<session_reservations::RecordCharge>,
+    /// A removed-during-launch release is in flight at the handoff.
+    handoff_release: bool,
 }
 
 /// Structured Lua-facing session-type spawn response.
@@ -2015,6 +2019,18 @@ impl HubRuntime {
             metadata,
         };
         let session_id = spawn.request.session_id.clone();
+        // The reservation record is charged before Core reserves the id.
+        let record_charge = self
+            .charge_session_reservation(&session_id.0)
+            .map_err(|error| {
+                ManagedGitError::new(
+                    "session_record_capacity",
+                    format!(
+                        "the Hub state budget cannot hold the session reservation record: requested {} bytes, {} available",
+                        error.requested, error.available
+                    ),
+                )
+            })?;
         let tracker = self.begin_reserve_session_for_owner(owner_waiter, session_id);
         Ok(ManagedSessionSpawnStart {
             tracker,
@@ -2026,6 +2042,8 @@ impl HubRuntime {
             spawn_error: None,
             reserve_operation_id: None,
             context_published: false,
+            record_charge: Some(record_charge),
+            handoff_release: false,
         })
     }
 
@@ -2090,6 +2108,17 @@ impl HubRuntime {
             &session_id.0,
             identity,
         );
+    }
+
+    /// Whether a created-worktree cleanup owns this session's token.
+    pub(crate) fn created_worktree_cleanup_tracks(&self, session_id: &str) -> bool {
+        self.created_worktree_cleanups
+            .lock()
+            .ok()
+            .is_some_and(|held| {
+                held.iter()
+                    .any(|cleanup| cleanup.session_id.0 == session_id)
+            })
     }
 
     pub(crate) fn queue_created_worktree_cleanup(
@@ -2261,6 +2290,8 @@ impl HubRuntime {
                     result: Ok(SessionReservationRelease::Released),
                     ..
                 })) => {
+                    self.session_reservations
+                        .retire(&cleanup.session_id.0, cleanup.reservation.identity());
                     confirmed.push(cleanup.prepared);
                 }
                 CoreTicketPoll::Ready(_) | CoreTicketPoll::Lost | CoreTicketPoll::Refused => {
@@ -6230,6 +6261,26 @@ impl ManagedSessionSpawnStart {
                     })) => match result {
                         Ok(reserved) => {
                             self.reservation = Some(reserved.clone());
+                            // Register before SpawnReserved so any later
+                            // removal of this id finds the record. A record
+                            // that already exists means a lost release
+                            // obligation: do not spawn; release this token.
+                            if let Some(charge) = self.record_charge.take()
+                                && runtime
+                                    .session_reservations()
+                                    .register(charge, reserved.identity())
+                                    .is_err()
+                            {
+                                eprintln!(
+                                    "session reservation record invariant failed for {}",
+                                    self.spawn.request.session_id.0
+                                );
+                                self.spawn_error = Some(CoreDaemonError::SessionReservation(
+                                    SessionReservationRefusal::Occupied,
+                                ));
+                                self.release_or_retain(runtime);
+                                continue;
+                            }
                             let context_charge = self
                                 .context
                                 .as_ref()
@@ -6349,6 +6400,7 @@ impl ManagedSessionSpawnStart {
                         let error = self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
                         match result {
                             Ok(SessionReservationRelease::Released) => {
+                                self.retire_record(runtime);
                                 return spawn_fail(
                                     error,
                                     Some(SessionReservationRelease::Released),
@@ -6385,8 +6437,78 @@ impl ManagedSessionSpawnStart {
 
     fn keep_reservation(&mut self, runtime: &HubRuntime) {
         if let Some(held) = self.reservation.take() {
+            runtime
+                .session_reservations()
+                .retire(&self.spawn.request.session_id.0, held.identity());
             runtime.retain_reservation(held);
         }
+    }
+
+    /// Delete this token's record (identity-exact).
+    fn retire_record(&self, runtime: &HubRuntime) {
+        if let Some(held) = self.reservation.as_ref() {
+            runtime
+                .session_reservations()
+                .retire(&self.spawn.request.session_id.0, held.identity());
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.spawn.request.session_id.0
+    }
+
+    /// After delivery, give the installed token to its record. Returns
+    /// `true` when ownership is settled; `false` means the session was
+    /// removed while it launched and `poll_handoff` must settle the release.
+    pub(crate) fn begin_handoff(&mut self, runtime: &HubRuntime) -> bool {
+        use session_reservations::Handoff;
+        let Some(token) = self.reservation.take() else {
+            return true;
+        };
+        match runtime
+            .session_reservations()
+            .install(&self.spawn.request.session_id.0, token)
+        {
+            Handoff::Kept => true,
+            Handoff::Unregistered(token) => {
+                runtime.retain_reservation(token);
+                true
+            }
+            Handoff::ReleaseNow(token) => {
+                self.tracker = runtime
+                    .begin_release_session_reservation_for_owner(self.waiter_id, token.clone());
+                self.reservation = Some(token);
+                self.handoff_release = true;
+                false
+            }
+        }
+    }
+
+    /// Settle a removed-during-launch release. Returns `true` when done.
+    pub(crate) fn poll_handoff(&mut self, runtime: &HubRuntime) -> bool {
+        if !self.handoff_release {
+            return true;
+        }
+        let released = match self.tracker.poll(runtime) {
+            CoreTicketPoll::Pending => return false,
+            CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                result: Ok(SessionReservationRelease::Released),
+                ..
+            })) => true,
+            _ => false,
+        };
+        self.retire_record(runtime);
+        if let Some(token) = self.reservation.take()
+            && !released
+        {
+            eprintln!(
+                "session {} was already removed; its reservation release is unconfirmed and the token is retained for retry",
+                self.spawn.request.session_id.0
+            );
+            runtime.retain_reservation(token);
+        }
+        self.handoff_release = false;
+        true
     }
 }
 
