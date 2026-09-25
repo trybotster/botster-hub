@@ -584,6 +584,10 @@ impl AttachStreamRegistry {
                     .then_some(row.generation)
             })
         };
+        // A full read covers every live owner: every key is queried.
+        let lookup = |client_id: &str, session_id: &str, subscription_id: &str| {
+            Some(lookup(client_id, session_id, subscription_id))
+        };
         let _ = self.reconcile_inventory_slice(lookup, read_epoch, None, usize::MAX);
     }
 
@@ -630,9 +634,15 @@ impl AttachStreamRegistry {
     /// stale decision and is left untouched. `lookup` is keyed by the
     /// stream's owning client plus the route, so another client's row for
     /// the same route never reads as this stream's generation.
+    ///
+    /// `lookup` returns `None` when the read did not ask Core about the
+    /// route, and `Some(None)` when Core answered that the route has no live
+    /// owner. A stream that attached before the read but bound after the
+    /// read was built was not asked about; the rows carry no evidence that
+    /// Core lost it, so it waits for a later read.
     pub(crate) fn reconcile_inventory_slice(
         &mut self,
-        mut lookup: impl FnMut(&str, &str, &str) -> Option<TerminalSubscriptionGeneration>,
+        mut lookup: impl FnMut(&str, &str, &str) -> Option<Option<TerminalSubscriptionGeneration>>,
         read_epoch: u64,
         after: Option<(String, String)>,
         max_entries: usize,
@@ -658,12 +668,14 @@ impl AttachStreamRegistry {
             if !adapter_bound || identity.epoch > read_epoch {
                 continue;
             }
+            let Some(live) = lookup(&identity.client_id, &session_id, &subscription_id) else {
+                continue;
+            };
             validated += 1;
             let stream_generation = self
                 .streams
                 .get(&(session_id.clone(), subscription_id.clone()))
                 .and_then(|stream| stream.generation);
-            let live = lookup(&identity.client_id, &session_id, &subscription_id);
             if Self::route_is_stale_against_live_generation(stream_generation, live) {
                 if self.cancel_stream_if(&session_id, &subscription_id, &identity) {
                     retired.push((session_id, subscription_id));
@@ -1085,6 +1097,13 @@ impl AttachedSubscriptionChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lookup for a read that asked Core about every route.
+    fn every(
+        mut live: impl FnMut(&str, &str, &str) -> Option<TerminalSubscriptionGeneration>,
+    ) -> impl FnMut(&str, &str, &str) -> Option<Option<TerminalSubscriptionGeneration>> {
+        move |client, session, subscription| Some(live(client, session, subscription))
+    }
     use crate::HubRuntime;
     use crate::client_api_dto::response::daemon_response_base;
     use crate::transport::unix::{UnixConnectionMux, UnixTerminalAdapter};
@@ -2027,7 +2046,7 @@ mod tests {
         // Read submitted after the bind; Core ended the route before the read
         // ran, so the vector lacks it.
         let progress = registry.reconcile_inventory_slice(
-            |_, _, _| None,
+            every(|_, _, _| None),
             registry.attach_epoch(),
             None,
             usize::MAX,
@@ -2057,14 +2076,14 @@ mod tests {
         let later = registry.start_attach(owner(), "s".into(), "later".into());
         let (_a2, later_handle) = bind_unix(&mut registry, &later, "s", "later", 2);
         let progress = registry.reconcile_inventory_slice(
-            |client_id, session_id, subscription_id| {
+            every(|client_id, session_id, subscription_id| {
                 read.iter().find_map(|row| {
                     (row.client_id.0 == client_id
                         && row.session_id.0 == session_id
                         && row.subscription_id.0 == subscription_id)
                         .then_some(row.generation)
                 })
-            },
+            }),
             read_epoch,
             None,
             usize::MAX,
@@ -2094,7 +2113,7 @@ mod tests {
         let pending = registry.start_attach(owner(), "s".into(), "pending".into());
         let read: Vec<TerminalSubscriptionRecord> = Vec::new();
         let progress = registry.reconcile_inventory_slice(
-            |_, _, _| None,
+            every(|_, _, _| None),
             registry.attach_epoch(),
             None,
             usize::MAX,
@@ -2163,14 +2182,14 @@ mod tests {
         let read_one = vec![inventory_row("client-a", "s", "a-first", 1)];
         let read_one_epoch = registry.attach_epoch();
         let progress = registry.reconcile_inventory_slice(
-            |_, session_id, subscription_id| {
+            every(|_, session_id, subscription_id| {
                 read_one
                     .iter()
                     .find(|row| {
                         row.session_id.0 == session_id && row.subscription_id.0 == subscription_id
                     })
                     .map(|row| row.generation)
-            },
+            }),
             read_one_epoch,
             None,
             1,
@@ -2184,14 +2203,14 @@ mod tests {
         let second = registry.start_attach(owner(), "s".into(), "b-second".into());
         let (_a2, second_handle) = bind_unix(&mut registry, &second, "s", "b-second", 2);
         let _ = registry.reconcile_inventory_slice(
-            |_, session_id, subscription_id| {
+            every(|_, session_id, subscription_id| {
                 read_two
                     .iter()
                     .find(|row| {
                         row.session_id.0 == session_id && row.subscription_id.0 == subscription_id
                     })
                     .map(|row| row.generation)
-            },
+            }),
             read_two_epoch,
             progress.after,
             1,
@@ -2211,7 +2230,7 @@ mod tests {
         let first = registry.start_attach(owner(), "s".into(), "a-first".into());
         let (_a1, _first_handle) = bind_unix(&mut registry, &first, "s", "a-first", 1);
         let progress = registry.reconcile_inventory_slice(
-            |_, _, _| Some(TerminalSubscriptionGeneration(1)),
+            every(|_, _, _| Some(TerminalSubscriptionGeneration(1))),
             registry.attach_epoch(),
             None,
             1,
@@ -2224,14 +2243,14 @@ mod tests {
         ];
         let read_two_epoch = registry.attach_epoch();
         let _ = registry.reconcile_inventory_slice(
-            |_, session_id, subscription_id| {
+            every(|_, session_id, subscription_id| {
                 read_two
                     .iter()
                     .find(|row| {
                         row.session_id.0 == session_id && row.subscription_id.0 == subscription_id
                     })
                     .map(|row| row.generation)
-            },
+            }),
             read_two_epoch,
             progress.after,
             1,
@@ -2298,6 +2317,93 @@ mod tests {
         assert!(registry.stream_matches("s", "w", &identity));
     }
 
+    /// Model the owner loop's partial read: the query names the bound routes
+    /// of one slice at submission, and Core answers every queried key.
+    fn partial_read(
+        registry: &AttachStreamRegistry,
+        read_epoch: u64,
+        max_entries: usize,
+        live: impl Fn(&str, &str) -> Option<TerminalSubscriptionGeneration>,
+    ) -> Vec<(String, String, Option<TerminalSubscriptionGeneration>)> {
+        registry
+            .inventory_reconcile_routes(read_epoch, None, max_entries)
+            .into_iter()
+            .map(|(session, subscription)| {
+                let generation = live(&session, &subscription);
+                (session, subscription, generation)
+            })
+            .collect()
+    }
+
+    fn answered(
+        answer: &[(String, String, Option<TerminalSubscriptionGeneration>)],
+    ) -> impl FnMut(&str, &str, &str) -> Option<Option<TerminalSubscriptionGeneration>> + '_ {
+        |_, session, subscription| {
+            answer
+                .iter()
+                .find(|(live_session, live_subscription, _)| {
+                    live_session == session && live_subscription == subscription
+                })
+                .map(|(_, _, generation)| *generation)
+        }
+    }
+
+    /// Row 7 (#3): an attach started before a partial read and still unbound
+    /// when the read was built is not in its query. It binds before apply.
+    /// The answer carries no evidence about it, so it must survive.
+    #[test]
+    fn reconcile_skips_a_stream_that_bound_after_its_partial_read_was_built() {
+        let mut registry = AttachStreamRegistry::default();
+        let identity = registry.start_attach(owner(), "s".into(), "late".into());
+        let read_epoch = registry.attach_epoch();
+        let answer = partial_read(&registry, read_epoch, 8, |_, _| None);
+        assert!(answer.is_empty(), "an unbound route is not queried");
+        let (_adapter, handle) = bind_unix(&mut registry, &identity, "s", "late", 3);
+        let progress = registry.reconcile_inventory_slice(answered(&answer), read_epoch, None, 8);
+        assert_eq!(progress.validated, 0);
+        assert!(progress.retired.is_empty());
+        assert!(!handle.host_closed(), "a late bind must survive the read");
+        assert!(registry.stream_matches("s", "late", &identity));
+    }
+
+    /// Row 8 (#3): a local removal between submission and apply moves an
+    /// unqueried bound row into the applied slice. The unqueried row must
+    /// survive; a queried row that Core answered as absent must retire.
+    #[test]
+    fn reconcile_skips_an_unqueried_row_moved_into_the_slice_and_retires_queried_absence() {
+        let mut registry = AttachStreamRegistry::default();
+        let mut identities = Vec::new();
+        let mut adapters = Vec::new();
+        for session in ["a", "b", "c", "d"] {
+            let identity = registry.start_attach(owner(), session.into(), "sub".into());
+            adapters.push(bind_unix(&mut registry, &identity, session, "sub", 1));
+            identities.push(identity);
+        }
+        let read_epoch = registry.attach_epoch();
+        let answer = partial_read(&registry, read_epoch, 3, |session, _| {
+            (session != "c").then_some(TerminalSubscriptionGeneration(1))
+        });
+        assert_eq!(
+            answer
+                .iter()
+                .map(|(session, _, _)| session.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!(registry.cancel_stream_if("b", "sub", &identities[1]));
+        let progress = registry.reconcile_inventory_slice(answered(&answer), read_epoch, None, 3);
+        assert_eq!(progress.validated, 2, "a and c were queried and visited");
+        assert_eq!(
+            progress.retired,
+            vec![("c".to_string(), "sub".to_string())],
+            "a queried key that Core answered as absent retires"
+        );
+        assert!(adapters[2].1.host_closed());
+        assert!(!adapters[3].1.host_closed(), "unqueried d must survive");
+        assert!(registry.stream_matches("d", "sub", &identities[3]));
+        assert!(registry.stream_matches("a", "sub", &identities[0]));
+    }
+
     #[test]
     fn reconcile_releases_routes_missing_from_core_inventory() {
         let mut registry = AttachStreamRegistry::default();
@@ -2340,7 +2446,8 @@ mod tests {
             "b" => Some(TerminalSubscriptionGeneration(9)),
             _ => None,
         };
-        let first = registry.reconcile_inventory_slice(live, registry.attach_epoch(), None, 2);
+        let first =
+            registry.reconcile_inventory_slice(every(live), registry.attach_epoch(), None, 2);
         assert_eq!(first.validated, 2);
         assert!(first.more);
         assert_eq!(
@@ -2358,7 +2465,7 @@ mod tests {
             BoundAdapterHandle::Unix(handle),
         );
         let second = registry.reconcile_inventory_slice(
-            |_, session, _| (session == "c").then_some(TerminalSubscriptionGeneration(4)),
+            every(|_, session, _| (session == "c").then_some(TerminalSubscriptionGeneration(4))),
             registry.attach_epoch(),
             first.after,
             8,
@@ -2389,10 +2496,10 @@ mod tests {
         let mut lookups = 0;
         let read_epoch = registry.attach_epoch();
         let first = registry.reconcile_inventory_slice(
-            |_, _, _| {
+            every(|_, _, _| {
                 lookups += 1;
                 Some(TerminalSubscriptionGeneration(1))
-            },
+            }),
             read_epoch,
             None,
             8,
@@ -2405,11 +2512,11 @@ mod tests {
             Some("unbound-07")
         );
         let second = registry.reconcile_inventory_slice(
-            |_, session, _| {
+            every(|_, session, _| {
                 lookups += 1;
                 assert_eq!(session, "z-bound");
                 Some(TerminalSubscriptionGeneration(1))
-            },
+            }),
             read_epoch,
             first.after,
             8,

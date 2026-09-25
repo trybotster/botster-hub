@@ -546,6 +546,10 @@ pub(crate) fn mark_pump_ready(state: &mut DaemonControlState) {
 /// program order; the Core bridge is one FIFO consumed by one thread).
 pub(crate) struct InventoryRead {
     read_epoch: u64,
+    /// The exact keys the submitted read asked Core about. Tests answer
+    /// every one of them, as Core does.
+    #[cfg(test)]
+    queried: Vec<(String, String)>,
     ticket: crate::data_plane::driver::CoreTicket<
         Vec<(
             String,
@@ -568,18 +572,22 @@ impl DaemonControlState {
             .reconcile_inventory
             .as_mut()
             .expect("the reconcile read must be submitted before its result is controlled");
-        read.ticket = crate::data_plane::driver::CoreTicket::resolved(
-            inventory
-                .into_iter()
-                .map(|row| {
-                    (
-                        row.session_id.0,
-                        row.subscription_id.0,
-                        Some(row.generation),
-                    )
-                })
-                .collect(),
-        );
+        // Core answers every queried key: the row's generation when the
+        // route is live, otherwise None.
+        let answer = read
+            .queried
+            .iter()
+            .map(|(session_id, subscription_id)| {
+                let generation = inventory
+                    .iter()
+                    .find(|row| {
+                        row.session_id.0 == *session_id && row.subscription_id.0 == *subscription_id
+                    })
+                    .map(|row| row.generation);
+                (session_id.clone(), subscription_id.clone(), generation)
+            })
+            .collect();
+        read.ticket = crate::data_plane::driver::CoreTicket::resolved(answer);
     }
 
     pub(crate) fn note_terminal_inventory_changed(&mut self) {
@@ -1597,6 +1605,8 @@ fn run_inventory_reconcile_phase_progress(
         };
         state.reconcile_inventory = Some(InventoryRead {
             read_epoch,
+            #[cfg(test)]
+            queried: routes.clone(),
             ticket: runtime.terminal_subscription_generations_for_owner(waiter_id, routes),
         });
         return BackgroundProgress::Waiting;
@@ -1620,13 +1630,16 @@ fn run_inventory_reconcile_phase_progress(
     state.reconcile_inventory = None;
     // Core keeps one live owner per (session, subscription). A takeover gets
     // a fresh monotonic generation, so the generation identifies that owner.
+    // Core answers every queried key, present or absent. A key with no answer
+    // row was not queried by this read (for example, it bound after
+    // submission); the slice skips it instead of reading it as absent.
     let lookup = |_client_id: &str, session_id: &str, subscription_id: &str| {
         inventory
             .iter()
             .find(|(live_session, live_subscription, _)| {
                 live_session == session_id && live_subscription == subscription_id
             })
-            .and_then(|(_, _, generation)| *generation)
+            .map(|(_, _, generation)| *generation)
     };
     let progress = state.pending_runtime.reconcile_inventory_slice(
         lookup,
