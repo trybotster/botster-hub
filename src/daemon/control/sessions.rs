@@ -207,6 +207,46 @@ fn retained_release_code(release: SessionReservationRelease) -> &'static str {
     }
 }
 
+/// Delete the reservation record for this exact token.
+fn retire_reservation_record(daemon: &HubDaemon, session_id: &str, token: &SessionReservation) {
+    if let Some(runtime) = daemon.runtime() {
+        runtime
+            .session_reservations()
+            .retire(session_id, token.identity());
+    }
+}
+
+/// A reservation record already existed for this id; this spawn did not run.
+fn session_record_invariant_error(request_id: &str, session_id: &str) -> DaemonResponse {
+    let mut response = core_operator_error("spawn", request_id, &CoreDaemonError::Shutdown);
+    set_spawn_error(
+        &mut response,
+        Some("session_record_invariant"),
+        format!(
+            "session {session_id} already has a reservation record; the spawn did not run and its new reservation was released or retained"
+        ),
+    );
+    response
+}
+
+/// The Hub state budget cannot hold the reservation record; nothing started.
+fn session_record_capacity_error(
+    request_id: &str,
+    session_id: &str,
+    error: crate::shared_view::SharedViewCapacityError,
+) -> DaemonResponse {
+    let mut response = core_operator_error("spawn", request_id, &CoreDaemonError::Shutdown);
+    set_spawn_error(
+        &mut response,
+        Some("session_record_capacity"),
+        format!(
+            "the Hub state budget cannot hold the reservation record for session {session_id}: requested {} bytes, {} available",
+            error.requested, error.available
+        ),
+    );
+    response
+}
+
 fn retain_explicit_reservation(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
@@ -281,6 +321,8 @@ fn finish_held_reservation(
     phase: &'static str,
     error: CoreDaemonError,
 ) -> ControlPoll {
+    // The retained list becomes the token's only owner in this same step.
+    retire_reservation_record(daemon, session_id, &reservation);
     retain_explicit_reservation(daemon, state, reservation);
     ControlPoll::Ready(Ok(held_reservation_error(
         request_id, session_id, phase, &error,
@@ -324,7 +366,17 @@ fn handle_daemon_spawn(
         Lookup,
         SpawnReserved,
         Release,
+        /// The session was removed while it launched; release its token.
+        ReleaseRemoved,
     }
+    // The reservation record is charged before Core reserves the id, so a
+    // refusal leaves nothing to clean up.
+    let mut record_charge = match runtime.charge_session_reservation(&session_id) {
+        Ok(charge) => Some(charge),
+        Err(error) => {
+            return ControlStep::ready(session_record_capacity_error(&id.0, &session_id, error));
+        }
+    };
     let mut retry_tokens = runtime.take_retained_reservations();
     state.retained_explicit_reservations.clear();
     let mut retry_keep = Vec::new();
@@ -340,6 +392,8 @@ fn handle_daemon_spawn(
     };
     let mut reservation: Option<SessionReservation> = None;
     let mut spawn_error: Option<CoreDaemonError> = None;
+    let mut spawned_response: Option<DaemonResponse> = None;
+    let mut record_invariant_failed = false;
     ControlStep::pending_spawn(move |daemon, state| {
         loop {
             match stage {
@@ -484,6 +538,39 @@ fn handle_daemon_spawn(
                                     DaemonTransportError::DaemonNotRunning,
                                 ));
                             };
+                            // Register before SpawnReserved so any later
+                            // removal of this id finds the record.
+                            let registered = match record_charge.take() {
+                                Some(charge) => runtime
+                                    .session_reservations()
+                                    .register(charge, reserved.identity())
+                                    .is_ok(),
+                                None => false,
+                            };
+                            if !registered {
+                                // A record for this id already exists: an
+                                // earlier release obligation was lost. Keep
+                                // that record, do not spawn, and release this
+                                // new token.
+                                eprintln!(
+                                    "session reservation record invariant failed for {session_id}"
+                                );
+                                record_invariant_failed = true;
+                                match submit_release(daemon, waiter_id, reserved) {
+                                    Some(next) => {
+                                        tracker = next;
+                                        stage = Stage::Release;
+                                    }
+                                    None => {
+                                        let held = reservation.take().expect("reserved identity");
+                                        retain_explicit_reservation(daemon, state, held);
+                                        return ControlPoll::Ready(Ok(
+                                            session_record_invariant_error(&id.0, &session_id),
+                                        ));
+                                    }
+                                }
+                                continue;
+                            }
                             tracker = runtime.begin_spawn_reserved_for_owner(
                                 waiter_id,
                                 reserved,
@@ -619,13 +706,37 @@ fn handle_daemon_spawn(
                         state
                             .drain_cursors
                             .insert(session.session_id.0.clone(), now);
-                        return ControlPoll::Ready(Ok(daemon_spawned(
+                        let response = daemon_spawned(
                             DaemonSession {
                                 session_id: session.session_id.0,
                                 lifecycle: lifecycle_label(&session.lifecycle).to_string(),
                             },
                             Vec::new(),
-                        )));
+                        );
+                        let Some(runtime) = daemon.runtime() else {
+                            return ControlPoll::Ready(Ok(response));
+                        };
+                        let token = reservation.take().expect("reserved identity");
+                        match runtime.session_reservations().install(&session_id, token) {
+                            crate::runtime::session_reservations::Handoff::Kept => {
+                                return ControlPoll::Ready(Ok(response));
+                            }
+                            crate::runtime::session_reservations::Handoff::Unregistered(token) => {
+                                retain_explicit_reservation(daemon, state, token);
+                                return ControlPoll::Ready(Ok(response));
+                            }
+                            crate::runtime::session_reservations::Handoff::ReleaseNow(token) => {
+                                // A client removed the session while it
+                                // launched. This spawn still owns the token.
+                                tracker = runtime.begin_release_session_reservation_for_owner(
+                                    waiter_id,
+                                    token.clone(),
+                                );
+                                reservation = Some(token);
+                                spawned_response = Some(response);
+                                stage = Stage::ReleaseRemoved;
+                            }
+                        }
                     }
                     CoreTicketPoll::Ready(Ok(CoreCompletion::SpawnReserved {
                         result: ReservedSpawnResult::Refused { error },
@@ -659,11 +770,42 @@ fn handle_daemon_spawn(
                         return ControlPoll::Ready(Err(DaemonTransportError::UnexpectedResponse));
                     }
                 },
+                Stage::ReleaseRemoved => {
+                    let released = match poll_spawn_ticket(&mut tracker, daemon) {
+                        CoreTicketPoll::Pending => return ControlPoll::Pending,
+                        CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                            result: Ok(SessionReservationRelease::Released),
+                            ..
+                        })) => true,
+                        _ => false,
+                    };
+                    let token = reservation.take().expect("removed reservation");
+                    retire_reservation_record(daemon, &session_id, &token);
+                    let mut response = spawned_response.take().expect("installed spawn response");
+                    if !released {
+                        retain_explicit_reservation(daemon, state, token);
+                        response.diagnostics.push(DaemonDiagnostic::action_failure(
+                            "spawn",
+                            format!(
+                                "session {session_id} was already removed; its reservation release is unconfirmed and the token is retained for retry"
+                            ),
+                        ));
+                    }
+                    return ControlPoll::Ready(Ok(response));
+                }
                 Stage::Release => match poll_spawn_ticket(&mut tracker, daemon) {
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
                     CoreTicketPoll::Refused
                     | CoreTicketPoll::Lost
                     | CoreTicketPoll::Ready(Err(_)) => {
+                        if record_invariant_failed {
+                            let held = reservation.take().expect("reserved identity");
+                            retain_explicit_reservation(daemon, state, held);
+                            return ControlPoll::Ready(Ok(session_record_invariant_error(
+                                &id.0,
+                                &session_id,
+                            )));
+                        }
                         let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
                         return finish_held_reservation(
                             daemon,
@@ -680,6 +822,22 @@ fn handle_daemon_spawn(
                         ..
                     })) => {
                         let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
+                        if record_invariant_failed {
+                            // This token was never registered; the existing
+                            // record belongs to the earlier obligation.
+                            if !matches!(result, Ok(SessionReservationRelease::Released))
+                                && let Some(held) = reservation.take()
+                            {
+                                retain_explicit_reservation(daemon, state, held);
+                            }
+                            return ControlPoll::Ready(Ok(session_record_invariant_error(
+                                &id.0,
+                                &session_id,
+                            )));
+                        }
+                        if let Some(held) = reservation.as_ref() {
+                            retire_reservation_record(daemon, &session_id, held);
+                        }
                         return ControlPoll::Ready(Ok(match result {
                             Ok(SessionReservationRelease::Released) => {
                                 spawn_operator_error(&id.0, &session_id, "spawn_reserved", &error)
@@ -742,12 +900,37 @@ pub(crate) fn handle_runtime(
     match request {
         DaemonRequest::RemoveSession { session_id } => {
             let runtime = daemon.runtime().expect("runtime checked above");
-            let mut tracker = runtime.begin_remove_session_for_owner(
-                state.current_waiter_id.expect("owner waiter is assigned"),
-                &SessionId(session_id.clone()),
-            );
+            let waiter_id = state.current_waiter_id.expect("owner waiter is assigned");
+            // The receipt applies only to the record that exists now.
+            let captured = runtime.session_reservations().capture(&session_id);
+            let mut tracker =
+                runtime.begin_remove_session_for_owner(waiter_id, &SessionId(session_id.clone()));
             let id = request_id("daemon-session-remove");
+            let mut releasing: Option<SessionReservation> = None;
             ControlStep::pending(move |daemon, state| {
+                if releasing.is_some() {
+                    let released = match poll_spawn_ticket(&mut tracker, daemon) {
+                        CoreTicketPoll::Pending => return ControlPoll::Pending,
+                        CoreTicketPoll::Ready(Ok(CoreCompletion::ReleaseSessionReservation {
+                            result: Ok(SessionReservationRelease::Released),
+                            ..
+                        })) => true,
+                        _ => false,
+                    };
+                    let token = releasing.take().expect("releasing token");
+                    retire_reservation_record(daemon, &session_id, &token);
+                    let mut response = daemon_response_base(DaemonResponseKind::SessionRemoved);
+                    if !released {
+                        retain_explicit_reservation(daemon, state, token);
+                        response.diagnostics.push(DaemonDiagnostic::action_failure(
+                            "remove_session",
+                            format!(
+                                "session {session_id} was removed; its reservation release is unconfirmed and will be retried"
+                            ),
+                        ));
+                    }
+                    return ControlPoll::Ready(Ok(response));
+                }
                 let completion = match poll_tracker(&mut tracker, daemon, "remove_session", &id.0) {
                     Ok(completion) => completion,
                     Err(poll) => return poll,
@@ -759,6 +942,27 @@ pub(crate) fn handle_runtime(
                     Ok(true) => {
                         suppress_unix_session_close_events(&state.pending_runtime, &session_id);
                         suppress_webrtc_session_close_events(&state.pending_runtime, &session_id);
+                        let removal = match (daemon.runtime(), captured) {
+                            (Some(runtime), Some(captured)) => runtime
+                                .session_reservations()
+                                .removed(&session_id, captured),
+                            _ => crate::runtime::session_reservations::Removal::None,
+                        };
+                        if let crate::runtime::session_reservations::Removal::ReleaseNow(token) =
+                            removal
+                        {
+                            let Some(runtime) = daemon.runtime() else {
+                                return ControlPoll::Ready(Err(
+                                    DaemonTransportError::DaemonNotRunning,
+                                ));
+                            };
+                            tracker = runtime.begin_release_session_reservation_for_owner(
+                                waiter_id,
+                                token.clone(),
+                            );
+                            releasing = Some(token);
+                            return ControlPoll::Again;
+                        }
                         ControlPoll::Ready(Ok(daemon_response_base(
                             DaemonResponseKind::SessionRemoved,
                         )))
@@ -3072,6 +3276,157 @@ sys.exit(0)
         assert!(state.retained_explicit_reservations.is_empty());
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn request_until_ready(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        request: DaemonRequest,
+    ) -> botster_hub_client::DaemonResponse {
+        match handle_runtime(daemon, state, observability(), request) {
+            ControlStep::Ready(Ok(response)) => response,
+            ControlStep::Pending(mut pending) => {
+                poll_spawn_until_ready(daemon, state, &mut pending)
+            }
+            _ => panic!("request must complete"),
+        }
+    }
+
+    fn remove_when_terminal(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        session_id: &str,
+    ) -> botster_hub_client::DaemonResponse {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = request_until_ready(
+                daemon,
+                state,
+                DaemonRequest::RemoveSession {
+                    session_id: session_id.into(),
+                },
+            );
+            if response.kind == DaemonResponseKind::SessionRemoved || Instant::now() >= deadline {
+                return response;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn removed_ordinary_session_releases_its_reservation_for_reuse() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("reservation-reuse", Some(worker));
+        let first = spawn_until_ready(&mut daemon, &mut state, "s1-reuse", "true");
+        assert_eq!(first.kind, DaemonResponseKind::Spawned, "{first:?}");
+        assert_eq!(daemon.runtime().unwrap().session_reservations().len(), 1);
+
+        let removed = remove_when_terminal(&mut daemon, &mut state, "s1-reuse");
+        assert_eq!(
+            removed.kind,
+            DaemonResponseKind::SessionRemoved,
+            "{removed:?}"
+        );
+        assert!(removed.diagnostics.is_empty(), "{removed:?}");
+        assert_eq!(daemon.runtime().unwrap().session_reservations().len(), 0);
+        assert!(state.retained_explicit_reservations.is_empty());
+
+        let reused = spawn_until_ready(&mut daemon, &mut state, "s1-reuse", "true");
+        assert_eq!(reused.kind, DaemonResponseKind::Spawned, "{reused:?}");
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_live_session_keeps_its_id_after_a_refused_removal() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("reservation-live", Some(worker));
+        let first = spawn_until_ready(&mut daemon, &mut state, "s1-live", "sleep 30");
+        assert_eq!(first.kind, DaemonResponseKind::Spawned, "{first:?}");
+        let refused = request_until_ready(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::RemoveSession {
+                session_id: "s1-live".into(),
+            },
+        );
+        assert_ne!(refused.kind, DaemonResponseKind::SessionRemoved);
+        assert_eq!(daemon.runtime().unwrap().session_reservations().len(), 1);
+        let duplicate = spawn_until_ready(&mut daemon, &mut state, "s1-live", "true");
+        assert_eq!(spawn_error_code(&duplicate), Some("session_already_exists"));
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_refused_record_charge_is_a_typed_refusal_with_no_reservation() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("reservation-charge", Some(worker));
+        let budget = daemon.runtime().unwrap().state_publication().budget();
+        let hold = budget
+            .reserve(budget.available())
+            .expect("fill the Hub state budget");
+        let refused = spawn_until_ready_or_ready(&mut daemon, &mut state, "s1-charge", "true");
+        assert_eq!(spawn_error_code(&refused), Some("session_record_capacity"));
+        assert_eq!(daemon.runtime().unwrap().session_reservations().len(), 0);
+        drop(hold);
+        // Nothing was reserved, so the same id spawns once the budget allows.
+        let spawned = spawn_until_ready(&mut daemon, &mut state, "s1-charge", "true");
+        assert_eq!(spawned.kind, DaemonResponseKind::Spawned, "{spawned:?}");
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_existing_record_stops_the_spawn_and_releases_its_new_token() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("reservation-invariant", Some(worker));
+        let runtime = daemon.runtime().unwrap();
+        let stray = botster_core::SessionAdmission::default()
+            .reserve(botster_core::SessionId("s1-invariant".into()))
+            .unwrap();
+        runtime
+            .session_reservations()
+            .register(
+                runtime.charge_session_reservation("s1-invariant").unwrap(),
+                stray.identity(),
+            )
+            .unwrap();
+        let refused = spawn_until_ready_or_ready(&mut daemon, &mut state, "s1-invariant", "true");
+        assert_eq!(spawn_error_code(&refused), Some("session_record_invariant"));
+        let runtime = daemon.runtime().unwrap();
+        assert!(runtime.session_reservations().capture("s1-invariant") == Some(stray.identity()));
+        assert_eq!(runtime.test_release_session_reservation_begins(), 1);
+        assert!(state.retained_explicit_reservations.is_empty());
+        let sessions = request_until_ready(&mut daemon, &mut state, DaemonRequest::ListSessions);
+        assert!(
+            sessions
+                .sessions
+                .iter()
+                .all(|session| session.session_id != "s1-invariant")
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn spawn_until_ready_or_ready(
+        daemon: &mut crate::HubDaemon,
+        state: &mut DaemonControlState,
+        session_id: &str,
+        command: &str,
+    ) -> botster_hub_client::DaemonResponse {
+        request_until_ready(
+            daemon,
+            state,
+            DaemonRequest::Spawn {
+                session_id: session_id.into(),
+                command: command.into(),
+            },
+        )
     }
 
     #[test]
