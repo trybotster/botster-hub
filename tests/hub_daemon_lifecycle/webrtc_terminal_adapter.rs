@@ -780,8 +780,10 @@ fn webrtc_terminal_adapter_late_attach_after_peer_close_does_not_recreate_route(
         peer.peer.close().await.expect("close offer peer");
     });
     thread::sleep(Duration::from_millis(400));
-    // A late message that carries the closed peer's grant is refused; it
-    // cannot reopen the closed WebRTC route.
+    // The grant is one-use: a second signal with it is refused. This proves
+    // signaling admission only. It does not prove peer-close cleanup or the
+    // rejection of a late control message on the closed peer, which this
+    // harness cannot send (recorded as a coverage gap in the ledger).
     let late_grant = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::LocalWebrtcSignal {
