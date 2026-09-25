@@ -1220,13 +1220,18 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
             "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
         )
         .await;
-        let occupancy_after_a =
+        let status_after_a =
             botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
                 .expect("status after A")
                 .status
-                .expect("status body")
-                .lifecycle_counters
-                .live_attach_subscriptions;
+                .expect("status body");
+        let occupancy_after_a = status_after_a.lifecycle_counters.live_attach_subscriptions;
+        let generation_a = status_after_a
+            .live_attach_occupancy
+            .iter()
+            .find(|row| row.session_id == "wsg-session" && row.subscription_id == "wsg-sub")
+            .map(|row| row.generation)
+            .expect("owner A Core generation");
 
         let (mut owner_b, key_b) = open_local_webrtc_peer(&endpoint, &bootstrap_b).await;
         owner_b.enable_host_events();
@@ -1257,7 +1262,10 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
                 .expect("A must observe TerminalSubscriptionClosed for generation N");
         match closed {
             botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { generation, .. } => {
-                assert_eq!(generation, 1);
+                assert_eq!(
+                    generation, generation_a,
+                    "the close must name owner A's own Core generation"
+                );
             }
             other => panic!("unexpected host event: {other:?}"),
         }
@@ -1706,7 +1714,12 @@ fn webrtc_terminal_adapter_attach_after_authoritative_exit_rejects() {
         let error = attach.error.as_ref().expect("ended-session rejection");
         assert_eq!(error.code, "invalid_request");
         assert_eq!(error.operation, "attach");
-        assert_eq!(error.message, "attach failed before adapter bind");
+        assert!(
+            error.message.starts_with("attach failed before adapter bind")
+                && error.message.contains("wnx-ended"),
+            "rejection must fail before bind and name the ended session: {}",
+            error.message
+        );
         assert!(attach.terminal_reservation.is_none());
         let status = peer.encrypted_request(&key, &botster_hub_client::DaemonRequest::Status)
             .await.expect("status after rejected attach");

@@ -4247,6 +4247,10 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
     assert_eq!(status.compatibility, ack.compatibility);
     assert!(status.diagnostics.is_empty());
 
+    let unsupported_current = format!(
+        "unsupported protocol version {}",
+        botster_hub_client::PROTOCOL_VERSION
+    );
     let mut stale_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     stale_requirement.client_name = "stale-5-29-client".to_string();
     stale_requirement.protocol_version = 5;
@@ -4260,10 +4264,7 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
             message.contains("stale-5-29-client"),
             "{attempt}: {message}"
         );
-        assert!(
-            message.contains("unsupported protocol version 8"),
-            "{attempt}: {message}"
-        );
+        assert!(message.contains(&unsupported_current), "{attempt}: {message}");
     }
 
     let mut protocol_seven = botster_hub_client::DaemonCompatibilityRequirement::current();
@@ -4276,7 +4277,7 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
             .expect_err("protocol-7 client must fail at admission");
     let protocol_seven_message = protocol_seven_error.to_string();
     assert!(
-        protocol_seven_message.contains("unsupported protocol version 8"),
+        protocol_seven_message.contains(&unsupported_current),
         "{protocol_seven_message}"
     );
     assert!(

@@ -395,7 +395,7 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
 }
 
 #[test]
-#[ignore = "run through script/test-update-preupdate-worker"]
+#[ignore = "blocked: update tests would operate on the real checkout via CARGO_MANIFEST_DIR; seam removed in cold cut; do not run script/test-update-preupdate-worker"]
 fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order() {
     let preupdate_worker = PathBuf::from(
         std::env::var_os("BOTSTER_PREUPDATE_WORKER_BIN")
