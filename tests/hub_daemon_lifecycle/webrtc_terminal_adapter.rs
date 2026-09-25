@@ -780,6 +780,27 @@ fn webrtc_terminal_adapter_late_attach_after_peer_close_does_not_recreate_route(
         peer.peer.close().await.expect("close offer peer");
     });
     thread::sleep(Duration::from_millis(400));
+    // A late message that carries the closed peer's grant is refused; it
+    // cannot reopen the closed WebRTC route.
+    let late_grant = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+            grant_id: bootstrap.grant_id.clone(),
+            grant_secret: bootstrap.grant_secret.clone(),
+            origin: bootstrap.expected_origin.clone(),
+            offer: serde_json::Value::Null,
+        },
+    )
+    .expect("closed grant returns an operator response");
+    assert_eq!(
+        late_grant.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    assert_eq!(
+        late_grant.error.as_ref().map(|error| error.code.as_str()),
+        Some("local_webrtc_redeemed_grant")
+    );
+    // A fresh Unix connection is a new owner, so its Attach binds.
     let late = botster_hub_client::request(
         &endpoint,
         botster_hub_client::DaemonRequest::Attach {
@@ -788,7 +809,10 @@ fn webrtc_terminal_adapter_late_attach_after_peer_close_does_not_recreate_route(
         },
     )
     .expect("socket attach after webrtc close is a new owner");
-    assert_eq!(late.kind, botster_hub_client::DaemonResponseKind::Events);
+    assert_eq!(
+        late.kind,
+        botster_hub_client::DaemonResponseKind::TerminalAttached
+    );
     shutdown_short_lived_session(&endpoint, session_id);
     hub.shutdown().expect("shutdown isolated hub");
 }

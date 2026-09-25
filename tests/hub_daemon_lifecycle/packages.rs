@@ -1942,26 +1942,42 @@ fn poison_recovery_delete_succeeds_under_invalid_repo_session_types() {
         Some("invalid_repo_session_types")
     );
 
-    // Subscribe after poison: entity surface must frame with subscribe_entities, not disconnect.
-    let subscribe_poisoned = botster_hub_client::request(
+    // Subscribe after poison: the Host admits the subscription while it builds
+    // the catalog, then delivers one correlated entity error and retires it.
+    let mut poisoned_subscription = botster_hub_client::subscribe_entities(
         &endpoint,
-        botster_hub_client::DaemonRequest::SubscribeEntities {
-            entity_type: "session_type".to_string(),
-            subscription_id: "st-poison-delete-late-sub".to_string(),
-        },
+        "session_type",
+        "st-poison-delete-late-sub",
     )
     .expect("subscribe under poison must keep transport open");
+    poisoned_subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound poisoned subscription read");
+    let mut poisoned_frames = Vec::new();
+    let entity_error = loop {
+        let frame = poisoned_subscription
+            .next_frame()
+            .unwrap_or_else(|error| panic!("poisoned subscription frame: {error}; seen {poisoned_frames:?}"));
+        match frame {
+            botster_hub_client::DaemonEntityFrame::Error {
+                subscription_id,
+                entity_type,
+                code,
+                ..
+            } => break (subscription_id, entity_type, code),
+            other if poisoned_frames.len() < 8 => poisoned_frames.push(other),
+            other => panic!("no entity error after {poisoned_frames:?}; last {other:?}"),
+        }
+    };
     assert_eq!(
-        subscribe_poisoned.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError
+        entity_error,
+        (
+            "st-poison-delete-late-sub".to_string(),
+            "session_type".to_string(),
+            "invalid_repo_session_types".to_string()
+        )
     );
-    let sub_error = subscribe_poisoned
-        .error
-        .as_ref()
-        .expect("subscribe operator error");
-    assert_eq!(sub_error.code, "invalid_repo_session_types");
-    assert_eq!(sub_error.operation, "subscribe_entities");
-    assert_eq!(sub_error.request_id, "st-poison-delete-late-sub");
+    drop(poisoned_subscription);
 
     // Independent recovery case: Delete under poison with no prior disable.
     let deleted = botster_hub::daemon_transport_request(
@@ -4448,6 +4464,25 @@ return botster.register({
     ] {
         assert_eq!(response.plugin_tool_result[key]["session_id"], id, "{response:?}");
         assert_eq!(response.plugin_tool_result[key]["context_id"], format!("ctx-{id}"));
+        assert_eq!(response.plugin_tool_result[key]["lifecycle"], "running", "{response:?}");
+        assert_eq!(
+            response.plugin_tool_result[key]["session_type_id"],
+            "ordinary.two/init"
+        );
+        assert_eq!(
+            response.plugin_tool_result[key]["context_keys"],
+            serde_json::json!([
+                "context_id",
+                "hub_socket",
+                "prompt",
+                "repo_path",
+                "session_dir",
+                "session_id",
+                "target_id",
+                "worktree_path"
+            ]),
+            "{key} context keys"
+        );
         let output = package_dir.join(format!("spawn-{id}.txt"));
         let context = package_dir.join(format!("context-{id}.json"));
         let hold = package_dir.join(format!("hold-{id}.fifo"));

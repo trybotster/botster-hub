@@ -1216,36 +1216,58 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
 }
 
 #[test]
-fn subscribe_entities_on_bound_unix_mux_returns_operator_error_and_keeps_route() {
+fn subscribe_entities_on_bound_unix_mux_coexists_with_the_terminal_route() {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub("sem");
     let mut stream = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
-    spawn_and_bind(&mut stream, "sem-live", "sub-live", "sleep 30", &mut envelopes, &mut events);
+    spawn_and_bind(
+        &mut stream,
+        "sem-live",
+        "sub-live",
+        "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done",
+        &mut envelopes,
+        &mut events,
+    );
 
+    // The Unix connection carries entity subscriptions beside terminal routes.
     let subscribe = stream.request_collecting(&botster_hub_client::DaemonRequest::SubscribeEntities {
             entity_type: "session".to_string(),
             subscription_id: "sem-entities".to_string(),
         }, &mut envelopes, &mut events);
     assert_eq!(
         subscribe.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError,
-        "SubscribeEntities on a bound Unix mux must fail closed: {subscribe:?}"
-    );
-    assert_eq!(
-        subscribe.error.as_ref().map(|error| error.code.as_str()),
-        Some("unix_mux_owns_connection")
+        botster_hub_client::DaemonResponseKind::EntitySubscribed,
+        "SubscribeEntities on a bound Unix mux must be admitted: {subscribe:?}"
     );
 
-    let status = stream.request_collecting(&botster_hub_client::DaemonRequest::Status, &mut envelopes, &mut events);
-    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
-    let drain = stream.request_collecting(&botster_hub_client::DaemonRequest::Status, &mut envelopes, &mut events);
-    assert_ne!(
-        drain.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError,
-        "bound adapter must stay owned after rejected SubscribeEntities: {:?}",
-        drain.error
+    stream.send_terminal_input("sub-live", &terminal_input_frame_bytes(b"after-subscribe\r"));
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline
+        && (!unix_envelope_contains_live_bytes(&envelopes, "echo:after-subscribe")
+            || !stream.entity_frames.iter().any(|frame| matches!(
+                frame,
+                botster_hub_client::DaemonEntityFrame::Snapshot { subscription_id, .. }
+                    if subscription_id == "sem-entities"
+            )))
+    {
+        let status = stream.request_collecting(&botster_hub_client::DaemonRequest::Status, &mut envelopes, &mut events);
+        assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        stream.entity_frames.iter().any(|frame| matches!(
+            frame,
+            botster_hub_client::DaemonEntityFrame::Snapshot { subscription_id, .. }
+                if subscription_id == "sem-entities"
+        )),
+        "the entity subscription must deliver its snapshot: {:?}",
+        stream.entity_frames
+    );
+    assert!(
+        unix_envelope_contains_live_bytes(&envelopes, "echo:after-subscribe"),
+        "the bound terminal route must keep making progress: {envelopes:?}"
     );
 
     shutdown_short_lived_session(hub.endpoint(), "sem-live");

@@ -71,6 +71,8 @@ pub(crate) struct RawUnixClient {
     ids: RequestIdSequence,
     routes: BTreeMap<String, u64>,
     operation_ids: RouteOperationIds,
+    /// Entity frames that arrived while a request waited for its response.
+    pub(crate) entity_frames: Vec<botster_hub_client::DaemonEntityFrame>,
 }
 
 impl RawUnixClient {
@@ -91,6 +93,7 @@ impl RawUnixClient {
             ids: RequestIdSequence::new(),
             routes: BTreeMap::new(),
             operation_ids: RouteOperationIds::default(),
+            entity_frames: Vec::new(),
         }
     }
 
@@ -162,7 +165,9 @@ impl RawUnixClient {
                 }
                 DaemonUnixMuxFrame::Terminal(frame) => frames.push(frame),
                 DaemonUnixMuxFrame::Server(ServerFrame::Event { event }) => events.push(event),
-                DaemonUnixMuxFrame::Server(ServerFrame::Entity { .. }) => {}
+                DaemonUnixMuxFrame::Server(ServerFrame::Entity { entity }) => {
+                    self.entity_frames.push(entity);
+                }
                 DaemonUnixMuxFrame::Server(ServerFrame::Close { reason }) => {
                     panic!("hub closed the connection before the response: {reason:?}")
                 }

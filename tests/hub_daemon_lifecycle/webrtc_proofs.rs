@@ -1460,18 +1460,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
             .await
             .expect("offer peer accepts answer and opens channel");
 
-        let spawn = offer_peer
-            .encrypted_request(
-                &stream_key,
-                &botster_hub_client::DaemonRequest::Spawn {
-                    session_id: "local-webrtc-drop-session".to_string(),
-                    command: "printf 'local-webrtc-drop-ready\\n'; while IFS= read -r line; do printf 'drop:%s\\n' \"$line\"; done".to_string(),
-                },
-            )
-            .await
-            .expect("spawn over encrypted WebRTC data channel");
-        assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
-
+        // Protocol 9 admits requests only after one Hello.
         offer_peer
             .encrypted_hello(
                 &stream_key,
@@ -1483,6 +1472,17 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
             )
             .await
             .expect("webrtc adapter hello before attach");
+        let spawn = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::Spawn {
+                    session_id: "local-webrtc-drop-session".to_string(),
+                    command: "printf 'local-webrtc-drop-ready\\n'; while IFS= read -r line; do printf 'drop:%s\\n' \"$line\"; done".to_string(),
+                },
+            )
+            .await
+            .expect("spawn over encrypted WebRTC data channel");
+        assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
         let attach = offer_peer
             .encrypted_request(
                 &stream_key,
