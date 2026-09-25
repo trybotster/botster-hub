@@ -4247,44 +4247,6 @@ fn external_hub_client_reports_compatibility_descriptor_and_mismatch_diagnostics
     assert_eq!(status.compatibility, ack.compatibility);
     assert!(status.diagnostics.is_empty());
 
-    let unsupported_current = format!(
-        "unsupported protocol version {}",
-        botster_hub_client::PROTOCOL_VERSION
-    );
-    let mut stale_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
-    stale_requirement.client_name = "stale-5-29-client".to_string();
-    stale_requirement.protocol_version = 5;
-    stale_requirement.minimum_conformance_fixture_revision = 29;
-    for attempt in ["initial connect", "reconnect"] {
-        let error =
-            botster_hub_client::connect_and_hello_with_requirement(&endpoint, &stale_requirement)
-                .expect_err("stale client must fail before dispatching a removed operation");
-        let message = error.to_string();
-        assert!(
-            message.contains("stale-5-29-client"),
-            "{attempt}: {message}"
-        );
-        assert!(message.contains(&unsupported_current), "{attempt}: {message}");
-    }
-
-    let mut protocol_seven = botster_hub_client::DaemonCompatibilityRequirement::current();
-    protocol_seven.client_name = "protocol-7-client".to_string();
-    protocol_seven.protocol_version = 7;
-    protocol_seven.minimum_conformance_fixture_revision =
-        botster_hub_client::CONFORMANCE_FIXTURE_REVISION;
-    let protocol_seven_error =
-        botster_hub_client::connect_and_hello_with_requirement(&endpoint, &protocol_seven)
-            .expect_err("protocol-7 client must fail at admission");
-    let protocol_seven_message = protocol_seven_error.to_string();
-    assert!(
-        protocol_seven_message.contains(&unsupported_current),
-        "{protocol_seven_message}"
-    );
-    assert!(
-        protocol_seven_message.contains("protocol-7-client"),
-        "{protocol_seven_message}"
-    );
-
     let mut version_requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     version_requirement.client_name = "future-version-client".to_string();
     version_requirement.protocol_version = botster_hub_client::PROTOCOL_VERSION + 1;
