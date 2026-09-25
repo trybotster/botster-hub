@@ -20,6 +20,13 @@ Setup finding: library tests need `target/debug/botster-session-worker` (`src/ru
 In a cold target, 14 library tests failed with worker ENOENT, and four more failed (`focused-lib.log`). All 18 passed after the worker was built. The cause of the other four is not verified.
 Worktree setup: tooling had truncated `.gitignore`. The orchestrator approved restoring it to HEAD.
 
+Inventory at `e295cdea` (matched candidate, `--no-fail-fast`, every target ran): 38 failures in 9 targets, exit 101.
+Table and log: `/Users/jasonconigliari/botster-evidence/inventory-20260925/`. The orchestrator grouped the fixes; the writer executes them in order.
+
+Safety block: five `update_command_test` tests are ignored with the reason `blocked: update tests would operate on the real checkout via CARGO_MANIFEST_DIR; seam removed in cold cut`.
+The tests still set the removed `BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT`. `src/update.rs` uses `CARGO_MANIFEST_DIR`, so a main-checkout run would operate on the real repository.
+The already-ignored `update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order` also sets that variable. Do not run `script/test-update-preupdate-worker` until the seam is rebuilt.
+
 ## Current delivery status — September 23
 
 ### Full workspace gate at `0db57795`
