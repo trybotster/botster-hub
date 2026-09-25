@@ -2312,6 +2312,16 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         }));
         flood_writers.push(writer);
     }
+    let mut flood_subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "focused-flood-events")
+            .expect("subscribe before sustained control pressure");
+    flood_subscription
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound flood subscription reads");
+    assert!(matches!(
+        flood_subscription.next_frame().expect("flood subscription snapshot"),
+        botster_hub_client::DaemonEntityFrame::Snapshot { .. }
+    ));
     let flood_before =
         botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
             .expect("status before sustained control pressure")
@@ -2331,6 +2341,34 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             .expect("pipeline sustained status request");
         }
     }
+    // One explicit lifecycle change during the flood must reach the
+    // subscriber. Reconciliation runs on events, not on idle turns.
+    let change_endpoint = endpoint.clone();
+    let change = thread::spawn(move || {
+        botster_hub_client::request(
+            &change_endpoint,
+            botster_hub_client::DaemonRequest::Spawn {
+                session_id: "focused-flood-change".to_string(),
+                command: "sleep 10".to_string(),
+            },
+        )
+        .map(|response| response.kind)
+    });
+    let flood_change_seen = loop {
+        match flood_subscription.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Upsert { id, .. })
+                if id == "focused-flood-change" =>
+            {
+                break true;
+            }
+            Ok(_) => {}
+            Err(_) => break false,
+        }
+    };
+    assert_eq!(
+        change.join().expect("join flood change spawn").expect("flood change spawn"),
+        botster_hub_client::DaemonResponseKind::Spawned
+    );
     thread::sleep(Duration::from_millis(1_100));
     let flood_after =
         botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status)
@@ -2345,8 +2383,15 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
             .expect("join pipelined status response drain");
     }
     assert!(
-        flood_after.reconciliation_wakes > flood_before.reconciliation_wakes,
-        "a continuously busy control queue must not starve shared entity reconciliation"
+        flood_change_seen,
+        "a continuously busy control queue must not starve delivery of a lifecycle change: before={flood_before:?} after={flood_after:?}"
+    );
+    drop(flood_subscription);
+    let _ = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::ShutdownSession {
+            session_id: "focused-flood-change".to_string(),
+        },
     );
     let screen_after = botster_hub_client::request(
         &endpoint,
@@ -2492,10 +2537,6 @@ fn focused_connection_lifecycle_is_bounded_event_driven_and_counter_visible() {
         "shared wake count must stay independent of session count: before={} after={}",
         many_before.reconciliation_wakes,
         many_after.reconciliation_wakes
-    );
-    assert!(
-        many_after.reconciliation_wakes > many_before.reconciliation_wakes,
-        "idle owner turns continue through observe and journal slices without terminal drains"
     );
 
     let mut attached = UnixRouteClient::connect(&endpoint)
