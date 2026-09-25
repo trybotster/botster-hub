@@ -366,7 +366,10 @@ mod tests {
         assert!(matches!(value, Value::String(_)));
         assert_eq!(
             spawner.test_take_abandoned(),
-            vec![("s1-abandon".to_string(), spawned.reservation_identity.unwrap())]
+            vec![(
+                "s1-abandon".to_string(),
+                spawned.reservation_identity.unwrap()
+            )]
         );
     }
 

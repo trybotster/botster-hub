@@ -21,7 +21,11 @@ struct BoundedFailure {
 
 impl std::fmt::Write for BoundedFailure {
     fn write_str(&mut self, text: &str) -> std::fmt::Result {
-        let next = self.value.len().checked_add(text.len()).ok_or(std::fmt::Error)?;
+        let next = self
+            .value
+            .len()
+            .checked_add(text.len())
+            .ok_or(std::fmt::Error)?;
         if next > self.limit {
             return Err(std::fmt::Error);
         }
@@ -104,7 +108,9 @@ impl CoreBinding {
     fn begin(&self, runtime: &HubRuntime, operation: CoreOperation) -> CoreOperationTracker {
         let ticket = match self {
             Self::Ownerless => runtime.core_daemon.begin(operation),
-            Self::ClientOwner(waiter_id) => runtime.core_daemon.begin_for_owner(*waiter_id, operation),
+            Self::ClientOwner(waiter_id) => {
+                runtime.core_daemon.begin_for_owner(*waiter_id, operation)
+            }
             Self::Owner { waiter_id, .. } => {
                 runtime.core_daemon.begin_for_owner(*waiter_id, operation)
             }
@@ -318,7 +324,10 @@ impl HubRuntime {
         materialized: crate::session_types::MaterializedSessionType,
         waiter_id: crate::owner_identity::WaiterId,
     ) -> SessionTypeSpawnStart {
-        self.begin_materialized_session_type_spawn(materialized, CoreBinding::ClientOwner(waiter_id))
+        self.begin_materialized_session_type_spawn(
+            materialized,
+            CoreBinding::ClientOwner(waiter_id),
+        )
     }
 
     fn begin_materialized_session_type_spawn(
@@ -435,7 +444,11 @@ impl SessionTypeSpawnStart {
     pub(crate) fn charged_plugin_failure(
         &mut self,
         failure: &PluginSpawnFailure,
-    ) -> Option<(String, crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge)> {
+    ) -> Option<(
+        String,
+        crate::lua_memory::LuaCallbackCharge,
+        crate::lua_memory::LuaCallbackCharge,
+    )> {
         use std::fmt::Write;
 
         let CoreBinding::Owner { allowance, .. } = &mut self.binding else {
@@ -574,7 +587,9 @@ impl SessionTypeSpawnStart {
                     _ => self.cleanup = CleanupStage::Unresolved,
                 },
                 CleanupStage::Confirmed => {
-                    if self.context_published && let Some(reservation) = self.reservation.as_ref() {
+                    if self.context_published
+                        && let Some(reservation) = self.reservation.as_ref()
+                    {
                         runtime.retract_spawn_context_aliases(
                             &self.context_id,
                             &self.spawn.request.session_id.0,

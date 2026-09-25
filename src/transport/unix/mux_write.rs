@@ -77,13 +77,7 @@ impl MuxWriteState {
         delivery_ack: Option<mpsc::Sender<()>>,
         close_after: bool,
     ) -> DaemonTransportResult<()> {
-        self.enqueue_response_with_receipt(
-            request_id,
-            response,
-            delivery_ack,
-            close_after,
-            None,
-        )
+        self.enqueue_response_with_receipt(request_id, response, delivery_ack, close_after, None)
     }
 
     pub(crate) fn enqueue_response_with_receipt(

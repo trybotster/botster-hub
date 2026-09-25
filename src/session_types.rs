@@ -9,9 +9,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
-use std::sync::Arc;
 
 use botster_core::{
     CoreSessionMetadata, PackageSource, RequestId, ResizePayload, SessionId, SessionSpawnRequest,
@@ -277,8 +277,7 @@ impl std::fmt::Debug for ChargedSessionTypeMaterialization {
 /// Host owns the charged input and the checked materializer until it returns.
 pub(crate) struct SpawnHostWork {
     run: Box<
-        dyn FnOnce()
-                -> Result<ChargedSessionTypeMaterialization, ChargedMaterializationFailure>
+        dyn FnOnce() -> Result<ChargedSessionTypeMaterialization, ChargedMaterializationFailure>
             + Send,
     >,
     receipt: crate::data_plane::driver::CoreReplyPublisher<()>,
@@ -312,10 +311,11 @@ impl SpawnHostWork {
             crate::data_plane::driver::CoreReplyPublisher<()>,
         ),
     > {
-        let config = match ChargedMaterializationConfig::from_config(config, startup_paths, &mut parent) {
-            Ok(config) => config,
-            Err(reason) => return Err((reason, parent, receipt)),
-        };
+        let config =
+            match ChargedMaterializationConfig::from_config(config, startup_paths, &mut parent) {
+                Ok(config) => config,
+                Err(reason) => return Err((reason, parent, receipt)),
+            };
         Self::new_checked(parent, receipt, move |parent| {
             materialize_ordinary_charged(
                 parent,
@@ -342,7 +342,9 @@ impl SpawnHostWork {
         ),
     >
     where
-        F: FnOnce(crate::lua_memory::LuaCallbackCharge)
+        F: FnOnce(
+                crate::lua_memory::LuaCallbackCharge,
+            )
                 -> Result<ChargedSessionTypeMaterialization, ChargedMaterializationFailure>
             + Send
             + 'static,
@@ -373,8 +375,7 @@ impl SpawnHostWork {
 /// Owner acknowledgement keeps the exact receipt publisher with the Host result.
 #[derive(Debug)]
 pub(crate) struct SpawnHostCompletion {
-    pub(crate) result:
-        Result<ChargedSessionTypeMaterialization, ChargedMaterializationFailure>,
+    pub(crate) result: Result<ChargedSessionTypeMaterialization, ChargedMaterializationFailure>,
     pub(crate) receipt: crate::data_plane::driver::CoreReplyPublisher<()>,
 }
 
@@ -411,8 +412,16 @@ impl ChargedSessionTypeFailure {
 
     pub(crate) fn into_parts(
         self,
-    ) -> (SessionTypeError, crate::lua_memory::LuaCallbackCharge, crate::lua_memory::LuaCallbackCharge) {
-        (self.error, self._variable, self.lua_render.expect("Lua refusal render was funded"))
+    ) -> (
+        SessionTypeError,
+        crate::lua_memory::LuaCallbackCharge,
+        crate::lua_memory::LuaCallbackCharge,
+    ) {
+        (
+            self.error,
+            self._variable,
+            self.lua_render.expect("Lua refusal render was funded"),
+        )
     }
 }
 
@@ -455,9 +464,7 @@ impl std::fmt::Debug for ChargedSessionTypeFailure {
 
 impl ChargedSessionTypeMaterialization {
     /// The next owner must retain the allowance until its payload is destroyed.
-    pub(crate) fn into_parts(
-        self,
-    ) -> (MaterializedSessionType, ChargedMaterializationAllowance) {
+    pub(crate) fn into_parts(self) -> (MaterializedSessionType, ChargedMaterializationAllowance) {
         (self.materialized, self.allowance)
     }
 }
@@ -496,7 +503,11 @@ impl<'a> From<&'a HubConfig> for MaterializationConfigView<'a> {
             shell: &config.session_defaults.shell,
             initial_rows: config.session_defaults.initial_rows,
             initial_cols: config.session_defaults.initial_cols,
-            local_socket: config.transports.local_socket.as_ref().map(|socket| socket.path.as_path()),
+            local_socket: config
+                .transports
+                .local_socket
+                .as_ref()
+                .map(|socket| socket.path.as_path()),
         }
     }
 }
@@ -514,14 +525,23 @@ impl StartupMaterializationPaths {
     pub(crate) fn capture(config: &HubConfig) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let absolute = |path: &Path| {
-            if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            }
         };
         let data_directory = absolute(&config.data_directory);
         let session_directory = data_directory.join("sessions");
-        let hub_socket = config.transports.local_socket.as_ref()
+        let hub_socket = config
+            .transports
+            .local_socket
+            .as_ref()
             .map(|socket| absolute(&socket.path).display().to_string())
             .unwrap_or_default();
-        let hub_bin = std::env::current_exe().ok().map(|path| path.display().to_string());
+        let hub_bin = std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string());
         Self {
             cwd,
             data_directory: data_directory.display().to_string(),
@@ -570,7 +590,9 @@ impl ChargedMaterializationConfig {
             .and_then(|bytes| bytes.checked_add(startup_paths.data_directory.len()))
             .and_then(|bytes| bytes.checked_add(startup_paths.session_directory.len()))
             .and_then(|bytes| bytes.checked_add(startup_paths.hub_socket.len()))
-            .and_then(|bytes| bytes.checked_add(startup_paths.hub_bin.as_ref().map_or(0, String::len)))
+            .and_then(|bytes| {
+                bytes.checked_add(startup_paths.hub_bin.as_ref().map_or(0, String::len))
+            })
             .ok_or("materialization config size overflow")?;
         parent
             .grow(bytes)
@@ -1255,12 +1277,7 @@ fn definition_clone_peak(definition: &PackageSessionType) -> Option<usize> {
             bytes = bytes.checked_add(path.len())?;
         }
     }
-    for strings in [
-        traits,
-        args,
-        allowed_environment_overrides,
-        context,
-    ] {
+    for strings in [traits, args, allowed_environment_overrides, context] {
         bytes = bytes.checked_add(vector_growth_peak::<String>(strings.len())?)?;
         for string in strings {
             bytes = bytes.checked_add(string.len())?;
@@ -1371,12 +1388,13 @@ impl<'a> ChargedSourceBuilder<'a> {
         &mut self,
         check: impl FnOnce() -> SessionTypeResult<()>,
     ) -> Result<(), ChargedSourceLoadFailure> {
-        let error_bytes = materialization_error::construction_error_storage_bytes(None)
-            .ok_or(ChargedSourceLoadFailure::Capacity("source validation size overflow"))?;
+        let error_bytes = materialization_error::construction_error_storage_bytes(None).ok_or(
+            ChargedSourceLoadFailure::Capacity("source validation size overflow"),
+        )?;
         let original = self.parent.bytes();
-        self.parent
-            .grow(error_bytes)
-            .map_err(|_| ChargedSourceLoadFailure::Capacity("source validation capacity exhausted"))?;
+        self.parent.grow(error_bytes).map_err(|_| {
+            ChargedSourceLoadFailure::Capacity("source validation capacity exhausted")
+        })?;
         match check() {
             Ok(()) => {
                 assert!(self.parent.shrink_to(original));
@@ -1447,11 +1465,9 @@ impl<'a> ChargedSourceBuilder<'a> {
                     .ok_or(ChargedSourceLoadFailure::Capacity(
                         "device source root size overflow",
                     ))?;
-                self.parent
-                    .grow(bytes)
-                    .map_err(|_| ChargedSourceLoadFailure::Capacity(
-                        "device source root capacity exhausted",
-                    ))?;
+                self.parent.grow(bytes).map_err(|_| {
+                    ChargedSourceLoadFailure::Capacity("device source root capacity exhausted")
+                })?;
                 let mut root = PathBuf::with_capacity(bytes);
                 root.push(startup_cwd);
                 root.push(&device.root);
@@ -1492,13 +1508,13 @@ impl<'a> ChargedSourceBuilder<'a> {
         root: &Path,
         target_id: &str,
     ) -> Result<(), ChargedSourceLoadFailure> {
-        let Some(read) = read_repo_file_charged(root, self.parent)
-            .map_err(ChargedSourceLoadFailure::Read)?
+        let Some(read) =
+            read_repo_file_charged(root, self.parent).map_err(ChargedSourceLoadFailure::Read)?
         else {
             return Ok(());
         };
-        let parsed = parse_repo_file_charged(read, self.parent)
-            .map_err(ChargedSourceLoadFailure::Parse)?;
+        let parsed =
+            parse_repo_file_charged(read, self.parent).map_err(ChargedSourceLoadFailure::Parse)?;
         self.validate(|| {
             validate_session_types(&parsed.definitions)
                 .map_err(|message| SessionTypeError::new("invalid_repo_session_types", message))
@@ -1577,11 +1593,13 @@ impl ChargedSourceSessionTypes {
                 let storage = parent
                     .split_fixed(error_bytes)
                     .expect("the parent admitted the source-selection error");
-                return Err(ChargedSourceResolveFailure::Semantic(ChargedSessionTypeFailure {
-                    error,
-                    _variable: storage,
-                    lua_render: None,
-                }));
+                return Err(ChargedSourceResolveFailure::Semantic(
+                    ChargedSessionTypeFailure {
+                        error,
+                        _variable: storage,
+                        lua_render: None,
+                    },
+                ));
             }
         };
         let index = self
@@ -1706,20 +1724,16 @@ impl ChargedSourceLoadFailure {
                     lua_render: None,
                 })
             }
-            Self::Read(ChargedRepoReadFailure::TooLarge) => funded_source_error(
-                parent,
-                "repo_session_types_too_large",
-                None,
-                0,
-                |output| {
+            Self::Read(ChargedRepoReadFailure::TooLarge) => {
+                funded_source_error(parent, "repo_session_types_too_large", None, 0, |output| {
                     write!(
                         output,
                         "repo-local session type file exceeds {} bytes",
                         REPO_SESSION_TYPES_FILE_BYTE_CAPACITY
                     )
-                },
-            )
-            .ok_or(Self::Read(ChargedRepoReadFailure::TooLarge)),
+                })
+                .ok_or(Self::Read(ChargedRepoReadFailure::TooLarge))
+            }
             #[cfg(target_os = "macos")]
             Self::Read(ChargedRepoReadFailure::Io(error)) => {
                 if error.raw_os_error().is_none() {
@@ -1740,7 +1754,10 @@ impl ChargedSourceLoadFailure {
                         Some(capacity),
                         762,
                         |output| {
-                            write!(output, "repo-local session type file could not be read: {error}")
+                            write!(
+                                output,
+                                "repo-local session type file could not be read: {error}"
+                            )
                         },
                     )
                 });
@@ -1770,9 +1787,9 @@ fn load_charged_sources(
     for target in state.spawn_targets.iter().filter(|target| target.enabled) {
         builder.push_repo_file(&target.root, &target.target_id)?;
     }
-    builder
-        .finish()
-        .ok_or(ChargedSourceLoadFailure::Capacity("source charge transfer failed"))
+    builder.finish().ok_or(ChargedSourceLoadFailure::Capacity(
+        "source charge transfer failed",
+    ))
 }
 
 /// Read complete definitions under the original input parent on Host.
@@ -1787,22 +1804,25 @@ fn materialize_ordinary_charged(
     session_type_id: &str,
     request: SessionTypeRequest,
 ) -> Result<ChargedSessionTypeMaterialization, ChargedMaterializationFailure> {
-    let sources = match load_charged_sources(package_records, state, &config.startup_cwd, &mut parent) {
-        Ok(sources) => sources,
-        Err(error) => {
-            return Err(match error.into_semantic_failure(&mut parent) {
-                Ok(failure) => semantic_materialization_failure(failure, &mut parent),
-                Err(ChargedSourceLoadFailure::Capacity(reason))
-                | Err(ChargedSourceLoadFailure::Read(ChargedRepoReadFailure::Capacity(reason)))
-                | Err(ChargedSourceLoadFailure::Parse(ChargedRepoParseFailure::Capacity(reason))) => {
-                    ChargedMaterializationFailure::Capacity(reason)
-                }
-                Err(_) => ChargedMaterializationFailure::Unavailable(
-                    "repository source error capacity exhausted",
-                ),
-            });
-        }
-    };
+    let sources =
+        match load_charged_sources(package_records, state, &config.startup_cwd, &mut parent) {
+            Ok(sources) => sources,
+            Err(error) => {
+                return Err(match error.into_semantic_failure(&mut parent) {
+                    Ok(failure) => semantic_materialization_failure(failure, &mut parent),
+                    Err(ChargedSourceLoadFailure::Capacity(reason))
+                    | Err(ChargedSourceLoadFailure::Read(ChargedRepoReadFailure::Capacity(
+                        reason,
+                    )))
+                    | Err(ChargedSourceLoadFailure::Parse(ChargedRepoParseFailure::Capacity(
+                        reason,
+                    ))) => ChargedMaterializationFailure::Capacity(reason),
+                    Err(_) => ChargedMaterializationFailure::Unavailable(
+                        "repository source error capacity exhausted",
+                    ),
+                });
+            }
+        };
     let (index, row, row_storage, target) = match sources.resolve(
         state,
         session_type_id,
@@ -1863,23 +1883,20 @@ fn materialize_ordinary_charged(
             return Err(failure);
         }
     };
-    let execution = match charged_execution(
-        &mut parent,
-        config.view().shell,
-        &sources.sources[index],
-    ) {
-        Ok(execution) => execution,
-        Err(reason) => {
-            drop(prefix);
-            drop(environment);
-            drop(environment_storage);
-            drop(row);
-            drop(row_storage);
-            drop(sources);
-            drop(config);
-            return Err(ChargedMaterializationFailure::Capacity(reason));
-        }
-    };
+    let execution =
+        match charged_execution(&mut parent, config.view().shell, &sources.sources[index]) {
+            Ok(execution) => execution,
+            Err(reason) => {
+                drop(prefix);
+                drop(environment);
+                drop(environment_storage);
+                drop(row);
+                drop(row_storage);
+                drop(sources);
+                drop(config);
+                return Err(ChargedMaterializationFailure::Capacity(reason));
+            }
+        };
     let metadata = match charged_session_type_metadata(&mut parent, &row) {
         Ok(metadata) => metadata,
         Err(reason) => {
@@ -1918,27 +1935,23 @@ fn materialize_ordinary_charged(
         }
     };
     let mut environment = environment;
-    let environment_injection = match charged_inject_context_environment(
-        &mut parent,
-        &mut environment,
-        &prefix,
-        paths,
-    ) {
-        Ok(injection) => injection,
-        Err(reason) => {
-            drop(context);
-            drop(metadata);
-            drop(execution);
-            drop(prefix);
-            drop(environment);
-            drop(environment_storage);
-            drop(row);
-            drop(row_storage);
-            drop(sources);
-            drop(config);
-            return Err(ChargedMaterializationFailure::Capacity(reason));
-        }
-    };
+    let environment_injection =
+        match charged_inject_context_environment(&mut parent, &mut environment, &prefix, paths) {
+            Ok(injection) => injection,
+            Err(reason) => {
+                drop(context);
+                drop(metadata);
+                drop(execution);
+                drop(prefix);
+                drop(environment);
+                drop(environment_storage);
+                drop(row);
+                drop(row_storage);
+                drop(sources);
+                drop(config);
+                return Err(ChargedMaterializationFailure::Capacity(reason));
+            }
+        };
     let result = charged_final_materialization(
         parent,
         row_storage,
@@ -2231,7 +2244,12 @@ pub(crate) fn materialize_managed_session_type(
         },
         &source.session_type.context,
     );
-    inject_context_environment(materialization_config, &mut environment, &session_id, &context_id);
+    inject_context_environment(
+        materialization_config,
+        &mut environment,
+        &session_id,
+        &context_id,
+    );
     let command_root = if source.rank == SessionTypeSourceRank::Repo {
         &managed_root
     } else {
@@ -2766,14 +2784,14 @@ fn choose_source_borrowed<'a>(
 ) -> SessionTypeResult<&'a SourceSessionType> {
     if let Some(target_id) = target_id {
         let mut selected = None;
-        for source in sources.iter().filter(|source| eligible_borrowed(source, target_id)) {
+        for source in sources
+            .iter()
+            .filter(|source| eligible_borrowed(source, target_id))
+        {
             // Only one winner per authored ID is visible to target-scoped spawn.
-            let winner = choose_effective_session_type_ref(
-                sources.iter().filter(|peer| {
-                    peer.session_type.id == source.session_type.id
-                        && eligible_borrowed(peer, target_id)
-                }),
-            )?;
+            let winner = choose_effective_session_type_ref(sources.iter().filter(|peer| {
+                peer.session_type.id == source.session_type.id && eligible_borrowed(peer, target_id)
+            }))?;
             if !std::ptr::eq(source, winner) || !source_matches_id(winner, session_type_id) {
                 continue;
             }
@@ -2822,20 +2840,23 @@ fn resolve_materialization_source_borrowed<'a>(
     }
 
     let source = choose_source_borrowed(sources, session_type_id, None)?;
-    let resolved_target_id = source.session_type.target_id.as_deref().unwrap_or_else(|| {
-        match source.rank {
-            SessionTypeSourceRank::Package => "",
-            SessionTypeSourceRank::Device => DEFAULT_DEVICE_TARGET_ID,
-            SessionTypeSourceRank::Repo => &source.source_name,
-        }
-    });
+    let resolved_target_id =
+        source
+            .session_type
+            .target_id
+            .as_deref()
+            .unwrap_or_else(|| match source.rank {
+                SessionTypeSourceRank::Package => "",
+                SessionTypeSourceRank::Device => DEFAULT_DEVICE_TARGET_ID,
+                SessionTypeSourceRank::Repo => &source.source_name,
+            });
     // Package defaults need a prefix comparison without allocating package:name.
-    if source.session_type.target_id.is_none()
-        && source.rank == SessionTypeSourceRank::Package
-    {
-        if let Some(target) = state.spawn_targets.iter().find(|target| {
-            target.enabled && default_target_matches(source, &target.target_id)
-        }) {
+    if source.session_type.target_id.is_none() && source.rank == SessionTypeSourceRank::Package {
+        if let Some(target) = state
+            .spawn_targets
+            .iter()
+            .find(|target| target.enabled && default_target_matches(source, &target.target_id))
+        {
             return Ok((source, Some(target)));
         }
         return Ok((source, None));
@@ -2889,52 +2910,97 @@ where
     I: Iterator<Item = &'a SourceSessionType> + Clone,
 {
     let definition = &winner.session_type;
-    let target_bytes = definition.target_id.as_ref().map_or_else(
-        || match winner.rank {
-            SessionTypeSourceRank::Package => "package:".len().checked_add(winner.source_name.len()),
-            SessionTypeSourceRank::Device => Some(DEFAULT_DEVICE_TARGET_ID.len()),
-            SessionTypeSourceRank::Repo => Some(winner.source_name.len()),
-        },
-        |pin| Some(pin.len()),
-    ).ok_or("row target size overflow")?;
+    let target_bytes = definition
+        .target_id
+        .as_ref()
+        .map_or_else(
+            || match winner.rank {
+                SessionTypeSourceRank::Package => {
+                    "package:".len().checked_add(winner.source_name.len())
+                }
+                SessionTypeSourceRank::Device => Some(DEFAULT_DEVICE_TARGET_ID.len()),
+                SessionTypeSourceRank::Repo => Some(winner.source_name.len()),
+            },
+            |pin| Some(pin.len()),
+        )
+        .ok_or("row target size overflow")?;
     let mut bytes = [
-        winner.source_name.len().checked_add(1).and_then(|n| n.checked_add(definition.id.len())).ok_or("row ID size overflow")?,
-        winner.source_name.len(), definition.id.len(), winner.source.len(),
-        definition.label.len(), definition.description.as_ref().map_or(0, String::len),
-        definition.icon.as_ref().map_or(0, String::len), definition.role.len(),
-        definition.interaction.len(), definition.lifecycle.len(), definition.command.len(),
+        winner
+            .source_name
+            .len()
+            .checked_add(1)
+            .and_then(|n| n.checked_add(definition.id.len()))
+            .ok_or("row ID size overflow")?,
+        winner.source_name.len(),
+        definition.id.len(),
+        winner.source.len(),
+        definition.label.len(),
+        definition.description.as_ref().map_or(0, String::len),
+        definition.icon.as_ref().map_or(0, String::len),
+        definition.role.len(),
+        definition.interaction.len(),
+        definition.lifecycle.len(),
+        definition.command.len(),
         target_bytes,
         match &definition.working_directory {
             PackageSessionTypeWorkingDirectory::PackageRoot => "package_root".len(),
             PackageSessionTypeWorkingDirectory::Relative { .. } => "relative".len(),
         },
-    ].into_iter().try_fold(0usize, usize::checked_add).ok_or("row string size overflow")?;
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+    .ok_or("row string size overflow")?;
     for strings in [
         &definition.traits,
         &definition.args,
         &definition.allowed_environment_overrides,
         &definition.context,
     ] {
-        bytes = bytes.checked_add(vector_growth_peak::<String>(strings.len()).ok_or("row vector size overflow")?).ok_or("row vector size overflow")?;
+        bytes = bytes
+            .checked_add(
+                vector_growth_peak::<String>(strings.len()).ok_or("row vector size overflow")?,
+            )
+            .ok_or("row vector size overflow")?;
         for value in strings {
-            bytes = bytes.checked_add(value.len()).ok_or("row string size overflow")?;
+            bytes = bytes
+                .checked_add(value.len())
+                .ok_or("row string size overflow")?;
         }
     }
     let mut overridden = 0usize;
     for source in peers.clone().filter(|source| source.rank < winner.rank) {
         overridden = overridden.checked_add(1).ok_or("row peer count overflow")?;
-        bytes = bytes.checked_add(source.source.len()).and_then(|n| n.checked_add(source.source_name.len())).ok_or("row peer string size overflow")?;
+        bytes = bytes
+            .checked_add(source.source.len())
+            .and_then(|n| n.checked_add(source.source_name.len()))
+            .ok_or("row peer string size overflow")?;
     }
-    bytes = bytes.checked_add(vector_growth_peak::<HubSessionTypeSource>(overridden).ok_or("row peer vector size overflow")?).ok_or("row peer vector size overflow")?;
+    bytes = bytes
+        .checked_add(
+            vector_growth_peak::<HubSessionTypeSource>(overridden)
+                .ok_or("row peer vector size overflow")?,
+        )
+        .ok_or("row peer vector size overflow")?;
     // Match the sole diagnostic push in effective_session_type_row below.
     if overridden > 0 {
         let mut count = CountFormattedBytes(0);
-        std::fmt::write(&mut count, format_args!("overrides {} lower-precedence definition(s)", overridden)).map_err(|_| "row diagnostic size overflow")?;
-        bytes = bytes.checked_add(vector_growth_peak::<String>(1).ok_or("row diagnostic vector size overflow")?).and_then(|n| n.checked_add(count.0)).ok_or("row diagnostic size overflow")?;
+        std::fmt::write(
+            &mut count,
+            format_args!("overrides {} lower-precedence definition(s)", overridden),
+        )
+        .map_err(|_| "row diagnostic size overflow")?;
+        bytes = bytes
+            .checked_add(
+                vector_growth_peak::<String>(1).ok_or("row diagnostic vector size overflow")?,
+            )
+            .and_then(|n| n.checked_add(count.0))
+            .ok_or("row diagnostic size overflow")?;
     }
     parent.grow(bytes).map_err(|_| "row capacity exhausted")?;
     let row = effective_session_type_row(winner, peers);
-    let storage = parent.split_fixed(bytes).expect("the parent admitted the complete row");
+    let storage = parent
+        .split_fixed(bytes)
+        .expect("the parent admitted the complete row");
     Ok((row, storage))
 }
 
@@ -2963,7 +3029,9 @@ impl ChargedEnvironmentFailure<'_> {
             Self::NotAdmitted(name) => funded_source_error(
                 parent,
                 "environment_not_admitted",
-                "environment override is not admitted: ".len().checked_add(name.len()),
+                "environment override is not admitted: "
+                    .len()
+                    .checked_add(name.len()),
                 0,
                 |output| write!(output, "environment override is not admitted: {name}"),
             ),
@@ -2979,7 +3047,10 @@ fn charged_effective_environment<'a>(
     definition: &PackageSessionType,
     request: &'a SessionTypeRequest,
 ) -> Result<
-    (BTreeMap<String, String>, crate::lua_memory::LuaCallbackCharge),
+    (
+        BTreeMap<String, String>,
+        crate::lua_memory::LuaCallbackCharge,
+    ),
     ChargedEnvironmentFailure<'a>,
 > {
     for name in request.environment.keys() {
@@ -3000,14 +3071,20 @@ fn charged_effective_environment<'a>(
         .checked_add(request.environment.len())
         // Context injection can add five reserved names after this copy.
         .and_then(|count| count.checked_add(5))
-        .ok_or(ChargedEnvironmentFailure::Capacity("environment row count overflow"))?;
+        .ok_or(ChargedEnvironmentFailure::Capacity(
+            "environment row count overflow",
+        ))?;
     let mut bytes = crate::lua_memory::layout::btree_nodes_checked::<String, String>(largest_len)
-        .ok_or(ChargedEnvironmentFailure::Capacity("environment node size overflow"))?;
+        .ok_or(ChargedEnvironmentFailure::Capacity(
+        "environment node size overflow",
+    ))?;
     for (name, value) in definition.environment.iter().chain(&request.environment) {
         bytes = bytes
             .checked_add(name.len())
             .and_then(|bytes| bytes.checked_add(value.len()))
-            .ok_or(ChargedEnvironmentFailure::Capacity("environment string size overflow"))?;
+            .ok_or(ChargedEnvironmentFailure::Capacity(
+                "environment string size overflow",
+            ))?;
     }
     parent
         .grow(bytes)
@@ -3071,7 +3148,9 @@ fn charged_deterministic_prefix(
         None if source.rank == SessionTypeSourceRank::Package => "package:"
             .len()
             .checked_add(source.source_name.len())
-            .ok_or(DeterministicPrefixFailure::Capacity("target ID size overflow"))?,
+            .ok_or(DeterministicPrefixFailure::Capacity(
+                "target ID size overflow",
+            ))?,
         None if source.rank == SessionTypeSourceRank::Device => DEFAULT_DEVICE_TARGET_ID.len(),
         None => source.source_name.len(),
     };
@@ -3096,19 +3175,30 @@ fn charged_deterministic_prefix(
                 .ok_or(DeterministicPrefixFailure::Capacity("cwd size overflow"))?,
         }
     };
-    let session_bytes = request.session_id.as_ref().map_or_else(
-        || "session-type-".len().checked_add(definition.id.len()),
-        |session_id| Some(session_id.0.len()),
-    ).ok_or(DeterministicPrefixFailure::Capacity("session ID size overflow"))?;
-    let context_bytes = "ctx-"
-        .len()
-        .checked_add(session_bytes)
-        .ok_or(DeterministicPrefixFailure::Capacity("context ID size overflow"))?;
+    let session_bytes = request
+        .session_id
+        .as_ref()
+        .map_or_else(
+            || "session-type-".len().checked_add(definition.id.len()),
+            |session_id| Some(session_id.0.len()),
+        )
+        .ok_or(DeterministicPrefixFailure::Capacity(
+            "session ID size overflow",
+        ))?;
+    let context_bytes =
+        "ctx-"
+            .len()
+            .checked_add(session_bytes)
+            .ok_or(DeterministicPrefixFailure::Capacity(
+                "context ID size overflow",
+            ))?;
     let bytes = target_bytes
         .checked_add(cwd_bytes)
         .and_then(|bytes| bytes.checked_add(session_bytes))
         .and_then(|bytes| bytes.checked_add(context_bytes))
-        .ok_or(DeterministicPrefixFailure::Capacity("spawn prefix size overflow"))?;
+        .ok_or(DeterministicPrefixFailure::Capacity(
+            "spawn prefix size overflow",
+        ))?;
     parent
         .grow(bytes)
         .map_err(|_| DeterministicPrefixFailure::Capacity("spawn prefix capacity exhausted"))?;
@@ -3138,8 +3228,7 @@ fn charged_deterministic_prefix(
         working_directory.push(cwd);
     } else {
         working_directory.push(cwd_root);
-        if let PackageSessionTypeWorkingDirectory::Relative { path } =
-            &definition.working_directory
+        if let PackageSessionTypeWorkingDirectory::Relative { path } = &definition.working_directory
         {
             // Every source passed validate_relative_manifest_path before selection.
             // Therefore push cannot replace cwd_root with an absolute path.
@@ -3204,9 +3293,10 @@ fn charged_execution(
         let argument_count = definition.args.len().checked_add(extra_args)?;
         // with_capacity allocates once; vector_growth_peak covers push growth.
         let vector_bytes = argument_count.checked_mul(std::mem::size_of::<String>())?;
-        let argument_bytes = definition.args.iter().try_fold(0usize, |bytes, argument| {
-            bytes.checked_add(argument.len())
-        })?;
+        let argument_bytes = definition
+            .args
+            .iter()
+            .try_fold(0usize, |bytes, argument| bytes.checked_add(argument.len()))?;
         let extra_bytes = if extra_args == 0 {
             0
         } else {
@@ -3359,31 +3449,42 @@ fn charged_context(
         ("workspace_id", input.workspace_id.as_ref()),
     ];
     let optional_count = optional.iter().filter(|(_, value)| value.is_some()).count();
-    let optional_key_bytes = optional.iter().try_fold(0usize, |bytes, (key, value)| {
-        if value.is_some() {
-            bytes.checked_add(key.len())
-        } else {
-            Some(bytes)
-        }
-    }).ok_or("context optional key size overflow")?;
+    let optional_key_bytes = optional
+        .iter()
+        .try_fold(0usize, |bytes, (key, value)| {
+            if value.is_some() {
+                bytes.checked_add(key.len())
+            } else {
+                Some(bytes)
+            }
+        })
+        .ok_or("context optional key size overflow")?;
     let mut metadata_count = 0usize;
     let mut metadata_key_bytes = 0usize;
     for key in input.metadata.keys() {
-        if key.bytes().all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()) {
-            metadata_count = metadata_count.checked_add(1).ok_or("context row count overflow")?;
+        if key
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        {
+            metadata_count = metadata_count
+                .checked_add(1)
+                .ok_or("context row count overflow")?;
             metadata_key_bytes = metadata_key_bytes
                 .checked_add("metadata.".len())
                 .and_then(|bytes| bytes.checked_add(key.len()))
                 .ok_or("context metadata key size overflow")?;
         }
     }
-    let declared_key_bytes = declared_keys.iter().try_fold(0usize, |bytes, key| {
-        bytes.checked_add(key.len())
-    }).ok_or("context declared key size overflow")?;
-    let base_key_bytes = BASE_KEYS.iter().try_fold(0usize, |bytes, key| {
-        bytes.checked_add(key.len())
-    }).ok_or("context base key size overflow")?;
-    let map_rows = BASE_KEYS.len()
+    let declared_key_bytes = declared_keys
+        .iter()
+        .try_fold(0usize, |bytes, key| bytes.checked_add(key.len()))
+        .ok_or("context declared key size overflow")?;
+    let base_key_bytes = BASE_KEYS
+        .iter()
+        .try_fold(0usize, |bytes, key| bytes.checked_add(key.len()))
+        .ok_or("context base key size overflow")?;
+    let map_rows = BASE_KEYS
+        .len()
         .checked_add(optional_count)
         .and_then(|rows| rows.checked_add(metadata_count))
         .and_then(|rows| rows.checked_add(declared_keys.len()))
@@ -3423,12 +3524,17 @@ fn charged_context(
         .and_then(|bytes| bytes.checked_add(declared_key_bytes))
         .and_then(|bytes| bytes.checked_add(copied_values))
         .ok_or("context size overflow")?;
-    parent.grow(bytes).map_err(|_| "context capacity exhausted")?;
+    parent
+        .grow(bytes)
+        .map_err(|_| "context capacity exhausted")?;
     let mut values = BTreeMap::new();
     values.insert("session_id".to_string(), prefix.session_id.0.clone());
     values.insert("context_id".to_string(), prefix.context_id.clone());
     values.insert("target_id".to_string(), prefix.target_id.clone());
-    values.insert("session_dir".to_string(), paths.session_directory.to_string());
+    values.insert(
+        "session_dir".to_string(),
+        paths.session_directory.to_string(),
+    );
     values.insert("hub_socket".to_string(), paths.hub_socket.to_string());
     // Keep these fallback conditions aligned with the display counts above.
     let repo_path = input.repo_path.unwrap_or_else(|| {
@@ -3453,7 +3559,10 @@ fn charged_context(
     insert_optional(&mut values, "ticket_id", input.ticket_id);
     insert_optional(&mut values, "workspace_id", input.workspace_id);
     for (key, value) in input.metadata {
-        if key.bytes().all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()) {
+        if key
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        {
             let mut named = String::with_capacity("metadata.".len() + key.len());
             named.push_str("metadata.");
             named.push_str(&key);
@@ -3463,7 +3572,9 @@ fn charged_context(
     for key in declared_keys {
         values.entry(key.clone()).or_default();
     }
-    let storage = parent.split_fixed(bytes).expect("the parent admitted the context");
+    let storage = parent
+        .split_fixed(bytes)
+        .expect("the parent admitted the context");
     Ok(ChargedSessionTypeContext {
         value: HubSessionContext {
             context_id: prefix.context_id.clone(),
@@ -3496,31 +3607,48 @@ fn charged_final_materialization(
         format_args!("{}", prefix.working_directory.display()),
     )
     .map_err(|_| "output cwd size overflow")?;
-    let argument_bytes = execution.arguments.iter().try_fold(0usize, |bytes, argument| {
-        bytes.checked_add(argument.len())
-    }).ok_or("output argument size overflow")?;
-    let argument_slots = execution.arguments.len()
+    let argument_bytes = execution
+        .arguments
+        .iter()
+        .try_fold(0usize, |bytes, argument| bytes.checked_add(argument.len()))
+        .ok_or("output argument size overflow")?;
+    let argument_slots = execution
+        .arguments
+        .len()
         .checked_mul(std::mem::size_of::<String>())
         .ok_or("output argument vector overflow")?;
-    let environment_strings = environment.iter().try_fold(0usize, |bytes, (key, value)| {
-        bytes.checked_add(key.len())?.checked_add(value.len())
-    }).ok_or("output environment size overflow")?;
-    let environment_nodes = crate::lua_memory::layout::btree_nodes_checked::<String, String>(
-        environment.len(),
-    ).ok_or("output environment node overflow")?;
-    let environment_slots = environment.len()
+    let environment_strings = environment
+        .iter()
+        .try_fold(0usize, |bytes, (key, value)| {
+            bytes.checked_add(key.len())?.checked_add(value.len())
+        })
+        .ok_or("output environment size overflow")?;
+    let environment_nodes =
+        crate::lua_memory::layout::btree_nodes_checked::<String, String>(environment.len())
+            .ok_or("output environment node overflow")?;
+    let environment_slots = environment
+        .len()
         .checked_mul(std::mem::size_of::<SpawnEnvironmentVariable>())
         .ok_or("output environment vector overflow")?;
-    let context_key_bytes = context.value.values.keys().try_fold(0usize, |bytes, key| {
-        bytes.checked_add(key.len())
-    }).ok_or("output context key size overflow")?;
-    let context_key_slots = context.value.values.len()
+    let context_key_bytes = context
+        .value
+        .values
+        .keys()
+        .try_fold(0usize, |bytes, key| bytes.checked_add(key.len()))
+        .ok_or("output context key size overflow")?;
+    let context_key_slots = context
+        .value
+        .values
+        .len()
         .checked_mul(std::mem::size_of::<String>())
         .ok_or("output context key vector overflow")?;
-    let request_id_bytes = "session-type-".len()
+    let request_id_bytes = "session-type-"
+        .len()
         .checked_add(prefix.context_id.len())
         .ok_or("output request ID size overflow")?;
-    let copy_bytes = cwd_count.0.checked_mul(2)
+    let copy_bytes = cwd_count
+        .0
+        .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(prefix.session_id.0.len()))
         .and_then(|bytes| bytes.checked_add(prefix.context_id.len()))
         .and_then(|bytes| bytes.checked_add(request_id_bytes))
@@ -3533,7 +3661,9 @@ fn charged_final_materialization(
         .and_then(|bytes| bytes.checked_add(context_key_bytes))
         .and_then(|bytes| bytes.checked_add(context_key_slots))
         .ok_or("output copy size overflow")?;
-    parent.grow(copy_bytes).map_err(|_| "output copy capacity exhausted")?;
+    parent
+        .grow(copy_bytes)
+        .map_err(|_| "output copy capacity exhausted")?;
 
     let ChargedDeterministicPrefix {
         target_id,
@@ -3548,8 +3678,14 @@ fn charged_final_materialization(
         _display_path,
         _storage: execution_storage,
     } = execution;
-    let ChargedSessionTypeMetadata { value: metadata, _storage: metadata_storage } = metadata;
-    let ChargedSessionTypeContext { value: context, _storage: context_storage } = context;
+    let ChargedSessionTypeMetadata {
+        value: metadata,
+        _storage: metadata_storage,
+    } = metadata;
+    let ChargedSessionTypeContext {
+        value: context,
+        _storage: context_storage,
+    } = context;
     row.target_id = target_id;
     let mut cwd = String::with_capacity(cwd_count.0);
     std::fmt::write(&mut cwd, format_args!("{}", working_directory.display()))
@@ -3570,10 +3706,11 @@ fn charged_final_materialization(
     request_id.push_str("session-type-");
     request_id.push_str(&context_id);
     let mut variables = Vec::with_capacity(environment.len());
-    variables.extend(environment.into_iter().map(|(name, value)| SpawnEnvironmentVariable {
-        name,
-        value,
-    }));
+    variables.extend(
+        environment
+            .into_iter()
+            .map(|(name, value)| SpawnEnvironmentVariable { name, value }),
+    );
     let spawn_request = SessionSpawnRequest {
         request_id: RequestId(request_id),
         session_id,
@@ -3583,12 +3720,21 @@ fn charged_final_materialization(
             path: resolved.working_directory.clone(),
         },
         environment: SpawnEnvironment { variables },
-        initial_pty_size: Some(ResizePayload { rows: initial_rows, cols: initial_cols }),
+        initial_pty_size: Some(ResizePayload {
+            rows: initial_rows,
+            cols: initial_cols,
+        }),
     };
-    let output_copies = parent.split_fixed(copy_bytes)
+    let output_copies = parent
+        .split_fixed(copy_bytes)
         .expect("the parent admitted the output copies");
     Ok(ChargedSessionTypeMaterialization {
-        materialized: MaterializedSessionType { resolved, spawn_request, context, metadata },
+        materialized: MaterializedSessionType {
+            resolved,
+            spawn_request,
+            context,
+            metadata,
+        },
         allowance: ChargedMaterializationAllowance {
             parent,
             row: row_storage,
@@ -3623,9 +3769,10 @@ fn charged_session_type_metadata(
         row.lifecycle.as_str(),
     ];
     let mut count = CountWrittenBytes(0);
-    serde_json::to_writer(&mut count, &row.traits)
-        .map_err(|_| "metadata traits size overflow")?;
-    let key_bytes = KEYS.iter().try_fold(0usize, |bytes, key| bytes.checked_add(key.len()))
+    serde_json::to_writer(&mut count, &row.traits).map_err(|_| "metadata traits size overflow")?;
+    let key_bytes = KEYS
+        .iter()
+        .try_fold(0usize, |bytes, key| bytes.checked_add(key.len()))
         .ok_or("metadata key size overflow")?;
     let value_bytes = values
         .iter()
@@ -3820,7 +3967,9 @@ fn parse_repo_file_charged(
         .map_err(|_| ChargedRepoParseFailure::Capacity("repo parser capacity exhausted"))?;
     let mut storage = parent
         .split_fixed(peak)
-        .ok_or(ChargedRepoParseFailure::Capacity("repo parser capacity exhausted"))?;
+        .ok_or(ChargedRepoParseFailure::Capacity(
+            "repo parser capacity exhausted",
+        ))?;
     let parsed = serde_json::from_slice::<RepoSessionTypesFile>(&file.bytes);
     let result = match parsed {
         Ok(parsed) => Ok(ChargedRepoDefinitions {
@@ -3867,7 +4016,10 @@ fn read_repo_file_charged(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ChargedRepoReadFailure::Io(error)),
     };
-    let metadata_size = file.metadata().ok().and_then(|value| usize::try_from(value.len()).ok());
+    let metadata_size = file
+        .metadata()
+        .ok()
+        .and_then(|value| usize::try_from(value.len()).ok());
     let initial_capacity = metadata_size.unwrap_or(0);
     read_repo_file_charged_from_open(file, initial_capacity, parent).map(Some)
 }
@@ -3909,7 +4061,9 @@ fn read_repo_file_charged_from_open(
                 .max(next_len)
                 .min(REPO_SESSION_TYPES_FILE_BYTE_CAPACITY);
             if parent.grow(next_capacity).is_err() {
-                break Err(ChargedRepoReadFailure::Capacity("repo file capacity exhausted"));
+                break Err(ChargedRepoReadFailure::Capacity(
+                    "repo file capacity exhausted",
+                ));
             }
             let mut grown = vec![0_u8; next_capacity];
             grown[..bytes.len()].copy_from_slice(&bytes);
@@ -3927,7 +4081,9 @@ fn read_repo_file_charged_from_open(
     }
     let storage = parent
         .split_fixed(bytes.capacity())
-        .ok_or(ChargedRepoReadFailure::Capacity("repo file capacity exhausted"))?;
+        .ok_or(ChargedRepoReadFailure::Capacity(
+            "repo file capacity exhausted",
+        ))?;
     Ok(ChargedRepoFileBytes {
         bytes,
         _storage: storage,
@@ -4316,8 +4472,8 @@ mod source_selection_tests {
             ),
             ..HubStartupOptions::default()
         }
-            .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
-            .unwrap();
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .unwrap();
         let memory = LuaMemoryAccount::new(LuaMemoryLimits {
             per_vm_bytes: 1,
             total_vm_bytes: 1,
@@ -4327,7 +4483,9 @@ mod source_selection_tests {
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
         let startup_paths = StartupMaterializationPaths::capture(&config);
-        let projected = ChargedMaterializationConfig::from_config(&config, &startup_paths, &mut parent).unwrap();
+        let projected =
+            ChargedMaterializationConfig::from_config(&config, &startup_paths, &mut parent)
+                .unwrap();
         let borrowed = MaterializationConfigView::from(&config);
         let owned = projected.view();
         assert_eq!(owned.data_directory, borrowed.data_directory);
@@ -4431,14 +4589,17 @@ mod source_selection_tests {
         })
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
-        let read = read_repo_file_charged_from_open(File::open(&path).unwrap(), 1, &mut parent)
-            .unwrap();
+        let read =
+            read_repo_file_charged_from_open(File::open(&path).unwrap(), 1, &mut parent).unwrap();
         assert_eq!(read.bytes, input);
         let parsed = match parse_repo_file_charged(read, &mut parent) {
             Ok(parsed) => parsed,
             Err(_) => panic!("the full charged schema must parse"),
         };
-        assert_eq!(parsed.definitions[0].environment["FULL_VALUE"], "value with spaces and = signs");
+        assert_eq!(
+            parsed.definitions[0].environment["FULL_VALUE"],
+            "value with spaces and = signs"
+        );
         assert!(parsed.definitions[0].traits.is_empty());
         assert!(parsed.definitions[0].args.is_empty());
         assert!(parsed.definitions[0].target_id.is_none());
@@ -4489,10 +4650,7 @@ mod source_selection_tests {
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
         let result = read_repo_file_charged_from_open(File::open(&path).unwrap(), 1, &mut parent);
-        assert!(matches!(
-            result,
-            Err(ChargedRepoReadFailure::TooLarge)
-        ));
+        assert!(matches!(result, Err(ChargedRepoReadFailure::TooLarge)));
         drop(parent);
         assert_eq!(memory.usage().1, 0);
         std::fs::remove_dir_all(root).unwrap();
@@ -4675,14 +4833,10 @@ mod source_selection_tests {
         }
     }
 
-    fn charged_device_root_with_absolute_cwd(
-        relative_root: bool,
-        captured_cwd: Option<PathBuf>,
-    ) {
-        let startup_cwd = captured_cwd
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| std::env::current_dir().expect("test process has a working directory"));
+    fn charged_device_root_with_absolute_cwd(relative_root: bool, captured_cwd: Option<PathBuf>) {
+        let startup_cwd = captured_cwd.as_ref().cloned().unwrap_or_else(|| {
+            std::env::current_dir().expect("test process has a working directory")
+        });
         let data_directory = PathBuf::from("relative-device-root-test-data");
         let stored_root = data_directory.join("session-types");
         let expected_root = startup_cwd.join(&stored_root);
@@ -4785,9 +4939,12 @@ mod source_selection_tests {
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
         let mut builder = ChargedSourceBuilder::new(&mut parent);
-        assert!(builder
-            .push_device_sources(&fixture.state, &fixture.root)
-            .is_ok(), "the charged device source must clone");
+        assert!(
+            builder
+                .push_device_sources(&fixture.state, &fixture.root)
+                .is_ok(),
+            "the charged device source must clone"
+        );
         assert_eq!(builder.sources.len(), 1);
         assert!(builder.reserved > 0);
         assert_eq!(builder.parent.bytes(), builder.reserved);
@@ -4835,12 +4992,17 @@ mod source_selection_tests {
         let mut builder = ChargedSourceBuilder::new(&mut parent);
         assert!(matches!(
             builder.push_device_sources(&fixture.state, &fixture.root),
-            Err(ChargedSourceLoadFailure::Capacity("source clone capacity exhausted"))
+            Err(ChargedSourceLoadFailure::Capacity(
+                "source clone capacity exhausted"
+            ))
         ));
         assert_eq!(builder.sources.len(), 1);
         assert_eq!(builder.reserved, first_clone);
         assert_eq!(builder.parent.bytes(), first_clone);
-        builder.parent.grow(anchor_bytes).expect("the temporary headroom returns");
+        builder
+            .parent
+            .grow(anchor_bytes)
+            .expect("the temporary headroom returns");
         assert!(builder.parent.shrink_to(first_clone));
         drop(builder);
         assert!(parent.shrink_to(0));
@@ -4888,18 +5050,18 @@ mod source_selection_tests {
         })
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
-        let sources = load_charged_sources(&[], &fixture.state, &fixture.root, &mut parent).unwrap_or_else(|_| {
-            panic!("the complete charged source set must load")
-        });
-        let (winner, expected_row, expected_target) = resolve_materialization_source(
-            &[], &fixture.state, "worker", Some("repo"),
-        )
-        .unwrap();
+        let sources = load_charged_sources(&[], &fixture.state, &fixture.root, &mut parent)
+            .unwrap_or_else(|_| panic!("the complete charged source set must load"));
+        let (winner, expected_row, expected_target) =
+            resolve_materialization_source(&[], &fixture.state, "worker", Some("repo")).unwrap();
         let (index, row, row_charge, target) = sources
             .resolve(&fixture.state, "worker", Some("repo"), &mut parent)
             .unwrap_or_else(|_| panic!("the charged winner must resolve"));
         assert_eq!(sources.sources[index].session_type, winner.session_type);
-        assert_eq!(sources.sources[index].session_type.environment, winner.session_type.environment);
+        assert_eq!(
+            sources.sources[index].session_type.environment,
+            winner.session_type.environment
+        );
         assert_eq!(row, expected_row);
         assert_eq!(target, expected_target.as_ref());
         assert!(row_charge.bytes() > 0);
@@ -4918,8 +5080,8 @@ mod source_selection_tests {
             ),
             ..HubStartupOptions::default()
         }
-            .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
-            .unwrap();
+        .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
+        .unwrap();
         let memory = LuaMemoryAccount::new(LuaMemoryLimits {
             per_vm_bytes: 1,
             total_vm_bytes: 1,
@@ -4940,9 +5102,10 @@ mod source_selection_tests {
                     source.session_type.args = vec!["one".into(), "two".into()];
                 }
                 source.session_type.context = vec!["declared".into(), "session_id".into()];
-                source.session_type.allowed_environment_overrides.push(
-                    "BOTSTER_SESSION_ID".into(),
-                );
+                source
+                    .session_type
+                    .allowed_environment_overrides
+                    .push("BOTSTER_SESSION_ID".into());
                 for request in [
                     SessionTypeRequest::default(),
                     SessionTypeRequest {
@@ -4986,23 +5149,17 @@ mod source_selection_tests {
                         prefix.working_directory.display().to_string(),
                         ordinary.resolved.working_directory
                     );
-                    let execution = charged_execution(
-                        &mut parent,
-                        &config.session_defaults.shell,
-                        &source,
-                    )
-                        .unwrap_or_else(|_| panic!("the charged command must fit"));
+                    let execution =
+                        charged_execution(&mut parent, &config.session_defaults.shell, &source)
+                            .unwrap_or_else(|_| panic!("the charged command must fit"));
                     assert_eq!(execution.executable, ordinary.resolved.executable);
                     assert_eq!(execution.arguments, ordinary.resolved.arguments);
-                    let metadata = charged_session_type_metadata(
-                        &mut parent,
-                        &ordinary.resolved.session_type,
-                    )
-                    .unwrap_or_else(|_| panic!("the charged metadata must fit"));
+                    let metadata =
+                        charged_session_type_metadata(&mut parent, &ordinary.resolved.session_type)
+                            .unwrap_or_else(|_| panic!("the charged metadata must fit"));
                     assert_eq!(metadata.value, ordinary.metadata);
-                    let data_directory = absolute_path(&config.data_directory)
-                        .display()
-                        .to_string();
+                    let data_directory =
+                        absolute_path(&config.data_directory).display().to_string();
                     let session_directory = absolute_path(&config.data_directory)
                         .join("sessions")
                         .display()
@@ -5027,12 +5184,9 @@ mod source_selection_tests {
                     )
                     .unwrap_or_else(|_| panic!("the charged context must fit"));
                     assert_eq!(context.value, ordinary.context);
-                    let (mut environment, environment_storage) = charged_effective_environment(
-                        &mut parent,
-                        &source.session_type,
-                        &request,
-                    )
-                    .unwrap_or_else(|_| panic!("the charged environment must fit"));
+                    let (mut environment, environment_storage) =
+                        charged_effective_environment(&mut parent, &source.session_type, &request)
+                            .unwrap_or_else(|_| panic!("the charged environment must fit"));
                     let injection_storage = charged_inject_context_environment(
                         &mut parent,
                         &mut environment,
@@ -5098,34 +5252,41 @@ mod source_selection_tests {
         })
         .unwrap();
         let mut source = source(SessionTypeSourceRank::Device, "final-output");
-        source.session_type.allowed_environment_overrides.push("BOTSTER_SESSION_ID".into());
+        source
+            .session_type
+            .allowed_environment_overrides
+            .push("BOTSTER_SESSION_ID".into());
         let request = SessionTypeRequest {
             session_id: Some(SessionId("charged-explicit".into())),
-            environment: BTreeMap::from([(
-                "BOTSTER_SESSION_ID".into(),
-                "request-value".into(),
-            )]),
+            environment: BTreeMap::from([("BOTSTER_SESSION_ID".into(), "request-value".into())]),
             ..SessionTypeRequest::default()
         };
         let mut parent = memory.reserve_callback_total(0).unwrap();
-        let (row, row_storage) = charged_effective_session_type_row(
-            &mut parent,
-            &source,
-            std::iter::once(&source),
-        ).unwrap();
+        let (row, row_storage) =
+            charged_effective_session_type_row(&mut parent, &source, std::iter::once(&source))
+                .unwrap();
         let ordinary = materialize_session_type_from_resolved(
-            (&config).into(), request.clone(), &source, row.clone(), None,
-        ).unwrap();
+            (&config).into(),
+            request.clone(),
+            &source,
+            row.clone(),
+            None,
+        )
+        .unwrap();
         let prefix = charged_deterministic_prefix(&mut parent, &source, None, &request)
             .unwrap_or_else(|_| panic!("the charged prefix must fit"));
-        let execution = charged_execution(&mut parent, &config.session_defaults.shell, &source)
-            .unwrap();
+        let execution =
+            charged_execution(&mut parent, &config.session_defaults.shell, &source).unwrap();
         let metadata = charged_session_type_metadata(&mut parent, &row).unwrap();
         let data_directory = absolute_path(&config.data_directory).display().to_string();
         let session_directory = absolute_path(&config.data_directory)
-            .join("sessions").display().to_string();
+            .join("sessions")
+            .display()
+            .to_string();
         let hub_socket = hub_socket_path((&config).into());
-        let hub_bin = std::env::current_exe().ok().map(|path| path.display().to_string());
+        let hub_bin = std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string());
         let paths = MaterializationPathText {
             data_directory: &data_directory,
             session_directory: &session_directory,
@@ -5133,23 +5294,41 @@ mod source_selection_tests {
             hub_bin: hub_bin.as_deref(),
         };
         let context = charged_context(
-            &mut parent, &prefix, &source.root, request.context.clone(),
-            &source.session_type.context, paths,
-        ).unwrap();
-        let (mut environment, environment_storage) = charged_effective_environment(
-            &mut parent, &source.session_type, &request,
-        ).unwrap_or_else(|_| panic!("the charged environment must fit"));
-        let environment_injection = charged_inject_context_environment(
-            &mut parent, &mut environment, &prefix, paths,
-        ).unwrap();
+            &mut parent,
+            &prefix,
+            &source.root,
+            request.context.clone(),
+            &source.session_type.context,
+            paths,
+        )
+        .unwrap();
+        let (mut environment, environment_storage) =
+            charged_effective_environment(&mut parent, &source.session_type, &request)
+                .unwrap_or_else(|_| panic!("the charged environment must fit"));
+        let environment_injection =
+            charged_inject_context_environment(&mut parent, &mut environment, &prefix, paths)
+                .unwrap();
         let charged = charged_final_materialization(
-            parent, row_storage, environment_storage, environment_injection, row, environment,
-            prefix, execution, metadata, context,
-            config.session_defaults.initial_rows, config.session_defaults.initial_cols,
-        ).unwrap();
+            parent,
+            row_storage,
+            environment_storage,
+            environment_injection,
+            row,
+            environment,
+            prefix,
+            execution,
+            metadata,
+            context,
+            config.session_defaults.initial_rows,
+            config.session_defaults.initial_cols,
+        )
+        .unwrap();
         let (materialized, allowance) = charged.into_parts();
         assert_eq!(materialized, ordinary);
-        assert_eq!(materialized.resolved.environment["BOTSTER_SESSION_ID"], "charged-explicit");
+        assert_eq!(
+            materialized.resolved.environment["BOTSTER_SESSION_ID"],
+            "charged-explicit"
+        );
         drop(materialized);
         drop(allowance);
         assert_eq!(memory.usage().1, 0);
@@ -5187,9 +5366,9 @@ mod source_selection_tests {
             ..SessionTypeRequest::default()
         };
         let failure = match charged_effective_environment(&mut parent, &definition, &refused) {
-            Err(failure) => failure.into_charged(&mut parent).unwrap_or_else(|_| {
-                panic!("the environment refusal must fit")
-            }),
+            Err(failure) => failure
+                .into_charged(&mut parent)
+                .unwrap_or_else(|_| panic!("the environment refusal must fit")),
             Ok(_) => panic!("the environment override must be refused"),
         };
         assert_eq!(failure.error.kind, "environment_not_admitted");
@@ -5203,9 +5382,9 @@ mod source_selection_tests {
             ..SessionTypeRequest::default()
         };
         let failure = match charged_effective_environment(&mut parent, &definition, &invalid) {
-            Err(failure) => failure.into_charged(&mut parent).unwrap_or_else(|_| {
-                panic!("the invalid name refusal must fit")
-            }),
+            Err(failure) => failure
+                .into_charged(&mut parent)
+                .unwrap_or_else(|_| panic!("the invalid name refusal must fit")),
             Ok(_) => panic!("the invalid name must be refused"),
         };
         assert_eq!(failure.error.kind, "invalid_environment");

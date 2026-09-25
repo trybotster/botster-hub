@@ -893,7 +893,12 @@ mod tests {
             .unwrap()
             .mark_package_entity_resync_needed("family");
         crate::daemon::owner_loop::publish_completion_wakes(&daemon, &mut state);
-        assert!(state.maintenance.wakes.take(MaintenanceSliceKind::ProviderResync));
+        assert!(
+            state
+                .maintenance
+                .wakes
+                .take(MaintenanceSliceKind::ProviderResync)
+        );
         crate::daemon::owner_loop::arm_package_entity_resync_deadline(
             &mut state,
             Some(Instant::now() + Duration::from_secs(1)),
@@ -912,8 +917,16 @@ mod tests {
         assert!(state.package_entity_resync_scan.deadline_key.is_none());
         assert!(state.deadlines.is_empty());
         assert!(state.package_entity_resync_scan.changed);
-        assert!(state.maintenance.wakes.take(MaintenanceSliceKind::ProviderResync));
-        state.maintenance.wakes.mark(MaintenanceSliceKind::ProviderResync);
+        assert!(
+            state
+                .maintenance
+                .wakes
+                .take(MaintenanceSliceKind::ProviderResync)
+        );
+        state
+            .maintenance
+            .wakes
+            .mark(MaintenanceSliceKind::ProviderResync);
         let limit = Instant::now() + Duration::from_secs(3);
         loop {
             crate::daemon::owner_loop::drive_ready_test_turn(&mut daemon, &mut state);
@@ -922,7 +935,10 @@ mod tests {
             {
                 break;
             }
-            assert!(Instant::now() < limit, "the owner must finish the fresh resync scan");
+            assert!(
+                Instant::now() < limit,
+                "the owner must finish the fresh resync scan"
+            );
             std::thread::yield_now();
         }
         assert!(

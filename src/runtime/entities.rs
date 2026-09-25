@@ -461,7 +461,10 @@ mod tests {
 
         let max_attempts = crate::package_entity_fanout::PACKAGE_ENTITY_RESYNC_MAX_ATTEMPTS;
         for attempt in 1..=max_attempts {
-            assert_eq!(model.record_resync_attempt("p.item"), attempt == max_attempts);
+            assert_eq!(
+                model.record_resync_attempt("p.item"),
+                attempt == max_attempts
+            );
             if attempt < max_attempts {
                 let resync = &model.families["p.item"].resync;
                 let before = (

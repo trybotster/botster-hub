@@ -265,9 +265,11 @@ mod background_core_capacity_tests {
             MaintenanceSliceKind::JournalPull,
             MaintenanceSliceKind::Baseline,
         ];
-        assert!(maintenance.iter().all(|kind| registers_core_phase(
-            BackgroundWork::Maintenance(*kind)
-        )));
+        assert!(
+            maintenance
+                .iter()
+                .all(|kind| registers_core_phase(BackgroundWork::Maintenance(*kind)))
+        );
         assert_eq!(
             MaintenanceSliceKind::ALL
                 .iter()
@@ -1070,16 +1072,15 @@ fn run_control_ingress_item(
                 .max(state.lifecycle_counters.live_connections);
             connection_tasks.push(transport_runtime.spawn(async move {
                 let _admission_permit = admission_permit;
-                if let Err(error) =
-                    handle_connection_async(
-                        stream,
-                        tx,
-                        entity_capacity_wake,
-                        cleanup_permit,
-                        shutdown,
-                        connection_permit,
-                    )
-                        .await
+                if let Err(error) = handle_connection_async(
+                    stream,
+                    tx,
+                    entity_capacity_wake,
+                    cleanup_permit,
+                    shutdown,
+                    connection_permit,
+                )
+                .await
                 {
                     eprintln!("botster-hub daemon connection error: {error}");
                 }
@@ -10307,7 +10308,9 @@ return botster.register({tools = {{
             HubDaemon::start(clean_config).expect("start clean generation daemon");
         drive_package_request(
             &mut clean_daemon,
-            DaemonRequest::InstallPackageLocalPath { path: clean_package },
+            DaemonRequest::InstallPackageLocalPath {
+                path: clean_package,
+            },
         )
         .expect("install clean types package");
         let clean_generation_after_install = clean_daemon

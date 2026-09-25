@@ -7,11 +7,11 @@ use std::fmt::{self, Write};
 use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
-use super::{PackageSessionType, PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory};
 use super::content_budget::{ContentContainer, ContentStorage};
 use super::materialization_error::ErrorTrack;
 use super::materialization_timeline::Track;
 use super::tagged_budget::{TaggedField, TaggedStorage};
+use super::{PackageSessionType, PackageSessionTypeExecution, PackageSessionTypeWorkingDirectory};
 
 #[derive(Clone, Copy)]
 pub(super) enum Shape {

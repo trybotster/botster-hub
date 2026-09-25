@@ -2538,10 +2538,7 @@ fn package_error(error: PackageRegistryError) -> HostMutationError {
     let package_name = crate::daemon_projection::package_error_display_name(&error);
     HostMutationError::new(
         "package_policy_rejected",
-        format!(
-            "package {} was rejected: {:?}",
-            package_name, error.reason
-        ),
+        format!("package {} was rejected: {:?}", package_name, error.reason),
     )
 }
 
@@ -2762,7 +2759,11 @@ mod tests {
             );
             let response = package_error(error);
             assert_eq!(response.code, "package_policy_rejected");
-            assert!(response.message.starts_with("package <local-package> was rejected: "));
+            assert!(
+                response
+                    .message
+                    .starts_with("package <local-package> was rejected: ")
+            );
             assert!(!response.message.contains(path));
         }
 
