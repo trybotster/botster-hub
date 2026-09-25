@@ -13,19 +13,29 @@ candidate_path_count=0
 [ -n "${BOTSTER_HUB_BIN:-}" ] && candidate_path_count=$((candidate_path_count + 1))
 [ -n "${BOTSTER_SESSION_WORKER_BIN:-}" ] && candidate_path_count=$((candidate_path_count + 1))
 [ -n "${BOTSTER_CANDIDATE_MANIFEST:-}" ] && candidate_path_count=$((candidate_path_count + 1))
+candidate_dir=$(mktemp -d "${TMPDIR:-/tmp}/botster-hub-candidate.XXXXXX")
+trap 'rm -rf "$candidate_dir"' EXIT HUP INT TERM
 if [ "$candidate_path_count" -eq 0 ]; then
-  candidate_dir=$(mktemp -d "${TMPDIR:-/tmp}/botster-hub-candidate.XXXXXX")
-  trap 'rm -rf "$candidate_dir"' EXIT HUP INT TERM
-  candidate_exports=$(script/build-dev-artifacts --out-dir "$candidate_dir")
+  candidate_exports=$(script/build-dev-artifacts --out-dir "$candidate_dir" --with-harness-adapter)
   printf '%s\n' "$candidate_exports"
   BOTSTER_HUB_BIN=$(printf '%s\n' "$candidate_exports" | sed -n 's/^BOTSTER_HUB_BIN=//p')
   BOTSTER_SESSION_WORKER_BIN=$(printf '%s\n' "$candidate_exports" | sed -n 's/^BOTSTER_SESSION_WORKER_BIN=//p')
   BOTSTER_CANDIDATE_MANIFEST=$(printf '%s\n' "$candidate_exports" | sed -n 's/^BOTSTER_CANDIDATE_MANIFEST=//p')
+  BOTSTER_HUB_CLIENT_ADAPTER_BIN=$(printf '%s\n' "$candidate_exports" | sed -n 's/^BOTSTER_HUB_CLIENT_ADAPTER_BIN=//p')
 elif [ "$candidate_path_count" -ne 3 ]; then
   echo "BOTSTER_HUB_BIN, BOTSTER_SESSION_WORKER_BIN, and BOTSTER_CANDIDATE_MANIFEST must be set together" >&2
   exit 1
 fi
-export BOTSTER_HUB_BIN BOTSTER_SESSION_WORKER_BIN BOTSTER_CANDIDATE_MANIFEST
+# Resource tests drive the Hub through the harness_control client adapter.
+# A supplied candidate usually predates the adapter, so build it from this
+# checkout and run an immutable copy, as the test library is built here too.
+if [ -z "${BOTSTER_HUB_CLIENT_ADAPTER_BIN:-}" ]; then
+  cargo build --locked -p botster-hub-client --example harness_control
+  cp "${CARGO_TARGET_DIR:-target}/debug/examples/harness_control" "$candidate_dir/harness_control"
+  BOTSTER_HUB_CLIENT_ADAPTER_BIN="$candidate_dir/harness_control"
+fi
+export BOTSTER_HUB_BIN BOTSTER_SESSION_WORKER_BIN BOTSTER_CANDIDATE_MANIFEST BOTSTER_HUB_CLIENT_ADAPTER_BIN
+[ -x "$BOTSTER_HUB_CLIENT_ADAPTER_BIN" ] || { echo "harness adapter is not executable: $BOTSTER_HUB_CLIENT_ADAPTER_BIN" >&2; exit 1; }
 [ -x "$BOTSTER_HUB_BIN" ] || { echo "candidate Hub is not executable: $BOTSTER_HUB_BIN" >&2; exit 1; }
 [ -x "$BOTSTER_SESSION_WORKER_BIN" ] || { echo "candidate worker is not executable: $BOTSTER_SESSION_WORKER_BIN" >&2; exit 1; }
 [ -f "$BOTSTER_CANDIDATE_MANIFEST" ] || { echo "candidate manifest is missing: $BOTSTER_CANDIDATE_MANIFEST" >&2; exit 1; }
@@ -54,6 +64,7 @@ for (const [name, path] of [["botster-hub", hubPath], ["botster-session-worker",
 NODE
 printf '%s\n' "candidate_manifest_verified=$BOTSTER_CANDIDATE_MANIFEST"
 printf '%s\n' "candidate_manifest=$BOTSTER_CANDIDATE_MANIFEST"
+printf '%s\n' "harness_adapter=$BOTSTER_HUB_CLIENT_ADAPTER_BIN"
 cat "$BOTSTER_CANDIDATE_MANIFEST"
 
 # --workspace is load-bearing. The root package `botster-hub` is itself a

@@ -160,12 +160,21 @@ pub(crate) fn harness_taint() -> Option<String> {
         .clone()
 }
 
+/// Separates each later taint record from the evidence recorded before it.
+pub(crate) const HARNESS_TAINT_SEPARATOR: &str = "\nadditional taint: ";
+
+/// Records taint evidence. Later records append to earlier ones, so an expected
+/// first error cannot hide a second cleanup failure before the taint is reset.
 pub(crate) fn record_harness_taint(evidence: impl Into<String>) {
     let mut slot = harness_taint_cell()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if slot.is_none() {
-        *slot = Some(evidence.into());
+    match slot.as_mut() {
+        Some(existing) => {
+            existing.push_str(HARNESS_TAINT_SEPARATOR);
+            existing.push_str(&evidence.into());
+        }
+        None => *slot = Some(evidence.into()),
     }
 }
 

@@ -177,6 +177,7 @@ fn test_items(path: &str) -> &'static [&'static str] {
     const MODULE: &str = "#[cfg(test)]\nmod tests {";
     match path {
         "src/daemon/owner_loop.rs"
+        | "src/daemon/control/sessions.rs"
         | "src/daemon_maintenance.rs"
         | "src/plugin_entity.rs"
         | "src/package_entity_fanout.rs" => &[MODULE],
@@ -298,7 +299,9 @@ pub(crate) fn check_lua_boundary(
         }
         production = production.replacen(IMPORT, "", 1);
     }
-    for line in production.lines() {
+    let code = String::from_utf8(code_mask(&production)?)
+        .map_err(|error| format!("{path} code mask is not UTF-8: {error}"))?;
+    for line in code.lines() {
         if line.contains("lua_runtime") && !carrier_line(path, line.trim()) {
             return Err(format!(
                 "{path} has an unreviewed Lua reference: {}",
@@ -364,6 +367,14 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn ignores_lua_mentions_in_comments_and_literals_only() {
+        let source = "/// Noted at lua_runtime.rs:281.\nfn a() { let _ = \"lua_runtime\"; } // lua_runtime\n";
+        assert!(check_lua_boundary(Path::new("."), "src/transport/unix.rs", source).is_ok());
+        let code = "/// Noted at lua_runtime.rs:281.\nfn a() { crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED; }\n";
+        assert!(check_lua_boundary(Path::new("."), "src/transport/unix.rs", code).is_err());
     }
 
     #[test]
