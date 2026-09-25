@@ -710,6 +710,9 @@ pub(crate) enum SessionTypeRecovery {
 pub(crate) struct HostMutationError {
     pub(crate) code: String,
     pub(crate) message: String,
+    /// A client-visible event that reports this failure, such as
+    /// `worktree_delete_failed`.
+    pub(crate) event: Option<DaemonEvent>,
 }
 
 #[derive(Debug)]
@@ -738,6 +741,7 @@ impl HostMutationError {
         Self {
             code: code.into(),
             message: message.into(),
+            event: None,
         }
     }
 
@@ -1832,6 +1836,7 @@ fn prepare_spawn_target(
             path,
             metadata,
         } => {
+            let failed_ids = (worktree_id.clone(), Some(target_id.clone()));
             let worktree = crate::create_worktree(
                 &mut candidate.worktrees,
                 &candidate.spawn_targets,
@@ -1843,7 +1848,9 @@ fn prepare_spawn_target(
                     metadata,
                 },
             )
-            .map_err(worktree_error)?;
+            .map_err(|error| {
+                worktree_failure("worktree_create_failed", failed_ids.0, failed_ids.1, error)
+            })?;
             let event = worktree_lifecycle_event(
                 "worktree_created",
                 Some(&worktree),
@@ -1862,7 +1869,14 @@ fn prepare_spawn_target(
                 &candidate.spawn_targets,
                 &worktree_id,
             )
-            .map_err(worktree_error)?;
+            .map_err(|error| {
+                worktree_failure(
+                    "worktree_delete_failed",
+                    Some(worktree_id.clone()),
+                    None,
+                    error,
+                )
+            })?;
             let event = worktree_lifecycle_event(
                 "worktree_deleted",
                 Some(&worktree),
@@ -2548,6 +2562,25 @@ fn spawn_error(error: SpawnTargetError) -> HostMutationError {
 
 fn worktree_error(error: crate::WorktreeError) -> HostMutationError {
     HostMutationError::new(error.kind, error.message)
+}
+
+/// A controlled worktree failure carries its sanitized lifecycle event.
+fn worktree_failure(
+    event: &str,
+    worktree_id: Option<String>,
+    target_id: Option<String>,
+    error: crate::WorktreeError,
+) -> HostMutationError {
+    let lifecycle = crate::client_api_dto::workspace::worktree_failure_event(
+        event,
+        worktree_id,
+        target_id,
+        &error,
+    );
+    HostMutationError {
+        event: Some(DaemonEvent::WorktreeLifecycle { event: lifecycle }),
+        ..HostMutationError::new(error.kind, error.message)
+    }
 }
 
 fn session_type_error(error: crate::SessionTypeError) -> HostMutationError {

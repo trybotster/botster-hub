@@ -607,6 +607,7 @@ impl HostMutationContinuation {
                     HostMutationError {
                         code: "host_completion_kind_mismatch".to_string(),
                         message: "the host executor returned a non-mutation result".to_string(),
+                        event: None,
                     },
                 );
             };
@@ -731,6 +732,7 @@ impl HostMutationContinuation {
                             message:
                                 "the committed host revision does not follow the published revision"
                                     .to_string(),
+                            event: None,
                         },
                     );
                 }
@@ -1075,6 +1077,7 @@ fn admit_or_park_commit(
                 code: "package_recovery_required".to_string(),
                 message: "package recovery is required before this prepared mutation can commit"
                     .to_string(),
+                event: None,
             },
         );
     }
@@ -1094,6 +1097,7 @@ fn admit_or_park_commit(
                         code: "state_publication_slot_occupied".to_string(),
                         message: "another unresolved state publication owns the retention cell"
                             .to_string(),
+                        event: None,
                     },
                 );
             }
@@ -1123,6 +1127,7 @@ fn admit_or_park_commit(
                     code: "host_prepared_revision_stale".to_string(),
                     message: "the Hub state changed while the host mutation was prepared"
                         .to_string(),
+                    event: None,
                 },
             )
         }
@@ -1346,8 +1351,24 @@ fn finish_error(
     operation: &'static str,
     error: HostMutationError,
 ) -> ControlPoll {
-    let charge = permit.into_prepared_charge(0);
-    ControlPoll::ReadyHost(Ok(host_error_response(operation, error)), charge)
+    if error.event.is_none() {
+        let charge = permit.into_prepared_charge(0);
+        return ControlPoll::ReadyHost(Ok(host_error_response(operation, error)), charge);
+    }
+    // A failure event is client-visible payload: charge it like a reply.
+    // If the event cannot be encoded within the limit, report the failure
+    // itself without the event.
+    let without_event = HostMutationError {
+        event: None,
+        ..error.clone()
+    };
+    match crate::host_mutations::HostReply::try_new(host_error_response(operation, error)) {
+        Ok(reply) => finish_reply(permit, reply),
+        Err(_) => {
+            let charge = permit.into_prepared_charge(0);
+            ControlPoll::ReadyHost(Ok(host_error_response(operation, without_event)), charge)
+        }
+    }
 }
 
 fn finish_transport_error(permit: HostWorkPermit, error: DaemonTransportError) -> ControlPoll {
@@ -1356,7 +1377,9 @@ fn finish_transport_error(permit: HostWorkPermit, error: DaemonTransportError) -
 }
 
 fn host_error_response(operation: &str, error: HostMutationError) -> DaemonResponse {
-    error_response(&error.code, operation, &error.message)
+    let mut response = error_response(&error.code, operation, &error.message);
+    response.events.extend(error.event);
+    response
 }
 
 fn submit_error_response(error: HostSubmitError) -> DaemonResponse {
@@ -1683,6 +1706,7 @@ mod tests {
                     reply: Err(HostMutationError {
                         code: "package_effect_failed".to_string(),
                         message: "test failure".to_string(),
+                        event: None,
                     }),
                     cleanup: HostPackageCleanup::default(),
                 },
@@ -1693,6 +1717,7 @@ mod tests {
                 HostMutationResult::Failed(HostMutationError {
                     code: "host_read_failed".to_string(),
                     message: "test failure".to_string(),
+                    event: None,
                 }),
             ),
         ] {
