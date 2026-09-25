@@ -1590,6 +1590,13 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
     let mut envelopes_a = Vec::new();
     let mut events_a = Vec::new();
     spawn_and_bind(&mut owner_a, "sgo-session", "sgo-sub", "while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done", &mut envelopes_a, &mut events_a);
+    let bound_a = owner_a.request_collecting(&botster_hub_client::DaemonRequest::Status, &mut envelopes_a, &mut events_a);
+    let generation_a = occupancy_generation(
+        &bound_a.status.as_ref().expect("status after owner A binds").live_attach_occupancy,
+        "sgo-session",
+        "sgo-sub",
+    )
+    .expect("owner A Core generation");
 
     let mut owner_b = RawUnixClient::connect_unix_terminal_adapter(&endpoint);
     let mut envelopes_b = Vec::new();
@@ -1619,7 +1626,11 @@ fn stale_generation_close_does_not_sweep_replacement_owner() {
         } if session_id == "sgo-session" => Some(*generation),
         _ => None,
     });
-    assert_eq!(closed_generation, Some(1));
+    assert_eq!(
+        closed_generation,
+        Some(generation_a),
+        "the close must name owner A's own Core generation"
+    );
 
     owner_b.send_terminal_input("sgo-sub", &terminal_input_frame_bytes(b"after-replace\r"));
     let deadline = Instant::now() + Duration::from_secs(8);
