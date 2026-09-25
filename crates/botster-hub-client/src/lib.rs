@@ -891,7 +891,9 @@ impl DaemonConnection {
             return Err(DaemonTransportError::Request(DaemonRequestError::Cancelled));
         }
         loop {
-            match self.read_next_frame()? {
+            // Read directly so the retirement result decides this response's
+            // route: return it, park it for its waiter, or discard it.
+            match self.frames.read_frame(&mut self.reader)? {
                 DaemonUnixMuxFrame::Server(ServerFrame::Response {
                     request_id: id,
                     response,
@@ -901,10 +903,11 @@ impl DaemonConnection {
                             DaemonProtocolErrorCode::InvalidRequestId,
                         ));
                     };
+                    let was_outstanding = self.retire_outstanding(id);
                     if id == request_id {
                         return Ok(response);
                     }
-                    if self.outstanding.contains(&id) {
+                    if was_outstanding {
                         self.parked_responses.push((id, response));
                     }
                 }
@@ -939,9 +942,17 @@ impl DaemonConnection {
         if let DaemonUnixMuxFrame::Server(ServerFrame::Response { request_id, .. }) = &frame
             && let Some(id) = parse_request_id(request_id)
         {
-            self.outstanding.retain(|outstanding| *outstanding != id);
+            self.retire_outstanding(id);
         }
         Ok(frame)
+    }
+
+    /// Remove an answered id from the outstanding set. Returns whether it was
+    /// outstanding.
+    fn retire_outstanding(&mut self, id: u64) -> bool {
+        let before = self.outstanding.len();
+        self.outstanding.retain(|outstanding| *outstanding != id);
+        before != self.outstanding.len()
     }
 
     /// Read the next frame of any kind. Parked frames are returned first.
