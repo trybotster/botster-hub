@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) mod charged_collection;
 pub(crate) mod layout;
 
+/// Refusal text when the callback memory account cannot fund a charge.
+pub(crate) const LUA_CALLBACK_CAPACITY_EXHAUSTED: &str = "Lua callback memory capacity exhausted";
+
 /// Explicit memory limits shared by every Lua plugin loaded by one Hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LuaMemoryLimits {
