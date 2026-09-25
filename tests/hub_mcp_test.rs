@@ -1116,12 +1116,11 @@ fn mcp_serve_lists_calls_and_reloads_project_pipelines_plugin_tools() {
         messages[8]["result"]["structuredContent"]["error"]["code"],
         "not_found"
     );
+    // PluginDb keeps every plugin namespace in one keyed store file. The
+    // restart below proves the records persisted.
     assert!(
-        data_dir
-            .join("plugin-data")
-            .join("project-pipelines")
-            .exists(),
-        "Project Pipelines state should live under plugin-data/project-pipelines through PluginDb"
+        data_dir.join("plugin-db.redb").is_file(),
+        "Project Pipelines state should persist through the PluginDb store"
     );
     assert!(
         !data_dir
