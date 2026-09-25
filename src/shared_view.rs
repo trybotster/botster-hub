@@ -67,6 +67,11 @@ impl SharedViewBudget {
     pub(crate) fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
     }
+
+    #[cfg(test)]
+    pub(crate) fn available(&self) -> usize {
+        self.capacity.saturating_sub(self.used())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

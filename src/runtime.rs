@@ -91,6 +91,7 @@ pub(crate) mod entity_model;
 pub(crate) mod provider;
 pub(crate) mod publication;
 pub(crate) mod resync;
+pub(crate) mod session_reservations;
 mod session_spawn;
 use provider::{ProviderExpectation, ProviderRequestPlan};
 pub(crate) use session_spawn::{SessionSpawnCleanupPoll, SessionTypeSpawnStart};
@@ -140,6 +141,7 @@ pub struct HubRuntime {
     inflight_plugin_core:
         Mutex<crate::lua_memory::charged_collection::ChargedVec<InflightPluginCore>>,
     retained_plugin_reservations: Mutex<Vec<SessionReservation>>,
+    session_reservations: session_reservations::SessionReservationRecords,
     created_worktree_cleanups: Mutex<Vec<CreatedWorktreeCleanup>>,
     confirmed_worktree_rollbacks: Mutex<Vec<crate::managed_git_worktrees::PreparedManagedWorktree>>,
     submitted_created_worktree_rollbacks: Mutex<BTreeSet<String>>,
@@ -639,6 +641,7 @@ impl HubRuntime {
                 crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
             ),
             retained_plugin_reservations: Mutex::new(Vec::new()),
+            session_reservations: session_reservations::SessionReservationRecords::default(),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
             submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
@@ -830,6 +833,7 @@ impl HubRuntime {
                 crate::lua_memory::charged_collection::ChargedVec::new(inflight_account),
             ),
             retained_plugin_reservations: Mutex::new(Vec::new()),
+            session_reservations: session_reservations::SessionReservationRecords::default(),
             created_worktree_cleanups: Mutex::new(Vec::new()),
             confirmed_worktree_rollbacks: Mutex::new(Vec::new()),
             submitted_created_worktree_rollbacks: Mutex::new(BTreeSet::new()),
@@ -4093,6 +4097,23 @@ impl HubRuntime {
                 }
             }
         }
+    }
+
+    /// Owner-side records of explicit session reservations after Reserve.
+    pub(crate) fn session_reservations(&self) -> &session_reservations::SessionReservationRecords {
+        &self.session_reservations
+    }
+
+    /// Charge one reservation record to the Hub state budget before Reserve.
+    pub(crate) fn charge_session_reservation(
+        &self,
+        session_id: &str,
+    ) -> Result<session_reservations::RecordCharge, crate::shared_view::SharedViewCapacityError>
+    {
+        session_reservations::SessionReservationRecords::charge(
+            &self.state_publication().budget(),
+            session_id,
+        )
     }
 
     pub(crate) fn retain_reservation(&self, reservation: SessionReservation) {
