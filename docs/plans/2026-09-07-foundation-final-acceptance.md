@@ -63,7 +63,13 @@ Diagnostics at `77f944da` with the `e295cdea` candidate, one run each (`/Users/j
 
 Queued after the production batch: port #23 (cross-package managed spawn) to the daemon owner path; it depends on #8's tagged success envelope.
 
-Wrapper and helper removal candidates (not started): `FileHubStateStore::load_or_initialize`, which always returns AuthorityRequired; runtime-only `HubRuntime` session-type spawn entry points used by `hub_lua_runtime_test`, which the daemon-owner rule now rejects.
+Wrapper and helper removal candidates (not started): `FileHubStateStore::load_or_initialize`, which always returns AuthorityRequired; runtime-only `HubRuntime` session-type spawn entry points used by `hub_lua_runtime_test`, which the daemon-owner rule now rejects; `HubClientRequest::RemoveSession`, which has no production caller.
+
+Production batch commits (reviewer accepted; matched-candidate lifecycle proof pending the rebuild): `e5f15a78` #34 parked responses, `f8b38e41` G1 spawn error mapping, `4ff7aea1` #2 response-attached worktree failure events, `7263cffc` #8 tagged managed-spawn result, `0f2ec7f4` #9 WebRTC disconnect cleanup for reserved routes, `8f71f8e6` #11 external session-type catalog observation, `8607ceaf` worktree lifecycle events delivered to Lua plugins.
+
+#12 (session id reuse after removal): Hub dropped explicit Core reservation tokens on successful install, so a removed id stayed Occupied. Decision (A): an owner-side record per reserved id, charged to the Hub state SharedView budget before Core reserve, releases the token after an authoritative removal. A live-session count limit (one OwnerPermit per installed session) was considered and NOT added; that limit is a user decision.
+
+Known coverage limits: sustained-flood overlap for #7's event-under-flood check is not proven; #19 proves seeded-state reload, not an owner-path durable commit.
 
 ## Current delivery status — September 23
 
