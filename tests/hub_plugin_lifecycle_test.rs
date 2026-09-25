@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use botster_core::{
@@ -77,6 +78,10 @@ impl PluginRuntime for FakeRuntime {
     }
 }
 
+/// Each runtime gets its own data directory. Tests run in parallel and the
+/// plugin database takes an exclusive lock on its directory.
+static NEXT_RUNTIME_DIR: AtomicU64 = AtomicU64::new(0);
+
 fn explicit_runtime() -> HubRuntime {
     let config = HubStartupOptions {
         host: HostIdentityOptions {
@@ -86,8 +91,9 @@ fn explicit_runtime() -> HubRuntime {
         },
         data_directory: DataDirectoryOption::Explicit(
             format!(
-                "target/botster-hub-test-data/plugin-lifecycle-{}",
-                std::process::id()
+                "target/botster-hub-test-data/plugin-lifecycle-{}-{}",
+                std::process::id(),
+                NEXT_RUNTIME_DIR.fetch_add(1, Ordering::Relaxed)
             )
             .into(),
         ),

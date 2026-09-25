@@ -4347,6 +4347,26 @@ return botster.register({
       })
     end,
   }},
+  handlers = {{
+    id = "spawn_action",
+    kind = "ui_action",
+    descriptor_id = "ordinary.spawn_action",
+    descriptor = {
+      action_id = "ordinary.spawn_action",
+      surface_id = "ordinary.surface",
+    },
+    call = function(args)
+      local spawned = botster.capabilities.session_types.spawn(args.payload)
+      return {
+        request_id = args.request_id or "ordinary-action",
+        surface_id = "ordinary.surface",
+        action_id = "ordinary.spawn_action",
+        node_id = "ordinary-form",
+        state = "accepted",
+        payload = spawned,
+      }
+    end,
+  }},
 })
 "#,
     )
@@ -4370,9 +4390,16 @@ return botster.register({
             "source": { "type": "path", "path": source_root.clone() },
             "capabilities": [
                 { "surface": "mcp" },
+                { "surface": "surfaces" },
                 { "surface": "session_actions", "scope": "session_type_spawn" }
             ],
             "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }],
+            "surfaces": [{
+                "id": "ordinary.surface",
+                "kind": "app",
+                "title": "Ordinary",
+                "supports": ["action"]
+            }],
             "session_types": [{
                 "id": "init",
                 "label": "Ordinary agent",
@@ -4511,6 +4538,55 @@ return botster.register({
     assert_eq!(
         capacity.error.as_ref().expect("capacity has an operator error").message,
         "runtime error: Lua refusal render capacity exhausted",
+    );
+    // A UI action handler, not only an MCP tool, reaches the same owner path.
+    let action = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::PluginSurfaceAction {
+            package_name: "ordinary.two".to_string(),
+            request: botster_ui_contract::UiActionRequest {
+                request_id: botster_ui_contract::UiActionRequestId("ordinary-action".to_string()),
+                surface_id: botster_ui_contract::UiSurfaceId("ordinary.surface".to_string()),
+                action_id: botster_ui_contract::UiActionId("ordinary.spawn_action".to_string()),
+                node_id: Some(botster_ui_contract::UiNodeId("ordinary-form".to_string())),
+                kind: botster_ui_contract::UiActionKind::Submit,
+                values: None,
+                payload: Some(serde_json::json!({
+                    "session_type_id": "ordinary.two/init",
+                    "session_id": "ordinary-action",
+                    "environment": { "BOTSTER_MODE": "action" },
+                    "context": { "prompt": "action prompt" }
+                })),
+            },
+        },
+    )
+    .expect("spawn through a UI action handler");
+    let action_result = action
+        .plugin_action_result
+        .as_ref()
+        .unwrap_or_else(|| panic!("UI action spawn result: {action:?}"));
+    assert_eq!(action_result.state, botster_ui_contract::UiActionResultState::Accepted);
+    assert_eq!(
+        action_result.payload.as_ref().expect("action payload")["session_id"],
+        "ordinary-action"
+    );
+    let output = package_dir.join("spawn-ordinary-action.txt");
+    let context = package_dir.join("context-ordinary-action.json");
+    let expected_output = format!("ordinary-action|action|{}|command-argument\n", source_root.display());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && (fs::read_to_string(&output).ok().as_deref() != Some(expected_output.as_str())
+            || !fs::read_to_string(&context).is_ok_and(|contents| contents.contains("action prompt")))
+    {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read_to_string(&output).expect("action session command output"),
+        expected_output,
+    );
+    assert!(
+        fs::read_to_string(&context).expect("action session context").contains("action prompt"),
+        "the action-spawned session must read its own context",
     );
     daemon.shutdown();
 }
@@ -5842,8 +5918,10 @@ fn package_update_apply_preserves_configuration_and_pin_metadata() {
     );
 
     shutdown_cli_daemon(&data_dir, restarted);
-    let state = FileHubStateStore::for_data_directory(&data_dir)
-        .load_or_initialize(&explicit_config(&data_dir))
+    // Reads of the File store require retained authority after the daemon
+    // releases the directory.
+    let (state, _authority) = FileHubStateStore::for_data_directory(&data_dir)
+        .load_retained(&explicit_config(&data_dir))
         .expect("load persisted hub state after update");
     let restored =
         PackageRegistry::from_snapshot(state.package_registry).expect("restore package registry");
