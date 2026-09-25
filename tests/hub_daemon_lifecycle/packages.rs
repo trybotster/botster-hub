@@ -2186,6 +2186,61 @@ fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
     let config = explicit_config(&data_dir);
     let child = start_cli_daemon(&data_dir);
 
+    // A real Lua plugin records every hub worktree lifecycle event it receives.
+    let recorder_dir = unique_short_test_dir("worktree-recorder");
+    fs::create_dir_all(&recorder_dir).expect("create recorder package");
+    fs::write(
+        recorder_dir.join("plugin.lua"),
+        r#"
+local seen = {}
+for _, name in ipairs({
+  "worktree_created", "worktree_create_failed", "worktree_deleted", "worktree_delete_failed",
+}) do
+  events.on("hub", name, function(event)
+    seen[#seen + 1] = event
+  end)
+end
+return botster.register({
+  tools = {{
+    name = "worktree_recorder.seen",
+    description = "Return the recorded worktree lifecycle events.",
+    handler = "seen",
+    call = function(args)
+      return { events = seen }
+    end,
+  }},
+})
+"#,
+    )
+    .expect("write recorder plugin");
+    let recorder_source = fs::canonicalize(&recorder_dir).expect("canonical recorder root");
+    fs::write(
+        recorder_dir.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "worktree-recorder",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": recorder_source },
+            "capabilities": [{ "surface": "mcp" }],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        }))
+        .expect("serialize recorder manifest"),
+    )
+    .expect("write recorder manifest");
+    let recorder = botster_hub::daemon_transport_request(
+        &config,
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: recorder_dir.clone(),
+        },
+    )
+    .expect("enable worktree recorder");
+    assert_eq!(
+        recorder.kind,
+        botster_hub::DaemonResponseKind::PackageDecision,
+        "{recorder:?}"
+    );
+
     botster_hub::daemon_transport_request(
         &config,
         botster_hub::DaemonRequest::CreateSpawnTarget {
@@ -2372,6 +2427,55 @@ fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
         "failure lifecycle events must not expose raw local paths: {failure_events_json}"
     );
 
+    // All four advertised worktree events reach the plugin through the
+    // production Host ingress, each after its authoritative result.
+    let expected = [
+        ("worktree_created", "wt_plain"),
+        ("worktree_deleted", "wt_plain"),
+        ("worktree_delete_failed", "wt_plain"),
+        ("worktree_create_failed", "wt_escape_parent"),
+    ];
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut last_error = None;
+    let recorded = loop {
+        let seen = botster_hub::daemon_transport_request(
+            &config,
+            botster_hub::DaemonRequest::PluginMcpCallTool {
+                name: "worktree_recorder.seen".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        )
+        .expect("read recorded worktree events");
+        last_error = seen.error.clone();
+        let events = seen.plugin_tool_result["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let complete = expected.iter().all(|(name, id)| {
+            events
+                .iter()
+                .any(|event| event["event"] == *name && event["worktree_id"] == *id)
+        });
+        if complete || std::time::Instant::now() >= deadline {
+            break events;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    for (name, id) in expected {
+        assert!(
+            recorded
+                .iter()
+                .any(|event| event["event"] == name && event["worktree_id"] == id),
+            "plugin must receive {name} for {id}: {recorded:?}; last tool error: {last_error:?}"
+        );
+    }
+    let recorded_json = serde_json::to_string(&recorded).expect("serialize recorded events");
+    assert!(
+        !recorded_json.contains(target_root.to_string_lossy().as_ref())
+            && !recorded_json.contains("/Users/"),
+        "plugin lifecycle events must not expose raw local paths: {recorded_json}"
+    );
+
     let symlink_escape = botster_hub::daemon_transport_request(
         &config,
         botster_hub::DaemonRequest::CreateWorktree {
@@ -2414,6 +2518,7 @@ fn daemon_worktree_crud_scopes_paths_to_spawn_targets_without_requiring_git() {
     assert_eq!(missing.worktrees[0].status, "missing");
 
     shutdown_cli_daemon(&data_dir, restarted_missing);
+    let _ = fs::remove_dir_all(&recorder_dir);
 }
 
 #[test]
