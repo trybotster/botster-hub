@@ -4865,6 +4865,238 @@ return botster.register({
     daemon.shutdown();
 }
 
+fn init_fixture_repository(repository: &Path, label: &str) {
+    fs::create_dir_all(repository).expect("create fixture repository");
+    run_fixture_git(None, &["init", "-b", "main", path_str(repository)]);
+    run_fixture_git(
+        Some(repository),
+        &["config", "user.email", "botster@example.invalid"],
+    );
+    run_fixture_git(Some(repository), &["config", "user.name", "Botster Test"]);
+    fs::write(repository.join("README.md"), format!("{label}\n"))
+        .expect("write repository fixture");
+    run_fixture_git(Some(repository), &["add", "README.md"]);
+    run_fixture_git(Some(repository), &["commit", "-m", label]);
+}
+
+fn create_git_target(data_dir: &Path, target_id: &str, root: &Path) {
+    let created = botster_hub::daemon_transport_request(
+        &explicit_config(data_dir),
+        botster_hub::DaemonRequest::CreateSpawnTarget {
+            target_id: Some(target_id.to_string()),
+            label: Some(target_id.to_string()),
+            root: root.to_path_buf(),
+            enabled: true,
+            kind: Some("git".to_string()),
+            base_ref: Some("main".to_string()),
+            metadata: BTreeMap::new(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("create git target {target_id}: {error}"));
+    assert_eq!(
+        created.kind,
+        botster_hub::DaemonResponseKind::SpawnTargets,
+        "create git target {target_id}: {created:?}"
+    );
+}
+
+fn enable_local_package(data_dir: &Path, path: &Path) {
+    let enabled = botster_hub::daemon_transport_request(
+        &explicit_config(data_dir),
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: path.to_path_buf(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("enable package {}: {error}", path.display()));
+    assert_eq!(
+        enabled.kind,
+        botster_hub::DaemonResponseKind::PackageDecision,
+        "enable package {}: {enabled:?}",
+        path.display()
+    );
+}
+
+fn call_plugin_tool(data_dir: &Path, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    let response = botster_hub::daemon_transport_request(
+        &explicit_config(data_dir),
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: name.to_string(),
+            arguments,
+        },
+    )
+    .unwrap_or_else(|error| panic!("call plugin tool {name}: {error}"));
+    assert_eq!(
+        response.kind,
+        botster_hub::DaemonResponseKind::PluginMcpToolResult,
+        "plugin tool {name}: {response:?}"
+    );
+    response.plugin_tool_result
+}
+
+fn assert_cross_package_session_type_is_listed(
+    inspected: &serde_json::Value,
+    session_type_id: &str,
+    source_name: &str,
+) {
+    let listed = inspected["list"]
+        .as_array()
+        .expect("cross-package template list");
+    assert!(
+        listed.iter().any(|session_type| {
+            session_type["session_type_id"] == session_type_id
+                && session_type["source_name"] == source_name
+        }),
+        "{session_type_id} from {source_name} must be visible to the caller; list: {listed:?}"
+    );
+    assert_eq!(inspected["shown"]["source_name"], source_name);
+}
+
+/// A real Lua plugin spawns session types contributed by other packages
+/// through the live Hub daemon owner: an explicit-target template, the
+/// Project Pipelines package template, a caller without the managed spawn
+/// capability, and a template pinned to another target.
+#[test]
+fn live_hub_lua_plugin_spawns_cross_package_managed_session_types() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("cross-package-live");
+    let contributor_dir = unique_short_test_dir("cross-package-contributor");
+    let caller_dir = unique_short_test_dir("cross-package-caller");
+    let denied_caller_dir = unique_short_test_dir("cross-package-denied");
+    let repository = unique_short_test_dir("cross-package-repo");
+    let pipelines_repository = unique_short_test_dir("cross-package-pp-repo");
+    let other_repository = unique_short_test_dir("cross-package-other-repo");
+    init_fixture_repository(&repository, "cross-package");
+    init_fixture_repository(&pipelines_repository, "cross-package-pipelines");
+    init_fixture_repository(&other_repository, "cross-package-other");
+    write_cross_package_template_contributor(&contributor_dir, "tgt_cross_package");
+    write_cross_package_caller_package(
+        &caller_dir,
+        "managed-session-caller.plugin",
+        "cross_package",
+        true,
+    );
+    write_cross_package_caller_package(
+        &denied_caller_dir,
+        "managed-session-denied-caller.plugin",
+        "cross_package_denied",
+        false,
+    );
+    let project_pipelines = std::env::current_dir()
+        .expect("current dir")
+        .join("examples/project-pipelines");
+
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "cross-package managed spawn cleanup");
+    // A Lua plugin reads session types from the package records captured
+    // when it loads, so both contributors are enabled before the callers.
+    enable_local_package(&data_dir, &contributor_dir);
+    enable_local_package(&data_dir, &project_pipelines);
+    enable_local_package(&data_dir, &caller_dir);
+    enable_local_package(&data_dir, &denied_caller_dir);
+    create_git_target(&data_dir, "tgt_cross_package", &repository);
+    create_git_target(&data_dir, "package:project-pipelines", &pipelines_repository);
+    create_git_target(&data_dir, "tgt_other", &other_repository);
+
+    // Explicit-target template from another package: provenance, the tagged
+    // result, and the contributor's own command running in the worktree.
+    let inspected = call_plugin_tool(
+        &data_dir,
+        "cross_package.inspect",
+        serde_json::json!({
+            "target_id": "tgt_cross_package",
+            "session_type_id": "managed-session-type.plugin/init"
+        }),
+    );
+    assert_cross_package_session_type_is_listed(
+        &inspected,
+        "managed-session-type.plugin/init",
+        "managed-session-type.plugin",
+    );
+    let result = call_plugin_tool(
+        &data_dir,
+        "cross_package.atomic",
+        serde_json::json!({
+            "target_id": "tgt_cross_package",
+            "branch": "feature/cross-package-explicit-target",
+            "session_type_id": "managed-session-type.plugin/init"
+        }),
+    );
+    assert_eq!(result["ok"], true, "cross-package result: {result}");
+    let session_id = result["result"]["session_id"]
+        .as_str()
+        .expect("cross-package session UUID")
+        .to_string();
+    assert_eq!(session_id.len(), 36);
+    let marker = PathBuf::from(
+        result["result"]["worktree_path"]
+            .as_str()
+            .expect("spawned worktree path"),
+    )
+    .join("cross-package-executed.txt");
+    wait_for_managed_git_session_exit(&data_dir, &session_id);
+    assert_eq!(
+        fs::read_to_string(&marker).expect("cross-package command marker"),
+        "cross-package\n",
+        "the selected template contributor's command must execute"
+    );
+
+    // Project Pipelines contributes its package-default template.
+    let inspected = call_plugin_tool(
+        &data_dir,
+        "cross_package.inspect",
+        serde_json::json!({
+            "target_id": "package:project-pipelines",
+            "session_type_id": "project-pipelines/agent-step"
+        }),
+    );
+    assert_cross_package_session_type_is_listed(
+        &inspected,
+        "project-pipelines/agent-step",
+        "project-pipelines",
+    );
+    let result = call_plugin_tool(
+        &data_dir,
+        "cross_package.atomic",
+        serde_json::json!({
+            "target_id": "package:project-pipelines",
+            "branch": "feature/cross-package-project-pipelines",
+            "session_type_id": "project-pipelines/agent-step"
+        }),
+    );
+    assert_eq!(result["ok"], true, "Project Pipelines result: {result}");
+    assert_eq!(
+        result["result"]["session_id"].as_str().map(str::len),
+        Some(36)
+    );
+
+    // A caller without the managed spawn capability is refused.
+    let denied = call_plugin_tool(
+        &data_dir,
+        "cross_package_denied.atomic",
+        serde_json::json!({
+            "target_id": "tgt_cross_package",
+            "branch": "feature/cross-package-capability-denied",
+            "session_type_id": "managed-session-type.plugin/init"
+        }),
+    );
+    assert_eq!(denied["ok"], false, "denied result: {denied}");
+    assert_eq!(denied["error"]["kind"], "capability_denied");
+
+    // A template pinned to another target is not eligible here.
+    let mismatched = call_plugin_tool(
+        &data_dir,
+        "cross_package.atomic",
+        serde_json::json!({
+            "target_id": "tgt_other",
+            "branch": "feature/cross-package-target-mismatch",
+            "session_type_id": "managed-session-type.plugin/init"
+        }),
+    );
+    assert_eq!(mismatched["ok"], false, "mismatched result: {mismatched}");
+    assert_eq!(mismatched["error"]["kind"], "session_type_not_eligible");
+
+    daemon.shutdown();
+}
+
 #[test]
 fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
     let _guard = daemon_test_guard();
