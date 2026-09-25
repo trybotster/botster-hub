@@ -1414,6 +1414,19 @@ fn botster_web_same_url_reload_issues_fresh_local_webrtc_bootstrap() {
     shutdown_cli_daemon(&data_dir, child);
 }
 
+/// The Hub's webrtc_peer_disconnected cleanup count, from a Status body.
+fn webrtc_peer_disconnected_cleanups(endpoint: &botster_hub_client::DaemonEndpoint) -> u64 {
+    botster_hub_client::request(endpoint, botster_hub_client::DaemonRequest::Status)
+        .expect("Status before WebRTC peer close")
+        .status
+        .expect("Status response carries a status body")
+        .lifecycle_counters
+        .cleanup_by_reason
+        .get("webrtc_peer_disconnected")
+        .copied()
+        .unwrap_or(0)
+}
+
 #[test]
 fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
     let _guard = daemon_test_guard();
@@ -1435,7 +1448,7 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
     let (_web_origin, bootstrap) = start_botster_web_and_issue_bootstrap(&endpoint);
     let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
 
-    block_on(async {
+    let disconnected_before = block_on(async {
         let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
             .await
             .expect("create WebRTC offer peer");
@@ -1498,7 +1511,9 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
             botster_hub_client::DaemonResponseKind::TerminalReservation
         );
 
+        let disconnected_before = webrtc_peer_disconnected_cleanups(&endpoint);
         offer_peer.peer.close().await.expect("close offer peer");
+        disconnected_before
     });
 
     thread::sleep(Duration::from_millis(800));
@@ -1528,26 +1543,38 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         observed.contains("drop:after-webrtc-close"),
         "socket client should observe output after WebRTC close, got {observed:?}"
     );
-    // Peer close reaches the Hub as an ICE Disconnected transition, about
-    // five seconds after the close (traced at t+4.7s). Poll Status within a
-    // bounded budget instead of asserting once after a fixed sleep.
+    // In this test the reserved route is released by the Hub's WebRTC
+    // peer-disconnected cleanup, which one trace observed 4.7 s after the
+    // close. Poll Status within a bounded budget for that cleanup and the
+    // route's removal, instead of asserting once after a fixed sleep.
     let detach_deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let occupancy_after_close = loop {
-        let occupancy = connection
+    let (occupancy_after_close, disconnected_after) = loop {
+        let status = connection
             .request(&botster_hub_client::DaemonRequest::Status)
             .expect("drain closed WebRTC subscription")
             .status
-            .map(|status| status.live_attach_occupancy)
-            .unwrap_or_default();
-        if occupancy
+            .expect("Status response carries a status body");
+        let disconnected = status
+            .lifecycle_counters
+            .cleanup_by_reason
+            .get("webrtc_peer_disconnected")
+            .copied()
+            .unwrap_or(0);
+        let detached = status
+            .live_attach_occupancy
             .iter()
-            .all(|row| row.subscription_id != "local-webrtc-drop-subscription")
+            .all(|row| row.subscription_id != "local-webrtc-drop-subscription");
+        if (detached && disconnected > disconnected_before)
             || std::time::Instant::now() >= detach_deadline
         {
-            break occupancy;
+            break (status.live_attach_occupancy, disconnected);
         }
         thread::sleep(Duration::from_millis(100));
     };
+    assert!(
+        disconnected_after > disconnected_before,
+        "WebRTC peer-disconnected cleanup must run within 20s: before={disconnected_before} after={disconnected_after}"
+    );
     assert!(
         occupancy_after_close
             .iter()
