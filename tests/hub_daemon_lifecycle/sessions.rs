@@ -2173,14 +2173,26 @@ fn session_entity_subscription_projects_stale_row_as_indeterminate() {
     subscription
         .unsubscribe()
         .expect("unsubscribe stale projection");
-    shutdown_cli_daemon(&data_dir, child);
-    assert!(
-        harness_taint().is_some_and(|evidence| {
-            evidence.contains("session-entity-stale") && evidence.contains("no recovery worker pid")
-        }),
-        "forged stale command 42 must taint as missing recovery identity: {:?}",
-        harness_taint()
+    let hub_pid = child.id();
+    let mut owned = child.owned_sessions.clone();
+    owned.push_pid(42);
+    let shutdown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shutdown_cli_daemon(&data_dir, child)
+    }));
+    let panic = shutdown.expect_err("forged stale command must taint shutdown");
+    let panic_message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("shutdown taint panic must contain text");
+    let evidence = harness_taint().expect("forged stale command must taint the harness");
+    assert_eq!(
+        evidence,
+        "lifecycle daemon: identity capture incomplete: nonterminal session session-entity-stale has dead command 42 and no recovery worker pid"
     );
+    assert_eq!(panic_message, format!("environment_tainted: {evidence}"));
+    prove_owned_children_absent(&data_dir, Some(hub_pid), &owned)
+        .expect("fixture Hub and owned processes must be absent before clearing taint");
     reset_harness_taint_after_proof();
 }
 

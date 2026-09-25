@@ -334,6 +334,20 @@ fn untokened_start_boundary_notify_is_ignored() {
     clear_real_daemon_start_token();
 }
 
+#[test]
+fn harness_taint_keeps_every_recorded_error() {
+    let _lock = daemon_test_guard();
+    record_harness_taint("injected first taint");
+    record_harness_taint("injected second taint");
+    let evidence = harness_taint();
+    reset_harness_taint_after_proof();
+    assert_eq!(
+        evidence.as_deref(),
+        Some(format!("injected first taint{HARNESS_TAINT_SEPARATOR}injected second taint").as_str()),
+        "a later taint record must append to the first"
+    );
+}
+
 fn taint_latch_refuses_next_daemon_start_without_spawning() {
     let _lock = daemon_test_guard();
     record_harness_taint("injected prove-absence failure");

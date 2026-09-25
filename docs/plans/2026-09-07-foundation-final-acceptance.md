@@ -1,6 +1,24 @@
 # Foundation integration and final acceptance
 
-Status: checkpoint `945dbb60` is pushed. The full rerun passes the ownership matrix, then stops at a client test that requires the daemon owner. Full workspace acceptance remains open.
+Status: Phase 0 of the September 25 delivery is in progress on `delivery/foundation-20260925`. Full workspace acceptance remains open.
+
+## Delivery status — September 25
+
+Orchestrator: Claude session `sess-1790363465-0055`. Writer: `sess-1790364122-0058`. Reviewer: `sess-1790364136-0059`.
+Evidence: `/Users/jasonconigliari/botster-evidence/phase0-20260925/`. Toolchain: `RUSTUP_TOOLCHAIN=1.97.0` must be exported; agent shells default to 1.92.0.
+
+Phase 0 changes, based on `9685412d`:
+
+- The stale-session fixture safety patch (carryover, tests diff SHA-256 `ab5b43b9…5277`) is committed.
+- `record_harness_taint` appends each later error after the first, joined by `HARNESS_TAINT_SEPARATOR`. An expected first error can no longer hide a second cleanup failure.
+- The Lua boundary guard scans code-masked lines. Comments and literals no longer count as Lua references.
+- `LUA_CALLBACK_CAPACITY_EXHAUSTED` moved unchanged from `lua_runtime` to `lua_memory`, the callback account that refuses. The daemon owner no longer depends on `lua_runtime` for it. The reviewer accepted the premise and the diff.
+- `test.sh` supplies `BOTSTER_HUB_CLIENT_ADAPTER_BIN` in every mode.
+
+Focused results: the library passed 1370 of 1370 (`focused-lib-with-worker.log`). The lifecycle target passed 13 of 13 through `test.sh` (`focused-lifecycle.log`).
+Setup finding: library tests need `target/debug/botster-session-worker` (`src/runtime.rs` sibling lookup). `cargo test --workspace` does not build it.
+In a cold target, 14 library tests failed with worker ENOENT, and four more failed (`focused-lib.log`). All 18 passed after the worker was built. The cause of the other four is not verified.
+Worktree setup: tooling had truncated `.gitignore`. The orchestrator approved restoring it to HEAD.
 
 ## Current delivery status — September 23
 
@@ -149,6 +167,39 @@ The logs are `client-context-focused-candidate.log` and `daemon-context-focused-
 Their SHA-256 values are `35d90348316b633b7bb4ee2f071794ab09cd05091416c5ca5ff8705be86af4b1` and `2d9f55ce34d2c3006cdec9bbd8d94c6ee3b19955755ee925391e8497cf1455c5` respectively.
 These focused passes close the test migration checkpoint. They do not establish full workspace acceptance.
 The next action is to commit the two test files and this log, then rerun the full gate with the unchanged verified candidate.
+Writer 001b committed and pushed `9685412d7b1b2bc73184f3a5dc48e09b47dcc081` and reported a matching remote head and clean worktree.
+The rerun used that test source and the unchanged candidate at `b801d673`. The library target passed 1369 tests and failed one.
+`client_event_cleanup_unix_sibling_wakes_during_blocked_reclamation` received `shed_busy` for its first subscription at `owner_loop.rs:3019`.
+The failure occurred before the cleanup assertions. Root read the raw failure and setup code. The cause remains unknown.
+The command exited 101 before later targets ran. The earlier isolated pass does not establish that concurrency is necessary for failure.
+The log is `test-after-client-context.log`; its reported SHA-256 is `c8f3a003dea9605c92fbe44817ac89df3cc3890259a8fe9a9ea0c5c684621013`.
+Writer 001b and reviewer 001e must trace the exact router, reachable lock holders, and fixture synchronization before proposing a correction.
+Root did not authorize an unchanged full rerun, arbitrary retries, longer timeouts, or source edits for this diagnosis.
+Root later authorized one temporary, test-only diagnostic run to label failed subscription acquisitions. Several locks map to the same `shed_busy` result.
+The diagnostic library run passed all 1370 tests and emitted no failure label. It did not identify the historical failed acquisition.
+The writer removed the diagnostics. Root confirmed that only this plan remains dirty.
+The diagnostic patch and log are `shed-busy-diagnostic.patch` and `shed-busy-diagnostic-lib.log` in the same evidence directory.
+The connection reader can contend on subscription slots. Cleanup jobs are not reachable before the first subscription in this fixture.
+The reader remains a candidate cause, not an observed cause. Reviewer 001e will propose a deterministic experiment without source changes.
+Writer 001b will separately run the complete client API and daemon lifecycle targets. These checks do not replace the failed full workspace gate.
+The client API target passed all 35 tests. The lifecycle target reported 259 passed, 69 failed, and one ignored test.
+Root read the raw failure section. Several independent assertions failed before the harness reported incomplete process identity for `session-entity-stale`.
+That fixture named dead command PID 42 without a recovery worker PID. Many later tests returned `environment_tainted` instead of exercising their assertions.
+One earlier resource test also lacked `BOTSTER_HUB_CLIENT_ADAPTER_BIN`. Setup failures and safety-blocked tests are not independent product defects.
+Evidence is in `client-api-complete.log` and `daemon-lifecycle-complete.log` in the same directory.
+Writer 001b must diagnose the synthetic stale-session fixture and verify test-owned process state without cleanup or guard bypasses.
+Reviewer 001e must classify the independent failures against existing acceptance requirements. The cleanup experiment is deferred during this diagnosis.
+No further broad run, source edit, process termination, or safety-guard reset is authorized for this phase.
+Reviewer 001e grouped 57 failures by the same `environment_tainted` panic, including the triggering fixture. They are not 57 independent defects.
+One failure is a source-guard omission. Root verified that the guard does not strip the existing `sessions.rs` test module.
+The new test-only Lua capacity assertion therefore triggers the production-source check. A bounded match-arm correction remains queued.
+One failure is the missing client adapter. Ten other assertions require contract or behavior review.
+Root verified that the missing-worker test deliberately supplies a nonexistent worker. Its error-code mismatch is not an unexplained setup failure.
+Reviewer 001e now checks that error mapping and the duplicate-session mapping against the established typed-error contract.
+Root verified two current mapping surfaces: the client projection provides specific spawn categories, while the Core response helper uses `core_error` for these refusals.
+The failing tests expect `session_already_exists` and `spawn_failed`; current responses report internal operations `reserve_session` and `spawn_reserved`.
+Historical regression attribution remains unverified. A source search limited to `src/daemon` excludes the client projection and cannot establish past response behavior.
+Reviewer 001e must propose typed Host mapping without string parsing or changes to cleanup disposition. Implementation remains unassigned during safety diagnosis.
 
 Latest capacity result: test-only patch `b025a409f5e87889e550957be7bd2225057e83d36bccfa36667d711a2959badf` passed against pushed checkpoint `ebaf8b3b`.
 The input unit passed one test. The matched daemon test passed one test, with 328 filtered tests.
