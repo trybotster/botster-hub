@@ -11,8 +11,8 @@ use botster_hub::test_internals::TestHubStateStoreExt;
 use botster_hub::{
     CoreEngineOptions, DataDirectoryOption, FileHubStateStore, HostIdentityOptions, HubClientApi,
     HubClientPackageClassification, HubClientPackageState, HubClientRequest, HubClientResponseBody,
-    HubDaemon, HubStartupOptions, HubStateLoadSource, PackageRegistry, RuntimeEnvironment,
-    SessionDefaults, TransportBindings,
+    HubConfig, HubDaemon, HubStartupOptions, HubStateLoadSource, PackageRegistry,
+    PackageRegistrySnapshot, RuntimeEnvironment, SessionDefaults, TransportBindings,
 };
 use botster_terminal_protocol_client::TerminalInputCommand;
 
@@ -61,7 +61,6 @@ fn run_local_runtime() {
     daemon
         .replace_package_registry(package_registry)
         .expect("replacement package registry fits");
-    persist_package_registry(&daemon);
 
     let packages = daemon.package_registry().clone();
     let api = HubClientApi::local_operator("runtime-local-client");
@@ -72,7 +71,11 @@ fn run_local_runtime() {
         1,
     );
 
+    let snapshot = daemon.package_registry().snapshot();
     daemon.stop();
+    // The running daemon owns the state directory. Seed the registry only
+    // after stop releases that ownership.
+    persist_package_registry(&config, snapshot);
     let mut reloaded = HubDaemon::start(config).expect("reload runtime daemon");
     let reloaded_status = reloaded.status();
     assert_eq!(reloaded_status.state_source, HubStateLoadSource::Loaded);
@@ -449,13 +452,10 @@ fn explicit_config(data_directory: &Path) -> botster_hub::HubConfig {
     .expect("explicit runtime config should build")
 }
 
-fn persist_package_registry(daemon: &HubDaemon) {
-    let runtime = daemon.runtime().expect("daemon runtime initialized");
-    let config = runtime.config().clone();
-    let snapshot = daemon.package_registry().snapshot();
+fn persist_package_registry(config: &HubConfig, snapshot: PackageRegistrySnapshot) {
     let store = FileHubStateStore::for_data_directory(&config.data_directory);
     store
-        .update_test_fixture(&config, |state| {
+        .update_test_fixture(config, |state| {
             state.package_registry = snapshot;
         })
         .expect("persist runtime package registry");
