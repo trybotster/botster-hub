@@ -197,6 +197,8 @@ pub(crate) struct EntitySubscriptionState {
     cursor: Option<SessionLifecycleCursor>,
     entities: BTreeMap<String, DaemonSessionEntity>,
     definition_generation: u64,
+    /// Internal catalog build version last delivered to this subscriber.
+    definition_version: u64,
     definition_entities: BTreeMap<String, Value>,
     /// A session-type subscriber registered while the catalog was being
     /// rebuilt off the owner; the first delivered catalog is its snapshot.
@@ -280,6 +282,7 @@ pub(crate) fn install_package_entity_subscription(
             cursor: None,
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -513,10 +516,23 @@ pub(crate) struct SessionTypeCatalogCache {
         HostWorkPermit,
     )>,
     failure: Option<(u64, HostError)>,
+    /// Count of external observations of the repository catalog (completed
+    /// session-type Host reads, prepares, and materializations). A repository
+    /// file edit does not advance the durable generation, so these
+    /// observations are what make a cached result stale.
+    observation: u64,
+    /// Observation count the pending build started under.
+    pending_observation: u64,
+    /// Observation count the cached result (entities or failure) was built under.
+    built_observation: u64,
+    /// Count of accepted build results. Subscribers compare it to skip
+    /// redelivery. It is internal and never a public sequence.
+    version: u64,
 }
 
 enum SessionTypeCatalogRefresh<'a> {
-    Ready(u64, &'a BTreeMap<String, Value>),
+    /// Durable generation, internal build version, and the catalog.
+    Ready(u64, u64, &'a BTreeMap<String, Value>),
     Pending,
     Failed(u64, HostError),
 }
@@ -606,17 +622,33 @@ impl SessionTypeCatalogCache {
             return SessionTypeCatalogRefresh::Pending;
         };
         self.retry_reclamation(runtime.host_executor());
+        // A cached result for this generation is always published. A newer
+        // external observation only adds one follow-up build; it never hides
+        // the result subscribers can use now.
+        if self.generation == Some(generation) {
+            if let Some(error) = self.submit_follow_up(daemon, generation, waiter_ids) {
+                return SessionTypeCatalogRefresh::Failed(generation, error);
+            }
+            return SessionTypeCatalogRefresh::Ready(generation, self.version, &self.entities);
+        }
+        if let Some((failed_generation, _)) = self.failure.as_ref()
+            && *failed_generation == generation
+        {
+            if let Some(error) = self.submit_follow_up(daemon, generation, waiter_ids) {
+                return SessionTypeCatalogRefresh::Failed(generation, error);
+            }
+            let error = self
+                .failure
+                .as_ref()
+                .expect("catalog failure was checked")
+                .1
+                .clone();
+            return SessionTypeCatalogRefresh::Failed(generation, error);
+        }
+        // Only new build admission waits for a retained reclamation.
         if self.retained_reclamation.is_some() {
             self.waiting_for_capacity = true;
             return SessionTypeCatalogRefresh::Pending;
-        }
-        if self.generation == Some(generation) {
-            return SessionTypeCatalogRefresh::Ready(generation, &self.entities);
-        }
-        if let Some((failed_generation, error)) = self.failure.as_ref()
-            && *failed_generation == generation
-        {
-            return SessionTypeCatalogRefresh::Failed(generation, error.clone());
         }
         if self.pending.is_some() {
             return SessionTypeCatalogRefresh::Pending;
@@ -650,6 +682,7 @@ impl SessionTypeCatalogCache {
         };
         // The owner registers the identity before the job can publish completion.
         self.pending = Some((identity, generation));
+        self.pending_observation = self.observation;
         self.last_identity = Some(identity);
         self.waiting_for_capacity = false;
         // These Arcs retain existing shared allocations. The job does not clone
@@ -709,6 +742,7 @@ impl SessionTypeCatalogCache {
         };
         self.waiting_for_capacity = false;
         self.pending = None;
+        let build_observation = self.pending_observation;
         let desired_generation = self.requested_generation.unwrap_or(expected_generation);
         let result_generation = match &result {
             HostResult::SessionTypeCatalogReady { generation, .. }
@@ -771,6 +805,8 @@ impl SessionTypeCatalogCache {
                 self.generation = Some(generation);
                 self.logical_bytes = logical_bytes;
                 self.failure = None;
+                self.built_observation = build_observation;
+                self.version = self.version.saturating_add(1);
                 self.submit_reclamation(
                     executor,
                     expected_identity.next_phase().unwrap_or(expected_identity),
@@ -783,6 +819,8 @@ impl SessionTypeCatalogCache {
                 eprintln!("session type catalog build failed: {}", error.message);
                 self.generation = None;
                 self.failure = Some((generation, error));
+                self.built_observation = build_observation;
+                self.version = self.version.saturating_add(1);
             }
             HostResult::OrdinarySessionTypeMaterialized(_)
             | HostResult::EntityModelComplete(_)
@@ -856,6 +894,87 @@ impl SessionTypeCatalogCache {
         true
     }
 
+    /// Record one external observation of the repository catalog.
+    pub(crate) fn observe_external(&mut self) {
+        self.observation = self.observation.saturating_add(1);
+    }
+
+    /// Submit one build when an external observation is newer than the
+    /// cached result. The cached result stays published this turn.
+    /// A capacity refusal (no permit, or a full queue) waits for the host
+    /// capacity notification, which marks subscriber delivery and retries.
+    /// A terminal executor or waiter-identity failure becomes the catalog
+    /// failure and is returned, so this refresh delivers it.
+    fn submit_follow_up(
+        &mut self,
+        daemon: &HubDaemon,
+        generation: u64,
+        waiter_ids: &crate::owner_identity::WaiterIdSource,
+    ) -> Option<HostError> {
+        if self.built_observation == self.observation
+            || self.pending.is_some()
+            || self.retained_reclamation.is_some()
+        {
+            return None;
+        }
+        let runtime = daemon.runtime()?;
+        let Some(permit) = runtime.host_executor().try_reserve() else {
+            self.waiting_for_capacity = true;
+            return None;
+        };
+        let Some(waiter_id) = waiter_ids.next() else {
+            drop(permit);
+            self.generation = None;
+            let error = HostError::new(
+                "host_waiter_id_exhausted",
+                "host waiter identity capacity is exhausted",
+            );
+            self.failure = Some((generation, error.clone()));
+            self.built_observation = self.observation;
+            return Some(error);
+        };
+        let identity = HostJobIdentity {
+            waiter_id,
+            phase: 1,
+        };
+        // The owner registers the identity before the job can publish completion.
+        self.pending = Some((identity, generation));
+        self.pending_observation = self.observation;
+        self.last_identity = Some(identity);
+        self.waiting_for_capacity = false;
+        let submitted = runtime.host_executor().submit(
+            identity,
+            HostCommand::BuildSessionTypeCatalog {
+                generation,
+                packages: daemon.package_registry_view(),
+                state: runtime.state(),
+            },
+            permit,
+        );
+        let Err(error) = submitted else {
+            return None;
+        };
+        self.pending = None;
+        match error.error {
+            HostSubmitError::Full => {
+                self.waiting_for_capacity = true;
+                None
+            }
+            HostSubmitError::Stopped
+            | HostSubmitError::PhaseExhausted
+            | HostSubmitError::WrongExecutor => {
+                let error = HostError::new(
+                    "host_executor_stopped",
+                    "host executor is unavailable for the catalog build",
+                );
+                self.generation = None;
+                self.failure = Some((generation, error.clone()));
+                self.built_observation = self.observation;
+                Some(error)
+            }
+        }
+    }
+
     fn clear_failure(&mut self, generation: u64) {
         if self
             .failure
@@ -864,6 +983,19 @@ impl SessionTypeCatalogCache {
         {
             self.failure = None;
         }
+    }
+}
+
+/// A session-type Host operation read the repository catalog. Mark the cached
+/// catalog stale and schedule a drive when session_type subscribers exist.
+pub(crate) fn note_session_type_catalog_observation(state: &mut DaemonControlState) {
+    state.session_type_catalog.observe_external();
+    if state
+        .entity_subscriptions
+        .values()
+        .any(|subscription| subscription.entity_type == "session_type")
+    {
+        state.maintenance.try_wake();
     }
 }
 
@@ -902,8 +1034,8 @@ pub(crate) fn register_builtin_entity_subscription(
                 ..
             } = state;
             match session_type_catalog.refresh(daemon, generation, waiter_ids) {
-                SessionTypeCatalogRefresh::Ready(generation, entities) => {
-                    Ok(Some((generation, entities.clone())))
+                SessionTypeCatalogRefresh::Ready(generation, version, entities) => {
+                    Ok(Some((generation, version, entities.clone())))
                 }
                 SessionTypeCatalogRefresh::Pending => Ok(None),
                 SessionTypeCatalogRefresh::Failed(generation, error) => {
@@ -918,7 +1050,7 @@ pub(crate) fn register_builtin_entity_subscription(
                 return Ok(entity_subscription_error(&code, &subscription_id, &message));
             }
         };
-        if let Some((generation, entities)) = &catalog {
+        if let Some((generation, _, entities)) = &catalog {
             let snapshot = DaemonEntityFrame::Snapshot {
                 subscription_id: subscription_id.clone(),
                 entity_type: entity_type.clone(),
@@ -937,9 +1069,10 @@ pub(crate) fn register_builtin_entity_subscription(
                 .try_send(snapshot)
                 .map_err(|_| DaemonTransportError::ControlThreadStopped)?;
         }
-        let (snapshot_seq, entities, awaiting_initial_snapshot) = match catalog {
-            Some((generation, entities)) => (generation, entities, false),
-            None => (0, BTreeMap::new(), true),
+        let (snapshot_seq, definition_version, entities, awaiting_initial_snapshot) = match catalog
+        {
+            Some((generation, version, entities)) => (generation, version, entities, false),
+            None => (0, 0, BTreeMap::new(), true),
         };
         state.entity_subscriptions.insert(
             subscription_id.clone(),
@@ -949,6 +1082,7 @@ pub(crate) fn register_builtin_entity_subscription(
                 cursor: None,
                 entities: BTreeMap::new(),
                 definition_generation: snapshot_seq,
+                definition_version,
                 definition_entities: entities,
                 awaiting_initial_snapshot,
                 resync_reason: None,
@@ -987,6 +1121,7 @@ pub(crate) fn register_builtin_entity_subscription(
         cursor,
         entities: BTreeMap::new(),
         definition_generation: 0,
+        definition_version: 0,
         definition_entities: BTreeMap::new(),
         awaiting_initial_snapshot: false,
         resync_reason: None,
@@ -1043,6 +1178,7 @@ pub(crate) fn seed_lifecycle_reconciliation(
 fn drive_session_type_subscriptions(
     subscriptions: &mut BTreeMap<String, EntitySubscriptionState>,
     generation: u64,
+    version: u64,
     entities: &BTreeMap<String, Value>,
 ) {
     subscriptions.retain(|subscription_id, subscription| {
@@ -1080,6 +1216,7 @@ fn drive_session_type_subscriptions(
                 Ok(()) => {
                     subscription.next_seq = snapshot_seq;
                     subscription.definition_generation = generation;
+                    subscription.definition_version = version;
                     subscription.definition_entities = entities.clone();
                     subscription.resync_reason = None;
                     subscription.awaiting_initial_snapshot = false;
@@ -1090,7 +1227,11 @@ fn drive_session_type_subscriptions(
             };
         }
 
-        if subscription.definition_generation == generation {
+        // A same-generation rebuild after an external observation has a new
+        // version and is diffed against the delivered definitions.
+        if subscription.definition_generation == generation
+            && subscription.definition_version == version
+        {
             return true;
         }
 
@@ -1132,6 +1273,7 @@ fn drive_session_type_subscriptions(
             }
         }
         subscription.definition_generation = generation;
+        subscription.definition_version = version;
         subscription.definition_entities = entities.clone();
         true
     });
@@ -1268,8 +1410,8 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
                 ..
             } = state;
             match session_type_catalog.refresh(daemon, generation, waiter_ids) {
-                SessionTypeCatalogRefresh::Ready(generation, entities) => {
-                    Ok(Some((generation, entities)))
+                SessionTypeCatalogRefresh::Ready(generation, version, entities) => {
+                    Ok(Some((generation, version, entities)))
                 }
                 SessionTypeCatalogRefresh::Pending => Ok(None),
                 SessionTypeCatalogRefresh::Failed(generation, error) => {
@@ -1278,10 +1420,11 @@ pub(crate) fn drive_entity_subscriptions(daemon: &mut HubDaemon, state: &mut Dae
             }
         };
         match outcome {
-            Ok(Some((generation, entities))) => {
+            Ok(Some((generation, version, entities))) => {
                 drive_session_type_subscriptions(
                     &mut state.entity_subscriptions,
                     generation,
+                    version,
                     entities,
                 );
             }
@@ -2496,6 +2639,7 @@ mod tests {
             cursor: None,
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -3828,6 +3972,7 @@ mod tests {
             }),
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: Some(overflow_reason.clone()),
@@ -3901,6 +4046,7 @@ mod tests {
                 cursor: None,
                 entities: BTreeMap::new(),
                 definition_generation: 1,
+                definition_version: 0,
                 definition_entities: BTreeMap::new(),
                 awaiting_initial_snapshot: false,
                 resync_reason: Some("subscriber_overflow".to_string()),
@@ -3922,7 +4068,7 @@ mod tests {
             serde_json::json!({ "description": "x".repeat(DAEMON_MAX_FRAME_BYTES) }),
         )]);
 
-        drive_session_type_subscriptions(&mut subscriptions, 2, &entities);
+        drive_session_type_subscriptions(&mut subscriptions, 2, 2, &entities);
 
         assert!(
             subscriptions.is_empty(),
@@ -3954,6 +4100,7 @@ mod tests {
             cursor: None,
             entities: BTreeMap::new(),
             definition_generation,
+            definition_version: 0,
             awaiting_initial_snapshot: false,
             definition_entities,
             resync_reason,
@@ -4032,7 +4179,7 @@ mod tests {
             ),
         ]);
 
-        drive_session_type_subscriptions(&mut subscriptions, 2, &entities);
+        drive_session_type_subscriptions(&mut subscriptions, 2, 2, &entities);
 
         let frames = session_type_delta_seqs(&receiver);
         assert_eq!(
@@ -4080,7 +4227,7 @@ mod tests {
             serde_json::json!({ "label": "Alpha 3" }),
         )]);
 
-        drive_session_type_subscriptions(&mut subscriptions, 3, &entities);
+        drive_session_type_subscriptions(&mut subscriptions, 3, 3, &entities);
 
         let frames = session_type_delta_seqs(&receiver);
         assert_eq!(
@@ -4121,7 +4268,7 @@ mod tests {
             serde_json::json!({ "label": "Alpha recovered" }),
         )]);
 
-        drive_session_type_subscriptions(&mut subscriptions, 3, &entities);
+        drive_session_type_subscriptions(&mut subscriptions, 3, 3, &entities);
 
         let frames = session_type_delta_seqs(&receiver);
         assert_eq!(
@@ -4170,6 +4317,7 @@ mod tests {
             }),
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: Some(overflow_reason.clone()),
@@ -4265,6 +4413,7 @@ mod tests {
                 crate::session_projection::SessionProjection::project_entity(&record("z")),
             )]),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -4341,6 +4490,7 @@ mod tests {
             cursor: projection.cursor.clone(),
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -4412,6 +4562,7 @@ mod tests {
             cursor: projection.cursor.clone(),
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -4494,6 +4645,7 @@ mod tests {
                 cursor: projection.cursor.clone(),
                 entities: BTreeMap::new(),
                 definition_generation: 0,
+                definition_version: 0,
                 definition_entities: BTreeMap::new(),
                 awaiting_initial_snapshot: false,
                 resync_reason: None,
@@ -4561,6 +4713,7 @@ mod tests {
             cursor: projection.cursor.clone(),
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -4660,6 +4813,7 @@ mod tests {
             cursor: projection.cursor.clone(),
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -4757,6 +4911,7 @@ mod tests {
             cursor: projection.cursor.clone(),
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -4836,6 +4991,7 @@ mod tests {
             cursor: projection.cursor.clone(),
             entities,
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -4897,6 +5053,7 @@ mod tests {
             cursor: projection.cursor.clone(),
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -4996,6 +5153,7 @@ mod tests {
                     cursor: None,
                     entities: BTreeMap::new(),
                     definition_generation: 0,
+                    definition_version: 0,
                     definition_entities: BTreeMap::new(),
                     awaiting_initial_snapshot: false,
                     resync_reason: None,
@@ -5062,6 +5220,7 @@ mod tests {
             cursor: projection.cursor.clone(),
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -5146,6 +5305,7 @@ mod tests {
             cursor: None,
             entities: BTreeMap::new(),
             definition_generation: 0,
+            definition_version: 0,
             definition_entities: BTreeMap::new(),
             awaiting_initial_snapshot: false,
             resync_reason: None,
@@ -5839,5 +5999,215 @@ mod tests {
         drop(permits);
         daemon.stop();
         std::fs::remove_dir_all(directory).expect("remove the catalog capacity directory");
+    }
+
+    fn catalog_test_daemon(label: &str) -> (HubDaemon, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "botster-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the system clock follows the epoch")
+                .as_nanos()
+        ));
+        let config = crate::HubStartupOptions {
+            host: crate::HostIdentityOptions {
+                id: format!("{label}-test"),
+                display_name: "Catalog Observation Test".into(),
+                fingerprint: None,
+            },
+            data_directory: crate::DataDirectoryOption::Explicit(directory.clone()),
+            ..crate::HubStartupOptions::default()
+        }
+        .build_config_for_environment(&crate::RuntimeEnvironment::from_values(None, None))
+        .expect("build the catalog observation configuration");
+        (
+            HubDaemon::start(config).expect("start the catalog observation daemon"),
+            directory,
+        )
+    }
+
+    #[test]
+    fn observed_catalog_publishes_the_cached_result_and_submits_one_follow_up() {
+        let (mut daemon, directory) = catalog_test_daemon("catalog-observation");
+        let mut state = DaemonControlState::default();
+        let entities = BTreeMap::from([("agent".to_string(), serde_json::json!({"id": "agent"}))]);
+        state.session_type_catalog.generation = Some(1);
+        state.session_type_catalog.entities = entities.clone();
+        state.session_type_catalog.version = 1;
+
+        // No observation: the cache is current and no build starts.
+        assert!(matches!(
+            state.session_type_catalog.refresh(&daemon, 1, &state.waiter_ids),
+            SessionTypeCatalogRefresh::Ready(1, 1, published) if published == &entities
+        ));
+        assert!(state.session_type_catalog.pending.is_none());
+
+        // A read observed the repository: the cached result is still
+        // published, and one follow-up build starts under that observation.
+        state.session_type_catalog.observe_external();
+        assert!(matches!(
+            state.session_type_catalog.refresh(&daemon, 1, &state.waiter_ids),
+            SessionTypeCatalogRefresh::Ready(1, 1, published) if published == &entities
+        ));
+        let first = state.session_type_catalog.pending.expect("follow-up build");
+        assert_eq!(state.session_type_catalog.pending_observation, 1);
+
+        // Reads that continue while it runs keep publishing and start no
+        // second build; the newer observation stays recorded for later.
+        state.session_type_catalog.observe_external();
+        assert!(matches!(
+            state
+                .session_type_catalog
+                .refresh(&daemon, 1, &state.waiter_ids),
+            SessionTypeCatalogRefresh::Ready(1, 1, _)
+        ));
+        assert_eq!(state.session_type_catalog.pending, Some(first));
+        assert_eq!(state.session_type_catalog.observation, 2);
+        assert_eq!(state.session_type_catalog.pending_observation, 1);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn observed_catalog_publishes_a_cached_failure_before_its_follow_up() {
+        let (mut daemon, directory) = catalog_test_daemon("catalog-failure-observation");
+        let mut state = DaemonControlState::default();
+        state.session_type_catalog.failure =
+            Some((1, HostError::new("invalid_repo_session_types", "invalid")));
+        state.session_type_catalog.observe_external();
+        assert!(matches!(
+            state.session_type_catalog.refresh(&daemon, 1, &state.waiter_ids),
+            SessionTypeCatalogRefresh::Failed(1, ref error) if error.code == "invalid_repo_session_types"
+        ));
+        assert!(state.session_type_catalog.pending.is_some());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn same_generation_rebuild_delivers_changes_only_for_a_new_version() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let before = BTreeMap::from([("agent".to_string(), serde_json::json!({"label": "old"}))]);
+        let after = BTreeMap::from([("agent".to_string(), serde_json::json!({"label": "new"}))]);
+        let mut subscriptions = BTreeMap::from([(
+            "session-types".to_string(),
+            session_type_subscription_state(sender, 1, 1, before, None),
+        )]);
+        drive_session_type_subscriptions(&mut subscriptions, 1, 0, &after);
+        assert!(
+            receiver.try_recv().is_err(),
+            "the delivered version must not redeliver"
+        );
+        drive_session_type_subscriptions(&mut subscriptions, 1, 1, &after);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEntityFrame::Upsert { ref id, ref entity, .. })
+                if id == "agent" && entity["label"] == "new"
+        ));
+    }
+
+    /// Build A is in flight when read B observes a poisoned repository. A's
+    /// result must still publish, build B must follow, and B's failure must
+    /// reach the held subscriber as an entity error. Reads keep arriving.
+    #[test]
+    fn observation_during_a_build_publishes_it_then_delivers_the_follow_up_failure() {
+        let (mut daemon, directory) = catalog_test_daemon("catalog-observation-race");
+        let mut state = DaemonControlState::default();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        state.entity_subscriptions.insert(
+            "session-types".to_string(),
+            session_type_subscription_state(sender, 0, 0, BTreeMap::new(), None),
+        );
+
+        // Build A starts under observation 0.
+        assert!(matches!(
+            state
+                .session_type_catalog
+                .refresh(&daemon, 1, &state.waiter_ids),
+            SessionTypeCatalogRefresh::Pending
+        ));
+        let (build_a, _) = state.session_type_catalog.pending.expect("build A");
+        assert_eq!(state.session_type_catalog.pending_observation, 0);
+
+        // Read B observes the repository while A runs.
+        state.session_type_catalog.observe_external();
+        let executor = daemon.runtime().expect("runtime").host_executor();
+        let a_entities = BTreeMap::from([("agent".to_string(), serde_json::json!({"label": "a"}))]);
+        assert!(state.session_type_catalog.absorb(
+            HostCompletion::for_test(
+                build_a,
+                HostResult::SessionTypeCatalogReady {
+                    generation: 1,
+                    entities: a_entities.clone(),
+                    logical_bytes: 1,
+                },
+                executor.try_reserve().expect("reserve build A completion"),
+            ),
+            executor,
+        ));
+        assert_eq!(state.session_type_catalog.built_observation, 0);
+
+        // A publishes, and follow-up build B starts under observation 1.
+        let published = match state
+            .session_type_catalog
+            .refresh(&daemon, 1, &state.waiter_ids)
+        {
+            SessionTypeCatalogRefresh::Ready(generation, version, entities) => {
+                (generation, version, entities.clone())
+            }
+            _ => panic!("build A must publish"),
+        };
+        assert_eq!(published.2, a_entities);
+        drive_session_type_subscriptions(
+            &mut state.entity_subscriptions,
+            published.0,
+            published.1,
+            &published.2,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEntityFrame::Upsert { ref id, .. }) if id == "agent"
+        ));
+        let (build_b, _) = state
+            .session_type_catalog
+            .pending
+            .expect("follow-up build B");
+        assert_ne!(build_b, build_a);
+        assert_eq!(state.session_type_catalog.pending_observation, 1);
+
+        // Reads continue while B runs; B's poison result then publishes.
+        state.session_type_catalog.observe_external();
+        assert!(state.session_type_catalog.absorb(
+            HostCompletion::for_test(
+                build_b,
+                HostResult::Failed {
+                    generation: 1,
+                    error: HostError::new("invalid_repo_session_types", "invalid repository file"),
+                },
+                executor.try_reserve().expect("reserve build B completion"),
+            ),
+            executor,
+        ));
+        let failure = match state
+            .session_type_catalog
+            .refresh(&daemon, 1, &state.waiter_ids)
+        {
+            SessionTypeCatalogRefresh::Failed(generation, error) => (generation, error),
+            _ => panic!("build B's failure must publish"),
+        };
+        assert!(!drive_session_type_catalog_failure(
+            &mut state.entity_subscriptions,
+            &failure.1.code,
+            &failure.1.message,
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEntityFrame::Error { ref code, .. }) if code == "invalid_repo_session_types"
+        ));
+        // The observation made while B ran starts one more build.
+        assert_eq!(state.session_type_catalog.pending_observation, 2);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

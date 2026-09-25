@@ -401,6 +401,10 @@ impl SessionTypeSpawnOperation {
                         crate::host_executor::HostResult::OrdinarySessionTypeMaterialized(
                             completed,
                         ) => {
+                            // Materialization read the repository catalog.
+                            crate::subscription::entity::note_session_type_catalog_observation(
+                                _state,
+                            );
                             completed.receipt.publish(());
                             match completed.result {
                                 Ok(product) => {
