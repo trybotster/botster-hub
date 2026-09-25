@@ -276,7 +276,7 @@ pub(crate) mod ownership {
                 Self::Unexpected => "coordination acknowledge returned unexpected response",
                 Self::HelperStopped => "core data-plane driver stopped",
                 Self::HelperFull => "core request queue is full",
-                Self::CallbackCapacity => crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+                Self::CallbackCapacity => crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED,
             }
         }
     }

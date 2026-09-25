@@ -3210,7 +3210,7 @@ return botster.register({
         )
         .expect_err("spawn admission must refuse callback capacity");
         assert!(
-            refused.contains(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED),
+            refused.contains(crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED),
             "spawn admission returned {refused}"
         );
         assert_eq!(state.pending_requests.len(), 1);

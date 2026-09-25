@@ -5263,16 +5263,16 @@ impl HubSessionTypeSpawner {
         let (mut parent, plugin_key, session_type_id, request) = input.into_parts();
         let bytes = crate::lua_memory::layout::single_reply_bytes::<AdmittedSpawnDelivery>(true)
             .ok_or_else(|| {
-                std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
+                std::borrow::Cow::Borrowed(crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED)
             })?;
         parent.grow(bytes).map_err(|_| {
-            std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
+            std::borrow::Cow::Borrowed(crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED)
         })?;
         let channel_charge = parent
             .split_fixed(bytes)
             .expect("the admitted parent owns the reply channel bytes");
         let (response, receiver) = spawn_reply_channel(channel_charge).map_err(|_| {
-            std::borrow::Cow::Borrowed(crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED)
+            std::borrow::Cow::Borrowed(crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED)
         })?;
         let item = PendingSessionTypeSpawn {
             #[cfg(test)]
@@ -5293,7 +5293,7 @@ impl HubSessionTypeSpawner {
         if let Err((_, item)) = queued {
             drop(item);
             return Err(std::borrow::Cow::Borrowed(
-                crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+                crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED,
             ));
         }
         self.publish_session_type_spawn();
@@ -7100,7 +7100,7 @@ pub(crate) mod tests {
             matches!(
                 reply,
                 Err(crate::lua_runtime::CoordinationFailure::NonAcknowledge(ref message))
-                    if message == crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED
+                    if message == crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED
             ),
             "unexpected reply: {reply:?}"
         );

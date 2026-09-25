@@ -469,7 +469,7 @@ impl SessionTypeSpawnOperation {
                                         })
                                         .unwrap_or_else(|| {
                                             AdmittedFailure::Unavailable(
-                                                crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+                                                crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED,
                                             )
                                         }),
                                 );
@@ -495,7 +495,7 @@ impl SessionTypeSpawnOperation {
                                     start.charged_plugin_response(&session)
                                 else {
                                     self.admitted_failure = Some(AdmittedFailure::Unavailable(
-                                        crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+                                        crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED,
                                     ));
                                     self.phase = Phase::Cleanup;
                                     return ControlPoll::Again;
@@ -723,7 +723,7 @@ mod admitted_failure_tests {
     #[test]
     fn confirmed_post_success_refusals_deliver_typed_failure() {
         for reason in [
-            crate::lua_runtime::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+            crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED,
             "conversion receipt registration refused",
         ] {
             let memory = memory();

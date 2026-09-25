@@ -33,7 +33,9 @@ use crate::lifecycle::{
     HubPluginEventHandler, HubPluginRuntimeBundle, PACKAGE_EVENT_INVOCATION_ORIGIN,
     SESSION_FAMILY_INVOCATION_ORIGIN, package_entity_owner_token,
 };
-use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount, LuaVmCharge};
+use crate::lua_memory::{
+    LUA_CALLBACK_CAPACITY_EXHAUSTED, LuaCallbackCharge, LuaMemoryAccount, LuaVmCharge,
+};
 use crate::package_event_router::{CausalScopeTable, EventPlaneStatus, PackageEventRouter};
 use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
@@ -67,7 +69,6 @@ use crate::session_types::{
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 500_000;
 const INSTRUCTION_BUDGET_ERROR: &str = "lua instruction budget exceeded";
-pub(crate) const LUA_CALLBACK_CAPACITY_EXHAUSTED: &str = "Lua callback memory capacity exhausted";
 
 fn decrement_instruction_budget(budget: &AtomicU64) -> u64 {
     budget
