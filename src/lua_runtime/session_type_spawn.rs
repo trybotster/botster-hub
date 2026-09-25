@@ -61,6 +61,14 @@ pub(super) fn convert_session_type_spawned(
     )
 }
 
+/// Success envelope for the atomic managed operation. Failures use
+/// `{ok = false, error = ...}`; success uses `{ok = true, result = ...}`.
+#[derive(serde::Serialize)]
+struct TaggedManagedSpawn<'a> {
+    ok: bool,
+    result: &'a PluginManagedSessionSpawned,
+}
+
 pub(super) fn convert_managed_spawned(
     lua: &Lua,
     memory: Option<&Arc<LuaMemoryAccount>>,
@@ -68,6 +76,7 @@ pub(super) fn convert_managed_spawned(
     spawned: &PluginManagedSessionSpawned,
     conversion_failure: &mlua::String,
 ) -> mlua::Result<Value> {
+    // The charge counts the envelope's JSON bytes, tag included.
     convert_json(
         lua,
         memory,
@@ -76,7 +85,10 @@ pub(super) fn convert_managed_spawned(
                 spawner.abandon_session_type_spawn(spawned.session_id.clone(), identity);
             }
         },
-        spawned,
+        &TaggedManagedSpawn {
+            ok: true,
+            result: spawned,
+        },
         conversion_failure,
     )
 }
@@ -388,6 +400,9 @@ mod tests {
         let value =
             convert_managed_spawned(&lua, Some(&account), &spawner, &spawned(), &failure).unwrap();
         assert!(!matches!(value, Value::String(ref s) if s == &failure));
+        let tagged: serde_json::Value = lua.from_value(value).expect("tagged result");
+        assert_eq!(tagged["ok"], true);
+        assert_eq!(tagged["result"]["session_id"], "s1-abandon");
         assert!(spawner.test_take_abandoned().is_empty());
     }
 }
