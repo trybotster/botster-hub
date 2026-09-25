@@ -135,6 +135,7 @@ pub struct HubRuntime {
     // Readers clone the current Arc under this short lock. Publication swaps
     // one Arc, so the owner never clones a durable state collection.
     state: SharedHubState,
+    package_registry: SharedPackageRegistry,
     state_authority: Option<Arc<HubStateAuthority>>,
     core_daemon: SharedCoreDaemon,
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
@@ -305,6 +306,47 @@ impl HubStatePublication {
         })
     }
 }
+
+/// The committed package registry that Lua session-type reads and spawn
+/// resolution use. The daemon owner publishes each committed registry view
+/// here, and a reader clones the current view for each call. The view's
+/// storage is charged once, when the owner reserves it; a replaced view is
+/// freed when its last reader drops it.
+pub struct PackageRegistryPublication(RwLock<SharedView<PackageRegistry>>);
+
+impl PackageRegistryPublication {
+    pub(crate) fn empty(budget: &Arc<SharedViewBudget>) -> Result<Self, HubStateStoreError> {
+        let empty = PackageRegistry::from_snapshot(crate::packages::PackageRegistrySnapshot::empty())
+            .expect("the empty package registry snapshot is valid");
+        Ok(Self(RwLock::new(crate::daemon::reserve_package_registry(
+            budget, empty,
+        )?)))
+    }
+
+    /// The current committed registry. A poisoned lock keeps its value:
+    /// publication replaces one view and cannot leave it partial.
+    pub(crate) fn current(&self) -> SharedView<PackageRegistry> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn publish(&self, view: SharedView<PackageRegistry>) {
+        let replaced = std::mem::replace(
+            &mut *self
+                .0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            view,
+        );
+        // The replaced view drops outside the lock.
+        drop(replaced);
+    }
+}
+
+/// Shared committed package registry exposed to Lua plugin workers.
+pub type SharedPackageRegistry = Arc<PackageRegistryPublication>;
 
 /// Shared immutable durable state exposed to runtime and Lua readers.
 pub type SharedHubState = Arc<HubStatePublication>;
@@ -637,6 +679,7 @@ impl HubRuntime {
             lua_memory,
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
+            package_registry: Arc::new(PackageRegistryPublication::empty(&state.budget())?),
             state,
             state_authority: None,
             core_daemon,
@@ -829,6 +872,7 @@ impl HubRuntime {
             lua_memory,
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
+            package_registry: Arc::new(PackageRegistryPublication::empty(&state.budget())?),
             state,
             state_authority,
             core_daemon,
@@ -969,6 +1013,27 @@ impl HubRuntime {
         Arc::clone(&self.state)
     }
 
+    /// Return the committed package registry view shared with Lua plugins.
+    pub(crate) fn package_registry_publication(&self) -> SharedPackageRegistry {
+        Arc::clone(&self.package_registry)
+    }
+
+    /// Publish the daemon owner's committed package registry view.
+    pub(crate) fn publish_package_registry_view(&self, view: SharedView<PackageRegistry>) {
+        self.package_registry.publish(view);
+    }
+
+    /// Publish a package registry for a host without a daemon owner. The view
+    /// is charged to this Hub's state budget.
+    pub fn publish_package_registry(
+        &self,
+        registry: PackageRegistry,
+    ) -> Result<(), HubStateStoreError> {
+        let view = crate::daemon::reserve_package_registry(&self.state.budget(), registry)?;
+        self.package_registry.publish(view);
+        Ok(())
+    }
+
     /// Return the shared worktree projection used by Lua helpers.
     #[must_use]
     pub fn worktrees(&self) -> SharedWorktrees {
@@ -986,6 +1051,7 @@ impl HubRuntime {
             session_types: self.session_type_spawner.clone(),
             spawn_targets: Arc::clone(&self.state),
             worktrees: Arc::clone(&self.state),
+            package_registry: Arc::clone(&self.package_registry),
             package_event_router: self.package_event_router.clone(),
             causal_scopes: self.causal_scopes.clone(),
             #[cfg(test)]

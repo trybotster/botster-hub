@@ -299,7 +299,7 @@ impl SpawnHostWork {
         config: &HubConfig,
         startup_paths: &StartupMaterializationPaths,
         state: crate::runtime::HubStateView,
-        package_records: Arc<Vec<PackageRecord>>,
+        package_records: crate::shared_view::SharedView<crate::packages::PackageRegistry>,
         plugin_key: botster_core::PluginKey,
         session_type_id: String,
         request: SessionTypeRequest,
@@ -1418,9 +1418,9 @@ impl<'a> ChargedSourceBuilder<'a> {
         }
     }
 
-    fn push_package_records(
+    fn push_package_records<'a>(
         &mut self,
-        records: &[PackageRecord],
+        records: impl IntoIterator<Item = &'a PackageRecord>,
     ) -> Result<(), ChargedSourceLoadFailure> {
         for record in records {
             let root = match &record.manifest.source {
@@ -1781,13 +1781,13 @@ impl ChargedSourceLoadFailure {
 /// Winner selection and materialization must use this product before activation.
 #[allow(dead_code)]
 fn load_charged_sources(
-    records: &[PackageRecord],
+    records: &crate::packages::PackageRegistry,
     state: &HubState,
     startup_cwd: &Path,
     parent: &mut crate::lua_memory::LuaCallbackCharge,
 ) -> Result<ChargedSourceSessionTypes, ChargedSourceLoadFailure> {
     let mut builder = ChargedSourceBuilder::new(parent);
-    builder.push_package_records(records)?;
+    builder.push_package_records(records.package_records())?;
     builder.push_device_sources(state, startup_cwd)?;
     for target in state.spawn_targets.iter().filter(|target| target.enabled) {
         builder.push_repo_file(&target.root, &target.target_id)?;
@@ -1804,7 +1804,7 @@ fn materialize_ordinary_charged(
     mut parent: crate::lua_memory::LuaCallbackCharge,
     config: ChargedMaterializationConfig,
     state: &HubState,
-    package_records: &[PackageRecord],
+    package_records: &crate::packages::PackageRegistry,
     _plugin_key: &botster_core::PluginKey,
     session_type_id: &str,
     request: SessionTypeRequest,
@@ -2328,7 +2328,7 @@ pub fn list_session_types_for_target(
 /// Bounded form used by Lua callbacks. `None` means the complete projection
 /// would exceed the caller's already-reserved Rust callback allowance.
 pub(crate) fn list_session_types_for_target_bounded(
-    records: &[PackageRecord],
+    records: &crate::packages::PackageRegistry,
     state: &HubState,
     target_id: &str,
     logical_byte_limit: usize,
@@ -2337,7 +2337,7 @@ pub(crate) fn list_session_types_for_target_bounded(
 }
 
 pub(crate) fn show_session_type_for_target_bounded(
-    records: &[PackageRecord],
+    records: &crate::packages::PackageRegistry,
     state: &HubState,
     target_id: &str,
     session_type_id: &str,
