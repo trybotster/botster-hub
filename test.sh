@@ -67,6 +67,11 @@ printf '%s\n' "candidate_manifest=$BOTSTER_CANDIDATE_MANIFEST"
 printf '%s\n' "harness_adapter=$BOTSTER_HUB_CLIENT_ADAPTER_BIN"
 cat "$BOTSTER_CANDIDATE_MANIFEST"
 
+# Library tests find the session worker beside their executable in
+# target/debug (src/runtime.rs). `--workspace` does not build it because it
+# belongs to the pinned Core dependency, so build it from that pin here.
+cargo build --locked -p botster-core-daemon --bin botster-session-worker
+
 # --workspace is load-bearing. The root package `botster-hub` is itself a
 # workspace member and no `default-members` is declared, so a bare `cargo test`
 # run from here tests the current package ONLY. Every other member crate's

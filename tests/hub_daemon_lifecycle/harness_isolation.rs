@@ -348,6 +348,7 @@ fn harness_taint_keeps_every_recorded_error() {
     );
 }
 
+#[test]
 fn taint_latch_refuses_next_daemon_start_without_spawning() {
     let _lock = daemon_test_guard();
     record_harness_taint("injected prove-absence failure");
@@ -411,6 +412,9 @@ fn injected_taint_cannot_race_an_unguarded_real_daemon_start() {
     let daemon = started.unwrap_or_else(|panic| {
         panic!("concurrent real-daemon start raced the injected taint: {panic:?}")
     });
+    // Shutdown reads the shared taint; hold the guard so a sibling test's
+    // guarded taint injection cannot reach this read.
+    let _shutdown_guard = daemon_test_guard();
     daemon.shutdown();
 }
 
@@ -512,6 +516,7 @@ fn sibling_real_daemon_start_cannot_satisfy_intended_boundary_hook() {
     let intended_daemon = intended_started.unwrap_or_else(|panic| {
         panic!("intended start raced the injected taint: {panic:?}")
     });
+    let _shutdown_guard = daemon_test_guard();
     sibling_daemon.shutdown();
     intended_daemon.shutdown();
 }
