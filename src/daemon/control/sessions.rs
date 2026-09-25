@@ -3301,6 +3301,46 @@ return botster.register({
     }
 
     #[test]
+    fn plugin_spawn_requires_the_exact_session_type_spawn_scope() {
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("plugin-unscoped", None);
+        let package_root = root.join("p1-plugin");
+        let mut record = plugin_spawn_package(&package_root);
+        record.manifest.capabilities = vec![botster_core::Capability {
+            surface: botster_core::CapabilitySurface::SessionActions,
+            scope: None,
+        }];
+        let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
+        let refused = invoke_plugin_spawn_tool(
+            &mut daemon,
+            &mut state,
+            &mut owner_rx,
+            "s1-plugin-unscoped",
+            None,
+        )
+        .expect_err("an unscoped SessionActions grant must not allow session-type spawn");
+        assert!(
+            refused.contains("session_type_spawn capability"),
+            "{refused}"
+        );
+        assert!(state.pending_requests.is_empty());
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .list_sessions()
+                .wait(std::time::Duration::from_secs(5))
+                .expect("core bridge")
+                .expect("list sessions")
+                .iter()
+                .all(|session| session.session_id.0 != "s1-plugin-unscoped"),
+            "a refused plugin call must not spawn a session"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(package_root);
+    }
+
+    #[test]
     fn plugin_occupied_spawn_leaves_live_session_context() {
         let worker = matched_worker_path();
         let (mut daemon, mut state, root) = spawn_fixture_with_worker("plugin-occ", Some(worker));
