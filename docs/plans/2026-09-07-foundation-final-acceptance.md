@@ -27,6 +27,43 @@ Safety block: five `update_command_test` tests are ignored with the reason `bloc
 The tests still set the removed `BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT`. `src/update.rs` uses `CARGO_MANIFEST_DIR`, so a main-checkout run would operate on the real repository.
 The already-ignored `update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order` also sets that variable. Do not run `script/test-update-preupdate-worker` until the seam is rebuilt.
 
+### User decisions — September 25 (verbatim, relayed by the orchestrator)
+
+CUTOVER BAR (monorepo Rails/trybotster → modular repos, cold cut): (a) agents collaborate in a workspace; (b) real Web and TUI clients on matched artifacts; (c) crash and restart recovery. Minimum proof: full workspace suite green + strict fmt/clippy.
+
+Addition to (a): "agents collaborate in a workspace" explicitly includes agent-to-agent messaging with terminal input. post_message → routed envelope → Core guarded_write doorbell typed into the target session's PTY → the target drains receive_messages and replies. Acceptance = two real agent sessions in one workspace on the matched build, not only the existing lifecycle/MCP tests.
+
+DEFERRED past cutover, recorded as known limits: remaining byte-level M2/A1 accounting; I1 plugin isolation (plugins are threads in the Hub process; a native stall inside a Rust callback cannot be preempted; Lua loops are bounded by instruction hooks and deadlines, and __gc is refused); P1 performance (no numeric targets, no monorepo comparison).
+
+POLICY:
+- Per-plugin memory budget = the existing standalone limits for every plugin; the Hub-hosted account uses the same limits.
+- Session context: retire the context when the session is REMOVED, not when it exits.
+- Unresolved recovery records: persist across restart, report them in status, provide one operator resolution command, reserve a small fixed recovery capacity, never evict silently.
+- Driver-stop timeout: keep the abort; durable recovery records must survive it and be reported at the next start.
+- No backward compatibility anywhere (cold cut).
+
+Earlier directive the same day: no modular Botster repo has any user. Delete tests that exist only to prove compatibility with an older version. List obsolete migration wrappers and synchronous helpers below; the orchestrator batches their removal after the gate is green.
+Safety, ownership, accounting, no-polling, and no-owner-wait constraints are unchanged.
+
+### Fix progress — September 25
+
+Test-only commits (reviewer accepted unless noted): `deb0b717` safety block, `208edd35` workspace fmt, `2d7a9c1d` worker build in `test.sh` and the taint-latch test, `86fa6ea0` G3, `9d4792a1` G4, `48f3d682` G2, `1b561c9f` old-protocol deletion, `77f944da` obsolete WebRTC/entity/MCP fixtures.
+Registering the taint-latch test exposed a harness race: `PanicSafeCliDaemon::shutdown_at` reads the shared taint outside `daemon_test_guard`. The two start-race tests now hold the guard around shutdown.
+`hub_local_runtime_test` (#19) proves seeded-state reload between lifecycles. It is not an owner-path durable commit; `HubDaemon` has no public package-registry commit.
+
+Coverage gap (#17): the harness cannot send a control message over a closed WebRTC peer. `local_webrtc_redeemed_grant` proves one-use signaling admission only, not peer-close cleanup or rejection of a late Attach.
+
+Diagnostics at `77f944da` with the `e295cdea` candidate, one run each (`/Users/jasonconigliari/botster-evidence/diagnostics-20260925/`):
+- #3: the idle reattach returned TerminalAttached, but no attach event arrived, occupancy was empty, and the screen stayed empty. A stale close of the dropped connection may remove the new route. Not verified.
+- #7: during the flood, reconciliation wakes rose (63 → 90) and the entity upsert arrived. The test then failed later: it requires idle reconciliation wakes to rise (observed 350 → 350). That expectation conflicts with the no-polling rule and needs a contract decision.
+- #11: a held session_type subscription under poison received the stale generation-1 snapshot, while ListSessionTypes returned `invalid_repo_session_types`. Reviewer trace: `SessionTypeCatalogCache::refresh` returns Ready when the generation matches, so an external repo-file change never invalidates the cache.
+- #12: ShutdownSession returned Events and RemoveSession returned SessionRemoved. The session list and occupancy no longer showed the victim, but the replacement spawn got `reserve_session` Occupied.
+- #14 and #15 passed in isolated single-thread runs. Their two-thread failures are load-sensitive and not reproduced.
+
+Queued after the production batch: port #23 (cross-package managed spawn) to the daemon owner path; it depends on #8's tagged success envelope.
+
+Wrapper and helper removal candidates (not started): `FileHubStateStore::load_or_initialize`, which always returns AuthorityRequired; runtime-only `HubRuntime` session-type spawn entry points used by `hub_lua_runtime_test`, which the daemon-owner rule now rejects.
+
 ## Current delivery status — September 23
 
 ### Full workspace gate at `0db57795`
