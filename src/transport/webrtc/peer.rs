@@ -742,6 +742,17 @@ impl LocalWebrtcPeerState {
         }
     }
 
+    /// Whether this peer owns any terminal route: a bound adapter route or
+    /// an attach it holds (including an unbound reservation).
+    fn owns_routes(&self) -> bool {
+        self.mux.has_bound_routes()
+            || !self
+                .attached_subscriptions
+                .lock()
+                .expect("local WebRTC peer subscription mutex")
+                .is_empty()
+    }
+
     pub(crate) fn apply_subscription_change(
         &self,
         change: Option<LocalWebrtcAttachedSubscriptionChange>,
@@ -848,7 +859,9 @@ impl LocalWebrtcPeerState {
         let cause = match state {
             RTCPeerConnectionState::Failed => LocalWebrtcTerminalCause::PeerFailed,
             RTCPeerConnectionState::Closed => LocalWebrtcTerminalCause::PeerClosed,
-            RTCPeerConnectionState::Disconnected if self.mux.has_bound_routes() => {
+            // A peer that owns routes, bound or only reserved, fails closed on
+            // disconnect. Its reservations hold Core attaches and occupancy.
+            RTCPeerConnectionState::Disconnected if self.owns_routes() => {
                 LocalWebrtcTerminalCause::PeerDisconnected
             }
             _ => return None,
@@ -3756,5 +3769,30 @@ mod tests {
 
         peer.close_offer();
         harness.cleanup();
+    }
+
+    #[test]
+    fn disconnect_is_terminal_for_a_peer_holding_only_an_unbound_reservation() {
+        use crate::transport::webrtc::subscription_channel::{
+            LocalWebrtcAttachedSubscription, LocalWebrtcAttachedSubscriptionChange,
+        };
+        let idle = crate::transport::webrtc::test_support::test_peer_state("grant-idle");
+        assert_eq!(
+            idle.observe_peer_connection_state(RTCPeerConnectionState::Disconnected),
+            None,
+            "a peer that owns no route may recover from disconnect"
+        );
+        let reserved = crate::transport::webrtc::test_support::test_peer_state("grant-reserved");
+        reserved.apply_subscription_change(Some(LocalWebrtcAttachedSubscriptionChange::Attach(
+            LocalWebrtcAttachedSubscription {
+                session_id: "reserved-session".to_string(),
+                subscription_id: "reserved-subscription".to_string(),
+            },
+        )));
+        assert_eq!(
+            reserved.observe_peer_connection_state(RTCPeerConnectionState::Disconnected),
+            Some(LocalWebrtcTerminalCause::PeerDisconnected),
+            "an unbound reservation holds a Core attach, so disconnect must clean it up"
+        );
     }
 }
