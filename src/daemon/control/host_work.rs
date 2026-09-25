@@ -776,6 +776,7 @@ impl HostMutationContinuation {
                     return submit_phase(daemon, state, waiter_id, command, permit, next_phase);
                 }
                 release_document(state, waiter_id);
+                ingest_worktree_lifecycle_events(daemon, state, &committed.reply.response.events);
                 finish_reply(permit, committed.reply)
             }
             HostMutationResult::PackageRestored(restored) => {
@@ -958,9 +959,43 @@ impl HostMutationContinuation {
                 if state.document_owner == Some(waiter_id) {
                     release_document(state, waiter_id);
                 }
+                ingest_worktree_lifecycle_events(daemon, state, error.event.as_slice());
                 finish_error(permit, operation, error)
             }
         }
+    }
+}
+
+/// Deliver authoritative worktree lifecycle events to plugin subscribers
+/// through the existing hub-owned router ingress. Delivery is best effort:
+/// the router counts backpressure refusals, and the client response is
+/// unchanged either way.
+fn ingest_worktree_lifecycle_events(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    events: &[botster_hub_client::DaemonEvent],
+) {
+    let Some(runtime) = daemon.runtime() else {
+        return;
+    };
+    let router = runtime.package_event_router();
+    let mut accepted = false;
+    for event in events {
+        let botster_hub_client::DaemonEvent::WorktreeLifecycle { event } = event else {
+            continue;
+        };
+        let Ok(payload) = serde_json::to_value(event) else {
+            continue;
+        };
+        accepted |= router.try_ingress(
+            crate::package_event_router::HUB_EVENT_OWNER,
+            &event.event,
+            &payload,
+            std::time::Instant::now(),
+        ) == crate::package_event_router::EventPlaneStatus::Accepted;
+    }
+    if accepted {
+        state.maintenance.try_wake();
     }
 }
 
