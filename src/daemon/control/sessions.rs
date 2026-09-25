@@ -113,6 +113,48 @@ pub(super) fn overloaded_core(operation: &'static str, request_id: &str) -> Daem
     )
 }
 
+/// Ordinary Spawn reports the client operation `spawn` in the error and its
+/// diagnostic. The internal Core phase appears only in the message.
+fn spawn_operator_error(
+    request_id: &str,
+    session_id: &str,
+    phase: &'static str,
+    error: &CoreDaemonError,
+) -> DaemonResponse {
+    let mut response = core_operator_error("spawn", request_id, error);
+    let (code, message) = match error {
+        CoreDaemonError::SessionReservation(botster_core::SessionReservationRefusal::Occupied) => (
+            Some("session_already_exists"),
+            format!("session {session_id} already exists"),
+        ),
+        CoreDaemonError::Engine(botster_core::ManagedSessionRuntimeError::Runtime(runtime))
+            if runtime.kind == botster_core::SessionRuntimeErrorKind::SpawnFailed =>
+        {
+            (
+                Some("spawn_failed"),
+                format!(
+                    "session worker could not start session {session_id}: {}",
+                    runtime.message
+                ),
+            )
+        }
+        _ => (None, format!("{phase}: {error}")),
+    };
+    set_spawn_error(&mut response, code, message);
+    response
+}
+
+fn set_spawn_error(response: &mut DaemonResponse, code: Option<&str>, message: String) {
+    if let Some(operator) = response.error.as_mut() {
+        if let Some(code) = code {
+            operator.code = code.to_string();
+        }
+        operator.diagnostics = vec![DaemonDiagnostic::action_failure("spawn", message.clone())];
+        operator.message = message;
+        response.diagnostics = operator.diagnostics.clone();
+    }
+}
+
 fn history_unavailable(
     reason: Option<botster_terminal_protocol::HistoryUnavailableReason>,
 ) -> Option<HistoryUnavailableReason> {
@@ -235,11 +277,32 @@ fn finish_held_reservation(
     state: &mut DaemonControlState,
     reservation: SessionReservation,
     request_id: &str,
-    operation: &'static str,
+    session_id: &str,
+    phase: &'static str,
     error: CoreDaemonError,
 ) -> ControlPoll {
     retain_explicit_reservation(daemon, state, reservation);
-    ControlPoll::Ready(Ok(core_operator_error(operation, request_id, &error)))
+    ControlPoll::Ready(Ok(held_reservation_error(
+        request_id, session_id, phase, &error,
+    )))
+}
+
+/// Hub kept the reservation because no release outcome was confirmed.
+fn held_reservation_error(
+    request_id: &str,
+    session_id: &str,
+    phase: &'static str,
+    cause: &CoreDaemonError,
+) -> DaemonResponse {
+    let mut response = spawn_operator_error(request_id, session_id, phase, cause);
+    set_spawn_error(
+        &mut response,
+        Some("cleanup_unconfirmed"),
+        format!(
+            "spawn of session {session_id} failed at {phase}; Hub retained the session reservation and cleanup is unconfirmed: {cause}"
+        ),
+    );
+    response
 }
 
 fn handle_daemon_spawn(
@@ -376,12 +439,22 @@ fn handle_daemon_spawn(
                 Stage::Reserve => match poll_spawn_ticket(&mut tracker, daemon) {
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
                     CoreTicketPoll::Refused => {
-                        return ControlPoll::Ready(Ok(overloaded_core("reserve_session", &id.0)));
+                        return ControlPoll::Ready(Ok(spawn_operator_error(
+                            &id.0,
+                            &session_id,
+                            "reserve_session",
+                            &core_bridge_error(CoreTicketError::Overloaded),
+                        )));
                     }
                     CoreTicketPoll::Lost => {
                         // Poll can accept begin and lose completion in the same call.
                         let Some(reserve_id) = tracker.accepted_id() else {
-                            return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
+                            return ControlPoll::Ready(Ok(spawn_operator_error(
+                                &id.0,
+                                &session_id,
+                                "reserve_session",
+                                &CoreDaemonError::Shutdown,
+                            )));
                         };
                         let Some(runtime) = daemon.runtime() else {
                             return ControlPoll::Ready(Err(DaemonTransportError::DaemonNotRunning));
@@ -394,9 +467,10 @@ fn handle_daemon_spawn(
                         stage = Stage::Lookup;
                     }
                     CoreTicketPoll::Ready(Err(error)) => {
-                        return ControlPoll::Ready(Ok(core_operator_error(
-                            "reserve_session",
+                        return ControlPoll::Ready(Ok(spawn_operator_error(
                             &id.0,
+                            &session_id,
+                            "reserve_session",
                             &error,
                         )));
                     }
@@ -418,9 +492,10 @@ fn handle_daemon_spawn(
                             stage = Stage::SpawnReserved;
                         }
                         Err(error) => {
-                            return ControlPoll::Ready(Ok(core_operator_error(
-                                "reserve_session",
+                            return ControlPoll::Ready(Ok(spawn_operator_error(
                                 &id.0,
+                                &session_id,
+                                "reserve_session",
                                 &error,
                             )));
                         }
@@ -432,21 +507,26 @@ fn handle_daemon_spawn(
                 Stage::Lookup => match poll_spawn_ticket(&mut tracker, daemon) {
                     CoreTicketPoll::Pending => return ControlPoll::Pending,
                     CoreTicketPoll::Refused => {
-                        return ControlPoll::Ready(Ok(overloaded_core(
-                            "lookup_session_reservation",
+                        return ControlPoll::Ready(Ok(spawn_operator_error(
                             &id.0,
+                            &session_id,
+                            "lookup_session_reservation",
+                            &core_bridge_error(CoreTicketError::Overloaded),
                         )));
                     }
                     CoreTicketPoll::Lost => {
-                        return ControlPoll::Ready(Ok(lost_core(
-                            "lookup_session_reservation",
+                        return ControlPoll::Ready(Ok(spawn_operator_error(
                             &id.0,
+                            &session_id,
+                            "lookup_session_reservation",
+                            &CoreDaemonError::Shutdown,
                         )));
                     }
                     CoreTicketPoll::Ready(Err(error)) => {
-                        return ControlPoll::Ready(Ok(core_operator_error(
-                            "lookup_session_reservation",
+                        return ControlPoll::Ready(Ok(spawn_operator_error(
                             &id.0,
+                            &session_id,
+                            "lookup_session_reservation",
                             &error,
                         )));
                     }
@@ -468,6 +548,7 @@ fn handle_daemon_spawn(
                                         state,
                                         reservation.take().expect("looked-up reservation"),
                                         &id.0,
+                                        &session_id,
                                         "lookup_session_reservation",
                                         CoreDaemonError::Shutdown,
                                     );
@@ -475,12 +556,18 @@ fn handle_daemon_spawn(
                             }
                         }
                         Ok(None) => {
-                            return ControlPoll::Ready(Ok(lost_core("reserve_session", &id.0)));
+                            return ControlPoll::Ready(Ok(spawn_operator_error(
+                                &id.0,
+                                &session_id,
+                                "reserve_session",
+                                &CoreDaemonError::Shutdown,
+                            )));
                         }
                         Err(error) => {
-                            return ControlPoll::Ready(Ok(core_operator_error(
-                                "lookup_session_reservation",
+                            return ControlPoll::Ready(Ok(spawn_operator_error(
                                 &id.0,
+                                &session_id,
+                                "lookup_session_reservation",
                                 &error,
                             )));
                         }
@@ -497,6 +584,7 @@ fn handle_daemon_spawn(
                             state,
                             reservation.take().expect("reserved identity"),
                             &id.0,
+                            &session_id,
                             "spawn_reserved",
                             core_bridge_error(CoreTicketError::Overloaded),
                         );
@@ -507,6 +595,7 @@ fn handle_daemon_spawn(
                             state,
                             reservation.take().expect("reserved identity"),
                             &id.0,
+                            &session_id,
                             "spawn_reserved",
                             CoreDaemonError::Shutdown,
                         );
@@ -517,6 +606,7 @@ fn handle_daemon_spawn(
                             state,
                             reservation.take().expect("reserved identity"),
                             &id.0,
+                            &session_id,
                             "spawn_reserved",
                             error,
                         );
@@ -558,6 +648,7 @@ fn handle_daemon_spawn(
                                     state,
                                     reservation.take().expect("reserved identity"),
                                     &id.0,
+                                    &session_id,
                                     "spawn_reserved",
                                     spawn_error.take().unwrap(),
                                 );
@@ -579,6 +670,7 @@ fn handle_daemon_spawn(
                             state,
                             reservation.take().expect("reserved identity"),
                             &id.0,
+                            &session_id,
                             "release_session_reservation",
                             error,
                         );
@@ -590,32 +682,35 @@ fn handle_daemon_spawn(
                         let error = spawn_error.take().unwrap_or(CoreDaemonError::Shutdown);
                         return ControlPoll::Ready(Ok(match result {
                             Ok(SessionReservationRelease::Released) => {
-                                core_operator_error("spawn_reserved", &id.0, &error)
+                                spawn_operator_error(&id.0, &session_id, "spawn_reserved", &error)
                             }
                             Ok(release) => {
                                 if let Some(held) = reservation.take() {
                                     retain_explicit_reservation(daemon, state, held);
                                 }
-                                let mut response = core_operator_error(
-                                    "release_session_reservation",
+                                let mut response = spawn_operator_error(
                                     &id.0,
+                                    &session_id,
+                                    "release_session_reservation",
                                     &error,
                                 );
-                                if let Some(operator) = response.error.as_mut() {
-                                    operator.code = retained_release_code(release).to_string();
-                                    operator.message = format!(
+                                set_spawn_error(
+                                    &mut response,
+                                    Some(retained_release_code(release)),
+                                    format!(
                                         "spawn failed and Core retained reservation ownership ({release:?}): {error}"
-                                    );
-                                }
+                                    ),
+                                );
                                 response
                             }
                             Err(release_error) => {
                                 if let Some(held) = reservation.take() {
                                     retain_explicit_reservation(daemon, state, held);
                                 }
-                                core_operator_error(
-                                    "release_session_reservation",
+                                held_reservation_error(
                                     &id.0,
+                                    &session_id,
+                                    "release_session_reservation",
                                     &release_error,
                                 )
                             }
@@ -2791,7 +2886,7 @@ sys.exit(0)
         let (mut daemon, mut state, root) =
             spawn_fixture_with_worker("missing-worker", Some(worker));
         let response = spawn_until_ready(&mut daemon, &mut state, "s1-missing-worker", "true");
-        assert_eq!(spawn_error_code(&response), Some("core_error"));
+        assert_eq!(spawn_error_code(&response), Some("spawn_failed"));
         assert_eq!(
             daemon
                 .runtime()
@@ -2821,7 +2916,7 @@ sys.exit(0)
         let (mut daemon, mut state, fixture_root) =
             spawn_fixture_with_worker("exit-before", Some(worker));
         let response = spawn_until_ready(&mut daemon, &mut state, "s1-exit-before", "true");
-        assert_eq!(spawn_error_code(&response), Some("core_error"));
+        assert_eq!(spawn_error_code(&response), Some("spawn_failed"));
         assert_eq!(
             daemon
                 .runtime()
@@ -2937,7 +3032,7 @@ sys.exit(0)
             Some("/no/such/botster-session-executable".into()),
         );
         let response = spawn_until_ready(&mut daemon, &mut state, "s1-matched-missing", "true");
-        assert_eq!(spawn_error_code(&response), Some("core_error"));
+        assert_eq!(spawn_error_code(&response), Some("spawn_failed"));
         let message = response
             .error
             .as_ref()
