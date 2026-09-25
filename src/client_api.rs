@@ -96,6 +96,8 @@ enum HubClientPendingStage {
         finish: Box<dyn FnOnce(CoreCompletion) -> HubClientResult<HubClientResponse> + Send>,
     },
     SessionType(SessionTypeSpawnStart),
+    /// The spawn succeeded; its reservation token is moving to its record.
+    SessionTypeHandoff(SessionTypeSpawnStart, HubClientResult<HubClientResponse>),
     Done,
 }
 
@@ -199,25 +201,38 @@ impl HubClientPending {
                 PluginSpawnPoll::Pending => None,
                 PluginSpawnPoll::Ready(result) => {
                     let stage = std::mem::replace(&mut self.stage, HubClientPendingStage::Done);
-                    let HubClientPendingStage::SessionType(start) = stage else {
+                    let HubClientPendingStage::SessionType(mut start) = stage else {
                         return Some(Err(self.lost()));
                     };
-                    Some(
-                        runtime
-                            .finish_client_session_type_spawn(&start, result)
-                            .map(|session| HubClientResponse {
-                                request_id: self.request_id.clone(),
-                                body: HubClientResponseBody::Spawned(HubClientSpawned {
-                                    session: HubClientSession::from(session),
-                                    events: Vec::new(),
-                                }),
-                            })
-                            .map_err(|error| {
-                                runtime_error(self.request_id.clone(), self.operation, error)
+                    let outcome = runtime
+                        .finish_client_session_type_spawn(&start, result)
+                        .map(|session| HubClientResponse {
+                            request_id: self.request_id.clone(),
+                            body: HubClientResponseBody::Spawned(HubClientSpawned {
+                                session: HubClientSession::from(session),
+                                events: Vec::new(),
                             }),
-                    )
+                        })
+                        .map_err(|error| {
+                            runtime_error(self.request_id.clone(), self.operation, error)
+                        });
+                    if outcome.is_ok() && !start.begin_handoff(runtime) {
+                        self.stage = HubClientPendingStage::SessionTypeHandoff(start, outcome);
+                        return None;
+                    }
+                    Some(outcome)
                 }
             },
+            HubClientPendingStage::SessionTypeHandoff(start, _) => {
+                if !start.poll_handoff(runtime) {
+                    return None;
+                }
+                let stage = std::mem::replace(&mut self.stage, HubClientPendingStage::Done);
+                let HubClientPendingStage::SessionTypeHandoff(_, outcome) = stage else {
+                    return Some(Err(self.lost()));
+                };
+                Some(outcome)
+            }
             HubClientPendingStage::Done => Some(Err(self.lost())),
         }
     }
@@ -945,7 +960,23 @@ impl HubClientApi {
                 let mut materialized = materialized;
                 materialized.metadata = session_type_client_metadata(materialized.metadata);
                 let _ = now_seconds;
-                let start = runtime.begin_client_session_type_spawn(materialized, owner_waiter_id);
+                // The reservation record is charged before Core reserves the id.
+                let record_charge = runtime
+                    .charge_session_reservation(&materialized.spawn_request.session_id.0)
+                    .map_err(|error| HubClientError::SessionType {
+                        request_id: request_id.clone(),
+                        operation,
+                        kind: "session_record_capacity",
+                        message: format!(
+                            "the Hub state budget cannot hold the session reservation record: requested {} bytes, {} available",
+                            error.requested, error.available
+                        ),
+                    })?;
+                let start = runtime.begin_client_session_type_spawn(
+                    materialized,
+                    owner_waiter_id,
+                    record_charge,
+                );
                 return Ok(HubClientStep::Pending(HubClientPending::session_type(
                     request_id, operation, start,
                 )));

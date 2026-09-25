@@ -3298,6 +3298,9 @@ sys.exit(0)
         session_id: &str,
     ) -> botster_hub_client::DaemonResponse {
         let deadline = Instant::now() + Duration::from_secs(10);
+        if state.current_waiter_id.is_none() {
+            state.current_waiter_id = state.waiter_ids.next();
+        }
         loop {
             let response = request_until_ready(
                 daemon,
@@ -3785,6 +3788,122 @@ return botster.register({
                 .all(|session| session.session_id.0 != "s1-plugin-unscoped"),
             "a refused plugin call must not spawn a session"
         );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(package_root);
+    }
+
+    /// A client removes the session after Core installs it and before the
+    /// plugin conversion completes. The removal only marks the record; the
+    /// spawn's handoff then releases the token, and the id is reusable.
+    #[test]
+    fn removal_before_conversion_releases_the_token_at_handoff() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) =
+            spawn_fixture_with_worker("reservation-race", Some(worker));
+        let runtime = daemon.runtime().unwrap();
+        let waiter = runtime.next_waiter_id().unwrap();
+        let parent = runtime.test_lua_memory().reserve_callback_total(0).unwrap();
+        let charge = runtime.charge_session_reservation("s1-race").unwrap();
+        let mut start = runtime.test_begin_owner_spawn_with_record(
+            waiter,
+            SessionId("s1-race".into()),
+            parent,
+            "true",
+            Some(charge),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(Instant::now() < deadline, "owner spawn did not install");
+            pump_core(&mut daemon, &mut state);
+            match start.poll(daemon.runtime().unwrap()) {
+                crate::runtime::PluginSpawnPoll::Ready(Ok(_)) => break,
+                crate::runtime::PluginSpawnPoll::Ready(Err(failure)) => {
+                    panic!("owner spawn failed: {}", failure.error)
+                }
+                crate::runtime::PluginSpawnPoll::Pending => std::thread::yield_now(),
+            }
+        }
+        let identity = start.test_reservation_identity().expect("installed token");
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .session_reservations()
+                .capture("s1-race")
+                == Some(identity)
+        );
+
+        // The client removal lands before conversion.
+        let removed = remove_when_terminal(&mut daemon, &mut state, "s1-race");
+        assert_eq!(
+            removed.kind,
+            DaemonResponseKind::SessionRemoved,
+            "{removed:?}"
+        );
+        assert!(
+            daemon
+                .runtime()
+                .unwrap()
+                .session_reservations()
+                .removed_during_launch("s1-race", identity)
+        );
+
+        // Conversion completes: the handoff releases the token.
+        assert!(!start.begin_handoff(daemon.runtime().unwrap()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "handoff release did not settle");
+            pump_core(&mut daemon, &mut state);
+            if start.poll_handoff(daemon.runtime().unwrap()) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(daemon.runtime().unwrap().session_reservations().len(), 0);
+        assert!(daemon.runtime().unwrap().retained_reservations().is_empty());
+        drop(start);
+
+        let reused = spawn_until_ready(&mut daemon, &mut state, "s1-race", "true");
+        assert_eq!(reused.kind, DaemonResponseKind::Spawned, "{reused:?}");
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removed_plugin_session_releases_its_reservation_for_reuse() {
+        let worker = matched_worker_path();
+        let (mut daemon, mut state, root) = spawn_fixture_with_worker("plugin-reuse", Some(worker));
+        let package_root = root.join("p1-plugin");
+        let record = plugin_spawn_package(&package_root);
+        let mut owner_rx = load_plugin_spawn_tool(&mut daemon, &package_root, record);
+        invoke_plugin_spawn_tool(
+            &mut daemon,
+            &mut state,
+            &mut owner_rx,
+            "s1-plugin-reuse",
+            None,
+        )
+        .expect("first plugin spawn");
+        assert_eq!(daemon.runtime().unwrap().session_reservations().len(), 1);
+
+        let removed = remove_when_terminal(&mut daemon, &mut state, "s1-plugin-reuse");
+        assert_eq!(
+            removed.kind,
+            DaemonResponseKind::SessionRemoved,
+            "{removed:?}"
+        );
+        assert!(removed.diagnostics.is_empty(), "{removed:?}");
+        assert_eq!(daemon.runtime().unwrap().session_reservations().len(), 0);
+
+        invoke_plugin_spawn_tool(
+            &mut daemon,
+            &mut state,
+            &mut owner_rx,
+            "s1-plugin-reuse",
+            None,
+        )
+        .expect("the removed plugin session id spawns again");
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(package_root);

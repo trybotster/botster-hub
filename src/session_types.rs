@@ -463,6 +463,11 @@ impl std::fmt::Debug for ChargedSessionTypeFailure {
 }
 
 impl ChargedSessionTypeMaterialization {
+    /// The session id this product will reserve.
+    pub(crate) fn session_id(&self) -> &str {
+        &self.materialized.spawn_request.session_id.0
+    }
+
     /// The next owner must retain the allowance until its payload is destroyed.
     pub(crate) fn into_parts(self) -> (MaterializedSessionType, ChargedMaterializationAllowance) {
         (self.materialized, self.allowance)
