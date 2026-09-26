@@ -5,6 +5,7 @@
 //! in `main`. WebRTC smoke lives in `local_webrtc_smoke`.
 
 use std::io::{self, BufRead, BufReader};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,8 +13,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use botster_hub::daemon::readiness::ReadyLine;
 use botster_hub::process_exit::{wait_for_child_group_exit, wait_for_pid_exit};
 use botster_hub::{DaemonRequest, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, daemon_transport_request};
+
+/// The descriptor that carries the daemon's `--ready-fd` pipe.
+const DAEMON_READY_FD: libc::c_int = 3;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -118,9 +123,8 @@ pub(crate) fn spawn_local_runtime_daemon(
             Ok(())
         });
     }
-    let mut child = command
-        .spawn()
-        .map_err(|source| LocalRuntimeError::SpawnDaemon {
+    let (mut child, ready_reader) =
+        spawn_with_ready_fd(&mut command).map_err(|source| LocalRuntimeError::SpawnDaemon {
             path: hub_bin.to_path_buf(),
             source,
         })?;
@@ -145,8 +149,8 @@ pub(crate) fn spawn_local_runtime_daemon(
     }
 
     if let Err(error) = wait_for_local_runtime_ready(
-        config,
         &mut child,
+        ready_reader,
         local_runtime_daemon_readiness_budget(),
         &stderr_rx,
     ) {
@@ -165,57 +169,133 @@ fn reap_local_runtime_daemon_on_exit(mut child: Child) {
     });
 }
 
+/// Spawns `command` with `--ready-fd DAEMON_READY_FD` and the write end of a
+/// fresh pipe at that descriptor. Returns the read end.
+fn spawn_with_ready_fd(command: &mut Command) -> io::Result<(Child, io::PipeReader)> {
+    let (ready_reader, ready_writer) = io::pipe()?;
+    let ready_writer_fd = ready_writer.as_raw_fd();
+    command.arg("--ready-fd").arg(DAEMON_READY_FD.to_string());
+    unsafe {
+        // SAFETY: this hook runs in the child after fork. It places the pipe's write end
+        // at DAEMON_READY_FD without close-on-exec; fcntl and dup2 are async-signal-safe.
+        command.pre_exec(move || {
+            let placed = if ready_writer_fd == DAEMON_READY_FD {
+                libc::fcntl(DAEMON_READY_FD, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(ready_writer_fd, DAEMON_READY_FD)
+            };
+            if placed == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn();
+    // Only the child may hold the write end, so its exit closes the pipe.
+    drop(ready_writer);
+    Ok((child?, ready_reader))
+}
+
+/// Waits for the daemon's ready line on the `--ready-fd` pipe. EOF without it
+/// means the daemon is exiting; its exit status and stderr explain why.
 fn wait_for_local_runtime_ready(
-    config: &botster_hub::HubConfig,
     child: &mut Child,
+    ready_reader: io::PipeReader,
     readiness_budget: Duration,
     stderr_rx: &mpsc::Receiver<String>,
 ) -> Result<(), LocalRuntimeError> {
     let started_at = Instant::now();
     let deadline = started_at + readiness_budget;
-    let mut last_probe = "status probe not attempted".to_string();
-    let mut stderr_tail = String::new();
-    while Instant::now() < deadline {
-        drain_runtime_stderr(stderr_rx, &mut stderr_tail);
-        if let Some(status) = child.try_wait().map_err(LocalRuntimeError::PollDaemon)? {
-            thread::sleep(Duration::from_millis(20));
-            drain_runtime_stderr(stderr_rx, &mut stderr_tail);
-            return Err(LocalRuntimeError::DaemonExited {
-                status: status.to_string(),
-                elapsed: started_at.elapsed(),
-                readiness_budget,
-                last_probe,
-                stderr_tail,
-            });
+    let (line_tx, line_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(ready_reader)
+            .read_line(&mut line)
+            .map(|_| line);
+        let _ = line_tx.send(result);
+    });
+    // timer: deadline — the product readiness budget; the ready line or pipe EOF ends the normal wait.
+    let outcome = line_rx.recv_timeout(readiness_budget);
+    if let Ok(Ok(line)) = &outcome
+        && !line.is_empty()
+    {
+        if ReadyLine::parse(line).is_some() {
+            return Ok(());
         }
-        match daemon_transport_request(config, DaemonRequest::Status) {
-            Ok(_) => return Ok(()),
-            Err(error) => last_probe = error.to_string(),
-        }
-        thread::sleep(Duration::from_millis(50));
+        let _ = terminate_owned_runtime_child(child);
+        return Err(LocalRuntimeError::MalformedReadiness(
+            sanitize_runtime_message(line),
+        ));
     }
-
-    let child_pid = child.id();
-    let child_status = terminate_owned_runtime_child(child)?;
-    Err(LocalRuntimeError::ReadinessTimeout {
+    if matches!(outcome, Err(mpsc::RecvTimeoutError::Timeout)) {
+        return Err(readiness_timeout(child, started_at, readiness_budget));
+    }
+    // The pipe closed without a ready line, so the daemon is exiting.
+    let exited = wait_for_pid_exit(child.id(), deadline).map_err(LocalRuntimeError::PollDaemon)?;
+    let Some(status) = exited
+        .then(|| child.try_wait())
+        .transpose()
+        .map_err(LocalRuntimeError::PollDaemon)?
+        .flatten()
+    else {
+        return Err(readiness_timeout(child, started_at, readiness_budget));
+    };
+    Err(LocalRuntimeError::DaemonExited {
+        status: status.to_string(),
         elapsed: started_at.elapsed(),
         readiness_budget,
-        last_probe,
-        child_pid,
-        child_status,
+        stderr_tail: collect_runtime_stderr(stderr_rx, deadline),
     })
 }
 
-fn drain_runtime_stderr(stderr_rx: &mpsc::Receiver<String>, stderr_tail: &mut String) {
-    for line in stderr_rx.try_iter() {
-        if !stderr_tail.is_empty() {
-            stderr_tail.push(' ');
+fn readiness_timeout(
+    child: &mut Child,
+    started_at: Instant,
+    readiness_budget: Duration,
+) -> LocalRuntimeError {
+    let child_pid = child.id();
+    match terminate_owned_runtime_child(child) {
+        Ok(child_status) => LocalRuntimeError::ReadinessTimeout {
+            elapsed: started_at.elapsed(),
+            readiness_budget,
+            child_pid,
+            child_status,
+        },
+        Err(error) => error,
+    }
+}
+
+/// Collects the exited daemon's stderr until its reader reaches EOF. The
+/// readiness deadline also bounds this collection, even while lines keep
+/// arriving; the result then says that it was cut short.
+fn collect_runtime_stderr(stderr_rx: &mpsc::Receiver<String>, deadline: Instant) -> String {
+    let mut stderr_tail = String::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            append_runtime_stderr(
+                &mut stderr_tail,
+                "[stderr collection stopped at the readiness deadline]",
+            );
+            return stderr_tail;
         }
-        stderr_tail.push_str(&sanitize_runtime_message(&line));
-        if stderr_tail.len() > 8_192 {
-            let keep_from = stderr_tail.len() - 8_192;
-            stderr_tail.drain(..keep_from);
+        // timer: deadline — the readiness budget also bounds diagnostics; expiry marks them truncated.
+        match stderr_rx.recv_timeout(remaining) {
+            Ok(line) => append_runtime_stderr(&mut stderr_tail, &line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return stderr_tail,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+    }
+}
+
+fn append_runtime_stderr(stderr_tail: &mut String, line: &str) {
+    if !stderr_tail.is_empty() {
+        stderr_tail.push(' ');
+    }
+    stderr_tail.push_str(&sanitize_runtime_message(line));
+    if stderr_tail.len() > 8_192 {
+        let keep_from = stderr_tail.len() - 8_192;
+        stderr_tail.drain(..keep_from);
     }
 }
 
@@ -506,6 +586,109 @@ fn wait_for_owned_runtime_daemon_reaped(pid: u32) -> Result<(), LocalRuntimeErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawns `script` the way the launcher spawns the daemon: a ready pipe at
+    /// DAEMON_READY_FD, stdin held open by the test, and stderr collected.
+    fn spawn_ready_fixture(script: &str) -> (Child, io::PipeReader, mpsc::Receiver<String>) {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let (mut child, ready_reader) = spawn_with_ready_fd(&mut command).expect("spawn fixture");
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        let stderr = child.stderr.take().expect("fixture stderr");
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = stderr_tx.send(line);
+            }
+        });
+        (child, ready_reader, stderr_rx)
+    }
+
+    #[test]
+    fn ready_line_on_the_ready_fd_ends_the_readiness_wait() {
+        // The fixture writes the ready line, then blocks on stdin until the test closes it.
+        let (mut child, ready, stderr) =
+            spawn_ready_fixture("printf 'ready 10 dev\\n' >&3; exec cat >/dev/null");
+
+        wait_for_local_runtime_ready(&mut child, ready, Duration::from_secs(10), &stderr)
+            .expect("the ready line ends the wait");
+
+        drop(child.stdin.take());
+        assert!(child.wait().expect("reap fixture").success());
+    }
+
+    #[test]
+    fn pipe_eof_without_a_ready_line_reports_the_exit_and_stderr() {
+        let (mut child, ready, stderr) = spawn_ready_fixture("echo boom >&2; exit 3");
+
+        let error =
+            wait_for_local_runtime_ready(&mut child, ready, Duration::from_secs(10), &stderr)
+                .expect_err("exit without a ready line fails");
+
+        let LocalRuntimeError::DaemonExited {
+            status,
+            stderr_tail,
+            ..
+        } = error
+        else {
+            panic!("expected DaemonExited, got {error}");
+        };
+        assert!(status.contains('3'), "{status}");
+        assert_eq!(stderr_tail, "boom");
+    }
+
+    #[test]
+    fn stderr_collection_stops_at_the_deadline_while_lines_keep_arriving() {
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        for _ in 0..4 {
+            stderr_tx.send("noise".to_string()).unwrap();
+        }
+        // The sender stays alive and the channel stays nonempty.
+        let tail = collect_runtime_stderr(&stderr_rx, Instant::now());
+
+        assert_eq!(
+            tail,
+            "[stderr collection stopped at the readiness deadline]"
+        );
+        assert_eq!(stderr_rx.try_iter().count(), 4);
+        drop(stderr_tx);
+    }
+
+    #[test]
+    fn a_malformed_ready_line_fails_and_terminates_the_child() {
+        let (mut child, ready, stderr) =
+            spawn_ready_fixture("printf 'ready soon\\n' >&3; exec cat >/dev/null");
+
+        let error =
+            wait_for_local_runtime_ready(&mut child, ready, Duration::from_secs(10), &stderr)
+                .expect_err("a malformed record fails");
+
+        assert!(
+            matches!(&error, LocalRuntimeError::MalformedReadiness(line) if line.contains("ready soon")),
+            "{error}"
+        );
+        assert!(child.try_wait().expect("inspect fixture").is_some());
+    }
+
+    #[test]
+    fn a_silent_child_times_out_and_is_terminated() {
+        // The fixture holds the ready pipe open without writing to it.
+        let (mut child, ready, stderr) = spawn_ready_fixture("exec cat >/dev/null");
+        let pid = child.id();
+
+        let error =
+            wait_for_local_runtime_ready(&mut child, ready, Duration::from_millis(200), &stderr)
+                .expect_err("silence past the budget fails");
+
+        assert!(
+            matches!(error, LocalRuntimeError::ReadinessTimeout { child_pid, .. } if child_pid == pid),
+            "{error}"
+        );
+        assert!(child.try_wait().expect("inspect fixture").is_some());
+    }
 
     #[test]
     fn owned_runtime_cleanup_falls_back_to_direct_child_and_remains_bounded() {

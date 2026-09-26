@@ -1117,9 +1117,16 @@ fn run_control_ingress_item(
     }
 }
 
-pub fn serve_daemon(config: HubConfig) -> DaemonTransportResult<HubDaemonStatus> {
+/// Serves the daemon until shutdown. When `readiness` is present, the ready
+/// line is written once the socket is bound and the owner loop accepts
+/// requests; an earlier failure closes the pipe without it.
+pub fn serve_daemon(
+    config: HubConfig,
+    readiness: Option<crate::daemon::readiness::DaemonReadiness>,
+) -> DaemonTransportResult<HubDaemonStatus> {
     serve_daemon_inner(
         config,
+        readiness,
         #[cfg(test)]
         None,
     )
@@ -1144,6 +1151,7 @@ struct ServeTerminalTest {
 
 fn serve_daemon_inner(
     config: HubConfig,
+    readiness: Option<crate::daemon::readiness::DaemonReadiness>,
     #[cfg(test)] terminal_test: Option<ServeTerminalTest>,
 ) -> DaemonTransportResult<HubDaemonStatus> {
     let socket_path = socket_path(&config)?;
@@ -1218,6 +1226,11 @@ fn serve_daemon_inner(
         }
         None => (None, None),
     };
+    // The accept task is running and every request it admits waits on the
+    // control channel that the owner loop below serves.
+    if let Some(readiness) = readiness {
+        readiness.notify();
+    }
     let outcome = 'owner: loop {
         let mut owner_turn = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
         reap_finished_connection_tasks(&mut connection_tasks);
@@ -2487,6 +2500,7 @@ mod tests {
                 .spawn(move || {
                     let result = serve_daemon_inner(
                         config,
+                        None,
                         Some(ServeTerminalTest {
                             start: Box::new(move |_daemon, receiver, sender| {
                                 if error_exit {
@@ -8016,6 +8030,7 @@ return botster.register({tools = {{
             .spawn(move || {
                 serve_daemon_inner(
                     server_config,
+                    None,
                     Some(ServeTerminalTest {
                         start: Box::new(move |daemon, _receiver, sender| {
                             // Fixture installation finishes before the tested socket requests start.
