@@ -605,12 +605,11 @@ impl<T> CoreTicketPublisher<T> {
             .expect("live publisher owns its sender")
             .try_send(result)
             .is_ok()
+            && self.notify_owner
         {
-            if self.notify_owner {
-                // The result is readable before its identity. The identity is
-                // readable before the independent bit and doorbell publish.
-                self.wake.publish(self.identity);
-            }
+            // The result is readable before its identity. The identity is
+            // readable before the independent bit and doorbell publish.
+            self.wake.publish(self.identity);
         }
     }
 }
@@ -1310,6 +1309,7 @@ impl CoreDaemonHandle {
         CoreOperationTicket { begin, completion }
     }
 
+    #[cfg(test)]
     pub(crate) fn waiter_ids(&self) -> &WaiterIdSource {
         &self.waiter_ids
     }
@@ -1324,10 +1324,6 @@ impl CoreDaemonHandle {
 
     pub(crate) fn restore_owner_completion_identities(&self, identities: &[OwnerWorkIdentity]) {
         self.completion_wake.restore_identities(identities);
-    }
-
-    pub(crate) fn retire_owner_completion(&self, identity: OwnerWorkIdentity) -> bool {
-        self.completion_wake.retire(identity)
     }
 
     pub(crate) fn retire_owner_waiter(&self, waiter_id: WaiterId) -> usize {

@@ -4669,6 +4669,7 @@ impl HubRuntime {
         &self.host_executor
     }
 
+    #[cfg(test)]
     pub(crate) fn next_waiter_id(&self) -> Option<crate::owner_identity::WaiterId> {
         self.core_daemon.waiter_ids().next()
     }
@@ -4690,13 +4691,6 @@ impl HubRuntime {
     ) {
         self.core_daemon
             .restore_owner_completion_identities(identities);
-    }
-
-    pub(crate) fn retire_owner_core_completion(
-        &self,
-        identity: crate::owner_identity::OwnerWorkIdentity,
-    ) -> bool {
-        self.core_daemon.retire_owner_completion(identity)
     }
 
     pub(crate) fn retire_owner_core_waiter(

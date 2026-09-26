@@ -862,9 +862,9 @@ fn control_ready_class(message: &ControlMessage) -> crate::daemon::owner_schedul
 fn enqueue_control_message(
     state: &mut DaemonControlState,
     message: ControlMessage,
-) -> Result<(), ControlMessage> {
+) -> Result<(), Box<ControlMessage>> {
     let Some(waiter_id) = state.waiter_ids.next() else {
-        return Err(message);
+        return Err(Box::new(message));
     };
     let class = control_ready_class(&message);
     state.control_ingress.insert(waiter_id, message);
@@ -877,10 +877,12 @@ fn enqueue_control_message(
         )
         .is_err()
     {
-        return Err(state
-            .control_ingress
-            .remove(&waiter_id)
-            .expect("a failed ingress mark retains its message"));
+        return Err(Box::new(
+            state
+                .control_ingress
+                .remove(&waiter_id)
+                .expect("a failed ingress mark retains its message"),
+        ));
     }
     Ok(())
 }
@@ -1442,7 +1444,7 @@ fn serve_daemon_inner(
             match *message {
                 Some(message) => {
                     if let Err(message) = enqueue_control_message(&mut control_state, message) {
-                        if let ControlMessage::ConnectionCleanup(cleanup) = message {
+                        if let ControlMessage::ConnectionCleanup(cleanup) = *message {
                             handle_connection_cleanup(
                                 &mut daemon,
                                 &mut control_state,
@@ -1773,6 +1775,7 @@ enum BackgroundProgress {
 ///
 /// The read is requested on one pump turn and consumed on a later one; the
 /// owner never waits for it. Returns `true` while more work is pending.
+#[cfg(test)]
 pub(crate) fn run_inventory_reconcile_phase(
     daemon: &HubDaemon,
     state: &mut DaemonControlState,
@@ -2486,6 +2489,7 @@ pub(crate) fn request_succeeded(response: Result<&DaemonResponse, &DaemonTranspo
     )
 }
 
+#[cfg(test)]
 pub(crate) fn should_mark_pump_after_control(request: &DaemonRequest, succeeded: bool) -> bool {
     match request {
         DaemonRequest::Spawn { .. }
