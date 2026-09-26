@@ -539,6 +539,7 @@ mod tests {
         let result = LuaPluginRuntime::new(
             PluginKey("sandbox-test.plugin".into()),
             &entrypoint,
+            None,
             host_api(&hub),
             hub.lua_plugin_host_api().memory,
         );
@@ -571,6 +572,7 @@ mod tests {
         let (runtime, _) = LuaPluginRuntime::new(
             PluginKey("sandbox-test.plugin".into()),
             &entrypoint,
+            None,
             host_api(&hub),
             hub.lua_plugin_host_api().memory,
         )
@@ -638,6 +640,7 @@ mod tests {
         let (runtime, _) = LuaPluginRuntime::new(
             PluginKey("sandbox-test.plugin".into()),
             &entrypoint,
+            None,
             host_api(&hub),
             hub.lua_plugin_host_api().memory,
         )
