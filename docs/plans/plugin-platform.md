@@ -1,8 +1,8 @@
 # Plugin platform design
 
-Status: revision 6 for review (2026-09-26). Owner: plugin-platform Hub writer.
-Revisions 1 (`4e6f5aa2`), 2 (`0bc5c83e`), 3 (`affb2368`), 4 (`781ebb57`), and
-5 (`8e02f13e`) were rejected;
+Status: revision 7 for review (2026-09-26). Owner: plugin-platform Hub writer.
+Revisions 1 (`4e6f5aa2`), 2 (`0bc5c83e`), 3 (`affb2368`), 4 (`781ebb57`),
+5 (`8e02f13e`), and 6 (`dd3b5512`) were rejected;
 section 17 maps every finding to its answer.
 
 Scope: the Lua-facing platform that first-party plugins need, starting with
@@ -177,13 +177,22 @@ Events and their only effects:
 
 | Event | Effect |
 | --- | --- |
-| an invocation of the chain publishes `suspended` | `open_invocations -= 1` |
-| an invocation of the chain publishes a final result | `open_invocations -= 1`; if not `answered`: answer the waiter with it, set `answered` |
+| an invocation of the chain publishes its marker (`suspended` or `done`) | `open_invocations -= 1` |
+| the chain's Reply arrives | if not `answered`: answer the waiter with the Reply body, set `answered`; in every case `release_call` returns the reply credit |
 | an invocation of the chain fails (handler error, worker stopped) | `open_invocations -= 1`; if not `answered`: answer with the failure, set `answered` |
 | deadline expiry or caller cancellation | if not `answered`: answer `timed_out` or `cancelled`, set `answered`; cancel the chain's open calls (section 4.2 rule 4) |
 | a host call of the chain reaches its terminal | `open_calls -= 1` |
 
-The entry is removed when `answered` is true and both counters are zero.
+**Where the result travels.** Invocations publish only markers (section 5.0).
+A request-response handler's return value, whether it suspended or not, is
+sent by the runtime as a Reply (a credited message, section 15) before the
+invocation publishes its `done` marker. The chain takes one of the plugin's 2
+reply credits when its root is admitted, so a Reply always has a credit; a 3rd
+concurrent root is refused with `backpressured`. The Hub may see the Reply and
+the markers in any order; the counters below do not depend on it.
+
+The entry is removed when `answered` is true, both counters are zero, and the
+reply credit has returned.
 Each event changes a disjoint field, and "answer" happens at most once, so
 every interleaving of `suspended`, final, deadline, and late publications
 gives the same outcome: the first of final, failure, or deadline answers,
@@ -303,6 +312,39 @@ This section is the contract with the event-driven writer (Hub delivery
 path) and the Core process-host writer (engine and IPC; premise
 `docs/plans/plugin-process-host.md` on `origin/delivery/plugin-process-host-20260926`).
 
+### 5.0 The complete allocation (USER DECISION, 2026-09-26)
+
+Sized for the 8-plugin maximum (128 MiB total / 16 MiB per-VM Lua limits; a
+known ceiling to revisit with the process-per-plugin host). "Existing" means
+an unchanged number from the current code; "approved" means a number the user
+approved for this plan.
+
+| Resource (owner) | Scope | Allocation | Numbers |
+| --- | --- | --- | --- |
+| Background queue (Core engine) | per plugin, existing 256 slots / 1 MiB | host-call pool | 128 slots / 512 KiB (approved) |
+| | | ordinary Background work (stream events, package events, session-family frames) | 128 slots / 512 KiB (approved) |
+| Request-response queue (Core engine) | per plugin, existing | request-response roots; at most 2 open chains per plugin (a 3rd call is `backpressured`) | existing queue numbers; 2 chains (approved) |
+| Completion store entries (Core engine) | global, per-plugin share reserved at load | 128 host-call results + 2 chain roots + 32 ordinary = 162 per plugin | global 1296 entries (approved; was 256) |
+| Completion reservation bytes (Core engine) | global | 4 KiB per entry (the existing Background allowance) | 1296 x 4 KiB = 5.2 MiB (approved; was 8 MiB) |
+| Completion queue bytes (Core engine) | global | markers only | 32 MiB (existing, unchanged) |
+| Reply credits (Core ingress on the process host; Hub callback account) | per plugin | the final result of a request-response chain | 2 x 1 MiB (approved) |
+| Request-body credit (Core ingress; then the Hub retained charge) | per plugin | host-call request bodies until backend disposal | 512 KiB (approved) |
+| Result producer and encoding (Hub callback account) | per plugin | producer buffer plus encoded bytes during overlap | 2 x 512 KiB (derived from the pool) |
+| Stream records and ledger charges (Hub callback account) | per plugin | one record per armed stream; one charge per open chain | about 160 KiB (derived: 128 records of fixed size plus `PATH_MAX`) |
+| Module staging (Hub callback account) | global, temporary | ONE 16 MiB staging permit; package loads stage one at a time and release the permit when the VM holds the text | 16 MiB (approved) |
+| Hub callback account total | global | 8 x about 3.7 MiB retained shares + 16 MiB staging = about 45.6 MiB; the rest (about 18 MiB) stays for existing users (for example up to 8 MiB of entity publishes in flight) | 64 MiB (existing, unchanged) |
+
+Load reserves the plugin's whole retained share (queue split, completion
+entries and bytes, reply and request credits, callback share) in one
+all-or-nothing step, then waits for the staging permit. If any part cannot be
+reserved, the load fails with `quota_exceeded` and nothing stays reserved.
+
+Required proofs (slice 3): 8 plugins load, and an ordinary event is still
+delivered while all 8 hold their full shares; the early-final ordering test
+(section 4.2); a 3rd concurrent request-response call to one plugin is
+`backpressured` while a sibling answers; a 9th plugin's load is refused with
+`quota_exceeded`.
+
 ### 5.1 The delivery pool (host calls only)
 
 1. **Engine reservation.** At load, the Hub reserves a standing delivery
@@ -337,28 +379,11 @@ path) and the Core process-host writer (engine and IPC; premise
    total does not change. A single host-call result larger than 512 KiB fails
    with `{ kind = "failed", detail = "response_too_large" }`; large downloads
    need a future streaming or file capability, not in this plan.
-7. **USER DECISION (completion store, 2026-09-26, Option A).** Every result
-   invocation needs a completion-store reservation for the result it will
-   publish. The Core completion store is Hub-wide, so each plugin's share is
-   reserved at **load**, sized for the 8-plugin maximum:
-   - pool completions: 128 slots x 4 KiB (the existing Background completion
-     allowance) = 512 KiB and 128 entries;
-   - request-response chains: 2 chains x 1 MiB (the existing request-response
-     allowance) and 2 entries. A chain keeps its reservation from root
-     admission through every suspension until its final result is drained.
-   Global store: entries 256 -> 1040 (8 x 130), reservation bytes 8 -> 20 MiB
-   (8 x 2.5 MiB). Both stay inside the unchanged 32 MiB completion queue byte
-   ceiling, so the memory ceiling does not change.
-   - A 3rd concurrent request-response call to one plugin gets a typed
-     `backpressured` error while 2 chains are open; siblings never wait.
-   - A load that cannot reserve its whole share fails with a typed
-     `quota_exceeded` error; a plugin is never partially loaded.
-   - Known ceiling: 8 plugins (128 MiB / 16 MiB per-VM limits); to be
-     revisited with the process-per-plugin host.
-   Slice 3 proofs: 8 plugins load and each uses its full share concurrently;
-   one plugin with both chains suspended does not delay a sibling's MCP call;
-   the 3rd call is backpressured; a 9th plugin's load is refused with
-   `quota_exceeded`.
+7. **Completion store holds markers only** (USER DECISION, 2026-09-26; it
+   supersedes the earlier 1040-entry decision). Every invocation, whether a
+   root, a resume, or ordinary Background work, completes with a marker of at
+   most 4 KiB. Result payloads travel as credited messages (section 5.2),
+   never in the completion store. The full allocation is in section 5.0.
 
 ### 5.2 Memory outside the pool, and the per-plugin share
 
@@ -370,7 +395,8 @@ path) and the Core process-host writer (engine and IPC; premise
 | Encoded completion | the call's pool unit | the result's completion is drained |
 | Stream pending-event records | the plugin share, at arm time | the stream is disarmed |
 | Chain ledger entries (section 4.2) | a fixed ledger charge from the plugin share, at root admission | the entry is removed |
-| Module staging (section 7.4) | the plugin share, at load | the VM's own accounting holds the text |
+| Module staging (section 7.4) | the one global 16 MiB staging permit, never a plugin share | the VM's own accounting holds the text; then the next load may stage |
+| Final request-response result (a Reply, section 4.2) | one of the plugin's 2 reply credits (1 MiB each): Core ingress on the process host, then the Hub callback share | the Hub has answered the waiter |
 
 - **Two credits, two lifetimes.** Core's ingress credit covers the frame
   while it waits in the parent's ingress queue and returns when the Hub
@@ -390,7 +416,8 @@ path) and the Core process-host writer (engine and IPC; premise
   its bounds: twice the pool bytes, the request credit bytes, its stream
   records (at most the operation capacity times the largest record), its
   ledger charges (at most its request-response admission bound times the
-  fixed ledger charge), and its module staging. At load, the Hub reserves the
+  fixed ledger charge), and its reply credits. Module staging is not part of
+  the share; it uses the global staging permit. At load, the Hub reserves the
   whole share from the Hub-wide callback account. A plugin that cannot get
   its share fails to load with `quota_exceeded`. Because every plugin's share
   is reserved up front, one plugin can never take a sibling's share; the
@@ -1046,23 +1073,15 @@ current generation, with `accept_call(call_id, max_result_bytes)`,
 host, the Hub's in-process host port calls the same methods, so both hosts
 share one accounting path.
 
-The completion-store decision (section 5.1 item 7) uses two pools per plugin
-from the same engine API:
-
-- the host-call pool: 128 slots, 512 KiB of request and result bytes,
-  `completion_bytes_per_slot` = 4 KiB (the existing Background allowance);
-  units return when their completion drains;
-- the chain pool: 2 slots with 1 MiB of completion each (the existing
-  request-response allowance). The root request-response invocation and every
-  resume of its chain are admitted from the chain's one held unit. The unit
-  is not returned when the root publishes `suspended`; the Hub releases it
-  explicitly when the chain ledger entry is removed (section 4.2). This needs
-  one engine addition: admission from a held pool unit, and an explicit
-  `release_unit`, for this pool.
-
-Both pools and the ordinary share are reserved at load; if any part cannot
-be reserved, the load fails with `quota_exceeded` and nothing is partially
-reserved. Log frames carry `dropped_since_last`.
+The completion store carries markers only (section 5.0). A request-response
+chain's final result is a **Reply**: a fire-and-forget `HostCall` kind with
+its own conserved ingress credit class (2 credits of 1 MiB body per plugin),
+returned at `release_call`; the Hub's terminal for a Reply is `release_call`,
+with no result `Invoke`. Core validates at spawn that `max_frame_bytes` is at
+least the Reply body allowance plus the envelope overhead (`InvalidConfig`
+otherwise). Core premise section 5.1 at `e54ce21` records the same contract.
+The pool and the ordinary completion entries are reserved in one atomic
+multi-spec reservation at load. Log frames carry `dropped_since_last`.
 
 Flow control: the standing delivery pool and its credits (section 5.1),
 separate conserved credits for host-call request bodies and for log records
@@ -1241,6 +1260,22 @@ setup.
    and 20 MiB of reservation bytes inside the unchanged 32 MiB ceiling; a
    load that cannot reserve its share fails with `quota_exceeded`
    (section 5.1 item 7, slice 3 proofs).
+
+### 17.6 Revision 6
+
+The user approved one complete allocation (section 5.0), which supersedes the
+revision-6 completion-store numbers.
+
+1. **Ordinary completion entries**: 32 per plugin are part of the 162-entry
+   share; slice 3 proves an ordinary event at 8-plugin saturation.
+2. **Resume ownership**: the completion store carries only markers, so each
+   invocation owns exactly one small entry for its own marker; the final
+   result is a Reply with its own credit, held from root admission to
+   `release_call` (section 4.2). No entry holds two publications, and the
+   early-final ordering needs no handoff.
+3. **Staging and the callback account**: staging is one global 16 MiB permit
+   with serialized loads, not part of any plugin share; the table in section
+   5.0 fits both the completion store and the 64 MiB callback account.
 
 
 ## 18. User decisions (summary, all approved as Option A on 2026-09-26)
