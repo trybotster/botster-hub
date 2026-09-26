@@ -184,11 +184,13 @@ impl Drop for CoordinationCallerGuard {
     }
 }
 
+mod basics;
 mod callback;
 mod entity_publish;
 pub(crate) mod lua_json;
 #[cfg(test)]
 mod registration_tests;
+pub(crate) mod result;
 mod session_type_spawn;
 use entity_publish::EntityPublishError;
 pub(crate) use entity_publish::PendingEntityPublishRequest;
@@ -2109,6 +2111,7 @@ fn install_botster_api(
 
     let botster = lua.create_table()?;
     botster.set("register", register)?;
+    basics::install(lua, &botster, Arc::clone(&host_api.memory))?;
 
     let capabilities_table = lua.create_table()?;
     let timer_capabilities = host_api.capabilities.clone();
