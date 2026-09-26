@@ -2163,10 +2163,12 @@ mod tests {
                     previous: prior,
                     repo_file: None,
                 },
-                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed(SessionTypeError::new(
-                    "repo_session_type_sync_uncertain",
-                    "test uncertainty",
-                )),
+                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed {
+                    _error: SessionTypeError::new(
+                        "repo_session_type_sync_uncertain",
+                        "test uncertainty",
+                    ),
+                },
             },
             UncertainPublicationKind::External,
             "repo_session_type_publication_uncertain",
