@@ -1,8 +1,8 @@
 # Plugin platform design
 
-Status: revision 7 for review (2026-09-26). Owner: plugin-platform Hub writer.
+Status: revision 8 for review (2026-09-26). Owner: plugin-platform Hub writer.
 Revisions 1 (`4e6f5aa2`), 2 (`0bc5c83e`), 3 (`affb2368`), 4 (`781ebb57`),
-5 (`8e02f13e`), and 6 (`dd3b5512`) were rejected;
+5 (`8e02f13e`), 6 (`dd3b5512`), and 7 (`c32f5c18`) were rejected;
 section 17 maps every finding to its answer.
 
 Scope: the Lua-facing platform that first-party plugins need, starting with
@@ -178,7 +178,7 @@ Events and their only effects:
 | Event | Effect |
 | --- | --- |
 | an invocation of the chain publishes its marker (`suspended` or `done`) | `open_invocations -= 1` |
-| the chain's Reply arrives | if not `answered`: answer the waiter with the Reply body, set `answered`; in every case `release_call` returns the reply credit |
+| the chain's Reply arrives | if not `answered`: answer the waiter with the Reply body, set `answered`; in every case call `release_call` and mark the Reply released |
 | an invocation of the chain fails (handler error, worker stopped) | `open_invocations -= 1`; if not `answered`: answer with the failure, set `answered` |
 | deadline expiry or caller cancellation | if not `answered`: answer `timed_out` or `cancelled`, set `answered`; cancel the chain's open calls (section 4.2 rule 4) |
 | a host call of the chain reaches its terminal | `open_calls -= 1` |
@@ -186,13 +186,43 @@ Events and their only effects:
 **Where the result travels.** Invocations publish only markers (section 5.0).
 A request-response handler's return value, whether it suspended or not, is
 sent by the runtime as a Reply (a credited message, section 15) before the
-invocation publishes its `done` marker. The chain takes one of the plugin's 2
-reply credits when its root is admitted, so a Reply always has a credit; a 3rd
-concurrent root is refused with `backpressured`. The Hub may see the Reply and
-the markers in any order; the counters below do not depend on it.
+invocation publishes its `done` marker. The Hub may see the Reply and the
+markers in any order; the counters below do not depend on it.
 
-The entry is removed when `answered` is true, both counters are zero, and the
-reply credit has returned.
+**Chain slots and reply credits are two things.**
+
+- A *chain slot* is a Hub reservation: each plugin has 2. The Hub takes one
+  when it admits a request-response root and holds it in the ledger entry
+  until the entry is removed. A 3rd concurrent root is refused with
+  `backpressured`.
+- A *reply credit* is Core's ingress credit: each plugin has 2 (1 MiB body
+  each). The runtime consumes one only when it actually sends a Reply; Core
+  returns it at `release_call`. Because an entry, and so its slot, is removed
+  only after its Reply (if any) has been released, at most one Reply per open
+  slot can be in flight, and the 2 credits always suffice.
+- Every marker carries `reply_sent: true | false`. The runtime sets it; the
+  Hub uses it to know whether a Reply is still owed to the release path.
+
+Terminal protocol for each case (each gives exactly one answer and releases
+everything):
+
+| Case | Reply | Waiter answer | Release |
+| --- | --- | --- | --- |
+| Handler returns a result within 1 MiB | sent (`reply_sent = true`) | the Reply body | `release_call` on the Reply; entry removed when the marker has also drained |
+| Handler raises an error | not sent (`reply_sent = false`) | the failure | entry removed when the failure marker drains; no credit was consumed |
+| Handler returns more than 1 MiB | not sent; the runtime checks the size before sending | `failed` / `response_too_large` | as for an error |
+| Deadline or caller cancellation before the Reply | the handler may still send one later (`reply_sent = true` on its marker) | `timed_out` or `cancelled`, at once | a late Reply finds the entry already answered: the Hub calls `release_call` and discards it; the entry (a tombstone) is removed when the marker drains and, if `reply_sent`, the Reply has been released |
+| A Reply for an unknown or removed entry | (protocol bug) | none | `release_call`, discard, count; on the process host Core treats an unknown `call_id` as a protocol violation |
+| Generation retirement (unload, reload, kill, crash) | any in flight is dropped by Core with the generation | every unanswered waiter gets `cancelled` (unload, reload) or `unavailable` (kill, crash) | Core releases the generation's credits; the Hub drops the generation's entries and slots |
+
+Real-daemon proofs (slice 3): two failing handlers followed by a successful
+call on the same plugin; a cancellation before the Reply racing with a late
+Reply; an oversized return; generation retirement with a suspended chain.
+Each asserts exactly one answer, both slots free, and both credits returned.
+
+The entry is removed when `answered` is true, both counters are zero, and a
+Reply that a marker reported as sent has been released. Removing the entry
+frees the chain slot.
 Each event changes a disjoint field, and "answer" happens at most once, so
 every interleaving of `suspended`, final, deadline, and late publications
 gives the same outcome: the first of final, failure, or deadline answers,
@@ -228,8 +258,9 @@ Rules:
 
 1. **Request-response handlers** (MCP tools, view actions, entity
    snapshots) may suspend. The Hub keeps the original waiter parked, keyed by
-   the suspended call. The final `InvocationResult` of the last resume
-   answers the waiter. The original deadline covers the whole handler.
+   its chain. The chain's Reply answers the waiter (section 4.2, "Where the
+   result travels"); every `InvocationResult` is only a marker. The original
+   deadline covers the whole handler.
 2. **Interleaving.** While a handler is suspended, other invocations of the
    same plugin may run. Plugin state can change across a suspension point,
    exactly as across an `await`.
@@ -1276,6 +1307,17 @@ revision-6 completion-store numbers.
 3. **Staging and the callback account**: staging is one global 16 MiB permit
    with serialized loads, not part of any plugin share; the table in section
    5.0 fits both the completion store and the 64 MiB callback account.
+
+### 17.7 Revision 7
+
+The Reply lifecycle now separates the Hub's chain slot (reserved at root
+admission, freed at ledger-entry removal) from Core's reply credit (consumed
+at send, returned at `release_call`), which matches Core `e54ce21`. Markers
+carry `reply_sent`, so an entry is removed only after its sent Reply is
+released. Section 4.2 gives one terminal protocol for sent, never sent,
+oversized, cancelled, late, unknown, and retired Replies, with real-daemon
+proofs. The stale rule that the final `InvocationResult` answers the waiter
+is replaced.
 
 
 ## 18. User decisions (summary, all approved as Option A on 2026-09-26)
