@@ -9,6 +9,14 @@ pub(crate) const MAX_SUBSCRIPTION_CHANNELS: usize = 32;
 pub(crate) const MAX_TOTAL_CHANNELS: usize = MAX_CONTROL_CHANNELS + MAX_SUBSCRIPTION_CHANNELS;
 pub(crate) const AGGREGATE_BUFFERED_HIGH: usize = 2_097_152;
 pub(crate) const AGGREGATE_BUFFERED_LOW: usize = 1_048_576;
+/// A channel whose published usage is at or below its buffered-amount-low
+/// threshold counts as drained. The transport reports a channel's drain only
+/// as it crosses that threshold (rtc-sctp's edge-triggered BufferedAmountLow),
+/// so bytes below it leave with no further event.
+pub(crate) const CHANNEL_DRAINED_BYTES: usize =
+    crate::transport::webrtc::control_channel::LOCAL_WEBRTC_BUFFERED_AMOUNT_LOW as usize;
+// The drained residue of every channel together stays within the high mark.
+const _: () = assert!(MAX_SUBSCRIPTION_CHANNELS * CHANNEL_DRAINED_BYTES <= AGGREGATE_BUFFERED_HIGH);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ChannelClass {
@@ -183,10 +191,20 @@ impl ConnectionAggregate {
             })
     }
 
+    /// Every channel's published usage is at or below its drained mark. A
+    /// peer reaches this through transport events alone.
+    fn published_drained(&self) -> bool {
+        self.slots
+            .iter()
+            .all(|slot| slot.load(Ordering::Acquire) <= CHANNEL_DRAINED_BYTES)
+    }
+
     /// The high mark is a high-water mark, not a per-frame cap. A frame
     /// that fits under the mark beside the occupied bytes is authorized. A
-    /// frame that does not fit is authorized only on an empty aggregate, so
-    /// the aggregate exceeds the mark by at most that one frame.
+    /// frame that does not fit is authorized only on a quiescent aggregate:
+    /// no outstanding authorization, and every channel drained. The drained
+    /// residue is at most the high mark, so the aggregate exceeds the mark
+    /// by at most that one frame.
     fn try_extend_authorized(&self, frame_len: usize) -> bool {
         // A sender publishes channel usage before it drops its permit. The
         // transition can count bytes twice, but it cannot omit them.
@@ -194,7 +212,7 @@ impl ConnectionAggregate {
         loop {
             let occupied = self.published_buffered().saturating_add(authorized);
             let fits = occupied.saturating_add(frame_len) <= AGGREGATE_BUFFERED_HIGH;
-            if !fits && occupied != 0 {
+            if !fits && (authorized != 0 || !self.published_drained()) {
                 return false;
             }
             match self.authorized.compare_exchange_weak(
@@ -203,10 +221,10 @@ impl ConnectionAggregate {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                // The empty check read usage before this authorization. A
+                // The drained check read usage before this authorization. A
                 // permit authorized and transferred in between can publish
                 // usage the check missed; undo this authorization then.
-                Ok(_) if !fits && self.published_buffered() != 0 => {
+                Ok(_) if !fits && !self.published_drained() => {
                     self.authorized.fetch_sub(frame_len, Ordering::AcqRel);
                     self.capacity_released();
                     authorized = self.authorized.load(Ordering::Acquire);
@@ -218,13 +236,14 @@ impl ConnectionAggregate {
     }
 
     /// Whether a write of `need` bytes that was refused would now be
-    /// authorized: the aggregate is below the low mark, and the write fits
-    /// or the aggregate is empty.
+    /// authorized: below the low mark with room for it, or quiescent.
     #[must_use]
     pub(crate) fn admits_refused(&self, need: usize) -> bool {
+        let authorized = self.authorized.load(Ordering::Acquire);
         let buffered = self.buffered();
-        buffered < AGGREGATE_BUFFERED_LOW
-            && (buffered == 0 || buffered.saturating_add(need) <= AGGREGATE_BUFFERED_HIGH)
+        (buffered < AGGREGATE_BUFFERED_LOW
+            && buffered.saturating_add(need) <= AGGREGATE_BUFFERED_HIGH)
+            || (authorized == 0 && self.published_drained())
     }
 
     #[must_use]
@@ -406,23 +425,38 @@ mod tests {
     }
 
     #[test]
-    fn an_oversize_frame_is_authorized_only_on_an_empty_aggregate() {
+    fn an_oversize_frame_is_authorized_only_on_a_quiescent_aggregate() {
         let aggregate = Arc::new(ConnectionAggregate::new());
         let oversize = AGGREGATE_BUFFERED_HIGH + 1;
         let first = aggregate.try_authorize(oversize).expect("empty aggregate");
+        // An outstanding authorization is not quiescent.
         assert!(aggregate.try_authorize(oversize).is_none());
         assert!(aggregate.try_authorize(1).is_none());
         drop(first);
-        // One published byte makes the aggregate nonempty.
-        aggregate.slots[0].store(1, Ordering::Release);
+        // Every channel at its drained mark is quiescent.
+        for slot in aggregate.slots.iter() {
+            slot.store(CHANNEL_DRAINED_BYTES, Ordering::Release);
+        }
+        assert!(aggregate.admits_refused(oversize));
+        drop(
+            aggregate
+                .try_authorize(oversize)
+                .expect("quiescent aggregate"),
+        );
+        // One channel one byte above its drained mark is not.
+        aggregate.slots[0].store(CHANNEL_DRAINED_BYTES + 1, Ordering::Release);
+        assert!(!aggregate.admits_refused(oversize));
+        assert!(aggregate.try_authorize(oversize).is_none());
+        for slot in aggregate.slots.iter() {
+            slot.store(0, Ordering::Release);
+        }
+        aggregate.slots[0].store(CHANNEL_DRAINED_BYTES + 1, Ordering::Release);
         assert!(aggregate.try_authorize(oversize).is_none());
         assert!(
             aggregate
-                .try_authorize(AGGREGATE_BUFFERED_HIGH - 1)
+                .try_authorize(AGGREGATE_BUFFERED_HIGH / 2)
                 .is_some()
         );
-        aggregate.slots[0].store(0, Ordering::Release);
-        assert!(aggregate.try_authorize(oversize).is_some());
     }
 
     #[test]
@@ -493,21 +527,24 @@ mod tests {
             .reserve("route".to_string(), ChannelClass::Terminal)
             .expect("route");
         let aggregate = budget.aggregate();
-        let permit = aggregate.try_authorize(64).expect("authorize frame");
+        // Above one channel's drained mark, so the refusal below counts the
+        // transferred bytes rather than the quiescent exception.
+        let frame = CHANNEL_DRAINED_BYTES + 64;
+        let permit = aggregate.try_authorize(frame).expect("authorize frame");
         BETWEEN_BUFFERED_READS.with(|observer| {
             *observer.borrow_mut() = Some(Box::new(move || {
-                usage.store(64, Ordering::Release);
+                usage.store(frame, Ordering::Release);
                 drop(permit);
             }));
         });
         assert!(
-            aggregate.buffered() >= 64,
+            aggregate.buffered() >= frame,
             "a concurrent transfer must not disappear from the snapshot"
         );
-        assert_eq!(aggregate.buffered(), 64);
+        assert_eq!(aggregate.buffered(), frame);
         assert!(
             aggregate
-                .try_authorize(AGGREGATE_BUFFERED_HIGH - 63)
+                .try_authorize(AGGREGATE_BUFFERED_HIGH - frame + 1)
                 .is_none()
         );
     }
