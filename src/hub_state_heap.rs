@@ -31,7 +31,7 @@ use crate::session_types::PackageSessionType;
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::{Worktree, WorktreeGitMetadata};
 
-use crate::lua_memory::layout::{btree_internal_size, btree_nodes};
+use crate::lua_memory::layout::btree_nodes;
 
 /// New-heap walk of one `HubState` clone, excluding the retained Arc view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1333,6 +1333,7 @@ mod tests {
     use super::*;
     use crate::RuntimeEnvironment;
     use crate::config::HubStartupOptions;
+    use crate::lua_memory::layout::btree_internal_size;
 
     #[test]
     fn string_value_internal_node_is_larger_than_string_string() {
