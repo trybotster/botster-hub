@@ -94,15 +94,17 @@ pub(crate) fn accept_one(daemon: &mut HubDaemon, state: &mut DaemonControlState)
         .split_fixed(operation_bytes)
         .expect("the parent admitted the boxed owner operation");
     let work = match crate::session_types::SpawnHostWork::new_ordinary(
-        parent,
-        receipt,
-        runtime.config(),
-        runtime.startup_materialization_paths(),
-        runtime.state(),
-        pending.package_records,
-        pending.plugin_key,
-        pending.session_type_id,
-        pending.request,
+        crate::session_types::OrdinarySpawnInputs {
+            parent,
+            receipt,
+            config: runtime.config(),
+            startup_paths: runtime.startup_materialization_paths(),
+            state: runtime.state(),
+            package_records: pending.package_records,
+            plugin_key: pending.plugin_key,
+            session_type_id: pending.session_type_id,
+            request: pending.request,
+        },
     ) {
         Ok(work) => work,
         Err((reason, _parent, _receipt)) => {

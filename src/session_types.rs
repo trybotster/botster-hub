@@ -290,18 +290,23 @@ impl std::fmt::Debug for SpawnHostWork {
     }
 }
 
+/// The inputs of one ordinary session-type spawn, in the original argument order.
+pub(crate) struct OrdinarySpawnInputs<'a> {
+    pub(crate) parent: crate::lua_memory::LuaCallbackCharge,
+    pub(crate) receipt: crate::data_plane::driver::CoreReplyPublisher<()>,
+    pub(crate) config: &'a HubConfig,
+    pub(crate) startup_paths: &'a StartupMaterializationPaths,
+    pub(crate) state: crate::runtime::HubStateView,
+    pub(crate) package_records: crate::shared_view::SharedView<crate::packages::PackageRegistry>,
+    pub(crate) plugin_key: botster_core::PluginKey,
+    pub(crate) session_type_id: String,
+    pub(crate) request: SessionTypeRequest,
+}
+
 impl SpawnHostWork {
     /// Keep the charged source parser and config live in the Host job.
     pub(crate) fn new_ordinary(
-        mut parent: crate::lua_memory::LuaCallbackCharge,
-        receipt: crate::data_plane::driver::CoreReplyPublisher<()>,
-        config: &HubConfig,
-        startup_paths: &StartupMaterializationPaths,
-        state: crate::runtime::HubStateView,
-        package_records: crate::shared_view::SharedView<crate::packages::PackageRegistry>,
-        plugin_key: botster_core::PluginKey,
-        session_type_id: String,
-        request: SessionTypeRequest,
+        inputs: OrdinarySpawnInputs<'_>,
     ) -> Result<
         Self,
         (
@@ -310,6 +315,17 @@ impl SpawnHostWork {
             crate::data_plane::driver::CoreReplyPublisher<()>,
         ),
     > {
+        let OrdinarySpawnInputs {
+            mut parent,
+            receipt,
+            config,
+            startup_paths,
+            state,
+            package_records,
+            plugin_key,
+            session_type_id,
+            request,
+        } = inputs;
         let config =
             match ChargedMaterializationConfig::from_config(config, startup_paths, &mut parent) {
                 Ok(config) => config,
@@ -1956,7 +1972,7 @@ fn materialize_ordinary_charged(
                 return Err(ChargedMaterializationFailure::Capacity(reason));
             }
         };
-    let result = charged_final_materialization(
+    let result = charged_final_materialization(FinalMaterializationInputs {
         parent,
         row_storage,
         environment_storage,
@@ -1967,9 +1983,9 @@ fn materialize_ordinary_charged(
         execution,
         metadata,
         context,
-        config.initial_rows,
-        config.initial_cols,
-    )
+        initial_rows: config.initial_rows,
+        initial_cols: config.initial_cols,
+    })
     .map_err(ChargedMaterializationFailure::Capacity);
     drop(sources);
     drop(config);
@@ -3591,12 +3607,14 @@ fn charged_context(
 
 /// Finish the output after startup paths and source values are charged.
 /// Every copy is admitted while all source and output payloads remain live.
-fn charged_final_materialization(
-    mut parent: crate::lua_memory::LuaCallbackCharge,
+/// The charges and parts of one final materialization, in the original
+/// argument order; the charges keep that order so they drop as before.
+struct FinalMaterializationInputs {
+    parent: crate::lua_memory::LuaCallbackCharge,
     row_storage: crate::lua_memory::LuaCallbackCharge,
     environment_storage: crate::lua_memory::LuaCallbackCharge,
     environment_injection: crate::lua_memory::LuaCallbackCharge,
-    mut row: HubSessionType,
+    row: HubSessionType,
     environment: BTreeMap<String, String>,
     prefix: ChargedDeterministicPrefix,
     execution: ChargedExecution,
@@ -3604,7 +3622,25 @@ fn charged_final_materialization(
     context: ChargedSessionTypeContext,
     initial_rows: u16,
     initial_cols: u16,
+}
+
+fn charged_final_materialization(
+    inputs: FinalMaterializationInputs,
 ) -> Result<ChargedSessionTypeMaterialization, &'static str> {
+    let FinalMaterializationInputs {
+        mut parent,
+        row_storage,
+        environment_storage,
+        environment_injection,
+        mut row,
+        environment,
+        prefix,
+        execution,
+        metadata,
+        context,
+        initial_rows,
+        initial_cols,
+    } = inputs;
     let mut cwd_count = CountFormattedBytes(0);
     std::fmt::write(
         &mut cwd_count,
@@ -5322,7 +5358,7 @@ mod source_selection_tests {
         let environment_injection =
             charged_inject_context_environment(&mut parent, &mut environment, &prefix, paths)
                 .unwrap();
-        let charged = charged_final_materialization(
+        let charged = charged_final_materialization(FinalMaterializationInputs {
             parent,
             row_storage,
             environment_storage,
@@ -5333,9 +5369,9 @@ mod source_selection_tests {
             execution,
             metadata,
             context,
-            config.session_defaults.initial_rows,
-            config.session_defaults.initial_cols,
-        )
+            initial_rows: config.session_defaults.initial_rows,
+            initial_cols: config.session_defaults.initial_cols,
+        })
         .unwrap();
         let (materialized, allowance) = charged.into_parts();
         assert_eq!(materialized, ordinary);
