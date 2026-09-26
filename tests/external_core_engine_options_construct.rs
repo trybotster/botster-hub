@@ -81,6 +81,7 @@ fn external_crate_constructs_hub_config_with_prior_exhaustive_literal() {
         transports: built.transports,
         core_engine: built.core_engine,
         package_event_plane: built.package_event_plane,
+        update_source_root: built.update_source_root,
     };
     assert_eq!(
         config.core_engine.plugin_worker_executor_concurrency,
