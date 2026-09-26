@@ -84,11 +84,30 @@ Landed on main (reviewer accepted):
 - permit_refused, cause 1 (`712c6c1e`..`178512e1`): a terminal write is authorized for its exact sealed size; `AGGREGATE_BUFFERED_HIGH` is a high-water mark (one frame over it on a quiescent peer, a channel counting as drained at its 64 KiB low threshold; bound HIGH + one frame); released capacity wakes refused writers. Not deterministically tested: the post-CAS undo and the post-mark refresh window.
 - permit_refused, cause 2 (`3cd9f7f3`): when a driver's frame release lost to Core's slot probe, the driver attempted a second flush of that frame; driver reads now wait for the slot mutex, and a lost release is the typed exit `completion_lost`. Web writer's durable N=10 on a local 20f53576 build (same patch): 10 passes, permit_refused 0 in every run (`web-cutover-20260925/durable-n10-20f53576.txt`).
 - Contended-slot lost wake (`a26b8866`): a driver holding the slot mutex no longer reads as Full to Core, and a Core write that meets it is woken by the unlock.
-- Core pin rolls: 891e220 → a499d5a (`9871f3f6`; stall resync), a499d5a → ac35e32 (`38f54ce8`; flood budget). Lifecycle filters 81/81 on each matched candidate. `8ff59ed3` fixed the stale protocol 10 floor test (49 → 50).
+- Core pin rolls: 891e220 → a499d5a (`9871f3f6`; stall resync), a499d5a → ac35e32 (`38f54ce8`; flood budget). Lifecycle filters 81/81 on each matched candidate. `8ff59ed3` fixed the stale protocol 10 floor test (49 → 50). The filters missed a regression: the full lifecycle target later showed `failed_remove_session_does_not_suppress_later_core_close` failing from the ac35e32 pin onward. Pin rolls now run the full lifecycle target.
+- G5 (`67d91f54`): the source update is a development-only loop with a CLI-only source root (`update --source`, `start --update-source-root`). `BOTSTER_ENV=test` refuses the default root. The update tests use fixture checkouts and stop their daemons through the endpoint on every failure path.
+- B2 strict-clippy mechanical cleanup (`0aa6e66f`, `f1674920`). `f1674920` keeps the inflight coordination record's fields alive until the response is sent. Scope: the reviewer accepted this cleanup batch only, not a green full gate. A coordination focused run passed 16/16.
 
 User decisions and rulings: G5 keeps the source update as a development-only loop with a CLI-only source root (no protocol field); oversize terminal frames use the high-water mark, not a typed close.
 
-In review: G5 on `delivery/g5-source-update-20260926` (`f2809a4f`). It replaces the safety block above: the five update tests run on fixture checkouts via `--source`/`--update-source-root`, and `BOTSTER_ENV=test` refuses the default root.
+User decisions, September 26:
+1. Core's reader-progress deadline D is 10 s. A route whose client reads nothing for D is hard-stopped as stalled. A pause shorter than D stays attached.
+2. There is no dedicated recovery-record limit. Records are charged to the existing hub-state byte budget. When the budget is full, new managed spawns are refused with a typed error, and resolution is always admitted.
+3. Plugins reach processes, sockets and the filesystem only through Hub-brokered capabilities.
+4. The cutover plugins are messaging, orchestrator and project-pipelines. A Plugin platform Hub pair (`delivery/plugin-platform-20260926`) designs and builds the plugin API.
+
+Orchestrator rulings on recovery records, September 26 (premise in `recovery-records-20260926/premise-v5.md`; the reviewer accepted it as an implementation premise, not as a diff):
+- Operator records exist only for managed-git attempts, one per attempt. They live in the atomic hub-state document, and each transition is one atomic document write. Unresolved records never stop the Hub from starting.
+- The recovery journal is retired (cold cut). The repository file is the source of truth for repository session types, and catalog invalidation reuses the existing catalog observation at repository commit completion.
+- One command resolves a record: `recovery resolve <record> --finish | --abandon`. It works offline, and abandon deletes nothing.
+- git 2.35 or later (`worktree add --reason`) is a typed startup prerequisite when managed git is configured.
+- While open views pin the resolution reserve, a resolution fails only with the typed `recovery_budget_exhausted`. The record stays, Status reports `recovery_reserve_unavailable`, and new managed spawns are refused. A new SharedViewBudget release wake re-establishes the reserve.
+
+Reader-deadline Hub tests (local only; they land with the Core 67217e1 pin roll): `never_reading_client_is_closed_at_the_reader_deadline_*` (live and silent producer), `rejected_remove_session_does_not_suppress_the_reader_deadline_close`, and `reader_pause_shorter_than_the_deadline_stays_attached`.
+- On Core 67217e11 every case passed each of its runs.
+- On ac35e32 the three closure cases failed at the close assertion, and the short-pause case passed.
+- Evidence: `core-dead-reader-67217e1-20260926/`.
+- Limits: the timing checks before D are intended observations until the roll commit adds a checked bound. These Hub cases do not isolate Core's host-wait clamp.
 
 Known limits and open items:
 - Unix post-restart output loss: not reproduced after the Core a499d5a attach fixes; not proven fixed; open, downgraded. TUI writer's runs on 8ff59ed3: T-S1, T-S8a, and T-S8b each 30 passes of 30 (`tui-cutover-20260925/live-repin-8ff59ed3-t_s*-x30.log`; load figures as reported by the TUI writer).
@@ -100,7 +119,8 @@ Known limits and open items:
   - Two owner_loop event-plane tests: 10 of 10 passes on 38f54ce8, 8 of 10 on 3cd9f7f3.
   - Full-suite `StateDirectoryError::Owned` failures in persistence and recovery tests; each passed in isolation.
   - Three full-suite `matches!` failures whose actual values were not printed (`file_startup_refuses_unresolved_intent_after_directory_sync_failure`, `file_store_updates_state_atomically`, `ambiguous_old_recovery_and_future_schema_fail_closed`); each passed in isolation.
-- Strict clippy is red at baseline (223 errors); the delivery commits add none.
+- Strict clippy is red: 223 errors at 67d91f54, and 193 library errors at f1674920 after B2 (`clippy-b1-20260926/baseline-f1674920.log`). Still to come: B1 (dead code), B3 (type aliases and parameter structs), and B4 (boxing large Err and variant payloads).
+- `client_event_cleanup_unix_sibling_wakes`: 7 of 10 passes on 0aa6e66f (2 shed_busy failures, 1 with an unknown cause) against 9 of 10 on 67d91f54. Not attributed.
 - G8 harness cleanup: update and MCP tests leaked daemons in the 2026-09-25 inventory run.
 
 ## Current delivery status — September 23
