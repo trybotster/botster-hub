@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use botster_hub_client::{
     DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER,
@@ -64,11 +64,15 @@ impl RouteCloseState {
     }
 }
 
+/// The data-plane wake that close work raises after it enqueues a route.
+type DataPlaneWake = Arc<OnceLock<Arc<dyn Fn() + Send + Sync>>>;
+
 #[derive(Clone)]
 pub(crate) struct CloseWorkHook {
     state: Weak<RouteCloseState>,
     tx: SyncSender<Arc<RouteCloseState>>,
     overflow: Arc<AtomicBool>,
+    data_plane_wake: DataPlaneWake,
 }
 
 impl CloseWorkHook {
@@ -94,7 +98,13 @@ impl CloseWorkHook {
             }
             Err(TrySendError::Disconnected(_)) => {
                 state.queued.store(false, Ordering::Release);
+                return;
             }
+        }
+        // Publish after enqueue: the data plane takes the route on the turn
+        // this wake starts.
+        if let Some(wake) = self.data_plane_wake.get() {
+            wake();
         }
     }
 
@@ -114,6 +124,10 @@ struct CloseWorkInner {
     rx: Mutex<Receiver<Arc<RouteCloseState>>>,
     overflow: Arc<AtomicBool>,
     registry: Mutex<HashMap<RouteCloseKey, Arc<RouteCloseState>>>,
+    data_plane_wake: DataPlaneWake,
+    /// Test-only: reports every ready-batch take, including empty ones.
+    #[cfg(test)]
+    take_observer: Mutex<Option<mpsc::Sender<Vec<RouteCloseKey>>>>,
 }
 
 #[derive(Clone)]
@@ -130,8 +144,17 @@ impl CloseWorkSource {
                 rx: Mutex::new(rx),
                 overflow: Arc::new(AtomicBool::new(false)),
                 registry: Mutex::new(HashMap::new()),
+                data_plane_wake: Arc::new(OnceLock::new()),
+                #[cfg(test)]
+                take_observer: Mutex::new(None),
             }),
         }
+    }
+
+    /// Binds the wake that every enqueue raises. The data-plane driver binds
+    /// it once, when it starts.
+    pub(crate) fn bind_data_plane_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.inner.data_plane_wake.set(wake);
     }
 
     pub(crate) fn register(
@@ -165,6 +188,7 @@ impl CloseWorkSource {
             state: Arc::downgrade(&state),
             tx: self.inner.tx.clone(),
             overflow: Arc::clone(&self.inner.overflow),
+            data_plane_wake: Arc::clone(&self.inner.data_plane_wake),
         }
     }
 
@@ -181,7 +205,14 @@ impl CloseWorkSource {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn take_batch(&self, max_keys: usize) -> Vec<Arc<RouteCloseState>> {
+        self.take_ready_batch(max_keys).0
+    }
+
+    /// Takes at most `max_keys` queued routes. The flag reports that queued
+    /// routes may remain, so the caller runs another turn without waiting.
+    pub(crate) fn take_ready_batch(&self, max_keys: usize) -> (Vec<Arc<RouteCloseState>>, bool) {
         let mut batch = Vec::new();
         let mut seen = std::collections::HashSet::new();
         if let Ok(rx) = self.inner.rx.lock() {
@@ -220,22 +251,22 @@ impl CloseWorkSource {
                 self.inner.overflow.store(true, Ordering::Release);
             }
         }
-        batch
+        let more_ready = batch.len() == max_keys || self.inner.overflow.load(Ordering::Acquire);
+        #[cfg(test)]
+        if let Ok(observer) = self.inner.take_observer.lock()
+            && let Some(observer) = observer.as_ref()
+        {
+            let _ = observer.send(batch.iter().map(|state| state.key.clone()).collect());
+        }
+        (batch, more_ready)
     }
 
-    pub(crate) fn requeue(&self, state: Arc<RouteCloseState>) {
-        if state.retired.load(Ordering::Acquire) || !state.queued.load(Ordering::Acquire) {
-            return;
-        }
-        match self.inner.tx.try_send(state) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.inner.overflow.store(true, Ordering::Release);
-            }
-            Err(TrySendError::Disconnected(state)) => {
-                state.queued.store(false, Ordering::Release);
-            }
-        }
+    /// Test-only: returns a receiver for every ready-batch take.
+    #[cfg(test)]
+    pub(crate) fn observe_takes(&self) -> Receiver<Vec<RouteCloseKey>> {
+        let (tx, rx) = mpsc::channel();
+        *self.inner.take_observer.lock().unwrap() = Some(tx);
+        rx
     }
 
     #[cfg(test)]
@@ -353,6 +384,66 @@ mod tests {
         }
         let second = source.take_batch(8);
         assert_eq!(second.len(), 2);
+    }
+
+    #[test]
+    fn notify_closed_wakes_the_data_plane_after_the_route_is_queued() {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let source = CloseWorkSource::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer_source = source.clone();
+        let observer = Arc::clone(&observed);
+        source.bind_data_plane_wake(Arc::new(move || {
+            // The wake runs after the enqueue, so the route is already takeable.
+            let taken = observer_source.take_batch(8);
+            observer
+                .lock()
+                .unwrap()
+                .extend(taken.into_iter().map(|state| state.key.clone()));
+        }));
+        let hook = source.register(
+            "session".into(),
+            "sub".into(),
+            1,
+            ClosedEventLedger::default(),
+            wake,
+        );
+
+        hook.notify_closed(false);
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![RouteCloseKey {
+                session_id: "session".into(),
+                subscription_id: "sub".into(),
+                generation: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_full_batch_reports_that_more_close_work_may_be_ready() {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let source = CloseWorkSource::new();
+        let hooks: Vec<_> = (0..3)
+            .map(|generation| {
+                source.register(
+                    format!("session-{generation}"),
+                    "sub".into(),
+                    generation,
+                    ClosedEventLedger::default(),
+                    Arc::clone(&wake),
+                )
+            })
+            .collect();
+        for hook in &hooks {
+            hook.notify_closed(false);
+        }
+
+        let (first, more) = source.take_ready_batch(2);
+        assert_eq!((first.len(), more), (2, true));
+        let (second, more) = source.take_ready_batch(2);
+        assert_eq!((second.len(), more), (1, false));
     }
 
     #[test]
