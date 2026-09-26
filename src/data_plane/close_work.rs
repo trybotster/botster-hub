@@ -8,12 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use botster_hub_client::{
-    DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER,
-    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER,
-};
+use botster_hub_client::DaemonEvent;
 
-use crate::subscription::closed_events::ClosedEventLedger;
+use crate::subscription::closed_events::{ClosedEventLedger, subscription_close_reason};
+use crate::transport::shared::close_reason::CloseSource;
 
 /// Bounded ready-channel capacity. Matches the Core wake channel.
 pub(crate) const CLOSE_WORK_QUEUE_CAPACITY: usize = 64;
@@ -29,7 +27,8 @@ pub(crate) struct RouteCloseState {
     pub queued: AtomicBool,
     pub retired: AtomicBool,
     pub reported: AtomicBool,
-    pub host_closed: AtomicBool,
+    /// The adapter's first close source, recorded by its close hook.
+    pub source: OnceLock<CloseSource>,
     pub key: RouteCloseKey,
     ledger: ClosedEventLedger,
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -48,17 +47,13 @@ impl RouteCloseState {
         if self.reported.swap(true, Ordering::SeqCst) {
             return;
         }
-        let reason = if self.host_closed.load(Ordering::SeqCst) {
-            TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
-        } else {
-            TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
-        };
+        let reason = subscription_close_reason(self.source.get().copied());
         self.ledger
             .push_event(DaemonEvent::TerminalSubscriptionClosed {
                 session_id: self.key.session_id.clone(),
                 subscription_id: self.key.subscription_id.clone(),
                 generation: self.key.generation,
-                reason: reason.to_string(),
+                reason,
             });
         (self.wake)();
     }
@@ -76,14 +71,14 @@ pub(crate) struct CloseWorkHook {
 }
 
 impl CloseWorkHook {
-    pub(crate) fn notify_closed(&self, host_closed: bool) {
+    pub(crate) fn notify_closed(&self, source: CloseSource) {
         let Some(state) = self.state.upgrade() else {
             return;
         };
         if state.retired.load(Ordering::Acquire) {
             return;
         }
-        state.host_closed.store(host_closed, Ordering::SeqCst);
+        let _ = state.source.set(source);
         if state
             .queued
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -109,11 +104,11 @@ impl CloseWorkHook {
     }
 
     #[cfg(test)]
-    fn notify_closed_through_overflow(&self, host_closed: bool) {
+    fn notify_closed_through_overflow(&self, source: CloseSource) {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        state.host_closed.store(host_closed, Ordering::SeqCst);
+        let _ = state.source.set(source);
         state.queued.store(true, Ordering::Release);
         self.overflow.store(true, Ordering::Release);
     }
@@ -174,7 +169,7 @@ impl CloseWorkSource {
             queued: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             reported: AtomicBool::new(false),
-            host_closed: AtomicBool::new(false),
+            source: OnceLock::new(),
             key: key.clone(),
             ledger,
             wake,
@@ -339,8 +334,12 @@ mod tests {
             ClosedEventLedger::default(),
             Arc::clone(&wake),
         );
-        live.notify_closed(false);
-        retired.notify_closed(false);
+        live.notify_closed(CloseSource::Core(
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::AdapterClosed,
+        ));
+        retired.notify_closed(CloseSource::Core(
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::AdapterClosed,
+        ));
         source.retire("dead", "sub", 3);
         source.force_overflow_for_test();
         let batch = source.take_batch(8);
@@ -370,7 +369,9 @@ mod tests {
             })
             .collect();
         for hook in &hooks {
-            hook.notify_closed_through_overflow(false);
+            hook.notify_closed_through_overflow(CloseSource::Core(
+                botster_core::contract::terminal_adapter::TerminalRouteCloseReason::AdapterClosed,
+            ));
         }
 
         let first = source.take_batch(8);
@@ -409,7 +410,9 @@ mod tests {
             wake,
         );
 
-        hook.notify_closed(false);
+        hook.notify_closed(CloseSource::Core(
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::AdapterClosed,
+        ));
 
         assert_eq!(
             *observed.lock().unwrap(),
@@ -437,7 +440,9 @@ mod tests {
             })
             .collect();
         for hook in &hooks {
-            hook.notify_closed(false);
+            hook.notify_closed(CloseSource::Core(
+                botster_core::contract::terminal_adapter::TerminalRouteCloseReason::AdapterClosed,
+            ));
         }
 
         let (first, more) = source.take_ready_batch(2);
@@ -461,7 +466,9 @@ mod tests {
         assert_eq!(source.live_count(), baseline + 1);
         source.retire("session", "sub", 7);
         assert_eq!(source.live_count(), baseline);
-        hook.notify_closed(false);
+        hook.notify_closed(CloseSource::Core(
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::AdapterClosed,
+        ));
         assert!(source.take_batch(8).is_empty());
     }
 
@@ -472,7 +479,9 @@ mod tests {
         let ledger = ClosedEventLedger::default();
         let hook = source.register("session".into(), "sub".into(), 7, ledger.clone(), wake);
         ledger.suppress_generation("session", "sub", 7);
-        hook.notify_closed(false);
+        hook.notify_closed(CloseSource::Core(
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::AdapterClosed,
+        ));
         let state = source.take_batch(1).pop().expect("queued close work");
         state.report_if_live(true);
         assert!(
@@ -489,7 +498,9 @@ mod tests {
         let hook = source.register("session".into(), "sub".into(), 7, ledger.clone(), wake);
         ledger.suppress_generation("session", "sub", 7);
         ledger.unsuppress_generation("session", "sub", 7);
-        hook.notify_closed(false);
+        hook.notify_closed(CloseSource::Core(
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::AdapterClosed,
+        ));
         let state = source.take_batch(1).pop().expect("queued close work");
         state.report_if_live(true);
         assert!(matches!(

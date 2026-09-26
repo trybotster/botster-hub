@@ -156,10 +156,78 @@ pub const FEATURE_HUB_SOURCE_UPDATE: &str = "hub_source_update";
 pub const FEATURE_UNIX_TERMINAL_ADAPTER: &str = "unix_terminal_adapter";
 /// Optional host event when a bound terminal subscription closes and the socket stays up.
 pub const FEATURE_TERMINAL_SUBSCRIPTION_CLOSED: &str = "terminal_subscription_closed";
-/// Hub closed this bound adapter while the connection stayed alive.
-pub const TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER: &str = "host_adapter_closed";
-/// Core closed this bound adapter while the connection stayed alive.
-pub const TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER: &str = "core_adapter_closed";
+/// Why a bound terminal subscription closed while the connection stayed alive.
+///
+/// `HostAdapterClosed` is a Hub close. `AdapterDropped` is a Hub adapter that
+/// was dropped without a close. Every other variant is the Core route close
+/// reason, with Core's name. `Replaced`, `Detached`, `SessionEnded`,
+/// `TerminalDelivered` and `Shutdown` are expected ends of a route; the rest
+/// report a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSubscriptionCloseReason {
+    HostAdapterClosed,
+    AdapterDropped,
+    Replaced,
+    Detached,
+    SessionEnded,
+    WorkerLinkFailed,
+    AdapterClosed,
+    TerminalDelivered,
+    Stalled,
+    Overflowed,
+    InputFailed,
+    Failed,
+    Shutdown,
+    BindRejected,
+}
+
+impl std::fmt::Display for TerminalSubscriptionCloseReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl TerminalSubscriptionCloseReason {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 14] = [
+        Self::HostAdapterClosed,
+        Self::AdapterDropped,
+        Self::Replaced,
+        Self::Detached,
+        Self::SessionEnded,
+        Self::WorkerLinkFailed,
+        Self::AdapterClosed,
+        Self::TerminalDelivered,
+        Self::Stalled,
+        Self::Overflowed,
+        Self::InputFailed,
+        Self::Failed,
+        Self::Shutdown,
+        Self::BindRejected,
+    ];
+
+    /// The wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostAdapterClosed => "host_adapter_closed",
+            Self::AdapterDropped => "adapter_dropped",
+            Self::Replaced => "replaced",
+            Self::Detached => "detached",
+            Self::SessionEnded => "session_ended",
+            Self::WorkerLinkFailed => "worker_link_failed",
+            Self::AdapterClosed => "adapter_closed",
+            Self::TerminalDelivered => "terminal_delivered",
+            Self::Stalled => "stalled",
+            Self::Overflowed => "overflowed",
+            Self::InputFailed => "input_failed",
+            Self::Failed => "failed",
+            Self::Shutdown => "shutdown",
+            Self::BindRejected => "bind_rejected",
+        }
+    }
+}
 /// Optional Hub WebRTC adapter plane. Bind happens only when DataChannel Hello requires this.
 pub const FEATURE_WEBRTC_TERMINAL_ADAPTER: &str = "webrtc_terminal_adapter";
 /// Optional named attach occupancy on `DaemonStatus`. Empty occupancy without this token is not absence proof.
@@ -4187,7 +4255,7 @@ pub enum DaemonEvent {
         session_id: String,
         subscription_id: String,
         generation: u64,
-        reason: String,
+        reason: TerminalSubscriptionCloseReason,
     },
     /// Unsolicited live package event for one host-control subscription.
     PackageEvent {
@@ -5008,12 +5076,29 @@ mod tests {
     }
 
     #[test]
+    fn terminal_subscription_close_reasons_serialize_to_their_wire_names() {
+        for reason in TerminalSubscriptionCloseReason::ALL {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::Value::String(reason.as_str().to_string())
+            );
+            assert_eq!(
+                serde_json::from_value::<TerminalSubscriptionCloseReason>(
+                    serde_json::Value::String(reason.as_str().to_string())
+                )
+                .unwrap(),
+                reason
+            );
+        }
+    }
+
+    #[test]
     fn terminal_subscription_closed_is_a_server_event_not_a_request_reply() {
         let event = DaemonEvent::TerminalSubscriptionClosed {
             session_id: "session".to_string(),
             subscription_id: "sub".to_string(),
             generation: 2,
-            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+            reason: TerminalSubscriptionCloseReason::Replaced,
         };
         let frame = ServerFrame::Event {
             event: event.clone(),

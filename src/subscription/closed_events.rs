@@ -11,11 +11,11 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use botster_core::SessionId;
+use botster_core::contract::terminal_adapter::TerminalRouteCloseReason;
 use botster_core_daemon::{CoreDaemonError, RegistrySessionState, SessionRegistryStateLookup};
-use botster_hub_client::{
-    DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER,
-    TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER,
-};
+use botster_hub_client::{DaemonEvent, TerminalSubscriptionCloseReason};
+
+use crate::transport::shared::close_reason::CloseSource;
 
 use crate::HubDaemon;
 use crate::admission::unix_hello::{UnixTerminalAdmission, WebrtcTerminalAdmission};
@@ -31,7 +31,41 @@ pub(crate) use crate::transport::shared::close_progress::{
 
 pub(crate) trait ClosedHandle {
     fn is_closed(&self) -> bool;
-    fn host_closed(&self) -> bool;
+    fn close_source(&self) -> Option<CloseSource>;
+}
+
+/// The wire reason for an adapter's first close source. A route whose close
+/// source was never recorded reports `AdapterDropped`: no close named it.
+pub(crate) fn subscription_close_reason(
+    source: Option<CloseSource>,
+) -> TerminalSubscriptionCloseReason {
+    match source {
+        Some(CloseSource::Host) => TerminalSubscriptionCloseReason::HostAdapterClosed,
+        Some(CloseSource::Core(reason)) => core_close_reason(reason),
+        Some(CloseSource::Dropped) | None => TerminalSubscriptionCloseReason::AdapterDropped,
+    }
+}
+
+/// Exhaustive, so a new Core reason fails to compile until it has a wire name.
+fn core_close_reason(reason: TerminalRouteCloseReason) -> TerminalSubscriptionCloseReason {
+    match reason {
+        TerminalRouteCloseReason::Replaced => TerminalSubscriptionCloseReason::Replaced,
+        TerminalRouteCloseReason::Detached => TerminalSubscriptionCloseReason::Detached,
+        TerminalRouteCloseReason::SessionEnded => TerminalSubscriptionCloseReason::SessionEnded,
+        TerminalRouteCloseReason::WorkerLinkFailed => {
+            TerminalSubscriptionCloseReason::WorkerLinkFailed
+        }
+        TerminalRouteCloseReason::AdapterClosed => TerminalSubscriptionCloseReason::AdapterClosed,
+        TerminalRouteCloseReason::TerminalDelivered => {
+            TerminalSubscriptionCloseReason::TerminalDelivered
+        }
+        TerminalRouteCloseReason::Stalled => TerminalSubscriptionCloseReason::Stalled,
+        TerminalRouteCloseReason::Overflowed => TerminalSubscriptionCloseReason::Overflowed,
+        TerminalRouteCloseReason::InputFailed => TerminalSubscriptionCloseReason::InputFailed,
+        TerminalRouteCloseReason::Failed => TerminalSubscriptionCloseReason::Failed,
+        TerminalRouteCloseReason::Shutdown => TerminalSubscriptionCloseReason::Shutdown,
+        TerminalRouteCloseReason::BindRejected => TerminalSubscriptionCloseReason::BindRejected,
+    }
 }
 
 pub(crate) struct ClosedEventRoute<H> {
@@ -176,16 +210,11 @@ impl ClosedEventLedger {
                 }
                 Some(true) => route.reported = true,
             }
-            let reason = if route.handle.host_closed() {
-                TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
-            } else {
-                TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
-            };
             queued.push(DaemonEvent::TerminalSubscriptionClosed {
                 session_id: route.session_id.clone(),
                 subscription_id: route.subscription_id.clone(),
                 generation: route.generation,
-                reason: reason.to_string(),
+                reason: subscription_close_reason(route.handle.close_source()),
             });
         }
         if !queued.is_empty() {
@@ -410,6 +439,57 @@ mod tests {
     use botster_core_daemon::{CoreDaemonError, RegistrySessionState, SessionRegistryStateLookup};
 
     #[test]
+    fn every_core_close_reason_reaches_the_wire_under_its_core_name() {
+        use TerminalRouteCloseReason as Core;
+        for reason in [
+            Core::Replaced,
+            Core::Detached,
+            Core::SessionEnded,
+            Core::WorkerLinkFailed,
+            Core::AdapterClosed,
+            Core::TerminalDelivered,
+            Core::Stalled,
+            Core::Overflowed,
+            Core::InputFailed,
+            Core::Failed,
+            Core::Shutdown,
+            Core::BindRejected,
+        ] {
+            assert_eq!(
+                subscription_close_reason(Some(CloseSource::Core(reason))).as_str(),
+                reason.as_str(),
+                "{reason:?}"
+            );
+        }
+        assert_eq!(
+            subscription_close_reason(Some(CloseSource::Host)),
+            TerminalSubscriptionCloseReason::HostAdapterClosed
+        );
+        assert_eq!(
+            subscription_close_reason(Some(CloseSource::Dropped)),
+            TerminalSubscriptionCloseReason::AdapterDropped
+        );
+        assert_eq!(
+            subscription_close_reason(None),
+            TerminalSubscriptionCloseReason::AdapterDropped
+        );
+    }
+
+    #[test]
+    fn a_unix_adapter_reports_the_core_reason_of_its_first_close() {
+        use botster_core::contract::terminal_adapter::TerminalAdapter;
+        let (mut adapter, handle) = crate::transport::unix::adapter::UnixTerminalAdapter::pair();
+        TerminalAdapter::close(&mut adapter, TerminalRouteCloseReason::Replaced);
+        TerminalAdapter::close(&mut adapter, TerminalRouteCloseReason::Shutdown);
+        handle.close();
+        drop(adapter);
+        assert_eq!(
+            subscription_close_reason(ClosedHandle::close_source(&handle)),
+            TerminalSubscriptionCloseReason::Replaced
+        );
+    }
+
+    #[test]
     fn close_event_suppression_matrix_matches_prior_predicate() {
         assert_eq!(
             session_close_event_decision(Ok(SessionRegistryStateLookup::Found(
@@ -498,8 +578,12 @@ mod tests {
             self.closed
         }
 
-        fn host_closed(&self) -> bool {
-            self.host_closed
+        fn close_source(&self) -> Option<CloseSource> {
+            self.closed.then_some(if self.host_closed {
+                CloseSource::Host
+            } else {
+                CloseSource::Core(TerminalRouteCloseReason::AdapterClosed)
+            })
         }
     }
 
@@ -633,7 +717,7 @@ mod tests {
                 assert_eq!(session_id, "s");
                 assert_eq!(subscription_id, "sub");
                 assert_eq!(generation, 5);
-                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
+                assert_eq!(reason, TerminalSubscriptionCloseReason::AdapterClosed);
             }
             other => panic!("later generation must still emit, got {other:?}"),
         }

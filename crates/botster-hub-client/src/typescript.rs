@@ -257,6 +257,12 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     );
     emit_string_union(
         &mut output,
+        "TerminalSubscriptionCloseReason",
+        &crate::TerminalSubscriptionCloseReason::ALL
+            .map(crate::TerminalSubscriptionCloseReason::as_str),
+    );
+    emit_string_union(
+        &mut output,
         "DaemonProtocolErrorCode",
         &[
             "malformed_frame",
@@ -1872,7 +1878,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
                     ("session_id", "string"),
                     ("subscription_id", "string"),
                     ("generation", "number"),
-                    ("reason", "string"),
+                    ("reason", "TerminalSubscriptionCloseReason"),
                 ],
             ),
             (

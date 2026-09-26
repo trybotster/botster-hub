@@ -1,34 +1,71 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
-/// Internal adapter close cause. Host close cannot rewrite an already-closed Core close.
+use botster_core::contract::terminal_adapter::TerminalRouteCloseReason;
+
+/// Who closed an adapter first, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseSource {
+    /// Hub closed the adapter.
+    Host,
+    /// Core closed the route, with its reason.
+    Core(TerminalRouteCloseReason),
+    /// The adapter was dropped without a close.
+    Dropped,
+}
+
+/// Internal adapter close cause. The first close records its source; a later
+/// close cannot replace it, so a host sweep cannot rewrite a Core close and a
+/// later Core close cannot replace the first Core reason.
 pub(crate) struct CloseCause {
-    closed: AtomicBool,
-    host_closed: AtomicBool,
+    source: OnceLock<CloseSource>,
 }
 
 impl CloseCause {
     pub(crate) fn new() -> Self {
         Self {
-            closed: AtomicBool::new(false),
-            host_closed: AtomicBool::new(false),
+            source: OnceLock::new(),
         }
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.source.get().is_some()
     }
 
     pub(crate) fn host_closed(&self) -> bool {
-        self.host_closed.load(Ordering::SeqCst)
+        self.source() == Some(CloseSource::Host)
     }
 
-    pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+    pub(crate) fn source(&self) -> Option<CloseSource> {
+        self.source.get().copied()
     }
 
-    pub(crate) fn mark_host_if_open(&self) {
-        if !self.is_closed() {
-            self.host_closed.store(true, Ordering::SeqCst);
-        }
+    /// Records `source` unless the adapter is already closed.
+    pub(crate) fn close(&self, source: CloseSource) {
+        let _ = self.source.set(source);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_close_source_wins() {
+        let cause = CloseCause::new();
+        assert_eq!(cause.source(), None);
+        cause.close(CloseSource::Core(TerminalRouteCloseReason::Replaced));
+        cause.close(CloseSource::Core(TerminalRouteCloseReason::Shutdown));
+        cause.close(CloseSource::Host);
+        cause.close(CloseSource::Dropped);
+        assert_eq!(
+            cause.source(),
+            Some(CloseSource::Core(TerminalRouteCloseReason::Replaced))
+        );
+        assert!(!cause.host_closed());
+
+        let hosted = CloseCause::new();
+        hosted.close(CloseSource::Host);
+        hosted.close(CloseSource::Core(TerminalRouteCloseReason::Detached));
+        assert!(hosted.host_closed());
     }
 }

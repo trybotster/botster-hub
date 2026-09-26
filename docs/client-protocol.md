@@ -1751,6 +1751,20 @@ no input and matches no close event on the route before the `HelloAck`.
 Terminal frames travel only on the bound route. The control channel carries
 no terminal frames.
 
+`terminal_subscription_closed.reason` is a `TerminalSubscriptionCloseReason`.
+It names the first close of the route's adapter; a later close does not
+replace it.
+- `host_adapter_closed`: Hub closed the route (a failed attach, a malformed
+  frame or input header, a dead attachment, or connection teardown).
+- `adapter_dropped`: the adapter was dropped without a close.
+- Any other value is Core's route close reason, with Core's name:
+  - Expected ends of a route, not transport loss: `replaced` (a newer attach
+    replaced the route, for example the same client reattaching), `detached`,
+    `session_ended`, `terminal_delivered`, and `shutdown`.
+  - Failures: `worker_link_failed`, `adapter_closed`, `stalled` (the reader
+    accepted nothing within Core's reader-progress deadline), `overflowed`,
+    `input_failed`, `failed`, and `bind_rejected`.
+
 A reserved channel that Hub refuses is closed without a `HelloAck`. Hub first
 sends a control-channel `RuntimeObservation` with kind
 `subscription_channel_rejected:<reason>:<label>`. The reasons are

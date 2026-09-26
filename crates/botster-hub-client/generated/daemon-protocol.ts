@@ -84,6 +84,22 @@ export type DaemonCloseReason =
   | { reason: "protocol_error"; code: DaemonProtocolErrorCode }
   | { reason: "daemon_shutdown" };
 
+export type TerminalSubscriptionCloseReason =
+  | "host_adapter_closed"
+  | "adapter_dropped"
+  | "replaced"
+  | "detached"
+  | "session_ended"
+  | "worker_link_failed"
+  | "adapter_closed"
+  | "terminal_delivered"
+  | "stalled"
+  | "overflowed"
+  | "input_failed"
+  | "failed"
+  | "shutdown"
+  | "bind_rejected";
+
 export type DaemonProtocolErrorCode =
   | "malformed_frame"
   | "frame_too_large"
@@ -1159,6 +1175,6 @@ export type DaemonEvent =
   | { type: "session_lifecycle"; session_id: string; state: string }
   | { type: "runtime_observation"; kind: string }
   | { type: "worktree_lifecycle"; event: DaemonWorktreeLifecycleEvent }
-  | { type: "terminal_subscription_closed"; session_id: string; subscription_id: string; generation: number; reason: string }
+  | { type: "terminal_subscription_closed"; session_id: string; subscription_id: string; generation: number; reason: TerminalSubscriptionCloseReason }
   | { type: "package_event"; subscription_id: string; owner: string; name: string; payload: JsonValue }
   | { type: "event_gap"; subscription_id: string; owner: string; name: string };

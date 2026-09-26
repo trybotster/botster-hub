@@ -83,6 +83,14 @@ impl WebRtcTerminalAdapterInner {
         self.release_aggregate_permit();
     }
 
+    fn close_from_core(
+        &self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.slot.close_from_core(reason);
+        self.release_aggregate_permit();
+    }
+
     fn set_would_block(&self, pressured: bool) {
         self.slot.set_would_block(pressured);
     }
@@ -333,8 +341,11 @@ impl TerminalAdapter for WebRtcTerminalAdapter {
         self.inner.try_write(frame)
     }
 
-    fn close(&mut self) {
-        self.inner.close();
+    fn close(
+        &mut self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.inner.close_from_core(reason);
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
@@ -476,7 +487,7 @@ impl WebRtcConnectionMux {
                 self.inner.closed_events.clone(),
                 Arc::new(move || wake.wake()),
             );
-            handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
+            handle.attach_close_hook(move |source| hook.notify_closed(source));
         }
         self.inner.wake.wake();
     }
@@ -704,8 +715,19 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.slot.wait_for_write().await;
     }
 
+    /// A Hub close. Every caller is Hub code ending this route, so it reports
+    /// `host_adapter_closed`; only the adapter's Drop reports no source.
     pub(crate) fn close(&self) {
-        self.inner.close();
+        self.inner.close_from_host();
+    }
+
+    /// Test-only: close as Core does, with its reason.
+    #[cfg(test)]
+    pub(crate) fn close_from_core(
+        &self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.inner.close_from_core(reason);
     }
 
     pub(crate) fn close_from_host(&self) {
@@ -746,7 +768,10 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.aggregate_blocked.load(Ordering::Acquire) != 0
     }
 
-    pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+    pub(crate) fn attach_close_hook(
+        &self,
+        hook: impl Fn(crate::transport::shared::close_reason::CloseSource) + Send + Sync + 'static,
+    ) {
         self.inner.slot.attach_close_hook(hook);
     }
 
@@ -760,8 +785,8 @@ impl ClosedHandle for WebRtcTerminalAdapterHandle {
         WebRtcTerminalAdapterHandle::is_closed(self)
     }
 
-    fn host_closed(&self) -> bool {
-        WebRtcTerminalAdapterHandle::host_closed(self)
+    fn close_source(&self) -> Option<crate::transport::shared::close_reason::CloseSource> {
+        self.inner.slot.close_source()
     }
 }
 
@@ -783,7 +808,7 @@ mod tests {
     use botster_core_test_support::terminal_adapter::{
         TerminalAdapterHarnessDriver, assert_terminal_adapter_conformance,
     };
-    use botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER;
+    use botster_hub_client::TerminalSubscriptionCloseReason;
 
     struct WebRtcTerminalAdapterDriver {
         adapter: WebRtcTerminalAdapter,
@@ -1271,7 +1296,10 @@ mod tests {
     #[test]
     fn close_from_host_does_not_rewrite_an_already_closed_handle() {
         let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
-        adapter.close();
+        TerminalAdapter::close(
+            &mut adapter,
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Replaced,
+        );
         handle.close_from_host();
         assert!(handle.is_closed());
         assert!(
@@ -1279,9 +1307,12 @@ mod tests {
             "Core close must keep host_closed false after later host reconciliation"
         );
         let mux = WebRtcConnectionMux::new();
-        let (_, live) = mux.create_adapter();
+        // Keep the adapter: dropping it first would record `Dropped`.
+        let (_adapter, live) = mux.create_adapter();
         mux.register("s".into(), "sub".into(), 3, live.clone());
-        live.close();
+        live.close_from_core(
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Replaced,
+        );
         assert_eq!(mux.queue_closed_subscription_events(|_| true), 1);
         match mux.pop_pending_event() {
             Some(DaemonEvent::TerminalSubscriptionClosed {
@@ -1293,7 +1324,7 @@ mod tests {
                 assert_eq!(session_id, "s");
                 assert_eq!(subscription_id, "sub");
                 assert_eq!(generation, 3);
-                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
+                assert_eq!(reason, TerminalSubscriptionCloseReason::Replaced);
             }
             other => panic!("expected core close event, got {other:?}"),
         }

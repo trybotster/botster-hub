@@ -668,8 +668,7 @@ pub(crate) mod mux_write_resume_tests {
     use botster_core::contract::terminal_adapter::{TerminalAdapter, TerminalAdapterPressure};
     use botster_hub_client::{
         DaemonEvent, DaemonResponseKind, DaemonUnixFrameReader, DaemonUnixMuxFrame, ServerFrame,
-        TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER, UnixTerminalContainerHeader,
-        encode_server_frame,
+        TerminalSubscriptionCloseReason, UnixTerminalContainerHeader, encode_server_frame,
     };
     use botster_terminal_protocol::{
         RouteId, RoutedTerminalFrame, encode_output, encode_process_exit,
@@ -807,7 +806,7 @@ pub(crate) mod mux_write_resume_tests {
             session_id: "session".to_string(),
             subscription_id: "sub".to_string(),
             generation: 2,
-            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+            reason: TerminalSubscriptionCloseReason::Replaced,
         }
     }
 
@@ -898,7 +897,7 @@ pub(crate) mod mux_write_resume_tests {
             }) => {
                 assert_eq!(session_id, "session");
                 assert_eq!(*generation, 2);
-                assert_eq!(reason, TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER);
+                assert_eq!(*reason, TerminalSubscriptionCloseReason::Replaced);
             }
             other => panic!("expected one close event, got {other:?}"),
         }
@@ -911,7 +910,7 @@ pub(crate) mod mux_write_resume_tests {
             session_id: "other".to_string(),
             subscription_id: "sub-2".to_string(),
             generation: 3,
-            reason: TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER.to_string(),
+            reason: TerminalSubscriptionCloseReason::Replaced,
         });
         let mut writer = PrefixStallWriter {
             written: Vec::new(),

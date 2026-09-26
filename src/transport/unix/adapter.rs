@@ -66,6 +66,13 @@ impl UnixTerminalAdapterInner {
         self.slot.close();
     }
 
+    fn close_from_core(
+        &self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.slot.close_from_core(reason);
+    }
+
     fn pressure(&self) -> TerminalAdapterPressure {
         self.slot.pressure()
     }
@@ -164,8 +171,11 @@ impl TerminalAdapter for UnixTerminalAdapter {
         self.inner.try_write(frame)
     }
 
-    fn close(&mut self) {
-        self.inner.close();
+    fn close(
+        &mut self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.inner.close_from_core(reason);
     }
 
     fn pressure(&self) -> TerminalAdapterPressure {
@@ -284,7 +294,7 @@ impl UnixConnectionMux {
                 self.inner.closed_events.clone(),
                 Arc::new(move || wake.wake()),
             );
-            handle.attach_close_hook(move |host_closed| hook.notify_closed(host_closed));
+            handle.attach_close_hook(move |source| hook.notify_closed(source));
         }
         self.inner.wake.wake();
         true
@@ -513,8 +523,19 @@ impl UnixConnectionMux {
 }
 
 impl UnixTerminalAdapterHandle {
+    /// A Hub close. Every caller is Hub code ending this route, so it reports
+    /// `host_adapter_closed`; only the adapter's Drop reports no source.
     pub(crate) fn close(&self) {
-        self.inner.close();
+        self.inner.close_from_host();
+    }
+
+    /// Test-only: close as Core does, with its reason.
+    #[cfg(test)]
+    pub(crate) fn close_from_core(
+        &self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.inner.close_from_core(reason);
     }
 
     pub(crate) fn close_from_host(&self) {
@@ -523,6 +544,12 @@ impl UnixTerminalAdapterHandle {
 
     pub(crate) fn host_closed(&self) -> bool {
         self.inner.host_closed()
+    }
+
+    pub(crate) fn close_source(
+        &self,
+    ) -> Option<crate::transport::shared::close_reason::CloseSource> {
+        self.inner.slot.close_source()
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -554,7 +581,10 @@ impl UnixTerminalAdapterHandle {
         self.inner.is_flush_deferred()
     }
 
-    pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+    pub(crate) fn attach_close_hook(
+        &self,
+        hook: impl Fn(crate::transport::shared::close_reason::CloseSource) + Send + Sync + 'static,
+    ) {
         self.inner.slot.attach_close_hook(hook);
     }
 
@@ -574,8 +604,8 @@ impl ClosedHandle for UnixTerminalAdapterHandle {
         UnixTerminalAdapterHandle::is_closed(self)
     }
 
-    fn host_closed(&self) -> bool {
-        UnixTerminalAdapterHandle::host_closed(self)
+    fn close_source(&self) -> Option<crate::transport::shared::close_reason::CloseSource> {
+        UnixTerminalAdapterHandle::close_source(self)
     }
 }
 
@@ -686,7 +716,10 @@ mod tests {
     #[test]
     fn host_close_after_core_close_does_not_claim_host_reason() {
         let (mut adapter, handle) = UnixTerminalAdapter::pair();
-        adapter.close();
+        TerminalAdapter::close(
+            &mut adapter,
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::Replaced,
+        );
         assert!(handle.is_closed());
         assert!(!handle.host_closed());
         handle.close_from_host();

@@ -8,11 +8,11 @@ use botster_core::contract::terminal_adapter::{
 use botster_core::contract::terminal_wake::{TerminalWakeKind, TerminalWakeSink};
 use botster_terminal_protocol::RoutedTerminalFrame;
 
-use super::close_reason::CloseCause;
+use super::close_reason::{CloseCause, CloseSource};
 use super::ingress::IngressBuffer;
 use super::wake::WakeSink;
 
-type CloseHook = Arc<dyn Fn(bool) + Send + Sync>;
+type CloseHook = Arc<dyn Fn(CloseSource) + Send + Sync>;
 
 /// One in-flight write slot shared by production terminal adapters.
 ///
@@ -53,7 +53,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         self.emit_writable();
     }
 
-    pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+    pub(crate) fn attach_close_hook(&self, hook: impl Fn(CloseSource) + Send + Sync + 'static) {
         if let Ok(mut slot) = self.close_hook.lock() {
             *slot = Some(Arc::new(hook));
         }
@@ -67,13 +67,28 @@ impl<W: WakeSink> AdapterSlot<W> {
         self.cause.host_closed()
     }
 
-    pub(crate) fn close_from_host(&self) {
-        self.cause.mark_host_if_open();
-        self.close();
+    pub(crate) fn close_source(&self) -> Option<CloseSource> {
+        self.cause.source()
     }
 
+    pub(crate) fn close_from_host(&self) {
+        self.close_with(CloseSource::Host);
+    }
+
+    pub(crate) fn close_from_core(
+        &self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.close_with(CloseSource::Core(reason));
+    }
+
+    /// A close with no stated source: the adapter's Drop.
     pub(crate) fn close(&self) {
-        self.cause.close();
+        self.close_with(CloseSource::Dropped);
+    }
+
+    fn close_with(&self, source: CloseSource) {
+        self.cause.close(source);
         self.close_work.store(true, Ordering::SeqCst);
         self.ingress.clear();
         match self.slot.try_lock() {
@@ -89,7 +104,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         if let Ok(hook) = self.close_hook.lock()
             && let Some(hook) = hook.as_ref()
         {
-            hook(self.host_closed());
+            hook(self.cause.source().unwrap_or(source));
         }
         self.wake.wake();
     }
@@ -163,7 +178,8 @@ impl<W: WakeSink> AdapterSlot<W> {
             Ok(slot) => slot,
             Err(TryLockError::WouldBlock) => return Err(TerminalAdapterWriteError::Full),
             Err(TryLockError::Poisoned(_)) => {
-                self.close();
+                // Hub found its own slot lock poisoned: a Hub close.
+                self.close_from_host();
                 return Err(TerminalAdapterWriteError::Closed);
             }
         };
@@ -199,7 +215,8 @@ impl<W: WakeSink> AdapterSlot<W> {
             }
             Ok(false) => Ok(()),
             Err(()) => {
-                self.close();
+                // Hub rejected a malformed input header: a Hub close.
+                self.close_from_host();
                 Err(())
             }
         }

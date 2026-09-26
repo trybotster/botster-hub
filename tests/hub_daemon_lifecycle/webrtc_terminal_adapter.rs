@@ -897,7 +897,7 @@ fn webrtc_terminal_adapter_host_close_emits_negotiated_terminal_subscription_clo
                 assert!(generation >= 1);
                 assert_eq!(
                     reason,
-                    botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
+                    botster_hub_client::TerminalSubscriptionCloseReason::HostAdapterClosed
                 );
             }
             other => panic!("unexpected host event: {other:?}"),

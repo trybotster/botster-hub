@@ -1198,7 +1198,7 @@ fn host_adapter_close_emits_terminal_subscription_closed_for_one_route() {
         .expect("closed event");
     assert_eq!(
         closed.1,
-        botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER
+        botster_hub_client::TerminalSubscriptionCloseReason::HostAdapterClosed
     );
     assert!(closed.0 >= 1);
     let sibling = stream.request_collecting(&botster_hub_client::DaemonRequest::Status, &mut envelopes, &mut events);
@@ -1305,7 +1305,7 @@ fn failed_remove_session_does_not_suppress_later_core_close() {
             reason,
             ..
         } if session_id == "frm-stall"
-            && reason == botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
+            && *reason == botster_hub_client::TerminalSubscriptionCloseReason::Stalled
     )));
     shutdown_short_lived_session(hub.endpoint(), "frm-stall");
     hub.shutdown().expect("shutdown isolated hub");

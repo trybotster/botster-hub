@@ -2,7 +2,7 @@
 // These pin current Hub behavior so later tickets show an intentional change.
 // They must not change transport behavior.
 
-const LOCKED_CORE_REV: &str = "4e2e5c87a2504de8a14e969905e8fdd8459d9861";
+const LOCKED_CORE_REV: &str = "349f121ccfea121c3cf0976295f9864c58703788";
 
 fn hub_source(relative: &str) -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
@@ -384,7 +384,11 @@ fn terminal_adapter_contract_is_duplex_at_the_locked_core_pin() {
             Ok(())
         }
 
-        fn close(&mut self) {}
+        fn close(
+            &mut self,
+            _reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+        ) {
+        }
 
         fn pressure(&self) -> botster_core::contract::terminal_adapter::TerminalAdapterPressure {
             botster_core::contract::terminal_adapter::TerminalAdapterPressure::Ready

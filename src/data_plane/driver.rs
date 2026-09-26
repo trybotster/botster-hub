@@ -2185,7 +2185,9 @@ mod tests {
             crate::subscription::closed_events::ClosedEventLedger::default(),
             Arc::new(|| {}),
         );
-        hook.notify_closed(false);
+        hook.notify_closed(crate::transport::shared::close_reason::CloseSource::Core(
+            botster_core::contract::terminal_adapter::TerminalRouteCloseReason::AdapterClosed,
+        ));
 
         let taken = loop {
             // timer: deadline — the woken turn's take; expiry fails the test.
