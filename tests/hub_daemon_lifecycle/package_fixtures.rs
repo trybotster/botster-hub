@@ -790,7 +790,7 @@ pub(crate) fn write_app_registry_package(root: &Path) {
                 "id": "web",
                 "kind": "web_app",
                 "command": "sh",
-                "args": ["-c", "echo 'http://127.0.0.1:59999'; printf '%s\n' '{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"http://127.0.0.1:49152\"}' > \"$BOTSTER_ENTRYPOINT_LAUNCH_RESULT\"; while true; do sleep 1; done"],
+                "args": ["-c", "echo 'http://127.0.0.1:59999'; printf '%s\n' '{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"http://127.0.0.1:49152\"}' >&3; exec 3>&-; hold=$(mktemp -u); mkfifo \"$hold\"; exec 4<>\"$hold\"; rm -f \"$hold\"; read -r _ <&4"],
                 "working_directory": { "policy": "package_root" },
                 "launch_mode": "background",
                 "readiness": { "result_fields": ["local_url"] },
@@ -829,7 +829,7 @@ pub(crate) fn write_reloadable_app_package_named(
     fs::write(root.join("plugin.lua"), "return botster.register({})\n")
         .expect("write reloadable app plugin entrypoint");
     let command = format!(
-        "printf '%s\n' '{{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"{local_url}\"}}' > \"$BOTSTER_ENTRYPOINT_LAUNCH_RESULT\"; while true; do sleep 1; done"
+        "printf '%s\n' '{{\"entrypoint_id\":\"web\",\"process_state\":\"running\",\"local_url\":\"{local_url}\"}}' >&3; exec 3>&-; hold=$(mktemp -u); mkfifo \"$hold\"; exec 4<>\"$hold\"; rm -f \"$hold\"; read -r _ <&4"
     );
     let manifest = serde_json::json!({
         "name": name,
@@ -867,6 +867,7 @@ pub(crate) fn write_hub_env_web_app_package(root: &Path) {
     fs::write(
         root.join("verify-hub-connection.mjs"),
         r#"import fs from 'node:fs';
+import net from 'node:net';
 
 const connection = JSON.parse(process.env.BOTSTER_HUB_CONNECTION || 'null');
 if (connection?.transport?.type !== 'unix_socket') {
@@ -881,12 +882,15 @@ if (!process.env.PACKAGE_DATA_DIR || !fs.statSync(process.env.PACKAGE_DATA_DIR).
 if (process.env.BOTSTER_WEB_MODE !== 'daemon-default') {
   throw new Error('manifest environment defaults must be preserved');
 }
-fs.writeFileSync(process.env.BOTSTER_ENTRYPOINT_LAUNCH_RESULT, JSON.stringify({
+const readyFd = Number(process.env.BOTSTER_ENTRYPOINT_READY_FD);
+fs.writeSync(readyFd, JSON.stringify({
   entrypoint_id: 'web',
   process_state: 'running',
   local_url: 'http://127.0.0.1:49153',
-}));
-setInterval(() => {}, 1000);
+}) + '\n');
+fs.closeSync(readyFd);
+// A listening socket keeps the event loop alive until the supervisor stops the group.
+net.createServer().listen(0, '127.0.0.1');
 "#,
     )
     .expect("write hub connection verifier");

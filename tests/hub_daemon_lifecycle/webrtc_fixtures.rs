@@ -1715,7 +1715,7 @@ const socket = connection?.transport?.type === 'unix_socket'
   ? connection.transport.path
   : undefined;
 const dataDir = process.env.BOTSTER_HUB_DATA_DIR;
-const launchResult = process.env.BOTSTER_ENTRYPOINT_LAUNCH_RESULT;
+const readyFd = process.env.BOTSTER_ENTRYPOINT_READY_FD;
 const source = socket ? 'socket' : (dataDir ? 'data_dir' : 'spawned');
 const mode = socket || dataDir ? 'existing_hub' : 'spawned_hub';
 const startupDelayMs = Number(process.env.BOTSTER_WEB_TEST_STARTUP_DELAY_MS || '0');
@@ -1969,12 +1969,13 @@ const server = http.createServer(async (request, response) => {
 const listen = () => server.listen(port, '127.0.0.1', () => {
   boundPort = server.address().port;
   console.log(`web_listening=http://127.0.0.1:${boundPort}`);
-  if (launchResult) {
-    fs.writeFileSync(launchResult, JSON.stringify({
+  if (readyFd) {
+    fs.writeSync(Number(readyFd), JSON.stringify({
       entrypoint_id: 'web-client',
       process_state: 'running',
       local_url: `http://127.0.0.1:${boundPort}/`,
-    }));
+    }) + '\n');
+    fs.closeSync(Number(readyFd));
   }
 });
 

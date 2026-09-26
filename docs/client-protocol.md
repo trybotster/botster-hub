@@ -604,9 +604,12 @@ Each app row includes `package_name`, `app_id`, `entrypoint_id`, core
 `local_url` result field and the supervisor has a core
 `RunnableEntrypointLaunchResult.local_url` for that entrypoint.
 `launch_target.kind` mirrors the core app kind (`web_app` or `terminal_app`) so
-clients do not need a second kind vocabulary. Supervised runtimes can emit the
-structured launch result through the hub-provided
-`BOTSTER_ENTRYPOINT_LAUNCH_RESULT` file path. The hub must not derive
+clients do not need a second kind vocabulary. When readiness declares a result
+field, the hub starts the runtime with a pipe's write end at the descriptor
+named by `BOTSTER_ENTRYPOINT_READY_FD` (fd 3). The runtime writes one
+newline-terminated JSON core `RunnableEntrypointLaunchResult` to it and closes
+it. End of file before a complete record means the launch failed; a malformed
+record, or one for another `entrypoint_id`, also fails readiness. The hub must not derive
 `local_url` from stdout, stderr, diagnostics, command arguments, environment
 defaults, local package names, or known ports. Terminal apps use a terminal app
 launch target and do not expose fake background URLs.
