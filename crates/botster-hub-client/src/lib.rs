@@ -1470,34 +1470,74 @@ fn with_handshake_deadlines<T>(
     read_timeout: Option<Duration>,
     op: impl FnOnce(&mut UnixStream) -> DaemonTransportResult<T>,
 ) -> DaemonTransportResult<T> {
-    let previous_write = stream.write_timeout().map_err(normalize_socket_io_error)?;
-    let previous_read = stream.read_timeout().map_err(normalize_socket_io_error)?;
+    // `None` from these helpers means the peer already closed the socket:
+    // there is nothing to bound and nothing to restore, and the operation
+    // reads what the peer left before the close.
+    let previous_write = socket_option(stream.write_timeout())?;
+    let previous_read = socket_option(stream.read_timeout())?;
     if let Some(timeout) = write_timeout {
-        stream
-            .set_write_timeout(Some(timeout.max(Duration::from_millis(1))))
-            .map_err(normalize_socket_io_error)?;
+        socket_option(stream.set_write_timeout(Some(timeout.max(Duration::from_millis(1)))))?;
     }
     if let Some(timeout) = read_timeout {
-        stream
-            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
-            .map_err(normalize_socket_io_error)?;
+        socket_option(stream.set_read_timeout(Some(timeout.max(Duration::from_millis(1)))))?;
     }
     let result = op(stream);
-    let restore_write = stream.set_write_timeout(previous_write);
-    let restore_read = stream.set_read_timeout(previous_read);
+    let restore_write = previous_write.map(|previous| stream.set_write_timeout(previous));
+    let restore_read = previous_read.map(|previous| stream.set_read_timeout(previous));
     match result {
         Ok(value) => {
-            restore_write.map_err(normalize_socket_io_error)?;
-            restore_read.map_err(normalize_socket_io_error)?;
+            if let Some(restore) = restore_write {
+                socket_option(restore)?;
+            }
+            if let Some(restore) = restore_read {
+                socket_option(restore)?;
+            }
             Ok(value)
         }
         Err(error) => Err(error),
     }
 }
 
+/// A socket-option call on a socket whose peer already closed it: macOS
+/// answers `getsockopt`/`setsockopt` with EINVAL there. The daemon closes an
+/// over-capacity connection right after its typed admission Hello, so that
+/// case is `Ok(None)`; the next read or write of the stream reports the
+/// close. Any other failure is an error.
+fn socket_option<T>(result: std::io::Result<T>) -> DaemonTransportResult<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(None),
+        Err(error) => Err(normalize_socket_io_error(error)),
+    }
+}
+
 #[cfg(test)]
 mod handshake_deadline_tests {
     use super::*;
+
+    /// The daemon answers an over-capacity client with a typed admission
+    /// Hello and closes the socket. The handshake result must survive the
+    /// deadline restore on that closed socket (EINVAL on macOS).
+    #[test]
+    fn handshake_result_survives_deadline_restore_after_peer_close() {
+        let (mut client, mut server) = UnixStream::pair().expect("pair");
+        server.write_all(b"hello").expect("write");
+        drop(server);
+        let mut buffer = [0_u8; 5];
+        let read = with_handshake_deadlines(
+            &mut client,
+            Some(Duration::from_millis(30)),
+            Some(Duration::from_millis(40)),
+            |stream| {
+                stream
+                    .read_exact(&mut buffer)
+                    .map_err(normalize_socket_io_error)?;
+                Ok(buffer)
+            },
+        )
+        .expect("the completed handshake is not lost to the restore");
+        assert_eq!(&read, b"hello");
+    }
 
     #[test]
     fn handshake_deadlines_restore_timeouts_on_success() {
