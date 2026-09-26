@@ -212,6 +212,10 @@ impl ReapWatch {
             ident: pid as libc::uintptr_t,
             filter: libc::EVFILT_PROC,
             flags: libc::EV_ADD | libc::EV_ONESHOT,
+            // NOTE_REAP is deprecated in the SDK header, but xnu still delivers
+            // it, including to a non-parent (verified by probe on Darwin 25.5.0).
+            // It is the only macOS reap event for a process this watch does not parent.
+            #[allow(deprecated)]
             fflags: libc::NOTE_REAP,
             data: 0,
             udata: std::ptr::null_mut(),
