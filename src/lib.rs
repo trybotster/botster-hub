@@ -83,6 +83,7 @@ pub mod packages;
 pub mod persistence;
 pub(crate) mod plugin_entity;
 pub(crate) mod plugin_response;
+pub mod process_exit;
 pub mod profile;
 pub(crate) mod recovery;
 pub mod runtime;
@@ -601,6 +602,12 @@ const HUB_CRATE_EXPORTS: &[HubCrateExport] = &[
         "durable hub-state persistence",
     ),
     HubCrateExport::new(
+        "process_exit",
+        HubCrateExportClass::HubPolicy,
+        HubCrateExportStability::KeepPublic,
+        "process exit events for the host binary and its supervisors",
+    ),
+    HubCrateExport::new(
         "profile",
         HubCrateExportClass::HubPolicy,
         HubCrateExportStability::KeepPublic,
@@ -782,6 +789,7 @@ mod tests {
             "package_entity_fanout",
             "packages",
             "persistence",
+            "process_exit",
             "profile",
             "runtime",
             "session_types",
@@ -806,7 +814,7 @@ mod tests {
             LocalWebrtcError, LocalWebrtcTransport, PackageRegistry, auth, capabilities,
             client_api, config, credentials, daemon, entrypoint_supervisor, lifecycle, lua_runtime,
             maintenance, managed_git_worktrees, mcp, package_entity_fanout, packages, persistence,
-            profile, runtime, session_types, source_update, spawn_targets, worktrees,
+            process_exit, profile, runtime, session_types, source_update, spawn_targets, worktrees,
         };
 
         let _: Option<DaemonRequest> = None;
