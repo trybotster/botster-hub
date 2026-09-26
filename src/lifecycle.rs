@@ -150,6 +150,28 @@ pub struct HubPluginLifecycle {
     event_handlers: Arc<Mutex<BTreeMap<String, Vec<HubPluginEventHandler>>>>,
 }
 
+/// Completion allowance the Hub reserves for an invocation class, or `None`
+/// for a class the Hub does not admit.
+fn completion_allowance(class: PluginInvocationClass) -> Option<usize> {
+    match class {
+        PluginInvocationClass::RequestResponse => Some(REQUEST_RESPONSE_COMPLETION_ALLOWANCE),
+        PluginInvocationClass::Background => Some(BACKGROUND_COMPLETION_ALLOWANCE),
+        _ => None,
+    }
+}
+
+fn unsupported_class(
+    class: PluginInvocationClass,
+    request: PluginInvocationRequest,
+) -> PluginAdmissionResult {
+    PluginAdmissionResult::RejectedBudget {
+        request_id: request.request_id,
+        class,
+        queue_bytes: None,
+        reason: "Hub does not support this invocation class".to_string(),
+    }
+}
+
 impl HubPluginLifecycle {
     /// Build a lifecycle adapter with explicit core plugin worker config.
     #[must_use]
@@ -230,19 +252,25 @@ impl HubPluginLifecycle {
         class: PluginInvocationClass,
         request: PluginInvocationRequest,
     ) -> PluginAdmissionResult {
-        let allowance = match class {
-            PluginInvocationClass::RequestResponse => REQUEST_RESPONSE_COMPLETION_ALLOWANCE,
-            PluginInvocationClass::Background => BACKGROUND_COMPLETION_ALLOWANCE,
-            _ => {
-                return PluginAdmissionResult::RejectedBudget {
-                    request_id: request.request_id,
-                    class,
-                    queue_bytes: None,
-                    reason: "Hub does not support this invocation class".to_string(),
-                };
-            }
-        };
-        self.engine.try_admit(class, request, allowance)
+        match completion_allowance(class) {
+            Some(allowance) => self.engine.try_admit(class, request, allowance),
+            None => unsupported_class(class, request),
+        }
+    }
+
+    /// Admit one invocation, waiting for Core's short internal locks, so it
+    /// never reports "admission lock busy". Tests only: an owner loop must
+    /// use [`Self::try_admit`], because an owner never waits.
+    #[cfg(test)]
+    pub(crate) fn admit_blocking(
+        &self,
+        class: PluginInvocationClass,
+        request: PluginInvocationRequest,
+    ) -> PluginAdmissionResult {
+        match completion_allowance(class) {
+            Some(allowance) => self.engine.admit(class, request, allowance),
+            None => unsupported_class(class, request),
+        }
     }
 
     /// Drain previously published async completions without waiting.
@@ -805,7 +833,7 @@ mod completion_tests {
         PluginCancellationToken, PluginHandlerKind, PluginHandlerRef, PluginInvocationContext,
         PluginInvocationFailureKind, PluginInvocationResult, PluginInvocationSuccess,
     };
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     struct ResultRuntime(usize);
 
@@ -892,37 +920,37 @@ mod completion_tests {
         class: PluginInvocationClass,
         request: PluginInvocationRequest,
     ) -> PluginAdmissionResult {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let result = lifecycle.try_admit(class, request.clone());
-            if matches!(&result, PluginAdmissionResult::Backpressured { reason, .. }
-                if reason == "admission lock busy")
-            {
-                assert!(Instant::now() < deadline, "admission lock remained busy");
-                std::thread::yield_now();
-            } else {
-                if let PluginAdmissionResult::Queued {
-                    reservation_bytes, ..
-                } = &result
-                {
-                    let payload_bytes = reservation_bytes
-                        .checked_sub(PluginWorkerEngine::completion_reservation_metadata_bytes())
-                        .expect("Core charges metadata in every reservation");
-                    let config = crate::config::CoreEngineOptions::default().plugin_worker_config();
-                    assert!(payload_bytes <= config.completion_reservation_byte_capacity);
-                    assert!(
-                        payload_bytes
-                            <= crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY
-                    );
-                    assert!(*reservation_bytes <= config.completion_queue_byte_capacity);
-                }
-                return result;
-            }
+        let result = lifecycle.admit_blocking(class, request);
+        if let PluginAdmissionResult::Queued {
+            reservation_bytes, ..
+        } = &result
+        {
+            let payload_bytes = reservation_bytes
+                .checked_sub(PluginWorkerEngine::completion_reservation_metadata_bytes())
+                .expect("Core charges metadata in every reservation");
+            let config = crate::config::CoreEngineOptions::default().plugin_worker_config();
+            assert!(payload_bytes <= config.completion_reservation_byte_capacity);
+            assert!(
+                payload_bytes
+                    <= crate::daemon::control::reply::RETAINED_PLUGIN_RESULT_BYTE_CAPACITY
+            );
+            assert!(*reservation_bytes <= config.completion_queue_byte_capacity);
         }
+        result
     }
 
+    /// Drains one completion. The notifier is installed before the first
+    /// drain, so a completion published earlier is drained and a later one
+    /// wakes the wait.
     fn drain(lifecycle: &HubPluginLifecycle) -> botster_core::PluginCompletion {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let (published, completions) = std::sync::mpsc::channel();
+        let published = std::sync::Mutex::new(published);
+        lifecycle.install_completion_notifier(std::sync::Arc::new(move || {
+            let _ = published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .send(());
+        }));
         loop {
             let mut drained = lifecycle.drain_completions(
                 1,
@@ -935,11 +963,10 @@ mod completion_tests {
                 );
                 return item.completion;
             }
-            assert!(
-                Instant::now() < deadline,
-                "completion did not fit Hub drain"
-            );
-            std::thread::sleep(Duration::from_millis(1));
+            // timer: deadline — bounds a missing completion so the test fails instead of hanging.
+            completions
+                .recv_timeout(Duration::from_secs(5))
+                .expect("completion did not fit Hub drain");
         }
     }
 
