@@ -22,15 +22,15 @@ use botster_core_daemon::{
 };
 
 use crate::daemon::control::message::{ControlMessage, ControlSender};
-use crate::data_plane::close_work::CloseWorkSource;
+use crate::data_plane::close_work::{CloseWorkSource, RouteCloseState};
 use crate::owner_identity::{OwnerWorkIdentity, WaiterId, WaiterIdSource};
 use crate::subscription::closed_events::session_close_event_decision;
 
-pub(crate) const DATA_PLANE_WATCHDOG: Duration = Duration::from_secs(1);
-pub(crate) const DATA_PLANE_STOP_SLACK: Duration = Duration::from_millis(500);
-pub(crate) const DATA_PLANE_STOP_BOUND: Duration = Duration::from_millis(
-    DATA_PLANE_WATCHDOG.as_millis() as u64 * 2 + DATA_PLANE_STOP_SLACK.as_millis() as u64,
-);
+/// Bound on the data-plane thread's exit after a stop request. The value is
+/// unchanged from when it was derived from a 1 s idle watchdog (2 x 1 s +
+/// 500 ms); the thread now waits only on events, and a stop interrupts that
+/// wait at once.
+pub(crate) const DATA_PLANE_STOP_BOUND: Duration = Duration::from_millis(2_500);
 pub(crate) const DATA_PLANE_MAX_CLOSE_KEYS: usize = 8;
 /// Host operations the owner may leave queued. A submission that finds the
 /// queue full is refused at once with a [`CoreTicketPoll::Refused`] ticket;
@@ -1359,30 +1359,41 @@ impl DataPlaneDriver {
         let thread_progress_latch = Arc::clone(&progress_latch);
         let thread = std::thread::Builder::new()
             .name("botster-hub-data-plane".to_string())
-            .spawn(move || {
-                let mut daemon = CoreDaemon::new(core_config);
-                let control = daemon.wake_pump_control();
-                ready_tx.send(control).expect("publish Core pump control");
-                run_loop(
-                    &mut daemon,
-                    request_rx,
-                    close_work,
-                    thread_owner_wake,
-                    thread_progress_latch,
-                    thread_request_pending,
-                    thread_owner_waiting,
-                );
-                if thread_stop_action.load(Ordering::Acquire) == STOP_ACTION_RELEASE_FOR_RESTART {
-                    daemon.release_for_restart();
-                } else {
-                    let _ = daemon.shutdown(None, current_unix_seconds());
+            .spawn({
+                let close_work = close_work.clone();
+                move || {
+                    let mut daemon = CoreDaemon::new(core_config);
+                    let control = daemon.wake_pump_control();
+                    ready_tx.send(control).expect("publish Core pump control");
+                    run_loop(
+                        &mut daemon,
+                        request_rx,
+                        close_work,
+                        thread_owner_wake,
+                        thread_progress_latch,
+                        thread_request_pending,
+                        thread_owner_waiting,
+                    );
+                    if thread_stop_action.load(Ordering::Acquire) == STOP_ACTION_RELEASE_FOR_RESTART
+                    {
+                        daemon.release_for_restart();
+                    } else {
+                        let _ = daemon.shutdown(None, current_unix_seconds());
+                    }
+                    let _ = done_tx.send(());
                 }
-                let _ = done_tx.send(());
             })
             .expect("start botster-hub-data-plane");
+        let control = ready_rx.recv().expect("receive Core pump control");
+        bind_close_work_wake(
+            &close_work,
+            control.clone(),
+            Arc::clone(&request_pending),
+            Arc::clone(&owner_waiting),
+        );
         let core = CoreDaemonHandle {
             requests: request_tx,
-            control: ready_rx.recv().expect("receive Core pump control"),
+            control,
             accepting,
             admission,
             request_pending,
@@ -1446,6 +1457,7 @@ impl DataPlaneDriver {
             thread.thread().unpark();
         }
         drop(_admission);
+        // timer: deadline — the data-plane thread's exit after stop; expiry returns DATA_PLANE_DRIVER_STOP_TIMEOUT.
         match self.done.recv_timeout(DATA_PLANE_STOP_BOUND) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => {
                 if let Some(thread) = self.thread.take() {
@@ -1469,6 +1481,22 @@ impl Drop for DataPlaneDriver {
     }
 }
 
+/// Close work wakes the data plane the way a Core request does: it marks
+/// work pending and interrupts the wait when the thread is waiting.
+fn bind_close_work_wake(
+    close_work: &CloseWorkSource,
+    control: WakePumpControl,
+    request_pending: Arc<AtomicBool>,
+    owner_waiting: Arc<AtomicBool>,
+) {
+    close_work.bind_data_plane_wake(Arc::new(move || {
+        request_pending.store(true, Ordering::Release);
+        if owner_waiting.swap(false, Ordering::AcqRel) {
+            control.interrupt();
+        }
+    }));
+}
+
 fn run_loop(
     core_daemon: &mut CoreDaemon,
     requests: Receiver<CoreRequest>,
@@ -1479,13 +1507,20 @@ fn run_loop(
     owner_waiting: Arc<AtomicBool>,
 ) {
     let mut pending_operations = PendingCoreOperations::new();
+    // Close work whose session state cannot decide it yet. It waits here, not
+    // in the ready queue, so it is re-examined on every turn an event starts
+    // and never starts a turn itself.
+    let mut unresolved_close_work: Vec<Arc<RouteCloseState>> = Vec::new();
+    let mut close_work_ready = false;
     loop {
         owner_waiting.store(true, Ordering::Release);
-        let wait_timeout = if request_pending.swap(false, Ordering::AcqRel) {
+        let wait_timeout = if request_pending.swap(false, Ordering::AcqRel) || close_work_ready {
             owner_waiting.store(false, Ordering::Release);
             Duration::ZERO
         } else {
-            DATA_PLANE_WATCHDOG
+            // Only events end this wait: Core wakes (Core clamps the wait to
+            // its own deadlines), request and close-work interrupts, and stop.
+            Duration::MAX
         };
         let waited = core_daemon.wait_pump(wait_timeout);
         owner_waiting.store(false, Ordering::Release);
@@ -1512,8 +1547,15 @@ fn run_loop(
         run_core_requests(core_daemon, &requests, &mut pending_operations);
         publish_completions(core_daemon, &mut pending_operations);
         {
-            let close_batch = close_work.take_batch(DATA_PLANE_MAX_CLOSE_KEYS);
-            for state in close_batch {
+            let (ready, more_ready) = close_work.take_ready_batch(DATA_PLANE_MAX_CLOSE_KEYS);
+            close_work_ready = more_ready;
+            for state in std::mem::take(&mut unresolved_close_work)
+                .into_iter()
+                .chain(ready)
+            {
+                if state.retired.load(Ordering::Acquire) {
+                    continue;
+                }
                 let lookup = core_daemon
                     .session_registry_state(&botster_core::SessionId(state.key.session_id.clone()));
                 match session_close_event_decision(lookup) {
@@ -1522,7 +1564,7 @@ fn run_loop(
                         state.report_if_live(emit);
                         close_work.retire(&key.session_id, &key.subscription_id, key.generation);
                     }
-                    None => close_work.requeue(state),
+                    None => unresolved_close_work.push(state),
                 }
             }
         }
