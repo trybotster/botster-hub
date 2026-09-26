@@ -233,15 +233,13 @@ fn wait_for_local_runtime_ready(
         return Err(readiness_timeout(child, started_at, readiness_budget));
     }
     // The pipe closed without a ready line, so the daemon is exiting.
-    let exited = wait_for_pid_exit(child.id(), deadline).map_err(LocalRuntimeError::PollDaemon)?;
-    let Some(status) = exited
-        .then(|| child.try_wait())
-        .transpose()
-        .map_err(LocalRuntimeError::PollDaemon)?
-        .flatten()
-    else {
+    if !wait_for_pid_exit(child.id(), deadline).map_err(LocalRuntimeError::PollDaemon)? {
         return Err(readiness_timeout(child, started_at, readiness_budget));
-    };
+    }
+    // The exit event can precede the moment waitpid can reap the child (macOS
+    // refuses a watch on an exiting process before it is a zombie), so reap
+    // with a blocking wait; the child is already exiting.
+    let status = child.wait().map_err(LocalRuntimeError::PollDaemon)?;
     Err(LocalRuntimeError::DaemonExited {
         status: status.to_string(),
         elapsed: started_at.elapsed(),
