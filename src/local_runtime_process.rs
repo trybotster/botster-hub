@@ -14,7 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_hub::daemon::readiness::ReadyLine;
-use botster_hub::process_exit::{wait_for_child_group_exit, wait_for_pid_exit};
+use botster_hub::process_exit::{
+    ReapRegistration, ReapWatch, wait_for_child_group_exit, wait_for_pid_exit,
+};
 use botster_hub::{DaemonRequest, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, daemon_transport_request};
 
 /// The descriptor that carries the daemon's `--ready-fd` pipe.
@@ -378,7 +380,34 @@ pub(crate) fn recover_owned_stale_runtime_daemon(
     Ok(true)
 }
 
-pub(crate) fn owned_runtime_daemon_pid(
+/// A runtime daemon that this data directory's metadata owns, with a reap
+/// watch registered while it still runs.
+pub(crate) struct OwnedRuntimeDaemon {
+    pid: u32,
+    reap: ReapRegistration,
+}
+
+impl OwnedRuntimeDaemon {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+/// Identifies the owned runtime daemon and registers its reap watch. Call it
+/// before requesting shutdown: macOS cannot watch a process that has already
+/// exited.
+pub(crate) fn owned_runtime_daemon(
+    data_directory: &Path,
+    config: &botster_hub::HubConfig,
+) -> Result<Option<OwnedRuntimeDaemon>, LocalRuntimeError> {
+    let Some(pid) = owned_runtime_daemon_pid(data_directory, config)? else {
+        return Ok(None);
+    };
+    let reap = ReapWatch::register(pid).map_err(LocalRuntimeError::InspectProcess)?;
+    Ok(Some(OwnedRuntimeDaemon { pid, reap }))
+}
+
+fn owned_runtime_daemon_pid(
     data_directory: &Path,
     config: &botster_hub::HubConfig,
 ) -> Result<Option<u32>, LocalRuntimeError> {
@@ -502,12 +531,12 @@ fn remove_runtime_daemon_metadata(data_directory: &Path) -> Result<(), LocalRunt
 pub(crate) fn complete_owned_runtime_daemon_shutdown(
     data_directory: &Path,
     config: &botster_hub::HubConfig,
-    owned_daemon_pid: Option<u32>,
+    owned_daemon: Option<OwnedRuntimeDaemon>,
 ) -> Result<(), LocalRuntimeError> {
-    let Some(pid) = owned_daemon_pid else {
+    let Some(owned_daemon) = owned_daemon else {
         return Ok(());
     };
-    wait_for_owned_runtime_daemon_reaped(pid)?;
+    wait_for_owned_runtime_daemon_reaped(owned_daemon)?;
     remove_configured_local_socket(config)?;
     remove_runtime_daemon_metadata(data_directory)
 }
@@ -563,24 +592,31 @@ fn wait_for_runtime_daemon_exit(pid: u32) -> Result<(), LocalRuntimeError> {
     Err(LocalRuntimeError::TerminateDaemonTimeout(pid))
 }
 
-/// Waits for the owned daemon's exit event, then reaps it. The detached reaper
-/// thread from `reap_local_runtime_daemon_on_exit` may reap it first; then
-/// `waitpid` reports `ECHILD` at once. After the exit event `waitpid` never
-/// blocks.
-fn wait_for_owned_runtime_daemon_reaped(pid: u32) -> Result<(), LocalRuntimeError> {
-    wait_for_runtime_daemon_exit(pid)?;
-    loop {
-        let mut status = 0;
-        if unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) } == pid as libc::pid_t {
-            return Ok(());
+/// Waits until the owned daemon is reaped. Its parent reaps it: the
+/// launcher's reaper thread, or the process that adopted it.
+fn wait_for_owned_runtime_daemon_reaped(
+    daemon: OwnedRuntimeDaemon,
+) -> Result<(), LocalRuntimeError> {
+    let mut watch = match daemon.reap {
+        ReapRegistration::Watching(watch) => watch,
+        ReapRegistration::AlreadyReaped => return Ok(()),
+        ReapRegistration::ExitedBeforeRegistration => {
+            return Err(LocalRuntimeError::InspectProcess(io::Error::other(
+                format!(
+                    "runtime daemon {} exited before its reap watch was registered and awaits its parent",
+                    daemon.pid
+                ),
+            )));
         }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ECHILD) | Some(libc::ESRCH) => return Ok(()),
-            Some(libc::EINTR) => {}
-            _ => return Err(LocalRuntimeError::InspectProcess(error)),
-        }
+    };
+    // timer: deadline — bound on the daemon's reap after shutdown; expiry reports TerminateDaemonTimeout.
+    if watch
+        .wait(Instant::now() + Duration::from_secs(10))
+        .map_err(LocalRuntimeError::InspectProcess)?
+    {
+        return Ok(());
     }
+    Err(LocalRuntimeError::TerminateDaemonTimeout(daemon.pid))
 }
 
 #[cfg(test)]

@@ -35,8 +35,8 @@ mod operator_console;
 mod update;
 
 use local_runtime_process::{
-    StartedRuntimeCleanup, complete_owned_runtime_daemon_shutdown, ensure_local_runtime_daemon,
-    owned_runtime_daemon_pid, recover_owned_stale_runtime_daemon,
+    OwnedRuntimeDaemon, StartedRuntimeCleanup, complete_owned_runtime_daemon_shutdown,
+    ensure_local_runtime_daemon, owned_runtime_daemon, recover_owned_stale_runtime_daemon,
 };
 pub(crate) use local_runtime_process::{read_runtime_daemon_metadata, spawn_local_runtime_daemon};
 use local_webrtc_smoke::smoke_local_webrtc_round_trip;
@@ -496,7 +496,7 @@ fn local_runtime_down(args: Vec<String>) -> Result<(), LocalRuntimeError> {
         return Err(LocalRuntimeError::Usage);
     }
     let config = explicit_config(options.data_directory.clone())?;
-    let owned_daemon_pid = owned_runtime_daemon_pid(&options.data_directory, &config)?;
+    let owned_daemon = owned_runtime_daemon(&options.data_directory, &config)?;
     let response = match daemon_transport_request(&config, DaemonRequest::DaemonShutdown) {
         Ok(response) => response,
         Err(botster_hub::DaemonTransportError::Compatibility(error)) => {
@@ -516,7 +516,7 @@ fn local_runtime_down(args: Vec<String>) -> Result<(), LocalRuntimeError> {
         Err(error) => return Err(error.into()),
     };
     print_daemon_response(response)?;
-    complete_owned_runtime_daemon_shutdown(&options.data_directory, &config, owned_daemon_pid)?;
+    complete_owned_runtime_daemon_shutdown(&options.data_directory, &config, owned_daemon)?;
     Ok(())
 }
 
@@ -1820,11 +1820,11 @@ fn operator_shutdown(args: Vec<String>) -> Result<(), OperatorError> {
         return Err(OperatorError::Usage("shutdown"));
     }
     let config = explicit_config(options.data_directory.clone())?;
-    let owned_daemon_pid = owned_runtime_daemon_pid(&options.data_directory, &config)
+    let owned_daemon = owned_runtime_daemon(&options.data_directory, &config)
         .map_err(|error| OperatorError::App(error.to_string()))?;
     let response = daemon_transport_request(&config, DaemonRequest::DaemonShutdown)?;
     print_daemon_response(response)?;
-    complete_owned_runtime_daemon_shutdown(&options.data_directory, &config, owned_daemon_pid)
+    complete_owned_runtime_daemon_shutdown(&options.data_directory, &config, owned_daemon)
         .map_err(|error| OperatorError::App(error.to_string()))?;
     Ok(())
 }

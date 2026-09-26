@@ -20,9 +20,9 @@ use botster_hub::{
 use serde::Deserialize;
 
 use super::{
-    DataArgs, LocalRuntimeOptions, command_data_dir_args, complete_owned_runtime_daemon_shutdown,
-    explicit_config, owned_runtime_daemon_pid, read_runtime_daemon_metadata,
-    spawn_local_runtime_daemon,
+    DataArgs, LocalRuntimeOptions, OwnedRuntimeDaemon, command_data_dir_args,
+    complete_owned_runtime_daemon_shutdown, explicit_config, owned_runtime_daemon,
+    read_runtime_daemon_metadata, spawn_local_runtime_daemon,
 };
 
 const SOURCE_LOCK_FILE: &str = ".botster-update.lock";
@@ -378,14 +378,16 @@ fn execute(
         ) => false,
         Err(error) => return Err(format!("probe running daemon: {error}")),
     };
-    let old_pid = if daemon_running {
-        owned_runtime_daemon_pid(&options.data_directory, &config)
+    // The reap watch is registered before the shutdown request below.
+    let old_daemon = if daemon_running {
+        owned_runtime_daemon(&options.data_directory, &config)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "running daemon has no matching owned runtime metadata".to_string())?
             .into()
     } else {
         None
     };
+    let old_pid = old_daemon.as_ref().map(OwnedRuntimeDaemon::pid);
 
     let selection = selected_packages(
         options.scope,
@@ -481,7 +483,7 @@ fn execute(
         if response.kind != botster_hub::DaemonResponseKind::Shutdown {
             return Err("old daemon returned an unexpected shutdown response".to_string());
         }
-        complete_owned_runtime_daemon_shutdown(&options.data_directory, &config, old_pid)
+        complete_owned_runtime_daemon_shutdown(&options.data_directory, &config, old_daemon)
             .map_err(|error| format!("complete old daemon shutdown: {error}"))?;
     }
 

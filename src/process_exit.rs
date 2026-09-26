@@ -14,11 +14,10 @@ use std::time::Instant;
 /// Waits until `pid` exits or `deadline` passes. Returns `Ok(false)` when the
 /// deadline passes first. A pid that no longer runs returns `Ok(true)` at once.
 pub fn wait_for_pid_exit(pid: u32, deadline: Instant) -> io::Result<bool> {
-    let mut watch = ExitWatch::new()?;
-    if !watch.watch_exit(pid)? {
-        return Ok(true);
+    match PidExitWatch::register(pid)? {
+        Some(mut watch) => watch.wait(deadline),
+        None => Ok(true),
     }
-    watch.wait(deadline)
 }
 
 /// Waits until process group `pgid` is empty or `deadline` passes. Returns
@@ -29,7 +28,9 @@ pub fn wait_for_pid_exit(pid: u32, deadline: Instant) -> io::Result<bool> {
 ///   a second snapshot. A member that forked before its watch was registered
 ///   has its child in the second snapshot, which extends the round. The group
 ///   is empty when a round ends with no new pid and no running member. Zombie
-///   members count as exited: macOS reports no reap event to a non-parent.
+///   members count as exited: macOS does report a reap (`NOTE_REAP`, see
+///   [`ReapWatch`]), but kqueue refuses to register on a zombie, so a zombie
+///   found by enumeration cannot be watched.
 ///
 /// Linux: the group is empty when `killpg(pgid, 0)` reports `ESRCH`, the one
 ///   atomic group fact, so zombie members must be reaped first. `/proc` is not an
@@ -143,6 +144,131 @@ fn watch_process_group(
     }
 }
 
+/// An exit watch registered now and waited on later, possibly on another
+/// thread. Registration pins the process, so a later reap and pid reuse
+/// cannot redirect the watch.
+pub struct PidExitWatch {
+    watch: ExitWatch,
+}
+
+impl PidExitWatch {
+    /// Registers an exit watch on `pid`. Returns `Ok(None)` when the process
+    /// already exited.
+    ///
+    /// # Errors
+    /// Returns an OS error other than "no such process".
+    pub fn register(pid: u32) -> io::Result<Option<Self>> {
+        let mut watch = ExitWatch::new()?;
+        Ok(watch.watch_exit(pid)?.then_some(Self { watch }))
+    }
+
+    /// Blocks until the process exits. Returns `Ok(false)` when the deadline
+    /// passes first.
+    ///
+    /// # Errors
+    /// Returns an OS error from the wait.
+    pub fn wait(&mut self, deadline: Instant) -> io::Result<bool> {
+        self.watch.wait(deadline)
+    }
+}
+
+/// A watch that ends when a process is reaped, meaning it has left the
+/// process table, not just exited. Its parent does the reaping, so a
+/// non-parent can use this to wait for that step.
+///
+/// macOS reports the reap with `NOTE_REAP`. The SDK header marks the flag
+/// deprecated, but xnu still delivers it, including to a non-parent; kqueue
+/// refuses a zombie, so the watch must be registered while the process runs.
+/// Linux reports it as `POLLHUP` on a pidfd, which also works for a zombie.
+pub struct ReapWatch {
+    watch: ExitWatch,
+}
+
+/// The outcome of [`ReapWatch::register`].
+pub enum ReapRegistration {
+    Watching(ReapWatch),
+    /// The pid no longer names any process.
+    AlreadyReaped,
+    /// macOS only: the process already exited and awaits its parent's reap,
+    /// and kqueue cannot watch a zombie.
+    ExitedBeforeRegistration,
+}
+
+impl ReapWatch {
+    /// Registers a reap watch on `pid`.
+    ///
+    /// # Errors
+    /// Returns an OS error other than "no such process".
+    #[cfg(target_os = "macos")]
+    pub fn register(pid: u32) -> io::Result<ReapRegistration> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let queue = unsafe { libc::kqueue() };
+        if queue < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
+        let change = libc::kevent {
+            ident: pid as libc::uintptr_t,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_REAP,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let result = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if result == 0 {
+            return Ok(ReapRegistration::Watching(Self {
+                watch: ExitWatch { queue },
+            }));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+        // ESRCH covers a zombie and a missing pid; signal 0 separates them.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            Ok(ReapRegistration::ExitedBeforeRegistration)
+        } else {
+            Ok(ReapRegistration::AlreadyReaped)
+        }
+    }
+
+    /// Registers a reap watch on `pid`.
+    ///
+    /// # Errors
+    /// Returns an OS error other than "no such process".
+    #[cfg(target_os = "linux")]
+    pub fn register(pid: u32) -> io::Result<ReapRegistration> {
+        let Some(pidfd) = open_pidfd(pid)? else {
+            return Ok(ReapRegistration::AlreadyReaped);
+        };
+        let mut watch = ExitWatch::new()?;
+        // POLLHUP is reported without being requested; POLLIN (exit) is not
+        // requested, so a zombie does not end the wait.
+        watch.push(pidfd, 0);
+        Ok(ReapRegistration::Watching(Self { watch }))
+    }
+
+    /// Blocks until the process is reaped. Returns `Ok(false)` when the
+    /// deadline passes first.
+    ///
+    /// # Errors
+    /// Returns an OS error from the wait.
+    pub fn wait(&mut self, deadline: Instant) -> io::Result<bool> {
+        self.watch.wait(deadline)
+    }
+}
+
 /// Waits for an owned child's exit event, reaps it, then waits until the
 /// process group it leads has no running member. Returns `Ok(None)` when the
 /// deadline passes first. A child that does not lead a group still works: its
@@ -219,6 +345,34 @@ impl ExitWatch {
         } else {
             Err(error)
         }
+    }
+
+    /// Test-only: reports whether a registered event is pending now, without
+    /// waiting. A zero timeout makes the kernel answer at once. A reported
+    /// event is consumed.
+    #[cfg(test)]
+    fn ready_now(&mut self) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+        let result = unsafe {
+            libc::kevent(
+                self.queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                &zero,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(result == 1)
     }
 
     /// Blocks until one watched process exits. Returns `Ok(false)` when the
@@ -323,6 +477,18 @@ impl ExitWatch {
             revents: 0,
         });
         self.pidfds.push(fd);
+    }
+
+    /// Test-only: reports whether a watched event is pending now, without
+    /// waiting. A zero timeout makes the kernel answer at once.
+    #[cfg(test)]
+    fn ready_now(&mut self) -> io::Result<bool> {
+        let result =
+            unsafe { libc::poll(self.polls.as_mut_ptr(), self.polls.len() as libc::nfds_t, 0) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(result > 0)
     }
 
     /// Blocks until one watched process exits or is reaped. Returns
@@ -514,6 +680,53 @@ mod tests {
         let stdin = leader.stdin.take().unwrap();
         assert!(leader.wait().unwrap().success());
         (stdin, pgid)
+    }
+
+    #[test]
+    fn reap_watch_waits_past_exit_until_the_parent_reaps() {
+        let mut child = Command::new("cat").stdin(Stdio::piped()).spawn().unwrap();
+        let pid = child.id();
+        let ReapRegistration::Watching(mut reaped) = ReapWatch::register(pid).unwrap() else {
+            panic!("a running child accepts a reap watch");
+        };
+
+        drop(child.stdin.take());
+        // The exit event fired, so an exit-subscribed watch would be ready now.
+        assert!(wait_for_pid_exit(pid, deadline()).unwrap());
+        assert!(
+            !reaped.watch.ready_now().unwrap(),
+            "the reap watch must not fire at exit"
+        );
+
+        child.wait().unwrap();
+        // ready_now consumes the event on macOS, so it is the last check.
+        assert!(reaped.watch.ready_now().unwrap(), "the reap fires at once");
+        assert!(matches!(
+            ReapWatch::register(pid).unwrap(),
+            ReapRegistration::AlreadyReaped
+        ));
+    }
+
+    #[test]
+    fn reap_watch_on_a_zombie_follows_each_platform() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        assert!(wait_for_pid_exit(pid, deadline()).unwrap());
+
+        let registration = ReapWatch::register(pid).unwrap();
+        #[cfg(target_os = "macos")]
+        assert!(matches!(
+            registration,
+            ReapRegistration::ExitedBeforeRegistration
+        ));
+        #[cfg(target_os = "linux")]
+        let ReapRegistration::Watching(mut reaped) = registration else {
+            panic!("a pidfd can watch a zombie");
+        };
+
+        child.wait().unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(reaped.wait(deadline()).unwrap());
     }
 
     #[test]
