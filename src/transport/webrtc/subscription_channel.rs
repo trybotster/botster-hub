@@ -1308,6 +1308,173 @@ mod tests {
         run_hanging_close_error_path(&FakeDataChannel::default(), false);
     }
 
+    fn flush_once(
+        channel: &FakeDataChannel,
+        handle: &WebRtcTerminalAdapterHandle,
+        usage: &std::sync::atomic::AtomicUsize,
+        next_message_id: &mut u64,
+    ) -> Result<TerminalFlushOutcome, TerminalDriverExit> {
+        let key = AesGcmKey::from_slice(&[13; 32]).expect("test key");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(flush_subscription_adapter_frames(
+                channel,
+                &key,
+                handle,
+                usage,
+                next_message_id,
+            ))
+    }
+
+    /// The write permit covers the frame's sealed size, so an admitted frame
+    /// always flushes: a full aggregate refuses the write, never the flush.
+    #[test]
+    fn an_admitted_frame_flushes_when_the_aggregate_is_exactly_full() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+        };
+        use crate::transport::webrtc::delivery::sealed_terminal_wire_len;
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("route".to_string(), ChannelClass::Terminal)
+            .expect("reserve route");
+        let sibling_usage = budget
+            .reserve("sibling".to_string(), ChannelClass::Terminal)
+            .expect("reserve sibling");
+        let mux = WebRtcConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        let frame = test_frame(b"output");
+        let wire_len = sealed_terminal_wire_len(frame.frame.len()).expect("wire len");
+        assert!(wire_len > frame.frame.len());
+        sibling_usage.store(AGGREGATE_BUFFERED_HIGH - wire_len, Ordering::Release);
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        // A sibling takes every byte the admitted write left free before
+        // the route flushes.
+        sibling_usage.fetch_add(
+            AGGREGATE_BUFFERED_HIGH - budget.aggregate_buffered(),
+            Ordering::AcqRel,
+        );
+        assert_eq!(budget.aggregate_buffered(), AGGREGATE_BUFFERED_HIGH);
+        let channel = FakeDataChannel::default();
+        let mut next_message_id = 1u64;
+        assert_eq!(
+            flush_once(&channel, &handle, &usage, &mut next_message_id),
+            Ok(TerminalFlushOutcome::Ready)
+        );
+        assert_eq!(next_message_id, 2);
+        assert!(!channel.sent_binary.lock().expect("sent").is_empty());
+    }
+
+    /// A write the aggregate refuses waits, and capacity released outside
+    /// the route's own loop wakes it: a retired sibling channel, or a
+    /// closing sibling adapter's permit.
+    #[test]
+    fn released_capacity_wakes_a_route_the_aggregate_refused() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+        };
+        use crate::transport::webrtc::delivery::sealed_terminal_wire_len;
+        for release_by_closing_sibling in [false, true] {
+            let mut budget = ConnectionBudget::default();
+            let usage = budget
+                .reserve("route".to_string(), ChannelClass::Terminal)
+                .expect("reserve route");
+            let sibling_usage = budget
+                .reserve("sibling".to_string(), ChannelClass::Terminal)
+                .expect("reserve sibling");
+            let mux = WebRtcConnectionMux::new();
+            let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+            let (mut sibling_adapter, sibling_handle) =
+                mux.create_adapter_with_aggregate(budget.aggregate());
+            let frame = test_frame(b"output");
+            let wire_len = sealed_terminal_wire_len(frame.frame.len()).expect("wire len");
+            let sibling_held = if release_by_closing_sibling {
+                let sibling_frame = test_frame(b"sibling output");
+                assert_eq!(sibling_adapter.try_write(&sibling_frame), Ok(()));
+                sealed_terminal_wire_len(sibling_frame.frame.len()).expect("wire len")
+            } else {
+                0
+            };
+            // One byte short of room for the route's sealed frame.
+            sibling_usage.store(
+                AGGREGATE_BUFFERED_HIGH - wire_len - sibling_held + 1,
+                Ordering::Release,
+            );
+            assert_eq!(
+                adapter.try_write(&frame),
+                Err(TerminalAdapterWriteError::WouldBlock)
+            );
+            assert!(handle.aggregate_blocked_for_test());
+            assert!(!handle.is_closed());
+
+            if release_by_closing_sibling {
+                sibling_usage.store(0, Ordering::Release);
+                sibling_handle.close();
+            } else {
+                assert!(budget.release("sibling"));
+            }
+            assert!(
+                !handle.aggregate_blocked_for_test(),
+                "the release woke the refused route"
+            );
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(1), handle.wait_for_write())
+                        .await
+                        .expect("the release notifies the route's writer");
+                });
+            assert_eq!(adapter.try_write(&frame), Ok(()));
+            let channel = FakeDataChannel::default();
+            let mut next_message_id = 1u64;
+            assert_eq!(
+                flush_once(&channel, &handle, &usage, &mut next_message_id),
+                Ok(TerminalFlushOutcome::Ready)
+            );
+            assert!(!channel.sent_binary.lock().expect("sent").is_empty());
+            drop(sibling_adapter);
+        }
+    }
+
+    /// close_all holds the route table while it closes handles; a handle
+    /// that releases its permit there must wake waiters without that table.
+    #[test]
+    fn close_all_releases_held_permits_without_reentering_the_route_table() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+        };
+        let mut budget = ConnectionBudget::default();
+        let sibling_usage = budget
+            .reserve("sibling".to_string(), ChannelClass::Terminal)
+            .expect("reserve sibling");
+        let mux = WebRtcConnectionMux::new();
+        let (mut holder, holder_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        mux.register("s".into(), "holder".into(), 1, holder_handle.clone());
+        let (mut waiter, waiter_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        assert_eq!(holder.try_write(&test_frame(b"held")), Ok(()));
+        sibling_usage.store(AGGREGATE_BUFFERED_HIGH, Ordering::Release);
+        assert_eq!(
+            waiter.try_write(&test_frame(b"refused")),
+            Err(TerminalAdapterWriteError::WouldBlock)
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let closing = mux.clone();
+        std::thread::spawn(move || {
+            closing.close_all();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("close_all returns while it releases a held permit");
+        assert!(holder_handle.is_closed());
+        assert!(waiter_handle.aggregate_blocked_for_test());
+        drop((holder, waiter));
+    }
+
     #[test]
     fn hard_close_abandons_occupied_frame_before_flush() {
         use crate::admission::connection_budget::{ChannelClass, ConnectionBudget};

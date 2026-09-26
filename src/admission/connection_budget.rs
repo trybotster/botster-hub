@@ -37,10 +37,31 @@ struct ChannelUsage {
     aggregate_slot: Option<usize>,
 }
 
-#[derive(Debug)]
+/// A sender that waits for aggregate capacity. Capacity released outside a
+/// sending route's own loop (a retired channel, a closing adapter's permit)
+/// wakes every live waiter.
+pub(crate) trait CapacityWaiter: Send + Sync {
+    /// Resume if capacity allows. Runs with no Hub lock held by the
+    /// aggregate; it must not release capacity itself.
+    fn capacity_released(&self);
+    /// A retired waiter is dropped from the list.
+    fn retired(&self) -> bool;
+}
+
 pub(crate) struct ConnectionAggregate {
     slots: Box<[Arc<AtomicUsize>]>,
     authorized: AtomicUsize,
+    // A leaf lock: no other lock is taken while it is held.
+    waiters: std::sync::Mutex<Vec<std::sync::Weak<dyn CapacityWaiter>>>,
+}
+
+impl std::fmt::Debug for ConnectionAggregate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectionAggregate")
+            .field("authorized", &self.authorized)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -61,6 +82,41 @@ impl ConnectionAggregate {
                 .map(|_| Arc::new(AtomicUsize::new(0)))
                 .collect(),
             authorized: AtomicUsize::new(0),
+            waiters: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Register a sender that waits for released capacity. Retired
+    /// waiters are pruned here and at each release.
+    pub(crate) fn register_waiter(&self, waiter: std::sync::Weak<dyn CapacityWaiter>) {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waiters.retain(|waiter| waiter.upgrade().is_some_and(|waiter| !waiter.retired()));
+        waiters.push(waiter);
+    }
+
+    /// Report released capacity to the waiting senders. The waiters run
+    /// after the list lock is dropped, so a caller may hold any Hub lock.
+    pub(crate) fn capacity_released(&self) {
+        let live = {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut live = Vec::with_capacity(waiters.len());
+            waiters.retain(|waiter| match waiter.upgrade() {
+                Some(waiter) if !waiter.retired() => {
+                    live.push(waiter);
+                    true
+                }
+                _ => false,
+            });
+            live
+        };
+        for waiter in live {
+            waiter.capacity_released();
         }
     }
 
@@ -224,6 +280,7 @@ impl ConnectionBudget {
             return false;
         };
         usage.buffered.store(0, Ordering::Release);
+        self.aggregate.capacity_released();
         true
     }
 
