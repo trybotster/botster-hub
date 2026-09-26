@@ -50,9 +50,8 @@ use crate::packages::{
     PackageAction, PackageAdmissionReason, PackageDecision, PackageRegistryError, PackageState,
 };
 use crate::persistence::{
-    ExternalFileIntent, FileCommitError, FileCommitOutcome, FileHubStateStore, HubState,
-    HubStateAuthority, HubStateStoreError, HubStateUncertainWrite, PendingFileCommit,
-    PreparedHubStateWrite,
+    FileCommitError, FileCommitOutcome, FileHubStateStore, HubState, HubStateAuthority,
+    HubStateUncertainWrite, PreparedHubStateWrite,
 };
 use crate::runtime::package_effect::{HostPackageCleanup, HostPackageRuntime};
 use crate::session_types::{
@@ -327,8 +326,12 @@ pub(crate) enum HostMutationResult {
         write: HubStateUncertainWrite,
         rollback: Option<RollbackDescriptor>,
     },
+    /// A repository session-types file committed with no Hub-state write.
+    RepoFileCommitted {
+        reply: HostReply,
+    },
+    /// The repository file was renamed, but its durable result is unconfirmed.
     ExternalEffectUncertain {
-        pending: PendingFileCommit,
         rollback: RollbackDescriptor,
         cause: ExternalEffectCause,
     },
@@ -356,6 +359,7 @@ impl std::fmt::Debug for HostMutationResult {
                 .field("base_revision", &prepared.base_revision)
                 .field("logical_bytes", &prepared.logical_bytes)
                 .finish_non_exhaustive(),
+            Self::RepoFileCommitted { .. } => formatter.write_str("RepoFileCommitted(..)"),
             Self::Committed(committed) => formatter
                 .debug_struct("Committed")
                 .field("committed_revision", &committed.committed_revision)
@@ -636,10 +640,16 @@ pub(crate) struct PackageRefreshEffect {
     pub(crate) restart_entrypoints: Vec<String>,
 }
 
-/// A prepared session-type write across Hub state and an optional repository file.
-pub(crate) struct PreparedSessionTypeChange {
-    state: PreparedStateChange,
-    repo_write: Option<(PathBuf, Vec<PackageSessionType>)>,
+/// A prepared session-type write: a Hub-state document for device types, or
+/// the repository file alone for repository types. The repository file is the
+/// source of truth for its types, so it is never paired with a document write.
+pub(crate) enum PreparedSessionTypeChange {
+    Document(PreparedStateChange),
+    RepoFile {
+        root: PathBuf,
+        definitions: Vec<PackageSessionType>,
+        reply: HostReply,
+    },
 }
 
 /// Exact repository file state retained for session-type compensation.
@@ -718,7 +728,6 @@ pub(crate) struct HostMutationError {
 #[derive(Debug)]
 pub(crate) enum ExternalEffectCause {
     RepoPublicationSyncUnconfirmed { _error: SessionTypeError },
-    RepoSyncedStateRefused { _error: HubStateStoreError },
 }
 
 impl ExternalEffectCause {
@@ -727,10 +736,6 @@ impl ExternalEffectCause {
             Self::RepoPublicationSyncUnconfirmed { .. } => (
                 "repo_session_type_publication_uncertain",
                 "the repository file was renamed, but its synchronization is unconfirmed; Hub state was not written",
-            ),
-            Self::RepoSyncedStateRefused { .. } => (
-                "repo_session_type_state_refused",
-                "the repository file is synchronized, but the Hub state write was refused",
             ),
         }
     }
@@ -1973,7 +1978,11 @@ fn prepare_session_type(
     }
     .map_err(session_type_error)?;
     let reply = HostReply::try_new(daemon_session_types(rows))?;
-    let state_bytes = pretty_encoded_len(&candidate, "host_prepared_state_encode_failed")?;
+    let state_bytes = if repo_write.is_some() {
+        0
+    } else {
+        pretty_encoded_len(&candidate, "host_prepared_state_encode_failed")?
+    };
     let repo_write_bytes = repo_write
         .as_ref()
         .map(|(root, definitions)| {
@@ -1997,28 +2006,36 @@ fn prepare_session_type(
             "prepared mutation exceeds its prepared-byte reservation",
         ));
     }
-    let store = FileHubStateStore::for_data_directory(data_directory);
-    let write = store
-        .prepare_shared(
-            &authority,
-            base_revision,
-            Some(state.clone()),
-            candidate,
-            &state.budget(),
-        )
-        .map_err(|error| HostMutationError::new("hub_state_prepare_failed", error.to_string()))?;
+    let change = if let Some((root, definitions)) = repo_write {
+        PreparedSessionTypeChange::RepoFile {
+            root,
+            definitions,
+            reply,
+        }
+    } else {
+        let store = FileHubStateStore::for_data_directory(data_directory);
+        let write = store
+            .prepare_shared(
+                &authority,
+                base_revision,
+                Some(state.clone()),
+                candidate,
+                &state.budget(),
+            )
+            .map_err(|error| {
+                HostMutationError::new("hub_state_prepare_failed", error.to_string())
+            })?;
+        PreparedSessionTypeChange::Document(PreparedStateChange {
+            store,
+            write,
+            reply,
+            packages: None,
+            package_effect: None,
+        })
+    };
     Ok(PreparedMutation {
         base_revision,
-        change: PreparedChange::SessionType(PreparedSessionTypeChange {
-            state: PreparedStateChange {
-                store,
-                write,
-                reply,
-                packages: None,
-                package_effect: None,
-            },
-            repo_write,
-        }),
+        change: PreparedChange::SessionType(change),
         rollback: RollbackDescriptor::SessionType {
             previous: state,
             repo_file,
@@ -2210,22 +2227,27 @@ fn execute_session_type_commit(
     change: PreparedSessionTypeChange,
     rollback: RollbackDescriptor,
 ) -> HostMutationResult {
-    let PreparedSessionTypeChange { state, repo_write } = change;
-    let PreparedStateChange {
-        store,
-        write,
-        reply,
-        packages,
-        package_effect,
-    } = state;
-    debug_assert!(packages.is_none());
-    debug_assert!(package_effect.is_none());
-    let Some((root, definitions)) = repo_write else {
-        return finish_session_type_state_commit(
-            store.commit_shared(write, committed_revision - 1),
-            rollback,
+    let (root, definitions, reply) = match change {
+        PreparedSessionTypeChange::Document(PreparedStateChange {
+            store,
+            write,
             reply,
-        );
+            packages,
+            package_effect,
+        }) => {
+            debug_assert!(packages.is_none());
+            debug_assert!(package_effect.is_none());
+            return finish_session_type_state_commit(
+                store.commit_shared(write, committed_revision - 1),
+                rollback,
+                reply,
+            );
+        }
+        PreparedSessionTypeChange::RepoFile {
+            root,
+            definitions,
+            reply,
+        } => (root, definitions, reply),
     };
     let RollbackDescriptor::SessionType {
         repo_file: Some(repo_prior),
@@ -2257,53 +2279,21 @@ fn execute_session_type_commit(
         Ok(bytes) => bytes,
         Err(error) => return HostMutationResult::Failed(session_type_error(error)),
     };
-    let external_path = root.join(".botster/session-types.json");
-    let prior_bytes = match &repo_prior.prior {
-        RepoSessionTypeFileSnapshot::Missing => None,
-        RepoSessionTypeFileSnapshot::Present(bytes) => Some(bytes.as_slice()),
-    };
-    let pending = match store.begin_shared_effect(
-        write,
-        committed_revision - 1,
-        Some(ExternalFileIntent {
-            path: &external_path,
-            prior: prior_bytes,
-            candidate: &repo_bytes,
-        }),
-    ) {
-        Ok(pending) => pending,
-        Err(error) => {
-            return HostMutationResult::Failed(HostMutationError::new(
-                "repo_session_type_recovery_required",
-                file_commit_error(error).message,
-            ));
-        }
-    };
+    // The repository file is the whole effect: one atomic write, no journal
+    // intent and no Hub-state document write.
     match commit_repo_session_type_bytes(&root, &repo_bytes) {
-        Ok(RepoSessionTypeFileCommit::Synced) => {}
+        Ok(RepoSessionTypeFileCommit::Synced) => HostMutationResult::RepoFileCommitted { reply },
         Ok(RepoSessionTypeFileCommit::PublishedUncertain(error)) => {
-            return HostMutationResult::ExternalEffectUncertain {
-                pending,
+            HostMutationResult::ExternalEffectUncertain {
                 rollback,
                 cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed { _error: error },
-            };
+            }
         }
-        Err(error) => {
-            return HostMutationResult::Failed(HostMutationError::new(
-                "repo_session_type_recovery_required",
-                error.message,
-            ));
-        }
-    }
-    match store.commit_shared_effect(pending) {
-        Ok(outcome) => finish_session_type_state_commit(Ok(outcome), rollback, reply),
-        Err(failure) => HostMutationResult::ExternalEffectUncertain {
-            pending: failure.pending,
-            rollback,
-            cause: ExternalEffectCause::RepoSyncedStateRefused {
-                _error: failure.error,
-            },
-        },
+        // Before the rename nothing was published.
+        Err(error) => HostMutationResult::Failed(HostMutationError::new(
+            "repo_session_type_recovery_required",
+            error.message,
+        )),
     }
 }
 
@@ -3389,11 +3379,22 @@ mod tests {
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
+    fn device_session_type_create_request() -> DaemonRequest {
+        let mut request = session_type_create_request(String::new());
+        let DaemonRequest::CreateSessionType { source, .. } = &mut request else {
+            unreachable!("the helper builds a create request");
+        };
+        *source = DaemonSessionTypeMutationSource::Device;
+        request
+    }
+
     #[test]
-    fn repo_session_type_commit_writes_the_repo_before_publishing_state() {
+    fn repo_session_type_commit_writes_only_the_repository_file() {
         let (config, state, packages, data_directory, target_id, authority) =
             session_type_inputs("session-type-commit");
         let repo_file = data_directory.join("repo/.botster/session-types.json");
+        let prior_state_bytes =
+            fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
                 request: session_type_create_request(target_id),
@@ -3408,26 +3409,27 @@ mod tests {
             panic!("session-type prepare must succeed");
         };
         assert!(!repo_file.exists());
-        let HostMutationResult::Committed(committed) =
+        let HostMutationResult::RepoFileCommitted { reply } =
             execute(HostMutationCommand::Commit(HostCommit { prepared }))
         else {
-            panic!("session-type commit must succeed");
+            panic!("a repository session-type commit writes only its file");
         };
-        assert_eq!(committed.committed_revision, 12);
-        assert_eq!(committed.view.session_type_generation, 1);
-        assert_eq!(
-            committed.reply.response.kind,
-            DaemonResponseKind::SessionTypes
-        );
+        assert_eq!(reply.response.kind, DaemonResponseKind::SessionTypes);
         assert!(repo_file.is_file());
+        assert_eq!(
+            fs::read(data_directory.join("hub-state.json")).expect("read unchanged state"),
+            prior_state_bytes,
+            "a repository session-type commit writes no Hub-state document"
+        );
+        assert!(!data_directory.join("hub-recovery.log").exists());
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
     #[test]
-    fn failed_state_commit_keeps_the_repo_effect_and_durable_intent() {
+    fn repo_session_type_failure_before_rename_publishes_nothing() {
         let (config, state, packages, data_directory, target_id, authority) =
-            session_type_inputs("session-type-recovery");
-        let repo_file = data_directory.join("repo/.botster/session-types.json");
+            session_type_inputs("session-type-pre-rename");
+        let root = data_directory.join("repo");
         let prior_state_bytes =
             fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
         let HostMutationResult::Prepared(prepared) =
@@ -3443,47 +3445,31 @@ mod tests {
         else {
             panic!("session-type prepare must succeed");
         };
-        FileHubStateStore::inject_next_save_failure(&data_directory);
-        let HostMutationResult::ExternalEffectUncertain {
-            pending,
-            rollback:
-                RollbackDescriptor::SessionType {
-                    repo_file: Some(prior),
-                    ..
-                },
-            cause: ExternalEffectCause::RepoSyncedStateRefused { .. },
-        } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
+        // A file where the .botster directory belongs fails before any rename.
+        fs::write(root.join(".botster"), b"not a directory").expect("block .botster");
+        let HostMutationResult::Failed(_) =
+            execute(HostMutationCommand::Commit(HostCommit { prepared }))
         else {
-            panic!("failed state commit must retain the repo effect for reconciliation");
+            panic!("a failure before the rename is an ordinary failure");
         };
-        assert_eq!(pending.receipt_sequence(), 2);
-        assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
-        assert!(repo_file.is_file());
-        assert!(data_directory.join("hub-recovery.log").is_file());
         assert_eq!(
-            fs::read(data_directory.join("hub-state.json")).expect("read retained state"),
+            fs::read(root.join(".botster")).expect("blocking file stays"),
+            b"not a directory"
+        );
+        assert_eq!(
+            fs::read(data_directory.join("hub-state.json")).expect("read unchanged state"),
             prior_state_bytes
         );
-        drop(pending);
-        assert!(matches!(
-            crate::recovery::journal::RecoveryJournal::scan(
-                crate::recovery::state_directory::StateDirectoryOwnership::acquire(&data_directory)
-                    .expect("reopen state directory"),
-                true,
-            ),
-            Err(crate::recovery::journal::JournalError::Unresolved(2))
-        ));
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
     #[test]
-    fn uncertain_session_type_commit_retains_repo_file_rollback() {
-        let (config, state, packages, data_directory, target_id, authority) =
+    fn uncertain_device_session_type_commit_retains_its_document_rollback() {
+        let (config, state, packages, data_directory, _target_id, authority) =
             session_type_inputs("session-type-uncertain");
-        let repo_file = data_directory.join("repo/.botster/session-types.json");
         let HostMutationResult::Prepared(prepared) =
             execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
-                request: session_type_create_request(target_id),
+                request: device_session_type_create_request(),
                 base_revision: 4,
                 authority,
                 config,
@@ -3499,27 +3485,19 @@ mod tests {
             write,
             rollback:
                 Some(RollbackDescriptor::SessionType {
-                    repo_file: Some(prior),
-                    ..
+                    repo_file: None, ..
                 }),
         } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
         else {
-            panic!("uncertain state publication must retain the repo rollback");
+            panic!("uncertain device publication must retain its document rollback");
         };
-        assert!(repo_file.is_file());
         assert_eq!(write.candidate().session_type_generation, 1);
-        assert_eq!(
-            fs::canonicalize(prior.root.join(".botster/session-types.json"))
-                .expect("canonicalize retained repo file"),
-            fs::canonicalize(&repo_file).expect("canonicalize fixture repo file"),
-        );
-        assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
         drop(write);
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 
     #[test]
-    fn repo_directory_sync_failure_retains_the_intent_and_prior_file() {
+    fn repo_directory_sync_failure_is_uncertain_and_writes_no_state() {
         let (config, state, packages, data_directory, target_id, authority) =
             session_type_inputs("repo-directory-sync-uncertain");
         let root = data_directory.join("repo");
@@ -3541,7 +3519,6 @@ mod tests {
         };
         crate::session_types::inject_next_repo_directory_sync_failure(&root);
         let HostMutationResult::ExternalEffectUncertain {
-            pending,
             rollback:
                 RollbackDescriptor::SessionType {
                     repo_file: Some(prior),
@@ -3553,23 +3530,12 @@ mod tests {
             panic!("repo rename with failed directory sync must retain uncertainty");
         };
         assert_eq!(error.kind, "repo_session_type_sync_uncertain");
-        assert_eq!(pending.receipt_sequence(), 2);
         assert!(matches!(prior.prior, RepoSessionTypeFileSnapshot::Missing));
         assert!(repo_file.is_file());
-        assert!(data_directory.join("hub-recovery.log").is_file());
         assert_eq!(
             fs::read(data_directory.join("hub-state.json")).expect("read retained state"),
             prior_state_bytes
         );
-        drop(pending);
-        assert!(matches!(
-            crate::recovery::journal::RecoveryJournal::scan(
-                crate::recovery::state_directory::StateDirectoryOwnership::acquire(&data_directory)
-                    .expect("reopen state directory"),
-                true,
-            ),
-            Err(crate::recovery::journal::JournalError::Unresolved(2))
-        ));
         fs::remove_dir_all(&data_directory).expect("remove host mutation test directory");
     }
 

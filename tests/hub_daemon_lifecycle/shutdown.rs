@@ -1158,11 +1158,6 @@ fn cli_local_runtime_up_reports_missing_installed_checkout_before_launch() {
         failed_data_dir.join("hub-state.json"),
     )
     .expect("copy installed package state into fresh failed-start directory");
-    fs::copy(
-        data_dir.join("hub-recovery.log"),
-        failed_data_dir.join("hub-recovery.log"),
-    )
-    .expect("copy matching recovery journal into fresh failed-start directory");
     fs::remove_dir_all(&web_package_dir).expect("remove installed web checkout");
 
     let failed = Command::new(env!("CARGO_BIN_EXE_botster-hub"))

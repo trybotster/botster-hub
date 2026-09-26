@@ -2,7 +2,7 @@
 //!
 //! The directory itself is the lock object. No lock pathname can be unlinked
 //! and recreated while another owner retains the original lock.
-//! File persistence retains this lock across state and recovery-journal writes.
+//! File persistence retains this lock across state writes.
 
 use std::ffi::CString;
 use std::fmt;
@@ -164,118 +164,18 @@ impl StateDirectoryOwnership {
         Ok(bytes)
     }
 
-    /// Open the exact document bytes for a write-ahead record.
-    pub(crate) fn open_document_bytes(&self) -> Result<Option<File>, StateDirectoryError> {
-        self.open_regular_file("hub-state.json")
-    }
-
-    pub(crate) fn ensure_document_bytes(&self, file: &File) -> Result<(), StateDirectoryError> {
-        self.ensure_named_file("hub-state.json", file)
-    }
-
-    /// Open an existing journal through the retained directory descriptor.
-    pub(crate) fn open_recovery_journal(&self) -> Result<Option<File>, StateDirectoryError> {
-        self.open_regular_file("hub-recovery.log")
-    }
-
-    pub(crate) fn open_recovery_journal_append(&self) -> Result<File, StateDirectoryError> {
-        use rustix::fs::{Mode, OFlags, openat};
+    /// Remove a recovery journal left by an earlier Hub. The journal is
+    /// retired; `true` when a file was removed, `false` when none existed.
+    /// The name is unlinked through the held descriptor and never followed.
+    pub(crate) fn remove_retired_recovery_journal(&self) -> Result<bool, StateDirectoryError> {
+        use rustix::fs::{AtFlags, unlinkat};
 
         self.ensure_current()?;
-        let descriptor = openat(
-            &self.0.file,
-            "hub-recovery.log",
-            OFlags::WRONLY | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(|error| StateDirectoryError::Io(error.into()))?;
-        let file = File::from(descriptor);
-        self.ensure_recovery_journal(&file)?;
-        Ok(file)
-    }
-
-    fn open_regular_file(&self, name: &str) -> Result<Option<File>, StateDirectoryError> {
-        use rustix::fs::{Mode, OFlags, openat};
-
-        self.ensure_current()?;
-        let descriptor = match openat(
-            &self.0.file,
-            name,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        ) {
-            Ok(descriptor) => descriptor,
-            Err(rustix::io::Errno::NOENT) => return Ok(None),
-            Err(error) => return Err(StateDirectoryError::Io(error.into())),
-        };
-        let file = File::from(descriptor);
-        self.verify_regular_file(&file)?;
-        self.ensure_current()?;
-        Ok(Some(file))
-    }
-
-    /// Create the journal once. Existing or linked files are never replaced.
-    pub(crate) fn create_recovery_journal(&self) -> Result<File, StateDirectoryError> {
-        use rustix::fs::{Mode, OFlags, openat};
-
-        self.ensure_current()?;
-        let descriptor = openat(
-            &self.0.file,
-            "hub-recovery.log",
-            OFlags::WRONLY
-                | OFlags::APPEND
-                | OFlags::CREATE
-                | OFlags::EXCL
-                | OFlags::CLOEXEC
-                | OFlags::NOFOLLOW,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(|error| StateDirectoryError::Io(error.into()))?;
-        let file = File::from(descriptor);
-        self.verify_regular_file(&file)?;
-        self.ensure_named_file("hub-recovery.log", &file)?;
-        Ok(file)
-    }
-
-    /// Confirm that the named file still refers to the retained open file.
-    pub(crate) fn ensure_recovery_journal(&self, file: &File) -> Result<(), StateDirectoryError> {
-        self.ensure_named_file("hub-recovery.log", file)
-    }
-
-    fn ensure_named_file(&self, name: &str, file: &File) -> Result<(), StateDirectoryError> {
-        use rustix::fs::{Mode, OFlags, openat};
-
-        self.ensure_current()?;
-        self.verify_regular_file(file)?;
-        let descriptor = openat(
-            &self.0.file,
-            name,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(|error| StateDirectoryError::Io(error.into()))?;
-        let named = File::from(descriptor);
-        self.verify_regular_file(&named)?;
-        let held = file.metadata().map_err(StateDirectoryError::Io)?;
-        let current = named.metadata().map_err(StateDirectoryError::Io)?;
-        if held.dev() != current.dev() || held.ino() != current.ino() {
-            return Err(StateDirectoryError::Replaced);
+        match unlinkat(&self.0.file, "hub-recovery.log", AtFlags::empty()) {
+            Ok(()) => Ok(true),
+            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Err(error) => Err(StateDirectoryError::Io(error.into())),
         }
-        self.ensure_current()
-    }
-
-    fn verify_regular_file(&self, file: &File) -> Result<(), StateDirectoryError> {
-        let metadata = file.metadata().map_err(StateDirectoryError::Io)?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
-            return Err(StateDirectoryError::InvalidTemporaryFile);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn sync_directory(&self) -> Result<(), StateDirectoryError> {
-        self.ensure_current()?;
-        rustix::fs::fsync(&self.0.file).map_err(|error| StateDirectoryError::Io(error.into()))?;
-        self.ensure_current()
     }
 
     /// Commit to the locked directory even if its pathname changes during I/O.
