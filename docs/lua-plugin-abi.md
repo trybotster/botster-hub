@@ -228,6 +228,15 @@ bad input.
 - `botster.clock.now()` returns Unix epoch milliseconds.
 - `botster.clock.monotonic()` returns milliseconds since the Hub process
   started; it never goes backward.
+- `require("lib.store")` loads `lua/lib/store.lua` from the package's own
+  `lua/` directory. It is Lua's standard function, so it keeps its standard
+  signature and raises an error for a missing or failing module. At load the
+  Hub stages every `.lua` file below `lua/` into the VM as text: it never
+  follows symlinks (a symlink fails the load), refuses non-UTF-8 names and
+  directory names with `.`, funds each file before reading it, and stages at
+  most 16 MiB per package under one global staging permit (loads stage one at
+  a time). After load the VM has no filesystem access; `require` serves only
+  the staged set, runs each module once, and reports circular requires.
 
 ## Capability Access
 
