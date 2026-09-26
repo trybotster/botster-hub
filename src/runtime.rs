@@ -1799,6 +1799,22 @@ impl HubRuntime {
         Ok(result)
     }
 
+    /// Install one plugin's runtime grants without loading its package.
+    ///
+    /// Test-only. In production the Hub installs grants from package
+    /// admission when it loads the package.
+    #[cfg(any(test, feature = "test-internals"))]
+    pub fn test_install_plugin_grants(
+        &mut self,
+        plugin_key: &PluginKey,
+        grants: impl IntoIterator<Item = botster_core::Capability>,
+    ) {
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .set_plugin_grants(plugin_key, grants);
+    }
+
     /// Submit a plugin capability request through the hub-owned concrete runtime.
     pub fn submit_capability_request(
         &mut self,
@@ -7788,7 +7804,8 @@ pub(crate) mod tests {
             root.join("botster-package.json"),
             serde_json::json!({
                 "name": "producer", "version": "1.0.0", "kind": "plugin",
-                "botster": ">=0.1.0", "capabilities": [],
+                "botster": ">=0.1.0",
+                "capabilities": [{ "surface": "timers", "scope": "callbacks" }],
                 "source": { "type": "path", "path": root.canonicalize().unwrap() },
                 "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
             })

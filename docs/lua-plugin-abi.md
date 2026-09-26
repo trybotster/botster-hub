@@ -294,7 +294,17 @@ The initial capability helper is:
   absence in `pcall`.
 
 `plugin_db` helpers always use the loaded plugin key as the namespace; Lua code
-cannot select another plugin's namespace. The synchronous Lua helpers prepare
+cannot select another plugin's namespace.
+
+Grants are per package. A package declares each capability in its manifest,
+and enable-time admission records the admitted set. A package may declare
+`{ "surface": "plugin_db", "scope": "<its own package name>" }` and never
+another package's namespace. The Hub installs the admitted set as the
+plugin's runtime grants before the entrypoint runs (on load and reload) and
+removes it at unload. Every capability request checks the calling plugin's
+own admitted set; there is no Hub-wide list of package names. A request
+outside the admitted set raises the Lua error "the plugin's package was not
+admitted with the required capability". The synchronous Lua helpers prepare
 the admitted operation under `HubCapabilityRuntime`, release its shared lock,
 and execute the store operation inside that plugin's isolated worker before
 returning. The general asynchronous `CapabilityOperation::PluginStore`
