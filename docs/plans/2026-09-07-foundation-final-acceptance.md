@@ -86,6 +86,7 @@ Landed on main (reviewer accepted):
 - Contended-slot lost wake (`a26b8866`): a driver holding the slot mutex no longer reads as Full to Core, and a Core write that meets it is woken by the unlock.
 - Core pin rolls: 891e220 → a499d5a (`9871f3f6`; stall resync), a499d5a → ac35e32 (`38f54ce8`; flood budget). Lifecycle filters 81/81 on each matched candidate. `8ff59ed3` fixed the stale protocol 10 floor test (49 → 50). The filters missed a regression: the full lifecycle target later showed `failed_remove_session_does_not_suppress_later_core_close` failing from the ac35e32 pin onward. Pin rolls now run the full lifecycle target.
 - G5 (`67d91f54`): the source update is a development-only loop with a CLI-only source root (`update --source`, `start --update-source-root`). `BOTSTER_ENV=test` refuses the default root. The update tests use fixture checkouts and stop their daemons through the endpoint on every failure path.
+- B1 part 1 strict-clippy dead code (`516bacb6`, `eeced936`, `f25b55cb`): unused helpers are deleted, test-only helpers move under `#[cfg(test)]`, and held charges get underscore names with unchanged drop order. Lib errors go from 193 to 181, and each step removes only its intended findings. Held back: the dead-feature and suspicious rows, and the rows that reach other writers' files (`clippy-b1-20260926/classification.md`).
 - B2 strict-clippy mechanical cleanup (`0aa6e66f`, `f1674920`). `f1674920` keeps the inflight coordination record's fields alive until the response is sent. Scope: the reviewer accepted this cleanup batch only, not a green full gate. A coordination focused run passed 16/16.
 
 User decisions and rulings: G5 keeps the source update as a development-only loop with a CLI-only source root (no protocol field); oversize terminal frames use the high-water mark, not a typed close.
@@ -95,6 +96,10 @@ User decisions, September 26:
 2. There is no dedicated recovery-record limit. Records are charged to the existing hub-state byte budget. When the budget is full, new managed spawns are refused with a typed error, and resolution is always admitted.
 3. Plugins reach processes, sockets and the filesystem only through Hub-brokered capabilities.
 4. The cutover plugins are messaging, orchestrator and project-pipelines. A Plugin platform Hub pair (`delivery/plugin-platform-20260926`) designs and builds the plugin API.
+5. Plugin isolation target: one OS process per plugin. The mechanism is in Core (Plugin process host pair, `delivery/plugin-process-host-20260926`); the Hub owns the policy: sandbox profile, limits, restart, and grants. This supersedes the earlier deferral of I1 plugin isolation.
+6. Plugin storage: document collections with declared indexes and change feeds. SQL is a possible later opt-in.
+7. Plugin UI: entities plus declarative views. Web bundles are a possible later escape hatch.
+The full list of these decisions is in `core-stall-resync-20260925/orchestrator-user-decisions.md`.
 
 Orchestrator rulings on recovery records, September 26 (premise in `recovery-records-20260926/premise-v5.md`; the reviewer accepted it as an implementation premise, not as a diff):
 - Operator records exist only for managed-git attempts, one per attempt. They live in the atomic hub-state document, and each transition is one atomic document write. Unresolved records never stop the Hub from starting.
