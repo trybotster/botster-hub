@@ -1274,40 +1274,168 @@ fn subscribe_entities_on_bound_unix_mux_coexists_with_the_terminal_route() {
     hub.shutdown().expect("shutdown isolated hub");
 }
 
-#[test]
-fn failed_remove_session_does_not_suppress_later_core_close() {
+/// Core's reader-progress deadline D: a route whose adapter refuses every write
+/// for D after the first refusal is hard-stopped (user-approved, 2026-09-26).
+const READER_PROGRESS_DEADLINE: Duration = Duration::from_secs(10);
+
+fn route_is_occupied(sibling: &mut RawUnixClient, session_id: &str, subscription_id: &str) -> bool {
+    let mut frames = Vec::new();
+    occupancy_has_pair(&sibling_status(sibling, &mut frames).live_attach_occupancy, session_id, subscription_id)
+}
+
+fn session_is_listed(sibling: &mut RawUnixClient, session_id: &str) -> bool {
+    let mut frames = Vec::new();
+    sibling
+        .request_skipping(&botster_hub_client::DaemonRequest::ListSessions, &mut frames)
+        .sessions
+        .iter()
+        .any(|session| session.session_id == session_id)
+}
+
+/// Read and discard terminal frames until `until`; keep host events. Returns
+/// the number of terminal frames read. The producer is unbounded, so frames are
+/// counted, not kept.
+fn drain_terminal_until(client: &mut RawUnixClient, until: Instant, events: &mut Vec<botster_hub_client::DaemonEvent>) -> usize {
+    let mut terminal = 0;
+    while Instant::now() < until {
+        client.set_read_timeout(Some(Duration::from_millis(100)));
+        match client.read_frame() {
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Terminal(_)) => terminal += 1,
+            Ok(botster_hub_client::DaemonUnixMuxFrame::Server(botster_hub_client::ServerFrame::Event { event })) => {
+                events.push(event)
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    client.set_read_timeout(None);
+    terminal
+}
+
+/// A client that never reads is closed by Core's reader-progress deadline:
+/// the route stays attached before D, closes as core_adapter by D plus slack
+/// measured from the observed Attach response, and the session survives.
+/// `producer` fills the socket; `name` keys the hub. With
+/// `reject_remove_first`, a sibling's RemoveSession is refused as
+/// session_not_terminal before the deadline, and must not suppress the close.
+fn never_reading_client_is_closed_at_the_reader_deadline(name: &str, producer: &str, reject_remove_first: bool) {
     let _guard = daemon_test_guard();
-    let hub = start_isolated_live_output_hub("frm");
-    let mut stream = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let hub = start_isolated_live_output_hub(name);
+    let session_id = format!("{name}-dead");
+    let subscription_id = format!("{name}-sub");
+    let mut reader = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut sibling = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
-    spawn_and_bind(&mut stream, "frm-stall", "sub-stall", "yes remove-session-still-live", &mut envelopes, &mut events);
-    let removed = stream.request_collecting(&botster_hub_client::DaemonRequest::RemoveSession {
-            session_id: "frm-stall".to_string(),
-        }, &mut envelopes, &mut events);
-    assert_eq!(
-        removed.kind,
-        botster_hub_client::DaemonResponseKind::OperatorError
-    );
-    assert_eq!(
-        removed.error.as_ref().map(|error| error.code.as_str()),
-        Some("session_not_terminal")
-    );
-    thread::sleep(Duration::from_secs(2));
+    // No write to the route can precede this instant, so no refusal can either.
+    let before_attach = Instant::now();
+    spawn_and_bind(&mut reader, &session_id, &subscription_id, producer, &mut envelopes, &mut events);
+    // The reader never reads from here. Core may already have refused writes
+    // before this response was read; the slack below starts from here.
+    let bound = Instant::now();
+    if reject_remove_first {
+        let mut frames = Vec::new();
+        let removed = sibling.request_skipping(
+            &botster_hub_client::DaemonRequest::RemoveSession { session_id: session_id.clone() },
+            &mut frames,
+        );
+        assert_eq!(removed.kind, botster_hub_client::DaemonResponseKind::OperatorError);
+        assert_eq!(removed.error.as_ref().map(|error| error.code.as_str()), Some("session_not_terminal"));
+    }
+
+    // timer: deadline — the observation point before D; the first refusal is at or after `before_attach`, so D cannot have elapsed.
+    thread::sleep((before_attach + READER_PROGRESS_DEADLINE - Duration::from_secs(2)).saturating_duration_since(Instant::now()));
+    let attached_before_deadline = route_is_occupied(&mut sibling, &session_id, &subscription_id);
+    // The observation only counts if its Status answer came back before D;
+    // a late answer makes the run inconclusive, never a pass.
+    let observed_after = before_attach.elapsed();
     assert!(
-        wait_for_subscription_closed(&mut stream, "frm-stall", "sub-stall", &mut envelopes, &mut events),
-        "failed RemoveSession must not suppress later Core hard-stop: {events:?}"
+        observed_after < READER_PROGRESS_DEADLINE,
+        "TIMING-INVALID: the pre-deadline Status answered {observed_after:?} after attach started, not before D; this run is inconclusive"
+    );
+    assert!(
+        attached_before_deadline,
+        "a never-reading route must stay attached before the reader deadline"
+    );
+
+    // timer: deadline — D plus 5 s slack from the observed Attach response, not from the (unobserved) first refusal.
+    thread::sleep((bound + READER_PROGRESS_DEADLINE + Duration::from_secs(5)).saturating_duration_since(Instant::now()));
+    assert!(
+        !route_is_occupied(&mut sibling, &session_id, &subscription_id),
+        "Core must hard-stop a never-reading route by the reader deadline plus slack"
+    );
+    assert!(
+        session_is_listed(&mut sibling, &session_id),
+        "the reader deadline closes the route, not the session"
+    );
+    assert!(
+        wait_for_subscription_closed(&mut reader, &session_id, &subscription_id, &mut envelopes, &mut events),
+        "the stalled reader must receive TerminalSubscriptionClosed: {events:?}"
     );
     assert!(events.iter().any(|event| matches!(
         event,
-        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
-            session_id,
-            reason,
-            ..
-        } if session_id == "frm-stall"
-            && reason == botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
+        botster_hub_client::DaemonEvent::TerminalSubscriptionClosed { session_id: closed, reason, .. }
+            if *closed == session_id && reason == botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER
     )));
-    shutdown_short_lived_session(hub.endpoint(), "frm-stall");
+    drop(reader);
+    drop(sibling);
+    shutdown_short_lived_session(hub.endpoint(), &session_id);
+    hub.shutdown().expect("shutdown isolated hub");
+}
+
+#[test]
+fn never_reading_client_is_closed_at_the_reader_deadline_under_a_live_producer() {
+    never_reading_client_is_closed_at_the_reader_deadline("nrl", "yes reader-deadline-live", false);
+}
+
+/// The silent variant: after the fill the producer writes nothing. Sibling
+/// Status requests and other Hub wakes still run, so this does not isolate
+/// Core's clamped host wait; Core's own test covers the clamp.
+#[test]
+fn never_reading_client_is_closed_at_the_reader_deadline_with_a_silent_producer() {
+    never_reading_client_is_closed_at_the_reader_deadline(
+        "nrs",
+        "yes reader-deadline-silent | head -c 2097152; exec cat",
+        false,
+    );
+}
+
+/// The replaced test's invariant: a RemoveSession refused as
+/// session_not_terminal must not suppress the later reader-deadline close.
+#[test]
+fn rejected_remove_session_does_not_suppress_the_reader_deadline_close() {
+    never_reading_client_is_closed_at_the_reader_deadline("nrr", "yes reader-deadline-remove", true);
+}
+
+#[test]
+fn reader_pause_shorter_than_the_deadline_stays_attached() {
+    let _guard = daemon_test_guard();
+    let hub = start_isolated_live_output_hub("rps");
+    let mut reader = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut sibling = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
+    let mut envelopes = Vec::new();
+    let mut events = Vec::new();
+    spawn_and_bind(&mut reader, "rps-pause", "rps-sub", "yes reader-pause", &mut envelopes, &mut events);
+    let bound = Instant::now();
+
+    // timer: deadline — the pause under test, shorter than D, so the socket fills and the adapter refuses.
+    thread::sleep(Duration::from_secs(3));
+    // Drain past the point where an unbroken refusal would have reached D.
+    let window_end = bound + READER_PROGRESS_DEADLINE + Duration::from_secs(5);
+    let drained = drain_terminal_until(&mut reader, window_end - Duration::from_secs(1), &mut events);
+    let resumed = drain_terminal_until(&mut reader, window_end, &mut events);
+    assert!(drained > 0, "the reader must drain the paused backlog");
+    assert!(resumed > 0, "output must keep flowing at the end of the window");
+    assert!(
+        no_terminal_subscription_closed(&events, "rps-pause", Some("rps-sub"), None),
+        "a pause shorter than the reader deadline must not close the route: {events:?}"
+    );
+    assert!(
+        route_is_occupied(&mut sibling, "rps-pause", "rps-sub"),
+        "a pause shorter than the reader deadline must stay attached"
+    );
+    drop(reader);
+    drop(sibling);
+    shutdown_short_lived_session(hub.endpoint(), "rps-pause");
     hub.shutdown().expect("shutdown isolated hub");
 }
 
