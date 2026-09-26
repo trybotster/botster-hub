@@ -1349,9 +1349,12 @@ fn drain_terminal_until(client: &mut RawUnixClient, until: Instant, events: &mut
 }
 
 /// A client that never reads is closed by Core's reader-progress deadline:
-/// the route stays attached before D, closes as core_adapter by D plus slack,
-/// and the session survives. `producer` fills the socket; `name` keys the hub.
-fn never_reading_client_is_closed_at_the_reader_deadline(name: &str, producer: &str) {
+/// the route stays attached before D, closes as core_adapter by D plus slack
+/// measured from the observed Attach response, and the session survives.
+/// `producer` fills the socket; `name` keys the hub. With
+/// `reject_remove_first`, a sibling's RemoveSession is refused as
+/// session_not_terminal before the deadline, and must not suppress the close.
+fn never_reading_client_is_closed_at_the_reader_deadline(name: &str, producer: &str, reject_remove_first: bool) {
     let _guard = daemon_test_guard();
     let hub = start_isolated_live_output_hub(name);
     let session_id = format!("{name}-dead");
@@ -1360,18 +1363,30 @@ fn never_reading_client_is_closed_at_the_reader_deadline(name: &str, producer: &
     let mut sibling = RawUnixClient::connect_unix_terminal_adapter(hub.endpoint());
     let mut envelopes = Vec::new();
     let mut events = Vec::new();
+    // No write to the route can precede this instant, so no refusal can either.
+    let before_attach = Instant::now();
     spawn_and_bind(&mut reader, &session_id, &subscription_id, producer, &mut envelopes, &mut events);
-    // The reader never reads from here. Its first refusal is at or after bind.
+    // The reader never reads from here. Core may already have refused writes
+    // before this response was read; the slack below starts from here.
     let bound = Instant::now();
+    if reject_remove_first {
+        let mut frames = Vec::new();
+        let removed = sibling.request_skipping(
+            &botster_hub_client::DaemonRequest::RemoveSession { session_id: session_id.clone() },
+            &mut frames,
+        );
+        assert_eq!(removed.kind, botster_hub_client::DaemonResponseKind::OperatorError);
+        assert_eq!(removed.error.as_ref().map(|error| error.code.as_str()), Some("session_not_terminal"));
+    }
 
-    // timer: deadline — the observation point before D; the first refusal is at or after `bound`, so D cannot have elapsed.
-    thread::sleep(READER_PROGRESS_DEADLINE - Duration::from_secs(2));
+    // timer: deadline — the observation point before D; the first refusal is at or after `before_attach`, so D cannot have elapsed.
+    thread::sleep((before_attach + READER_PROGRESS_DEADLINE - Duration::from_secs(2)).saturating_duration_since(Instant::now()));
     assert!(
         route_is_occupied(&mut sibling, &session_id, &subscription_id),
         "a never-reading route must stay attached before the reader deadline"
     );
 
-    // timer: deadline — D plus 5 s slack for the first refusal and the close to land.
+    // timer: deadline — D plus 5 s slack from the observed Attach response, not from the (unobserved) first refusal.
     thread::sleep((bound + READER_PROGRESS_DEADLINE + Duration::from_secs(5)).saturating_duration_since(Instant::now()));
     assert!(
         !route_is_occupied(&mut sibling, &session_id, &subscription_id),
@@ -1398,17 +1413,26 @@ fn never_reading_client_is_closed_at_the_reader_deadline(name: &str, producer: &
 
 #[test]
 fn never_reading_client_is_closed_at_the_reader_deadline_under_a_live_producer() {
-    never_reading_client_is_closed_at_the_reader_deadline("nrl", "yes reader-deadline-live");
+    never_reading_client_is_closed_at_the_reader_deadline("nrl", "yes reader-deadline-live", false);
 }
 
-/// The silent variant: after the fill the producer writes nothing, so only
-/// Core's clamped host wait can run the pump that observes the deadline.
+/// The silent variant: after the fill the producer writes nothing. Sibling
+/// Status requests and other Hub wakes still run, so this does not isolate
+/// Core's clamped host wait; Core's own test covers the clamp.
 #[test]
 fn never_reading_client_is_closed_at_the_reader_deadline_with_a_silent_producer() {
     never_reading_client_is_closed_at_the_reader_deadline(
         "nrs",
         "yes reader-deadline-silent | head -c 2097152; exec cat",
+        false,
     );
+}
+
+/// The replaced test's invariant: a RemoveSession refused as
+/// session_not_terminal must not suppress the later reader-deadline close.
+#[test]
+fn rejected_remove_session_does_not_suppress_the_reader_deadline_close() {
+    never_reading_client_is_closed_at_the_reader_deadline("nrr", "yes reader-deadline-remove", true);
 }
 
 #[test]
