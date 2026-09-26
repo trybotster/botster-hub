@@ -676,10 +676,10 @@ impl AttachStreamRegistry {
                 .streams
                 .get(&(session_id.clone(), subscription_id.clone()))
                 .and_then(|stream| stream.generation);
-            if Self::route_is_stale_against_live_generation(stream_generation, live) {
-                if self.cancel_stream_if(&session_id, &subscription_id, &identity) {
-                    retired.push((session_id, subscription_id));
-                }
+            if Self::route_is_stale_against_live_generation(stream_generation, live)
+                && self.cancel_stream_if(&session_id, &subscription_id, &identity)
+            {
+                retired.push((session_id, subscription_id));
             }
         }
         InventoryReconcileProgress {

@@ -691,100 +691,106 @@ impl SessionTypeSpawnStart {
                         return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                 },
-                PluginSpawnStage::Reserve => match {
-                    let result = self.poll_core(runtime);
+                PluginSpawnStage::Reserve => {
+                    let polled = self.poll_core(runtime);
                     // Poll can accept begin and lose completion in the same call.
                     self.reserve_operation_id = self.tracker.accepted_id();
-                    result
-                } {
-                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
-                    CoreTicketPoll::Refused => {
-                        self.cleanup = CleanupStage::Confirmed;
-                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
-                    }
-                    CoreTicketPoll::Lost => {
-                        let Some(reserve_id) = self.reserve_operation_id else {
-                            return spawn_fail(CoreDaemonError::Shutdown, None);
-                        };
-                        self.tracker = self.binding.begin(
-                            runtime,
-                            CoreOperation::LookupSessionReservation {
-                                session_id: self.spawn.request.session_id.clone(),
-                                reserve_operation_id: reserve_id,
-                            },
-                        );
-                        self.stage = PluginSpawnStage::Lookup;
-                    }
-                    CoreTicketPoll::Ready(Err(error)) => {
-                        return spawn_fail(error, None);
-                    }
-                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
-                        result, ..
-                    })) => match result {
-                        Ok(reserved) => {
-                            self.reservation = Some(reserved.clone());
-                            if self.abandon_requested {
-                                self.spawn_error = Some(CoreDaemonError::Shutdown);
-                                self.release_or_retain(runtime);
-                                continue;
-                            }
-                            // Register before SpawnReserved so any later
-                            // removal of this id finds the record. A record
-                            // that already exists means a lost release
-                            // obligation: do not spawn; release this token.
-                            if let Some(charge) = self.record_charge.take()
-                                && runtime
-                                    .session_reservations()
-                                    .register(charge, reserved.identity())
-                                    .is_err()
-                            {
-                                eprintln!(
-                                    "session reservation record invariant failed for {}",
-                                    self.spawn.request.session_id.0
-                                );
-                                self.spawn_error = Some(CoreDaemonError::SessionReservation(
-                                    SessionReservationRefusal::Occupied,
-                                ));
-                                self.release_or_retain(runtime);
-                                continue;
-                            }
-                            let published = self
-                                .binding
-                                .context_charge(
-                                    runtime,
-                                    self.context.as_ref().expect("context precedes publication"),
-                                )
-                                .ok_or(())
-                                .and_then(|charge| {
-                                    let context = self.context.take().ok_or(())?;
-                                    runtime
-                                        .publish_spawn_context(context, &reserved, charge)
-                                        .map_err(|_| ())
-                                });
-                            if published.is_err() {
-                                self.spawn_error = Some(CoreDaemonError::Shutdown);
-                                self.release_or_retain(runtime);
-                                continue;
-                            }
-                            self.context_published = true;
+                    match polled {
+                        CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                        CoreTicketPoll::Refused => {
+                            self.cleanup = CleanupStage::Confirmed;
+                            return spawn_fail(
+                                core_bridge_error(CoreTicketError::Overloaded),
+                                None,
+                            );
+                        }
+                        CoreTicketPoll::Lost => {
+                            let Some(reserve_id) = self.reserve_operation_id else {
+                                return spawn_fail(CoreDaemonError::Shutdown, None);
+                            };
                             self.tracker = self.binding.begin(
                                 runtime,
-                                CoreOperation::SpawnReserved {
-                                    reservation: reserved,
-                                    request: self.spawn.clone(),
+                                CoreOperation::LookupSessionReservation {
+                                    session_id: self.spawn.request.session_id.clone(),
+                                    reserve_operation_id: reserve_id,
                                 },
                             );
-                            self.stage = PluginSpawnStage::SpawnReserved;
+                            self.stage = PluginSpawnStage::Lookup;
                         }
-                        Err(error) => {
-                            self.cleanup = CleanupStage::Confirmed;
+                        CoreTicketPoll::Ready(Err(error)) => {
                             return spawn_fail(error, None);
                         }
-                    },
-                    CoreTicketPoll::Ready(Ok(_)) => {
-                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                        CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                            result,
+                            ..
+                        })) => match result {
+                            Ok(reserved) => {
+                                self.reservation = Some(reserved.clone());
+                                if self.abandon_requested {
+                                    self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                    self.release_or_retain(runtime);
+                                    continue;
+                                }
+                                // Register before SpawnReserved so any later
+                                // removal of this id finds the record. A record
+                                // that already exists means a lost release
+                                // obligation: do not spawn; release this token.
+                                if let Some(charge) = self.record_charge.take()
+                                    && runtime
+                                        .session_reservations()
+                                        .register(charge, reserved.identity())
+                                        .is_err()
+                                {
+                                    eprintln!(
+                                        "session reservation record invariant failed for {}",
+                                        self.spawn.request.session_id.0
+                                    );
+                                    self.spawn_error = Some(CoreDaemonError::SessionReservation(
+                                        SessionReservationRefusal::Occupied,
+                                    ));
+                                    self.release_or_retain(runtime);
+                                    continue;
+                                }
+                                let published = self
+                                    .binding
+                                    .context_charge(
+                                        runtime,
+                                        self.context
+                                            .as_ref()
+                                            .expect("context precedes publication"),
+                                    )
+                                    .ok_or(())
+                                    .and_then(|charge| {
+                                        let context = self.context.take().ok_or(())?;
+                                        runtime
+                                            .publish_spawn_context(context, &reserved, charge)
+                                            .map_err(|_| ())
+                                    });
+                                if published.is_err() {
+                                    self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                    self.release_or_retain(runtime);
+                                    continue;
+                                }
+                                self.context_published = true;
+                                self.tracker = self.binding.begin(
+                                    runtime,
+                                    CoreOperation::SpawnReserved {
+                                        reservation: reserved,
+                                        request: self.spawn.clone(),
+                                    },
+                                );
+                                self.stage = PluginSpawnStage::SpawnReserved;
+                            }
+                            Err(error) => {
+                                self.cleanup = CleanupStage::Confirmed;
+                                return spawn_fail(error, None);
+                            }
+                        },
+                        CoreTicketPoll::Ready(Ok(_)) => {
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
+                        }
                     }
-                },
+                }
                 PluginSpawnStage::Lookup => match self.poll_core(runtime) {
                     CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
                     CoreTicketPoll::Refused => {

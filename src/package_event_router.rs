@@ -757,12 +757,9 @@ impl PackageEventRouter {
         connection_id: &str,
         subscription_id: &str,
         mailbox: &Arc<crate::subscription::package_events::ClientEventMailbox>,
-    ) -> Result<(), crate::subscription::package_events::ClientCleanupFault> {
-        use crate::subscription::package_events::ClientCleanupFault;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| ClientCleanupFault::RouterPoisoned)?;
+    ) -> Result<(), crate::subscription::package_events::PoisonedCleanupLock> {
+        use crate::subscription::package_events::PoisonedCleanupLock;
+        let mut inner = self.inner.lock().map_err(|_| PoisonedCleanupLock::Router)?;
         let identity = (connection_id.to_string(), subscription_id.to_string());
         let Some(key) = inner.client_by_id.get(&identity) else {
             return Ok(());
@@ -1076,10 +1073,10 @@ impl PackageEventRouter {
                 }
                 if used_bytes + size > max_bytes && !ready.is_empty() {
                     inner.note_queued_copy(&copy.holder);
-                    if let Some(queue) = inner.consumers.get_mut(&plugin_key) {
-                        if queue.copies.is_empty() {
-                            inner.ready_consumers.insert(plugin_key.clone());
-                        }
+                    if let Some(queue) = inner.consumers.get_mut(&plugin_key)
+                        && queue.copies.is_empty()
+                    {
+                        inner.ready_consumers.insert(plugin_key.clone());
                     }
                     if let Some(queue) = inner.consumers.get_mut(&plugin_key) {
                         queue.events += 1;

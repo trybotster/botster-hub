@@ -162,44 +162,44 @@ impl HostPackageCleanup {
 impl FamilyCleanupCursor {
     fn select_detached(&mut self) -> Option<Selection> {
         let cursor = self;
-        if let Some((_, retired)) = &mut cursor.retired {
-            if let Some(family) = retired {
-                assert!(
-                    cursor.payload.is_none()
-                        && cursor.mutation_lease.is_none()
-                        && cursor.resync_lease.is_none()
-                );
-                if let Some((seq, payload)) = family.pending_by_seq.pop_first() {
-                    cursor.payload = Some(payload);
-                    cursor.mutation_lease = family.pending_leases.remove(&seq);
-                    cursor.release = cursor.mutation_lease.as_ref().map(mutation_release);
-                    cursor.awaiting_worker = true;
-                    return Some(Selection::Payload);
-                }
-                if let Some((_, lease)) = family.pending_leases.pop_first() {
-                    cursor.mutation_lease = Some(lease);
-                    cursor.release = cursor.mutation_lease.as_ref().map(mutation_release);
-                    return Some(Selection::Pending);
-                }
-                if !family.resync.leases.is_empty() {
-                    let family_token = family
-                        .causal_token
-                        .expect("resync lease has a family token");
-                    cursor.resync_lease = family.resync.leases.pop_first();
-                    cursor.release = Some(CausalOp::Release {
-                        scope_id: cursor
-                            .resync_lease
-                            .as_ref()
-                            .expect("the resync lease is retained")
-                            .0,
-                        identity: LeaseIdentity::ProviderResyncNeed { family_token },
-                    });
-                    return Some(Selection::Pending);
-                }
-                // Clear the state after its maps and lease set become empty.
-                *retired = None;
+        if let Some((_, retired)) = &mut cursor.retired
+            && let Some(family) = retired
+        {
+            assert!(
+                cursor.payload.is_none()
+                    && cursor.mutation_lease.is_none()
+                    && cursor.resync_lease.is_none()
+            );
+            if let Some((seq, payload)) = family.pending_by_seq.pop_first() {
+                cursor.payload = Some(payload);
+                cursor.mutation_lease = family.pending_leases.remove(&seq);
+                cursor.release = cursor.mutation_lease.as_ref().map(mutation_release);
+                cursor.awaiting_worker = true;
+                return Some(Selection::Payload);
+            }
+            if let Some((_, lease)) = family.pending_leases.pop_first() {
+                cursor.mutation_lease = Some(lease);
+                cursor.release = cursor.mutation_lease.as_ref().map(mutation_release);
                 return Some(Selection::Pending);
             }
+            if !family.resync.leases.is_empty() {
+                let family_token = family
+                    .causal_token
+                    .expect("resync lease has a family token");
+                cursor.resync_lease = family.resync.leases.pop_first();
+                cursor.release = Some(CausalOp::Release {
+                    scope_id: cursor
+                        .resync_lease
+                        .as_ref()
+                        .expect("the resync lease is retained")
+                        .0,
+                    identity: LeaseIdentity::ProviderResyncNeed { family_token },
+                });
+                return Some(Selection::Pending);
+            }
+            // Clear the state after its maps and lease set become empty.
+            *retired = None;
+            return Some(Selection::Pending);
         }
         None
     }

@@ -470,21 +470,17 @@ impl ClientEventMailbox {
     }
 
     /// The worker retains the slot and its residency until payload destruction finishes.
-    fn reclaim(&self) -> Result<(), ClientCleanupFault> {
+    fn reclaim(&self) -> Result<(), PoisonedCleanupLock> {
         let mut slots = self
             .slots
             .lock()
-            .map_err(|_| ClientCleanupFault::MailboxPoisoned)?;
+            .map_err(|_| PoisonedCleanupLock::Mailbox)?;
         let mut inner = self
             .inner
             .lock()
-            .map_err(|_| ClientCleanupFault::MailboxPoisoned)?;
+            .map_err(|_| PoisonedCleanupLock::Mailbox)?;
         let mut residency = match self.connection_pool.as_ref() {
-            Some(pool) => Some(
-                pool.inner
-                    .lock()
-                    .map_err(|_| ClientCleanupFault::PoolPoisoned)?,
-            ),
+            Some(pool) => Some(pool.inner.lock().map_err(|_| PoisonedCleanupLock::Pool)?),
             None => None,
         };
         self.retire();
@@ -712,14 +708,14 @@ impl ClientEventConnection {
         }
     }
 
-    fn lock_slots(&self) -> Result<ClientSlotsGuard<'_>, ClientCleanupFault> {
+    fn lock_slots(&self) -> Result<ClientSlotsGuard<'_>, PoisonedCleanupLock> {
         self.slots
             .lock()
             .map(|guard| ClientSlotsGuard {
                 connection: self,
                 guard: Some(guard),
             })
-            .map_err(|_| ClientCleanupFault::ConnectionPoisoned)
+            .map_err(|_| PoisonedCleanupLock::Connection)
     }
 
     fn mailbox(&self) -> Option<Arc<ClientEventMailbox>> {
@@ -809,12 +805,13 @@ impl std::fmt::Debug for ClientEventPlane {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientCleanupFault {
-    PlanePoisoned,
-    ConnectionPoisoned,
-    RouterPoisoned,
-    MailboxPoisoned,
-    PoolPoisoned,
+/// The lock whose poisoning stopped a client cleanup.
+pub(crate) enum PoisonedCleanupLock {
+    Plane,
+    Connection,
+    Router,
+    Mailbox,
+    Pool,
 }
 
 #[derive(Debug)]
@@ -832,7 +829,7 @@ pub(crate) struct ClientCleanupCompletion {
 #[derive(Debug)]
 pub(crate) struct ClientCleanupFailure {
     pub(crate) work: ClientCleanupWork,
-    pub(crate) fault: ClientCleanupFault,
+    pub(crate) fault: PoisonedCleanupLock,
 }
 
 impl ClientCleanupWork {
@@ -856,7 +853,7 @@ impl ClientCleanupWork {
         }
     }
 
-    fn apply(&self, router: &PackageEventRouter) -> Result<bool, ClientCleanupFault> {
+    fn apply(&self, router: &PackageEventRouter) -> Result<bool, PoisonedCleanupLock> {
         #[cfg(test)]
         if self.connection.panic_cleanup.swap(false, Ordering::AcqRel) {
             panic!("client cleanup worker panic");
@@ -911,7 +908,7 @@ impl ClientCleanupWork {
                 .plane
                 .connections
                 .lock()
-                .map_err(|_| ClientCleanupFault::PlanePoisoned)?;
+                .map_err(|_| PoisonedCleanupLock::Plane)?;
             if connections
                 .get(self.connection.identity.as_ref())
                 .is_some_and(|current| Arc::ptr_eq(current, &self.connection))

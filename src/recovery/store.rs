@@ -195,11 +195,11 @@ impl PreparedRecoveryWrite {
             }
             Err(FileCommitError::Preparation(error))
             | Err(FileCommitError::BeforePublication { error, .. }) => {
-                return Err(RecoveryCommitError::Write {
+                Err(RecoveryCommitError::Write {
                     error,
                     attempt,
                     phase,
-                });
+                })
             }
         }
     }

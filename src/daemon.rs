@@ -394,17 +394,16 @@ pub(crate) fn load_enabled_local_plugins(
     let prepared = package_registry
         .prepare_enabled_local_packages("daemon startup load enabled local plugin packages")?;
     for package in prepared {
-        if package.selected_lua_entrypoint().is_some() {
-            if let Err(error) =
+        if package.selected_lua_entrypoint().is_some()
+            && let Err(error) =
                 runtime.load_lua_plugin_package(package_registry, &package.package_name)
-            {
-                if !error.is_package_scoped_startup_failure() {
-                    return Err(error.into());
-                }
-                // The failed package stays unloaded. Startup records the exact
-                // package failure and continues with healthy siblings.
-                runtime.record_startup_plugin_load_failure(&package.package_name, &error);
+        {
+            if !error.is_package_scoped_startup_failure() {
+                return Err(error.into());
             }
+            // The failed package stays unloaded. Startup records the exact
+            // package failure and continues with healthy siblings.
+            runtime.record_startup_plugin_load_failure(&package.package_name, &error);
         }
     }
     Ok(())

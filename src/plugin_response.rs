@@ -99,15 +99,15 @@ fn shape_response(
             format!("plugin completion identity did not match admitted request {request_id}"),
         );
     }
-    if let Ok(PluginInvocationResult::Failed(failure)) = &result {
-        if failure.kind == PluginInvocationFailureKind::CompletionTooLarge {
-            return plugin_preparation_error(
-                kind,
-                transport_request_id,
-                "plugin_response_too_large",
-                &failure.reason,
-            );
-        }
+    if let Ok(PluginInvocationResult::Failed(failure)) = &result
+        && failure.kind == PluginInvocationFailureKind::CompletionTooLarge
+    {
+        return plugin_preparation_error(
+            kind,
+            transport_request_id,
+            "plugin_response_too_large",
+            &failure.reason,
+        );
     }
     let result =
         result.map_err(|message| McpToolError::new("plugin_completion_inconsistent", message));

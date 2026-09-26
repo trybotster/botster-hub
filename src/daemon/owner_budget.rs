@@ -206,7 +206,7 @@ impl OwnerBudget {
     }
 
     pub(crate) fn release(&mut self, permit: OwnerPermit) {
-        drop(permit);
+        let OwnerPermit(()) = permit;
         self.outstanding = self.outstanding.saturating_sub(1);
         self.released = true;
     }
