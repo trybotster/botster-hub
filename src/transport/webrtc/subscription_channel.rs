@@ -1445,22 +1445,32 @@ mod tests {
     #[test]
     fn close_all_releases_held_permits_without_reentering_the_route_table() {
         use crate::admission::connection_budget::{
-            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+            AGGREGATE_BUFFERED_HIGH, AGGREGATE_BUFFERED_LOW, ConnectionBudget,
         };
-        let mut budget = ConnectionBudget::default();
-        let sibling_usage = budget
-            .reserve("sibling".to_string(), ChannelClass::Terminal)
-            .expect("reserve sibling");
+        let budget = ConnectionBudget::default();
         let mux = WebRtcConnectionMux::new();
         let (mut holder, holder_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
         mux.register("s".into(), "holder".into(), 1, holder_handle.clone());
         let (mut waiter, waiter_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
-        assert_eq!(holder.try_write(&test_frame(b"held")), Ok(()));
-        sibling_usage.store(AGGREGATE_BUFFERED_HIGH, Ordering::Release);
+        // The held permit alone refuses the waiter's write, and its release
+        // brings the aggregate below the low mark, so the release runs the
+        // waiters while close_all holds the route table.
         assert_eq!(
-            waiter.try_write(&test_frame(b"refused")),
+            holder.try_write(&test_frame(&vec![
+                b'h';
+                AGGREGATE_BUFFERED_HIGH / 2 - 64 * 1024
+            ])),
+            Ok(())
+        );
+        assert!(budget.aggregate_buffered() < AGGREGATE_BUFFERED_LOW);
+        assert_eq!(
+            waiter.try_write(&test_frame(&vec![
+                b'w';
+                AGGREGATE_BUFFERED_HIGH / 2 + 128 * 1024
+            ])),
             Err(TerminalAdapterWriteError::WouldBlock)
         );
+        assert!(waiter_handle.aggregate_blocked_for_test());
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let closing = mux.clone();
         std::thread::spawn(move || {
@@ -1471,7 +1481,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("close_all returns while it releases a held permit");
         assert!(holder_handle.is_closed());
-        assert!(waiter_handle.aggregate_blocked_for_test());
+        assert!(
+            !waiter_handle.aggregate_blocked_for_test(),
+            "the released permit woke the refused writer"
+        );
         drop((holder, waiter));
     }
 

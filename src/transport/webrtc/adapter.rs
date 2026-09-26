@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use botster_core::contract::terminal_adapter::{
     TerminalAdapter, TerminalAdapterPressure, TerminalAdapterWriteError, TerminalIngress,
@@ -47,7 +47,8 @@ struct WebRtcTerminalAdapterInner {
     slot: AdapterSlot<AdapterWake>,
     aggregate: Option<Arc<crate::admission::connection_budget::ConnectionAggregate>>,
     aggregate_permit: Mutex<Option<crate::admission::connection_budget::AggregateSendPermit>>,
-    aggregate_blocked: AtomicBool,
+    /// Wire bytes of the write the aggregate refused; zero when none is.
+    aggregate_blocked: AtomicUsize,
 }
 
 impl WebRtcTerminalAdapterInner {
@@ -59,7 +60,7 @@ impl WebRtcTerminalAdapterInner {
             ),
             aggregate: None,
             aggregate_permit: Mutex::new(None),
-            aggregate_blocked: AtomicBool::new(false),
+            aggregate_blocked: AtomicUsize::new(0),
         }
     }
 
@@ -91,7 +92,7 @@ impl WebRtcTerminalAdapterInner {
             return TerminalAdapterPressure::Closed;
         }
         self.refresh_aggregate_pressure();
-        if self.aggregate_blocked.load(Ordering::Acquire) {
+        if self.aggregate_blocked.load(Ordering::Acquire) != 0 {
             return TerminalAdapterPressure::WouldBlock;
         }
         self.slot.pressure()
@@ -108,7 +109,8 @@ impl WebRtcTerminalAdapterInner {
                 crate::transport::webrtc::delivery::sealed_terminal_wire_len(frame.frame.len())
                     .unwrap_or(usize::MAX);
             let Some(permit) = aggregate.try_authorize(wire_len) else {
-                self.aggregate_blocked.store(true, Ordering::Release);
+                self.aggregate_blocked
+                    .store(wire_len.max(1), Ordering::Release);
                 // A release that ran before the mark saw nothing to wake.
                 self.refresh_aggregate_pressure();
                 return Err(TerminalAdapterWriteError::WouldBlock);
@@ -151,12 +153,22 @@ impl WebRtcTerminalAdapterInner {
         result
     }
 
+    /// Resume a refused writer once the aggregate is below the low mark and
+    /// the refused write fits. A write larger than the high mark never fits;
+    /// it resumes below the low mark and meets Core's write budget.
     fn refresh_aggregate_pressure(&self) {
-        let can_resume = self
-            .aggregate
-            .as_ref()
-            .is_none_or(|aggregate| aggregate.below_low_water());
-        if can_resume && self.aggregate_blocked.swap(false, Ordering::AcqRel) {
+        let need = self.aggregate_blocked.load(Ordering::Acquire);
+        if need == 0 {
+            return;
+        }
+        let can_resume = self.aggregate.as_ref().is_none_or(|aggregate| {
+            let buffered = aggregate.buffered();
+            buffered < crate::admission::connection_budget::AGGREGATE_BUFFERED_LOW
+                && (need > crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH
+                    || buffered.saturating_add(need)
+                        <= crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH)
+        });
+        if can_resume && self.aggregate_blocked.swap(0, Ordering::AcqRel) != 0 {
             self.slot.notify_writable();
         }
     }
@@ -202,7 +214,8 @@ impl WebRtcTerminalAdapterInner {
         } else if let Some(existing) = permit.as_mut() {
             let permitted = existing.try_resize(frame_len);
             if !permitted {
-                self.aggregate_blocked.store(true, Ordering::Release);
+                self.aggregate_blocked
+                    .store(frame_len.max(1), Ordering::Release);
             }
             permitted
         } else {
@@ -211,7 +224,9 @@ impl WebRtcTerminalAdapterInner {
         if permitted {
             // Publish the full wire bound before releasing its authorization.
             usage.fetch_add(frame_len, Ordering::Release);
-            permit.take();
+            if let Some(permit) = permit.take() {
+                permit.transferred();
+            }
         }
         drop(permit);
         if self.is_closed() {
@@ -221,20 +236,14 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn release_aggregate_permit(&self) {
-        // A contended holder releases the permit after it drops its guard.
+        // A contended holder takes the permit itself. Whichever holder
+        // takes it, the permit's drop wakes the senders waiting for it.
         let released = match self.aggregate_permit.try_lock() {
             Ok(mut permit) => permit.take(),
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().take(),
             Err(std::sync::TryLockError::WouldBlock) => None,
         };
-        // A closing route's authorization returns to its peer: wake the
-        // routes waiting for capacity after the permit is dropped.
-        if released.is_some() {
-            drop(released);
-            if let Some(aggregate) = self.aggregate.as_ref() {
-                aggregate.capacity_released();
-            }
-        }
+        drop(released);
     }
 }
 
@@ -285,7 +294,7 @@ impl WebRtcTerminalAdapter {
             slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
             aggregate,
             aggregate_permit: Mutex::new(None),
-            aggregate_blocked: AtomicBool::new(false),
+            aggregate_blocked: AtomicUsize::new(0),
         });
         if let Some(aggregate) = inner.aggregate.as_ref() {
             let waiter: std::sync::Weak<dyn crate::admission::connection_budget::CapacityWaiter> =
@@ -738,7 +747,7 @@ impl WebRtcTerminalAdapterHandle {
 
     #[cfg(test)]
     pub(crate) fn aggregate_blocked_for_test(&self) -> bool {
-        self.inner.aggregate_blocked.load(Ordering::Acquire)
+        self.inner.aggregate_blocked.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
@@ -903,6 +912,82 @@ mod tests {
         assert_eq!(budget.aggregate_buffered(), filled.load(Ordering::Acquire));
         assert_eq!(sibling.try_write(&sibling_frame), Ok(()));
         assert!(sibling_handle.snapshot_active().is_some());
+    }
+
+    /// A close that finds the permit lock held leaves the permit to that
+    /// holder. The holder's later release must still wake a sender the
+    /// aggregate refused.
+    #[test]
+    fn a_contended_close_wakes_refused_senders_from_the_holder_release() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, AGGREGATE_BUFFERED_LOW, ChannelClass, ConnectionBudget,
+        };
+        for holder_path in ["transfer_aggregate_permit", "complete_active"] {
+            let mut budget = ConnectionBudget::default();
+            let _usage = budget
+                .reserve("route".into(), ChannelClass::Terminal)
+                .expect("route budget");
+            let mux = WebRtcConnectionMux::new();
+            let (mut holder, holder_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+            let (mut refused, refused_handle) =
+                mux.create_adapter_with_aggregate(budget.aggregate());
+            let wire = |frame: &RoutedTerminalFrame| {
+                crate::transport::webrtc::delivery::sealed_terminal_wire_len(frame.frame.len())
+                    .expect("wire len")
+            };
+            let frame = test_frame(&vec![b'h'; 64 * 1024]);
+            let wire_len = wire(&frame);
+            assert_eq!(holder.try_write(&frame), Ok(()));
+            // A write that fits an empty aggregate but not beside the held
+            // permit, which keeps the aggregate below the low mark.
+            let mut refused_len = AGGREGATE_BUFFERED_HIGH;
+            let big = loop {
+                let candidate = test_frame(&vec![b'x'; refused_len]);
+                if wire(&candidate) <= AGGREGATE_BUFFERED_HIGH - wire_len / 2 {
+                    break candidate;
+                }
+                refused_len -= 1024;
+            };
+            assert!(wire(&big) + wire_len > AGGREGATE_BUFFERED_HIGH);
+            assert!(budget.aggregate_buffered() < AGGREGATE_BUFFERED_LOW);
+            assert_eq!(
+                refused.try_write(&big),
+                Err(TerminalAdapterWriteError::WouldBlock)
+            );
+            assert!(refused_handle.aggregate_blocked_for_test());
+
+            // Close while another holder has the permit lock.
+            let guard = holder_handle
+                .inner
+                .aggregate_permit
+                .lock()
+                .expect("hold permit lock");
+            let closer = std::thread::spawn({
+                let holder_handle = holder_handle.clone();
+                move || holder_handle.close()
+            });
+            closer.join().expect("close thread");
+            assert!(holder_handle.is_closed());
+            assert!(guard.is_some(), "the contended close left the permit");
+            drop(guard);
+            assert!(refused_handle.aggregate_blocked_for_test());
+
+            // The holder path meets the closed adapter and drops the permit.
+            match holder_path {
+                "transfer_aggregate_permit" => {
+                    let usage = std::sync::atomic::AtomicUsize::new(0);
+                    assert!(!holder_handle.transfer_aggregate_permit(wire_len, &usage));
+                }
+                _ => {
+                    let _ = holder_handle.complete_active();
+                }
+            }
+            assert!(
+                !refused_handle.aggregate_blocked_for_test(),
+                "{holder_path}: the holder's release woke the refused sender"
+            );
+            drop((holder, refused));
+        }
     }
 
     #[test]
