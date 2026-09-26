@@ -102,8 +102,15 @@ impl WebRtcTerminalAdapterInner {
             return Err(TerminalAdapterWriteError::Closed);
         }
         let permit = if let Some(aggregate) = self.aggregate.as_ref() {
-            let Some(permit) = aggregate.try_authorize(frame.frame.len()) else {
+            // Authorize the exact sealed size, so the flush never needs more
+            // than this permit holds.
+            let wire_len =
+                crate::transport::webrtc::delivery::sealed_terminal_wire_len(frame.frame.len())
+                    .unwrap_or(usize::MAX);
+            let Some(permit) = aggregate.try_authorize(wire_len) else {
                 self.aggregate_blocked.store(true, Ordering::Release);
+                // A release that ran before the mark saw nothing to wake.
+                self.refresh_aggregate_pressure();
                 return Err(TerminalAdapterWriteError::WouldBlock);
             };
             Some(permit)
@@ -215,15 +222,29 @@ impl WebRtcTerminalAdapterInner {
 
     fn release_aggregate_permit(&self) {
         // A contended holder releases the permit after it drops its guard.
-        match self.aggregate_permit.try_lock() {
-            Ok(mut permit) => {
-                permit.take();
+        let released = match self.aggregate_permit.try_lock() {
+            Ok(mut permit) => permit.take(),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().take(),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        // A closing route's authorization returns to its peer: wake the
+        // routes waiting for capacity after the permit is dropped.
+        if released.is_some() {
+            drop(released);
+            if let Some(aggregate) = self.aggregate.as_ref() {
+                aggregate.capacity_released();
             }
-            Err(std::sync::TryLockError::Poisoned(error)) => {
-                error.into_inner().take();
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {}
         }
+    }
+}
+
+impl crate::admission::connection_budget::CapacityWaiter for WebRtcTerminalAdapterInner {
+    fn capacity_released(&self) {
+        self.refresh_aggregate_pressure();
+    }
+
+    fn retired(&self) -> bool {
+        self.is_closed()
     }
 }
 
@@ -266,6 +287,11 @@ impl WebRtcTerminalAdapter {
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
         });
+        if let Some(aggregate) = inner.aggregate.as_ref() {
+            let waiter: std::sync::Weak<dyn crate::admission::connection_budget::CapacityWaiter> =
+                Arc::downgrade(&inner) as _;
+            aggregate.register_waiter(waiter);
+        }
         (
             Self {
                 inner: Arc::clone(&inner),
@@ -710,6 +736,11 @@ impl WebRtcTerminalAdapterHandle {
         self.inner.transfer_aggregate_permit(frame_len, usage)
     }
 
+    #[cfg(test)]
+    pub(crate) fn aggregate_blocked_for_test(&self) -> bool {
+        self.inner.aggregate_blocked.load(Ordering::Acquire)
+    }
+
     pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
         self.inner.slot.attach_close_hook(hook);
     }
@@ -855,7 +886,10 @@ mod tests {
             sibling_handle.clone(),
         );
         let occupied = test_frame(b"occupied-late-budget");
-        let occupied_len = occupied.frame.len();
+        // The write permit covers the sealed wire size.
+        let occupied_len =
+            crate::transport::webrtc::delivery::sealed_terminal_wire_len(occupied.frame.len())
+                .expect("wire len");
         let sibling_frame = test_frame(b"sibling-late-budget");
         filled.store(
             AGGREGATE_BUFFERED_HIGH - occupied_len - 32,
