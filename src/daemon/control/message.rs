@@ -266,6 +266,7 @@ impl DaemonDeliveryKind {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn daemon_delivery_kind(_response: &DaemonResponse) -> DaemonDeliveryKind {
     DaemonDeliveryKind::Control
 }

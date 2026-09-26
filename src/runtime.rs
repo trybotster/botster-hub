@@ -826,6 +826,7 @@ impl HubRuntime {
         Self::from_initialized_state(config, publication, authority)
     }
 
+    #[cfg(test)]
     fn from_validated_state(config: HubConfig, state: HubState) -> HubRuntimeResult<Self> {
         Self::from_initialized_state(config, HubStatePublication::new(state)?, None)
     }
@@ -1019,6 +1020,7 @@ impl HubRuntime {
     }
 
     /// Return the committed package registry view shared with Lua plugins.
+    #[cfg(test)]
     pub(crate) fn package_registry_publication(&self) -> SharedPackageRegistry {
         Arc::clone(&self.package_registry)
     }
@@ -1559,6 +1561,7 @@ impl HubRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_direct_package_entity_cleanup(
         &self,
         cleanup: &mut HostPackageCleanup,
@@ -2624,6 +2627,7 @@ impl HubRuntime {
         self.entity_model_readiness().publication != publication::Next::Idle
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_entity_publish_daemon_owned(&self) {
         self.package_entities
             .lock()
@@ -2996,6 +3000,7 @@ impl HubRuntime {
         self.package_entity_resync_changed.replace(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn package_entity_resync_next_attempt(&self, entity_type: &str) -> Option<Instant> {
         let model = self
             .package_entities
@@ -4287,6 +4292,7 @@ impl HubRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn retract_spawn_context(
         &self,
         context: &HubSessionContext,
@@ -4446,6 +4452,7 @@ impl HubRuntime {
     /// exists, declare the adapter, attach, look up the new generation, bind
     /// the adapter. Any failure after attach detaches again so Core holds no
     /// route without an adapter. Nothing here waits on the owner thread.
+    #[cfg(test)]
     pub(crate) fn attach_and_bind_terminal(
         &self,
         plan: AttachBindPlan,
