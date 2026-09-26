@@ -1,7 +1,8 @@
 # Plugin platform design
 
-Status: revision 4 for review (2026-09-26). Owner: plugin-platform Hub writer.
-Revisions 1 (`4e6f5aa2`), 2 (`0bc5c83e`), and 3 (`affb2368`) were rejected;
+Status: revision 5 for review (2026-09-26). Owner: plugin-platform Hub writer.
+Revisions 1 (`4e6f5aa2`), 2 (`0bc5c83e`), 3 (`affb2368`), and 4 (`781ebb57`)
+were rejected;
 section 17 maps every finding to its answer.
 
 Scope: the Lua-facing platform that first-party plugins need, starting with
@@ -254,7 +255,7 @@ as a suspendable handler too.
 
 ```lua
 local watch = botster.capabilities.store.watch({ collection = "questions" }, function(event)
-  -- event.value = { latest_seq = 42 }; pull the changes with store.changes
+  -- event.value = { collection = "questions", changed = true }; re-query the indexes
 end)
 watch.value:cancel()
 ```
@@ -275,10 +276,10 @@ A stream has three separate lifetimes, each with its own bound:
   stream reserves one fixed-size record before the resource exists: a timer
   record holds `sequence` and `missed`; a watch record holds a change kind,
   an `overflow` flag, and one path buffer of the OS path maximum (`PATH_MAX`,
-  an OS fact, not a policy number); a change-feed record holds only the
-  latest commit sequence (section 11.2). New occurrences fold into the record
-  (timers count `missed`; a watch that sees a second path sets `overflow`; a
-  feed raises its sequence). No occurrence allocates.
+  an OS fact, not a policy number); a store-watch record holds only its
+  collection and a `changed` flag (section 11.2). New occurrences fold into
+  the record (timers count `missed`; a watch that sees a second path sets
+  `overflow`; a store watch stays `changed`). No occurrence allocates.
 - **Capacity wake.** When `try_admit` returns `Backpressured`, the record
   stays pending. The next completion that the plugin's own worker publishes
   (the existing `PluginCompletionPublished` notifier) frees Background
@@ -328,27 +329,38 @@ path) and the Core process-host writer (engine and IPC; premise
    completion of the result invocation (or that invocation fails or is
    cancelled), or at `release_call`. A cancelled call keeps its unit until
    its `cancelled` result's completion is drained or the generation retires.
-6. **USER DECISION (pool size):** slots = the capability operation capacity
-   (128); request bytes and completion bytes = the plugin's Background queue
-   byte capacity (1 MiB) and the completion reservation bytes the engine
-   already configures.
+6. **USER DECISION (pool size, amended 2026-09-26, Option A):** the plugin's
+   existing Background queue byte capacity (1 MiB) is split. The host-call
+   pool gets 512 KiB of request and result bytes and 128 slots (the
+   capability operation capacity); ordinary Background work (stream events,
+   package events, session-family frames) keeps a guaranteed 512 KiB. The
+   total does not change. A single host-call result larger than 512 KiB fails
+   with `{ kind = "failed", detail = "response_too_large" }`; large downloads
+   need a future streaming or file capability, not in this plan.
 
 ### 5.2 Memory outside the pool, and the per-plugin share
 
 | Allocation | Charged to | Held until |
 | --- | --- | --- |
-| `HostCall` request body | the plugin's request credit (count and bytes), debited before send | the backend finishes the call **and** the decoded request is dropped |
-| Decoded request in the Hub | the same request credit, sized by the existing bounded JSON accounting walker (representation overhead included) before decoding completes | as above |
+| `HostCall` frame bytes at parent ingress (process host) | Core's ingress credit, debited by the child before send | the Hub dequeues the call (Core contract, unchanged) |
+| Decoded request in the Hub, until the backend is done with it | a retained backend charge from the plugin share, sized by the existing bounded JSON accounting walker (representation overhead included) | the backend finishes, fails, or cancels the call, or the generation retires |
 | Producer buffer (HTTP body, file read, query page) | the call's result allowance inside the plugin share, before each growth step | encoding finishes |
 | Encoded completion | the call's pool unit | the result's completion is drained |
 | Stream pending-event records | the plugin share, at arm time | the stream is disarmed |
 | Chain ledger entries (section 4.2) | a fixed ledger charge from the plugin share, at root admission | the entry is removed |
 | Module staging (section 7.4) | the plugin share, at load | the VM's own accounting holds the text |
 
-- **Request credit.** The request credit returns only when the backend has
-  finished with the call and the decoded request is gone, not when the Hub
-  dequeues the call. So repeated calls cannot accumulate decoded bodies
-  beyond the credit.
+- **Two credits, two lifetimes.** Core's ingress credit covers the frame
+  while it waits in the parent's ingress queue and returns when the Hub
+  dequeues the call (Core contract). At that dequeue, the Hub takes a
+  retained backend charge from the plugin's share **before** it acknowledges
+  the dequeue, so the bytes are always charged to one of the two. If the
+  share cannot cover the decoded request, the Hub answers the call with a
+  `backpressured` result through `admit_result` (its pool unit guarantees the
+  delivery) and decodes nothing. The retained charge has one release point:
+  the backend's terminal for the call (success, failure, cancellation) or
+  generation retirement. So repeated calls cannot accumulate decoded bodies
+  beyond the share.
 - **Serialization overlap.** While a completion is encoded, its producer
   buffer and its encoded bytes both exist, so the result part of the share is
   twice the pool bytes.
@@ -797,25 +809,20 @@ store.watch({ collection = "run_steps", index = "by_session", equals = { sid } }
 - **Atomic batches** validate every revision and index change, then commit
   as one Core batch (at most 256 operations, the existing Core ceiling).
   Index entries are written in the same transaction as the documents.
-- **Change feeds.** Every commit gets a per-collection commit sequence. The
-  store keeps a change index `(commit_seq, id)` per collection; a delete
-  leaves a tombstone entry. A watch event carries only `latest_seq` (a fixed
-  size, section 4.3). The plugin pulls the changes with a bounded, paged host
-  call:
-  `store.changes({ collection = "questions", since_seq = 41, limit = 100, max_bytes = 65536 })`
-  returns `{ changes = { { seq, op = "put" | "delete", id } }, cursor }`;
-  the plugin then reads documents with `get` or `query`. Nothing is lost when
-  events fold together, because the change index is the record. Tombstones
-  and change entries are kept until every watch cursor of that collection has
-  passed them, and they count against `max_plugin_bytes`.
-- **Watch cursors.** A watch stores its acknowledged sequence; `store.changes`
-  advances it. A cancelled watch releases its cursor, so it no longer holds
-  tombstones.
+- **Store watches are bounded resync notifications.** A watch on a
+  collection delivers `{ collection, changed = true }` after one or more
+  commits touched the collection; further commits fold into the one pending
+  record (section 4.3). The plugin then re-queries the indexes it cares
+  about. There is no durable change log, no cursor, and no tombstone, so a
+  watch holds no store data and costs nothing after it is cancelled. Plugins
+  that need the exact set of changes keep their own `updated_seq` field and
+  an index on it.
 - **Entity projection.** The manifest may bind a collection to a package
   entity family with a field allowlist
   (`"entities": { "project-pipelines.run": { "collection": "runs", "fields": [...] } }`).
-  The Hub then serves snapshots from the collection and live changes from its
-  change feed, with no plugin code. Plugins can still publish computed
+  The Hub then serves snapshots from the collection and live changes from
+  each commit's own diff, which the commit path hands to the projection
+  synchronously, with no plugin code and no change log. Plugins can still publish computed
   entities with `botster.entity_publish`.
 - Layout on the existing redb keyed store: documents under
   `c/<collection>/d/<id>`, index entries under
@@ -1059,8 +1066,8 @@ setup.
 | 0 | Sandbox (section 14) | none | Host-file `dofile`/`loadfile` fail; bytecode `load` fails; `string.dump`, `print` absent; `collectgarbage("collect")` refused; a `pcall` spin fails at the budget; text `load` works. Per-guard control VM probes. |
 | 1 | Per-package grants (section 17 item 5); result convention for existing helpers; ABI doc rewrite | none | A package without `plugin_db` gets `capability_denied` while a granted sibling succeeds; the literal grant list is gone (ablation: restore it, the denial test fails). |
 | 2 | `log`, `json`, `clock`, `require` | log limits decision | `require` of a sibling module works; a symlinked or `..` module fails the load; log records reach `get_plugin_logs` with package and level; a flooding plugin drops records and reports the count without blocking. |
-| 3 | Suspendable handlers, delivery pool, credits, call ledger, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload; a host call completed before the issuing invocation's `suspended` result is published still answers the MCP caller (a test gate holds the issuing executor after the yield, before publication); a Hub refusal after the yield resumes the handler with the typed error; a pool-exhausted plugin's next call returns `backpressured` without suspending; a timer record parked on `Backpressured` is delivered after the plugin's next completion, with no new timer fire (ablation: remove the completion-notifier re-arm, the record stays parked); a plugin whose share cannot be reserved fails to load with `quota_exceeded` while a loaded sibling keeps answering; decoded request bytes stay charged until the backend disposes them (ablation: return the credit at dequeue, the accounting assertion fails). |
-| 4 | Storage collections (section 11) | key quota decision | Index query returns exactly the bound range with a limit; a batch with one stale revision changes nothing; a watch folds several commits into one event whose `latest_seq` is the last commit, and `store.changes` then returns every change including deletes (ablation: drop tombstones, the delete is missing); a collection projection serves a snapshot and a live change to an entity subscriber. |
+| 3 | Suspendable handlers, delivery pool, credits, call ledger, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload; a host call completed before the issuing invocation's `suspended` result is published still answers the MCP caller (a test gate holds the issuing executor after the yield, before publication); a Hub refusal after the yield resumes the handler with the typed error; a pool-exhausted plugin's next call returns `backpressured` without suspending; a timer fires into an otherwise idle plugin while its pool is fully free, and again while every pool slot is in use (the ordinary 512 KiB carries both); a host-call result above 512 KiB fails with `response_too_large`; a timer record parked on `Backpressured` is delivered after the plugin's next completion, with no new timer fire (ablation: remove the completion-notifier re-arm, the record stays parked); a plugin whose share cannot be reserved fails to load with `quota_exceeded` while a loaded sibling keeps answering; decoded request bytes stay charged until the backend disposes them (ablation: return the credit at dequeue, the accounting assertion fails). |
+| 4 | Storage collections (section 11) | key quota decision | Index query returns exactly the bound range with a limit; a batch with one stale revision changes nothing; two watches on one collection each receive one notification for a burst of commits and one batch touching many documents; cancelling one watch leaves the other notified (ablation: remove folding, the second commit queues a second event); a collection projection delivers a delete from the commit diff to an entity subscriber; a collection projection serves a snapshot and a live change to an entity subscriber. |
 | 4b | Declarative views (section 12): schema, admission, projection, action routing; `surface_route` removed | none (user decision made); Web/TUI renderer work scheduled by the orchestrator | A manifest view over an undeclared family, an unknown field, or an unregistered action fails enable; an admitted view is projected to a daemon client; an action reaches the plugin handler with validated input and returns its result; a collection change reaches a client subscribed to the view's family; ablation: removing the field-allowlist check lets the invalid manifest enable. |
 | 5 | Sessions, messaging, caller identity (section 9) | cross-plugin control, message tools, caller auth decisions | A plugin cannot close a session it does not own without `:any`; post/receive round trip between two sessions; a forged caller is refused (option A). |
 | 6 | HTTP, secrets, filesystem roots (section 8) | network policy decision | A non-granted origin is denied; a secret-bound header is sent only to its origin; a symlink swapped in during a read is refused; `..` is refused before I/O; watch overflow delivers one `overflow`. |
@@ -1157,6 +1164,22 @@ setup.
    carry a retained charge and are bounded per plugin.
 5. **User decisions**: every product decision is now a recorded user
    decision (Option A).
+
+### 17.4 Revision 4
+
+1. **Pool against ordinary capacity**: the user amended decision 1 to split
+   the 1 MiB Background byte capacity 512 KiB / 512 KiB (section 5.1); slice
+   3 proves a timer fire into an idle plugin with the pool fully free and
+   fully used.
+2. **Request credit ownership**: Core's ingress credit keeps its
+   return-at-dequeue lifetime; the Hub takes a separate retained backend
+   charge at dequeue, before acknowledging it, with one release point
+   (section 5.2).
+3. **Change-feed cursors**: durable replay is dropped. Store watches are
+   bounded resync notifications with no cursor or tombstone; entity
+   projections read each commit's diff in the commit path (section 11.2);
+   slice 4 tests two watches, folding across a many-document batch, and
+   cancellation.
 
 
 ## 18. User decisions (summary, all approved as Option A on 2026-09-26)
