@@ -449,6 +449,16 @@ fn bind_reserved_subscription(
     let bind_now = tick(&mut state.logical_clock);
     let generation = botster_core::TerminalSubscriptionGeneration(reservation.generation);
     let (adapter, handle) = mux.create_adapter_with_aggregate(aggregate);
+    handle.diagr_label(&reservation.subscription_id);
+    if crate::transport::webrtc::adapter::diagr(&reservation.subscription_id) {
+        crate::transport::webrtc::adapter::diagr_log(format_args!(
+            "bind start session={} sub={} gen={} label={label} peer_generation={peer_generation} epoch={}",
+            reservation.session_id,
+            reservation.subscription_id,
+            reservation.generation,
+            identity.epoch
+        ));
+    }
     // The bind runs on the Core owner thread; the reply follows as owner work.
     let client_id = identity.client_id.clone();
     let mut bind_plan = Some(BindRoutePlan {
@@ -513,12 +523,26 @@ fn bind_reserved_subscription(
                 CoreWorkPoll::Pending => return ObligationPoll::Pending,
                 CoreWorkPoll::Retry => false,
                 CoreWorkPoll::Lost => false,
-                CoreWorkPoll::Ready(result) => result.is_ok(),
+                CoreWorkPoll::Ready(result) => {
+                    if crate::transport::webrtc::adapter::diagr(&subscription_id) {
+                        crate::transport::webrtc::adapter::diagr_log(format_args!(
+                            "bind core result sub={subscription_id} ok={} handle={}",
+                            result.is_ok(),
+                            handle.diagr_state()
+                        ));
+                    }
+                    result.is_ok()
+                }
             };
             let (Some(reply_tx), Some(usage)) = (reply_tx.take(), usage.take()) else {
                 return ObligationPoll::Done;
             };
             if !bound {
+                if crate::transport::webrtc::adapter::diagr(&subscription_id) {
+                    crate::transport::webrtc::adapter::diagr_log(format_args!(
+                        "bind not bound sub={subscription_id}"
+                    ));
+                }
                 handle.close();
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
                 let _ = reply_tx.send(Err(BindReservedError::BindFailed));
@@ -541,6 +565,12 @@ fn bind_reserved_subscription(
             if reservation_bound {
                 crate::daemon::owner_loop::retire_reservation_deadline(state, &label);
             }
+            if crate::transport::webrtc::adapter::diagr(&subscription_id) {
+                crate::transport::webrtc::adapter::diagr_log(format_args!(
+                    "bind fence sub={subscription_id} still_owned={still_owned} reservation_bound={reservation_bound} handle={}",
+                    handle.diagr_state()
+                ));
+            }
             if !reservation_bound {
                 handle.close();
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
@@ -562,6 +592,12 @@ fn bind_reserved_subscription(
                 generation.0,
                 handle.clone(),
             );
+            if crate::transport::webrtc::adapter::diagr(&subscription_id) {
+                crate::transport::webrtc::adapter::diagr_log(format_args!(
+                    "bind registered sub={subscription_id} registered={registered} handle={}",
+                    handle.diagr_state()
+                ));
+            }
             if reply_tx
                 .send(Ok(BoundSubscription::Terminal {
                     handle: handle.clone(),
@@ -571,6 +607,11 @@ fn bind_reserved_subscription(
             {
                 // The channel gave up waiting: nobody will drive this
                 // adapter. Undo the bind for exactly this attachment.
+                if crate::transport::webrtc::adapter::diagr(&subscription_id) {
+                    crate::transport::webrtc::adapter::diagr_log(format_args!(
+                        "bind reply dropped sub={subscription_id}"
+                    ));
+                }
                 let _ = state.pending_runtime.cancel_stream_if(
                     &session_id,
                     &subscription_id,

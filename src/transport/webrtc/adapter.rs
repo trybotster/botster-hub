@@ -43,7 +43,77 @@ impl std::fmt::Debug for WebRtcTerminalAdapterHandle {
     }
 }
 
+// DIAGNOSTIC restart-route (not for commit).
+pub(crate) fn diagr(route: &str) -> bool {
+    route.contains("web-flood") || route.starts_with("btui-sub")
+}
+
+// Ring capture: events stay in memory and are written only on a dump,
+// so tracing does not add file I/O to the traced paths.
+static DIAGR_RING: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const DIAGR_RING_CAPACITY: usize = 8192;
+
+pub(crate) fn diagr_log(line: std::fmt::Arguments<'_>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let entry = format!("{now} {line}");
+    if let Ok(mut ring) = DIAGR_RING.lock() {
+        if ring.len() >= DIAGR_RING_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(entry);
+    }
+}
+
+/// Append the ring to /private/tmp/botster-diagr/ring-<pid>.log.
+pub(crate) fn diagr_dump(reason: &str) {
+    use std::io::Write;
+    let entries = DIAGR_RING
+        .lock()
+        .map(|mut ring| std::mem::take(&mut *ring))
+        .unwrap_or_default();
+    let _ = std::fs::create_dir_all("/private/tmp/botster-diagr");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!(
+            "/private/tmp/botster-diagr/ring-{}.log",
+            std::process::id()
+        ))
+    {
+        let _ = writeln!(file, "=== dump reason={reason} entries={}", entries.len());
+        for entry in entries {
+            let _ = writeln!(file, "{entry}");
+        }
+    }
+}
+
+/// Dump when /private/tmp/botster-diagr/dump-<pid> appears (checked every
+/// 500 ms on its own thread), then remove the trigger.
+pub(crate) fn diagr_start_dump_watcher() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("diagr-dump".into())
+            .spawn(|| {
+                let trigger = format!("/private/tmp/botster-diagr/dump-{}", std::process::id());
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if std::fs::remove_file(&trigger).is_ok() {
+                        diagr_dump("trigger");
+                    }
+                }
+            });
+    });
+}
+
 struct WebRtcTerminalAdapterInner {
+    diagr: std::sync::OnceLock<String>,
+    diagr_writes: std::sync::atomic::AtomicUsize,
+    diagr_first_close: AtomicBool,
     slot: AdapterSlot<AdapterWake>,
     aggregate: Option<Arc<crate::admission::connection_budget::ConnectionAggregate>>,
     aggregate_permit: Mutex<Option<crate::admission::connection_budget::AggregateSendPermit>>,
@@ -60,6 +130,9 @@ impl WebRtcTerminalAdapterInner {
             aggregate: None,
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
+            diagr: std::sync::OnceLock::new(),
+            diagr_writes: std::sync::atomic::AtomicUsize::new(0),
+            diagr_first_close: AtomicBool::new(true),
         }
     }
 
@@ -67,7 +140,24 @@ impl WebRtcTerminalAdapterInner {
         self.slot.is_closed()
     }
 
+    fn diagr_close(&self, how: &str) {
+        if let Some(route) = self.diagr.get() {
+            diagr_log(format_args!(
+                "adapter {how} route={route} closed_before={} host_closed_before={}",
+                self.slot.is_closed(),
+                self.slot.host_closed()
+            ));
+            if self.diagr_first_close.swap(false, Ordering::SeqCst) {
+                diagr_log(format_args!(
+                    "adapter first close backtrace route={route}:\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                ));
+            }
+        }
+    }
+
     fn close_from_host(&self) {
+        self.diagr_close("close_from_host");
         self.slot.close_from_host();
         self.release_aggregate_permit();
     }
@@ -78,6 +168,7 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn close(&self) {
+        self.diagr_close("close");
         self.slot.close();
         self.release_aggregate_permit();
     }
@@ -98,6 +189,25 @@ impl WebRtcTerminalAdapterInner {
     }
 
     fn try_write(&self, frame: &RoutedTerminalFrame) -> Result<(), TerminalAdapterWriteError> {
+        let result = self.try_write_inner(frame);
+        if let Some(route) = self.diagr.get()
+            && (self.diagr_writes.fetch_add(1, Ordering::SeqCst) < 12 || result.is_err())
+        {
+            diagr_log(format_args!(
+                "adapter try_write route={route} gen={} bytes={} result={result:?} closed={} aggregate_blocked={}",
+                frame.generation,
+                frame.frame.len(),
+                self.slot.is_closed(),
+                self.aggregate_blocked.load(Ordering::Acquire)
+            ));
+        }
+        result
+    }
+
+    fn try_write_inner(
+        &self,
+        frame: &RoutedTerminalFrame,
+    ) -> Result<(), TerminalAdapterWriteError> {
         if self.is_closed() {
             return Err(TerminalAdapterWriteError::Closed);
         }
@@ -265,6 +375,9 @@ impl WebRtcTerminalAdapter {
             aggregate,
             aggregate_permit: Mutex::new(None),
             aggregate_blocked: AtomicBool::new(false),
+            diagr: std::sync::OnceLock::new(),
+            diagr_writes: std::sync::atomic::AtomicUsize::new(0),
+            diagr_first_close: AtomicBool::new(true),
         });
         (
             Self {
@@ -669,6 +782,26 @@ impl WebRtcConnectionMux {
 }
 
 impl WebRtcTerminalAdapterHandle {
+    // DIAGNOSTIC restart-route (not for commit).
+    pub(crate) fn diagr_label(&self, route: &str) {
+        if diagr(route) {
+            let _ = self.inner.diagr.set(route.to_string());
+            diagr_log(format_args!("adapter created route={route}"));
+        }
+    }
+
+    pub(crate) fn diagr_route(&self) -> Option<String> {
+        self.inner.diagr.get().cloned()
+    }
+
+    pub(crate) fn diagr_state(&self) -> String {
+        format!(
+            "closed={} host_closed={}",
+            self.inner.slot.is_closed(),
+            self.inner.slot.host_closed()
+        )
+    }
+
     pub(crate) async fn wait_for_write(&self) {
         self.inner.slot.wait_for_write().await;
     }

@@ -37,6 +37,9 @@ pub(crate) struct UnixTerminalAdapterHandle {
 struct UnixTerminalAdapterInner {
     slot: AdapterSlot<AdapterWake>,
     deferred: AtomicBool,
+    diagr: std::sync::OnceLock<String>,
+    diagr_writes: std::sync::atomic::AtomicUsize,
+    diagr_first_close: AtomicBool,
 }
 
 impl UnixTerminalAdapterInner {
@@ -47,6 +50,9 @@ impl UnixTerminalAdapterInner {
                 Arc::new(AtomicBool::new(false)),
             ),
             deferred: AtomicBool::new(false),
+            diagr: std::sync::OnceLock::new(),
+            diagr_writes: std::sync::atomic::AtomicUsize::new(0),
+            diagr_first_close: AtomicBool::new(true),
         }
     }
 
@@ -54,7 +60,23 @@ impl UnixTerminalAdapterInner {
         self.slot.is_closed()
     }
 
+    fn diagr_close(&self, how: &str) {
+        if let Some(route) = self.diagr.get() {
+            crate::transport::webrtc::adapter::diagr_log(format_args!(
+                "unix adapter {how} route={route} closed_before={}",
+                self.slot.is_closed()
+            ));
+            if self.diagr_first_close.swap(false, Ordering::SeqCst) {
+                crate::transport::webrtc::adapter::diagr_log(format_args!(
+                    "unix adapter first close backtrace route={route}:\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                ));
+            }
+        }
+    }
+
     fn close_from_host(&self) {
+        self.diagr_close("close_from_host");
         self.slot.close_from_host();
     }
 
@@ -63,6 +85,7 @@ impl UnixTerminalAdapterInner {
     }
 
     fn close(&self) {
+        self.diagr_close("close");
         self.slot.close();
     }
 
@@ -71,7 +94,18 @@ impl UnixTerminalAdapterInner {
     }
 
     fn try_write(&self, frame: &RoutedTerminalFrame) -> Result<(), TerminalAdapterWriteError> {
-        self.slot.try_write(frame)
+        let result = self.slot.try_write(frame);
+        if let Some(route) = self.diagr.get()
+            && (self.diagr_writes.fetch_add(1, Ordering::SeqCst) < 12 || result.is_err())
+        {
+            crate::transport::webrtc::adapter::diagr_log(format_args!(
+                "unix adapter try_write route={route} gen={} bytes={} result={result:?} closed={}",
+                frame.generation,
+                frame.frame.len(),
+                self.slot.is_closed()
+            ));
+        }
+        result
     }
 
     fn try_read(&self) -> TerminalIngress {
@@ -127,6 +161,9 @@ impl UnixTerminalAdapter {
         let inner = Arc::new(UnixTerminalAdapterInner {
             slot: AdapterSlot::with_wake_and_close_work(wake, close_work),
             deferred: AtomicBool::new(false),
+            diagr: std::sync::OnceLock::new(),
+            diagr_writes: std::sync::atomic::AtomicUsize::new(0),
+            diagr_first_close: AtomicBool::new(true),
         });
         (
             Self {
@@ -513,6 +550,20 @@ impl UnixConnectionMux {
 }
 
 impl UnixTerminalAdapterHandle {
+    // DIAGNOSTIC restart-route (not for commit).
+    pub(crate) fn diagr_label(&self, route: &str) {
+        if crate::transport::webrtc::adapter::diagr(route) {
+            let _ = self.inner.diagr.set(route.to_string());
+            crate::transport::webrtc::adapter::diagr_log(format_args!(
+                "unix adapter created route={route}"
+            ));
+        }
+    }
+
+    pub(crate) fn diagr_is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
     pub(crate) fn close(&self) {
         self.inner.close();
     }

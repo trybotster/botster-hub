@@ -100,6 +100,8 @@ pub struct HubDaemon {
 impl HubDaemon {
     /// Start the local daemon from explicit, already-validated hub config.
     pub fn start(config: HubConfig) -> HubDaemonResult<Self> {
+        crate::transport::webrtc::adapter::diagr_start_dump_watcher();
+        crate::transport::webrtc::adapter::diagr_log(format_args!("daemon start"));
         let installation_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let maximum_completion_bytes = config
             .plugin_worker_config()
@@ -330,6 +332,7 @@ impl HubDaemon {
 
     /// Stop the daemon lifecycle. This is idempotent.
     pub fn stop(&mut self) -> HubDaemonStatus {
+        crate::transport::webrtc::adapter::diagr_dump("daemon stop");
         self.local_webrtc.stop_all();
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.release_for_restart();

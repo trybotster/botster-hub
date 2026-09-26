@@ -37,6 +37,20 @@ pub(crate) struct RouteCloseState {
 
 impl RouteCloseState {
     fn enqueue_closed_event(&self) {
+        if crate::transport::webrtc::adapter::diagr(&self.key.subscription_id) {
+            crate::transport::webrtc::adapter::diagr_log(format_args!(
+                "close_work enqueue sub={} gen={} suppressed={} reported={} host_closed={}",
+                self.key.subscription_id,
+                self.key.generation,
+                self.ledger.generation_is_suppressed(
+                    &self.key.session_id,
+                    &self.key.subscription_id,
+                    self.key.generation
+                ),
+                self.reported.load(Ordering::SeqCst),
+                self.host_closed.load(Ordering::SeqCst)
+            ));
+        }
         if self.ledger.generation_is_suppressed(
             &self.key.session_id,
             &self.key.subscription_id,
@@ -80,6 +94,14 @@ impl CloseWorkHook {
             return;
         }
         state.host_closed.store(host_closed, Ordering::SeqCst);
+        if crate::transport::webrtc::adapter::diagr(&state.key.subscription_id) {
+            crate::transport::webrtc::adapter::diagr_log(format_args!(
+                "close_work notify sub={} gen={} host_closed={host_closed} queued_before={}",
+                state.key.subscription_id,
+                state.key.generation,
+                state.queued.load(Ordering::Acquire)
+            ));
+        }
         if state
             .queued
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -265,6 +287,15 @@ impl RouteCloseState {
     }
 
     pub(crate) fn report_if_live(&self, emit: bool) {
+        if crate::transport::webrtc::adapter::diagr(&self.key.subscription_id) {
+            crate::transport::webrtc::adapter::diagr_log(format_args!(
+                "close_work report sub={} emit={emit} retired={} queued={} reported={}",
+                self.key.subscription_id,
+                self.retired.load(Ordering::Acquire),
+                self.queued.load(Ordering::Acquire),
+                self.reported.load(Ordering::Acquire)
+            ));
+        }
         if self.retired.load(Ordering::Acquire) {
             return;
         }

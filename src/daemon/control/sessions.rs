@@ -1822,6 +1822,7 @@ fn handle_attach(
         subscription_id.clone(),
     );
     let (adapter, handle) = mux.create_adapter();
+    handle.diagr_label(&subscription_id);
     let runtime = daemon.runtime().expect("runtime checked by caller");
     let mut ticket = runtime.attach_and_bind_terminal_for_owner(
         state.current_waiter_id.expect("owner waiter is assigned"),
@@ -1870,6 +1871,13 @@ fn handle_attach(
                         generation,
                         BoundAdapterHandle::Unix(handle.clone()),
                     );
+                if crate::transport::webrtc::adapter::diagr(&subscription_id) {
+                    crate::transport::webrtc::adapter::diagr_log(format_args!(
+                        "unix attach ok session={session_id} sub={subscription_id} gen={} live={live} bound={bound} closed={}",
+                        generation.0,
+                        handle.diagr_is_closed()
+                    ));
+                }
                 if !bound {
                     // Late success for a dead attachment: release exactly
                     // this generation and leave any replacement alone.
