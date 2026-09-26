@@ -250,6 +250,10 @@ fn update_replaces_the_daemon_and_the_replacement_keeps_the_selected_source() {
     )
     .unwrap();
     let new_pid = metadata["pid"].as_u64().unwrap() as u32;
+    let _replacement = ReplacementDaemonGuard {
+        pid: new_pid,
+        data_dir: data_dir.clone(),
+    };
     assert_ne!(
         new_pid, old_daemon.pid,
         "update silently reused the old daemon"
@@ -765,9 +769,12 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
 
 /// A `botster-hub start` child that reported ready on its `--ready-fd` pipe.
 /// A thread reaps it as soon as it exits, so an updater that waits for the
-/// old daemon's reap never waits on the test.
+/// old daemon's reap never waits on the test. Dropping it while the daemon
+/// still runs kills and reaps it through its own `Child`, so a failed test
+/// never leaves it behind and never signals a reused pid.
 struct FixtureDaemon {
     pid: u32,
+    child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
     exited: mpsc::Receiver<ExitStatus>,
 }
 
@@ -795,7 +802,9 @@ impl FixtureDaemon {
             .env("HOME", home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::from(
+                fs::File::create(daemon_stderr_path(data_dir)).expect("daemon stderr log"),
+            ));
         if let Some(prefix) = path_prefix {
             command.env(
                 "PATH",
@@ -836,21 +845,36 @@ impl FixtureDaemon {
         let line = line_rx.recv_timeout(DAEMON_BUDGET);
         if !matches!(&line, Ok(line) if !line.is_empty()) {
             let _ = child.kill();
-            let output = child.wait_with_output().expect("collect failed daemon");
+            let status = child.wait().expect("reap failed daemon");
             panic!(
-                "fixture daemon did not report ready ({line:?}): {} {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
+                "fixture daemon did not report ready ({line:?}): {status} {}",
+                fs::read_to_string(daemon_stderr_path(data_dir)).unwrap_or_default()
             );
         }
         let pid = child.id();
+        let child = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
         let (exit_tx, exited) = mpsc::channel();
-        thread::spawn(move || {
-            if let Ok(status) = child.wait() {
-                let _ = exit_tx.send(status);
+        thread::spawn({
+            let child = std::sync::Arc::clone(&child);
+            move || {
+                // The exit event does not reap; the child stays ours until
+                // the wait below, so Drop's kill can never reach another
+                // process. The long bound only caps a thread nobody waits on.
+                let _ = botster_hub::process_exit::wait_for_pid_exit(
+                    pid,
+                    Instant::now() + Duration::from_secs(24 * 60 * 60),
+                );
+                let reaped = child
+                    .lock()
+                    .expect("fixture child")
+                    .take()
+                    .and_then(|mut child| child.wait().ok());
+                if let Some(status) = reaped {
+                    let _ = exit_tx.send(status);
+                }
             }
         });
-        Self { pid, exited }
+        Self { pid, child, exited }
     }
 
     /// Whether the daemon has not exited.
@@ -864,6 +888,56 @@ impl FixtureDaemon {
             .recv_timeout(DAEMON_BUDGET)
             .expect("fixture daemon exits")
     }
+}
+
+impl Drop for FixtureDaemon {
+    fn drop(&mut self) {
+        let Ok(mut child) = self.child.lock() else {
+            return;
+        };
+        if let Some(mut running) = child.take()
+            && matches!(running.try_wait(), Ok(None))
+        {
+            let _ = running.kill();
+            let _ = running.wait();
+        }
+    }
+}
+
+/// A daemon the update started (not this test's child). On a failed test it
+/// is stopped only while its command line still names this test's data
+/// directory, so a pid reused by another process is never signalled.
+struct ReplacementDaemonGuard {
+    pid: u32,
+    data_dir: PathBuf,
+}
+
+impl Drop for ReplacementDaemonGuard {
+    fn drop(&mut self) {
+        let Ok(output) = Command::new("ps")
+            .args(["-p", &self.pid.to_string(), "-o", "command="])
+            .output()
+        else {
+            return;
+        };
+        let command = String::from_utf8_lossy(&output.stdout);
+        if command.contains(" start ") && command.contains(&*self.data_dir.to_string_lossy()) {
+            unsafe {
+                libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+fn daemon_stderr_path(data_dir: &Path) -> PathBuf {
+    let parent = data_dir.parent().unwrap_or(data_dir);
+    parent.join(format!(
+        "{}-daemon-stderr.log",
+        data_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ))
 }
 
 /// Waits on the updater's exit event; it records its outcome before exiting.
