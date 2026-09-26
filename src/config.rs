@@ -150,6 +150,7 @@ impl HubStartupOptions {
             core_engine: self.core_engine,
             package_event_plane: self.package_event_plane.into_policy()?,
             retention: self.retention,
+            update_source_root: None,
         })
     }
 
@@ -181,6 +182,11 @@ pub struct HubConfig {
     pub package_event_plane: PackageEventPlanePolicy,
     #[serde(default)]
     pub retention: RetentionOptions,
+    /// The checkout a development source update builds, fixed by the local
+    /// user at daemon start (`start --update-source-root`). No client can set
+    /// it. `None` leaves the updater on its development default.
+    #[serde(default)]
+    pub update_source_root: Option<PathBuf>,
 }
 
 impl HubConfig {

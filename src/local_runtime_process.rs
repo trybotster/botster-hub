@@ -111,7 +111,11 @@ pub(crate) fn spawn_local_runtime_daemon(
         .arg("--data-dir")
         .arg(&options.data_directory)
         .arg("--session-worker-bin")
-        .arg(&session_worker_bin)
+        .arg(&session_worker_bin);
+    if let Some(source_root) = &options.update_source_root {
+        command.arg("--update-source-root").arg(source_root);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
