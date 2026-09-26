@@ -94,25 +94,27 @@ impl ConnectionAggregate {
     /// Register a sender that waits for released capacity. Retired
     /// waiters are pruned here and at each release.
     pub(crate) fn register_waiter(&self, waiter: std::sync::Weak<dyn CapacityWaiter>) {
-        // Strong handles taken under the lock are dropped after it: the
-        // last one drops an adapter, whose permit reports its release.
-        let mut pruned = Vec::new();
+        // Strong handles taken under the lock, live or retired, are dropped
+        // after it: the last one can drop an adapter, whose permit reports
+        // its release.
+        let mut upgraded = Vec::new();
         {
             let mut waiters = self
                 .waiters
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            upgraded.reserve(waiters.len());
             waiters.retain(|waiter| match waiter.upgrade() {
-                Some(waiter) if !waiter.retired() => true,
                 Some(waiter) => {
-                    pruned.push(waiter);
-                    false
+                    let live = !waiter.retired();
+                    upgraded.push(waiter);
+                    live
                 }
                 None => false,
             });
             waiters.push(waiter);
         }
-        drop(pruned);
+        drop(upgraded);
     }
 
     /// Report released capacity to the waiting senders. A waiter resumes
@@ -358,6 +360,69 @@ impl ConnectionBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A waiter whose own strong handle is released during the list scan,
+    /// so the scan's upgraded handle is its last one. Its drop reports a
+    /// release, as an adapter holding a permit does. This checks the list
+    /// lock invariant; it does not show a production path to that drop.
+    struct LastHandleWaiter {
+        aggregate: Arc<ConnectionAggregate>,
+        own: std::sync::Mutex<Option<Arc<LastHandleWaiter>>>,
+        retired: bool,
+    }
+
+    impl CapacityWaiter for LastHandleWaiter {
+        fn capacity_released(&self) {}
+
+        fn retired(&self) -> bool {
+            drop(self.own.lock().expect("own handle").take());
+            self.retired
+        }
+    }
+
+    impl Drop for LastHandleWaiter {
+        fn drop(&mut self) {
+            self.aggregate.capacity_released();
+        }
+    }
+
+    #[test]
+    fn a_last_waiter_handle_drops_after_the_list_lock() {
+        for (scan, retired) in [
+            ("register_waiter", false),
+            ("register_waiter", true),
+            ("capacity_released", false),
+            ("capacity_released", true),
+        ] {
+            let aggregate = Arc::new(ConnectionAggregate::new());
+            let waiter = Arc::new(LastHandleWaiter {
+                aggregate: Arc::clone(&aggregate),
+                own: std::sync::Mutex::new(None),
+                retired,
+            });
+            *waiter.own.lock().expect("own handle") = Some(Arc::clone(&waiter));
+            let weak: std::sync::Weak<dyn CapacityWaiter> = Arc::downgrade(&waiter) as _;
+            aggregate.register_waiter(weak.clone());
+            drop(waiter);
+            assert!(weak.upgrade().is_some(), "only its own handle keeps it");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let scanning = Arc::clone(&aggregate);
+            std::thread::spawn(move || {
+                if scan == "register_waiter" {
+                    let absent: std::sync::Weak<dyn CapacityWaiter> =
+                        std::sync::Weak::<LastHandleWaiter>::new() as _;
+                    scanning.register_waiter(absent);
+                } else {
+                    scanning.capacity_released();
+                }
+                let _ = done_tx.send(());
+            });
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("{scan} (retired {retired}) re-entered its list lock"));
+            assert!(weak.upgrade().is_none(), "the scan dropped the last handle");
+        }
+    }
 
     #[test]
     fn snapshot_counts_a_permit_transferred_between_its_reads() {
