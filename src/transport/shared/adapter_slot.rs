@@ -23,6 +23,13 @@ pub(crate) struct AdapterSlot<W: WakeSink> {
     cause: CloseCause,
     would_block: AtomicBool,
     slot: Mutex<Option<RoutedTerminalFrame>>,
+    /// Whether `slot` holds a frame. Stored only while the slot mutex is
+    /// held, so Core's `pressure()` reads occupancy without the lock and a
+    /// contended lock never reads as Full.
+    occupied: AtomicBool,
+    /// Core's `try_write` met the slot mutex held by a transport driver;
+    /// that driver's unlock raises the Writable wake Core waits for.
+    writer_waiting: AtomicBool,
     wake: W,
     close_work: Arc<AtomicBool>,
     close_hook: Mutex<Option<CloseHook>>,
@@ -37,6 +44,8 @@ impl<W: WakeSink> AdapterSlot<W> {
             cause: CloseCause::new(),
             would_block: AtomicBool::new(false),
             slot: Mutex::new(None),
+            occupied: AtomicBool::new(false),
+            writer_waiting: AtomicBool::new(false),
             wake,
             close_work,
             close_hook: Mutex::new(None),
@@ -79,10 +88,12 @@ impl<W: WakeSink> AdapterSlot<W> {
         match self.slot.try_lock() {
             Ok(mut slot) => {
                 *slot = None;
+                self.occupied.store(false, Ordering::SeqCst);
             }
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Poisoned(poisoned)) => {
                 *poisoned.into_inner() = None;
+                self.occupied.store(false, Ordering::SeqCst);
             }
         }
         self.emit_closed();
@@ -130,22 +141,17 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
+    /// Core's owner-loop probe. It reads occupancy without the slot mutex,
+    /// so a driver holding the mutex over an empty slot never reads as Full.
     pub(crate) fn pressure(&self) -> TerminalAdapterPressure {
         if self.is_closed() {
-            return TerminalAdapterPressure::Closed;
-        }
-        match self.slot.try_lock() {
-            Ok(slot) => {
-                if slot.is_some() {
-                    TerminalAdapterPressure::Full
-                } else if self.would_block.load(Ordering::SeqCst) {
-                    TerminalAdapterPressure::WouldBlock
-                } else {
-                    TerminalAdapterPressure::Ready
-                }
-            }
-            Err(TryLockError::WouldBlock) => TerminalAdapterPressure::Full,
-            Err(TryLockError::Poisoned(_)) => TerminalAdapterPressure::Closed,
+            TerminalAdapterPressure::Closed
+        } else if self.occupied.load(Ordering::SeqCst) {
+            TerminalAdapterPressure::Full
+        } else if self.would_block.load(Ordering::SeqCst) {
+            TerminalAdapterPressure::WouldBlock
+        } else {
+            TerminalAdapterPressure::Ready
         }
     }
 
@@ -159,9 +165,28 @@ impl<W: WakeSink> AdapterSlot<W> {
         if self.would_block.load(Ordering::SeqCst) {
             return Err(TerminalAdapterWriteError::WouldBlock);
         }
+        // Core never waits here. A driver holding the mutex is inside a
+        // short clone or take; mark the wait before the one retry, so either
+        // the retry succeeds or that driver's unlock sees the mark and wakes
+        // Core (see `DriverSlotGuard`).
         let mut slot = match self.slot.try_lock() {
             Ok(slot) => slot,
-            Err(TryLockError::WouldBlock) => return Err(TerminalAdapterWriteError::Full),
+            Err(TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                run_contended_write_hook();
+                self.writer_waiting.store(true, Ordering::SeqCst);
+                match self.slot.try_lock() {
+                    Ok(slot) => {
+                        self.writer_waiting.store(false, Ordering::SeqCst);
+                        slot
+                    }
+                    Err(TryLockError::WouldBlock) => return Err(TerminalAdapterWriteError::Full),
+                    Err(TryLockError::Poisoned(_)) => {
+                        self.close();
+                        return Err(TerminalAdapterWriteError::Closed);
+                    }
+                }
+            }
             Err(TryLockError::Poisoned(_)) => {
                 self.close();
                 return Err(TerminalAdapterWriteError::Closed);
@@ -169,12 +194,14 @@ impl<W: WakeSink> AdapterSlot<W> {
         };
         if self.is_closed() {
             *slot = None;
+            self.occupied.store(false, Ordering::SeqCst);
             return Err(TerminalAdapterWriteError::Closed);
         }
         if slot.is_some() {
             return Err(TerminalAdapterWriteError::Full);
         }
         *slot = Some(frame.clone());
+        self.occupied.store(true, Ordering::SeqCst);
         drop(slot);
         self.wake.wake();
         Ok(())
@@ -256,23 +283,26 @@ impl<W: WakeSink> AdapterSlot<W> {
     /// a driver waits, because a lost read or completion here loses or
     /// repeats a frame. Every holder keeps it for a clone, store, or take
     /// only, with no other lock and no await. A poisoned slot is closed.
-    fn lock_for_driver(&self) -> Option<std::sync::MutexGuard<'_, Option<RoutedTerminalFrame>>> {
+    fn lock_for_driver(&self) -> Option<DriverSlotGuard<'_, W>> {
         match self.slot.lock() {
-            Ok(slot) => Some(slot),
+            Ok(guard) => Some(DriverSlotGuard {
+                guard: Some(guard),
+                slot: self,
+            }),
             Err(poisoned) => {
                 *poisoned.into_inner() = None;
+                self.occupied.store(false, Ordering::SeqCst);
                 self.close();
                 None
             }
         }
     }
 
-    /// Holds the slot mutex as a contending owner-loop call would.
+    /// Holds the slot mutex exactly as a transport driver does, unlock wake
+    /// included.
     #[cfg(test)]
-    pub(crate) fn hold_slot_for_test(
-        &self,
-    ) -> std::sync::MutexGuard<'_, Option<RoutedTerminalFrame>> {
-        self.slot.lock().expect("slot lock")
+    pub(crate) fn hold_slot_for_test(&self) -> DriverSlotGuard<'_, W> {
+        self.lock_for_driver().expect("slot lock")
     }
 
     /// The occupying routed frame, by `Arc` clones. `None` when empty or
@@ -280,10 +310,10 @@ impl<W: WakeSink> AdapterSlot<W> {
     pub(crate) fn snapshot_active(&self) -> Option<RoutedTerminalFrame> {
         let mut slot = self.lock_for_driver()?;
         if self.is_closed() {
-            *slot = None;
+            slot.set(None);
             return None;
         }
-        slot.clone()
+        slot.get().clone()
     }
 
     /// Release the occupying frame after the transport finished its write.
@@ -295,7 +325,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         let taken = match self.lock_for_driver() {
             Some(mut slot) => {
                 if self.is_closed() {
-                    *slot = None;
+                    slot.set(None);
                     None
                 } else {
                     slot.take()
@@ -308,6 +338,60 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
         self.wake.wake();
         taken
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once when `try_write` first meets a held slot mutex, before it
+    /// marks the wait: the unlock-before-mark interleaving.
+    static CONTENDED_WRITE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_contended_write_hook(hook: impl FnOnce() + 'static) {
+    CONTENDED_WRITE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_contended_write_hook() {
+    if let Some(hook) = CONTENDED_WRITE_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// The slot mutex held by a transport driver. Every store keeps `occupied`
+/// in step. Dropping it unlocks first, then raises the Writable wake a
+/// contended Core `try_write` marked.
+pub(crate) struct DriverSlotGuard<'a, W: WakeSink> {
+    guard: Option<std::sync::MutexGuard<'a, Option<RoutedTerminalFrame>>>,
+    slot: &'a AdapterSlot<W>,
+}
+
+impl<W: WakeSink> DriverSlotGuard<'_, W> {
+    fn get(&self) -> &Option<RoutedTerminalFrame> {
+        self.guard.as_ref().expect("held until drop")
+    }
+
+    fn set(&mut self, frame: Option<RoutedTerminalFrame>) {
+        self.slot.occupied.store(frame.is_some(), Ordering::SeqCst);
+        **self.guard.as_mut().expect("held until drop") = frame;
+    }
+
+    fn take(&mut self) -> Option<RoutedTerminalFrame> {
+        let taken = self.guard.as_mut().expect("held until drop").take();
+        self.slot.occupied.store(false, Ordering::SeqCst);
+        taken
+    }
+}
+
+impl<W: WakeSink> Drop for DriverSlotGuard<'_, W> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        if self.slot.writer_waiting.swap(false, Ordering::SeqCst) {
+            self.slot.notify_writable();
+        }
     }
 }
 
