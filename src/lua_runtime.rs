@@ -15,15 +15,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use botster_core::{
-    BoundaryJson, CapabilityOperation, CapabilityOperationId, CapabilityRuntimeErrorKind,
-    CapabilityRuntimeRequest, EndpointId, EntityContract, EntityKind, EnvelopeCursor, EnvelopeId,
-    EnvelopeTarget, PluginCancellationToken, PluginCapabilityRuntime, PluginDescriptorKind,
-    PluginDescriptorRef, PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration,
-    PluginInvocationFailure, PluginInvocationFailureKind, PluginInvocationRequest,
-    PluginInvocationResult, PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor,
-    PluginResourceKind, PluginResourceRef, PluginRuntime, PluginStoreCapabilityRequest,
-    PluginStoreKey, PluginStoreOperation, RoutedEnvelope, RoutedEnvelopePayload,
-    TimerCapabilityRequest,
+    BoundaryJson, Capability, CapabilityOperation, CapabilityOperationId,
+    CapabilityRuntimeErrorKind, CapabilityRuntimeRequest, CapabilitySurface, EndpointId,
+    EntityContract, EntityKind, EnvelopeCursor, EnvelopeId, EnvelopeTarget,
+    PluginCancellationToken, PluginCapabilityRuntime, PluginDescriptorKind, PluginDescriptorRef,
+    PluginHandlerKind, PluginHandlerRef, PluginHandlerRegistration, PluginInvocationFailure,
+    PluginInvocationFailureKind, PluginInvocationRequest, PluginInvocationResult,
+    PluginInvocationSuccess, PluginKey, PluginOwnedDescriptor, PluginResourceKind,
+    PluginResourceRef, PluginRuntime, PluginStoreCapabilityRequest, PluginStoreKey,
+    PluginStoreOperation, RoutedEnvelope, RoutedEnvelopePayload, TimerCapabilityRequest,
 };
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde_json::json;
@@ -1928,7 +1928,7 @@ impl LoadedLuaPlugin {
             };
             handlers.push(PluginHandlerRegistration {
                 handler: handler.clone(),
-                required_capability: None,
+                required_capability: required_capability_for(&PluginHandlerKind::McpTool),
             });
             descriptors.push(PluginOwnedDescriptor {
                 descriptor: PluginDescriptorRef {
@@ -1964,7 +1964,7 @@ impl LoadedLuaPlugin {
             };
             handlers.push(PluginHandlerRegistration {
                 handler: handler_ref.clone(),
-                required_capability: None,
+                required_capability: required_capability_for(&handler.kind),
             });
             if handler.kind == PluginHandlerKind::EntityProvider {
                 let entity_type = EntityKind(handler.descriptor_id.clone());
@@ -3533,6 +3533,28 @@ fn registration_from_value(
         }
     }
     Ok(LuaRegistration { tools, handlers })
+}
+
+/// The capability a handler kind needs before Core admits an invocation of
+/// it. Core checks it against the package's admitted capabilities, so a
+/// package cannot serve a surface or tool that its manifest did not declare.
+/// Event and entity-provider handlers stay capability-free (see
+/// docs/lua-plugin-abi.md); their inputs are already gated by their sources.
+fn required_capability_for(kind: &PluginHandlerKind) -> Option<Capability> {
+    let surface = match kind {
+        PluginHandlerKind::McpTool
+        | PluginHandlerKind::McpPrompt
+        | PluginHandlerKind::McpResource => CapabilitySurface::Mcp,
+        PluginHandlerKind::SurfaceRoute | PluginHandlerKind::UiAction => {
+            CapabilitySurface::Surfaces
+        }
+        PluginHandlerKind::SessionAction => CapabilitySurface::SessionActions,
+        _ => return None,
+    };
+    Some(Capability {
+        surface,
+        scope: None,
+    })
 }
 
 fn descriptor_kind_for_handler_kind(kind: PluginHandlerKind) -> Option<PluginDescriptorKind> {
