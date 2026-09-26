@@ -696,10 +696,12 @@ fn core_capability_enforcement_denies_missing_handler_capability_without_runtime
 fn reload_and_unload_return_core_cleanup_and_stop_runtimes() {
     let package_name = "reloadable.plugin";
     let surface = capability(CapabilitySurface::Surfaces, None);
-    let mut registry = registry_with_grants(vec![surface.clone()]);
+    // The package declares the timer capability that its old generation uses.
+    let timers = capability(CapabilitySurface::Timers, Some("callbacks"));
+    let mut registry = registry_with_grants(vec![surface.clone(), timers.clone()]);
     registry
         .install(
-            plugin_manifest(package_name, vec![surface.clone()]),
+            plugin_manifest(package_name, vec![surface.clone(), timers]),
             provenance(),
             "install plugin",
         )
@@ -791,4 +793,18 @@ fn reload_and_unload_return_core_cleanup_and_stop_runtimes() {
             ..
         })
     ));
+    // Unload revokes the package's runtime grants.
+    let after_unload = hub
+        .submit_capability_request(CapabilityRuntimeRequest {
+            plugin_key: plugin_key(package_name),
+            operation_id: CapabilityOperationId("timer-after-unload".to_string()),
+            operation: CapabilityOperation::Timer(TimerCapabilityRequest::Once { delay_ms: 5 }),
+            timeout_ms: 1_000,
+            callback: None,
+        })
+        .expect_err("an unloaded plugin keeps no grants");
+    assert_eq!(
+        after_unload.kind,
+        botster_core::CapabilityRuntimeErrorKind::CapabilityDenied
+    );
 }
