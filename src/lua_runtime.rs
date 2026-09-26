@@ -1155,7 +1155,7 @@ mod state_owner_tests {
     }
 
     #[test]
-    fn runtime_keeps_caught_exhaustion_and_resets_for_the_next_invocation() {
+    fn runtime_refuses_caught_exhaustion_and_resets_for_the_next_invocation() {
         use botster_core::{PluginInvocationContext, RequestId};
 
         struct Directory(std::path::PathBuf);
@@ -1251,28 +1251,21 @@ mod state_owner_tests {
                 PluginCancellationToken::new(),
             )
         };
-        let PluginInvocationResult::Completed(result) = invoke("exhaust") else {
-            panic!("the handler must catch three hook errors and return");
+        // The sandbox re-raises the budget error from every protected call,
+        // so the handler cannot catch it and no caught value is retained.
+        let PluginInvocationResult::Failed(failure) = invoke("exhaust") else {
+            panic!("protected calls must not absorb the exhausted budget");
         };
-        assert_eq!(result.payload.unwrap().0["caught"], 3);
+        assert!(
+            failure.reason.contains(INSTRUCTION_BUDGET_ERROR),
+            "{}",
+            failure.reason
+        );
         assert_eq!(runtime.instruction_budget.load(Ordering::Relaxed), 0);
         {
             let state = runtime.lua.lock().unwrap();
             let caught: Table = state.lua().globals().get("caught").unwrap();
-            let mut shared = None;
-            for index in 1..=3 {
-                let Value::Error(error) = caught.raw_get::<Value>(index).unwrap() else {
-                    panic!("the caught value must remain a Rust error");
-                };
-                assert_eq!(error.to_string(), INSTRUCTION_BUDGET_ERROR);
-                let mlua::Error::ExternalError(error) = *error else {
-                    panic!("the hook must preserve the shared external error");
-                };
-                if let Some(previous) = &shared {
-                    assert!(Arc::ptr_eq(previous, &error));
-                }
-                shared = Some(error);
-            }
+            assert_eq!(caught.raw_len(), 0);
         }
         let PluginInvocationResult::Completed(result) = invoke("finite") else {
             panic!("the next invocation must receive the existing budget reset");
@@ -1309,7 +1302,14 @@ mod state_owner_tests {
             },
         )
         .unwrap();
-        sandbox::install(lua).unwrap();
+        // This test keeps a caught budget error, so the sandbox's protected-call
+        // guard reads a budget that never runs out.
+        sandbox::install(
+            lua,
+            Arc::new(AtomicU64::new(u64::MAX)),
+            Arc::new(InstructionBudgetExceeded),
+        )
+        .unwrap();
         let tables: (Table, Table) = lua
             .load(
                 r#"
@@ -1643,7 +1643,7 @@ impl LuaPluginRuntime {
                     Ok(VmState::Continue)
                 },
             )?;
-            sandbox::install(lua)?;
+            sandbox::install(lua, Arc::clone(&budget), Arc::clone(&instruction_error))?;
             let capacity_string = install_botster_api(lua, plugin_key.clone(), host_api)?;
             let value: Value = lua
                 .load(&source)
@@ -2079,9 +2079,6 @@ fn install_botster_api(
 ) -> Result<LuaCallbackCharge, LuaPluginRuntimeError> {
     let globals = lua.globals();
     globals.set("__botster_handlers", lua.create_table()?)?;
-    globals.set("os", Value::Nil)?;
-    globals.set("io", Value::Nil)?;
-    globals.set("package", Value::Nil)?;
 
     let (event_on, register): (Function, Function) = lua
         .load(include_str!("lua_runtime/registration.lua"))
