@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use botster_hub::process_exit::{wait_for_child_group_exit, wait_for_pid_exit};
 use botster_hub::{DaemonRequest, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET, daemon_transport_request};
 use serde::{Deserialize, Serialize};
 
@@ -224,50 +225,22 @@ const fn local_runtime_daemon_readiness_budget() -> Duration {
 
 fn terminate_owned_runtime_child(child: &mut Child) -> Result<String, LocalRuntimeError> {
     let pid = child.id();
-    let mut child_status = child
-        .try_wait()
-        .map_err(LocalRuntimeError::PollDaemon)?
-        .map(|status| status.to_string());
     signal_owned_runtime_child(pid, libc::SIGTERM).map_err(LocalRuntimeError::TerminateDaemon)?;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < deadline {
-        if child_status.is_none() {
-            child_status = child
-                .try_wait()
-                .map_err(LocalRuntimeError::PollDaemon)?
-                .map(|status| status.to_string());
-        }
-        if !process_group_exists(pid)
-            && let Some(status) = child_status.take()
-        {
-            return Ok(status);
-        }
-        thread::sleep(Duration::from_millis(20));
+    // timer: deadline — SIGTERM grace for the runtime group; expiry escalates to SIGKILL.
+    if let Some(status) =
+        wait_for_child_group_exit(child, Instant::now() + Duration::from_millis(500))
+            .map_err(LocalRuntimeError::PollDaemon)?
+    {
+        return Ok(status.to_string());
     }
     signal_owned_runtime_child(pid, libc::SIGKILL).map_err(LocalRuntimeError::TerminateDaemon)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if child_status.is_none() {
-            child_status = child
-                .try_wait()
-                .map_err(LocalRuntimeError::PollDaemon)?
-                .map(|status| status.to_string());
-        }
-        if !process_group_exists(pid)
-            && let Some(status) = child_status.take()
-        {
-            return Ok(status);
-        }
-        thread::sleep(Duration::from_millis(20));
+    // timer: deadline — SIGKILL cleanup bound; expiry reports TerminateDaemonTimeout.
+    if let Some(status) = wait_for_child_group_exit(child, Instant::now() + Duration::from_secs(2))
+        .map_err(LocalRuntimeError::PollDaemon)?
+    {
+        return Ok(status.to_string());
     }
     Err(LocalRuntimeError::TerminateDaemonTimeout(pid))
-}
-
-fn process_group_exists(pid: u32) -> bool {
-    if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn signal_owned_runtime_child(pid: u32, signal: libc::c_int) -> io::Result<()> {
@@ -501,67 +474,32 @@ fn terminate_process(pid: u32) -> Result<(), LocalRuntimeError> {
 }
 
 fn wait_for_runtime_daemon_exit(pid: u32) -> Result<(), LocalRuntimeError> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        match process_state(pid)? {
-            None => return Ok(()),
-            Some(state) if state.starts_with('Z') => return Ok(()),
-            Some(_) => {}
-        }
-        thread::sleep(Duration::from_millis(50));
+    // timer: deadline — bound on the daemon's exit after SIGTERM; expiry reports TerminateDaemonTimeout.
+    if wait_for_pid_exit(pid, Instant::now() + Duration::from_secs(10))
+        .map_err(LocalRuntimeError::InspectProcess)?
+    {
+        return Ok(());
     }
     Err(LocalRuntimeError::TerminateDaemonTimeout(pid))
 }
 
+/// Waits for the owned daemon's exit event, then reaps it. The detached reaper
+/// thread from `reap_local_runtime_daemon_on_exit` may reap it first; then
+/// `waitpid` reports `ECHILD` at once. After the exit event `waitpid` never
+/// blocks.
 fn wait_for_owned_runtime_daemon_reaped(pid: u32) -> Result<(), LocalRuntimeError> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if reap_owned_child_if_exited(pid)? {
-            return Ok(());
-        }
-        if process_state(pid)?.is_none() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err(LocalRuntimeError::TerminateDaemonTimeout(pid))
-}
-
-fn reap_owned_child_if_exited(pid: u32) -> Result<bool, LocalRuntimeError> {
+    wait_for_runtime_daemon_exit(pid)?;
     loop {
         let mut status = 0;
-        let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-        if result == pid as libc::pid_t {
-            return Ok(true);
-        }
-        if result == 0 {
-            return Ok(false);
+        if unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) } == pid as libc::pid_t {
+            return Ok(());
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(libc::ECHILD) | Some(libc::ESRCH) => return Ok(false),
+            Some(libc::ECHILD) | Some(libc::ESRCH) => return Ok(()),
             Some(libc::EINTR) => {}
             _ => return Err(LocalRuntimeError::InspectProcess(error)),
         }
-    }
-}
-
-fn process_state(pid: u32) -> Result<Option<String>, LocalRuntimeError> {
-    let output = Command::new("ps")
-        .arg("-p")
-        .arg(pid.to_string())
-        .arg("-o")
-        .arg("stat=")
-        .output()
-        .map_err(LocalRuntimeError::InspectProcess)?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if state.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(state))
     }
 }
 
@@ -571,8 +509,9 @@ mod tests {
 
     #[test]
     fn owned_runtime_cleanup_falls_back_to_direct_child_and_remains_bounded() {
-        let mut child = Command::new("/bin/sleep")
-            .arg("60")
+        // The fixture blocks on its open stdin pipe until cleanup signals it.
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
             .spawn()
             .expect("spawn non-process-group-leader fixture");
         let pid = child.id();

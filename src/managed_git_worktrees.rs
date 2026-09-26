@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::process_exit::{wait_for_child_group_exit, wait_for_pid_exit};
 use crate::spawn_targets::SpawnTarget;
 use crate::worktrees::{Worktree, WorktreeGitMetadata};
 
@@ -961,25 +962,20 @@ fn wait_for_child(child: &mut Child, deadline: Instant) -> Result<ExitStatus, Ma
     let command_deadline = Instant::now()
         .checked_add(MANAGED_GIT_COMMAND_TIMEOUT)
         .map_or(deadline, |candidate| candidate.min(deadline));
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if Instant::now() < command_deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                terminate_owned_child_group(child)?;
-                return Err(timed_out());
-            }
-            Err(_) => {
-                terminate_owned_child_group(child)?;
-                return Err(ManagedGitError::new(
-                    "git_failed",
-                    "managed Git child could not be observed",
-                ));
-            }
-        }
+    let exited = wait_for_pid_exit(child.id(), command_deadline);
+    if let Ok(true) = exited
+        && let Ok(status) = child.wait()
+    {
+        return Ok(status);
     }
+    terminate_owned_child_group(child)?;
+    if let Ok(false) = exited {
+        return Err(timed_out());
+    }
+    Err(ManagedGitError::new(
+        "git_failed",
+        "managed Git child could not be observed",
+    ))
 }
 
 fn configure_owned_process_group(command: &mut Command) {
@@ -993,38 +989,33 @@ fn configure_owned_process_group(command: &mut Command) {
     }
 }
 
+fn owned_child_group_exited(child: &mut Child, deadline: Instant) -> Result<bool, ManagedGitError> {
+    wait_for_child_group_exit(child, deadline)
+        .map(|status| status.is_some())
+        .map_err(|_| {
+            ManagedGitError::new(
+                "git_cleanup_failed",
+                "managed Git process group could not be observed",
+            )
+        })
+}
+
 fn terminate_owned_child_group(child: &mut Child) -> Result<(), ManagedGitError> {
     let pid = child.id();
-    let mut child_reaped = child.try_wait().ok().flatten().is_some();
     signal_owned_child(pid, libc::SIGTERM)?;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < deadline {
-        child_reaped |= child.try_wait().ok().flatten().is_some();
-        if child_reaped && !owned_process_group_exists(pid) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(10));
+    // timer: deadline — SIGTERM grace for the Git group; expiry escalates to SIGKILL.
+    if owned_child_group_exited(child, Instant::now() + Duration::from_millis(500))? {
+        return Ok(());
     }
     signal_owned_child(pid, libc::SIGKILL)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        child_reaped |= child.try_wait().ok().flatten().is_some();
-        if child_reaped && !owned_process_group_exists(pid) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(10));
+    // timer: deadline — SIGKILL cleanup bound; expiry reports git_cleanup_timed_out.
+    if owned_child_group_exited(child, Instant::now() + Duration::from_secs(2))? {
+        return Ok(());
     }
     Err(ManagedGitError::new(
         "git_cleanup_timed_out",
         "managed Git child cleanup did not finish within the bounded deadline",
     ))
-}
-
-fn owned_process_group_exists(pid: u32) -> bool {
-    if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn signal_owned_child(pid: u32, signal: libc::c_int) -> Result<(), ManagedGitError> {

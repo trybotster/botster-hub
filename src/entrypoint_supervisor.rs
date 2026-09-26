@@ -18,6 +18,7 @@ use botster_core::{
 };
 use notify::{RecursiveMode, Watcher};
 
+use crate::process_exit::{process_group_running, wait_for_child_group_exit};
 use crate::{PackageRecord, PackageRegistry, PackageRunnableEntrypoint, PackageState};
 
 const OUTPUT_LIMIT_BYTES: usize = 4096;
@@ -424,7 +425,7 @@ impl SupervisedProcess {
     fn stop(&mut self) {
         self.refresh();
         let pid = self.child.id();
-        if self.exited_at.is_some() && !supervised_process_group_exists(pid) {
+        if self.exited_at.is_some() && !self.group_running(pid) {
             self.mark_stopped();
             return;
         }
@@ -435,14 +436,10 @@ impl SupervisedProcess {
             });
             return;
         }
-        let deadline = std::time::Instant::now() + STOP_GRACE;
-        while std::time::Instant::now() < deadline {
-            self.refresh();
-            if self.exited_at.is_some() && !supervised_process_group_exists(pid) {
-                self.mark_stopped();
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
+        // timer: deadline — SIGTERM grace for the entrypoint group; expiry escalates to SIGKILL.
+        if self.wait_for_group_exit(Instant::now() + STOP_GRACE) {
+            self.mark_stopped();
+            return;
         }
         if let Err(error) = signal_process_group_or_child(pid, libc::SIGKILL) {
             self.diagnostics.push(EntrypointDiagnostic {
@@ -451,14 +448,10 @@ impl SupervisedProcess {
             });
             return;
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            self.refresh();
-            if self.exited_at.is_some() && !supervised_process_group_exists(pid) {
-                self.mark_stopped();
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
+        // timer: deadline — SIGKILL cleanup bound; expiry records cleanup_timeout.
+        if self.wait_for_group_exit(Instant::now() + Duration::from_secs(2)) {
+            self.mark_stopped();
+            return;
         }
         self.diagnostics.push(EntrypointDiagnostic {
             kind: "cleanup_timeout".to_string(),
@@ -468,6 +461,33 @@ impl SupervisedProcess {
             ),
         });
         self.mark_stopped();
+    }
+
+    /// Blocks on the child's and its group's exit events until `deadline`.
+    fn wait_for_group_exit(&mut self, deadline: Instant) -> bool {
+        let exited = match wait_for_child_group_exit(&mut self.child, deadline) {
+            Ok(status) => status.is_some(),
+            Err(error) => {
+                self.diagnostics.push(EntrypointDiagnostic {
+                    kind: "wait_error".to_string(),
+                    message: bounded_message(error.to_string()),
+                });
+                false
+            }
+        };
+        // The child is reaped once its exit event fires, so this records the exit.
+        self.refresh();
+        exited
+    }
+
+    fn group_running(&mut self, pgid: u32) -> bool {
+        process_group_running(pgid).unwrap_or_else(|error| {
+            self.diagnostics.push(EntrypointDiagnostic {
+                kind: "wait_error".to_string(),
+                message: bounded_message(error.to_string()),
+            });
+            true
+        })
     }
 
     fn mark_exit(&mut self, status: ExitStatus) {
@@ -769,13 +789,6 @@ fn signal_process_group_or_child(pid: u32, signal: libc::c_int) -> std::io::Resu
     } else {
         Err(child_error)
     }
-}
-
-fn supervised_process_group_exists(pid: u32) -> bool {
-    if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn exit_status_label(status: ExitStatus) -> String {
@@ -1239,7 +1252,7 @@ mod tests {
         );
         assert_pid_gone(pid as libc::pid_t);
         assert!(
-            !supervised_process_group_exists(pid),
+            !process_group_running(pid).expect("inspect owned process group"),
             "missing publication must leave no owned process group"
         );
         let _ = fs::remove_file(descendant_pid_path);
