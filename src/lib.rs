@@ -187,7 +187,9 @@ pub use lifecycle::{
 pub use lua_runtime::{
     LuaPluginHostApi, LuaPluginRuntime, LuaPluginRuntimeError, SharedHubCapabilityRuntime,
 };
-pub use maintenance::{installation_identity, software_identity};
+pub use maintenance::{
+    SourceUpdateRefusal, installation_identity, software_identity, source_update_refusal,
+};
 pub use mcp::{
     McpCallRequest, McpServeError, McpToolDescriptor, McpToolError, McpToolProvider,
     McpToolRegistry, McpToolResult, NativeHubToolProvider, PluginHubToolProvider, serve_mcp_stdio,

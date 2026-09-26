@@ -59,19 +59,116 @@ impl UpdateScope {
 struct UpdateOptions {
     scope: UpdateScope,
     data_directory: PathBuf,
+    /// The checkout to build; `None` uses the development default.
+    source: Option<PathBuf>,
 }
 
 impl UpdateOptions {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let args = DataArgs::parse(args, "update").map_err(|_| usage())?;
-        if args.arguments.len() != 1 {
-            return Err(usage());
+        let mut scope = None;
+        let mut source = None;
+        let mut arguments = args.arguments.into_iter();
+        while let Some(argument) = arguments.next() {
+            if argument == "--source" {
+                let value = arguments.next().ok_or_else(usage)?;
+                if source.replace(PathBuf::from(value)).is_some() {
+                    return Err(usage());
+                }
+            } else if scope.is_none() {
+                scope = Some(UpdateScope::parse(&argument)?);
+            } else {
+                return Err(usage());
+            }
         }
         Ok(Self {
-            scope: UpdateScope::parse(&args.arguments[0])?,
+            scope: scope.ok_or_else(usage)?,
             data_directory: args.data_directory,
+            source,
         })
     }
+}
+
+/// A validated source-update checkout: the canonical top level of a Git
+/// checkout (a linked worktree included) whose root manifest names the
+/// `botster-hub` package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceRoot {
+    root: PathBuf,
+    /// The checkout's own Git directory; a linked worktree has one per
+    /// worktree, reached through its `.git` file.
+    git_directory: PathBuf,
+    /// Selected by `--source`; carried to a replacement daemon.
+    explicit: bool,
+}
+
+const SOURCE_PACKAGE_NAME: &str = "botster-hub";
+
+fn validate_source_root(
+    path: &Path,
+    explicit: bool,
+    runner: &mut dyn CommandRunner,
+) -> Result<SourceRoot, String> {
+    let invalid = |reason: String| format!("source_root_invalid: {}: {reason}", path.display());
+    let root = fs::canonicalize(path).map_err(|error| invalid(error.to_string()))?;
+    let top_level = git_output(
+        &root,
+        &["rev-parse", "--show-toplevel"],
+        runner,
+        GIT_TIMEOUT,
+    )
+    .map_err(|error| invalid(format!("not a Git checkout ({error})")))?;
+    let top_level =
+        fs::canonicalize(&top_level).map_err(|error| invalid(format!("{top_level}: {error}")))?;
+    if top_level != root {
+        return Err(invalid(format!(
+            "not the top level of its Git checkout ({})",
+            top_level.display()
+        )));
+    }
+    let git_directory = git_output(
+        &root,
+        &["rev-parse", "--absolute-git-dir"],
+        runner,
+        GIT_TIMEOUT,
+    )
+    .map_err(|error| invalid(format!("no Git directory ({error})")))?;
+    let manifest = root.join("Cargo.toml");
+    let text =
+        fs::read_to_string(&manifest).map_err(|error| invalid(format!("Cargo.toml: {error}")))?;
+    let name = manifest_package_name(&text).map_err(|error| invalid(error))?;
+    if name != SOURCE_PACKAGE_NAME {
+        return Err(invalid(format!(
+            "Cargo.toml names package {name:?}, not {SOURCE_PACKAGE_NAME:?}"
+        )));
+    }
+    Ok(SourceRoot {
+        root,
+        git_directory: PathBuf::from(git_directory),
+        explicit,
+    })
+}
+
+/// `[package].name` read by a TOML parser; any form the parser resolves to
+/// that key counts, and nothing else does.
+fn manifest_package_name(text: &str) -> Result<String, String> {
+    let document = toml_edit::Document::parse(text)
+        .map_err(|error| format!("Cargo.toml is not valid TOML: {error}"))?;
+    let package = document
+        .as_table()
+        .get("package")
+        .and_then(toml_edit::Item::as_table_like)
+        .ok_or_else(|| "Cargo.toml has no [package] table".to_string())?;
+    package
+        .get("name")
+        .and_then(toml_edit::Item::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "Cargo.toml [package] has no string name".to_string())
+}
+
+/// `start --update-source-root`: validate before the daemon serves.
+pub(super) fn validate_update_source_root(path: &Path) -> Result<PathBuf, String> {
+    validate_source_root(path, true, &mut ProcessCommandRunner).map(|source| source.root)
 }
 
 #[derive(Debug, Deserialize)]
@@ -325,12 +422,34 @@ fn read_command_output(mut reader: impl Read) -> Result<Vec<u8>, String> {
 
 pub(super) fn run(args: Vec<String>) -> Result<(), String> {
     let options = UpdateOptions::parse(args)?;
-    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    execute(options, &source_root, &mut ProcessCommandRunner)
+    // Only a development installation builds a checkout in place.
+    if let Some(refusal) = botster_hub::source_update_refusal() {
+        return Err(refusal.to_string());
+    }
+    let mut runner = ProcessCommandRunner;
+    let source = match &options.source {
+        Some(path) => validate_source_root(path, true, &mut runner)?,
+        // A test process must never build the checkout the binary came from:
+        // a root lost on its way here fails instead of falling back to it.
+        None if std::env::var("BOTSTER_ENV").as_deref() == Ok("test") => {
+            return Err(
+                "source_root_required: BOTSTER_ENV=test never falls back to the build's own checkout"
+                    .to_string(),
+            );
+        }
+        // The build's own checkout is the default only on this gated path.
+        None => validate_source_root(Path::new(env!("CARGO_MANIFEST_DIR")), false, &mut runner)?,
+    };
+    execute(options, &source, &mut runner)
 }
 
 pub(super) fn run_handoff(args: Vec<String>) -> Result<(), String> {
-    if args.len() != 5 || args[1] != "--data-dir" || args[3] != "--update-id" {
+    let source = match args.len() {
+        5 => None,
+        7 if args[5] == "--source" => Some(args[6].clone()),
+        _ => return Err("invalid internal update handoff".to_string()),
+    };
+    if args[1] != "--data-dir" || args[3] != "--update-id" {
         return Err("invalid internal update handoff".to_string());
     }
     let scope = UpdateScope::parse(&args[0])?;
@@ -341,11 +460,15 @@ pub(super) fn run_handoff(args: Vec<String>) -> Result<(), String> {
         .read_exact(&mut gate)
         .map_err(|error| format!("wait for update handoff: {error}"))?;
     botster_hub::source_update::mark_update_running(&data_directory, update_id)?;
-    let result = run(vec![
+    let mut update_args = vec![
         scope.as_str().to_string(),
         "--data-dir".to_string(),
         data_directory.display().to_string(),
-    ]);
+    ];
+    if let Some(source) = source {
+        update_args.extend(["--source".to_string(), source]);
+    }
+    let result = run(update_args);
     match result {
         Ok(()) => {
             botster_hub::source_update::mark_update_complete(&data_directory, update_id)?;
@@ -360,10 +483,11 @@ pub(super) fn run_handoff(args: Vec<String>) -> Result<(), String> {
 
 fn execute(
     options: UpdateOptions,
-    source_root: &Path,
+    source: &SourceRoot,
     runner: &mut dyn CommandRunner,
 ) -> Result<(), String> {
-    let source_lock = source_root.join(".git").join(SOURCE_LOCK_FILE);
+    let source_root = source.root.as_path();
+    let source_lock = source.git_directory.join(SOURCE_LOCK_FILE);
     let _source_lock = UpdateLock::acquire(&source_lock, "source build")?;
     let replace_lock = options.data_directory.join(REPLACE_LOCK_FILE);
     let _replace_lock = UpdateLock::acquire(&replace_lock, "daemon replace")?;
@@ -490,6 +614,9 @@ fn execute(
     let runtime_options = LocalRuntimeOptions {
         data_directory: options.data_directory.clone(),
         session_worker_bin: Some(worker_bin.clone()),
+        // The replacement keeps an operator-selected checkout; a default
+        // root stays the default.
+        update_source_root: source.explicit.then(|| source.root.clone()),
     };
     spawn_local_runtime_daemon(&hub_bin, &runtime_options, &config).map_err(|error| {
         let data_dir_args = command_data_dir_args(&options.data_directory);
@@ -1138,13 +1265,180 @@ fn verify_worker_identity(
 }
 
 fn usage() -> String {
-    "usage: botster-hub update <core|all> [--data-dir <path>]".to_string()
+    "usage: botster-hub update <core|all> [--source <path>] [--data-dir <path>]".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn manifest_package_name_reads_the_package_table_with_a_parser() {
+        for (label, text) in [
+            (
+                "comments and a [[bin]] name",
+                "# the hub\n[package] # table\nname = \"botster-hub\" # name\n\n[[bin]]\nname = \"other\"\n",
+            ),
+            (
+                "literal string",
+                "[package]\nname = 'botster-hub'\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "dotted key",
+                "package.name = \"botster-hub\"\npackage.version = \"0.1.0\"\n",
+            ),
+        ] {
+            assert_eq!(
+                manifest_package_name(text).as_deref(),
+                Ok("botster-hub"),
+                "{label}"
+            );
+        }
+        for (label, text) in [
+            ("workspace only", "[workspace]\nmembers = [\"a\"]\n"),
+            (
+                "name only under another table",
+                "[dependencies]\nname = \"botster-hub\"\n",
+            ),
+            ("non-string name", "[package]\nname = 7\n"),
+            ("invalid TOML", "[package\nname = \"botster-hub\"\n"),
+        ] {
+            assert!(manifest_package_name(text).is_err(), "{label}");
+        }
+        assert_eq!(
+            manifest_package_name("[package]\nname = \"other\"\n").as_deref(),
+            Ok("other")
+        );
+    }
+
+    struct SourceFixture(PathBuf);
+
+    impl SourceFixture {
+        fn new(label: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "botster-update-source-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(fs::canonicalize(&path).unwrap())
+        }
+
+        fn git(&self, cwd: &Path, args: &[&str]) {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {}", args.join(" "));
+        }
+
+        /// A committed checkout at `name` whose manifest names `package`.
+        fn checkout(&self, name: &str, package: &str) -> PathBuf {
+            let root = self.0.join(name);
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(
+                root.join("Cargo.toml"),
+                format!("[package]\nname = \"{package}\"\n"),
+            )
+            .unwrap();
+            self.git(&root, &["init", "-q", "-b", "main"]);
+            self.git(
+                &root,
+                &["config", "user.email", "update-test@example.invalid"],
+            );
+            self.git(&root, &["config", "user.name", "Update Test"]);
+            self.git(&root, &["add", "Cargo.toml"]);
+            self.git(&root, &["commit", "-q", "-m", "fixture"]);
+            root
+        }
+    }
+
+    impl Drop for SourceFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn source_root_is_the_top_level_of_a_botster_hub_checkout() {
+        let fixture = SourceFixture::new("validate");
+        let checkout = fixture.checkout("checkout", "botster-hub");
+        let source = validate_source_root(&checkout, true, &mut ProcessCommandRunner)
+            .expect("a botster-hub checkout is accepted");
+        assert_eq!(source.root, checkout);
+        assert_eq!(source.git_directory, checkout.join(".git"));
+        assert!(source.explicit);
+
+        let invalid = |path: &Path| {
+            validate_source_root(path, true, &mut ProcessCommandRunner).expect_err("refused")
+        };
+        let plain = fixture.0.join("plain");
+        fs::create_dir(&plain).unwrap();
+        fs::write(
+            plain.join("Cargo.toml"),
+            "[package]\nname = \"botster-hub\"\n",
+        )
+        .unwrap();
+        assert!(
+            invalid(&plain).contains("not a Git checkout"),
+            "{}",
+            invalid(&plain)
+        );
+        assert!(
+            invalid(&checkout.join("src")).contains("not the top level"),
+            "{}",
+            invalid(&checkout.join("src"))
+        );
+        let other = fixture.checkout("other", "not-the-hub");
+        assert!(
+            invalid(&other).contains("not \"botster-hub\""),
+            "{}",
+            invalid(&other)
+        );
+        assert!(invalid(&fixture.0.join("missing")).starts_with("source_root_invalid: "));
+    }
+
+    /// A linked worktree's `.git` is a file; its Git directory, where the
+    /// source lock lives, is reached through that file.
+    #[test]
+    fn a_linked_worktree_is_an_accepted_source_root_with_its_own_lock() {
+        let fixture = SourceFixture::new("worktree");
+        let checkout = fixture.checkout("checkout", "botster-hub");
+        let linked = fixture.0.join("linked");
+        fixture.git(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+        assert!(linked.join(".git").is_file());
+        let source = validate_source_root(&linked, true, &mut ProcessCommandRunner)
+            .expect("a linked worktree is accepted");
+        assert_eq!(source.root, linked);
+        assert!(source.git_directory.is_dir());
+        assert_ne!(source.git_directory, linked.join(".git"));
+        let lock =
+            UpdateLock::acquire(&source.git_directory.join(SOURCE_LOCK_FILE), "source build")
+                .expect("the lock lives in the worktree's Git directory");
+        assert!(
+            UpdateLock::acquire(&source.git_directory.join(SOURCE_LOCK_FILE), "source build")
+                .is_err(),
+            "the lock excludes a second update of the same worktree"
+        );
+        drop(lock);
+    }
 
     struct RegistryFixture(PathBuf);
 
