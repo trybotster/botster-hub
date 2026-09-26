@@ -196,6 +196,8 @@ pub struct HubRuntime {
     >,
     acknowledged_spawn_ids: Mutex<BTreeSet<String>>,
     force_plugin_admit_backpressure: Arc<std::sync::atomic::AtomicBool>,
+    /// Test hook: refuse admission with Core's lock-busy reason.
+    force_plugin_admit_lock_busy: std::sync::atomic::AtomicBool,
     pending_test_event_settlements: Mutex<Vec<PendingTestEvent>>,
     force_park_test_events: std::sync::atomic::AtomicBool,
 }
@@ -736,6 +738,7 @@ impl HubRuntime {
             event_plane_cleanup_faults: std::cell::RefCell::new(Vec::new()),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
             force_plugin_admit_backpressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            force_plugin_admit_lock_busy: std::sync::atomic::AtomicBool::new(false),
             pending_test_event_settlements: Mutex::new(Vec::new()),
             force_park_test_events: std::sync::atomic::AtomicBool::new(false),
         })
@@ -931,6 +934,7 @@ impl HubRuntime {
             event_plane_cleanup_faults: std::cell::RefCell::new(Vec::new()),
             acknowledged_spawn_ids: Mutex::new(BTreeSet::new()),
             force_plugin_admit_backpressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            force_plugin_admit_lock_busy: std::sync::atomic::AtomicBool::new(false),
             pending_test_event_settlements: Mutex::new(Vec::new()),
             force_park_test_events: std::sync::atomic::AtomicBool::new(false),
         };
@@ -4013,6 +4017,12 @@ impl HubRuntime {
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Test hook: refuse admission with Core's "admission lock busy" reason.
+    pub fn set_test_plugin_admit_lock_busy(&self, on: bool) {
+        self.force_plugin_admit_lock_busy
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn set_test_park_package_events(&self, on: bool) {
         if std::env::var("BOTSTER_ENV").as_deref() == Ok("test") {
             self.force_park_test_events
@@ -4057,6 +4067,18 @@ impl HubRuntime {
                 request_id: request.request_id,
                 class,
                 reason: "test-forced plugin admission backpressure".to_string(),
+                backpressure: None,
+            };
+        }
+        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
+            && self
+                .force_plugin_admit_lock_busy
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return PluginAdmissionResult::Backpressured {
+                request_id: request.request_id,
+                class,
+                reason: crate::daemon_maintenance::ADMISSION_LOCK_BUSY.to_string(),
                 backpressure: None,
             };
         }

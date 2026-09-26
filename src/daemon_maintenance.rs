@@ -25,6 +25,20 @@ use crate::lifecycle::{PACKAGE_EVENT_INVOCATION_ORIGIN, SESSION_FAMILY_INVOCATIO
 
 /// Invocation origin of a capability callback delivery.
 const CAPABILITY_INVOCATION_ORIGIN: &str = "capability-callback";
+
+/// Core's refusal reason when `try_admit` loses a `try_lock` (private in Core).
+pub(crate) const ADMISSION_LOCK_BUSY: &str = "admission lock busy";
+
+/// Whether an admission refusal may park until a plugin completion or
+/// released result capacity. A capacity refusal can: a queued job holds the
+/// capacity and publishes a completion after it frees it. A lock-busy refusal
+/// cannot: Core can release the lock after its last completion notification,
+/// so nothing would resume the park. Until Core notifies on that release
+/// (/private/tmp/event-driven-hub/core-admission-lock-release.md), a lock-busy
+/// refusal re-marks its own slice.
+fn admission_refusal_parks(reason: &str) -> bool {
+    reason != ADMISSION_LOCK_BUSY
+}
 use crate::session_projection::SessionProjection;
 
 /// Published owner-turn budget after isolated-path measurement.
@@ -519,7 +533,10 @@ pub struct MaintenanceState {
     pub pending_retirements: VecDeque<EventDeliveryFlight>,
     pub event_causal_blocked: bool,
     pub event_causal_faulted: bool,
-    /// Capability callback admission was refused; the retained deliveries wait
+    /// Package event admission hit capacity; the requeued deliveries wait for
+    /// a plugin completion or released result capacity, not a self-wake.
+    pub event_admission_parked: bool,
+    /// Capability callback admission hit capacity; the retained deliveries wait
     /// for a plugin completion or released result capacity, not a self-wake.
     pub capability_admission_parked: bool,
     /// Request ids of admitted capability callbacks.
@@ -1329,7 +1346,7 @@ fn queue_event_retirement(
 
 fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     flush_pending_event_retirements(runtime, state);
-    if state.event_causal_blocked || state.event_causal_faulted {
+    if state.event_causal_blocked || state.event_causal_faulted || state.event_admission_parked {
         return;
     }
     let woke = runtime.package_event_router().take_delivery_wake();
@@ -1430,14 +1447,18 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     event_flight(&delivery, Some(scope_id), request_id.0),
                 );
             }
-            PluginAdmissionResult::Backpressured { .. } => {
+            PluginAdmissionResult::Backpressured { reason, .. } => {
                 reservation.commit(crate::package_event_router::CausalOp::Release {
                     scope_id,
                     identity: crate::package_event_router::LeaseIdentity::EventInFlight,
                 });
                 match runtime.package_event_router().requeue_delivery(delivery) {
                     Ok(()) => {
-                        state.wakes.mark_all();
+                        if admission_refusal_parks(&reason) {
+                            state.event_admission_parked = true;
+                        } else {
+                            state.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
+                        }
                     }
                     Err((delivery, _)) => {
                         let mut flight = event_flight(&delivery, None, request_id.0);
@@ -1462,6 +1483,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
     if runtime.package_event_router().peek_delivery_wake()
         && !state.event_causal_blocked
         && !state.event_causal_faulted
+        && !state.event_admission_parked
     {
         state.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
     }
@@ -1510,11 +1532,15 @@ fn run_capability_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceSt
                     runtime.retire_capability_callback(&delivery);
                 }
             }
-            PluginAdmissionResult::Backpressured { .. } => {
+            PluginAdmissionResult::Backpressured { reason, .. } => {
                 let mut refused = vec![delivery];
                 refused.extend(deliveries);
                 runtime.retain_capability_deliveries(refused);
-                state.capability_admission_parked = true;
+                if admission_refusal_parks(&reason) {
+                    state.capability_admission_parked = true;
+                } else {
+                    state.wakes.mark(MaintenanceSliceKind::CapabilityDelivery);
+                }
                 return;
             }
             // The handler cannot run (the plugin stopped or the handler is
@@ -1527,6 +1553,9 @@ fn run_capability_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceSt
 /// A plugin completion or released result capacity can admit a parked
 /// delivery again.
 pub(crate) fn resume_parked_admissions(state: &mut MaintenanceState) {
+    if std::mem::take(&mut state.event_admission_parked) {
+        state.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
+    }
     if std::mem::take(&mut state.capability_admission_parked) {
         state.wakes.mark(MaintenanceSliceKind::CapabilityDelivery);
     }
@@ -4064,6 +4093,10 @@ return botster.register({})
         runtime.apply_causal_owner_ops();
         assert!(runtime.take_causal_capacity_notification());
         state.note_causal_capacity_progress();
+        // The refusal above hit capacity, so it parked; a completion or
+        // released result capacity resumes it.
+        assert!(state.event_admission_parked);
+        resume_parked_admissions(&mut state);
         run_package_event_delivery_slice(&runtime, &mut state);
         let new_scope = resumed + 1;
         assert_eq!(scopes.lease_count(old_scope), Some(1));
@@ -4129,7 +4162,8 @@ return botster.register({})
             "requeued occupancy must remain until a later slice admits or expires the copy"
         );
         runtime.set_test_plugin_admit_backpressure(false);
-        runtime.package_event_router().set_delivery_wake();
+        assert!(state.event_admission_parked, "a capacity refusal parks");
+        resume_parked_admissions(&mut state);
         run_package_event_delivery_slice(&runtime, &mut state);
         let after = runtime.package_event_router().snapshot().expect("after");
         assert_eq!(
@@ -4621,6 +4655,13 @@ return botster.register({ handlers = {
         assert!(!state.capability_admission_parked);
         assert!(state.wakes.take(MaintenanceSliceKind::CapabilityDelivery));
         run_capability_delivery_slice(&runtime, &mut state);
+        // A worker taking the first job can hold Core's admission lock, so
+        // the second admission may see lock-busy. That refusal re-marks the
+        // slice (interim, pending the Core release notification).
+        while state.wakes.take(MaintenanceSliceKind::CapabilityDelivery) {
+            assert!(!state.capability_admission_parked);
+            run_capability_delivery_slice(&runtime, &mut state);
+        }
         assert_eq!(state.capability_in_flight.len(), 2);
         assert!(runtime.take_capability_deliveries().unwrap().is_empty());
         first_server.join().expect("first server");
@@ -4704,6 +4745,145 @@ return botster.register({ handlers = {
             "the slice cancels the expired operation, so the owner does not re-arm a passed deadline"
         );
         drop(release);
+        server.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_capacity_refused_package_event_parks_until_a_plugin_completion() {
+        let (registry, package_root) = install_lua_event_plugin(
+            "event-park",
+            r#"
+events.on("hub", "worktree_created", function(event) return { received = event.event } end)
+return botster.register({})
+"#,
+        );
+        let (mut runtime, data_directory) = event_delivery_runtime("event-park");
+        runtime
+            .load_lua_plugin_package(&registry, "event-probe.plugin")
+            .expect("load event probe plugin");
+        let completions = completion_notifications(&runtime);
+        let mut state = MaintenanceState::default();
+
+        // The first event is admitted; its completion is the resume event.
+        ingress_worktree_created(&runtime);
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert_eq!(state.event_in_flight.len(), 1);
+
+        // The second event hits capacity and parks.
+        runtime.set_test_plugin_admit_backpressure(true);
+        ingress_worktree_created(&runtime);
+        state.wakes.take(MaintenanceSliceKind::PackageEventDelivery);
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert!(state.event_admission_parked);
+        assert!(
+            !state.wakes.take(MaintenanceSliceKind::PackageEventDelivery),
+            "a parked refusal does not wake its own slice"
+        );
+        // While parked, the slice neither retries nor re-marks itself.
+        runtime.set_test_plugin_admit_backpressure(false);
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert_eq!(state.event_in_flight.len(), 1);
+        assert!(!state.wakes.take(MaintenanceSliceKind::PackageEventDelivery));
+        assert_eq!(
+            runtime
+                .package_event_router()
+                .snapshot()
+                .unwrap()
+                .queued_holders,
+            1,
+            "the refused delivery stays requeued"
+        );
+
+        // timer: deadline — bounds a missing completion so the test fails instead of hanging.
+        completions
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first handler completes");
+        run_completion_drain_slice(&runtime, &mut state);
+        assert!(
+            !state.event_admission_parked,
+            "the completion resumes the park"
+        );
+        assert!(state.wakes.take(MaintenanceSliceKind::PackageEventDelivery));
+        run_package_event_delivery_slice(&runtime, &mut state);
+        // The finished worker can still hold Core's admission lock; that
+        // lock-busy refusal re-marks the slice (interim, see
+        // admission_refusal_parks).
+        while state.wakes.take(MaintenanceSliceKind::PackageEventDelivery) {
+            assert!(!state.event_admission_parked);
+            run_package_event_delivery_slice(&runtime, &mut state);
+        }
+        assert_eq!(
+            state.event_in_flight.len(),
+            1,
+            "the requeued delivery is admitted"
+        );
+        assert_eq!(
+            runtime
+                .package_event_router()
+                .snapshot()
+                .unwrap()
+                .queued_holders,
+            0
+        );
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_lock_busy_package_event_refusal_does_not_park() {
+        let (runtime, data_directory) = event_delivery_runtime("event-lock-busy");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        runtime.insert_test_event_handler("consumer", "worktree_created");
+        ingress_worktree_created(&runtime);
+        runtime.set_test_plugin_admit_lock_busy(true);
+        let mut state = MaintenanceState::default();
+        state.wakes.take(MaintenanceSliceKind::PackageEventDelivery);
+        run_package_event_delivery_slice(&runtime, &mut state);
+        assert!(
+            !state.event_admission_parked,
+            "Core can release the lock after its last notification"
+        );
+        assert!(state.wakes.take(MaintenanceSliceKind::PackageEventDelivery));
+        assert_eq!(
+            runtime
+                .package_event_router()
+                .snapshot()
+                .unwrap()
+                .queued_holders,
+            1
+        );
+        runtime.set_test_plugin_admit_lock_busy(false);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_lock_busy_capability_refusal_does_not_park() {
+        let (mut runtime, package_root, data_directory) =
+            install_capability_callback_plugin("capability-lock-busy");
+        let wakes = capability_wake_channel(&runtime);
+        let (endpoint, release, server) = held_http_server();
+        runtime
+            .submit_capability_request(http_callback_request("busy", &endpoint, 5_000))
+            .expect("submit the request");
+        expect_capability_wake(&runtime, &wakes);
+        release.send(()).expect("release the response");
+        expect_capability_wake(&runtime, &wakes);
+
+        runtime.set_test_plugin_admit_lock_busy(true);
+        let mut state = MaintenanceState::default();
+        state.wakes.take(MaintenanceSliceKind::CapabilityDelivery);
+        run_capability_delivery_slice(&runtime, &mut state);
+        assert!(!state.capability_admission_parked);
+        assert!(state.wakes.take(MaintenanceSliceKind::CapabilityDelivery));
+        runtime.set_test_plugin_admit_lock_busy(false);
+        run_capability_delivery_slice(&runtime, &mut state);
+        assert_eq!(
+            state.capability_in_flight.len(),
+            1,
+            "the retained delivery is admitted"
+        );
         server.join().expect("server thread");
         let _ = std::fs::remove_dir_all(package_root);
         let _ = std::fs::remove_dir_all(data_directory);
