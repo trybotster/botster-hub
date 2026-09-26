@@ -4,7 +4,7 @@
 //! handshake, and connection helpers. It intentionally contains no hub runtime,
 //! TUI, Lua, or daemon-to-session-worker protocol dependencies.
 //!
-//! # Host-control protocol 9
+//! # Host-control protocol 10
 //!
 //! Every frame on the Unix socket is one length-prefixed container:
 //!
@@ -55,12 +55,12 @@ mod typescript;
 
 pub const PROTOCOL: &str = "botster-hub-daemon-v1";
 /// Host-control protocol version. Any other version is rejected at Hello; there is no negotiation.
-pub const PROTOCOL_VERSION: u16 = 9;
-pub const CONFORMANCE_FIXTURE_REVISION: u16 = 49;
+pub const PROTOCOL_VERSION: u16 = 10;
+pub const CONFORMANCE_FIXTURE_REVISION: u16 = 50;
 /// Oldest conformance revision accepted by the default first-party client requirement.
 ///
-/// Protocol 9 is a cold cut: the floor equals the current revision.
-pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 49;
+/// Protocol 10 is a cold cut: the floor equals the current revision.
+pub const DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION: u16 = 50;
 /// Maximum byte length of a `request_id`: a canonical positive decimal `u64`, no leading zeros.
 pub const MAX_REQUEST_ID_BYTES: usize = 20;
 /// Outstanding (unanswered) control requests one connection may hold.
@@ -160,8 +160,6 @@ pub const FEATURE_TERMINAL_SUBSCRIPTION_CLOSED: &str = "terminal_subscription_cl
 pub const TERMINAL_SUBSCRIPTION_CLOSED_HOST_ADAPTER: &str = "host_adapter_closed";
 /// Core closed this bound adapter while the connection stayed alive.
 pub const TERMINAL_SUBSCRIPTION_CLOSED_CORE_ADAPTER: &str = "core_adapter_closed";
-/// Reserved WebRTC subscription channel opened after the reservation expired.
-pub const TERMINAL_SUBSCRIPTION_CLOSED_RESERVATION_EXPIRED: &str = "reservation_expired";
 /// Optional Hub WebRTC adapter plane. Bind happens only when DataChannel Hello requires this.
 pub const FEATURE_WEBRTC_TERMINAL_ADAPTER: &str = "webrtc_terminal_adapter";
 /// Optional named attach occupancy on `DaemonStatus`. Empty occupancy without this token is not absence proof.
@@ -1628,6 +1626,12 @@ pub struct DaemonHelloAck {
     pub terminal_compatibility: Option<TerminalCompatibility>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DaemonDiagnostic>,
+    /// Core terminal subscription generation for a reserved terminal channel.
+    /// Hub attaches and binds the route when the channel's Hello arrives, so
+    /// the generation first exists here. Input chunks and close-event
+    /// matching use it. Absent on every other HelloAck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2595,8 +2599,6 @@ impl DaemonTerminalAttach {
 pub struct DaemonTerminalReservation {
     pub session_id: String,
     pub subscription_id: String,
-    /// Core-minted terminal subscription generation for this route.
-    pub generation: u64,
     /// Hub peer generation that owns the reservation.
     pub peer_generation: u64,
     /// Exact DataChannel label the peer must create. Opaque to the peer.
@@ -2651,7 +2653,6 @@ impl DaemonTerminalReservation {
     pub fn new(
         session_id: impl Into<String>,
         subscription_id: impl Into<String>,
-        generation: u64,
         peer_generation: u64,
         label: impl Into<String>,
         expires_in_seconds: u32,
@@ -2659,7 +2660,6 @@ impl DaemonTerminalReservation {
         Self {
             session_id: session_id.into(),
             subscription_id: subscription_id.into(),
-            generation,
             peer_generation,
             label: label.into(),
             expires_in_seconds,
@@ -5149,16 +5149,16 @@ mod tests {
         );
         let requirement = DaemonCompatibilityRequirement::for_package_event_subscriptions();
         let mut old_revision = previous.clone();
-        old_revision.conformance_fixture_revision = 48;
+        old_revision.conformance_fixture_revision = 49;
         let error = ensure_compatible(&requirement, &old_revision)
-            .expect_err("event requirement rejects revision 48");
+            .expect_err("event requirement rejects revision 49");
         assert!(
             error
                 .diagnostic
                 .contains("unsupported conformance fixture revision")
         );
         let error = ensure_compatible(&requirement, &previous)
-            .expect_err("event requirement rejects the missing feature at revision 49");
+            .expect_err("event requirement rejects the missing feature at revision 50");
         assert!(
             error
                 .diagnostic
@@ -5439,28 +5439,28 @@ mod tests {
     }
 
     #[test]
-    fn protocol_nine_rejects_protocol_eight_and_pins_the_conformance_floor() {
-        assert_eq!(PROTOCOL_VERSION, 9);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 49);
+    fn protocol_ten_rejects_protocol_nine_and_pins_the_conformance_floor() {
+        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 50);
 
-        let protocol_eight = DaemonCompatibilityRequirement {
-            protocol_version: 8,
-            minimum_conformance_fixture_revision: 48,
+        let protocol_nine = DaemonCompatibilityRequirement {
+            protocol_version: 9,
+            minimum_conformance_fixture_revision: 49,
             ..DaemonCompatibilityRequirement::current()
         };
-        let error = ensure_compatible(&protocol_eight, &DaemonCompatibility::current())
-            .expect_err("protocol-8 client must fail closed against protocol 9");
-        assert!(error.diagnostic.contains("unsupported protocol version 9"));
+        let error = ensure_compatible(&protocol_nine, &DaemonCompatibility::current())
+            .expect_err("protocol-9 client must fail closed against protocol 10");
+        assert!(error.diagnostic.contains("unsupported protocol version 10"));
 
-        let hub_at_forty_eight = DaemonCompatibility {
-            conformance_fixture_revision: 48,
+        let hub_at_forty_nine = DaemonCompatibility {
+            conformance_fixture_revision: 49,
             ..DaemonCompatibility::current()
         };
         ensure_compatible(
             &DaemonCompatibilityRequirement::current(),
-            &hub_at_forty_eight,
+            &hub_at_forty_nine,
         )
-        .expect_err("a protocol-9 client rejects a revision-48 Hub");
+        .expect_err("a protocol-10 client rejects a revision-49 Hub");
     }
 
     #[test]
@@ -5502,7 +5502,7 @@ mod tests {
                 "| { frame: \"response\"; request_id: string; response: DaemonResponse }"
             )
         );
-        assert!(generated.contains("export const PROTOCOL_VERSION = 9;"));
+        assert!(generated.contains("export const PROTOCOL_VERSION = 10;"));
         assert!(generated.contains("export const MAX_OUTSTANDING_REQUESTS = 32;"));
     }
 
@@ -5848,7 +5848,7 @@ mod tests {
     #[test]
     fn terminal_reservation_protocol_is_serde_stable_and_generated() {
         let reservation =
-            DaemonTerminalReservation::new("session", "subscription", 4, 2, "r-opaque", 30);
+            DaemonTerminalReservation::new("session", "subscription", 2, "r-opaque", 30);
         let response = DaemonResponse {
             kind: DaemonResponseKind::TerminalReservation,
             terminal_reservation: Some(reservation),
@@ -5860,13 +5860,31 @@ mod tests {
             serde_json::json!({
                 "session_id": "session",
                 "subscription_id": "subscription",
-                "generation": 4,
                 "peer_generation": 2,
                 "label": "r-opaque",
                 "expires_in_seconds": 30,
             })
         );
         assert_eq!(value["kind"], "terminal_reservation");
+        assert!(value["terminal_reservation"].get("generation").is_none());
+    }
+
+    #[test]
+    fn hello_ack_carries_terminal_generation_only_when_present() {
+        let mut ack = DaemonHelloAck {
+            protocol: PROTOCOL.to_string(),
+            compatibility: DaemonCompatibility::current(),
+            terminal_compatibility: None,
+            diagnostics: Vec::new(),
+            terminal_generation: None,
+        };
+        let value = serde_json::to_value(&ack).expect("ack serializes");
+        assert!(value.get("terminal_generation").is_none());
+        ack.terminal_generation = Some(1_877_350_376_538_113);
+        let value = serde_json::to_value(&ack).expect("ack serializes");
+        assert_eq!(value["terminal_generation"], 1_877_350_376_538_113_u64);
+        let round: DaemonHelloAck = serde_json::from_value(value).expect("ack round trips");
+        assert_eq!(round.terminal_generation, Some(1_877_350_376_538_113));
     }
 
     #[test]
@@ -5964,6 +5982,7 @@ mod tests {
             compatibility: DaemonCompatibility::current(),
             terminal_compatibility: None,
             diagnostics: Vec::new(),
+            terminal_generation: None,
         };
         assert_serde_omits_empty_diagnostics(
             "DaemonHelloAck",
@@ -6088,9 +6107,9 @@ mod tests {
         assert!(generated.contains("export type DaemonQueueKind ="));
         assert!(generated.contains("export type DaemonQueueAgeState ="));
         assert!(generated.contains("| (string & {});"));
-        assert_eq!(PROTOCOL_VERSION, 9);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 49);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 49);
+        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 50);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 50);
     }
 
     #[test]
@@ -7568,7 +7587,6 @@ mod tests {
                 "session",
                 "subscription",
                 1,
-                1,
                 "r-example",
                 30,
             )),
@@ -8146,6 +8164,7 @@ mod tests {
                     compatibility: DaemonCompatibility::current(),
                     terminal_compatibility: None,
                     diagnostics: Vec::new(),
+                    terminal_generation: None,
                 },
             },
             ServerFrame::Response {
@@ -8431,9 +8450,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_nine_and_conformance_forty_nine_define_the_cold_cut_boundary() {
-        assert_eq!(PROTOCOL_VERSION, 9);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 49);
+    fn protocol_ten_and_conformance_fifty_define_the_cold_cut_boundary() {
+        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 50);
 
         let requirement = DaemonCompatibilityRequirement::current();
         let protocol_error = ensure_compatible(
@@ -8486,7 +8505,7 @@ mod tests {
         .expect("serialize current status");
         let stale: StaleStatus =
             serde_json::from_value(status_value).expect("stale status ignores additive identity");
-        assert_eq!(stale.compatibility.protocol_version, 9);
+        assert_eq!(stale.compatibility.protocol_version, 10);
         assert_eq!(stale.host_id, "hub");
         assert_eq!(stale.schema_version, 1);
     }
@@ -8494,11 +8513,11 @@ mod tests {
     #[test]
     fn additive_session_type_definition_read_rides_the_conformance_floor() {
         // `ensure_compatible` compares protocol version with exact equality and
-        // conformance revision with a floor. Protocol 9 is a cold cut, so the
+        // conformance revision with a floor. Protocol 10 is a cold cut, so the
         // default floor equals the current revision.
-        assert_eq!(PROTOCOL_VERSION, 9);
-        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 49);
-        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 49);
+        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(CONFORMANCE_FIXTURE_REVISION, 50);
+        assert_eq!(DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION, 50);
         assert_eq!(
             current_feature_list(),
             vec![
@@ -8540,12 +8559,12 @@ mod tests {
             "the default client requirement excludes optional capabilities",
         );
 
-        let pinned_at_forty_nine = DaemonCompatibilityRequirement {
-            minimum_conformance_fixture_revision: 49,
+        let pinned_at_fifty = DaemonCompatibilityRequirement {
+            minimum_conformance_fixture_revision: 50,
             ..DaemonCompatibilityRequirement::current()
         };
-        ensure_compatible(&pinned_at_forty_nine, &DaemonCompatibility::current())
-            .expect("a protocol-9 client pinned at conformance 49 accepts a revision-49 Hub");
+        ensure_compatible(&pinned_at_fifty, &DaemonCompatibility::current())
+            .expect("a protocol-10 client pinned at conformance 50 accepts a revision-50 Hub");
 
         assert_eq!(
             daemon_request_tag(&DaemonRequest::ShowSessionTypeDefinition {

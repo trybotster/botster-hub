@@ -1592,195 +1592,100 @@ fn handle_attach(
         if !holds_permit {
             return ControlStep::ready(owner_budget_error());
         }
-        // Reserve the route key and the cleanup permit before any Core work
-        // exists for this attach; both are released on every failure path.
-        let reservation =
-            reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id);
-        if reservation == RouteReservation::Full {
+        // A WebRTC attach does no Core work. It reserves the route key, opens
+        // the Hub attach stream, and reserves a labeled channel. Core attaches
+        // and binds the route in one call when that channel's Hello arrives,
+        // so a busy session cannot overflow a route that has no adapter yet.
+        let route = reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id);
+        if route == RouteReservation::Full {
             return ControlStep::ready(attach_route_limit_error());
         }
-        let Some(cleanup_permit) = state.budget.reserve() else {
-            release_failed_attach_route(
-                &mut state.pending_runtime,
-                &owner,
-                &session_id,
-                &subscription_id,
-                reservation,
-            );
-            return ControlStep::ready(owner_budget_error());
-        };
-        let mut cleanup_permit = Some(cleanup_permit);
         let identity = state.pending_runtime.start_attach(
             owner.clone(),
             session_id.clone(),
             subscription_id.clone(),
         );
-        let runtime = daemon.runtime().expect("runtime checked by caller");
-        let mut ticket = runtime.attach_route_for_owner(
-            state.current_waiter_id.expect("owner waiter is assigned"),
-            ClientId(client_id.clone()),
-            SessionId(session_id.clone()),
-            SubscriptionId(subscription_id.clone()),
-            now,
+        let reserved = state.pending_runtime.admission.reservations.reserve(
+            session_id.clone(),
+            subscription_id.clone(),
+            peer_generation,
+            now_seconds(),
+            owner.clone(),
+            identity.clone(),
+            route,
         );
-        return ControlStep::pending(move |_, state| {
-            let result = match ticket.poll() {
-                CoreTicketPoll::Pending => return ControlPoll::Pending,
-                CoreTicketPoll::Lost => Err(AttachBindFailure::Attach(CoreDaemonError::Shutdown)),
-                CoreTicketPoll::Refused => Err(AttachBindFailure::Attach(core_bridge_error(
-                    CoreTicketError::Overloaded,
-                ))),
-                CoreTicketPoll::Ready(result) => result,
-            };
-            let permit = cleanup_permit
-                .take()
-                .expect("cleanup permit held until the attach completes");
-            let generation = match result {
-                Ok(generation) => generation,
-                Err(failure) => {
-                    state.budget.release(permit);
-                    let _ = state.pending_runtime.cancel_stream_if(
-                        &session_id,
-                        &subscription_id,
-                        &identity,
-                    );
-                    release_failed_attach_route(
-                        &mut state.pending_runtime,
-                        &owner,
-                        &session_id,
-                        &subscription_id,
-                        reservation,
-                    );
-                    return ControlPoll::Ready(Ok(super::attach_bind_operator_error(
-                        "invalid_request",
-                        &attach_bind_failure_message(&failure),
-                    )));
-                }
-            };
-            // Fence: the route is attached in Core, but only the attachment
-            // that started it may record it. Otherwise release exactly it.
-            if !state.pending_runtime.record_generation_if(
-                &session_id,
-                &subscription_id,
-                &identity,
-                generation,
-            ) {
-                retain_exact_detach(
+        let response = match reserved {
+            Ok(reservation) => {
+                let budget_result = state
+                    .pending_runtime
+                    .admission
+                    .connection_budgets
+                    .get_mut(&peer_generation)
+                    .ok_or(crate::admission::connection_budget::ChannelBudgetError::ChannelLimit)
+                    .and_then(|budget| {
+                        budget
+                            .reserve(
+                                reservation.label.clone(),
+                                crate::admission::connection_budget::ChannelClass::Terminal,
+                            )
+                            .map(|_| ())
+                    });
+                if budget_result.is_err() {
+                    let _ = state
+                        .pending_runtime
+                        .admission
+                        .reservations
+                        .forget_label(&reservation.label, peer_generation);
+                    Err(super::attach_bind_operator_error(
+                        "connection_channel_limit",
+                        "the WebRTC connection channel budget rejected the reservation",
+                    ))
+                } else if crate::daemon::owner_loop::arm_reservation_deadline(
                     state,
-                    permit,
-                    client_id.clone(),
-                    session_id.clone(),
-                    subscription_id.clone(),
-                    generation,
-                );
-                release_failed_attach_route(
-                    &mut state.pending_runtime,
-                    &owner,
-                    &session_id,
-                    &subscription_id,
-                    reservation,
-                );
-                return ControlPoll::Ready(Ok(stale_attach_error()));
-            }
-            let reserved = state.pending_runtime.admission.reservations.reserve(
-                session_id.clone(),
-                subscription_id.clone(),
-                generation.0,
-                peer_generation,
-                now_seconds(),
-            );
-            let response = match reserved {
-                Ok(reservation) => {
-                    let budget_result = state
+                    reservation.label.clone(),
+                    peer_generation,
+                    reservation.expires_in_seconds,
+                ) {
+                    Ok(daemon_terminal_reservation(reservation))
+                } else {
+                    if let Some(budget) = state
                         .pending_runtime
                         .admission
                         .connection_budgets
                         .get_mut(&peer_generation)
-                        .ok_or(
-                            crate::admission::connection_budget::ChannelBudgetError::ChannelLimit,
-                        )
-                        .and_then(|budget| {
-                            budget
-                                .reserve(
-                                    reservation.label.clone(),
-                                    crate::admission::connection_budget::ChannelClass::Terminal,
-                                )
-                                .map(|_| ())
-                        });
-                    if budget_result.is_err() {
-                        let _ = state
-                            .pending_runtime
-                            .admission
-                            .reservations
-                            .forget_label(&reservation.label, peer_generation);
-                        Err(super::attach_bind_operator_error(
-                            "connection_channel_limit",
-                            "the WebRTC connection channel budget rejected the reservation",
-                        ))
-                    } else if crate::daemon::owner_loop::arm_reservation_deadline(
-                        state,
-                        reservation.label.clone(),
-                        peer_generation,
-                        reservation.expires_in_seconds,
-                    ) {
-                        Ok(daemon_terminal_reservation(reservation))
-                    } else {
-                        if let Some(budget) = state
-                            .pending_runtime
-                            .admission
-                            .connection_budgets
-                            .get_mut(&peer_generation)
-                        {
-                            let _ = budget.release(&reservation.label);
-                        }
-                        let _ = state
-                            .pending_runtime
-                            .admission
-                            .reservations
-                            .forget_label(&reservation.label, peer_generation);
-                        Err(super::attach_bind_operator_error(
-                            "owner_budget_exhausted",
-                            "the daemon exhausted unique owner waiter identifiers",
-                        ))
+                    {
+                        let _ = budget.release(&reservation.label);
                     }
-                }
-                Err(ReserveError::LabelConflict) => Err(super::attach_bind_operator_error(
-                    "reservation_label_conflict",
-                    "a live reservation already exists for this route",
-                )),
-            };
-            match response {
-                Ok(response) => {
-                    state.budget.release(permit);
-                    ControlPoll::Ready(Ok(response))
-                }
-                Err(error) => {
-                    // The route exists in Core without an adapter; release
-                    // exactly the generation this attach created.
-                    let _ = state.pending_runtime.cancel_stream_if(
-                        &session_id,
-                        &subscription_id,
-                        &identity,
-                    );
-                    retain_exact_detach(
-                        state,
-                        permit,
-                        client_id.clone(),
-                        session_id.clone(),
-                        subscription_id.clone(),
-                        generation,
-                    );
-                    release_failed_attach_route(
-                        &mut state.pending_runtime,
-                        &owner,
-                        &session_id,
-                        &subscription_id,
-                        reservation,
-                    );
-                    ControlPoll::Ready(Ok(error))
+                    let _ = state
+                        .pending_runtime
+                        .admission
+                        .reservations
+                        .forget_label(&reservation.label, peer_generation);
+                    Err(super::attach_bind_operator_error(
+                        "owner_budget_exhausted",
+                        "the daemon exhausted unique owner waiter identifiers",
+                    ))
                 }
             }
-        });
+            Err(ReserveError::LabelConflict) => Err(super::attach_bind_operator_error(
+                "reservation_label_conflict",
+                "a live reservation already exists for this route",
+            )),
+        };
+        return match response {
+            Ok(response) => ControlStep::ready(response),
+            Err(error) => {
+                crate::daemon::control::connection::abandon_unbound_terminal(
+                    state,
+                    &owner,
+                    &identity,
+                    route,
+                    &session_id,
+                    &subscription_id,
+                );
+                ControlStep::ready(error)
+            }
+        };
     }
     let Some(UnixTerminalAdmission::Admitted {
         capabilities, mux, ..

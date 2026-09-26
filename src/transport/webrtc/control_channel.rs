@@ -1,6 +1,6 @@
 //! Local WebRTC control DataChannel driver.
 //!
-//! The control channel carries host-control protocol 9: encrypted JSON
+//! The control channel carries host-control protocol 10: encrypted JSON
 //! [`ClientFrame`] messages in, chunked encrypted [`ServerFrame`] deliveries
 //! out. Requests are correlated by `request_id`; Hub serves them in arrival
 //! order and answers requests beyond the outstanding limit with a correlated
@@ -362,6 +362,7 @@ where
                     compatibility: DaemonCompatibility::current(),
                     terminal_compatibility: Some(TerminalCompatibility::current()),
                     diagnostics: vec![DaemonDiagnostic::connected("hello")],
+                    terminal_generation: None,
                 };
                 let Ok(frames) = framed_server_frame(stream_key, &ServerFrame::HelloAck { ack })
                 else {
@@ -833,7 +834,7 @@ pub(crate) fn apply_data_channel_event(
     }
 }
 
-/// Decrypt one control message and apply the protocol 9 admission rules:
+/// Decrypt one control message and apply the protocol 10 admission rules:
 /// hello first and once, canonical strictly increasing request ids.
 pub(crate) fn admit_client_frame(
     key: &AesGcmKey,

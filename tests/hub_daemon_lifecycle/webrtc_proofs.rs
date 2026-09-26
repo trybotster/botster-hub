@@ -913,7 +913,10 @@ fn local_webrtc_chunks_oversized_encrypted_daemon_response() {
         // host-event path rather than inspecting an instantaneous queue snapshot.
         let observation_prefix = format!(
             "terminal_channel_closed:{}:{}:",
-            reservation.subscription_id, reservation.generation
+            reservation.subscription_id,
+            offer_peer
+                .route_generation(&reservation.label)
+                .expect("the terminal HelloAck named the route generation")
         );
         let is_driver_exit_report = |event: &botster_hub_client::DaemonEvent| {
             matches!(
@@ -1591,6 +1594,180 @@ fn local_webrtc_peer_close_detaches_terminal_subscriptions() {
         shutdown_session.kind,
         botster_hub_client::DaemonResponseKind::Events
     );
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+/// Protocol 10: a WebRTC Attach reserves a channel and declares no Core
+/// route. A session that floods output while the client is still opening the
+/// channel therefore cannot end the route before it binds (the pre-10 order
+/// declared the route at Attach, and Core ends a never-bound route on its
+/// first overflow). The channel opens two measured seconds after the reply.
+#[test]
+fn local_webrtc_attach_to_a_flooding_session_binds_after_a_slow_channel_open() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("web-webrtc-flood");
+    let package_dir = unique_test_dir("web-webrtc-flood-package");
+    write_botster_web_package(&package_dir);
+    let config = explicit_config(&data_dir);
+    let socket_path = config
+        .transports
+        .local_socket
+        .as_ref()
+        .expect("test config has local socket")
+        .path
+        .clone();
+    let endpoint = botster_hub_client::DaemonEndpoint::new(socket_path);
+    let child = start_cli_daemon(&data_dir);
+    enable_supervised_package(&data_dir, &package_dir);
+    let (_web_origin, bootstrap) = start_botster_web_and_issue_bootstrap(&endpoint);
+    let stream_key = local_webrtc_stream_key(&bootstrap.grant_secret);
+    let stop_file = data_dir.join("flood-stop");
+    let session_id = "local-webrtc-flood-session";
+    let command = format!(
+        "while [ ! -e '{}' ]; do printf 'webrtc-flood-line-%s\\n' 0123456789abcdef0123456789abcdef; done; printf 'flood-stopped\\n'; while IFS= read -r line; do printf 'flood-echo:%s\\n' \"$line\"; done",
+        stop_file.display()
+    );
+
+    block_on(async {
+        let (mut offer_peer, offer) = LocalWebrtcOfferPeer::create_offer()
+            .await
+            .expect("create WebRTC offer peer");
+        let signal = botster_hub_client::request(
+            &endpoint,
+            botster_hub_client::DaemonRequest::LocalWebrtcSignal {
+                grant_id: bootstrap.grant_id.clone(),
+                grant_secret: bootstrap.grant_secret.clone(),
+                origin: bootstrap.expected_origin.clone(),
+                offer,
+            },
+        )
+        .expect("signal local WebRTC offer");
+        let answer = signal
+            .local_webrtc_answer
+            .as_ref()
+            .expect("signal response includes WebRTC answer")
+            .answer
+            .clone();
+        offer_peer
+            .accept_answer(answer)
+            .await
+            .expect("offer peer accepts answer and opens channel");
+        offer_peer
+            .encrypted_hello(
+                &stream_key,
+                &botster_hub_client::DaemonHello {
+                    protocol: botster_hub_client::PROTOCOL.to_string(),
+                    compatibility: botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+                    terminal_compatibility: None,
+                },
+            )
+            .await
+            .expect("webrtc adapter hello before attach");
+        let spawn = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::Spawn {
+                    session_id: session_id.to_string(),
+                    command: command.clone(),
+                },
+            )
+            .await
+            .expect("spawn the flooding session");
+        assert_eq!(spawn.kind, botster_hub_client::DaemonResponseKind::Spawned);
+        let attach = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::Attach {
+                    session_id: session_id.to_string(),
+                    subscription_id: "local-webrtc-flood-subscription".to_string(),
+                },
+            )
+            .await
+            .expect("attach to the flooding session");
+        let replied = Instant::now();
+        assert_eq!(
+            attach.kind,
+            botster_hub_client::DaemonResponseKind::TerminalReservation
+        );
+        let reservation = attach
+            .terminal_reservation
+            .clone()
+            .expect("WebRTC Attach returns a reservation");
+
+        // The session floods for the whole reservation interval.
+        sleep(Duration::from_secs(2)).await;
+        let held_open = replied.elapsed();
+        assert!(held_open >= Duration::from_secs(2), "held {held_open:?}");
+        fs::write(&stop_file, b"").expect("end the flood");
+        offer_peer
+            .open_reserved_terminal(
+                &stream_key,
+                &reservation.label,
+                &botster_hub_client::DaemonHello {
+                    protocol: botster_hub_client::PROTOCOL.to_string(),
+                    compatibility:
+                        botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(
+                        ),
+                    terminal_compatibility: None,
+                },
+            )
+            .await
+            .expect("the reserved channel binds after the flood interval");
+        let generation = offer_peer
+            .route_generation(&reservation.label)
+            .expect("the terminal HelloAck names the route generation");
+        assert!(generation > 0);
+
+        offer_peer
+            .send_terminal_input(
+                &stream_key,
+                &reservation.label,
+                &terminal_input_frame_bytes(b"probe-after-flood\n"),
+            )
+            .await
+            .expect("input through the bound route");
+        let mut route_output = String::new();
+        let mut screen = String::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let read = offer_peer
+                .encrypted_request(
+                    &stream_key,
+                    &botster_hub_client::DaemonRequest::ReadScreen {
+                        session_id: session_id.to_string(),
+                    },
+                )
+                .await
+                .expect("read screen");
+            if let Some(body) = read.read_screen {
+                screen = body.text;
+            }
+            while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
+                if let Some(output) = terminal_body_output(&bytes) {
+                    route_output.push_str(&live_output_utf8(&output));
+                }
+            }
+            if route_output.contains("flood-echo:probe-after-flood") {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            route_output.contains("flood-echo:probe-after-flood"),
+            "the bound route must carry live output for the input; route_output_tail={:?} screen={screen:?}",
+            route_output.chars().rev().take(400).collect::<String>().chars().rev().collect::<String>()
+        );
+
+        let _ = offer_peer
+            .encrypted_request(
+                &stream_key,
+                &botster_hub_client::DaemonRequest::ShutdownSession {
+                    session_id: session_id.to_string(),
+                },
+            )
+            .await;
+        offer_peer.peer.close().await.expect("close offer peer");
+    });
     shutdown_cli_daemon(&data_dir, child);
 }
 

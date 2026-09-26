@@ -1,7 +1,9 @@
 //! Hub-owned WebRTC terminal subscription label reservations.
 //!
 //! Labels are opaque. Hub never derives peer-visible meaning from their
-//! contents. Core-minted generations stay recorded values.
+//! contents. A terminal reservation holds no Core route: Hub attaches and
+//! binds the route in one Core call when the reserved channel's Hello
+//! arrives, so the Core generation first exists at that bind.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +31,9 @@ pub(crate) struct TerminalReservation {
     pub class: ChannelClass,
     pub session_id: String,
     pub subscription_id: String,
+    /// Entity and event reservations: the Hub subscription generation.
+    /// Terminal reservations: the attach epoch that keys this reservation
+    /// (never a Core generation).
     pub generation: u64,
     pub peer_generation: u64,
     pub label: String,
@@ -41,7 +46,13 @@ pub(crate) struct TerminalReservation {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ReservationBinding {
-    Terminal,
+    /// The Hub attach stream this reservation opened. Cleanup before the
+    /// bind fences on `identity`, so it never touches a replacement stream.
+    Terminal {
+        owner: crate::subscription::attach_routes::AttachStreamOwner,
+        identity: crate::subscription::attach_routes::AttachmentIdentity,
+        route: crate::subscription::attach_routes::RouteReservation,
+    },
     Entity {
         receiver: std::sync::Arc<
             std::sync::Mutex<Option<mpsc::Receiver<crate::entity_delivery::EntityDelivery>>>,
@@ -112,10 +123,13 @@ impl TerminalReservationRegistry {
         &mut self,
         session_id: String,
         subscription_id: String,
-        generation: u64,
         peer_generation: u64,
         now_seconds: u64,
+        owner: crate::subscription::attach_routes::AttachStreamOwner,
+        identity: crate::subscription::attach_routes::AttachmentIdentity,
+        route: crate::subscription::attach_routes::RouteReservation,
     ) -> Result<DaemonTerminalReservation, ReserveError> {
+        let generation = identity.epoch;
         let key = (
             ChannelClass::Terminal,
             session_id.clone(),
@@ -144,14 +158,17 @@ impl TerminalReservationRegistry {
             expires_at_seconds: now_seconds.saturating_add(u64::from(expires_in_seconds)),
             expires_in_seconds,
             state: ReservationState::Live,
-            binding: ReservationBinding::Terminal,
+            binding: ReservationBinding::Terminal {
+                owner,
+                identity,
+                route,
+            },
         };
         self.by_label.insert(label.clone(), key.clone());
         self.by_key.insert(key, reservation);
         Ok(DaemonTerminalReservation::new(
             session_id,
             subscription_id,
-            generation,
             peer_generation,
             label,
             expires_in_seconds,
@@ -494,16 +511,61 @@ fn unique_label(existing: &BTreeMap<String, (ChannelClass, String, String, u64, 
 mod tests {
     use super::*;
 
+    fn terminal_binding(
+        epoch: u64,
+    ) -> (
+        crate::subscription::attach_routes::AttachStreamOwner,
+        crate::subscription::attach_routes::AttachmentIdentity,
+        crate::subscription::attach_routes::RouteReservation,
+    ) {
+        (
+            crate::subscription::attach_routes::AttachStreamOwner {
+                client_id: "client".into(),
+                grant_id: Some("grant".into()),
+            },
+            crate::subscription::attach_routes::AttachmentIdentity {
+                client_id: "client".into(),
+                epoch,
+            },
+            crate::subscription::attach_routes::RouteReservation::Inserted,
+        )
+    }
+
+    fn reserve_terminal(
+        registry: &mut TerminalReservationRegistry,
+        session: &str,
+        subscription: &str,
+        epoch: u64,
+        peer_generation: u64,
+        now: u64,
+    ) -> Result<DaemonTerminalReservation, ReserveError> {
+        let (owner, identity, route) = terminal_binding(epoch);
+        registry.reserve(
+            session.into(),
+            subscription.into(),
+            peer_generation,
+            now,
+            owner,
+            identity,
+            route,
+        )
+    }
+
     #[test]
     fn repeated_reserve_for_the_same_route_conflicts() {
         let mut registry = TerminalReservationRegistry::default();
-        let first = registry
-            .reserve("session".into(), "sub".into(), 1, 9, 100)
-            .expect("first reserve");
-        assert_eq!(first.generation, 1);
+        let first =
+            reserve_terminal(&mut registry, "session", "sub", 1, 9, 100).expect("first reserve");
         assert_eq!(first.peer_generation, 9);
         assert_eq!(
-            registry.reserve("session".into(), "sub".into(), 1, 9, 100),
+            registry
+                .reservation_for_label(&first.label, 9)
+                .map(|reservation| reservation.generation),
+            Some(1),
+            "a terminal reservation is keyed by its attach epoch"
+        );
+        assert_eq!(
+            reserve_terminal(&mut registry, "session", "sub", 1, 9, 100),
             Err(ReserveError::LabelConflict)
         );
         assert_eq!(
@@ -515,9 +577,8 @@ mod tests {
     #[test]
     fn expired_label_stays_distinguishable_from_unknown() {
         let mut registry = TerminalReservationRegistry::default();
-        let reserved = registry
-            .reserve("session".into(), "sub".into(), 2, 3, 10)
-            .expect("reserve");
+        let reserved =
+            reserve_terminal(&mut registry, "session", "sub", 2, 3, 10).expect("reserve");
         registry.retire_expired(10 + u64::from(reserved.expires_in_seconds));
         assert_eq!(
             registry.lookup_label(
@@ -536,9 +597,8 @@ mod tests {
     #[test]
     fn wrong_peer_cannot_inspect_expire_or_bind_a_reservation() {
         let mut registry = TerminalReservationRegistry::default();
-        let reserved = registry
-            .reserve("session".into(), "sub".into(), 2, 3, 10)
-            .expect("reserve");
+        let reserved =
+            reserve_terminal(&mut registry, "session", "sub", 2, 3, 10).expect("reserve");
 
         assert_eq!(
             registry.lookup_label(&reserved.label, 4, u64::MAX),
@@ -560,9 +620,8 @@ mod tests {
     #[test]
     fn reused_grant_generation_cannot_bind_an_old_reservation() {
         let mut registry = TerminalReservationRegistry::default();
-        let reserved = registry
-            .reserve("session".into(), "sub".into(), 2, 3, 10)
-            .expect("reserve");
+        let reserved =
+            reserve_terminal(&mut registry, "session", "sub", 2, 3, 10).expect("reserve");
 
         assert_eq!(
             registry.lookup_label(&reserved.label, 5, 10),
@@ -619,8 +678,7 @@ mod tests {
     #[test]
     fn peer_forget_retires_every_channel_class_once() {
         let mut registry = TerminalReservationRegistry::default();
-        let terminal = registry
-            .reserve("session".into(), "terminal".into(), 1, 9, 10)
+        let terminal = reserve_terminal(&mut registry, "session", "terminal", 1, 9, 10)
             .expect("terminal reserve");
         let (_entity_tx, entity_rx) = tokio::sync::mpsc::channel(1);
         let entity = registry

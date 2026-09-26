@@ -1722,6 +1722,7 @@ impl IncompatibleDaemonFixture {
                             compatibility,
                             terminal_compatibility: None,
                             diagnostics: Vec::new(),
+                            terminal_generation: None,
                         },
                     },
                 )

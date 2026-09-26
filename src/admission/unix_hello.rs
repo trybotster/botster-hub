@@ -72,6 +72,7 @@ pub(crate) fn daemon_hello_ack(diagnostics: Vec<DaemonDiagnostic>) -> DaemonHell
         compatibility: DaemonCompatibility::current(),
         terminal_compatibility: Some(TerminalCompatibility::current()),
         diagnostics,
+        terminal_generation: None,
     }
 }
 

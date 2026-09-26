@@ -24,7 +24,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
     line(&mut output, "");
     line(
         &mut output,
-        "// Host-control protocol 9 constants. See botster-hub-client/src/lib.rs.",
+        "// Host-control protocol 10 constants. See botster-hub-client/src/lib.rs.",
     );
     emit_const(&mut output, "PROTOCOL", &format!("\"{}\"", crate::PROTOCOL));
     emit_const(
@@ -291,6 +291,7 @@ pub(crate) fn daemon_protocol_typescript() -> String {
             ("compatibility", "DaemonCompatibility"),
             ("terminal_compatibility?", "TerminalCompatibility"),
             ("diagnostics?", "DaemonDiagnostic[]"),
+            ("terminal_generation?", "number"),
         ],
     );
     emit_interface(
@@ -723,7 +724,6 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         &[
             ("session_id", "string"),
             ("subscription_id", "string"),
-            ("generation", "number"),
             ("peer_generation", "number"),
             ("label", "string"),
             ("expires_in_seconds", "number"),

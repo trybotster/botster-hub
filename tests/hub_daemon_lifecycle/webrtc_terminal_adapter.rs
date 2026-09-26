@@ -130,7 +130,6 @@ async fn spawn_and_bind_webrtc_channel_with_label(
         .expect("WebRTC Attach returns a reservation");
     assert_eq!(reservation.session_id, session_id);
     assert_eq!(reservation.subscription_id, subscription_id);
-    assert!(reservation.generation >= 1);
     assert!(reservation.peer_generation >= 1);
     assert!(reservation.label.starts_with("r-"));
     assert!(reservation.expires_in_seconds >= 1);
@@ -835,7 +834,7 @@ fn webrtc_terminal_adapter_feature_does_not_raise_default_requirement() {
         botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter();
     botster_hub_client::ensure_compatible(&adapter_requirement, &previous)
         .expect_err("the webrtc adapter requirement must fail closed without the feature");
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 9);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 10);
 }
 
 #[test]
@@ -1357,7 +1356,7 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_9() {
             .iter()
             .any(|feature| feature == botster_hub_client::FEATURE_TERMINAL_SUBSCRIPTION_CLOSED)
     );
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 9);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 10);
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
         49

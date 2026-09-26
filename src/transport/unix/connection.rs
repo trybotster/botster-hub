@@ -1,6 +1,6 @@
 //! Unix accepted-connection driver and client connection role.
 //!
-//! One task serves one muxed connection under host-control protocol 9: Hello
+//! One task serves one muxed connection under host-control protocol 10: Hello
 //! first, then correlated requests that may complete out of order, entity
 //! subscription frames, host events, and content-blind terminal containers.
 use std::collections::BTreeSet;

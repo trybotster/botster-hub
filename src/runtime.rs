@@ -4418,19 +4418,6 @@ impl HubRuntime {
         })
     }
 
-    pub(crate) fn attach_route_for_owner(
-        &self,
-        waiter_id: crate::owner_identity::WaiterId,
-        client_id: ClientId,
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        now_seconds: u64,
-    ) -> CoreTicket<Result<TerminalSubscriptionGeneration, AttachBindFailure>> {
-        self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
-            attach_route_on_core(daemon, client_id, session_id, subscription_id, now_seconds)
-        })
-    }
-
     /// Bind an adapter to an attached generation. On failure Core detaches
     /// that generation so no route stays without an adapter.
     pub(crate) fn bind_route_adapter(

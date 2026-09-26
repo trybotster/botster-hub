@@ -1,6 +1,6 @@
 //! Local runtime WebRTC smoke offerer.
 //!
-//! Owns the smoke offerer, host-control protocol 9 framing, waits, and the
+//! Owns the smoke offerer, host-control protocol 10 framing, waits, and the
 //! sender terminal-record proof. CLI argument handling and top-level result
 //! reporting stay in `main`.
 
@@ -120,7 +120,6 @@ pub(crate) fn smoke_local_webrtc_round_trip(
             .open_reserved_terminal(
                 &stream_key,
                 &reservation.label,
-                reservation.generation,
                 terminal_input_frame(1, b"from-smoke-webrtc\n")?,
             )
             .await?;
@@ -350,12 +349,12 @@ impl LocalWebrtcOfferPeer {
     }
 
     /// Open the reserved terminal channel, complete its hello, and send one
-    /// scheme 2 input frame as sealed binary chunks.
+    /// scheme 2 input frame as sealed binary chunks at the generation the
+    /// HelloAck names.
     async fn open_reserved_terminal(
         &mut self,
         key: &AesGcmKey,
         label: &str,
-        generation: u64,
         input: Vec<u8>,
     ) -> Result<(), SmokeError> {
         let (open_tx, mut open_rx) = channel::<()>(1);
@@ -412,7 +411,7 @@ impl LocalWebrtcOfferPeer {
             .send_text(&encrypt_client_frame(key, &hello)?)
             .await
             .map_err(|error| SmokeError::Webrtc(error.to_string()))?;
-        loop {
+        let generation = loop {
             let text = timeout(
                 webrtc_runtime().as_ref(),
                 Duration::from_secs(10),
@@ -423,10 +422,12 @@ impl LocalWebrtcOfferPeer {
             .ok_or_else(|| {
                 SmokeError::Webrtc("reserved channel closed during hello".to_string())
             })?;
-            if let ServerFrame::HelloAck { .. } = assemble_server_frame(key, &text, &mut None)? {
-                break;
+            if let ServerFrame::HelloAck { ack } = assemble_server_frame(key, &text, &mut None)? {
+                break ack.terminal_generation.ok_or_else(|| {
+                    SmokeError::Webrtc("terminal HelloAck has no terminal_generation".to_string())
+                })?;
             }
-        }
+        };
         for chunk in sealed_terminal_chunks(key, &input, 1, generation)? {
             channel
                 .send(BytesMut::from(chunk.as_slice()))

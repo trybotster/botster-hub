@@ -546,12 +546,14 @@ impl TestOfferPeer {
         }
     }
 
+    /// Open a reserved channel and complete its Hello. Returns the HelloAck
+    /// `terminal_generation` (present on terminal channels only).
     pub(crate) async fn open_reserved_terminal(
         &mut self,
         key: &AesGcmKey,
         label: &str,
         hello: &DaemonHello,
-    ) {
+    ) -> Option<u64> {
         let runtime = webrtc_runtime();
         let (open_tx, mut open_rx) = webrtc_channel::<()>(1);
         let (message_tx, mut message_rx) = webrtc_channel::<String>(256);
@@ -599,15 +601,15 @@ impl TestOfferPeer {
             .send_text(&encrypt_client_frame_text(key, &frame))
             .await
             .expect("send reserved hello");
-        loop {
+        let terminal_generation = loop {
             match read_server_frame(key, &mut message_rx, "reserved hello ack").await {
-                ServerFrame::HelloAck { .. } => break,
+                ServerFrame::HelloAck { ack } => break ack.terminal_generation,
                 ServerFrame::Close { reason } => {
                     panic!("hub closed the reserved channel during hello: {reason:?}")
                 }
                 _ => {}
             }
-        }
+        };
         self.reserved_channels.insert(
             label.to_string(),
             ReservedTestChannel {
@@ -615,6 +617,73 @@ impl TestOfferPeer {
                 message_rx,
             },
         );
+        terminal_generation
+    }
+
+    /// Open a reserved channel and send its Hello. True when Hub closed the
+    /// channel before any HelloAck.
+    pub(crate) async fn open_reserved_expecting_close(
+        &mut self,
+        key: &AesGcmKey,
+        label: &str,
+        hello: &DaemonHello,
+    ) -> bool {
+        let runtime = webrtc_runtime();
+        let (open_tx, mut open_rx) = webrtc_channel::<()>(1);
+        let (message_tx, mut message_rx) = webrtc_channel::<String>(256);
+        let channel = self
+            .peer
+            .create_data_channel(
+                label,
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create reserved subscription channel");
+        {
+            let channel = channel.clone();
+            runtime.spawn(Box::pin(async move {
+                while let Some(event) = channel.poll().await {
+                    match event {
+                        DataChannelEvent::OnOpen => {
+                            let _ = open_tx.try_send(());
+                        }
+                        DataChannelEvent::OnMessage(message) => {
+                            if let Ok(text) = String::from_utf8(message.data.to_vec()) {
+                                let _ = message_tx.try_send(text);
+                            }
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
+                    }
+                }
+            }));
+        }
+        timeout(runtime.as_ref(), Duration::from_secs(10), open_rx.recv())
+            .await
+            .expect("timed out waiting for reserved channel open")
+            .expect("reserved channel open signal");
+        let frame = ClientFrame::Hello {
+            hello: hello.clone(),
+        };
+        let _ = channel
+            .send_text(&encrypt_client_frame_text(key, &frame))
+            .await;
+        loop {
+            match timeout(runtime.as_ref(), Duration::from_secs(10), message_rx.recv())
+                .await
+                .expect("reserved channel neither acknowledged nor closed")
+            {
+                None => return true,
+                // Before its HelloAck a reserved channel carries no other
+                // server frame, so any text frame is the acknowledgement.
+                Some(_) => return false,
+            }
+        }
     }
 
     pub(crate) async fn next_reserved_event(
@@ -1300,7 +1369,13 @@ impl PeerHarness {
         ack
     }
 
-    pub(crate) fn bind_reserved_on_peer(&mut self, peer: &mut LiveSignaledPeer, label: &str) {
+    /// Open the reserved terminal channel and complete its Hello. Returns
+    /// the HelloAck `terminal_generation`.
+    pub(crate) fn bind_reserved_on_peer(
+        &mut self,
+        peer: &mut LiveSignaledPeer,
+        label: &str,
+    ) -> Option<u64> {
         let key = peer.stream_key.clone();
         let hello = DaemonHello {
             protocol: PROTOCOL.to_string(),
@@ -1315,14 +1390,18 @@ impl PeerHarness {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         let offer_handle = peer.offer_runtime.handle().clone();
         let worker = thread::spawn(move || {
-            offer_handle.block_on(offer_peer.open_reserved_terminal(&key, &reserved_label, &hello));
+            let generation = offer_handle.block_on(offer_peer.open_reserved_terminal(
+                &key,
+                &reserved_label,
+                &hello,
+            ));
             response_tx
-                .send(offer_peer)
+                .send((offer_peer, generation))
                 .expect("return reserved-channel offer peer");
         });
 
         let deadline = Instant::now() + Duration::from_secs(15);
-        let offer_peer = loop {
+        let (offer_peer, generation) = loop {
             if let Ok(result) = response_rx.try_recv() {
                 break result;
             }
@@ -1349,6 +1428,68 @@ impl PeerHarness {
         };
         worker.join().expect("reserved-channel worker joins");
         peer.offer_peer = Some(offer_peer);
+        generation
+    }
+
+    /// Open the reserved channel, send its Hello, and report whether Hub
+    /// closed the channel without a HelloAck.
+    pub(crate) fn open_reserved_expecting_reject(
+        &mut self,
+        peer: &mut LiveSignaledPeer,
+        label: &str,
+    ) -> bool {
+        let key = peer.stream_key.clone();
+        let hello = DaemonHello {
+            protocol: PROTOCOL.to_string(),
+            compatibility: DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+            terminal_compatibility: None,
+        };
+        let mut offer_peer = peer
+            .offer_peer
+            .take()
+            .expect("offer peer available for reserved-channel reject");
+        let reserved_label = label.to_string();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let offer_handle = peer.offer_runtime.handle().clone();
+        let worker = thread::spawn(move || {
+            let rejected = offer_handle.block_on(offer_peer.open_reserved_expecting_close(
+                &key,
+                &reserved_label,
+                &hello,
+            ));
+            response_tx
+                .send((offer_peer, rejected))
+                .expect("return reserved-channel offer peer");
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (offer_peer, rejected) = loop {
+            if let Ok(result) = response_rx.try_recv() {
+                break result;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for the reserved-channel reject");
+            }
+            match self.try_receive_owner_message() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut self.daemon,
+                        &mut self.state,
+                        &self.transport_handle,
+                        self.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("control channel closed during reserved-channel reject");
+                }
+            }
+        };
+        worker.join().expect("reserved-channel worker joins");
+        peer.offer_peer = Some(offer_peer);
+        rejected
     }
 
     pub(crate) fn wait_for_reserved_event(
@@ -1557,6 +1698,21 @@ impl PeerHarness {
         session_id: &str,
         subscription_id: &str,
     ) {
+        self.spawn_on_peer(
+            peer,
+            session_id,
+            "printf 'webrtc-attach-ready\\n'; while IFS= read -r line; do printf 'a:%s\\n' \"$line\"; done",
+        );
+        self.attach_and_bind_on_peer(peer, session_id, subscription_id);
+    }
+
+    /// Spawn a worker-backed session over the peer and record its worker.
+    pub(crate) fn spawn_on_peer(
+        &mut self,
+        peer: &mut LiveSignaledPeer,
+        session_id: &str,
+        command: &str,
+    ) {
         // Hold spawn capture lock for the full baseline → Spawn → census window so
         // process-global "new pid" adoption cannot pick a sibling test's worker.
         let _spawn_capture = spawn_capture_lock();
@@ -1565,13 +1721,13 @@ impl PeerHarness {
         let workers_before_spawn = session_worker_identities();
         let data_dir = self.data_directory.clone();
         let spawn = self.request_on_peer(
-                peer,
-                DaemonRequest::Spawn {
-                    session_id: session_id.to_string(),
-                    command: "printf 'webrtc-attach-ready\\n'; while IFS= read -r line; do printf 'a:%s\\n' \"$line\"; done".to_string(),
-                },
-                "Spawn",
-            );
+            peer,
+            DaemonRequest::Spawn {
+                session_id: session_id.to_string(),
+                command: command.to_string(),
+            },
+            "Spawn",
+        );
         assert_eq!(
             spawn.kind,
             botster_hub_client::DaemonResponseKind::Spawned,
@@ -1667,7 +1823,48 @@ impl PeerHarness {
                 "worker pid must appear in its process group census at readiness: {worker:?}"
             );
         }
+    }
 
+    /// Handle owner messages until `done` holds; panics at the deadline.
+    pub(crate) fn pump_until(
+        &mut self,
+        deadline: Instant,
+        what: &str,
+        mut done: impl FnMut(&mut Self) -> bool,
+    ) {
+        loop {
+            if done(self) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            match self.try_receive_owner_message() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut self.daemon,
+                        &mut self.state,
+                        &self.transport_handle,
+                        self.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("control channel closed while waiting for {what}");
+                }
+            }
+        }
+    }
+
+    /// Attach over the peer: returns the terminal reservation. No Core route
+    /// exists until its channel binds.
+    pub(crate) fn reserve_attach_on_peer(
+        &mut self,
+        peer: &mut LiveSignaledPeer,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> botster_hub_client::DaemonTerminalReservation {
         let attach = self.request_on_peer(
             peer,
             DaemonRequest::Attach {
@@ -1681,12 +1878,23 @@ impl PeerHarness {
             botster_hub_client::DaemonResponseKind::TerminalReservation,
             "attach over local WebRTC must succeed"
         );
-        let reservation = attach
+        attach
             .terminal_reservation
-            .as_ref()
+            .clone()
             .expect("WebRTC Attach must return a reservation body")
-            .clone();
-        self.bind_reserved_on_peer(peer, &reservation.label);
+    }
+
+    /// Attach and bind over the peer; returns the HelloAck generation.
+    pub(crate) fn attach_and_bind_on_peer(
+        &mut self,
+        peer: &mut LiveSignaledPeer,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> u64 {
+        let reservation = self.reserve_attach_on_peer(peer, session_id, subscription_id);
+        let generation = self
+            .bind_reserved_on_peer(peer, &reservation.label)
+            .expect("terminal HelloAck carries terminal_generation");
         self.wait_until_adapter_bound(session_id, subscription_id);
         assert!(
             self.state
@@ -1704,6 +1912,7 @@ impl PeerHarness {
             self.list_session_lifecycle(session_id).is_some(),
             "spawned session must be listed after attach readiness"
         );
+        generation
     }
 
     pub(crate) fn cleanup(mut self) {

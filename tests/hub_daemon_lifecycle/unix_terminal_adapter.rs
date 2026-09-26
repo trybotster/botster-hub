@@ -929,7 +929,7 @@ fn unix_adapter_feature_does_not_raise_default_requirement() {
         botster_hub_client::DaemonCompatibilityRequirement::for_unix_terminal_adapter();
     botster_hub_client::ensure_compatible(&adapter_requirement, &previous)
         .expect_err("the unix adapter requirement must fail closed without the feature");
-    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 9);
+    assert_eq!(botster_hub_client::PROTOCOL_VERSION, 10);
 }
 
 #[allow(clippy::too_many_arguments)]

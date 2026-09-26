@@ -1043,10 +1043,6 @@ impl LocalWebrtcOfferPeer {
                         ))
                         .into());
                     }
-                    if let Some(reservation) = response.terminal_reservation.as_ref() {
-                        self.route_generations
-                            .insert(reservation.label.clone(), reservation.generation);
-                    }
                     if let Some(reservation) = response.subscription_reservation.as_ref() {
                         let compatibility = match reservation.kind {
                             botster_hub_client::DaemonSubscriptionReservationKind::Entity => {
@@ -1491,7 +1487,12 @@ impl LocalWebrtcOfferPeer {
         let mut extra = extra;
         let (delivery, _) = extra.inbound.receive_delivery(key).await?;
         match delivery {
-            FixtureDelivery::Server(botster_hub_client::ServerFrame::HelloAck { .. }) => {}
+            FixtureDelivery::Server(botster_hub_client::ServerFrame::HelloAck { ack }) => {
+                // A terminal channel learns its Core generation here.
+                if let Some(generation) = ack.terminal_generation {
+                    self.route_generations.insert(label.to_string(), generation);
+                }
+            }
             other => {
                 return Err(std::io::Error::other(format!(
                     "reserved hello ack expected, got {other:?}"
