@@ -231,6 +231,13 @@ fn update_replaces_the_daemon_and_the_replacement_keeps_the_selected_source() {
         old_daemon.pid,
     );
 
+    // Installed before the update runs, so any later panic still stops the
+    // daemon the update starts.
+    let _replacement = EndpointShutdownGuard {
+        hub_bin: hub_bin.clone(),
+        data_dir: data_dir.clone(),
+        home: home.clone(),
+    };
     let output = Command::new(&hub_bin)
         .args(["update", "core", "--source"])
         .arg(&source)
@@ -250,10 +257,6 @@ fn update_replaces_the_daemon_and_the_replacement_keeps_the_selected_source() {
     )
     .unwrap();
     let new_pid = metadata["pid"].as_u64().unwrap() as u32;
-    let _replacement = ReplacementDaemonGuard {
-        pid: new_pid,
-        data_dir: data_dir.clone(),
-    };
     assert_ne!(
         new_pid, old_daemon.pid,
         "update silently reused the old daemon"
@@ -860,10 +863,17 @@ impl FixtureDaemon {
                 // The exit event does not reap; the child stays ours until
                 // the wait below, so Drop's kill can never reach another
                 // process. The long bound only caps a thread nobody waits on.
-                let _ = botster_hub::process_exit::wait_for_pid_exit(
-                    pid,
-                    Instant::now() + Duration::from_secs(24 * 60 * 60),
-                );
+                // Reap only on a confirmed exit. On a watch error or expiry
+                // the Child stays for Drop to kill and reap.
+                if !matches!(
+                    botster_hub::process_exit::wait_for_pid_exit(
+                        pid,
+                        Instant::now() + Duration::from_secs(24 * 60 * 60),
+                    ),
+                    Ok(true)
+                ) {
+                    return;
+                }
                 let reaped = child
                     .lock()
                     .expect("fixture child")
@@ -904,28 +914,25 @@ impl Drop for FixtureDaemon {
     }
 }
 
-/// A daemon the update started (not this test's child). On a failed test it
-/// is stopped only while its command line still names this test's data
-/// directory, so a pid reused by another process is never signalled.
-struct ReplacementDaemonGuard {
-    pid: u32,
+/// Stops whatever daemon serves this test's private data directory, through
+/// its socket, never by pid: the daemon an update starts is not this test's
+/// child. A shutdown with no daemon listening is a harmless failed request.
+struct EndpointShutdownGuard {
+    hub_bin: PathBuf,
     data_dir: PathBuf,
+    home: PathBuf,
 }
 
-impl Drop for ReplacementDaemonGuard {
+impl Drop for EndpointShutdownGuard {
     fn drop(&mut self) {
-        let Ok(output) = Command::new("ps")
-            .args(["-p", &self.pid.to_string(), "-o", "command="])
-            .output()
-        else {
-            return;
-        };
-        let command = String::from_utf8_lossy(&output.stdout);
-        if command.contains(" start ") && command.contains(&*self.data_dir.to_string_lossy()) {
-            unsafe {
-                libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
+        let _ = Command::new(&self.hub_bin)
+            .args(["shutdown", "--data-dir"])
+            .arg(&self.data_dir)
+            .env("HOME", &self.home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
