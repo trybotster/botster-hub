@@ -1847,8 +1847,7 @@ pub(crate) struct UncertainPublicationCell {
 enum UncertainPublicationPayload {
     State(crate::persistence::HubStateUncertainWrite),
     External {
-        pending: crate::persistence::PendingFileCommit,
-        cause: crate::host_mutations::ExternalEffectCause,
+        _cause: crate::host_mutations::ExternalEffectCause,
     },
 }
 
@@ -2027,7 +2026,6 @@ impl DaemonControlState {
     pub(crate) fn retain_uncertain_external(
         &mut self,
         waiter_id: crate::owner_identity::WaiterId,
-        pending: crate::persistence::PendingFileCommit,
         rollback: crate::host_mutations::RollbackDescriptor,
         cause: crate::host_mutations::ExternalEffectCause,
     ) {
@@ -2043,7 +2041,7 @@ impl DaemonControlState {
             cell.write.is_none(),
             "publication cell cannot be overwritten"
         );
-        cell.write = Some(UncertainPublicationPayload::External { pending, cause });
+        cell.write = Some(UncertainPublicationPayload::External { _cause: cause });
         cell.rollback = Some(rollback);
     }
 
@@ -10305,27 +10303,26 @@ return botster.register({tools = {{
             generation_after_install
         );
 
-        let refused_retry = drive_package_request(
+        // Nothing was published before the rename, so the retry commits.
+        let retry = drive_package_request(
             &mut daemon,
             DaemonRequest::EnablePackage {
                 package_name: "types.plugin".to_string(),
             },
         )
-        .expect("typed retry refusal");
-        let refusal = refused_retry.error.as_ref().expect("retry must be refused");
-        assert_eq!(refusal.code, "hub_state_commit_failed");
-        // This message distinguishes journal quarantine from the first write failure.
-        assert_eq!(
-            refusal.message,
-            "recovery required: recovery_journal_quarantined"
+        .expect("retry response");
+        assert!(
+            retry.error.is_none(),
+            "retry must commit: {:?}",
+            retry.error
         );
-        assert_eq!(
+        assert!(
             daemon
                 .runtime()
                 .expect("runtime")
                 .state()
-                .session_type_generation,
-            generation_after_install
+                .session_type_generation
+                > generation_after_install
         );
         daemon.stop();
 

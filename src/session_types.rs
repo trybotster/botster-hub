@@ -773,6 +773,10 @@ pub(crate) fn prepare_session_type_mutation(
                 .first_mut()
                 .expect("device source inserted above");
             apply_definition_mutation(&mut source.session_types, mutation)?;
+            // Device types live in the Hub-state document, so its generation
+            // invalidates the catalog. Repository types are invalidated by the
+            // catalog observation of the repository file.
+            next.session_type_generation = next.session_type_generation.saturating_add(1);
             None
         }
         SessionTypeMutationSource::Repo { target_id } => {
@@ -794,7 +798,6 @@ pub(crate) fn prepare_session_type_mutation(
         }
         SessionTypeMutationSource::Package { .. } => unreachable!("handled above"),
     };
-    next.session_type_generation = next.session_type_generation.saturating_add(1);
     Ok(PreparedSessionTypeMutation {
         state: next,
         repo_write,

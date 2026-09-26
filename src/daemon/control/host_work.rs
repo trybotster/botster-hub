@@ -613,6 +613,11 @@ impl HostMutationContinuation {
             } else if let HostResult::Mutation(result) = result {
                 result
             } else {
+                // A session-type job may have touched the repository file
+                // before this result, so the catalog observes it here too.
+                if *observes_session_type_catalog {
+                    crate::subscription::entity::note_session_type_catalog_observation(state);
+                }
                 state.release_uncertain_reservation(waiter_id);
                 return finish_error(
                     permit,
@@ -714,16 +719,16 @@ impl HostMutationContinuation {
                 drop(permit);
                 ControlPoll::Ready(Ok(error_response(code, "hub_state", message)))
             }
-            HostMutationResult::ExternalEffectUncertain {
-                pending,
-                rollback,
-                cause,
-            } => {
+            HostMutationResult::ExternalEffectUncertain { rollback, cause } => {
                 let (code, message) = cause.client_error();
-                state.retain_uncertain_external(waiter_id, pending, rollback, cause);
+                state.retain_uncertain_external(waiter_id, rollback, cause);
                 release_document(state, waiter_id);
                 drop(permit);
                 ControlPoll::Ready(Ok(error_response(code, "repo_session_type", message)))
+            }
+            HostMutationResult::RepoFileCommitted { reply } => {
+                release_document(state, waiter_id);
+                finish_reply(permit, reply)
             }
             HostMutationResult::Prepared(prepared) => admit_or_park_commit(
                 daemon,
@@ -1711,7 +1716,7 @@ mod tests {
     use crate::daemon::owner_loop::UncertainPublicationKind;
     use crate::host_executor::HostCompletion;
     use crate::host_mutations::{ExternalEffectCause, RollbackDescriptor};
-    use crate::persistence::{ExternalFileIntent, FileCommitOutcome, FileHubStateStore};
+    use crate::persistence::{FileCommitOutcome, FileHubStateStore};
     use crate::runtime::package_effect::HostPackageCleanup;
     use crate::session_types::SessionTypeError;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2155,38 +2160,10 @@ mod tests {
     #[test]
     fn external_uncertainty_uses_the_host_completion_cell_and_releases_one_document_waiter() {
         let (mut daemon, directory) = recovery_test_daemon();
-        let (revision, prior) = daemon.state_view();
-        let authority = daemon
-            .runtime()
-            .expect("runtime")
-            .state_authority()
-            .expect("File authority");
-        let store = FileHubStateStore::for_data_directory(&directory);
-        let prepared = store
-            .prepare_shared(
-                &authority,
-                revision,
-                Some(prior.clone()),
-                (*prior).clone(),
-                &authority.budget(),
-            )
-            .expect("prepare state write");
-        let external_path = directory.join("repo/.botster/session-types.json");
-        let pending = store
-            .begin_shared_effect(
-                prepared,
-                revision,
-                Some(ExternalFileIntent {
-                    path: &external_path,
-                    prior: None,
-                    candidate: b"candidate repo bytes",
-                }),
-            )
-            .expect("synchronize real external intent");
+        let (_revision, prior) = daemon.state_view();
         poll_uncertain_result(
             &mut daemon,
             HostMutationResult::ExternalEffectUncertain {
-                pending,
                 rollback: RollbackDescriptor::SessionType {
                     previous: prior,
                     repo_file: None,
@@ -2201,7 +2178,6 @@ mod tests {
             UncertainPublicationKind::External,
             "repo_session_type_publication_uncertain",
         );
-        drop(authority);
         daemon.stop();
         std::fs::remove_dir_all(directory).expect("remove external uncertainty test directory");
     }

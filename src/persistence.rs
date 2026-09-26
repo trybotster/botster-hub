@@ -12,9 +12,9 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, OnceLock};
 
 use botster_core::{Capability, CapabilitySurface};
 use serde::{Deserialize, Serialize};
@@ -25,9 +25,6 @@ use crate::config::{
 };
 use crate::credentials::{CredentialKeyPurpose, CredentialProviderKind};
 use crate::packages::PackageRegistrySnapshot;
-use crate::recovery::journal::{
-    DurableIntentReceipt, JournalError, JournalExternal, JournalIntent, RecoveryJournal,
-};
 use crate::recovery::state_directory::{
     StateDirectoryError, StateDirectoryOwnership, StateDocumentCommit,
 };
@@ -342,7 +339,6 @@ pub struct FileHubStateStore {
 pub struct HubStateAuthority {
     store_path: PathBuf,
     directory: StateDirectoryOwnership,
-    journal: Arc<Mutex<RecoveryJournal>>,
     budget: Arc<SharedViewBudget>,
     startup_charge: Option<SharedViewCharge>,
 }
@@ -358,7 +354,6 @@ impl HubStateAuthority {
         Self {
             store_path: self.store_path.clone(),
             directory: self.directory.clone(),
-            journal: Arc::clone(&self.journal),
             budget: Arc::clone(&self.budget),
             startup_charge: None,
         }
@@ -388,7 +383,6 @@ impl fmt::Debug for HubStateAuthority {
 pub enum HubStatePublicationCause {
     DirectorySync(io::Error),
     DirectoryChanged,
-    JournalCompletion,
 }
 
 impl HubStatePublicationCause {
@@ -397,10 +391,6 @@ impl HubStatePublicationCause {
             Self::DirectorySync(_) | Self::DirectoryChanged => (
                 "state_publication_uncertain",
                 "the state write reached publication without a confirmed durable result",
-            ),
-            Self::JournalCompletion => (
-                "state_completion_record_uncertain",
-                "the state write is synchronized, but recovery completion synchronization is unconfirmed",
             ),
         }
     }
@@ -414,23 +404,6 @@ struct FileWriteEvidence {
     base_revision: u64,
     committed_revision: u64,
     cause: Option<HubStatePublicationCause>,
-    journal_error: Option<JournalError>,
-    receipt: Option<DurableIntentReceipt>,
-}
-
-#[derive(Serialize)]
-struct StateWriteIntentMetadata<'a> {
-    kind: &'static str,
-    host_id: &'a str,
-    base_revision: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    external_path: Option<&'a [u8]>,
-}
-
-pub(crate) struct ExternalFileIntent<'a> {
-    pub(crate) path: &'a Path,
-    pub(crate) prior: Option<&'a [u8]>,
-    pub(crate) candidate: &'a [u8],
 }
 
 /// Evidence owned by the caller after a write reached rename without a clean result.
@@ -462,14 +435,6 @@ impl HubStateUncertainWrite {
     pub(crate) fn authority(&self) -> &HubStateAuthority {
         &self.0.authority
     }
-
-    pub(crate) fn journal_error(&self) -> Option<&JournalError> {
-        self.0.journal_error.as_ref()
-    }
-
-    pub(crate) fn receipt_sequence(&self) -> Option<u64> {
-        self.0.receipt.as_ref().map(DurableIntentReceipt::sequence)
-    }
 }
 
 #[derive(Debug)]
@@ -497,30 +462,6 @@ pub(crate) enum FileCommitError {
 pub(crate) struct PreparedHubStateWrite {
     evidence: Box<FileWriteEvidence>,
     bytes: Vec<u8>,
-}
-
-/// One prepared state write with its durable intent already synchronized.
-#[derive(Debug)]
-#[must_use]
-pub(crate) struct PendingFileCommit {
-    prepared: PreparedHubStateWrite,
-}
-
-impl PendingFileCommit {
-    pub(crate) fn receipt_sequence(&self) -> u64 {
-        self.prepared
-            .evidence
-            .receipt
-            .as_ref()
-            .expect("pending File commit has a durable receipt")
-            .sequence()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct FileEffectCommitError {
-    pub(crate) error: HubStateStoreError,
-    pub(crate) pending: PendingFileCommit,
 }
 
 impl FileHubStateStore {
@@ -583,20 +524,22 @@ impl FileHubStateStore {
             .parent()
             .ok_or(HubStateStoreError::MissingParent)?;
         let directory = StateDirectoryOwnership::acquire(parent).map_err(map_directory_error)?;
-        let state_exists = directory
-            .open_document_bytes()
-            .map_err(map_directory_error)?
-            .is_some();
-        let journal = RecoveryJournal::scan(directory.clone(), state_exists).map_err(|error| {
-            HubStateStoreError::RecoveryRequired {
-                reason: error.code(),
-                sequence: error.sequence(),
-            }
-        })?;
+        // The recovery journal is retired. A file left by an earlier Hub is
+        // removed through the held directory; its outcome never blocks startup.
+        match directory.remove_retired_recovery_journal() {
+            Ok(false) => {}
+            Ok(true) => crate::hub_log::hub_log!(
+                "event=recovery_journal_retired outcome=removed directory={}",
+                directory.directory().display()
+            ),
+            Err(error) => crate::hub_log::hub_log!(
+                "event=recovery_journal_retired outcome=remove_failed directory={} error={error}",
+                directory.directory().display()
+            ),
+        }
         Ok(HubStateAuthority {
             store_path: self.path.clone(),
             directory,
-            journal: Arc::new(Mutex::new(journal)),
             budget: SharedViewBudget::new(),
             startup_charge: None,
         })
@@ -707,33 +650,16 @@ impl FileHubStateStore {
             base_revision,
             committed_revision: base_revision,
             cause: None,
-            journal_error: None,
-            receipt: None,
         });
         PreparedHubStateWrite { evidence, bytes }
     }
 
-    /// Commit a state document without an earlier external effect.
+    /// Commit a prepared state document through the atomic directory write.
     pub(crate) fn commit_shared(
         &self,
         prepared: PreparedHubStateWrite,
         current_revision: u64,
     ) -> Result<FileCommitOutcome, FileCommitError> {
-        let pending = self.begin_shared_effect(prepared, current_revision, None)?;
-        self.commit_shared_effect(pending)
-            .map_err(|failure| FileCommitError::BeforePublication {
-                error: failure.error,
-                prepared: failure.pending.prepared,
-            })
-    }
-
-    /// Synchronize the one intent before the caller starts an external effect.
-    pub(crate) fn begin_shared_effect(
-        &self,
-        prepared: PreparedHubStateWrite,
-        current_revision: u64,
-        external: Option<ExternalFileIntent<'_>>,
-    ) -> Result<PendingFileCommit, FileCommitError> {
         if current_revision != prepared.evidence.base_revision {
             return Err(FileCommitError::Stale(prepared));
         }
@@ -745,77 +671,6 @@ impl FileHubStateStore {
         }
         let mut prepared = prepared;
         prepared.evidence.committed_revision = revision;
-        let metadata = match serde_json::to_vec(&StateWriteIntentMetadata {
-            kind: if external.is_some() {
-                "state_and_external_file_write"
-            } else {
-                "state_write"
-            },
-            host_id: &prepared.evidence.candidate.host.id,
-            base_revision: current_revision,
-            external_path: external
-                .as_ref()
-                .map(|external| external.path.as_os_str().as_encoded_bytes()),
-        }) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                return Err(FileCommitError::BeforePublication {
-                    error: HubStateStoreError::Serialize(error),
-                    prepared,
-                });
-            }
-        };
-        let journal_handle = Arc::clone(&prepared.evidence.authority.journal);
-        let mut journal = match journal_handle.lock() {
-            Ok(journal) => journal,
-            Err(_) => {
-                return Err(FileCommitError::BeforePublication {
-                    error: HubStateStoreError::JournalPoisoned,
-                    prepared,
-                });
-            }
-        };
-        let intent = match journal.begin(JournalIntent {
-            metadata: &metadata,
-            candidate_bytes: &prepared.bytes,
-            prior_exists: prepared.evidence.prior.is_some(),
-            external: external.as_ref().map(|external| JournalExternal {
-                prior: external.prior,
-                candidate: external.candidate,
-            }),
-        }) {
-            Ok(intent) => intent,
-            Err(error) => {
-                return Err(FileCommitError::BeforePublication {
-                    error: HubStateStoreError::RecoveryRequired {
-                        reason: error.code(),
-                        sequence: error.sequence(),
-                    },
-                    prepared,
-                });
-            }
-        };
-        prepared.evidence.receipt = Some(intent);
-        Ok(PendingFileCommit { prepared })
-    }
-
-    /// Finish the same intent after every named external effect has synchronized.
-    pub(crate) fn commit_shared_effect(
-        &self,
-        pending: PendingFileCommit,
-    ) -> Result<FileCommitOutcome, FileEffectCommitError> {
-        let PendingFileCommit { mut prepared } = pending;
-        let revision = prepared.evidence.committed_revision;
-        let journal_handle = Arc::clone(&prepared.evidence.authority.journal);
-        let mut journal = match journal_handle.lock() {
-            Ok(journal) => journal,
-            Err(_) => {
-                return Err(FileEffectCommitError {
-                    error: HubStateStoreError::JournalPoisoned,
-                    pending: PendingFileCommit { prepared },
-                });
-            }
-        };
         #[cfg(test)]
         let result = if save_failure_is_due(&self.path) {
             prepared
@@ -843,32 +698,14 @@ impl FileHubStateStore {
             .directory
             .write_document(&prepared.bytes);
         match result {
-            Err(error) => Err(FileEffectCommitError {
+            Err(error) => Err(FileCommitError::BeforePublication {
                 error: map_directory_error(error),
-                pending: PendingFileCommit { prepared },
+                prepared,
             }),
-            Ok(StateDocumentCommit::Synced) => match journal.complete(
-                prepared
-                    .evidence
-                    .receipt
-                    .as_ref()
-                    .expect("durable intent receipt precedes state write"),
-            ) {
-                Ok(()) => {
-                    prepared.evidence.receipt = None;
-                    Ok(FileCommitOutcome::Synced {
-                        state: prepared.evidence.candidate.clone(),
-                        revision,
-                    })
-                }
-                Err(error) => {
-                    prepared.evidence.cause = Some(HubStatePublicationCause::JournalCompletion);
-                    prepared.evidence.journal_error = Some(error);
-                    Ok(FileCommitOutcome::PublishedUncertain(
-                        HubStateUncertainWrite(prepared.evidence),
-                    ))
-                }
-            },
+            Ok(StateDocumentCommit::Synced) => Ok(FileCommitOutcome::Synced {
+                state: prepared.evidence.candidate.clone(),
+                revision,
+            }),
             Ok(StateDocumentCommit::SyncedDirectoryChanged(_)) => {
                 prepared.evidence.cause = Some(HubStatePublicationCause::DirectoryChanged);
                 Ok(FileCommitOutcome::PublishedUncertain(
@@ -1095,13 +932,6 @@ pub enum HubStateStoreError {
     DirectoryChanged,
     /// A published write paused further writes through this authority.
     Quarantined,
-    /// A durable intent is unresolved or its journal cannot be trusted.
-    RecoveryRequired {
-        reason: &'static str,
-        sequence: Option<u64>,
-    },
-    /// A poisoned journal owner cannot authorize another state write.
-    JournalPoisoned,
     /// A temporary file did not have exclusive regular-file identity.
     InvalidTemporaryFile,
     /// A state write reached rename without a clean commit result.
@@ -1143,11 +973,6 @@ impl fmt::Display for HubStateStoreError {
             Self::Quarantined => {
                 formatter.write_str("state directory writes are paused after uncertain publication")
             }
-            Self::RecoveryRequired { reason, sequence } => match sequence {
-                Some(sequence) => write!(formatter, "recovery required: {reason} at {sequence}"),
-                None => write!(formatter, "recovery required: {reason}"),
-            },
-            Self::JournalPoisoned => formatter.write_str("recovery journal owner is poisoned"),
             Self::InvalidTemporaryFile => formatter
                 .write_str("state temporary file is not an exclusively linked regular file"),
             Self::PublishedUncertain(write) => {
@@ -1179,7 +1004,6 @@ impl Error for HubStateStoreError {
             Self::PublishedUncertain(write) => match write.cause() {
                 HubStatePublicationCause::DirectorySync(error) => Some(error),
                 HubStatePublicationCause::DirectoryChanged => None,
-                HubStatePublicationCause::JournalCompletion => None,
             },
             Self::Io(error) => Some(error),
             Self::Serialize(error) | Self::Corrupt(error) => Some(error),
@@ -1191,8 +1015,6 @@ impl Error for HubStateStoreError {
             | Self::Owned(_)
             | Self::DirectoryChanged
             | Self::Quarantined
-            | Self::RecoveryRequired { .. }
-            | Self::JournalPoisoned
             | Self::InvalidTemporaryFile
             | Self::ViewCapacity { .. } => None,
             #[cfg(test)]
@@ -1419,7 +1241,6 @@ mod tests {
         ));
         assert_eq!(uncertain.base_revision(), 1);
         assert_eq!(uncertain.committed_revision(), 2);
-        assert_eq!(uncertain.receipt_sequence(), Some(3));
         assert_eq!(uncertain.prior().unwrap().session_type_generation, 1);
         assert_eq!(uncertain.candidate().session_type_generation, 2);
         assert_eq!(
@@ -1429,7 +1250,6 @@ mod tests {
             2
         );
         let document_bytes = authority.directory.read_document().unwrap();
-        let journal_bytes = fs::read(config.data_directory.join("hub-recovery.log")).unwrap();
 
         let mut later = (*confirmed).clone();
         later.session_type_generation = 3;
@@ -1439,31 +1259,23 @@ mod tests {
         assert!(matches!(
             store.commit_shared(prepared, 1),
             Err(FileCommitError::BeforePublication {
-                error: HubStateStoreError::RecoveryRequired {
-                    reason: "recovery_journal_quarantined",
-                    sequence: None,
-                },
+                error: HubStateStoreError::Quarantined,
                 ..
             })
         ));
         assert_eq!(authority.directory.read_document().unwrap(), document_bytes);
-        assert_eq!(
-            fs::read(config.data_directory.join("hub-recovery.log")).unwrap(),
-            journal_bytes
-        );
         assert!(!config.data_directory.join("hub-state.json.tmp").exists());
         drop(uncertain);
         drop(authority);
     }
 
     #[test]
-    fn file_startup_refuses_unresolved_intent_after_directory_sync_failure() {
-        let config = test_config("startup-unresolved-intent");
+    fn file_startup_after_directory_sync_failure_loads_the_renamed_document() {
+        let config = test_config("startup-after-sync-failure");
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
         let (state, Some(mut authority)) = store.load_retained(&config).unwrap() else {
             panic!("File load must return its authority");
         };
-        assert!(config.data_directory.join("hub-recovery.log").exists());
         let unrelated = config.data_directory.join("unrelated.txt");
         std::fs::write(&unrelated, b"leave this file alone").unwrap();
 
@@ -1482,42 +1294,76 @@ mod tests {
         else {
             panic!("rename with failed directory sync must remain uncertain");
         };
-        assert!(matches!(
-            write.cause(),
-            HubStatePublicationCause::DirectorySync(_)
-        ));
         drop(write);
         drop(authority);
 
-        assert!(matches!(
-            store.load_retained(&config),
-            Err(HubStateStoreError::RecoveryRequired {
-                reason: "recovery_intent_unresolved",
-                sequence: Some(2),
-            })
-        ));
+        // With no journal, startup never refuses: the atomic rename left one
+        // exact document, and that document is the state.
+        let (loaded, Some(_authority)) = store.load_retained(&config).unwrap() else {
+            panic!("File load must return its authority");
+        };
+        assert_eq!(loaded.session_type_generation, 1);
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"leave this file alone");
     }
 
     #[test]
-    fn file_startup_refuses_existing_state_without_journal() {
-        let config = test_config("startup-legacy-state");
+    fn file_startup_removes_a_retired_recovery_journal() {
+        let config = test_config("startup-retired-journal");
         std::fs::create_dir_all(&config.data_directory).unwrap();
-        let state = HubState::from_config(&config);
-        std::fs::write(
-            config.data_directory.join(HUB_STATE_FILE_NAME),
-            serde_json::to_vec_pretty(&state).unwrap(),
-        )
-        .unwrap();
+        let journal = config.data_directory.join("hub-recovery.log");
+        std::fs::write(&journal, b"BSTRJNL1 retired").unwrap();
         let store = FileHubStateStore::for_data_directory(&config.data_directory);
-        assert!(matches!(
-            store.load_retained(&config),
-            Err(HubStateStoreError::RecoveryRequired {
-                reason: "recovery_journal_missing_for_state",
-                sequence: None,
-            })
-        ));
-        assert!(!config.data_directory.join("hub-recovery.log").exists());
+        let (_state, Some(_authority)) = store.load_retained(&config).unwrap() else {
+            panic!("File load must return its authority");
+        };
+        assert!(!journal.exists(), "startup must remove the retired journal");
+        let directory = config.data_directory.canonicalize().unwrap();
+        let lines = crate::hub_log::captured_matching(&[
+            "event=recovery_journal_retired",
+            "outcome=removed",
+            &format!("directory={}", directory.display()),
+        ]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    #[test]
+    fn file_startup_removes_a_retired_journal_link_without_following_it() {
+        let config = test_config("startup-retired-journal-link");
+        std::fs::create_dir_all(&config.data_directory).unwrap();
+        let outside = config.data_directory.with_extension("outside");
+        std::fs::write(&outside, b"not the journal").unwrap();
+        let journal = config.data_directory.join("hub-recovery.log");
+        std::os::unix::fs::symlink(&outside, &journal).unwrap();
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let (_state, Some(_authority)) = store.load_retained(&config).unwrap() else {
+            panic!("File load must return its authority");
+        };
+        assert!(
+            std::fs::symlink_metadata(&journal).is_err(),
+            "the link is removed"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"not the journal");
+        std::fs::remove_file(&outside).unwrap();
+    }
+
+    #[test]
+    fn file_startup_starts_when_the_retired_journal_cannot_be_removed() {
+        let config = test_config("startup-retired-journal-stuck");
+        std::fs::create_dir_all(&config.data_directory).unwrap();
+        // A non-empty directory cannot be unlinked as a file.
+        let journal = config.data_directory.join("hub-recovery.log");
+        std::fs::create_dir_all(journal.join("inner")).unwrap();
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        let (_state, Some(_authority)) = store.load_retained(&config).unwrap() else {
+            panic!("startup must not refuse because of a retired journal");
+        };
+        let directory = config.data_directory.canonicalize().unwrap();
+        let lines = crate::hub_log::captured_matching(&[
+            "event=recovery_journal_retired",
+            "outcome=remove_failed",
+            &format!("directory={}", directory.display()),
+        ]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
     }
 
     #[test]
@@ -2127,13 +1973,8 @@ mod tests {
             fs::read(store.path()).expect("read unchanged state document"),
             prior_bytes
         );
-        assert!(matches!(
-            load_file_state(&store, &config),
-            Err(HubStateStoreError::RecoveryRequired {
-                reason: "recovery_intent_unresolved",
-                sequence: Some(2),
-            })
-        ));
+        // Nothing was renamed, so a restart loads the unchanged document.
+        assert!(load_file_state(&store, &config).is_ok());
     }
 
     #[test]

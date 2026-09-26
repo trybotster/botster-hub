@@ -46,7 +46,7 @@ impl Fixture {
     }
 
     fn replace_initialized_document(&self, bytes: &[u8]) {
-        if !self.directory.join("hub-recovery.log").exists() {
+        if !self.store.path().exists() {
             let _ = self.state();
         }
         fs::write(self.store.path(), bytes).expect("replace initialized test document");
@@ -432,13 +432,8 @@ fn failed_write_returns_no_receipt_and_preserves_committed_bytes() {
     assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
     drop(authority);
     drop(state);
-    assert!(matches!(
-        fixture.store.load_retained(&fixture.config),
-        Err(HubStateStoreError::RecoveryRequired {
-            reason: "recovery_intent_unresolved",
-            sequence: Some(2),
-        })
-    ));
+    // Nothing was renamed, so a restart loads the unchanged document.
+    assert!(fixture.store.load_retained(&fixture.config).is_ok());
 }
 
 #[test]
@@ -643,13 +638,8 @@ fn schema_three_migrates_both_load_paths_without_mutating_disk() {
     assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
     drop(prior);
     drop(authority);
-    assert!(matches!(
-        fixture.store.load_retained(&fixture.config),
-        Err(HubStateStoreError::RecoveryRequired {
-            reason: "recovery_intent_unresolved",
-            sequence: Some(2),
-        })
-    ));
+    // Nothing was renamed, so a restart loads the unchanged document.
+    assert!(fixture.store.load_retained(&fixture.config).is_ok());
 
     let successful = Fixture::new();
     successful.replace_initialized_document(&bytes);
