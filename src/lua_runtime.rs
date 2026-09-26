@@ -188,6 +188,7 @@ mod basics;
 mod callback;
 mod entity_publish;
 pub(crate) mod lua_json;
+mod modules;
 #[cfg(test)]
 mod registration_tests;
 pub(crate) mod result;
@@ -1229,7 +1230,7 @@ mod state_owner_tests {
         .unwrap();
         let key = PluginKey("instruction-budget-test".into());
         let (runtime, _) =
-            LuaPluginRuntime::new(key.clone(), &entrypoint, host_api, memory).unwrap();
+            LuaPluginRuntime::new(key.clone(), &entrypoint, None, host_api, memory).unwrap();
         let invoke = |handler: &str| {
             runtime.invoke(
                 PluginInvocationRequest {
@@ -1586,7 +1587,13 @@ impl LuaPluginRuntime {
             causal_scopes: api.causal_scopes,
             memory: Arc::clone(&memory),
         };
-        let loaded = LoadedLuaPlugin::load(plugin_key.clone(), entrypoint, host_api, memory)?;
+        let loaded = LoadedLuaPlugin::load(
+            plugin_key.clone(),
+            entrypoint,
+            Some(&prepared.package_root),
+            host_api,
+            memory,
+        )?;
         let runtime = Arc::new(loaded.runtime);
         #[cfg(test)]
         lua_plugin_runtimes
@@ -1610,6 +1617,7 @@ impl LuaPluginRuntime {
     fn new(
         plugin_key: PluginKey,
         entrypoint: &Path,
+        package_root: Option<&Path>,
         host_api: LuaHostApi,
         memory: Arc<LuaMemoryAccount>,
     ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
@@ -1647,6 +1655,14 @@ impl LuaPluginRuntime {
             )?;
             sandbox::install(lua, Arc::clone(&budget), Arc::clone(&instruction_error))?;
             let capacity_string = install_botster_api(lua, plugin_key.clone(), host_api)?;
+            if let Some(package_root) = package_root {
+                let staged = modules::stage(package_root, &memory).map_err(|message| {
+                    LuaPluginRuntimeError::Load(format!("cannot stage Lua modules: {message}"))
+                })?;
+                modules::install(lua, &staged)?;
+                // The VM owns the module text now; the staging charge ends here.
+                drop(staged);
+            }
             let value: Value = lua
                 .load(&source)
                 .set_name(entrypoint.to_string_lossy().as_ref())
@@ -1877,11 +1893,17 @@ impl LoadedLuaPlugin {
     fn load(
         plugin_key: PluginKey,
         entrypoint: &Path,
+        package_root: Option<&Path>,
         host_api: LuaHostApi,
         memory: Arc<LuaMemoryAccount>,
     ) -> Result<Self, LuaPluginRuntimeError> {
-        let (runtime, registration) =
-            LuaPluginRuntime::new(plugin_key.clone(), entrypoint, host_api, memory)?;
+        let (runtime, registration) = LuaPluginRuntime::new(
+            plugin_key.clone(),
+            entrypoint,
+            package_root,
+            host_api,
+            memory,
+        )?;
         let mut handlers = Vec::new();
         let mut event_handlers = Vec::new();
         let mut descriptors = Vec::new();
