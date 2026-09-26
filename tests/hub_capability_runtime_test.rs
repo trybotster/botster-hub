@@ -60,7 +60,31 @@ fn explicit_runtime(name: &str) -> HubRuntime {
     .build_config_for_environment(&RuntimeEnvironment::from_values(None, None))
     .expect("explicit runtime config should build");
 
-    HubRuntime::new(config).expect("hub runtime starts")
+    let mut runtime = HubRuntime::new(config).expect("hub runtime starts");
+    // These tests submit requests without loading a package, so they install
+    // the grants that package admission would record for each plugin.
+    for plugin in ["project-pipelines", "botster-workspaces"] {
+        runtime.test_install_plugin_grants(&PluginKey(plugin.to_string()), admitted_grants(plugin));
+    }
+    runtime
+}
+
+/// The capabilities these fixture packages would declare and be admitted with.
+fn admitted_grants(plugin: &str) -> Vec<Capability> {
+    vec![
+        capability(CapabilitySurface::PluginDb, plugin),
+        capability(CapabilitySurface::Network, "http"),
+        capability(CapabilitySurface::Network, "websocket"),
+        capability(CapabilitySurface::Filesystem, "workspace"),
+        capability(CapabilitySurface::Timers, "callbacks"),
+    ]
+}
+
+fn capability(surface: CapabilitySurface, scope: &str) -> Capability {
+    Capability {
+        surface,
+        scope: Some(scope.to_string()),
+    }
 }
 
 fn request(
@@ -272,6 +296,69 @@ fn drain_session_until(
         "timed out waiting for {:?}",
         String::from_utf8_lossy(needle)
     );
+}
+
+#[test]
+fn hub_runtime_checks_each_plugin_against_its_own_admitted_grants() {
+    let mut runtime = explicit_runtime("per-plugin-grants");
+    let timer = || CapabilityOperation::Timer(TimerCapabilityRequest::Once { delay_ms: 60_000 });
+    let store = |namespace: &str| {
+        CapabilityOperation::PluginStore(PluginStoreCapabilityRequest {
+            namespace: namespace.to_string(),
+            operation: PluginStoreOperation::Get {
+                key: PluginStoreKey("settings".to_string()),
+            },
+        })
+    };
+    let denied = |result: Result<_, botster_core::CapabilityRuntimeError>| {
+        let error = result.expect_err("the request must be denied");
+        assert_eq!(
+            error.kind,
+            CapabilityRuntimeErrorKind::CapabilityDenied,
+            "{error:?}"
+        );
+    };
+
+    // A plugin with no admitted package gets nothing, not even timers.
+    denied(runtime.submit_capability_request(request("unadmitted.plugin", "timer", timer())));
+    denied(runtime.submit_capability_request(request(
+        "unadmitted.plugin",
+        "store",
+        store("unadmitted.plugin"),
+    )));
+
+    // A plugin admitted with timers only gets timers and nothing else.
+    let timers_only = PluginKey("timers.plugin".to_string());
+    runtime.test_install_plugin_grants(
+        &timers_only,
+        vec![capability(CapabilitySurface::Timers, "callbacks")],
+    );
+    runtime
+        .submit_capability_request(request(&timers_only.0, "timer", timer()))
+        .expect("admitted timer");
+    denied(runtime.submit_capability_request(request(
+        &timers_only.0,
+        "store",
+        store(&timers_only.0),
+    )));
+
+    // An admitted plugin_db grant never reaches another plugin's namespace.
+    denied(runtime.submit_capability_request(request(
+        "project-pipelines",
+        "foreign-store",
+        store("botster-workspaces"),
+    )));
+    runtime
+        .submit_capability_request(request(
+            "project-pipelines",
+            "own-store",
+            store("project-pipelines"),
+        ))
+        .expect("own namespace");
+
+    // Replacing the admitted set takes effect for the next request.
+    runtime.test_install_plugin_grants(&timers_only, Vec::new());
+    denied(runtime.submit_capability_request(request(&timers_only.0, "timer-after", timer())));
 }
 
 #[test]
