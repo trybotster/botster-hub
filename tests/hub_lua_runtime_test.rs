@@ -1584,7 +1584,8 @@ fn plugin_db_batch_capability_denial_raises_a_lua_error() {
     assert!(
         denied["error"]
             .as_str()
-            .is_some_and(|error| error.contains("plugin-store namespace must exactly match")),
+            // The namespace is the package's own; the package just lacks the grant.
+            .is_some_and(|error| error.contains("was not admitted with the required capability")),
         "unexpected capability denial: {denied}"
     );
     let _ = fs::remove_dir_all(data_directory);
@@ -4218,4 +4219,76 @@ fn two_publications_keep_distinct_pending_leases_before_owner_transfers_apply() 
     }
     drain_causal_owner_work(&hub);
     assert!(!scopes.is_live(live));
+}
+
+/// Grants exist while the entrypoint runs, so a package can use its admitted
+/// capabilities during load (for example a data migration).
+#[test]
+fn plugin_db_grant_is_installed_before_the_entrypoint_runs() {
+    let root = PathBuf::from("target")
+        .join("botster-hub-test-data")
+        .join("lua-runtime-packages")
+        .join("plugin-db-at-load");
+    let source_root = std::env::current_dir().expect("current dir").join(&root);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create load-time plugin-db package root");
+    fs::write(
+        root.join("plugin.lua"),
+        r#"
+local plugin_db = botster.capabilities.plugin_db
+local loaded_ok, loaded_error = pcall(plugin_db.set, {
+  key = "written-at-load",
+  payload = { at_load = true },
+})
+return botster.register({
+  tools = {{
+    name = "plugin_db_at_load.report",
+    description = "Report whether the entrypoint could write during load.",
+    handler = "report",
+    call = function()
+      return { loaded_ok = loaded_ok, loaded_error = loaded_error and tostring(loaded_error) }
+    end,
+  }},
+})
+"#,
+    )
+    .expect("write load-time plugin-db plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::json!({
+            "name": "plugin-db-at-load",
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": source_root.display().to_string() },
+            "capabilities": [
+                { "surface": "mcp" },
+                { "surface": "plugin_db", "scope": "plugin-db-at-load" }
+            ],
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        })
+        .to_string(),
+    )
+    .expect("write load-time plugin-db manifest");
+    let mut policy = default_package_policy();
+    policy
+        .install_local_path(&root, "install load-time plugin-db package")
+        .expect("install load-time plugin-db package");
+    policy
+        .enable("plugin-db-at-load", "enable load-time plugin-db package")
+        .expect("enable load-time plugin-db package");
+    let registry = policy.registry().clone();
+
+    let data_directory = unique_short_test_dir("plugin-db-at-load");
+    let mut hub = explicit_runtime_in("plugin-db-at-load", data_directory.clone());
+    hub.load_lua_plugin_package(&registry, "plugin-db-at-load")
+        .expect("load package that writes during load");
+    let report = hub
+        .call_plugin_mcp_tool(botster_hub::McpCallRequest {
+            name: "plugin_db_at_load.report".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .expect("report load-time write");
+    assert_eq!(report["loaded_ok"], true, "{report}");
+    let _ = fs::remove_dir_all(data_directory);
 }

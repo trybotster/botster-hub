@@ -236,8 +236,35 @@ impl HostPackageRuntime {
         package_name: &str,
         bundle: HubPluginRuntimeBundle,
     ) -> HubLifecycleResult<PluginKey> {
-        self.plugin_lifecycle
-            .load_package(registry, package_name, bundle)
+        self.install_admitted_grants(registry, package_name);
+        let loaded = self
+            .plugin_lifecycle
+            .load_package(registry, package_name, bundle);
+        if loaded.is_err() {
+            self.revoke_grants(package_name);
+        }
+        loaded
+    }
+
+    /// Install the package's admitted capabilities as the plugin's runtime
+    /// grants. Package admission is the only source, and the Hub installs them
+    /// before the plugin's entrypoint runs.
+    fn install_admitted_grants(&self, registry: &PackageRegistry, package_name: &str) {
+        let grants = registry
+            .package(package_name)
+            .map(|record| record.admitted_capabilities.clone())
+            .unwrap_or_default();
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .set_plugin_grants(&PluginKey(package_name.to_string()), grants);
+    }
+
+    fn revoke_grants(&self, package_name: &str) {
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .revoke_plugin_grants(&PluginKey(package_name.to_string()));
     }
 
     pub fn load_lua_plugin_package(
@@ -252,12 +279,18 @@ impl HostPackageRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
-        let bundle = LuaPluginRuntime::load_prepared_bounded(
+        self.install_admitted_grants(registry, package_name);
+        let bundle = match LuaPluginRuntime::load_prepared_bounded(
             &prepared,
             configuration,
             self.host_api.clone(),
-        )
-        .map_err(HubLuaPluginLoadError::Lua)?;
+        ) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                self.revoke_grants(package_name);
+                return Err(HubLuaPluginLoadError::Lua(error));
+            }
+        };
         let event_handlers = bundle.event_handlers.clone();
         // Every fallible step runs before anything changes: prepare the
         // plugin, then stage its event generation. The install cannot fail,
@@ -372,6 +405,9 @@ impl HostPackageRuntime {
             .package(package_name)
             .map(|record| record.configuration_view())
             .expect("prepared local package must have a registry record");
+        // The old generation stays loaded if this reload fails, so a failure
+        // keeps the grants that the current admitted record defines.
+        self.install_admitted_grants(registry, package_name);
         let bundle = LuaPluginRuntime::load_prepared_bounded(
             &prepared,
             configuration,
@@ -481,6 +517,7 @@ impl HostPackageRuntime {
         ));
         let plugin_key = PluginKey(package_name.to_string());
         let capability_cleanup = self.cleanup_plugin_capabilities(&plugin_key).ok();
+        self.revoke_grants(package_name);
         let mut lifecycle_cleanup = self
             .plugin_lifecycle
             .unload_package(request_id, package_name);
