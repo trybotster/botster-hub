@@ -183,12 +183,7 @@ pub struct HubRuntime {
     direct_family_cleanup: std::cell::RefCell<Option<HostPackageCleanup>>,
     event_plane_owner_ops: std::cell::RefCell<crate::package_event_router::EventPlaneOwnerOps>,
     event_plane_owner_ops_changed: std::cell::Cell<bool>,
-    event_plane_cleanup_faults: std::cell::RefCell<
-        Vec<(
-            Option<Result<u64, EventPlaneStatus>>,
-            crate::package_event_router::EventOwnerWorkError,
-        )>,
-    >,
+    event_plane_cleanup_faults: std::cell::RefCell<Vec<EventPlaneCleanupFault>>,
     acknowledged_spawn_ids: Mutex<BTreeSet<String>>,
     force_plugin_admit_backpressure: Arc<std::sync::atomic::AtomicBool>,
     pending_test_event_settlements: Mutex<Vec<PendingTestEvent>>,
@@ -212,6 +207,28 @@ enum PendingTestEvent {
 
 type SharedCoreDaemon = crate::data_plane::driver::CoreDaemonHandle;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, Arc<StoredSessionContext>>>>;
+/// The outcome of one package entity publish: the caller's result, the
+/// mutation the model discarded (or never admitted), the causal release for a
+/// discarded pending publication, and the fanout drain the admission started.
+struct EntityPublishAdmission {
+    result: Result<PackageEntityPublishResult, String>,
+    discarded: Option<PackageEntityMutation>,
+    release: Option<CausalOp>,
+    drain: Option<(String, u64)>,
+}
+
+/// A publish the entity model admitted.
+struct AdmittedEntityPublish {
+    result: PackageEntityPublishResult,
+    discarded: Option<PackageEntityMutation>,
+    drain: Option<(String, u64)>,
+}
+
+/// One event-plane cleanup fault: the plane's last status, if any, and the owner-work error.
+type EventPlaneCleanupFault = (
+    Option<Result<u64, EventPlaneStatus>>,
+    crate::package_event_router::EventOwnerWorkError,
+);
 
 pub(crate) struct StoredSessionContext {
     identity: botster_core::SessionReservationIdentity,
@@ -1400,8 +1417,12 @@ impl HubRuntime {
                 return Err(error);
             }
         };
-        let (result, discarded, release, drain) =
-            self.admit_package_entity_publish(registration, mutation, scope_id, 0, reservation);
+        let EntityPublishAdmission {
+            result,
+            discarded,
+            release,
+            drain,
+        } = self.admit_package_entity_publish(registration, mutation, scope_id, 0, reservation);
         drop(discarded);
         let (response, receiver) = std::sync::mpsc::channel();
         assert!(
@@ -2718,7 +2739,12 @@ impl HubRuntime {
             Some((reservation, acquired))
         });
         let (pending, (reservation, acquired)) = selected?;
-        let (result, discarded, release, drain) = if acquired {
+        let EntityPublishAdmission {
+            result,
+            discarded,
+            release,
+            drain,
+        } = if acquired {
             self.admit_package_entity_publish(
                 pending.registration,
                 pending.mutation,
@@ -2727,12 +2753,12 @@ impl HubRuntime {
                 reservation,
             )
         } else {
-            (
-                Err("causal scope no longer exists".into()),
-                Some(pending.mutation),
-                None,
-                None,
-            )
+            EntityPublishAdmission {
+                result: Err("causal scope no longer exists".into()),
+                discarded: Some(pending.mutation),
+                release: None,
+                drain: None,
+            }
         };
         if discarded.is_some() || drain.is_some() {
             self.package_entities
@@ -2766,12 +2792,7 @@ impl HubRuntime {
         scope_id: Option<u64>,
         publication_token: u64,
         reservation: CausalReservation,
-    ) -> (
-        Result<PackageEntityPublishResult, String>,
-        Option<PackageEntityMutation>,
-        Option<CausalOp>,
-        Option<(String, u64)>,
-    ) {
+    ) -> EntityPublishAdmission {
         let pending_identity = LeaseIdentity::PendingEntityPublish { publication_token };
         let mut reservation = Some(reservation);
         let (result, discarded, drain) = match self.admit_package_entity_publish_inner(
@@ -2781,7 +2802,11 @@ impl HubRuntime {
             publication_token,
             &mut reservation,
         ) {
-            Ok((result, discarded, drain)) => (Ok(result), discarded, drain),
+            Ok(AdmittedEntityPublish {
+                result,
+                discarded,
+                drain,
+            }) => (Ok(result), discarded, drain),
             Err((error, mutation)) => (Err(error), Some(mutation), None),
         };
         let release = scope_id
@@ -2790,7 +2815,12 @@ impl HubRuntime {
                 scope_id,
                 identity: pending_identity,
             });
-        (result, discarded, release, drain)
+        EntityPublishAdmission {
+            result,
+            discarded,
+            release,
+            drain,
+        }
     }
 
     fn admit_package_entity_publish_inner(
@@ -2800,14 +2830,7 @@ impl HubRuntime {
         scope_id: Option<u64>,
         publication_token: u64,
         reservation: &mut Option<CausalReservation>,
-    ) -> Result<
-        (
-            PackageEntityPublishResult,
-            Option<PackageEntityMutation>,
-            Option<(String, u64)>,
-        ),
-        (String, PackageEntityMutation),
-    > {
+    ) -> Result<AdmittedEntityPublish, (String, PackageEntityMutation)> {
         let transition = self.with_direct_entity_model(|model| {
             model.admit(registration, mutation, scope_id, publication_token)
         })?;
@@ -2818,7 +2841,11 @@ impl HubRuntime {
                 .commit(op);
         }
         self.note_package_entity_resync_changed();
-        Ok((transition.result, transition.discarded, transition.drain))
+        Ok(AdmittedEntityPublish {
+            result: transition.result,
+            discarded: transition.discarded,
+            drain: transition.drain,
+        })
     }
 
     /// Take admitted mutations for callers outside the owner delivery path.

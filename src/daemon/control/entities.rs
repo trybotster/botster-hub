@@ -63,13 +63,16 @@ struct PendingPluginEntity {
 struct TerminalEntity {
     job: crate::host_disposal::Job,
     permit: OwnerPermit,
-    _invocation: Option<(
-        u64,
-        Option<(u64, u64)>,
-        bool,
-        Option<crate::lua_runtime::EntityPublishPermit>,
-    )>,
+    _invocation: Option<RetainedInvocation>,
 }
+
+/// The entity invocation parts a terminal entity keeps alive until disposal.
+type RetainedInvocation = (
+    u64,
+    Option<(u64, u64)>,
+    bool,
+    Option<crate::lua_runtime::EntityPublishPermit>,
+);
 
 enum RoutedPluginEntityCompletion {
     Invocation(RetainedPluginResult<PluginInvocationResult>),
