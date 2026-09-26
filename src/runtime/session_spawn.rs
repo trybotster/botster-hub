@@ -440,6 +440,14 @@ impl HubRuntime {
         result: Result<CoreSession, PluginSpawnFailure>,
     ) -> Result<CoreSession, CoreDaemonError> {
         result.map_err(|failure| {
+            crate::hub_log::hub_log!(
+                "session_type_spawn_failed session_id={} session_type_id={} context_id={} disposition={:?} core_error={}",
+                start.spawn.request.session_id.0,
+                start.session_type_id,
+                start.context_id,
+                failure.disposition,
+                failure.error
+            );
             if start.context_published
                 && failure.disposition == Some(SessionReservationRelease::Released)
                 && let Some(reservation) = start.reservation.as_ref()
@@ -759,14 +767,20 @@ impl SessionTypeSpawnStart {
                                             .as_ref()
                                             .expect("context precedes publication"),
                                     )
-                                    .ok_or(())
+                                    .ok_or_else(|| "no context charge".to_string())
                                     .and_then(|charge| {
-                                        let context = self.context.take().ok_or(())?;
-                                        runtime
-                                            .publish_spawn_context(context, &reserved, charge)
-                                            .map_err(|_| ())
+                                        let context = self
+                                            .context
+                                            .take()
+                                            .ok_or_else(|| "context already taken".to_string())?;
+                                        runtime.publish_spawn_context(context, &reserved, charge)
                                     });
-                                if published.is_err() {
+                                if let Err(reason) = published {
+                                    // The returned Shutdown hides this reason from the client.
+                                    crate::hub_log::hub_log!(
+                                        "session_type_spawn_step_failed session_id={} step=publish_context reason={reason}",
+                                        self.spawn.request.session_id.0
+                                    );
                                     self.spawn_error = Some(CoreDaemonError::Shutdown);
                                     self.release_or_retain(runtime);
                                     continue;
@@ -796,7 +810,15 @@ impl SessionTypeSpawnStart {
                     CoreTicketPoll::Refused => {
                         return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
                     }
-                    CoreTicketPoll::Lost | CoreTicketPoll::Ready(Err(_)) => {
+                    CoreTicketPoll::Lost => {
+                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                    }
+                    CoreTicketPoll::Ready(Err(error)) => {
+                        // The returned Shutdown hides this error from the client.
+                        crate::hub_log::hub_log!(
+                            "session_type_spawn_step_failed session_id={} step=lookup_reservation error={error:?}",
+                            self.spawn.request.session_id.0
+                        );
                         return spawn_fail(CoreDaemonError::Shutdown, None);
                     }
                     CoreTicketPoll::Ready(Ok(CoreCompletion::LookupSessionReservation {
@@ -859,9 +881,20 @@ impl SessionTypeSpawnStart {
                 },
                 PluginSpawnStage::Release => match self.poll_core(runtime) {
                     CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
-                    CoreTicketPoll::Refused
-                    | CoreTicketPoll::Lost
-                    | CoreTicketPoll::Ready(Err(_)) => {
+                    CoreTicketPoll::Refused | CoreTicketPoll::Lost => {
+                        self.keep_reservation(runtime);
+                        return spawn_fail(
+                            self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown),
+                            Some(SessionReservationRelease::RetainedUnconfirmed),
+                        );
+                    }
+                    CoreTicketPoll::Ready(Err(release_error)) => {
+                        // A cleanup failure after the spawn failed; the spawn's own
+                        // error below is unchanged.
+                        crate::hub_log::hub_log!(
+                            "session_type_spawn_release_failed session_id={} stage=release_ticket error={release_error:?}",
+                            self.spawn.request.session_id.0
+                        );
                         self.keep_reservation(runtime);
                         return spawn_fail(
                             self.spawn_error.take().unwrap_or(CoreDaemonError::Shutdown),
@@ -886,7 +919,13 @@ impl SessionTypeSpawnStart {
                                 self.keep_reservation(runtime);
                                 return spawn_fail(error, Some(disposition));
                             }
-                            Err(_) => {
+                            Err(release_error) => {
+                                // A cleanup failure after the spawn failed; the spawn's own
+                                // error is returned unchanged.
+                                crate::hub_log::hub_log!(
+                                    "session_type_spawn_release_failed session_id={} stage=release_result error={release_error:?}",
+                                    self.spawn.request.session_id.0
+                                );
                                 self.keep_reservation(runtime);
                                 return spawn_fail(
                                     error,
@@ -1045,6 +1084,89 @@ mod tests {
             collected,
             phases.map(|phase| OwnerWorkIdentity { waiter_id, phase })
         );
+    }
+
+    #[test]
+    fn failed_client_session_type_spawn_logs_its_core_error() {
+        let runtime = super::super::tests::family_runtime("log-client-session-type-spawn");
+        let waiter_id = runtime.next_waiter_id().unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(64);
+        runtime.bind_data_plane_owner_wake(sender);
+        let session_id = SessionId("log-client-session-type-spawn".into());
+        let start = runtime.test_begin_ordinary_owner_spawn(
+            waiter_id,
+            session_id,
+            runtime.lua_memory.reserve_callback_total(0).unwrap(),
+        );
+        let error = runtime
+            .finish_client_session_type_spawn(
+                &start,
+                Err(PluginSpawnFailure {
+                    error: CoreDaemonError::Shutdown,
+                    disposition: None,
+                }),
+            )
+            .expect_err("the failure is returned unchanged");
+        assert!(matches!(error, CoreDaemonError::Shutdown));
+        let lines = crate::hub_log::captured_matching(&[
+            "session_type_spawn_failed",
+            "session_id=log-client-session-type-spawn",
+        ]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("session_type_id=ordinary.owner-test"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("context_id=ctx-log-client-session-type-spawn"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("disposition=None"), "{lines:?}");
+        assert!(
+            lines[0].contains(&format!("core_error={}", CoreDaemonError::Shutdown)),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn unpublished_spawn_context_logs_its_reason() {
+        let runtime = super::super::tests::family_runtime("log-spawn-context-unpublished");
+        let waiter_id = runtime.next_waiter_id().unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        runtime.bind_data_plane_owner_wake(sender);
+        let retirement = runtime.coordination_retirement(waiter_id);
+        let mut start = runtime.test_begin_ordinary_owner_spawn(
+            waiter_id,
+            SessionId("log-spawn-context-unpublished".into()),
+            runtime.lua_memory.reserve_callback_total(0).unwrap(),
+        );
+        // A context larger than the per-callback growth ceiling cannot be
+        // charged, so it cannot be published.
+        let ceiling = crate::config::lua_memory_limits().per_callback_bytes;
+        start
+            .context
+            .as_mut()
+            .expect("the harness stages a context")
+            .values
+            .insert("oversized".into(), "x".repeat(ceiling + 1));
+        collect_phases(&runtime, &mut receiver, waiter_id, [1, 2]);
+        assert!(matches!(start.poll(&runtime), PluginSpawnPoll::Pending));
+        assert!(matches!(start.stage, PluginSpawnStage::Release));
+        let lines = crate::hub_log::captured_matching(&[
+            "session_type_spawn_step_failed",
+            "session_id=log-spawn-context-unpublished",
+            "step=publish_context",
+        ]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("reason=no context charge"), "{lines:?}");
+
+        collect_phases(&runtime, &mut receiver, waiter_id, [3, 4]);
+        let PluginSpawnPoll::Ready(Err(failure)) = start.poll(&runtime) else {
+            panic!("the unpublished context must fail the spawn after release");
+        };
+        assert!(matches!(failure.error, CoreDaemonError::Shutdown));
+        drop(start);
+        drop(retirement);
     }
 
     #[test]
