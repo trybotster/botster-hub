@@ -4,7 +4,7 @@
   "kind": "plugin",
   "botster": ">=0.1.0",
   "source": { "type": "path", "path": "." },
-  "capabilities": [],
+  "capabilities": [{ "surface": "mcp" }],
   "entrypoints": [
     { "runtime": "lua", "path": "plugin.lua", "bootstrap": false }
   ]
