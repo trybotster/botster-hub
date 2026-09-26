@@ -3542,6 +3542,11 @@ return botster.register({
         snapshot.records.push(record);
         let registry = crate::packages::PackageRegistry::from_snapshot(snapshot)
             .expect("admit spawn tool package");
+        // The plugin reads the daemon's committed registry, so publish it
+        // through the daemon before the plugin loads.
+        daemon
+            .replace_package_registry(registry.clone())
+            .expect("publish the spawn tool package registry");
         daemon
             .runtime_mut()
             .unwrap()
@@ -4325,7 +4330,7 @@ return botster.register({
                 "topic",
                 "agent",
                 crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![record],
+                crate::runtime::package_view_for_test(vec![record]),
             )
         });
         let spawned = pump_until_join(&mut daemon, &mut state, handle).expect("created spawn");
@@ -4418,7 +4423,7 @@ return botster.register({
                 "topic",
                 "agent",
                 crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![first_record],
+                crate::runtime::package_view_for_test(vec![first_record]),
             )
         });
         let first = pump_until_join(&mut daemon, &mut state, first).expect("first create");
@@ -4431,7 +4436,7 @@ return botster.register({
                 "topic",
                 "agent",
                 crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![record],
+                crate::runtime::package_view_for_test(vec![record]),
             )
         });
         let second = pump_until_join(&mut daemon, &mut state, second).expect("reuse spawn");
@@ -4511,7 +4516,7 @@ return botster.register({
                 "topic",
                 "agent",
                 crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![a_record],
+                crate::runtime::package_view_for_test(vec![a_record]),
             )
         });
         let b = std::thread::spawn(move || {
@@ -4521,7 +4526,7 @@ return botster.register({
                 "topic",
                 "agent",
                 crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![record],
+                crate::runtime::package_view_for_test(vec![record]),
             )
         });
         let overlap = Instant::now() + Duration::from_secs(5);
@@ -4590,7 +4595,7 @@ return botster.register({
                 "topic",
                 "agent",
                 crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![record],
+                crate::runtime::package_view_for_test(vec![record]),
             )
         });
         let err = pump_until_join(&mut daemon, &mut state, handle)
@@ -4723,7 +4728,7 @@ return botster.register({
                 "keep",
                 "agent",
                 crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![first_record],
+                crate::runtime::package_view_for_test(vec![first_record]),
             )
         });
         let first = pump_until_join(&mut daemon, &mut state, first).expect("keep worktree");
@@ -5022,7 +5027,7 @@ return botster.register({
                 "topic",
                 "agent",
                 crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![record],
+                crate::runtime::package_view_for_test(vec![record]),
             )
         });
         let spawned = pump_until_join(&mut daemon, &mut state, handle).expect("live spawn");
@@ -5380,7 +5385,7 @@ return botster.register({
                 "topic",
                 "agent",
                 crate::session_types::ManagedSessionTypeRequest::default(),
-                vec![second_record],
+                crate::runtime::package_view_for_test(vec![second_record]),
             )
         });
         let wait_reuse = Instant::now() + Duration::from_secs(1);

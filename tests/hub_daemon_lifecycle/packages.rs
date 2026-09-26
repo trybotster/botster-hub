@@ -5097,6 +5097,121 @@ fn live_hub_lua_plugin_spawns_cross_package_managed_session_types() {
     daemon.shutdown();
 }
 
+/// A Lua caller loaded before a contributor package is enabled sees the
+/// contributor's session types on its next call, without a reload, and stops
+/// seeing them once the contributor is disabled: Lua session-type reads and
+/// spawns use the daemon's current committed package registry.
+#[test]
+fn live_hub_lua_caller_sees_session_types_of_packages_enabled_after_it_loads() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("late-contrib-live");
+    let contributor_dir = unique_short_test_dir("late-contrib");
+    let caller_dir = unique_short_test_dir("late-contrib-caller");
+    let repository = unique_short_test_dir("late-contrib-repo");
+    init_fixture_repository(&repository, "late-contributor");
+    write_cross_package_template_contributor(&contributor_dir, "tgt_late_contributor");
+    write_cross_package_caller_package(
+        &caller_dir,
+        "managed-session-caller.plugin",
+        "cross_package",
+        true,
+    );
+    let session_type_id = "managed-session-type.plugin/init";
+    let listed = |inspected: &serde_json::Value| {
+        inspected["list"].as_array().is_some_and(|list| {
+            list.iter()
+                .any(|session_type| session_type["session_type_id"] == session_type_id)
+        })
+    };
+    let list_only = |data_dir: &Path| {
+        botster_hub::daemon_transport_request(
+            &explicit_config(data_dir),
+            botster_hub::DaemonRequest::PluginMcpCallTool {
+                name: "cross_package.inspect".to_string(),
+                arguments: serde_json::json!({
+                    "target_id": "tgt_late_contributor",
+                    "session_type_id": session_type_id
+                }),
+            },
+        )
+        .expect("call the inspect tool")
+    };
+
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "late contributor cleanup");
+    // The caller loads first; the contributor does not exist yet.
+    enable_local_package(&data_dir, &caller_dir);
+    create_git_target(&data_dir, "tgt_late_contributor", &repository);
+    let before = list_only(&data_dir);
+    assert!(
+        before.kind != botster_hub::DaemonResponseKind::PluginMcpToolResult
+            || !listed(&before.plugin_tool_result),
+        "no contributor yet: {before:?}"
+    );
+
+    // Enable the contributor after the caller loaded; the next call sees it.
+    enable_local_package(&data_dir, &contributor_dir);
+    let inspected = call_plugin_tool(
+        &data_dir,
+        "cross_package.inspect",
+        serde_json::json!({
+            "target_id": "tgt_late_contributor",
+            "session_type_id": session_type_id
+        }),
+    );
+    assert_cross_package_session_type_is_listed(
+        &inspected,
+        session_type_id,
+        "managed-session-type.plugin",
+    );
+    let spawned = call_plugin_tool(
+        &data_dir,
+        "cross_package.atomic",
+        serde_json::json!({
+            "target_id": "tgt_late_contributor",
+            "branch": "feature/late-contributor",
+            "session_type_id": session_type_id
+        }),
+    );
+    assert_eq!(spawned["ok"], true, "late contributor spawn: {spawned}");
+    let session_id = spawned["result"]["session_id"]
+        .as_str()
+        .expect("late contributor session id")
+        .to_string();
+    wait_for_managed_git_session_exit(&data_dir, &session_id);
+
+    // Disable the contributor; a new call no longer sees or spawns it.
+    let disabled = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::DisablePackage {
+            package_name: "managed-session-type.plugin".to_string(),
+        },
+    )
+    .expect("disable the contributor");
+    assert_eq!(
+        disabled.kind,
+        botster_hub::DaemonResponseKind::PackageDecision,
+        "{disabled:?}"
+    );
+    let after = list_only(&data_dir);
+    assert!(
+        after.kind != botster_hub::DaemonResponseKind::PluginMcpToolResult
+            || !listed(&after.plugin_tool_result),
+        "a disabled contributor's type is gone: {after:?}"
+    );
+    let refused = call_plugin_tool(
+        &data_dir,
+        "cross_package.atomic",
+        serde_json::json!({
+            "target_id": "tgt_late_contributor",
+            "branch": "feature/late-contributor-after-disable",
+            "session_type_id": session_type_id
+        }),
+    );
+    assert_eq!(refused["ok"], false, "disabled contributor spawn: {refused}");
+
+    daemon.shutdown();
+}
+
 #[test]
 fn live_hub_managed_git_spawn_reconciles_and_reuses_after_restart() {
     let _guard = daemon_test_guard();

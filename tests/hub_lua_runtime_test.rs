@@ -1908,6 +1908,10 @@ fn real_lua_plugin_lists_and_shows_cross_package_session_types_without_spawning(
         metadata: BTreeMap::new(),
     }];
     hub.replace_state(state).expect("replacement state fits");
+    // A runtime without a daemon owner publishes its committed registry
+    // itself; Lua session-type reads use that registry.
+    hub.publish_package_registry(registry.clone())
+        .expect("publish the package registry");
     hub.load_lua_plugin_package(&registry, "managed-session-caller.plugin")
         .expect("load cross-package inspection caller");
 
@@ -2364,7 +2368,6 @@ fn reload_replaces_lua_tool_descriptors_and_removes_stale_handlers() {
             .expect("reload package")
             .configuration_view(),
         hub.lua_plugin_host_api(),
-        registry.packages().into_iter().cloned().collect(),
     )
     .expect("load new reload lua bundle");
     let cleanup = hub

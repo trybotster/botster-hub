@@ -252,7 +252,7 @@ mod tests {
             session_types: hub.session_type_spawner(),
             spawn_targets: hub.spawn_targets(),
             worktrees: hub.worktrees(),
-            package_records: Vec::new(),
+            package_registry: hub.package_registry_publication(),
             package_event_router: hub.package_event_router().clone(),
             causal_scopes: hub.causal_scopes().clone(),
             memory: hub.lua_plugin_host_api().memory,

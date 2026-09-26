@@ -37,7 +37,7 @@ use crate::lua_memory::{
     LUA_CALLBACK_CAPACITY_EXHAUSTED, LuaCallbackCharge, LuaMemoryAccount, LuaVmCharge,
 };
 use crate::package_event_router::{CausalScopeTable, EventPlaneStatus, PackageEventRouter};
-use crate::packages::{PackageConfigurationView, PackageRecord, PreparedLocalPackage};
+use crate::packages::{PackageConfigurationView, PreparedLocalPackage};
 use crate::runtime::{SharedSessionTypeSpawner, SharedSpawnTargets, SharedWorktrees};
 
 mod acknowledge_input;
@@ -689,7 +689,7 @@ struct LuaHostApi {
     session_types: SharedSessionTypeSpawner,
     spawn_targets: SharedSpawnTargets,
     worktrees: SharedWorktrees,
-    package_records: Vec<PackageRecord>,
+    package_registry: crate::runtime::SharedPackageRegistry,
     package_event_router: Arc<PackageEventRouter>,
     causal_scopes: Arc<CausalScopeTable>,
     memory: Arc<LuaMemoryAccount>,
@@ -858,6 +858,8 @@ pub struct LuaPluginHostApi {
     pub session_types: SharedSessionTypeSpawner,
     pub spawn_targets: SharedSpawnTargets,
     pub worktrees: SharedWorktrees,
+    /// The committed package registry that session-type reads and spawns use.
+    pub(crate) package_registry: crate::runtime::SharedPackageRegistry,
     pub package_event_router: Arc<PackageEventRouter>,
     pub causal_scopes: Arc<CausalScopeTable>,
     #[cfg(test)]
@@ -1193,7 +1195,7 @@ mod state_owner_tests {
             session_types: api.session_types,
             spawn_targets: api.spawn_targets,
             worktrees: api.worktrees,
-            package_records: Vec::new(),
+            package_registry: api.package_registry,
             package_event_router: api.package_event_router,
             causal_scopes: api.causal_scopes,
             memory: Arc::clone(&memory),
@@ -1552,9 +1554,8 @@ impl LuaPluginRuntime {
         prepared: &PreparedLocalPackage,
         configuration: PackageConfigurationView,
         api: LuaPluginHostApi,
-        package_records: Vec<PackageRecord>,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
-        Self::load_prepared_bounded(prepared, configuration, api, package_records)
+        Self::load_prepared_bounded(prepared, configuration, api)
     }
 
     /// Load with the shared account retained by the supplied Host API.
@@ -1562,7 +1563,6 @@ impl LuaPluginRuntime {
         prepared: &PreparedLocalPackage,
         configuration: PackageConfigurationView,
         api: LuaPluginHostApi,
-        package_records: Vec<PackageRecord>,
     ) -> Result<HubPluginRuntimeBundle, LuaPluginRuntimeError> {
         #[cfg(test)]
         let lua_plugin_runtimes = Arc::clone(&api.lua_plugin_runtimes);
@@ -1579,7 +1579,7 @@ impl LuaPluginRuntime {
             session_types: api.session_types,
             spawn_targets: api.spawn_targets,
             worktrees: api.worktrees,
-            package_records,
+            package_registry: api.package_registry,
             package_event_router: api.package_event_router,
             causal_scopes: api.causal_scopes,
             memory: Arc::clone(&memory),
@@ -2154,7 +2154,7 @@ fn install_botster_api(
             plugin_key.clone(),
             host_api.session_types,
             host_api.spawn_targets.clone(),
-            host_api.package_records,
+            host_api.package_registry,
             Some(host_api.memory.clone()),
         )?,
     )?;
@@ -2383,7 +2383,7 @@ fn session_type_read_callback(
     lua: &Lua,
     show: bool,
     state: SharedSpawnTargets,
-    records: Vec<PackageRecord>,
+    packages: crate::runtime::SharedPackageRegistry,
     memory: Option<Arc<LuaMemoryAccount>>,
 ) -> mlua::Result<mlua::Function> {
     let operation = if show {
@@ -2437,6 +2437,9 @@ fn session_type_read_callback(
             let limit = memory
                 .as_ref()
                 .map_or(usize::MAX, |account| account.limits().per_callback_bytes);
+            // Read the committed registry at call time, so a package enabled
+            // after this plugin loaded is visible without a reload.
+            let records = packages.current();
             let result = if show {
                 let result = if memory.is_some() {
                     crate::session_types::show_session_type_for_target_bounded(
@@ -2447,7 +2450,7 @@ fn session_type_read_callback(
                         limit,
                     )
                 } else {
-                    let records = records.iter().collect::<Vec<_>>();
+                    let records = records.packages();
                     crate::session_types::show_session_type_for_target(
                         &records,
                         &state,
@@ -2463,7 +2466,7 @@ fn session_type_read_callback(
                         &records, &state, target_id, limit,
                     )
                 } else {
-                    let records = records.iter().collect::<Vec<_>>();
+                    let records = records.packages();
                     crate::session_types::list_session_types_for_target(&records, &state, target_id)
                         .map(Some)
                 };
@@ -2519,7 +2522,7 @@ fn session_types_table(
     plugin_key: PluginKey,
     session_types: SharedSessionTypeSpawner,
     state: SharedSpawnTargets,
-    package_records: Vec<PackageRecord>,
+    packages: crate::runtime::SharedPackageRegistry,
     memory: Option<Arc<LuaMemoryAccount>>,
 ) -> Result<Table, mlua::Error> {
     let table = lua.create_table()?;
@@ -2529,17 +2532,17 @@ fn session_types_table(
             lua,
             false,
             state.clone(),
-            package_records.clone(),
+            Arc::clone(&packages),
             memory.clone(),
         )?,
     )?;
     table.set(
         "show",
-        session_type_read_callback(lua, true, state, package_records.clone(), memory.clone())?,
+        session_type_read_callback(lua, true, state, Arc::clone(&packages), memory.clone())?,
     )?;
     let spawn_templates = session_types.clone();
     let spawn_plugin_key = plugin_key.clone();
-    let spawn_records = Arc::new(package_records.clone());
+    let spawn_packages = Arc::clone(&packages);
     let spawn_memory = memory.clone();
     let spawn_conversion =
         lua.create_string("session_types.spawn could not allocate its Lua result")?;
@@ -2554,7 +2557,7 @@ fn session_types_table(
                 ));
             };
             let input = spawn_input::admit(lua, &args, &spawn_plugin_key, memory, &spawn_capacity)?;
-            let delivery = match spawn_templates.spawn_admitted(input, Arc::clone(&spawn_records)) {
+            let delivery = match spawn_templates.spawn_admitted(input, spawn_packages.current()) {
                 Ok(delivery) => delivery,
                 Err(error) if error.as_ref() == LUA_CALLBACK_CAPACITY_EXHAUSTED => {
                     return Ok(Value::String(spawn_capacity.clone()));
@@ -2634,7 +2637,7 @@ fn session_types_table(
                 branch,
                 session_type_id,
                 request,
-                package_records.clone(),
+                packages.current(),
             ) {
                 Ok(spawned) => {
                     let conversion = lua.create_string(
@@ -3637,7 +3640,7 @@ mod bounded_session_type_tests {
             PluginKey("test.plugin".to_string()),
             Arc::new(HubSessionTypeSpawner::new()),
             state(),
-            Vec::new(),
+            crate::runtime::package_publication_for_test(Vec::new()),
             Some(Arc::clone(&memory)),
         )
         .unwrap();
@@ -3674,7 +3677,7 @@ mod bounded_session_type_tests {
             PluginKey("test.plugin".to_string()),
             Arc::new(HubSessionTypeSpawner::new()),
             state(),
-            Vec::new(),
+            crate::runtime::package_publication_for_test(Vec::new()),
             Some(Arc::clone(&memory)),
         )
         .unwrap();
@@ -3745,7 +3748,7 @@ mod bounded_session_type_tests {
             PluginKey("test.plugin".to_string()),
             Arc::new(HubSessionTypeSpawner::new()),
             state_with_catalog(Some("x".repeat(1024)), 16),
-            Vec::new(),
+            crate::runtime::package_publication_for_test(Vec::new()),
             Some(Arc::clone(&memory)),
         )
         .unwrap();
@@ -3792,7 +3795,7 @@ mod bounded_session_type_tests {
             PluginKey("test.plugin".to_string()),
             Arc::new(HubSessionTypeSpawner::new()),
             state(),
-            Vec::new(),
+            crate::runtime::package_publication_for_test(Vec::new()),
             Some(Arc::clone(&memory)),
         )
         .unwrap();
@@ -3833,7 +3836,7 @@ mod bounded_session_type_tests {
             PluginKey("test.plugin".to_string()),
             Arc::new(HubSessionTypeSpawner::new()),
             state(),
-            Vec::new(),
+            crate::runtime::package_publication_for_test(Vec::new()),
             Some(Arc::clone(&refused)),
         )
         .unwrap();

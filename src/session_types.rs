@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
@@ -299,7 +298,7 @@ impl SpawnHostWork {
         config: &HubConfig,
         startup_paths: &StartupMaterializationPaths,
         state: crate::runtime::HubStateView,
-        package_records: Arc<Vec<PackageRecord>>,
+        package_records: crate::shared_view::SharedView<crate::packages::PackageRegistry>,
         plugin_key: botster_core::PluginKey,
         session_type_id: String,
         request: SessionTypeRequest,
@@ -1418,9 +1417,9 @@ impl<'a> ChargedSourceBuilder<'a> {
         }
     }
 
-    fn push_package_records(
+    fn push_package_records<'r>(
         &mut self,
-        records: &[PackageRecord],
+        records: impl IntoIterator<Item = &'r PackageRecord>,
     ) -> Result<(), ChargedSourceLoadFailure> {
         for record in records {
             let root = match &record.manifest.source {
@@ -1781,13 +1780,13 @@ impl ChargedSourceLoadFailure {
 /// Winner selection and materialization must use this product before activation.
 #[allow(dead_code)]
 fn load_charged_sources(
-    records: &[PackageRecord],
+    records: &crate::packages::PackageRegistry,
     state: &HubState,
     startup_cwd: &Path,
     parent: &mut crate::lua_memory::LuaCallbackCharge,
 ) -> Result<ChargedSourceSessionTypes, ChargedSourceLoadFailure> {
     let mut builder = ChargedSourceBuilder::new(parent);
-    builder.push_package_records(records)?;
+    builder.push_package_records(records.package_records())?;
     builder.push_device_sources(state, startup_cwd)?;
     for target in state.spawn_targets.iter().filter(|target| target.enabled) {
         builder.push_repo_file(&target.root, &target.target_id)?;
@@ -1804,7 +1803,7 @@ fn materialize_ordinary_charged(
     mut parent: crate::lua_memory::LuaCallbackCharge,
     config: ChargedMaterializationConfig,
     state: &HubState,
-    package_records: &[PackageRecord],
+    package_records: &crate::packages::PackageRegistry,
     _plugin_key: &botster_core::PluginKey,
     session_type_id: &str,
     request: SessionTypeRequest,
@@ -2328,7 +2327,7 @@ pub fn list_session_types_for_target(
 /// Bounded form used by Lua callbacks. `None` means the complete projection
 /// would exceed the caller's already-reserved Rust callback allowance.
 pub(crate) fn list_session_types_for_target_bounded(
-    records: &[PackageRecord],
+    records: &crate::packages::PackageRegistry,
     state: &HubState,
     target_id: &str,
     logical_byte_limit: usize,
@@ -2337,7 +2336,7 @@ pub(crate) fn list_session_types_for_target_bounded(
 }
 
 pub(crate) fn show_session_type_for_target_bounded(
-    records: &[PackageRecord],
+    records: &crate::packages::PackageRegistry,
     state: &HubState,
     target_id: &str,
     session_type_id: &str,
@@ -4885,7 +4884,7 @@ mod source_selection_tests {
             parent,
             charged_config,
             &state,
-            &[],
+            &crate::runtime::package_view_for_test(Vec::new()),
             &botster_core::PluginKey("device-root-test".into()),
             "worker",
             request,
@@ -5027,7 +5026,12 @@ mod source_selection_tests {
         })
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
-        let sources = match load_charged_sources(&[], &fixture.state, &fixture.root, &mut parent) {
+        let sources = match load_charged_sources(
+            &crate::runtime::package_view_for_test(Vec::new()),
+            &fixture.state,
+            &fixture.root,
+            &mut parent,
+        ) {
             Ok(sources) => sources,
             Err(_) => panic!("the charged source set must load"),
         };
@@ -5055,8 +5059,13 @@ mod source_selection_tests {
         })
         .unwrap();
         let mut parent = memory.reserve_callback_total(0).unwrap();
-        let sources = load_charged_sources(&[], &fixture.state, &fixture.root, &mut parent)
-            .unwrap_or_else(|_| panic!("the complete charged source set must load"));
+        let sources = load_charged_sources(
+            &crate::runtime::package_view_for_test(Vec::new()),
+            &fixture.state,
+            &fixture.root,
+            &mut parent,
+        )
+        .unwrap_or_else(|_| panic!("the complete charged source set must load"));
         let (winner, expected_row, expected_target) =
             resolve_materialization_source(&[], &fixture.state, "worker", Some("repo")).unwrap();
         let (index, row, row_charge, target) = sources
@@ -5632,7 +5641,7 @@ mod bounded_catalog_tests {
         }];
 
         let error = show_session_type_for_target_bounded(
-            &[],
+            &crate::runtime::package_view_for_test(Vec::new()),
             &state,
             "requested-target",
             "device/hidden",
@@ -5683,7 +5692,7 @@ mod bounded_catalog_tests {
         });
 
         let error = show_session_type_for_target_bounded(
-            &records,
+            &crate::runtime::package_view_for_test(records.clone()),
             &state,
             "package:disabled.source",
             "disabled.source/agent",

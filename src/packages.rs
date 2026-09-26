@@ -1091,7 +1091,9 @@ impl PackageRegistry {
     }
 
     /// Borrow package records without allocating a reference vector.
-    pub(crate) fn package_records(&self) -> impl ExactSizeIterator<Item = &PackageRecord> {
+    pub(crate) fn package_records(
+        &self,
+    ) -> std::collections::btree_map::Values<'_, String, PackageRecord> {
         self.records.values()
     }
 

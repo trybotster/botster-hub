@@ -150,6 +150,7 @@ impl HubDaemon {
             };
             runtime.publish_state_view(state.clone());
         }
+        runtime.publish_package_registry_view(package_registry.clone());
         load_enabled_local_plugins(&mut runtime, &package_registry)?;
 
         let state = runtime.state_publication();
@@ -217,6 +218,10 @@ impl HubDaemon {
         &mut self,
         package_registry: SharedView<PackageRegistry>,
     ) {
+        // Lua plugin reads and spawn resolution see the committed registry.
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.publish_package_registry_view(package_registry.clone());
+        }
         self.package_registry = package_registry;
     }
 
@@ -404,7 +409,7 @@ pub(crate) fn load_enabled_local_plugins(
     Ok(())
 }
 
-fn reserve_package_registry(
+pub(crate) fn reserve_package_registry(
     budget: &Arc<crate::shared_view::SharedViewBudget>,
     package_registry: PackageRegistry,
 ) -> Result<SharedView<PackageRegistry>, HubStateStoreError> {

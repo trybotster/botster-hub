@@ -100,7 +100,6 @@ impl HostPackageRuntime {
             &prepared,
             configuration,
             self.host_api.clone(),
-            registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
         let event_handlers = bundle.event_handlers.clone();
@@ -136,7 +135,6 @@ impl HostPackageRuntime {
             &prepared,
             configuration,
             self.host_api.clone(),
-            registry.packages().into_iter().cloned().collect(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
         let event_handlers = bundle.event_handlers.clone();
