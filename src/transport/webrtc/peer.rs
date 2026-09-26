@@ -4311,24 +4311,63 @@ mod tests {
             }));
             channels.push(channel);
         }
+        // Force the overlap: admit both binds in one owner step, before any
+        // Core completion can be applied, then let the owner run.
+        let mut held = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while held.len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "both channels must request a bind"
+            );
+            match harness.try_receive_owner_message() {
+                Ok(message @ crate::daemon::control::message::ControlMessage::BindReservedSubscription { .. }) => {
+                    held.push(message);
+                }
+                Ok(message) => {
+                    crate::daemon::control::handle_control_message(
+                        &mut harness.daemon,
+                        &mut harness.state,
+                        &harness.transport_handle,
+                        harness.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("control channel failed: {error}"),
+            }
+        }
+        for message in held {
+            crate::daemon::control::dispatch_control_message(
+                &mut harness.daemon,
+                &mut harness.state,
+                &harness.transport_handle,
+                harness.control_tx.clone(),
+                message,
+            );
+        }
         harness.pump_until(
             Instant::now() + Duration::from_secs(10),
-            "one bind to acknowledge and the other to be rejected",
-            |_| {
-                let acknowledged = channels
-                    .iter()
-                    .filter(|channel| !channel.sent.lock().expect("sent frames").is_empty())
-                    .count();
-                acknowledged == 1 && hosts.iter().any(|host| host.is_finished())
-            },
+            "one channel host to finish",
+            |_| hosts.iter().any(|host| host.is_finished()),
         );
+        // Let every Core completion of both binds apply before judging.
+        let settle = Instant::now() + Duration::from_secs(1);
+        harness.pump_until(settle + Duration::from_secs(1), "the settle window", |_| {
+            Instant::now() >= settle
+        });
         let acknowledged = channels
             .iter()
             .filter(|channel| !channel.sent.lock().expect("sent frames").is_empty())
             .count();
-        assert_eq!(acknowledged, 1, "exactly one channel receives a HelloAck");
-        let route = core_route(&harness, session_id, subscription_id)
-            .expect("the accepted route stays in Core");
+        let route = core_route(&harness, session_id, subscription_id);
+        assert_eq!(
+            acknowledged, 1,
+            "exactly one channel receives a HelloAck; core_route={route:?}"
+        );
+        let route = route.expect("the accepted route stays in Core");
         assert!(route.adapter_bound, "{route:?}");
         assert!(
             harness
