@@ -82,7 +82,7 @@ Landed on main (reviewer accepted):
 - Protocol 10 (`a69b70cc`): the WebRTC terminal reservation is claimed before bind and expires once; the package registry is published to Lua and spawns (`20b201bd`).
 - G7 fixture manifests (`e2f4a4c9`); #7b over-capacity hello survives the deadline restore after peer close (`31e448dd`, `194e1cca`; Apple timeout setters only).
 - permit_refused, cause 1 (`712c6c1e`..`178512e1`): a terminal write is authorized for its exact sealed size; `AGGREGATE_BUFFERED_HIGH` is a high-water mark (one frame over it on a quiescent peer, a channel counting as drained at its 64 KiB low threshold; bound HIGH + one frame); released capacity wakes refused writers. Not deterministically tested: the post-CAS undo and the post-mark refresh window.
-- permit_refused, cause 2 (`3cd9f7f3`): a driver's frame release lost to Core's slot probe re-flushed the frame; driver reads now wait for the slot mutex, and a lost release is the typed exit `completion_lost`. Web durable N=10 on it: 10/10, permit_refused 0.
+- permit_refused, cause 2 (`3cd9f7f3`): when a driver's frame release lost to Core's slot probe, the driver attempted a second flush of that frame; driver reads now wait for the slot mutex, and a lost release is the typed exit `completion_lost`. Web writer's durable N=10 on a local 20f53576 build (same patch): 10 passes, permit_refused 0 in every run (`web-cutover-20260925/durable-n10-20f53576.txt`).
 - Contended-slot lost wake (`a26b8866`): a driver holding the slot mutex no longer reads as Full to Core, and a Core write that meets it is woken by the unlock.
 - Core pin rolls: 891e220 → a499d5a (`9871f3f6`; stall resync), a499d5a → ac35e32 (`38f54ce8`; flood budget). Lifecycle filters 81/81 on each matched candidate. `8ff59ed3` fixed the stale protocol 10 floor test (49 → 50).
 
@@ -91,9 +91,15 @@ User decisions and rulings: G5 keeps the source update as a development-only loo
 In review: G5 on `delivery/g5-source-update-20260926` (`f2809a4f`). It replaces the safety block above: the five update tests run on fixture checkouts via `--source`/`--update-source-root`, and `BOTSTER_ENV=test` refuses the default root.
 
 Known limits and open items:
-- Unix post-restart output loss: not reproduced after the Core a499d5a attach fixes (TUI 0/90 at loads 16.8–23.8); not proven fixed; open, downgraded (`tui-cutover-20260925/live-repin-8ff59ed3*.log`).
-- Web run3 on Core ac35e32: a Core-initiated close during rapid reattach (same-client replacement, pre-existing); the reason is not recorded by the Hub. Core is adding a typed teardown reason.
-- Unresolved full-gate failures (not waived; cause unknown): `blocked_plugin_connection_returns_correlated_too_many_requests_before_release` (9/10 on both 178512e1 and 194e1cca); `owned_worker_census_is_non_empty_before_absence_assertions` (fails on 3cd9f7f3); `reap_budget_expiry_is_not_successful_cleanup` (2/3 on 38f54ce8); two owner_loop event-plane tests (pin 10/10, base 8/10); and the full-suite `StateDirectoryError::Owned` family (each passes in isolation; three are `matches!` failures that do not print the actual value).
+- Unix post-restart output loss: not reproduced after the Core a499d5a attach fixes; not proven fixed; open, downgraded. TUI writer's runs on 8ff59ed3: T-S1, T-S8a, and T-S8b each 30 passes of 30 (`tui-cutover-20260925/live-repin-8ff59ed3-t_s*-x30.log`; load figures as reported by the TUI writer).
+- Web run3 on Core ac35e32 (`web-cutover-20260925/smoke_live-packaged-protocol_durable-20260926T073159.log`): the Hub log shows a Core-initiated close during rapid reattach; the Hub does not record Core's reason. The Core writer traced it to the same-client replacement path (`record_attach` → `teardown_replaced_client_session`) and reported that path unchanged in ac35e32. Core is adding a typed teardown reason.
+- Unresolved full-gate failures (not waived; cause unknown; counts are passes of runs):
+  - `blocked_plugin_connection_returns_correlated_too_many_requests_before_release`: 9 of 10 passes on 178512e1 and 9 of 10 on 194e1cca.
+  - `owned_worker_census_is_non_empty_before_absence_assertions`: 0 of 2 passes on 3cd9f7f3 (predates the ac35e32 pin).
+  - `reap_budget_expiry_is_not_successful_cleanup`: 2 of 3 passes on 38f54ce8; not shown pre-existing.
+  - Two owner_loop event-plane tests: 10 of 10 passes on 38f54ce8, 8 of 10 on 3cd9f7f3.
+  - Full-suite `StateDirectoryError::Owned` failures in persistence and recovery tests; each passed in isolation.
+  - Three full-suite `matches!` failures whose actual values were not printed (`file_startup_refuses_unresolved_intent_after_directory_sync_failure`, `file_store_updates_state_atomically`, `ambiguous_old_recovery_and_future_schema_fail_closed`); each passed in isolation.
 - Strict clippy is red at baseline (223 errors); the delivery commits add none.
 - G8 harness cleanup: update and MCP tests leaked daemons in the 2026-09-25 inventory run.
 
