@@ -742,6 +742,13 @@ impl WebRtcTerminalAdapterHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn hold_slot_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<RoutedTerminalFrame>> {
+        self.inner.slot.hold_slot_for_test()
+    }
+
+    #[cfg(test)]
     pub(crate) fn aggregate_blocked_for_test(&self) -> bool {
         self.inner.aggregate_blocked.load(Ordering::Acquire) != 0
     }
@@ -1053,6 +1060,45 @@ mod tests {
         assert!(!oversize_handle.aggregate_blocked_for_test());
         assert_eq!(oversize.try_write(&frame), Ok(()));
         drop(holder);
+    }
+
+    /// While the slot lock is held, Core's owner-loop calls return at once,
+    /// and a driver's read of the active frame waits for the lock and
+    /// returns the frame instead of reporting an empty slot.
+    #[test]
+    fn a_held_slot_lock_never_blocks_core_and_never_hides_the_active_frame() {
+        let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
+        let frame = test_frame(b"active");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        let slot = handle.hold_slot_for_test();
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::Full);
+        assert_eq!(
+            adapter.try_write(&test_frame(b"next")),
+            Err(TerminalAdapterWriteError::Full)
+        );
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let handle = handle.clone();
+            move || {
+                let _ = read_tx.send(handle.snapshot_active());
+            }
+        });
+        // timer: deadline — bounds the window in which the driver read meets
+        // the held lock; a read that waits for it has no result yet.
+        let early = read_rx.recv_timeout(Duration::from_millis(200)).ok();
+        let waited = early.is_none();
+        drop(slot);
+        let read = match early {
+            Some(read) => read,
+            None => read_rx.recv().expect("driver read result"),
+        };
+        reader.join().expect("reader thread");
+        assert_eq!(
+            read.map(|active| active.frame.as_bytes().to_vec()),
+            Some(frame.frame.as_bytes().to_vec()),
+            "the driver read waits for the lock and sees the frame"
+        );
+        assert!(waited, "the driver read waited for the held lock");
     }
 
     #[test]

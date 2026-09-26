@@ -481,6 +481,9 @@ pub(crate) enum TerminalDriverExit {
     UsageFailed,
     FrameEncode,
     PermitRefused,
+    /// The sent frame was not released from an open adapter; a later flush
+    /// would send it again.
+    CompletionLost,
     SendFailed,
     /// An inbound chunk failed the header, order, generation, size, or
     /// authentication rules of the binary terminal channel contract.
@@ -500,6 +503,7 @@ impl TerminalDriverExit {
             Self::UsageFailed => "usage_failed",
             Self::FrameEncode => "frame_encode",
             Self::PermitRefused => "permit_refused",
+            Self::CompletionLost => "completion_lost",
             Self::SendFailed => "send_failed",
             Self::IngressAssembly => "ingress_assembly",
             Self::IngressRejected => "ingress_rejected",
@@ -1049,7 +1053,9 @@ where
         }
         Err(UsageQueryFailure::Other) => return Err(TerminalDriverExit::UsageFailed),
     }
-    let _ = handle.complete_active();
+    if handle.complete_active().is_none() && !handle.is_closed() {
+        return Err(TerminalDriverExit::CompletionLost);
+    }
     Ok(TerminalFlushOutcome::Ready)
 }
 
@@ -1730,6 +1736,95 @@ mod tests {
             ))
             .expect("sibling sends after the first route closed");
         assert_eq!(sibling_channel.sent.lock().expect("sibling sends").len(), 2);
+    }
+
+    /// Core's owner-loop `pressure()` holds the slot lock briefly. A flush
+    /// that releases its sent frame while that lock is held must release it
+    /// once, so the next flush neither re-sends the frame nor meets a
+    /// refused permit.
+    #[test]
+    fn a_flush_completing_under_slot_contention_sends_its_frame_once() {
+        use crate::admission::connection_budget::{ChannelClass, ConnectionBudget};
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("route".to_string(), ChannelClass::Terminal)
+            .expect("reserve route");
+        let mux = WebRtcConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        mux.register("s".into(), "route".into(), 1, handle.clone());
+        let frame = test_frame(b"sent once");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        let channel = Arc::new(FakeDataChannel::default());
+        // Park the flush after its send and before it releases the frame.
+        channel.usage_hangs.store(true, Ordering::Release);
+        let key = AesGcmKey::from_slice(&[13; 32]).expect("test key");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut flush = runtime.spawn({
+            let channel = Arc::clone(&channel);
+            let handle = handle.clone();
+            let usage = Arc::clone(&usage);
+            let key = key.clone();
+            async move {
+                let mut next_message_id = 1u64;
+                flush_subscription_adapter_frames(
+                    channel.as_ref(),
+                    &key,
+                    &handle,
+                    &usage,
+                    &mut next_message_id,
+                )
+                .await
+            }
+        });
+        runtime.block_on(channel.usage_entered_notify.notified());
+        assert_eq!(channel.sent_binary.lock().expect("sent").len(), 1);
+
+        // The slot lock is held, as by a pressure() call, while the flush
+        // reaches its release.
+        let slot = handle.hold_slot_for_test();
+        channel.usage_hangs.store(false, Ordering::Release);
+        channel.usage_notify.notify_waiters();
+        // timer: deadline — bounds the window in which the flush meets the
+        // held lock; a flush that waits for it is still running afterwards.
+        let early = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(200), &mut flush)
+                .await
+                .ok()
+        });
+        let waited_for_lock = early.is_none();
+        drop(slot);
+        let first = match early {
+            Some(result) => result.expect("flush task"),
+            None => runtime.block_on(flush).expect("flush task"),
+        };
+        let retained = handle
+            .snapshot_active()
+            .map(|active| active.frame.as_bytes().to_vec());
+        let mut next_message_id = 2u64;
+        let second = runtime.block_on(flush_subscription_adapter_frames(
+            channel.as_ref(),
+            &key,
+            &handle,
+            &usage,
+            &mut next_message_id,
+        ));
+        let sent = channel.sent_binary.lock().expect("sent").len();
+        // (first flush, frame left active, next flush, copies sent)
+        assert_eq!(
+            (first, retained, second, sent),
+            (
+                Ok(TerminalFlushOutcome::Ready),
+                None,
+                Ok(TerminalFlushOutcome::Ready),
+                1
+            ),
+            "the frame is released once and never sent again"
+        );
+        assert!(waited_for_lock, "the release waited for the held lock");
     }
 
     #[test]
