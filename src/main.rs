@@ -360,6 +360,18 @@ fn command_usage(command: &str) -> &'static str {
 
 fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     let options = StartOptions::parse(args)?;
+    // Adopt the readiness pipe first, so it is close-on-exec before this
+    // process starts any child.
+    let readiness = options
+        .ready_fd
+        .map(|fd| {
+            // SAFETY: the launcher passed this descriptor for readiness alone. It was
+            // open at exec, so no file this process opens can share its number, no
+            // other code in this process names it, and it is adopted once, here.
+            unsafe { botster_hub::daemon::readiness::DaemonReadiness::adopt_inherited_fd(fd) }
+        })
+        .transpose()
+        .map_err(StartError::ReadyFd)?;
     let config = explicit_config_with_worker(options.data_directory, options.session_worker_bin)?;
 
     // The lease is taken before the daemon binds anything and held for the
@@ -369,7 +381,7 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
     // knowledge.
     let _installation_lease = acquire_installation_lease()?;
 
-    let stopped = serve_daemon(config)?;
+    let stopped = serve_daemon(config, readiness)?;
     let status = DaemonStatus {
         lifecycle_state: lifecycle_state_label(stopped.lifecycle_state).to_string(),
         compatibility: DaemonCompatibility::current(),
@@ -3247,22 +3259,32 @@ impl DataArgs {
 struct StartOptions {
     data_directory: PathBuf,
     session_worker_bin: Option<PathBuf>,
+    ready_fd: Option<std::os::fd::RawFd>,
 }
 
 impl StartOptions {
     fn parse(args: Vec<String>) -> Result<Self, OperatorError> {
         let options = DataArgs::parse(args, "start")?;
-        let session_worker_bin = match options.arguments.first().map(String::as_str) {
-            None => None,
-            Some("--session-worker-bin") if options.arguments.len() == 2 => {
-                options.arguments.get(1).map(PathBuf::from)
+        let mut session_worker_bin = None;
+        let mut ready_fd = None;
+        let mut arguments = options.arguments.into_iter();
+        while let Some(flag) = arguments.next() {
+            let value = arguments.next().ok_or(OperatorError::Usage("start"))?;
+            match flag.as_str() {
+                "--session-worker-bin" if session_worker_bin.is_none() => {
+                    session_worker_bin = Some(PathBuf::from(value));
+                }
+                "--ready-fd" if ready_fd.is_none() => {
+                    ready_fd = Some(value.parse().map_err(|_| OperatorError::Usage("start"))?);
+                }
+                _ => return Err(OperatorError::Usage("start")),
             }
-            Some(_) => return Err(OperatorError::Usage("start")),
-        };
+        }
 
         Ok(Self {
             data_directory: options.data_directory,
             session_worker_bin,
+            ready_fd,
         })
     }
 }
@@ -4134,6 +4156,7 @@ enum StartError {
     Transport(botster_hub::DaemonTransportError),
     InstallationLeaseHeld(PathBuf),
     InstallationLeaseUnavailable(botster_hub_installation::InstallationProblem),
+    ReadyFd(io::Error),
 }
 
 #[derive(Debug)]
@@ -4151,10 +4174,10 @@ enum LocalRuntimeError {
         source: io::Error,
     },
     PollDaemon(io::Error),
+    MalformedReadiness(String),
     ReadinessTimeout {
         elapsed: Duration,
         readiness_budget: Duration,
-        last_probe: String,
         child_pid: u32,
         child_status: String,
     },
@@ -4203,7 +4226,6 @@ enum LocalRuntimeError {
         status: String,
         elapsed: Duration,
         readiness_budget: Duration,
-        last_probe: String,
         stderr_tail: String,
     },
 }
@@ -4280,6 +4302,7 @@ impl fmt::Display for StartError {
                 formatter,
                 "the managed installation lease could not be taken: {problem}"
             ),
+            Self::ReadyFd(error) => write!(formatter, "--ready-fd is not usable: {error}"),
         }
     }
 }
@@ -4318,16 +4341,19 @@ impl fmt::Display for LocalRuntimeError {
                 )
             }
             Self::PollDaemon(error) => write!(formatter, "poll local runtime daemon: {error}"),
+            Self::MalformedReadiness(line) => write!(
+                formatter,
+                "local runtime daemon wrote a malformed readiness record: {line}"
+            ),
             Self::ReadinessTimeout {
                 elapsed,
                 readiness_budget,
-                last_probe,
                 child_pid,
                 child_status,
             } => {
                 write!(
                     formatter,
-                    "timed out waiting for local runtime daemon readiness after {elapsed:?} (budget {readiness_budget:?}); last status probe: {last_probe}; terminated owned child_pid={child_pid} child_status={child_status}"
+                    "timed out waiting for local runtime daemon readiness after {elapsed:?} (budget {readiness_budget:?}); terminated owned child_pid={child_pid} child_status={child_status}"
                 )
             }
             Self::MissingLocalSocket => write!(formatter, "local socket transport is disabled"),
@@ -4426,12 +4452,11 @@ impl fmt::Display for LocalRuntimeError {
                 status,
                 elapsed,
                 readiness_budget,
-                last_probe,
                 stderr_tail,
             } => {
                 write!(
                     formatter,
-                    "local runtime daemon exited with {status} after {elapsed:?} (readiness budget {readiness_budget:?}); last status probe: {last_probe}; daemon error: {stderr_tail}"
+                    "local runtime daemon exited with {status} after {elapsed:?} before it reported readiness (budget {readiness_budget:?}); daemon error: {stderr_tail}"
                 )
             }
         }
@@ -4587,7 +4612,9 @@ Packages:
   botster-hub packages restart-entrypoint [--data-dir <path>] <package> <entrypoint>
   botster-hub packages entrypoint-status [--data-dir <path>] <package> <entrypoint>"
         }
-        "start" => "usage: botster-hub start [--data-dir <path>] [--session-worker-bin <path>]",
+        "start" => {
+            "usage: botster-hub start [--data-dir <path>] [--session-worker-bin <path>] [--ready-fd <fd>]"
+        }
         "up" => {
             "usage: botster-hub up [--data-dir <path>] [--session-worker-bin <path>]"
         }
@@ -5035,6 +5062,42 @@ mod cli_data_dir_tests {
             ["--", "--data-dir", "/tmp/operand"],
             "operand-tail tokens must not be consumed as CLI options"
         );
+    }
+
+    #[test]
+    fn start_accepts_ready_fd_and_session_worker_bin_in_either_order() {
+        let args = |tail: &[&str]| {
+            ["--data-dir", "/tmp/explicit"]
+                .iter()
+                .chain(tail)
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        for tail in [
+            ["--ready-fd", "7", "--session-worker-bin", "/w"],
+            ["--session-worker-bin", "/w", "--ready-fd", "7"],
+        ] {
+            let options = StartOptions::parse(args(&tail)).expect("parse start options");
+            assert_eq!(options.ready_fd, Some(7));
+            assert_eq!(options.session_worker_bin, Some(PathBuf::from("/w")));
+        }
+        assert_eq!(
+            StartOptions::parse(args(&[]))
+                .expect("parse bare start")
+                .ready_fd,
+            None
+        );
+        for tail in [
+            &["--ready-fd"][..],
+            &["--ready-fd", "three"],
+            &["--ready-fd", "7", "--ready-fd", "8"],
+            &["--unknown", "1"],
+        ] {
+            assert!(
+                StartOptions::parse(args(tail)).is_err(),
+                "{tail:?} must be rejected"
+            );
+        }
     }
 
     #[test]

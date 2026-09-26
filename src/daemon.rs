@@ -14,6 +14,7 @@ pub(crate) mod owner_loop;
 pub(crate) mod owner_schedule;
 pub(crate) mod owner_turn;
 pub(crate) mod publication_owner;
+pub mod readiness;
 pub(crate) mod shutdown;
 
 use std::error::Error;
