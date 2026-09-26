@@ -534,10 +534,12 @@ impl HostMutationContinuation {
                 daemon,
                 state,
                 waiter_id,
-                prepared,
-                permit,
-                must_finish,
-                operation,
+                ParkableCommit {
+                    prepared,
+                    permit,
+                    must_finish,
+                    operation,
+                },
                 retained_prepare,
                 next_phase,
             );
@@ -727,10 +729,12 @@ impl HostMutationContinuation {
                 daemon,
                 state,
                 waiter_id,
-                prepared,
-                permit,
-                must_finish,
-                operation,
+                ParkableCommit {
+                    prepared,
+                    permit,
+                    must_finish,
+                    operation,
+                },
                 retained_prepare,
                 next_phase,
             ),
@@ -837,10 +841,12 @@ impl HostMutationContinuation {
                         daemon,
                         state,
                         waiter_id,
-                        restore,
-                        effect,
-                        error,
-                        permit,
+                        PackageRestoreSubmission {
+                            restore,
+                            effect,
+                            original: error,
+                            permit,
+                        },
                         next_phase,
                         failed_package_effect,
                     )
@@ -999,17 +1005,28 @@ fn ingest_worktree_lifecycle_events(
     }
 }
 
-fn submit_package_restore(
-    daemon: &HubDaemon,
-    state: &mut DaemonControlState,
-    waiter_id: WaiterId,
+/// The owned parts of one package restore, in their original argument order.
+struct PackageRestoreSubmission {
     restore: HostPackageRestore,
     effect: PackageRuntimeEffect,
     original: DaemonTransportError,
     permit: HostWorkPermit,
+}
+
+fn submit_package_restore(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    submission: PackageRestoreSubmission,
     next_phase: &mut u64,
     failed_package_effect: &mut Option<(PackageRuntimeEffect, DaemonTransportError)>,
 ) -> ControlPoll {
+    let PackageRestoreSubmission {
+        restore,
+        effect,
+        original,
+        permit,
+    } = submission;
     if state.document_owner != Some(waiter_id) {
         let failure = PackageRollbackFailure {
             step: "restore_admission",
@@ -1095,17 +1112,28 @@ pub(crate) fn handles(request: &DaemonRequest) -> bool {
         || is_session_type_prepare(request)
 }
 
-fn admit_or_park_commit(
-    daemon: &HubDaemon,
-    state: &mut DaemonControlState,
-    waiter_id: WaiterId,
+/// The owned parts of one parkable commit, in their original argument order.
+struct ParkableCommit {
     prepared: PreparedMutation,
     permit: HostWorkPermit,
     must_finish: bool,
     operation: &'static str,
+}
+
+fn admit_or_park_commit(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    commit: ParkableCommit,
     retained: &mut Option<(PreparedMutation, HostWorkPermit)>,
     next_phase: &mut u64,
 ) -> ControlPoll {
+    let ParkableCommit {
+        prepared,
+        permit,
+        must_finish,
+        operation,
+    } = commit;
     // Anything that reaches this site can park on the document reservation.
     // Transport closure must not retire its handoff.
     debug_assert!(must_finish, "a parkable host mutation must finish");
@@ -2324,10 +2352,12 @@ mod tests {
             &daemon,
             &mut state,
             WaiterId(41),
-            restore,
-            effect,
-            DaemonTransportError::DaemonNotRunning,
-            permit,
+            PackageRestoreSubmission {
+                restore,
+                effect,
+                original: DaemonTransportError::DaemonNotRunning,
+                permit,
+            },
             &mut next_phase,
             &mut failed_package_effect,
         );

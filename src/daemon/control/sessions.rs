@@ -127,13 +127,15 @@ pub(crate) fn reserve_webrtc_terminal(
         subscription_id.clone(),
     );
     let reserved = state.pending_runtime.admission.reservations.reserve(
-        session_id.clone(),
-        subscription_id.clone(),
-        peer_generation,
-        now_seconds(),
-        owner.clone(),
-        identity.clone(),
-        route,
+        crate::admission::reservations::TerminalReservationRequest {
+            session_id: session_id.clone(),
+            subscription_id: subscription_id.clone(),
+            peer_generation,
+            now_seconds: now_seconds(),
+            owner: owner.clone(),
+            identity: identity.clone(),
+            route,
+        },
     );
     let response = match reserved {
         Ok(reservation) => {

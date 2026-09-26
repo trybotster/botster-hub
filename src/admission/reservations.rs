@@ -102,6 +102,17 @@ pub(crate) struct TerminalReservationRegistry {
     by_label: BTreeMap<String, (ChannelClass, String, String, u64, u64)>,
 }
 
+/// One terminal route to reserve, in the original argument order.
+pub(crate) struct TerminalReservationRequest {
+    pub(crate) session_id: String,
+    pub(crate) subscription_id: String,
+    pub(crate) peer_generation: u64,
+    pub(crate) now_seconds: u64,
+    pub(crate) owner: crate::subscription::attach_routes::AttachStreamOwner,
+    pub(crate) identity: crate::subscription::attach_routes::AttachmentIdentity,
+    pub(crate) route: crate::subscription::attach_routes::RouteReservation,
+}
+
 impl TerminalReservationRegistry {
     pub(crate) fn has_live_for_route(
         &self,
@@ -121,14 +132,17 @@ impl TerminalReservationRegistry {
 
     pub(crate) fn reserve(
         &mut self,
-        session_id: String,
-        subscription_id: String,
-        peer_generation: u64,
-        now_seconds: u64,
-        owner: crate::subscription::attach_routes::AttachStreamOwner,
-        identity: crate::subscription::attach_routes::AttachmentIdentity,
-        route: crate::subscription::attach_routes::RouteReservation,
+        request: TerminalReservationRequest,
     ) -> Result<DaemonTerminalReservation, ReserveError> {
+        let TerminalReservationRequest {
+            session_id,
+            subscription_id,
+            peer_generation,
+            now_seconds,
+            owner,
+            identity,
+            route,
+        } = request;
         let generation = identity.epoch;
         let key = (
             ChannelClass::Terminal,
@@ -549,15 +563,15 @@ mod tests {
         now: u64,
     ) -> Result<DaemonTerminalReservation, ReserveError> {
         let (owner, identity, route) = terminal_binding(epoch);
-        registry.reserve(
-            session.into(),
-            subscription.into(),
+        registry.reserve(TerminalReservationRequest {
+            session_id: session.into(),
+            subscription_id: subscription.into(),
             peer_generation,
-            now,
+            now_seconds: now,
             owner,
             identity,
             route,
-        )
+        })
     }
 
     #[test]

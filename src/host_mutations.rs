@@ -1444,17 +1444,17 @@ fn prepare_managed_worktree_removal(
     candidate.worktrees.retain(|worktree| {
         worktree.worktree_id != worktree_id || worktree.management != "hub_managed_git"
     });
-    prepare_state_change(
+    prepare_state_change(StateChangeInputs {
         base_revision,
         authority,
-        state,
+        previous: state,
         candidate,
         data_directory,
-        HostReply::try_new(daemon_worktrees(Vec::new()))?,
-        MutationFamily::RegisteredWorktree,
-        None,
-        None,
-    )
+        reply: HostReply::try_new(daemon_worktrees(Vec::new()))?,
+        family: MutationFamily::RegisteredWorktree,
+        packages: None,
+        package_effect: None,
+    })
 }
 
 fn prepare_managed_worktree_record(
@@ -1483,17 +1483,17 @@ fn prepare_managed_worktree_record(
     } else {
         candidate.worktrees.push(worktree.clone());
     }
-    prepare_state_change(
+    prepare_state_change(StateChangeInputs {
         base_revision,
         authority,
-        state,
+        previous: state,
         candidate,
         data_directory,
-        HostReply::try_new(daemon_worktrees(vec![worktree]))?,
-        MutationFamily::RegisteredWorktree,
-        None,
-        None,
-    )
+        reply: HostReply::try_new(daemon_worktrees(vec![worktree]))?,
+        family: MutationFamily::RegisteredWorktree,
+        packages: None,
+        package_effect: None,
+    })
 }
 
 fn prepare_package(
@@ -1707,17 +1707,17 @@ fn prepare_package(
                 )
             },
         )?;
-    prepare_state_change(
+    prepare_state_change(StateChangeInputs {
         base_revision,
         authority,
-        state,
-        candidate_state,
+        previous: state,
+        candidate: candidate_state,
         data_directory,
         reply,
-        MutationFamily::PackageConfiguration,
-        Some(candidate_packages),
+        family: MutationFamily::PackageConfiguration,
+        packages: Some(candidate_packages),
         package_effect,
-    )
+    })
 }
 
 fn prepare_spawn_target(
@@ -1896,17 +1896,17 @@ fn prepare_spawn_target(
             ));
         }
     };
-    prepare_state_change(
+    prepare_state_change(StateChangeInputs {
         base_revision,
         authority,
-        state,
+        previous: state,
         candidate,
         data_directory,
-        HostReply::try_new(reply)?,
+        reply: HostReply::try_new(reply)?,
         family,
-        None,
-        None,
-    )
+        packages: None,
+        package_effect: None,
+    })
 }
 
 fn prepare_session_type(
@@ -2027,7 +2027,8 @@ fn prepare_session_type(
     })
 }
 
-fn prepare_state_change(
+/// The inputs of one prepared Hub-state change, in their original argument order.
+struct StateChangeInputs {
     base_revision: u64,
     authority: Arc<HubStateAuthority>,
     previous: SharedView<HubState>,
@@ -2037,7 +2038,20 @@ fn prepare_state_change(
     family: MutationFamily,
     packages: Option<SharedView<PackageRegistry>>,
     package_effect: Option<PackageRuntimeEffect>,
-) -> Result<PreparedMutation, HostMutationError> {
+}
+
+fn prepare_state_change(inputs: StateChangeInputs) -> Result<PreparedMutation, HostMutationError> {
+    let StateChangeInputs {
+        base_revision,
+        authority,
+        previous,
+        candidate,
+        data_directory,
+        reply,
+        family,
+        packages,
+        package_effect,
+    } = inputs;
     let state_bytes = pretty_encoded_len(&candidate, "host_prepared_state_encode_failed")?;
     let effect_bytes = package_effect
         .as_ref()
