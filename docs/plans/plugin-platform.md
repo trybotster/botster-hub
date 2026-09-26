@@ -956,6 +956,14 @@ Messages: section 4.1. Deliveries into the plugin are ordinary `Invoke`s of
 reserved handlers through `PluginWorkerEngine`; Core adds no separate result
 or event message.
 
+Engine API (Core premise revision 2, `4e6b0db`, section 5):
+`engine.try_reserve_delivery_pool(plugin_key, slots, request_bytes,
+completion_bytes_per_slot)` at load returns a `DeliveryPool` bound to the
+current generation, with `accept_call(call_id, max_result_bytes)`,
+`admit_result(call_id, request)`, and `release_call(call_id)`. On the thread
+host, the Hub's in-process host port calls the same methods, so both hosts
+share one accounting path. Log frames carry `dropped_since_last`.
+
 Flow control: the standing delivery pool and its credits (section 5.1),
 separate conserved credits for host-call request bodies and for log records
 (section 5.2), and a dropped-record counter for logs. A host call without a
@@ -974,9 +982,13 @@ resources and applies its restart policy.
 Deadline: the engine cancels the invocation, Core sends `Cancel`, and after a
 Hub-supplied grace (a `// timer: deadline`) Core kills the process group.
 
-**PRODUCT DECISIONS (process host policy)**: the kill grace, the restart
-policy (count and backoff after crashes), and the per-plugin OS limits
-(address space, CPU time, open files) are new numbers. Option A
+**PRODUCT DECISIONS (process host policy)**: Core has no defaults; the Hub
+supplies every number (Core premise section 11): startup deadline (spawn
+through `Loaded`), shutdown deadline, cancel grace, `max_frame_bytes`,
+ingress bytes, log credits (count and bytes), stderr tail bytes, the pool
+(slots, request bytes, completion bytes per slot), the memory cap (enforced
+on macOS by a counting global allocator in the Hub worker binary, a
+mechanism the orchestrator accepted), the restart policy, and rlimits. Option A
 (recommended): memory limit = the existing per-VM limit (16 MiB) plus a
 measured runtime overhead; restart once per crash with a
 `// timer: backoff`, then quarantine until the operator re-enables. Option B:
