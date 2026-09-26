@@ -440,24 +440,33 @@ fn daemon_shutdown_during_hub_update_check_is_bounded_and_leak_free() {
     fs::remove_dir_all(&home).expect("remove maintenance home");
 }
 
-#[test]
-fn process_ownership_wait_for_status_timeout_reports_diagnostics_and_reaps_owned_child() {
-    let data_dir = unique_test_dir("wait-for-status-timeout");
-    let mut child = Command::new("sh")
+/// Spawns a never-ready `sh` fixture the way the harness spawns a daemon, with
+/// the readiness pipe at fd 3. The fixture blocks on its stdin pipe, which the
+/// returned child holds, and never writes the ready line.
+fn spawn_readiness_fixture(script: &str) -> (Child, io::PipeReader) {
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
-        .arg(
-            "printf 'daemon stdout marker\\n'; printf 'daemon stderr marker\\n' >&2; exec sleep 60",
-        )
+        .arg(script)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn never-ready daemon fixture");
+        .stderr(Stdio::piped());
+    let ready = attach_ready_fd(&mut command);
+    let child = command.spawn().expect("spawn readiness fixture");
+    (child, ready.spawned())
+}
 
-    let error = wait_for_status_with_budget(&data_dir, &mut child, Duration::from_millis(100))
+#[test]
+fn process_ownership_readiness_timeout_reports_diagnostics_and_reaps_owned_child() {
+    let data_dir = unique_test_dir("readiness-timeout");
+    let (mut child, ready) = spawn_readiness_fixture(
+        "printf 'daemon stdout marker\\n'; printf 'daemon stderr marker\\n' >&2; exec cat >/dev/null",
+    );
+
+    let error = wait_for_ready_with_budget(ready, &mut child, Duration::from_millis(100))
         .expect_err("never-ready child should time out");
 
     assert!(error.contains("readiness budget 100ms"), "{error}");
-    assert!(error.contains("last status output="), "{error}");
     assert!(error.contains("daemon stdout marker"), "{error}");
     assert!(error.contains("daemon stderr marker"), "{error}");
     assert!(error.contains("child_status="), "{error}");
@@ -480,6 +489,86 @@ fn process_ownership_wait_for_status_timeout_reports_diagnostics_and_reaps_owned
         "timed-out fixture must not answer status: {}",
         command_output_text(&status)
     );
+}
+
+/// A descendant that keeps the fixture's stdout and stderr open reads the
+/// fixture's stdin pipe through fd 4, so it lives until the test drops that
+/// pipe. `close_ready` also closes the readiness pipe in the descendant.
+fn held_output_descendant(close_ready: bool) -> &'static str {
+    if close_ready {
+        "exec 4<&0; cat <&4 3>&- & printf 'held output marker\\n' >&2; exit 4"
+    } else {
+        "exec 4<&0; cat <&4 & printf 'held output marker\\n' >&2; exec cat >/dev/null"
+    }
+}
+
+#[test]
+fn process_ownership_readiness_eof_returns_while_a_descendant_holds_the_output() {
+    let (mut child, ready) = spawn_readiness_fixture(held_output_descendant(true));
+    let stdin = child.stdin.take();
+
+    let error = wait_for_ready_with_budget(ready, &mut child, Duration::from_secs(10))
+        .expect_err("exit without a ready line fails");
+
+    assert!(error.contains("without a ready line"), "{error}");
+    assert!(error.contains("child_status=exit status: 4"), "{error}");
+    assert!(error.contains("held output marker"), "{error}");
+    drop(stdin);
+}
+
+#[test]
+fn process_ownership_readiness_timeout_returns_while_a_descendant_holds_the_output() {
+    let (mut child, ready) = spawn_readiness_fixture(held_output_descendant(false));
+    let stdin = child.stdin.take();
+
+    let error = wait_for_ready_with_budget(ready, &mut child, Duration::from_millis(100))
+        .expect_err("silence past the budget fails");
+
+    assert!(error.contains("readiness budget 100ms"), "{error}");
+    assert!(error.contains("held output marker"), "{error}");
+    drop(stdin);
+}
+
+#[test]
+fn buffered_output_drain_ends_while_the_writer_keeps_refilling_the_pipe() {
+    // Every read refills the pipe with as many bytes as it took, so the pipe is
+    // never empty and never reaches EOF. Only a drain bounded by the bytes
+    // buffered at its start can return.
+    struct RefillingPipe {
+        reader: io::PipeReader,
+        writer: io::PipeWriter,
+    }
+    impl Read for RefillingPipe {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = self.reader.read(buffer)?;
+            self.writer.write_all(&buffer[..read])?;
+            Ok(read)
+        }
+    }
+    impl std::os::fd::AsRawFd for RefillingPipe {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.reader.as_raw_fd()
+        }
+    }
+    let (reader, mut writer) = io::pipe().expect("create pipe");
+    writer.write_all(b"refilled output").expect("buffer output");
+
+    let drained = drain_buffered_output(RefillingPipe { reader, writer });
+
+    assert_eq!(drained, "refilled output");
+}
+
+#[test]
+fn process_ownership_readiness_pipe_eof_reports_the_exit_and_output() {
+    let (mut child, ready) =
+        spawn_readiness_fixture("printf 'startup failed marker\\n' >&2; exit 7");
+
+    let error = wait_for_ready_with_budget(ready, &mut child, Duration::from_secs(10))
+        .expect_err("a child that exits without a ready line fails readiness");
+
+    assert!(error.contains("without a ready line"), "{error}");
+    assert!(error.contains("child_status=exit status: 7"), "{error}");
+    assert!(error.contains("startup failed marker"), "{error}");
 }
 
 #[test]
@@ -735,17 +824,16 @@ fn cli_local_runtime_up_starts_reuses_and_down_stops_runtime() {
         "1.1.0"
     );
 
-    let live_idle_connection =
-        UnixRouteClient::connect(&botster_hub_client::DaemonEndpoint::new(
-            config
-                .transports
-                .local_socket
-                .as_ref()
-                .expect("local runtime socket binding")
-                .path
-                .clone(),
-        ))
-        .expect("hold idle connection across down");
+    let live_idle_connection = UnixRouteClient::connect(&botster_hub_client::DaemonEndpoint::new(
+        config
+            .transports
+            .local_socket
+            .as_ref()
+            .expect("local runtime socket binding")
+            .path
+            .clone(),
+    ))
+    .expect("hold idle connection across down");
     let mut live_entity_subscription = botster_hub_client::subscribe_session_entities(
         &botster_hub_client::DaemonEndpoint::new(
             config
@@ -925,10 +1013,7 @@ fn cli_shutdown_waits_until_metadata_owned_daemon_is_reaped() {
         .local_socket
         .expect("local socket binding")
         .path;
-    let mut daemon = start_cli_daemon_with_session_worker(
-        &data_dir,
-        &session_worker_binary_path(),
-    );
+    let mut daemon = start_cli_daemon_with_session_worker(&data_dir, &session_worker_binary_path());
     let daemon_pid = daemon.child_mut().id();
     write_local_runtime_daemon_metadata(&data_dir, daemon_pid);
     let before_shutdown = process_snapshot(daemon_pid).expect("ready daemon process snapshot");
@@ -987,7 +1072,9 @@ fn cli_shutdown_waits_until_metadata_owned_daemon_is_reaped() {
         thread::sleep(Duration::from_millis(20));
     }
 
-    let daemon_output = daemon.wait_with_output().expect("wait for metadata-owned daemon");
+    let daemon_output = daemon
+        .wait_with_output()
+        .expect("wait for metadata-owned daemon");
     assert!(
         daemon_output.status.success(),
         "daemon did not exit cleanly before reap: status={} stdout={:?} stderr={:?}",
@@ -1612,16 +1699,19 @@ fn cli_home_runtime_start_does_not_reuse_dead_pid_metadata_and_rebinds_leftover_
     write_local_runtime_daemon_metadata(&data_dir, dead_pid);
 
     candidate_session_worker_binary_path();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_botster-hub"));
+    command
         .env("HOME", &home)
         .env_remove("BOTSTER_HUB_DATA_DIR")
         .env_remove("XDG_DATA_HOME")
         .arg("start")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let ready = attach_ready_fd(&mut command);
+    let mut daemon = command
         .spawn()
         .expect("start home runtime with stale dead-pid metadata");
-    wait_for_status(&data_dir, &mut daemon);
+    wait_for_ready(ready.spawned(), &mut daemon);
 
     let stale_metadata: serde_json::Value = serde_json::from_slice(
         &fs::read(data_dir.join(".botster-hub-runtime-daemon.json"))
@@ -1692,10 +1782,9 @@ impl IncompatibleDaemonFixture {
                 let raw = botster_hub_client::DaemonUnixFrameReader::new()
                     .read_raw_frame(&mut stream, botster_hub_client::MAX_UNIX_FRAME_BYTES)
                     .expect("read framed client hello");
-                let frame = botster_hub_client::decode_unix_frame::<botster_hub_client::ClientFrame>(
-                    &raw,
-                )
-                .expect("decode framed client hello");
+                let frame =
+                    botster_hub_client::decode_unix_frame::<botster_hub_client::ClientFrame>(&raw)
+                        .expect("decode framed client hello");
                 match frame {
                     botster_hub_client::DaemonUnixFrame::Control(
                         botster_hub_client::ClientFrame::Hello { hello },
@@ -2053,7 +2142,8 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
             HubClientRequest::ListSessions {
                 request_id: RequestId("hub-daemon-restart-list".to_string()),
             },
-        ).wait(restarted.runtime().expect("runtime initialized"))
+        )
+        .wait(restarted.runtime().expect("runtime initialized"))
         .expect("list after restart through client api");
     assert!(
         matches!(listed.body, HubClientResponseBody::Sessions(sessions) if sessions.iter().any(|session| session.session_id == session_id))
@@ -2100,7 +2190,8 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
                     session_id: session_id.clone(),
                     now_seconds: logical_clock,
                 },
-            ).wait(restarted.runtime().expect("runtime initialized"))
+            )
+            .wait(restarted.runtime().expect("runtime initialized"))
             .expect("read screen after restart");
         if let HubClientResponseBody::ReadScreen(body) = response.body {
             screen = body.text;
@@ -2122,7 +2213,8 @@ fn daemon_restart_reconnects_worker_backed_session_through_client_api() {
             session_id,
             now_seconds: logical_clock,
         },
-    ).wait(restarted.runtime().expect("runtime initialized"))
+    )
+    .wait(restarted.runtime().expect("runtime initialized"))
     .expect("shutdown after restart through client api");
 }
 
@@ -2244,7 +2336,8 @@ fn daemon_startup_reconciliation_marks_stale_adoption_socket_and_continues() {
                     command: "printf 'fresh-after-stale-ready\\n'; sleep 1".to_string(),
                     now_seconds: 3,
                 },
-            ).wait(daemon.runtime().expect("runtime initialized"))
+            )
+            .wait(daemon.runtime().expect("runtime initialized"))
             .expect("fresh session should spawn after stale adoption reconciliation");
             assert!(
                 wait_ticket(
@@ -2254,8 +2347,8 @@ fn daemon_startup_reconciliation_marks_stale_adoption_socket_and_continues() {
                         .list_sessions()
                 )
                 .expect("list sessions after fresh spawn")
-                    .iter()
-                    .any(|session| session.session_id == fresh_session_id),
+                .iter()
+                .any(|session| session.session_id == fresh_session_id),
                 "fresh session should be visible after stale adoption reconciliation"
             );
         });
@@ -2411,8 +2504,8 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             .any(|session| session.session_id == session_id && session.lifecycle == "running")
     );
 
-    let mut pre_restart = UnixRouteClient::connect(&endpoint)
-        .expect("connect before daemon restart");
+    let mut pre_restart =
+        UnixRouteClient::connect(&endpoint).expect("connect before daemon restart");
     pre_restart
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
@@ -2477,8 +2570,7 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
             .any(|session| session.session_id == session_id && session.lifecycle == "running")
     );
 
-    let mut connection = UnixRouteClient::connect(&endpoint)
-        .expect("connect after daemon restart");
+    let mut connection = UnixRouteClient::connect(&endpoint).expect("connect after daemon restart");
     connection
         .request(&botster_hub_client::DaemonRequest::Attach {
             session_id: session_id.to_string(),
@@ -2486,7 +2578,10 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
         })
         .expect("attach after daemon restart");
     connection
-        .send_terminal_frame("cli-restart-subscription-after", &terminal_resize_frame_bytes(30, 100))
+        .send_terminal_frame(
+            "cli-restart-subscription-after",
+            &terminal_resize_frame_bytes(30, 100),
+        )
         .expect("resize after daemon restart");
     let ready_deadline = Instant::now() + Duration::from_secs(8);
     let mut attached = false;
@@ -2513,7 +2608,10 @@ fn process_ownership_daemon_restart_adopts_then_shuts_down_worker_session() {
         thread::sleep(Duration::from_millis(25));
     }
     connection
-        .send_terminal_frame("cli-restart-subscription-after", &terminal_input_frame_bytes(b"after-restart\r"))
+        .send_terminal_frame(
+            "cli-restart-subscription-after",
+            &terminal_input_frame_bytes(b"after-restart\r"),
+        )
         .expect("send input after daemon restart");
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut screen_text = String::new();
@@ -2585,15 +2683,14 @@ fn process_ownership_daemon_restart_lists_ended_session_row() {
     );
     wait_for_authoritative_session_exit(&endpoint, &session_id);
 
-    let before = botster_hub::daemon_transport_request(
-        &config,
-        botster_hub::DaemonRequest::ListSessions,
-    )
-    .expect("list exited row before hub restart");
+    let before =
+        botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
+            .expect("list exited row before hub restart");
     assert!(
-        before.sessions.iter().any(|session| {
-            session.session_id == session_id && session.lifecycle == "exited"
-        }),
+        before
+            .sessions
+            .iter()
+            .any(|session| { session.session_id == session_id && session.lifecycle == "exited" }),
         "pre-restart list must keep the exited row, sessions={:?}",
         before.sessions
     );
@@ -2631,18 +2728,16 @@ fn process_ownership_daemon_restart_lists_ended_session_row() {
         botster_hub::daemon_transport_request(&config, botster_hub::DaemonRequest::ListSessions)
             .expect("list ended row after daemon restart");
     assert!(
-        list.sessions.iter().any(|session| {
-            session.session_id == session_id && session.lifecycle == "exited"
-        }),
+        list.sessions
+            .iter()
+            .any(|session| { session.session_id == session_id && session.lifecycle == "exited" }),
         "restarted hub must list the persisted exited row, sessions={:?} registry_files={registry_files:?}",
         list.sessions
     );
 
-    let mut subscription = botster_hub_client::subscribe_session_entities(
-        &endpoint,
-        "cli-restart-ended-entities",
-    )
-    .expect("subscribe session entities after restart");
+    let mut subscription =
+        botster_hub_client::subscribe_session_entities(&endpoint, "cli-restart-ended-entities")
+            .expect("subscribe session entities after restart");
     subscription
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bound post-restart snapshot reads");
@@ -2669,9 +2764,7 @@ fn process_ownership_daemon_restart_lists_ended_session_row() {
             }
             Ok(botster_hub_client::DaemonEntityFrame::Upsert { id, entity, .. })
                 if id == session_id
-                    && entity
-                        .get("lifecycle")
-                        .and_then(serde_json::Value::as_str)
+                    && entity.get("lifecycle").and_then(serde_json::Value::as_str)
                         == Some("exited")
                     && entity
                         .get("lifecycle_class")
@@ -2706,7 +2799,10 @@ fn session_registry_json_names(data_dir: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
-        .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
         .collect();
     names.sort();
     names

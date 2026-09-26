@@ -1090,9 +1090,11 @@ pub(crate) fn start_cli_daemon_with_session_worker(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_test_process_group(&mut command);
+    let ready = attach_ready_fd(&mut command);
     let child = command.spawn().expect("spawn botster-hub start");
+    let ready = ready.spawned();
     let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "session-worker daemon");
-    wait_for_status(data_dir, daemon.child_mut());
+    wait_for_ready(ready, daemon.child_mut());
     daemon
 }
 

@@ -373,27 +373,31 @@ pub(crate) fn try_terminate_and_reap_child(child: &mut Child) -> Result<String, 
     let pid = child.id();
     signal_test_group_or_child(pid, libc::SIGTERM)
         .map_err(|error| format!("signal daemon group after readiness failure: {error}"))?;
-    let deadline = Instant::now() + HUB_STOP_TERM_GRACE;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status.to_string()),
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(format!("poll daemon child during cleanup: {error}")),
-        }
+    // timer: deadline — the SIGTERM grace; the child's exit event ends the normal wait and expiry escalates to SIGKILL.
+    if child_exited_before(child, Instant::now() + HUB_STOP_TERM_GRACE)? {
+        return child
+            .wait()
+            .map(|status| status.to_string())
+            .map_err(|error| format!("reap daemon child after SIGTERM: {error}"));
     }
     signal_test_group_or_child(pid, libc::SIGKILL)
         .map_err(|error| format!("kill daemon group after readiness failure: {error}"))?;
-    let deadline = Instant::now() + HUB_STOP_KILL_GRACE;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status.to_string()),
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(format!("poll killed daemon child: {error}")),
-        }
+    // timer: deadline — the SIGKILL grace; expiry reports a cleanup failure.
+    if child_exited_before(child, Instant::now() + HUB_STOP_KILL_GRACE)? {
+        return child
+            .wait()
+            .map(|status| status.to_string())
+            .map_err(|error| format!("reap killed daemon child: {error}"));
     }
     Err(format!(
         "daemon child {pid} did not exit within bounded cleanup"
     ))
+}
+
+/// Blocks on the child's exit event until `deadline`.
+fn child_exited_before(child: &Child, deadline: Instant) -> Result<bool, String> {
+    botster_hub::process_exit::wait_for_pid_exit(child.id(), deadline)
+        .map_err(|error| format!("watch daemon child exit: {error}"))
 }
 
 pub(crate) fn collect_owned_session_processes(data_dir: &Path) -> Result<IdentityCapture, String> {

@@ -656,6 +656,44 @@ pub(crate) fn collect_child_output(child: &mut Child) -> (String, String) {
     (stdout, stderr)
 }
 
+/// Reads a finite snapshot of what the child already wrote, without waiting.
+/// A descendant can keep the pipes open, idle or still writing, after the
+/// child exits, so reading to EOF could block or never end. `FIONREAD` gives
+/// the bytes buffered now (at most the pipe capacity); only those are read.
+/// After the child exits or is killed, its own output is in that snapshot.
+pub(crate) fn drain_buffered_child_output(child: &mut Child) -> String {
+    fn drain(pipe: Option<impl Read + std::os::fd::AsRawFd>) -> String {
+        pipe.map(drain_buffered_output).unwrap_or_default()
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    format!("stdout={stdout:?} stderr={stderr:?}")
+}
+
+/// Reads the bytes buffered in `pipe` when the call starts, and no more.
+pub(crate) fn drain_buffered_output(mut pipe: impl Read + std::os::fd::AsRawFd) -> String {
+    let mut buffered: libc::c_int = 0;
+    if unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut buffered) } == -1 {
+        return format!(
+            "<cannot size buffered output: {}>",
+            io::Error::last_os_error()
+        );
+    }
+    let mut bytes = vec![0u8; usize::try_from(buffered).unwrap_or(0)];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        // The bytes are already buffered, so this read returns at once.
+        match pipe.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    bytes.truncate(filled);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 pub(crate) fn shutdown_local_runtime_daemon(data_dir: &Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
         .arg("shutdown")
@@ -998,9 +1036,11 @@ pub(crate) fn start_installed_daemon(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_test_process_group(&mut command);
+    let ready = attach_ready_fd(&mut command);
     let child = command.spawn().expect("spawn the installed Hub");
+    let ready = ready.spawned();
     let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "installed daemon");
-    wait_for_status(data_dir, daemon.child_mut());
+    wait_for_ready(ready, daemon.child_mut());
     daemon
 }
 
