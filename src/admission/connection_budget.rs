@@ -183,17 +183,18 @@ impl ConnectionAggregate {
             })
     }
 
+    /// The high mark is a high-water mark, not a per-frame cap. A frame
+    /// that fits under the mark beside the occupied bytes is authorized. A
+    /// frame that does not fit is authorized only on an empty aggregate, so
+    /// the aggregate exceeds the mark by at most that one frame.
     fn try_extend_authorized(&self, frame_len: usize) -> bool {
         // A sender publishes channel usage before it drops its permit. The
         // transition can count bytes twice, but it cannot omit them.
         let mut authorized = self.authorized.load(Ordering::Acquire);
         loop {
-            if self
-                .published_buffered()
-                .saturating_add(authorized)
-                .saturating_add(frame_len)
-                > AGGREGATE_BUFFERED_HIGH
-            {
+            let occupied = self.published_buffered().saturating_add(authorized);
+            let fits = occupied.saturating_add(frame_len) <= AGGREGATE_BUFFERED_HIGH;
+            if !fits && occupied != 0 {
                 return false;
             }
             match self.authorized.compare_exchange_weak(
@@ -202,10 +203,28 @@ impl ConnectionAggregate {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
+                // The empty check read usage before this authorization. A
+                // permit authorized and transferred in between can publish
+                // usage the check missed; undo this authorization then.
+                Ok(_) if !fits && self.published_buffered() != 0 => {
+                    self.authorized.fetch_sub(frame_len, Ordering::AcqRel);
+                    self.capacity_released();
+                    authorized = self.authorized.load(Ordering::Acquire);
+                }
                 Ok(_) => return true,
                 Err(current) => authorized = current,
             }
         }
+    }
+
+    /// Whether a write of `need` bytes that was refused would now be
+    /// authorized: the aggregate is below the low mark, and the write fits
+    /// or the aggregate is empty.
+    #[must_use]
+    pub(crate) fn admits_refused(&self, need: usize) -> bool {
+        let buffered = self.buffered();
+        buffered < AGGREGATE_BUFFERED_LOW
+            && (buffered == 0 || buffered.saturating_add(need) <= AGGREGATE_BUFFERED_HIGH)
     }
 
     #[must_use]
@@ -383,6 +402,49 @@ mod tests {
     impl Drop for LastHandleWaiter {
         fn drop(&mut self) {
             self.aggregate.capacity_released();
+        }
+    }
+
+    #[test]
+    fn an_oversize_frame_is_authorized_only_on_an_empty_aggregate() {
+        let aggregate = Arc::new(ConnectionAggregate::new());
+        let oversize = AGGREGATE_BUFFERED_HIGH + 1;
+        let first = aggregate.try_authorize(oversize).expect("empty aggregate");
+        assert!(aggregate.try_authorize(oversize).is_none());
+        assert!(aggregate.try_authorize(1).is_none());
+        drop(first);
+        // One published byte makes the aggregate nonempty.
+        aggregate.slots[0].store(1, Ordering::Release);
+        assert!(aggregate.try_authorize(oversize).is_none());
+        assert!(
+            aggregate
+                .try_authorize(AGGREGATE_BUFFERED_HIGH - 1)
+                .is_some()
+        );
+        aggregate.slots[0].store(0, Ordering::Release);
+        assert!(aggregate.try_authorize(oversize).is_some());
+    }
+
+    #[test]
+    fn concurrent_oversize_authorizations_admit_one() {
+        for _ in 0..200 {
+            let aggregate = Arc::new(ConnectionAggregate::new());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let contenders = (0..2)
+                .map(|_| {
+                    let aggregate = Arc::clone(&aggregate);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        aggregate.try_authorize(AGGREGATE_BUFFERED_HIGH + 1)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let permits = contenders
+                .into_iter()
+                .map(|contender| contender.join().expect("contender"))
+                .collect::<Vec<_>>();
+            assert_eq!(permits.iter().filter(|permit| permit.is_some()).count(), 1);
         }
     }
 
