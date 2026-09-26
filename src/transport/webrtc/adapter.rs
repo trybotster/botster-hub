@@ -153,21 +153,17 @@ impl WebRtcTerminalAdapterInner {
         result
     }
 
-    /// Resume a refused writer once the aggregate is below the low mark and
-    /// the refused write fits. A write larger than the high mark never fits;
-    /// it resumes below the low mark and meets Core's write budget.
+    /// Resume a refused writer only when its write would now be
+    /// authorized, so a resume never meets the same refusal.
     fn refresh_aggregate_pressure(&self) {
         let need = self.aggregate_blocked.load(Ordering::Acquire);
         if need == 0 {
             return;
         }
-        let can_resume = self.aggregate.as_ref().is_none_or(|aggregate| {
-            let buffered = aggregate.buffered();
-            buffered < crate::admission::connection_budget::AGGREGATE_BUFFERED_LOW
-                && (need > crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH
-                    || buffered.saturating_add(need)
-                        <= crate::admission::connection_budget::AGGREGATE_BUFFERED_HIGH)
-        });
+        let can_resume = self
+            .aggregate
+            .as_ref()
+            .is_none_or(|aggregate| aggregate.admits_refused(need));
         if can_resume && self.aggregate_blocked.swap(0, Ordering::AcqRel) != 0 {
             self.slot.notify_writable();
         }
@@ -988,6 +984,39 @@ mod tests {
             );
             drop((holder, refused));
         }
+    }
+
+    /// An oversize write refused beside a small buffered frame stays refused
+    /// with no wake: it would be refused again until the aggregate empties.
+    /// The release that empties the aggregate resumes it.
+    #[test]
+    fn an_oversize_refusal_stays_blocked_until_the_aggregate_empties() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, AGGREGATE_BUFFERED_LOW, ConnectionBudget,
+        };
+        let budget = ConnectionBudget::default();
+        let mux = WebRtcConnectionMux::new();
+        let (mut holder, holder_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        let (mut oversize, oversize_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        assert_eq!(holder.try_write(&test_frame(b"small")), Ok(()));
+        assert!(budget.aggregate_buffered() < AGGREGATE_BUFFERED_LOW);
+        let frame = test_frame(&vec![b'o'; AGGREGATE_BUFFERED_HIGH + 1]);
+        assert_eq!(
+            oversize.try_write(&frame),
+            Err(TerminalAdapterWriteError::WouldBlock)
+        );
+        assert!(
+            oversize_handle.aggregate_blocked_for_test(),
+            "no resume while the aggregate is nonempty"
+        );
+        assert_eq!(
+            oversize_handle.inner.pressure(),
+            TerminalAdapterPressure::WouldBlock
+        );
+        holder_handle.close();
+        assert!(!oversize_handle.aggregate_blocked_for_test());
+        assert_eq!(oversize.try_write(&frame), Ok(()));
+        drop(holder);
     }
 
     #[test]

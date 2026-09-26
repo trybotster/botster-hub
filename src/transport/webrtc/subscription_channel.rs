@@ -1367,6 +1367,85 @@ mod tests {
         assert!(!channel.sent_binary.lock().expect("sent").is_empty());
     }
 
+    /// The high mark is a high-water mark: a frame larger than the mark is
+    /// delivered on an idle peer, and the next frame waits for the drain.
+    #[test]
+    fn an_oversize_frame_on_an_idle_peer_is_delivered_and_the_next_waits_for_the_drain() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+        };
+        use crate::transport::webrtc::delivery::{
+            LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES, sealed_terminal_wire_len,
+        };
+        let mut budget = ConnectionBudget::default();
+        let usage = budget
+            .reserve("route".to_string(), ChannelClass::Terminal)
+            .expect("reserve route");
+        let mux = WebRtcConnectionMux::new();
+        let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        mux.register("s".into(), "route".into(), 1, handle.clone());
+        let (mut next, next_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        mux.register("s".into(), "next".into(), 1, next_handle.clone());
+        let oversize = test_frame(&vec![
+            b'o';
+            AGGREGATE_BUFFERED_HIGH + AGGREGATE_BUFFERED_HIGH / 4
+        ]);
+        let wire_len = sealed_terminal_wire_len(oversize.frame.len()).expect("wire len");
+        assert!(wire_len > AGGREGATE_BUFFERED_HIGH);
+        assert_eq!(budget.aggregate_buffered(), 0);
+        assert_eq!(adapter.try_write(&oversize), Ok(()));
+        // Above the mark, nothing more is authorized.
+        let small = test_frame(b"next");
+        assert_eq!(
+            next.try_write(&small),
+            Err(TerminalAdapterWriteError::WouldBlock)
+        );
+        assert!(next_handle.aggregate_blocked_for_test());
+
+        let channel = FakeDataChannel::default();
+        // The transport still holds every sealed byte after the send.
+        channel.outstanding_bytes.store(wire_len, Ordering::Release);
+        let mut next_message_id = 1u64;
+        assert_eq!(
+            flush_once(&channel, &handle, &usage, &mut next_message_id),
+            Ok(TerminalFlushOutcome::Ready)
+        );
+        let sent = channel.sent_binary.lock().expect("sent").clone();
+        assert_eq!(
+            sent.len(),
+            oversize
+                .frame
+                .len()
+                .div_ceil(LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES)
+        );
+        assert_eq!(sent.iter().map(Vec::len).sum::<usize>(), wire_len);
+        assert_eq!(budget.aggregate_buffered(), wire_len);
+        mux.refresh_aggregate_pressure();
+        assert!(
+            next_handle.aggregate_blocked_for_test(),
+            "the next frame waits while the oversize frame is buffered"
+        );
+
+        // A drain event: the driver publishes the drained usage, then
+        // refreshes the peer's routes.
+        channel.outstanding_bytes.store(0, Ordering::Release);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                publish_channel_usage(&channel, &usage)
+                    .await
+                    .expect("publish usage");
+                mux.refresh_aggregate_pressure();
+                tokio::time::timeout(Duration::from_secs(1), next_handle.wait_for_write())
+                    .await
+                    .expect("the drain wakes the waiting frame");
+            });
+        assert!(!next_handle.aggregate_blocked_for_test());
+        assert_eq!(next.try_write(&small), Ok(()));
+    }
+
     /// A write the aggregate refuses waits, and capacity released outside
     /// the route's own loop wakes it: a retired sibling channel, or a
     /// closing sibling adapter's permit.
