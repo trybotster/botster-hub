@@ -136,8 +136,12 @@ struct RepoCatalogDefinition {
     args: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_working_directory")]
     working_directory: CatalogWorkingDirectory,
-    #[serde(default, deserialize_with = "discard_environment")]
-    environment: (),
+    #[serde(
+        default,
+        rename = "environment",
+        deserialize_with = "discard_environment"
+    )]
+    _environment: (),
     #[serde(default)]
     allowed_environment_overrides: Vec<String>,
     #[serde(default)]

@@ -232,14 +232,14 @@ pub(crate) struct ChargedSessionTypeMaterialization {
 /// One open parent funds later Core replies. Fixed output charges stay sealed.
 pub(crate) struct ChargedMaterializationAllowance {
     pub(crate) parent: crate::lua_memory::LuaCallbackCharge,
-    row: crate::lua_memory::LuaCallbackCharge,
-    environment: crate::lua_memory::LuaCallbackCharge,
-    prefix: crate::lua_memory::LuaCallbackCharge,
-    execution: crate::lua_memory::LuaCallbackCharge,
-    metadata: crate::lua_memory::LuaCallbackCharge,
-    context: crate::lua_memory::LuaCallbackCharge,
-    environment_injection: crate::lua_memory::LuaCallbackCharge,
-    output_copies: crate::lua_memory::LuaCallbackCharge,
+    _row: crate::lua_memory::LuaCallbackCharge,
+    _environment: crate::lua_memory::LuaCallbackCharge,
+    _prefix: crate::lua_memory::LuaCallbackCharge,
+    _execution: crate::lua_memory::LuaCallbackCharge,
+    _metadata: crate::lua_memory::LuaCallbackCharge,
+    _context: crate::lua_memory::LuaCallbackCharge,
+    _environment_injection: crate::lua_memory::LuaCallbackCharge,
+    _output_copies: crate::lua_memory::LuaCallbackCharge,
 }
 
 #[cfg(test)]
@@ -255,14 +255,14 @@ impl ChargedMaterializationAllowance {
         let output_copies = parent.split_fixed(0).expect("the test parent remains open");
         Self {
             parent,
-            row,
-            environment,
-            prefix,
-            execution,
-            metadata,
-            context,
-            environment_injection,
-            output_copies,
+            _row: row,
+            _environment: environment,
+            _prefix: prefix,
+            _execution: execution,
+            _metadata: metadata,
+            _context: context,
+            _environment_injection: environment_injection,
+            _output_copies: output_copies,
         }
     }
 }
@@ -3741,14 +3741,14 @@ fn charged_final_materialization(
         },
         allowance: ChargedMaterializationAllowance {
             parent,
-            row: row_storage,
-            environment: environment_storage,
-            prefix: prefix_storage,
-            execution: execution_storage,
-            metadata: metadata_storage,
-            context: context_storage,
-            environment_injection,
-            output_copies,
+            _row: row_storage,
+            _environment: environment_storage,
+            _prefix: prefix_storage,
+            _execution: execution_storage,
+            _metadata: metadata_storage,
+            _context: context_storage,
+            _environment_injection: environment_injection,
+            _output_copies: output_copies,
         },
     })
 }

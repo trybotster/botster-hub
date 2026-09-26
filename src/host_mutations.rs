@@ -717,18 +717,18 @@ pub(crate) struct HostMutationError {
 
 #[derive(Debug)]
 pub(crate) enum ExternalEffectCause {
-    RepoPublicationSyncUnconfirmed(SessionTypeError),
-    RepoSyncedStateRefused(HubStateStoreError),
+    RepoPublicationSyncUnconfirmed { _error: SessionTypeError },
+    RepoSyncedStateRefused { _error: HubStateStoreError },
 }
 
 impl ExternalEffectCause {
     pub(crate) fn client_error(&self) -> (&'static str, &'static str) {
         match self {
-            Self::RepoPublicationSyncUnconfirmed(_) => (
+            Self::RepoPublicationSyncUnconfirmed { .. } => (
                 "repo_session_type_publication_uncertain",
                 "the repository file was renamed, but its synchronization is unconfirmed; Hub state was not written",
             ),
-            Self::RepoSyncedStateRefused(_) => (
+            Self::RepoSyncedStateRefused { .. } => (
                 "repo_session_type_state_refused",
                 "the repository file is synchronized, but the Hub state write was refused",
             ),
@@ -2271,7 +2271,7 @@ fn execute_session_type_commit(
             return HostMutationResult::ExternalEffectUncertain {
                 pending,
                 rollback,
-                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed(error),
+                cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed { _error: error },
             };
         }
         Err(error) => {
@@ -2286,7 +2286,9 @@ fn execute_session_type_commit(
         Err(failure) => HostMutationResult::ExternalEffectUncertain {
             pending: failure.pending,
             rollback,
-            cause: ExternalEffectCause::RepoSyncedStateRefused(failure.error),
+            cause: ExternalEffectCause::RepoSyncedStateRefused {
+                _error: failure.error,
+            },
         },
     }
 }
@@ -3435,7 +3437,7 @@ mod tests {
                     repo_file: Some(prior),
                     ..
                 },
-            cause: ExternalEffectCause::RepoSyncedStateRefused(_),
+            cause: ExternalEffectCause::RepoSyncedStateRefused { .. },
         } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
         else {
             panic!("failed state commit must retain the repo effect for reconciliation");
@@ -3531,7 +3533,7 @@ mod tests {
                     repo_file: Some(prior),
                     ..
                 },
-            cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed(error),
+            cause: ExternalEffectCause::RepoPublicationSyncUnconfirmed { _error: error },
         } = execute(HostMutationCommand::Commit(HostCommit { prepared }))
         else {
             panic!("repo rename with failed directory sync must retain uncertainty");

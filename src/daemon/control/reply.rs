@@ -196,8 +196,12 @@ pub(crate) enum ControlReply {
 
 #[derive(Debug)]
 pub(crate) enum RetainedControlCharge {
-    Plugin(RetainedPluginResultCharge),
-    Host(crate::host_executor::HostPreparedCharge),
+    Plugin {
+        _charge: RetainedPluginResultCharge,
+    },
+    Host {
+        _charge: crate::host_executor::HostPreparedCharge,
+    },
 }
 
 impl ControlReply {
@@ -215,7 +219,7 @@ impl ControlReply {
         let (response, charge) = response.into_parts();
         Self::Typed {
             response,
-            charge: Some(RetainedControlCharge::Plugin(charge)),
+            charge: Some(RetainedControlCharge::Plugin { _charge: charge }),
             delivery: None,
         }
     }
@@ -226,7 +230,7 @@ impl ControlReply {
     ) -> Self {
         Self::Typed {
             response,
-            charge: Some(RetainedControlCharge::Host(charge)),
+            charge: Some(RetainedControlCharge::Host { _charge: charge }),
             delivery: None,
         }
     }
@@ -291,7 +295,7 @@ impl ControlReply {
                 };
                 (
                     Ok(response),
-                    Some(RetainedControlCharge::Host(charge)),
+                    Some(RetainedControlCharge::Host { _charge: charge }),
                     Some(encoded_frame),
                 )
             }
