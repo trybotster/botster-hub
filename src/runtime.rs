@@ -135,6 +135,7 @@ pub struct HubRuntime {
     // Readers clone the current Arc under this short lock. Publication swaps
     // one Arc, so the owner never clones a durable state collection.
     state: SharedHubState,
+    package_registry: SharedPackageRegistry,
     state_authority: Option<Arc<HubStateAuthority>>,
     core_daemon: SharedCoreDaemon,
     detached_operations: Mutex<Vec<CoreOperationTracker>>,
@@ -306,6 +307,48 @@ impl HubStatePublication {
     }
 }
 
+/// The committed package registry that Lua session-type reads and spawn
+/// resolution use. The daemon owner publishes each committed registry view
+/// here, and a reader clones the current view for each call. The view's
+/// storage is charged once, when the owner reserves it; a replaced view is
+/// freed when its last reader drops it.
+pub struct PackageRegistryPublication(RwLock<SharedView<PackageRegistry>>);
+
+impl PackageRegistryPublication {
+    pub(crate) fn empty(budget: &Arc<SharedViewBudget>) -> Result<Self, HubStateStoreError> {
+        let empty =
+            PackageRegistry::from_snapshot(crate::packages::PackageRegistrySnapshot::empty())
+                .expect("the empty package registry snapshot is valid");
+        Ok(Self(RwLock::new(crate::daemon::reserve_package_registry(
+            budget, empty,
+        )?)))
+    }
+
+    /// The current committed registry. A poisoned lock keeps its value:
+    /// publication replaces one view and cannot leave it partial.
+    pub(crate) fn current(&self) -> SharedView<PackageRegistry> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn publish(&self, view: SharedView<PackageRegistry>) {
+        let replaced = std::mem::replace(
+            &mut *self
+                .0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            view,
+        );
+        // The replaced view drops outside the lock.
+        drop(replaced);
+    }
+}
+
+/// Shared committed package registry exposed to Lua plugin workers.
+pub type SharedPackageRegistry = Arc<PackageRegistryPublication>;
+
 /// Shared immutable durable state exposed to runtime and Lua readers.
 pub type SharedHubState = Arc<HubStatePublication>;
 /// Shared hub-owned spawn-target view exposed to Lua plugin workers.
@@ -451,7 +494,9 @@ pub(crate) struct PendingSessionTypeSpawn {
     pub(crate) plugin_key: PluginKey,
     pub(crate) session_type_id: String,
     pub(crate) request: SessionTypeRequest,
-    pub(crate) package_records: Arc<Vec<PackageRecord>>,
+    /// The committed registry the admitting call read; resolution and the
+    /// capability check use this same view.
+    pub(crate) package_records: SharedView<PackageRegistry>,
     pub(crate) response: OrdinarySpawnReply,
     // The admitted Lua projection remains funded after the caller times out.
     pub(crate) parent: Option<crate::lua_memory::LuaCallbackCharge>,
@@ -465,7 +510,9 @@ pub(crate) struct PendingManagedSessionSpawn {
     pub(crate) branch: String,
     pub(crate) session_type_id: String,
     pub(crate) request: ManagedSessionTypeRequest,
-    pub(crate) package_records: Vec<PackageRecord>,
+    /// The committed registry the admitting call read; validation and
+    /// materialization use this same view.
+    pub(crate) package_records: SharedView<PackageRegistry>,
     pub(crate) accepted_at: Instant,
     response: ManagedSpawnReply,
     // Lua ingress moves its open parent through the queued request.
@@ -522,7 +569,7 @@ impl PendingManagedSessionSpawn {
             branch,
             session_type_id,
             request,
-            package_records,
+            package_records: package_view_for_test(package_records),
             accepted_at: Instant::now(),
             response: ManagedSpawnReply::Legacy(response),
             parent: None,
@@ -637,6 +684,7 @@ impl HubRuntime {
             lua_memory,
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
+            package_registry: Arc::new(PackageRegistryPublication::empty(&state.budget())?),
             state,
             state_authority: None,
             core_daemon,
@@ -829,6 +877,7 @@ impl HubRuntime {
             lua_memory,
             #[cfg(test)]
             lua_plugin_runtimes: std::sync::Arc::new(Mutex::new(Vec::new())),
+            package_registry: Arc::new(PackageRegistryPublication::empty(&state.budget())?),
             state,
             state_authority,
             core_daemon,
@@ -969,6 +1018,27 @@ impl HubRuntime {
         Arc::clone(&self.state)
     }
 
+    /// Return the committed package registry view shared with Lua plugins.
+    pub(crate) fn package_registry_publication(&self) -> SharedPackageRegistry {
+        Arc::clone(&self.package_registry)
+    }
+
+    /// Publish the daemon owner's committed package registry view.
+    pub(crate) fn publish_package_registry_view(&self, view: SharedView<PackageRegistry>) {
+        self.package_registry.publish(view);
+    }
+
+    /// Publish a package registry for a host without a daemon owner. The view
+    /// is charged to this Hub's state budget.
+    pub fn publish_package_registry(
+        &self,
+        registry: PackageRegistry,
+    ) -> Result<(), HubStateStoreError> {
+        let view = crate::daemon::reserve_package_registry(&self.state.budget(), registry)?;
+        self.package_registry.publish(view);
+        Ok(())
+    }
+
     /// Return the shared worktree projection used by Lua helpers.
     #[must_use]
     pub fn worktrees(&self) -> SharedWorktrees {
@@ -986,6 +1056,7 @@ impl HubRuntime {
             session_types: self.session_type_spawner.clone(),
             spawn_targets: Arc::clone(&self.state),
             worktrees: Arc::clone(&self.state),
+            package_registry: Arc::clone(&self.package_registry),
             package_event_router: self.package_event_router.clone(),
             causal_scopes: self.causal_scopes.clone(),
             #[cfg(test)]
@@ -1955,7 +2026,7 @@ impl HubRuntime {
             .ok_or_else(|| {
                 ManagedGitError::new("target_not_found", "spawn target was not found")
             })?;
-        let records = pending.package_records.iter().collect::<Vec<_>>();
+        let records = pending.package_records.packages();
         show_session_type_for_target(
             &records,
             &state,
@@ -1985,7 +2056,7 @@ impl HubRuntime {
         owner_waiter: crate::owner_identity::WaiterId,
     ) -> Result<ManagedSessionSpawnStart, ManagedGitError> {
         let session_id = generated_session_uuid()?;
-        let records = pending.package_records.iter().collect::<Vec<_>>();
+        let records = pending.package_records.packages();
         let state = self.state();
         let materialized = materialize_managed_session_type(
             &self.config,
@@ -5073,7 +5144,7 @@ impl HubSessionTypeSpawner {
                     environment: BTreeMap::from([("PAYLOAD".into(), "spawn payload".repeat(128))]),
                     ..SessionTypeRequest::default()
                 },
-                package_records: Arc::new(Vec::new()),
+                package_records: package_view_for_test(Vec::new()),
                 response: OrdinarySpawnReply::Legacy(response),
                 parent: None,
                 _dispose_probe: Some(probe(gate)),
@@ -5092,7 +5163,7 @@ impl HubSessionTypeSpawner {
                     prompt: Some("managed payload".repeat(128)),
                     ..ManagedSessionTypeRequest::default()
                 },
-                package_records: Vec::new(),
+                package_records: package_view_for_test(Vec::new()),
                 accepted_at: Instant::now(),
                 response: ManagedSpawnReply::Legacy(response),
                 parent: None,
@@ -5207,7 +5278,7 @@ impl HubSessionTypeSpawner {
                 branch,
                 session_type_id,
                 request,
-                package_records,
+                package_records: package_view_for_test(package_records),
                 accepted_at: Instant::now(),
                 response: ManagedSpawnReply::Legacy(response),
                 parent: None,
@@ -5286,7 +5357,7 @@ impl HubSessionTypeSpawner {
     pub(crate) fn spawn_admitted(
         &self,
         input: crate::lua_runtime::spawn_input::SpawnInput,
-        package_records: Arc<Vec<PackageRecord>>,
+        package_records: SharedView<PackageRegistry>,
     ) -> Result<AdmittedSpawnDelivery, std::borrow::Cow<'static, str>> {
         if self
             .ordinary_owner_thread
@@ -5392,14 +5463,16 @@ impl HubSessionTypeSpawner {
     }
 
     /// Queue the one atomic managed-worktree/session spawn operation.
-    pub fn ensure_worktree_and_spawn(
+    /// `package_records` is the committed registry view the caller read once;
+    /// the capability check and the queued spawn use that same view.
+    pub(crate) fn ensure_worktree_and_spawn(
         &self,
         plugin_key: &PluginKey,
         target_id: &str,
         branch: &str,
         session_type_id: &str,
         request: ManagedSessionTypeRequest,
-        package_records: Vec<PackageRecord>,
+        package_records: SharedView<PackageRegistry>,
     ) -> Result<PluginManagedSessionSpawned, ManagedGitError> {
         if !package_allows_managed_git_spawn(&package_records, plugin_key) {
             return Err(ManagedGitError::new(
@@ -5487,7 +5560,7 @@ mod ordinary_spawn_queue_tests {
             plugin_key: PluginKey("plugin".into()),
             session_type_id: "worker".into(),
             request: SessionTypeRequest::default(),
-            package_records: Arc::new(Vec::new()),
+            package_records: package_view_for_test(Vec::new()),
             response,
             parent,
         };
@@ -5607,13 +5680,9 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
     }
 }
 
-fn package_allows_session_type_spawn(
-    package_records: &[PackageRecord],
-    plugin_key: &PluginKey,
-) -> bool {
-    package_records.iter().any(|record| {
-        record.manifest.name == plugin_key.0
-            && matches!(record.state, PackageState::Enabled)
+fn package_allows_session_type_spawn(packages: &PackageRegistry, plugin_key: &PluginKey) -> bool {
+    packages.package(&plugin_key.0).is_some_and(|record| {
+        matches!(record.state, PackageState::Enabled)
             && record.manifest.capabilities.iter().any(|capability| {
                 capability.surface == botster_core::CapabilitySurface::SessionActions
                     && capability.scope.as_deref() == Some("session_type_spawn")
@@ -5621,18 +5690,37 @@ fn package_allows_session_type_spawn(
     })
 }
 
-fn package_allows_managed_git_spawn(
-    package_records: &[PackageRecord],
-    plugin_key: &PluginKey,
-) -> bool {
-    package_records.iter().any(|record| {
-        record.manifest.name == plugin_key.0
-            && matches!(record.state, PackageState::Enabled)
+fn package_allows_managed_git_spawn(packages: &PackageRegistry, plugin_key: &PluginKey) -> bool {
+    packages.package(&plugin_key.0).is_some_and(|record| {
+        matches!(record.state, PackageState::Enabled)
             && record.manifest.capabilities.iter().any(|capability| {
                 capability.surface == botster_core::CapabilitySurface::SessionActions
                     && capability.scope.as_deref() == Some("session_type_managed_git_spawn")
             })
     })
+}
+
+/// A committed registry view built from `records`, for tests that queue
+/// spawns directly.
+#[cfg(test)]
+pub(crate) fn package_view_for_test(records: Vec<PackageRecord>) -> SharedView<PackageRegistry> {
+    let mut snapshot = crate::packages::PackageRegistrySnapshot::empty();
+    snapshot.records = records;
+    let registry =
+        PackageRegistry::from_snapshot(snapshot).expect("test package records form a registry");
+    crate::daemon::reserve_package_registry(&SharedViewBudget::new(), registry)
+        .expect("test package registry view")
+}
+
+/// A publication holding a committed registry view built from `records`.
+#[cfg(test)]
+pub(crate) fn package_publication_for_test(records: Vec<PackageRecord>) -> SharedPackageRegistry {
+    let publication = Arc::new(
+        PackageRegistryPublication::empty(&SharedViewBudget::new())
+            .expect("empty test package registry"),
+    );
+    publication.publish(package_view_for_test(records));
+    publication
 }
 
 fn generated_session_uuid() -> Result<SessionId, ManagedGitError> {

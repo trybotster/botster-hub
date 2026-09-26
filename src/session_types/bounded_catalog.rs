@@ -1597,7 +1597,7 @@ fn winner<'a>(peers: &'a [SourceRef<'a>]) -> SessionTypeResult<&'a SourceRef<'a>
 }
 
 pub(super) fn list(
-    records: &[PackageRecord],
+    records: &crate::packages::PackageRegistry,
     state: &HubState,
     target_id: &str,
     limit: usize,
@@ -1609,7 +1609,8 @@ pub(super) fn list(
     let Some(repo_files) = collect_repo_files(state, &mut budget)? else {
         return Ok(None);
     };
-    let Some(mut sources) = collect_sources(records.iter(), state, &repo_files, &mut budget)?
+    let Some(mut sources) =
+        collect_sources(records.package_records(), state, &repo_files, &mut budget)?
     else {
         return Ok(None);
     };
@@ -1669,7 +1670,7 @@ pub(super) fn list(
 }
 
 pub(super) fn show(
-    records: &[PackageRecord],
+    records: &crate::packages::PackageRegistry,
     state: &HubState,
     target_id: &str,
     session_type_id: &str,
@@ -1682,7 +1683,8 @@ pub(super) fn show(
     let Some(repo_files) = collect_repo_files(state, &mut budget)? else {
         return Ok(None);
     };
-    let Some(mut sources) = collect_sources(records.iter(), state, &repo_files, &mut budget)?
+    let Some(mut sources) =
+        collect_sources(records.package_records(), state, &repo_files, &mut budget)?
     else {
         return Ok(None);
     };

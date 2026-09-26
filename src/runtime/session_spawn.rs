@@ -303,7 +303,7 @@ impl HubRuntime {
             return Err("plugin package lacks session_type_spawn capability".to_string());
         }
 
-        let records = pending.package_records.iter().collect::<Vec<_>>();
+        let records = pending.package_records.packages();
         let state = self.state();
         let mut materialized = materialize_session_type(
             &self.config,
