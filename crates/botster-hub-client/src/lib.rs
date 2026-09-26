@@ -1470,43 +1470,38 @@ fn with_handshake_deadlines<T>(
     read_timeout: Option<Duration>,
     op: impl FnOnce(&mut UnixStream) -> DaemonTransportResult<T>,
 ) -> DaemonTransportResult<T> {
-    // `None` from these helpers means the peer already closed the socket:
-    // there is nothing to bound and nothing to restore, and the operation
-    // reads what the peer left before the close.
-    let previous_write = socket_option(stream.write_timeout())?;
-    let previous_read = socket_option(stream.read_timeout())?;
+    let previous_write = stream.write_timeout().map_err(normalize_socket_io_error)?;
+    let previous_read = stream.read_timeout().map_err(normalize_socket_io_error)?;
     if let Some(timeout) = write_timeout {
-        socket_option(stream.set_write_timeout(Some(timeout.max(Duration::from_millis(1)))))?;
+        set_timeout(stream.set_write_timeout(Some(timeout.max(Duration::from_millis(1)))))?;
     }
     if let Some(timeout) = read_timeout {
-        socket_option(stream.set_read_timeout(Some(timeout.max(Duration::from_millis(1)))))?;
+        set_timeout(stream.set_read_timeout(Some(timeout.max(Duration::from_millis(1)))))?;
     }
     let result = op(stream);
-    let restore_write = previous_write.map(|previous| stream.set_write_timeout(previous));
-    let restore_read = previous_read.map(|previous| stream.set_read_timeout(previous));
-    match result {
-        Ok(value) => {
-            if let Some(restore) = restore_write {
-                socket_option(restore)?;
-            }
-            if let Some(restore) = restore_read {
-                socket_option(restore)?;
-            }
-            Ok(value)
-        }
-        Err(error) => Err(error),
-    }
+    let restore_write = stream.set_write_timeout(previous_write);
+    let restore_read = stream.set_read_timeout(previous_read);
+    let value = result?;
+    set_timeout(restore_write)?;
+    set_timeout(restore_read)?;
+    Ok(value)
 }
 
-/// A socket-option call on a socket whose peer already closed it: macOS
-/// answers `getsockopt`/`setsockopt` with EINVAL there. The daemon closes an
-/// over-capacity connection right after its typed admission Hello, so that
-/// case is `Ok(None)`; the next read or write of the stream reports the
-/// close. Any other failure is an error.
-fn socket_option<T>(result: std::io::Result<T>) -> DaemonTransportResult<Option<T>> {
+/// A timeout setter on a socket whose peer already closed it. On macOS,
+/// `setsockopt` answers EINVAL there, for any timeout; the getters still
+/// succeed. The daemon closes an over-capacity connection right after its
+/// typed admission Hello, so a setter failing that way is not an error: a
+/// read or write of that stream cannot block, and it reports the close.
+/// On other platforms, and for any other failure, the setter's error stands.
+fn set_timeout(result: std::io::Result<()>) -> DaemonTransportResult<()> {
     match result {
-        Ok(value) => Ok(Some(value)),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(None),
+        Ok(()) => Ok(()),
+        Err(error)
+            if cfg!(target_vendor = "apple")
+                && error.kind() == std::io::ErrorKind::InvalidInput =>
+        {
+            Ok(())
+        }
         Err(error) => Err(normalize_socket_io_error(error)),
     }
 }
@@ -1517,7 +1512,8 @@ mod handshake_deadline_tests {
 
     /// The daemon answers an over-capacity client with a typed admission
     /// Hello and closes the socket. The handshake result must survive the
-    /// deadline restore on that closed socket (EINVAL on macOS).
+    /// deadline setup and restore on that closed socket (setsockopt answers
+    /// EINVAL there on macOS).
     #[test]
     fn handshake_result_survives_deadline_restore_after_peer_close() {
         let (mut client, mut server) = UnixStream::pair().expect("pair");
