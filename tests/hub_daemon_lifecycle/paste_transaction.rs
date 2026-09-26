@@ -68,6 +68,16 @@ fn paste_sink_command(sink: &Path, ready: &str, done: &str) -> String {
     )
 }
 
+/// The raw sink, gated on one input byte. A WebRTC route exists only after
+/// its channel binds, so the ready marker must follow an input sent through
+/// that route to arrive as live output rather than attach history.
+fn paste_sink_command_after_go(sink: &Path, ready: &str, done: &str) -> String {
+    format!(
+        "stty raw -echo; head -c 1 > /dev/null; printf '{ready}'; head -c {LIVE_PASTE_BYTES} > {}; printf '{done}'; sleep 30",
+        sink.display()
+    )
+}
+
 /// One raw terminal frame body carries OUTPUT containing `marker`.
 fn terminal_frame_contains(bytes: &[u8], marker: &str) -> bool {
     botster_terminal_protocol::TerminalFrame::from_bytes(bytes).is_ok_and(|frame| {
@@ -331,7 +341,7 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
                 &key,
                 &botster_hub_client::DaemonRequest::Spawn {
                     session_id: session_id.to_string(),
-                    command: paste_sink_command(&sink, ready, done),
+                    command: paste_sink_command_after_go(&sink, ready, done),
                 },
             )
             .await
@@ -356,6 +366,9 @@ fn webrtc_paste_transaction_delivers_one_result_and_byte_exact_pty_content() {
             .open_reserved_terminal(&key, &label, &webrtc_terminal_adapter_hello())
             .await
             .expect("open reserved terminal channel");
+        peer.send_terminal_input(&key, &label, &terminal_input_frame_bytes(b"g"))
+            .await
+            .expect("release the paste sink through the bound route");
 
         let ready_deadline = Instant::now() + Duration::from_secs(8);
         loop {
