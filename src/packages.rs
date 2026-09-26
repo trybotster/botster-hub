@@ -943,7 +943,13 @@ impl PackageRegistry {
             .manifest
             .capabilities
             .iter()
-            .find(|capability| !self.granted_capabilities.contains(capability))
+            .find(|capability| {
+                !capability_granted(
+                    &self.granted_capabilities,
+                    &record.manifest.name,
+                    capability,
+                )
+            })
             .cloned();
         if let Some(capability) = ungranted_capability {
             return Err(PackageRegistryError::with_record(
@@ -1342,12 +1348,9 @@ impl PackageRegistry {
             });
         }
 
-        if let Some(capability) = record
-            .manifest
-            .capabilities
-            .iter()
-            .find(|capability| !granted_capabilities.contains(capability))
-        {
+        if let Some(capability) = record.manifest.capabilities.iter().find(|capability| {
+            !capability_granted(granted_capabilities, &record.manifest.name, capability)
+        }) {
             return Err(PackageRegistrySnapshotError::CapabilityAdmission {
                 package_name: record.manifest.name.clone(),
                 reason: PackageAdmissionReason::UngrantedCapability(capability.clone()),
@@ -1394,6 +1397,22 @@ impl PackageRegistry {
             )
         })
     }
+}
+
+/// Decide whether host policy grants one requested capability to a package.
+///
+/// Admission and durable snapshot reconstruction both use this helper. A
+/// package may always hold `plugin_db` scoped to its own name, and never
+/// another package's; every other capability must be in the host grants.
+fn capability_granted(
+    granted: &CapabilitySet,
+    package_name: &str,
+    capability: &Capability,
+) -> bool {
+    if capability.surface == CapabilitySurface::PluginDb {
+        return capability.scope.as_deref() == Some(package_name);
+    }
+    granted.contains(capability)
 }
 
 fn provider_ids_for_record(record: &PackageRecord) -> Vec<String> {
@@ -4557,57 +4576,59 @@ mod tests {
     }
 
     #[test]
-    fn default_package_policy_admits_botster_workspaces_plugin_db_namespace() {
-        let requested = capability(CapabilitySurface::PluginDb, Some("botster-workspaces"));
-        let mut policy = default_package_policy();
-
-        policy
-            .install(
-                plugin_manifest("botster-workspaces", vec![requested.clone()]),
-                provenance(),
-                "install botster workspaces",
-            )
-            .expect("install botster-workspaces package");
-
-        let decision = policy
-            .enable("botster-workspaces", "enable botster workspaces")
-            .expect("enable botster-workspaces package");
-
-        assert_eq!(decision.state, PackageState::Enabled);
-        assert_eq!(
+    fn default_package_policy_admits_any_package_own_plugin_db_namespace() {
+        for package_name in ["botster-workspaces", "ordinary.plugin"] {
+            let requested = capability(CapabilitySurface::PluginDb, Some(package_name));
+            let mut policy = default_package_policy();
             policy
-                .registry()
-                .package("botster-workspaces")
-                .expect("botster-workspaces record")
-                .admitted_capabilities,
-            vec![requested]
-        );
+                .install(
+                    plugin_manifest(package_name, vec![requested.clone()]),
+                    provenance(),
+                    "install plugin_db package",
+                )
+                .expect("install plugin_db package");
+
+            let decision = policy
+                .enable(package_name, "enable plugin_db package")
+                .expect("a package may hold its own plugin_db namespace");
+
+            assert_eq!(decision.state, PackageState::Enabled);
+            assert_eq!(
+                policy
+                    .registry()
+                    .package(package_name)
+                    .expect("plugin_db package record")
+                    .admitted_capabilities,
+                vec![requested]
+            );
+        }
     }
 
     #[test]
-    fn default_package_policy_denies_botster_workspaces_mismatched_plugin_db_namespace() {
-        let requested = capability(CapabilitySurface::PluginDb, Some("other-plugin"));
-        let mut policy = default_package_policy();
+    fn default_package_policy_denies_a_foreign_plugin_db_namespace() {
+        for foreign in ["other-plugin", "project-pipelines"] {
+            let requested = capability(CapabilitySurface::PluginDb, Some(foreign));
+            let mut policy = default_package_policy();
+            policy
+                .install(
+                    plugin_manifest("botster-workspaces", vec![requested.clone()]),
+                    provenance(),
+                    "install mismatched plugin_db package",
+                )
+                .expect("install mismatched plugin_db package");
 
-        policy
-            .install(
-                plugin_manifest("botster-workspaces", vec![requested.clone()]),
-                provenance(),
-                "install mismatched botster workspaces",
-            )
-            .expect("install mismatched botster-workspaces package");
+            let error = policy
+                .enable("botster-workspaces", "enable mismatched plugin_db package")
+                .expect_err("a foreign plugin_db namespace must be denied");
 
-        let error = policy
-            .enable("botster-workspaces", "enable mismatched botster workspaces")
-            .expect_err("mismatched plugin_db namespace should deny");
-
-        assert_eq!(error.package_name, "botster-workspaces");
-        assert_eq!(error.action, PackageAction::Enable);
-        assert_eq!(
-            error.reason,
-            PackageAdmissionReason::UngrantedCapability(requested)
-        );
-        assert_eq!(error.state, Some(PackageState::Installed));
+            assert_eq!(error.package_name, "botster-workspaces");
+            assert_eq!(error.action, PackageAction::Enable);
+            assert_eq!(
+                error.reason,
+                PackageAdmissionReason::UngrantedCapability(requested)
+            );
+            assert_eq!(error.state, Some(PackageState::Installed));
+        }
     }
 
     #[test]
