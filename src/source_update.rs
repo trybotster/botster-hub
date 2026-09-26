@@ -36,9 +36,12 @@ impl UpdateHandoff {
     }
 }
 
+/// `source_root` is the root the local user fixed at daemon start; `None`
+/// leaves the updater on its development default. The updater validates it.
 pub(crate) fn start_update_handoff(
     data_directory: &Path,
     scope: DaemonHubUpdateScope,
+    source_root: Option<&Path>,
 ) -> Result<(DaemonHubUpdateExecution, UpdateHandoff), String> {
     if let Some(active) = current_update_execution(data_directory)?
         && matches!(
@@ -68,7 +71,11 @@ pub(crate) fn start_update_handoff(
         .arg("--data-dir")
         .arg(data_directory)
         .arg("--update-id")
-        .arg(&update_id)
+        .arg(&update_id);
+    if let Some(source_root) = source_root {
+        command.arg("--source").arg(source_root);
+    }
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -322,7 +329,7 @@ mod tests {
             error: None,
         };
         write_update_execution(&root, &execution).unwrap();
-        let error = start_update_handoff(&root, DaemonHubUpdateScope::Core)
+        let error = start_update_handoff(&root, DaemonHubUpdateScope::Core, None)
             .err()
             .expect("a live updater must block a second start");
         assert!(error.contains("already active"), "{error}");
