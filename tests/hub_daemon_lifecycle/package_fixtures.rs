@@ -284,6 +284,16 @@ return botster.register({{
       end,
     }},
     {{
+      name = "{tool_prefix}.list",
+      description = "List target-effective templates only.",
+      handler = "list",
+      call = function(args)
+        return {{
+          list = botster.capabilities.session_types.list({{ target_id = args.target_id }}),
+        }}
+      end,
+    }},
+    {{
       name = "{tool_prefix}.inspect",
       description = "Inspect target-effective templates contributed by another package.",
       handler = "inspect",
