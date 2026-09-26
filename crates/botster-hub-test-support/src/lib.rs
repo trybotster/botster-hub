@@ -6859,8 +6859,9 @@ exit 42
         );
 
         let error = IsolatedHubBuilder::new()
-            .hub_bin(hub)
-            .session_worker_bin(worker)
+            .hub_bin(&hub)
+            .session_worker_bin(&worker)
+            .manifest(fixture_manifest(&hub, &worker))
             .root(&root)
             .ready_timeout(Duration::from_secs(2))
             .start_error();
@@ -6895,8 +6896,9 @@ done
         let hub = executable_script(&root, "botster-hub", &script);
 
         let error = IsolatedHubBuilder::new()
-            .hub_bin(hub)
-            .session_worker_bin(worker)
+            .hub_bin(&hub)
+            .session_worker_bin(&worker)
+            .manifest(fixture_manifest(&hub, &worker))
             .root(&root)
             .ready_timeout(Duration::from_secs(2))
             .start_error();
@@ -7695,8 +7697,9 @@ os.wait()
             set_isolated_hub_start_token(token);
             bypass_isolated_hub_start_guard(true);
             let started = IsolatedHubBuilder::new()
-                .hub_bin(hub_bin)
-                .session_worker_bin(worker)
+                .hub_bin(&hub_bin)
+                .session_worker_bin(&worker)
+                .manifest(fixture_manifest(&hub_bin, &worker))
                 .root(&start_root)
                 .working_directory(&start_root)
                 .ready_timeout(Duration::from_millis(200))
@@ -7747,8 +7750,9 @@ os.wait()
             set_isolated_hub_start_token(sibling_token);
             bypass_isolated_hub_start_guard(true);
             let started = IsolatedHubBuilder::new()
-                .hub_bin(sibling_hub)
-                .session_worker_bin(sibling_worker)
+                .hub_bin(&sibling_hub)
+                .session_worker_bin(&sibling_worker)
+                .manifest(fixture_manifest(&sibling_hub, &sibling_worker))
                 .root(&sibling_start_root)
                 .working_directory(&sibling_start_root)
                 .ready_timeout(Duration::from_millis(200))
@@ -7873,9 +7877,45 @@ os.wait()
         }
     }
 
+    /// A candidate manifest that authenticates exactly these fake binaries,
+    /// so a test never inherits the ambient BOTSTER_CANDIDATE_MANIFEST.
+    fn fixture_manifest(hub: &Path, worker: &Path) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let artifact = |path: &Path, name: &str| {
+            let bytes = fs::read(path).expect("read fake binary");
+            serde_json::json!({
+                "name": name,
+                "size": bytes.len(),
+                "sha256": format!("{:x}", Sha256::digest(&bytes)),
+            })
+        };
+        let manifest = serde_json::json!({
+            "source_revisions": {
+                "botster_hub": "0123456789abcdef0123456789abcdef01234567",
+                "botster_core": "89abcdef0123456789abcdef0123456789abcdef"
+            },
+            "artifacts": [
+                artifact(hub, "botster-hub"),
+                artifact(worker, "botster-session-worker"),
+            ]
+        });
+        let path = hub
+            .parent()
+            .expect("fake hub has a parent directory")
+            .join("fixture-install-manifest.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize fixture manifest"),
+        )
+        .expect("write fixture manifest");
+        path
+    }
+
     fn existing_file(root: &Path, name: &str) -> PathBuf {
         let path = root.join(name);
-        fs::write(&path, b"").expect("write fake binary placeholder");
+        // Non-empty, so a fixture manifest can authenticate it (a candidate
+        // artifact must have a positive size).
+        fs::write(&path, b"fake binary placeholder\n").expect("write fake binary placeholder");
         path
     }
 
