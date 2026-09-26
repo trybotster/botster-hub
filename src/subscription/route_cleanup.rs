@@ -126,6 +126,16 @@ fn cleanup_core_turn(
             });
             let foreign_core_owner =
                 owner.is_some_and(|(client, _)| client.0 != candidate.core_client_id);
+            if crate::transport::webrtc::adapter::diagr(&candidate.subscription_id) {
+                crate::transport::webrtc::adapter::diagr_log(format_args!(
+                    "route_cleanup candidate session={} sub={} client={} gen={:?} owner={:?}",
+                    candidate.session_id,
+                    candidate.subscription_id,
+                    candidate.core_client_id,
+                    generation.map(|g| g.0),
+                    owner.map(|(client, generation)| (client.0.clone(), generation.0))
+                ));
+            }
             let outcome = match generation {
                 None if foreign_core_owner => CleanupRouteOutcome::Foreign,
                 None => CleanupRouteOutcome::NoGeneration,

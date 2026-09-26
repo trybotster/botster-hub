@@ -4449,6 +4449,7 @@ impl HubRuntime {
         subscription_id: SubscriptionId,
         now_seconds: u64,
     ) -> CoreTicket<Result<(), CoreDaemonError>> {
+        diagr_detach("detach_client", &session_id, &subscription_id, None);
         self.core_daemon.submit(move |daemon| {
             daemon.detach(client_id, session_id, subscription_id, now_seconds)
         })
@@ -4604,6 +4605,12 @@ impl HubRuntime {
         generation: Option<TerminalSubscriptionGeneration>,
         now_seconds: u64,
     ) -> CoreTicket<Result<(), CoreDaemonError>> {
+        diagr_detach(
+            "detach_route_exact_or_owned",
+            &session_id,
+            &subscription_id,
+            generation,
+        );
         self.core_daemon.submit(move |daemon| match generation {
             Some(generation) => daemon
                 .detach_terminal_subscription(
@@ -4627,6 +4634,12 @@ impl HubRuntime {
         generation: Option<TerminalSubscriptionGeneration>,
         now_seconds: u64,
     ) -> CoreTicket<Result<(), CoreDaemonError>> {
+        diagr_detach(
+            "detach_route_exact_or_owned_for_owner",
+            &session_id,
+            &subscription_id,
+            generation,
+        );
         self.core_daemon
             .submit_for_owner(waiter_id, move |daemon| match generation {
                 Some(generation) => daemon
@@ -4651,6 +4664,12 @@ impl HubRuntime {
         generation: TerminalSubscriptionGeneration,
         now_seconds: u64,
     ) -> CoreTicket<Result<DetachTerminalSubscriptionResult, CoreDaemonError>> {
+        diagr_detach(
+            "detach_terminal_subscription",
+            &session_id,
+            &subscription_id,
+            Some(generation),
+        );
         self.core_daemon.submit(move |daemon| {
             daemon.detach_terminal_subscription(
                 client_id,
@@ -6634,6 +6653,16 @@ pub(crate) fn attach_route_on_core(
         let _ = daemon.detach(client_id, session_id, subscription_id, now_seconds);
         return Err(AttachBindFailure::MissingGeneration);
     };
+    if crate::transport::webrtc::adapter::diagr(&subscription_id.0) {
+        crate::transport::webrtc::adapter::diagr_log(format_args!(
+            "core attach ok session={} sub={} gen={} client={} replaced_previous={:?}",
+            session_id.0,
+            subscription_id.0,
+            generation.0,
+            client_id.0,
+            previous.map(|g| g.0)
+        ));
+    }
     Ok(generation)
 }
 
@@ -6658,6 +6687,12 @@ pub(crate) fn bind_route_on_core(
         capabilities,
         adapter,
     ) {
+        if crate::transport::webrtc::adapter::diagr(&subscription_id.0) {
+            crate::transport::webrtc::adapter::diagr_log(format_args!(
+                "core bind error sub={} gen={} client={} error={error:?}",
+                subscription_id.0, generation.0, client_id.0
+            ));
+        }
         let _ = daemon.detach_terminal_subscription(
             client_id,
             session_id,
@@ -6668,6 +6703,30 @@ pub(crate) fn bind_route_on_core(
         return Err(AttachBindFailure::Bind(error));
     }
     Ok(())
+}
+
+// DIAGNOSTIC restart-route (not for commit).
+fn diagr_detach(
+    kind: &str,
+    session_id: &SessionId,
+    subscription_id: &SubscriptionId,
+    generation: Option<TerminalSubscriptionGeneration>,
+) {
+    if crate::transport::webrtc::adapter::diagr(&subscription_id.0) {
+        let trace = std::backtrace::Backtrace::force_capture().to_string();
+        let frames = trace
+            .lines()
+            .filter(|line| line.contains("botster_hub::") && !line.contains("diagr"))
+            .take(14)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        crate::transport::webrtc::adapter::diagr_log(format_args!(
+            "hub detach {kind} session={} sub={} gen={:?} from: {frames}",
+            session_id.0,
+            subscription_id.0,
+            generation.map(|g| g.0)
+        ));
+    }
 }
 
 impl HubRuntime {
