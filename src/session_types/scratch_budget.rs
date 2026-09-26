@@ -18,6 +18,7 @@
 //! - Clear at the start of an ignored value.
 //! - Append one frame byte for each container nested inside that ignored value.
 //! - Pop frames as the decoder closes those containers.
+//!
 //! Unknown-field keys still use parse_str. The ignore_str operation copies nothing.
 //! The recursion limit does not bound ignored nesting. The caller must derive
 //! actual depth from input and fund growth before allocation, without a new limit.

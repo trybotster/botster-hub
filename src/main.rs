@@ -15,7 +15,7 @@ use botster_core::{
 use botster_hub::{
     DaemonApp, DaemonCompatibility, DaemonEvent, DaemonOperatorError, DaemonPackage,
     DaemonPackageActionStatus, DaemonPackagePin, DaemonRequest, DaemonResponse, DaemonResponseKind,
-    DaemonSession, DaemonSpawnTarget, DaemonStatus, DaemonWorktree, DataDirectoryOption, HubDaemon,
+    DaemonSession, DaemonSpawnTarget, DaemonStatus, DaemonWorktree, DataDirectoryOption,
     HubDaemonState, HubRuntime, HubStartupOptions, HubStateLoadSource, RuntimeEnvironment,
     SessionDefaults, TransportBindings, daemon_transport_request,
     daemon_transport_request_for_doctor, host_profile, installation_identity, serve_daemon,

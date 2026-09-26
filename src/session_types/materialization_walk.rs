@@ -155,7 +155,7 @@ impl<'input> Cursor<'input> {
             return None;
         }
         if (0xd800..=0xdbff).contains(&first) {
-            for expected in [b'\\', b'u'] {
+            for expected in *b"\\u" {
                 let actual = self.input.get(self.offset).copied();
                 if actual.is_some() {
                     self.offset += 1;

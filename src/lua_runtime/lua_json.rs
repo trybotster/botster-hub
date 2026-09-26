@@ -269,7 +269,7 @@ impl Scratch {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) enum KeyFail {
+pub(crate) enum KeyFail {
     Integer(i64),
     Number(f64),
     Boolean(bool),
@@ -281,7 +281,7 @@ pub(super) enum KeyFail {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) enum JsonProblem {
+pub(crate) enum JsonProblem {
     Deserialize(&'static str),
     Runtime(&'static str),
     Key(KeyFail),

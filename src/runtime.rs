@@ -213,7 +213,7 @@ enum PendingTestEvent {
 type SharedCoreDaemon = crate::data_plane::driver::CoreDaemonHandle;
 type SharedSessionContexts = Arc<Mutex<BTreeMap<String, Arc<StoredSessionContext>>>>;
 
-struct StoredSessionContext {
+pub(crate) struct StoredSessionContext {
     identity: botster_core::SessionReservationIdentity,
     context: HubSessionContext,
     // Both aliases share this owner. Reads need their own response allowance.
@@ -1964,41 +1964,32 @@ impl HubRuntime {
                     match finished {
                         CoreTicketPoll::Pending => index += 1,
                         CoreTicketPoll::Ready(result) => {
-                            if let InflightPluginCore::Coordination { response, .. } =
-                                inflight.swap_remove(index)
-                            {
-                                let _ = response.send(result);
-                            }
+                            let InflightPluginCore::Coordination { response, .. } =
+                                inflight.swap_remove(index);
+                            let _ = response.send(result);
                         }
                         CoreTicketPoll::Lost => {
-                            if let InflightPluginCore::Coordination { response, .. } =
-                                inflight.swap_remove(index)
-                            {
-                                let _ = response.send(
-                                    crate::lua_runtime::CoordinationDelivery::Refused(
-                                        crate::lua_runtime::CoordinationRefusal::HelperStopped,
-                                    ),
-                                );
-                            }
+                            let InflightPluginCore::Coordination { response, .. } =
+                                inflight.swap_remove(index);
+                            let _ =
+                                response.send(crate::lua_runtime::CoordinationDelivery::Refused(
+                                    crate::lua_runtime::CoordinationRefusal::HelperStopped,
+                                ));
                         }
                         CoreTicketPoll::Refused => {
-                            if let InflightPluginCore::Coordination {
+                            let InflightPluginCore::Coordination {
                                 response, rejected, ..
-                            } = inflight.swap_remove(index)
-                            {
-                                let refusal = if rejected.as_ref().is_some_and(|rejected| {
-                                    rejected.reason
-                                        == crate::data_plane::driver::CoreRefusal::Stopped
-                                }) {
-                                    crate::lua_runtime::CoordinationRefusal::HelperStopped
-                                } else {
-                                    crate::lua_runtime::CoordinationRefusal::HelperFull
-                                };
-                                drop(rejected);
-                                let _ = response.send(
-                                    crate::lua_runtime::CoordinationDelivery::Refused(refusal),
-                                );
-                            }
+                            } = inflight.swap_remove(index);
+                            let refusal = if rejected.as_ref().is_some_and(|rejected| {
+                                rejected.reason == crate::data_plane::driver::CoreRefusal::Stopped
+                            }) {
+                                crate::lua_runtime::CoordinationRefusal::HelperStopped
+                            } else {
+                                crate::lua_runtime::CoordinationRefusal::HelperFull
+                            };
+                            drop(rejected);
+                            let _ = response
+                                .send(crate::lua_runtime::CoordinationDelivery::Refused(refusal));
                         }
                     }
                 }
@@ -3516,17 +3507,17 @@ impl HubRuntime {
             client_id,
         )?;
         let mut invocation = self.select_plugin_entity_snapshot(&plan.expected)?;
-        if let Some((scope_id, invocation_token)) = invocation.causal_lease {
-            if !self.causal_scopes.acquire_with_admission(
+        if let Some((scope_id, invocation_token)) = invocation.causal_lease
+            && !self.causal_scopes.acquire_with_admission(
                 scope_id,
                 LeaseIdentity::ProviderInFlight { invocation_token },
                 invocation.admission.clone(),
-            ) {
-                return Err(crate::McpToolError::new(
-                    "causal_scope_busy",
-                    "could not acquire provider causal lease",
-                ));
-            }
+            )
+        {
+            return Err(crate::McpToolError::new(
+                "causal_scope_busy",
+                "could not acquire provider causal lease",
+            ));
         }
         invocation.lease_acquired = true;
         plan.request.context.metadata = invocation
@@ -3621,13 +3612,13 @@ impl HubRuntime {
         expected_entity_kind: &EntityKind,
         result: PluginInvocationResult,
     ) -> Result<(u64, Vec<serde_json::Value>), crate::McpToolError> {
-        if let PluginInvocationResult::Failed(failure) = &result {
-            if failure.kind == PluginInvocationFailureKind::CompletionTooLarge {
-                return Err(crate::McpToolError::new(
-                    "entity_provider_frame_too_large",
-                    &failure.reason,
-                ));
-            }
+        if let PluginInvocationResult::Failed(failure) = &result
+            && failure.kind == PluginInvocationFailureKind::CompletionTooLarge
+        {
+            return Err(crate::McpToolError::new(
+                "entity_provider_frame_too_large",
+                &failure.reason,
+            ));
         }
         let value = completed_plugin_payload(result, "plugin entity provider")?;
         let value = coerce_entity_frame_empty_items(value);
@@ -5387,9 +5378,9 @@ impl HubSessionTypeSpawner {
         }
         let (mut parent, plugin_key, session_type_id, request) = input.into_parts();
         let bytes = crate::lua_memory::layout::single_reply_bytes::<AdmittedSpawnDelivery>(true)
-            .ok_or_else(|| {
-                std::borrow::Cow::Borrowed(crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED)
-            })?;
+            .ok_or(std::borrow::Cow::Borrowed(
+                crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED,
+            ))?;
         parent.grow(bytes).map_err(|_| {
             std::borrow::Cow::Borrowed(crate::lua_memory::LUA_CALLBACK_CAPACITY_EXHAUSTED)
         })?;
@@ -6307,91 +6298,97 @@ impl ManagedSessionSpawnStart {
                 PluginSpawnStage::RetryRetained => {
                     return spawn_fail(CoreDaemonError::Shutdown, None);
                 }
-                PluginSpawnStage::Reserve => match {
-                    let result = self.tracker.poll(runtime);
+                PluginSpawnStage::Reserve => {
+                    let polled = self.tracker.poll(runtime);
                     // Poll can accept begin and lose completion in the same call.
                     self.reserve_operation_id = self.tracker.accepted_id();
-                    result
-                } {
-                    CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
-                    CoreTicketPoll::Refused => {
-                        return spawn_fail(core_bridge_error(CoreTicketError::Overloaded), None);
-                    }
-                    CoreTicketPoll::Lost => {
-                        let Some(reserve_id) = self.reserve_operation_id else {
-                            return spawn_fail(CoreDaemonError::Shutdown, None);
-                        };
-                        self.tracker = runtime.begin_lookup_session_reservation_for_owner(
-                            self.waiter_id,
-                            self.spawn.request.session_id.clone(),
-                            reserve_id,
-                        );
-                        self.stage = PluginSpawnStage::Lookup;
-                    }
-                    CoreTicketPoll::Ready(Err(error)) => {
-                        return spawn_fail(error, None);
-                    }
-                    CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
-                        result, ..
-                    })) => match result {
-                        Ok(reserved) => {
-                            self.reservation = Some(reserved.clone());
-                            // Register before SpawnReserved so any later
-                            // removal of this id finds the record. A record
-                            // that already exists means a lost release
-                            // obligation: do not spawn; release this token.
-                            if let Some(charge) = self.record_charge.take()
-                                && runtime
-                                    .session_reservations()
-                                    .register(charge, reserved.identity())
-                                    .is_err()
-                            {
-                                eprintln!(
-                                    "session reservation record invariant failed for {}",
-                                    self.spawn.request.session_id.0
-                                );
-                                self.spawn_error = Some(CoreDaemonError::SessionReservation(
-                                    SessionReservationRefusal::Occupied,
-                                ));
-                                self.release_or_retain(runtime);
-                                continue;
-                            }
-                            let context_charge = self
-                                .context
-                                .as_ref()
-                                .and_then(stored_context_bytes)
-                                .and_then(|bytes| match parent.as_mut() {
-                                    Some(parent) => {
-                                        parent.grow(bytes).ok()?;
-                                        parent.split_fixed(bytes)
-                                    }
-                                    None => runtime.lua_memory.reserve_callback_total(bytes).ok(),
-                                });
-                            let published = context_charge.ok_or(()).and_then(|charge| {
-                                let context = self.context.take().ok_or(())?;
-                                runtime
-                                    .publish_spawn_context(context, &reserved, charge)
-                                    .map_err(|_| ())
-                            });
-                            if published.is_err() {
-                                self.spawn_error = Some(CoreDaemonError::Shutdown);
-                                self.release_or_retain(runtime);
-                                continue;
-                            }
-                            self.context_published = true;
-                            self.tracker = runtime.begin_spawn_reserved_for_owner(
-                                self.waiter_id,
-                                reserved,
-                                self.spawn.clone(),
+                    match polled {
+                        CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
+                        CoreTicketPoll::Refused => {
+                            return spawn_fail(
+                                core_bridge_error(CoreTicketError::Overloaded),
+                                None,
                             );
-                            self.stage = PluginSpawnStage::SpawnReserved;
                         }
-                        Err(error) => return spawn_fail(error, None),
-                    },
-                    CoreTicketPoll::Ready(Ok(_)) => {
-                        return spawn_fail(CoreDaemonError::Shutdown, None);
+                        CoreTicketPoll::Lost => {
+                            let Some(reserve_id) = self.reserve_operation_id else {
+                                return spawn_fail(CoreDaemonError::Shutdown, None);
+                            };
+                            self.tracker = runtime.begin_lookup_session_reservation_for_owner(
+                                self.waiter_id,
+                                self.spawn.request.session_id.clone(),
+                                reserve_id,
+                            );
+                            self.stage = PluginSpawnStage::Lookup;
+                        }
+                        CoreTicketPoll::Ready(Err(error)) => {
+                            return spawn_fail(error, None);
+                        }
+                        CoreTicketPoll::Ready(Ok(CoreCompletion::ReserveSession {
+                            result,
+                            ..
+                        })) => match result {
+                            Ok(reserved) => {
+                                self.reservation = Some(reserved.clone());
+                                // Register before SpawnReserved so any later
+                                // removal of this id finds the record. A record
+                                // that already exists means a lost release
+                                // obligation: do not spawn; release this token.
+                                if let Some(charge) = self.record_charge.take()
+                                    && runtime
+                                        .session_reservations()
+                                        .register(charge, reserved.identity())
+                                        .is_err()
+                                {
+                                    eprintln!(
+                                        "session reservation record invariant failed for {}",
+                                        self.spawn.request.session_id.0
+                                    );
+                                    self.spawn_error = Some(CoreDaemonError::SessionReservation(
+                                        SessionReservationRefusal::Occupied,
+                                    ));
+                                    self.release_or_retain(runtime);
+                                    continue;
+                                }
+                                let context_charge = self
+                                    .context
+                                    .as_ref()
+                                    .and_then(stored_context_bytes)
+                                    .and_then(|bytes| match parent.as_mut() {
+                                        Some(parent) => {
+                                            parent.grow(bytes).ok()?;
+                                            parent.split_fixed(bytes)
+                                        }
+                                        None => {
+                                            runtime.lua_memory.reserve_callback_total(bytes).ok()
+                                        }
+                                    });
+                                let published = context_charge.ok_or(()).and_then(|charge| {
+                                    let context = self.context.take().ok_or(())?;
+                                    runtime
+                                        .publish_spawn_context(context, &reserved, charge)
+                                        .map_err(|_| ())
+                                });
+                                if published.is_err() {
+                                    self.spawn_error = Some(CoreDaemonError::Shutdown);
+                                    self.release_or_retain(runtime);
+                                    continue;
+                                }
+                                self.context_published = true;
+                                self.tracker = runtime.begin_spawn_reserved_for_owner(
+                                    self.waiter_id,
+                                    reserved,
+                                    self.spawn.clone(),
+                                );
+                                self.stage = PluginSpawnStage::SpawnReserved;
+                            }
+                            Err(error) => return spawn_fail(error, None),
+                        },
+                        CoreTicketPoll::Ready(Ok(_)) => {
+                            return spawn_fail(CoreDaemonError::Shutdown, None);
+                        }
                     }
-                },
+                }
                 PluginSpawnStage::Lookup => match self.tracker.poll(runtime) {
                     CoreTicketPoll::Pending => return PluginSpawnPoll::Pending,
                     CoreTicketPoll::Refused => {

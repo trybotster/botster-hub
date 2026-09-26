@@ -423,9 +423,9 @@ impl StateDirectoryOwnership {
         FileType::from_raw_mode(current.st_mode) == FileType::Directory
             && FileType::from_raw_mode(retained.st_mode) == FileType::Directory
             && current.st_dev as u64 == self.0.device
-            && current.st_ino as u64 == self.0.inode
+            && current.st_ino == self.0.inode
             && retained.st_dev as u64 == self.0.device
-            && retained.st_ino as u64 == self.0.inode
+            && retained.st_ino == self.0.inode
     }
 
     /// Reject replacement detected before a filesystem operation.

@@ -110,112 +110,110 @@ pub(crate) fn accept_connections(
     accept_connections_with_events(listener, control_tx, shutdown_rx, admission, socket_events)
 }
 
-fn accept_connections_with_events(
+async fn accept_connections_with_events(
     mut listener: TokioUnixListener,
     control_tx: tokio_mpsc::Sender<ControlMessage>,
     mut shutdown_rx: watch::Receiver<bool>,
     admission: Arc<Semaphore>,
     socket_events: Result<SocketPathEvents, String>,
-) -> impl Future<Output = ()> + Send {
-    async move {
-        let watched_path = socket_events
-            .as_ref()
-            .ok()
-            .map(|events| events.path.clone());
-        let mut socket_events = match socket_events {
-            Ok(events) => Some(events),
-            Err(error) => {
-                eprintln!("botster-hub daemon socket watch error: {error}");
-                None
-            }
-        };
-        if let Some(events) = socket_events.as_ref()
-            && events.missing_at_start
-        {
-            rebind_listener(&mut listener, &events.path);
+) {
+    let watched_path = socket_events
+        .as_ref()
+        .ok()
+        .map(|events| events.path.clone());
+    let mut socket_events = match socket_events {
+        Ok(events) => Some(events),
+        Err(error) => {
+            eprintln!("botster-hub daemon socket watch error: {error}");
+            None
         }
+    };
+    if let Some(events) = socket_events.as_ref()
+        && events.missing_at_start
+    {
+        rebind_listener(&mut listener, &events.path);
+    }
 
-        let rejection_admission = Arc::new(Semaphore::new(DAEMON_MAX_REJECTION_TASKS));
-        let mut rejection_tasks = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((stream, _)) => {
-                            match admission.clone().try_acquire_owned() {
-                                Ok(admission_permit) => {
-                                    let cleanup_permit = match control_tx.clone().reserve_owned().await {
-                                        Ok(permit) => permit,
-                                        Err(_) => return,
-                                    };
-                                    if control_tx
-                                        .send(ControlMessage::AcceptedConnection {
-                                            stream,
-                                            admission_permit,
-                                            cleanup_permit,
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                                Err(_) => {
-                                    let permit = tokio::select! {
-                                        permit = rejection_admission.clone().acquire_owned() => {
-                                            permit.expect("rejection semaphore remains owned by accept loop")
-                                        }
-                                        changed = shutdown_rx.changed() => {
-                                            let _ = changed;
-                                            return;
-                                        }
-                                    };
-                                    let rejection_tx = control_tx.clone();
-                                    rejection_tasks.spawn(async move {
-                                        let _permit = permit;
-                                        reject_connection_async(stream).await;
-                                        let _ = rejection_tx
-                                            .send(ControlMessage::RejectedConnection)
-                                            .await;
-                                    });
+    let rejection_admission = Arc::new(Semaphore::new(DAEMON_MAX_REJECTION_TASKS));
+    let mut rejection_tasks = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        match admission.clone().try_acquire_owned() {
+                            Ok(admission_permit) => {
+                                let cleanup_permit = match control_tx.clone().reserve_owned().await {
+                                    Ok(permit) => permit,
+                                    Err(_) => return,
+                                };
+                                if control_tx
+                                    .send(ControlMessage::AcceptedConnection {
+                                        stream,
+                                        admission_permit,
+                                        cleanup_permit,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
                                 }
                             }
+                            Err(_) => {
+                                let permit = tokio::select! {
+                                    permit = rejection_admission.clone().acquire_owned() => {
+                                        permit.expect("rejection semaphore remains owned by accept loop")
+                                    }
+                                    changed = shutdown_rx.changed() => {
+                                        let _ = changed;
+                                        return;
+                                    }
+                                };
+                                let rejection_tx = control_tx.clone();
+                                rejection_tasks.spawn(async move {
+                                    let _permit = permit;
+                                    reject_connection_async(stream).await;
+                                    let _ = rejection_tx
+                                        .send(ControlMessage::RejectedConnection)
+                                        .await;
+                                });
+                            }
                         }
-                        Err(error) => {
-                            eprintln!("botster-hub daemon accept error: {error}");
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
+                    }
+                    Err(error) => {
+                        eprintln!("botster-hub daemon accept error: {error}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
-                event = async {
-                    match socket_events.as_mut() {
-                        Some(events) => events.events.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match event {
-                        Some(Err(error)) => {
-                            eprintln!("botster-hub daemon socket watch error: {error}");
-                        }
-                        None => {
-                            eprintln!("botster-hub daemon socket watch stopped");
-                            socket_events = None;
-                            continue;
-                        }
-                        Some(Ok(_)) => {}
-                    }
-                    if let Some(path) = watched_path.as_ref() {
-                        rebind_listener(&mut listener, path);
-                    }
+            }
+            event = async {
+                match socket_events.as_mut() {
+                    Some(events) => events.events.recv().await,
+                    None => std::future::pending().await,
                 }
-                changed = shutdown_rx.changed() => {
-                    let _ = changed;
-                    return;
-                }
-                result = rejection_tasks.join_next(), if !rejection_tasks.is_empty() => {
-                    if let Some(Err(error)) = result {
-                        eprintln!("botster-hub daemon rejection task error: {error}");
+            } => {
+                match event {
+                    Some(Err(error)) => {
+                        eprintln!("botster-hub daemon socket watch error: {error}");
                     }
+                    None => {
+                        eprintln!("botster-hub daemon socket watch stopped");
+                        socket_events = None;
+                        continue;
+                    }
+                    Some(Ok(_)) => {}
+                }
+                if let Some(path) = watched_path.as_ref() {
+                    rebind_listener(&mut listener, path);
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                return;
+            }
+            result = rejection_tasks.join_next(), if !rejection_tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    eprintln!("botster-hub daemon rejection task error: {error}");
                 }
             }
         }

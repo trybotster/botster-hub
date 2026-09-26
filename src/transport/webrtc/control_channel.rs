@@ -577,10 +577,10 @@ where
             peer_state,
         )
         .await;
-        if delivery.is_ok() {
-            if let Some(receipt) = delivery_receipt {
-                receipt.delivered();
-            }
+        if delivery.is_ok()
+            && let Some(receipt) = delivery_receipt
+        {
+            receipt.delivered();
         }
         if let Some(response_delivery_tx) = response_delivery_tx {
             let _ = response_delivery_tx.send(());

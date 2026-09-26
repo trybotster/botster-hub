@@ -226,20 +226,20 @@ pub(crate) fn dispose_terminal_recovery(
             waiter_id,
             phase: 0,
         });
-        if let HostRecoveryRequired::Terminal(terminal) = &mut recovery {
-            if let crate::host_disposal::Poll::Disposed(permit) = terminal.job.poll() {
-                if let Some(family) = terminal.family.as_mut() {
-                    assert!(
-                        family.retire_terminal(runtime),
-                        "disposal precedes causal retirement"
-                    );
-                }
-                drop(permit);
-                if let Some(permit) = terminal.owner_permit.take() {
-                    state.budget.release(permit);
-                }
-                continue;
+        if let HostRecoveryRequired::Terminal(terminal) = &mut recovery
+            && let crate::host_disposal::Poll::Disposed(permit) = terminal.job.poll()
+        {
+            if let Some(family) = terminal.family.as_mut() {
+                assert!(
+                    family.retire_terminal(runtime),
+                    "disposal precedes causal retirement"
+                );
             }
+            drop(permit);
+            if let Some(permit) = terminal.owner_permit.take() {
+                state.budget.release(permit);
+            }
+            continue;
         }
         state.host_recovery.insert(waiter_id, recovery);
     }
@@ -500,10 +500,10 @@ impl HostMutationContinuation {
     }
 
     pub(crate) fn retire_terminal(&mut self, runtime: &crate::HubRuntime) -> bool {
-        if let Some(family) = self.family_work.as_mut() {
-            if !family.retire_terminal(runtime) {
-                return false;
-            }
+        if let Some(family) = self.family_work.as_mut()
+            && !family.retire_terminal(runtime)
+        {
+            return false;
         }
         self.family_work.take();
         true

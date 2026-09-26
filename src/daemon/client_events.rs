@@ -333,14 +333,14 @@ pub(crate) fn drive_ready(
                 connection.closed = done.closed;
                 connection.submitted = false;
                 drop(completion);
-                if connection.closed {
-                    if let Some(disconnect_waiter) = connection.disconnect_waiter.take() {
-                        crate::daemon::owner_budget::mark_obligation_ready(
-                            state,
-                            disconnect_waiter,
-                            crate::daemon::control::pending::READY_HOST_COMPLETION,
-                        );
-                    }
+                if connection.closed
+                    && let Some(disconnect_waiter) = connection.disconnect_waiter.take()
+                {
+                    crate::daemon::owner_budget::mark_obligation_ready(
+                        state,
+                        disconnect_waiter,
+                        crate::daemon::control::pending::READY_HOST_COMPLETION,
+                    );
                 }
             }
             _ => {

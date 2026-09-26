@@ -56,11 +56,10 @@ impl FamilyWork {
             let (identity, value, permit) = completion.into_parts();
             result = Some(value);
             (identity, permit)
-        } else if let Some(submission) = self.submission.take() {
+        } else {
+            let submission = self.submission.take()?;
             command = Some(submission.command);
             (submission.identity, submission.permit)
-        } else {
-            return None;
         };
         Some(crate::host_disposal::Parts {
             storage: None,

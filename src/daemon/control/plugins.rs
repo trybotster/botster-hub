@@ -240,12 +240,11 @@ impl PluginControlState {
             .pending
             .get(&request_id.0)
             .is_some_and(|entry| entry.identity == *identity)
+            && let Some(entry) = self.pending.remove(&request_id.0)
         {
-            if let Some(entry) = self.pending.remove(&request_id.0) {
-                self.ready_waiters.remove(&entry.waiter_id);
-                self.by_waiter.remove(&entry.waiter_id);
-                self.capacity_waiters.remove(&entry.waiter_id);
-            }
+            self.ready_waiters.remove(&entry.waiter_id);
+            self.by_waiter.remove(&entry.waiter_id);
+            self.capacity_waiters.remove(&entry.waiter_id);
         }
     }
 
