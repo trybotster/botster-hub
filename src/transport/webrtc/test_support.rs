@@ -70,6 +70,8 @@ pub(crate) struct FakeDataChannel {
     pub(crate) usage_closed: AtomicBool,
     pub(crate) usage_fails: AtomicBool,
     pub(crate) usage_notify: tokio::sync::Notify,
+    /// Signalled (with a stored permit) each time a usage query starts.
+    pub(crate) usage_entered_notify: tokio::sync::Notify,
     pub(crate) close_hangs: AtomicBool,
     pub(crate) close_fails: AtomicBool,
     pub(crate) close_started: AtomicBool,
@@ -105,6 +107,7 @@ impl LocalWebrtcDataChannel for FakeDataChannel {
 
     async fn local_outstanding_bytes(&self) -> Result<usize, webrtc::error::Error> {
         self.usage_entered.store(true, Ordering::Release);
+        self.usage_entered_notify.notify_one();
         while self.usage_hangs.load(Ordering::Acquire) {
             let notified = self.usage_notify.notified();
             tokio::pin!(notified);

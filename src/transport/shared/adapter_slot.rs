@@ -251,36 +251,49 @@ impl<W: WakeSink> AdapterSlot<W> {
         }
     }
 
-    /// The occupying routed frame, by `Arc` clones. `None` when empty or closed.
-    pub(crate) fn snapshot_active(&self) -> Option<RoutedTerminalFrame> {
-        if self.is_closed() {
-            match self.slot.try_lock() {
-                Ok(mut slot) => *slot = None,
-                Err(TryLockError::WouldBlock) => {}
-                Err(TryLockError::Poisoned(poisoned)) => {
-                    *poisoned.into_inner() = None;
-                }
+    /// The slot mutex for a transport driver. Core's owner-loop calls
+    /// (`try_write`, `pressure`, `close`) only `try_lock` it and never wait;
+    /// a driver waits, because a lost read or completion here loses or
+    /// repeats a frame. Every holder keeps it for a clone, store, or take
+    /// only, with no other lock and no await. A poisoned slot is closed.
+    fn lock_for_driver(&self) -> Option<std::sync::MutexGuard<'_, Option<RoutedTerminalFrame>>> {
+        match self.slot.lock() {
+            Ok(slot) => Some(slot),
+            Err(poisoned) => {
+                *poisoned.into_inner() = None;
+                self.close();
+                None
             }
-            return None;
-        }
-        match self.slot.try_lock() {
-            Ok(slot) => {
-                if self.is_closed() {
-                    return None;
-                }
-                slot.clone()
-            }
-            Err(_) => None,
         }
     }
 
+    /// Holds the slot mutex as a contending owner-loop call would.
+    #[cfg(test)]
+    pub(crate) fn hold_slot_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<RoutedTerminalFrame>> {
+        self.slot.lock().expect("slot lock")
+    }
+
+    /// The occupying routed frame, by `Arc` clones. `None` when empty or
+    /// closed. Transport drivers only; see [`Self::lock_for_driver`].
+    pub(crate) fn snapshot_active(&self) -> Option<RoutedTerminalFrame> {
+        let mut slot = self.lock_for_driver()?;
+        if self.is_closed() {
+            *slot = None;
+            return None;
+        }
+        slot.clone()
+    }
+
     /// Release the occupying frame after the transport finished its write.
+    /// Transport drivers only; see [`Self::lock_for_driver`].
     pub(crate) fn complete_active(&self) -> Option<RoutedTerminalFrame> {
         if self.is_closed() {
             return None;
         }
-        let taken = match self.slot.try_lock() {
-            Ok(mut slot) => {
+        let taken = match self.lock_for_driver() {
+            Some(mut slot) => {
                 if self.is_closed() {
                     *slot = None;
                     None
@@ -288,7 +301,7 @@ impl<W: WakeSink> AdapterSlot<W> {
                     slot.take()
                 }
             }
-            Err(_) => None,
+            None => None,
         };
         if taken.is_some() {
             self.emit_writable();
