@@ -40,6 +40,20 @@ Supported registration fields:
 Handler ids are stable strings. Hub registries store descriptor bodies and
 handler refs, not Lua closure identities.
 
+Each handler kind requires a manifest capability, and Core refuses to invoke
+a handler whose package did not declare it:
+
+| Handler kind | Required capability |
+| --- | --- |
+| MCP tool, prompt, or resource | `{ "surface": "mcp" }` |
+| `surface_route`, `ui_action` | `{ "surface": "surfaces" }` |
+| `session_action` | `{ "surface": "session_actions" }` |
+| `event`, `entity_provider`, others | none |
+
+A package that registers tools without declaring `mcp` loads, but every call
+of those tools fails with "plugin handler requires a capability missing from
+package metadata".
+
 ## Package-owned entity providers
 
 An enabled package may declare one worker-owned provider for each exact entity
