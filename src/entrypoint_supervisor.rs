@@ -18,7 +18,7 @@ use botster_core::{
 };
 use notify::{RecursiveMode, Watcher};
 
-use crate::process_exit::{process_group_running, wait_for_child_group_exit};
+use crate::process_exit::{PidExitWatch, process_group_running, wait_for_child_group_exit};
 use crate::{PackageRecord, PackageRegistry, PackageRunnableEntrypoint, PackageState};
 
 const OUTPUT_LIMIT_BYTES: usize = 4096;
@@ -116,9 +116,20 @@ impl EntrypointSupervisor {
 
         let launch_result_path = entrypoint_declares_launch_result(entrypoint)
             .then(|| launch_result_path(&key.package_name, &key.entrypoint_id, now_seconds()));
+        let readiness: Option<LaunchReadinessChannel> =
+            launch_result_path.as_ref().map(|_| mpsc::channel());
         let launch_result_watcher = launch_result_path
             .as_ref()
-            .map(|path| watch_launch_result_parent(path))
+            .zip(readiness.as_ref())
+            .map(|(path, (events_tx, events))| {
+                let watcher = watch_launch_result_parent(path, events_tx)?;
+                confirm_watcher_is_live(
+                    path,
+                    events,
+                    Instant::now() + LAUNCH_RESULT_READINESS_BUDGET,
+                )?;
+                Ok(watcher)
+            })
             .transpose()?;
         let command_path = resolve_command(&package_root, entrypoint.command.as_str());
         let working_directory = resolve_working_directory(&package_root, entrypoint)?;
@@ -151,6 +162,14 @@ impl EntrypointSupervisor {
                 return Ok(snapshot);
             }
         };
+        let readiness_deadline = Instant::now() + LAUNCH_RESULT_READINESS_BUDGET;
+        if let Some((events, _)) = &readiness
+            && let Err(error) = notify_child_exit(&child, events.clone(), readiness_deadline)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         let stdout = child.stdout.take().map(spawn_reader);
         let stderr = child.stderr.take().map(spawn_reader);
         let process = SupervisedProcess {
@@ -176,10 +195,11 @@ impl EntrypointSupervisor {
         self.retained.insert(key.clone(), snapshot.clone());
         self.processes.insert(key.clone(), process);
         let _ = record;
-        if let Some((_watcher, events)) = launch_result_watcher {
-            self.wait_for_launch_result(&key, &events, LAUNCH_RESULT_READINESS_BUDGET)
-        } else {
-            Ok(snapshot)
+        match (launch_result_watcher, readiness) {
+            (Some(_watcher), Some((_, events))) => {
+                self.wait_for_launch_result(&key, &events, readiness_deadline)
+            }
+            _ => Ok(snapshot),
         }
     }
 
@@ -277,25 +297,17 @@ impl EntrypointSupervisor {
     fn wait_for_launch_result(
         &mut self,
         key: &EntrypointKey,
-        events: &Receiver<notify::Result<notify::Event>>,
-        readiness_budget: Duration,
+        events: &Receiver<LaunchReadinessEvent>,
+        deadline: Instant,
     ) -> EntrypointSupervisorResult<EntrypointProcessSnapshot> {
-        let deadline = Instant::now() + readiness_budget;
-        let launch_result_path = self
-            .processes
-            .get(key)
-            .and_then(|process| process.launch_result_path.clone())
-            .expect("readiness wait requires a launch-result path");
-        let mut launch_result_may_have_changed = true;
         loop {
             let process = self
                 .processes
                 .get_mut(key)
                 .expect("entrypoint was inserted before readiness wait");
-            if launch_result_may_have_changed {
-                process.refresh();
-            } else {
-                process.refresh_process_state();
+            process.refresh();
+            if process.exited_at.is_some() && process.pending_terminal_state.is_some() {
+                process.await_output();
             }
             let snapshot = process.snapshot(key);
             self.retained.insert(key.clone(), snapshot.clone());
@@ -308,7 +320,7 @@ impl EntrypointSupervisor {
             {
                 return Ok(snapshot);
             }
-            if process.exited_at.is_some() && process.pending_terminal_state.is_none() {
+            if process.exited_at.is_some() {
                 return Err(EntrypointSupervisorError::ReadinessFailed {
                     package_name: key.package_name.clone(),
                     entrypoint_id: key.entrypoint_id.clone(),
@@ -316,8 +328,8 @@ impl EntrypointSupervisor {
                 });
             }
 
-            let now = Instant::now();
-            if now >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 let error = EntrypointSupervisorError::ReadinessTimeout {
                     package_name: key.package_name.clone(),
                     entrypoint_id: key.entrypoint_id.clone(),
@@ -326,22 +338,22 @@ impl EntrypointSupervisor {
                 process.stop();
                 return Err(error);
             }
-            let wait = (deadline - now).min(Duration::from_millis(50));
-            match events.recv_timeout(wait) {
-                Ok(Ok(event)) => {
-                    launch_result_may_have_changed = event
-                        .paths
-                        .iter()
-                        .any(|path| path.file_name() == launch_result_path.file_name());
-                }
+            // Every watcher event re-reads the launch result: a backend may
+            // coalesce a create/write sequence or report only the watched parent.
+            // timer: deadline — the launch-result readiness budget; a watcher or child-exit event ends each normal wait.
+            match events.recv_timeout(remaining) {
+                Ok(LaunchReadinessEvent::Watch(Ok(_)) | LaunchReadinessEvent::ChildExited) => {}
+                // Expiry ends the wait; a result that appears later does not count.
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Filesystem backends may coalesce a create/write sequence or
-                    // report only the watched parent. Re-read the tiny result file
-                    // on timeout as a portability fallback; only valid structured
-                    // readiness can succeed.
-                    launch_result_may_have_changed = true;
+                    let error = EntrypointSupervisorError::ReadinessTimeout {
+                        package_name: key.package_name.clone(),
+                        entrypoint_id: key.entrypoint_id.clone(),
+                        details: readiness_details(&snapshot),
+                    };
+                    process.stop();
+                    return Err(error);
                 }
-                Ok(Err(error)) => {
+                Ok(LaunchReadinessEvent::Watch(Err(error))) => {
                     process.stop();
                     return Err(EntrypointSupervisorError::Watch(error.to_string()));
                 }
@@ -402,11 +414,39 @@ impl SupervisedProcess {
         self.publish_terminal_state_if_ready();
     }
 
+    /// Blocks on the output readers until both finish or the output
+    /// finalization deadline passes, then publishes the terminal state.
+    fn await_output(&mut self) {
+        let Some(deadline) = self.output_finalization_deadline else {
+            return;
+        };
+        for (kind, reader) in [("stdout", &mut self.stdout), ("stderr", &mut self.stderr)] {
+            let Some(receiver) = reader else {
+                continue;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // timer: deadline — OUTPUT_FINALIZATION_GRACE; reader EOF ends the normal wait and expiry publishes without the rest.
+            match receiver.recv_timeout(remaining) {
+                Ok(bytes) => {
+                    push_output_diagnostic(kind, &bytes, &mut self.diagnostics);
+                    *reader = None;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => *reader = None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        // Both readers finished, or the deadline passed; either publishes.
+        self.publish_terminal_state_if_ready();
+    }
+
     fn refresh_launch_result(&mut self) {
         let Some(path) = &self.launch_result_path else {
             return;
         };
-        let Ok(bytes) = fs::read(path) else {
+        let read = fs::read(path);
+        #[cfg(test)]
+        tests::after_launch_result_read();
+        let Ok(bytes) = read else {
             return;
         };
         let Ok(result) = serde_json::from_slice::<RunnableEntrypointLaunchResult>(&bytes) else {
@@ -690,22 +730,103 @@ fn launch_result_path(package_name: &str, entrypoint_id: &str, started_at: u64) 
     std::env::temp_dir().join(file_name)
 }
 
+/// One event that can end a launch-result readiness wait.
+#[derive(Debug)]
+enum LaunchReadinessEvent {
+    Watch(notify::Result<notify::Event>),
+    ChildExited,
+}
+
+type LaunchReadinessChannel = (
+    mpsc::Sender<LaunchReadinessEvent>,
+    Receiver<LaunchReadinessEvent>,
+);
+
 fn watch_launch_result_parent(
     launch_result_path: &Path,
-) -> EntrypointSupervisorResult<(
-    notify::RecommendedWatcher,
-    Receiver<notify::Result<notify::Event>>,
-)> {
-    let (tx, rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(tx)
-        .map_err(|error| EntrypointSupervisorError::Watch(error.to_string()))?;
+    events: &mpsc::Sender<LaunchReadinessEvent>,
+) -> EntrypointSupervisorResult<notify::RecommendedWatcher> {
+    let events = events.clone();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = events.send(LaunchReadinessEvent::Watch(event));
+    })
+    .map_err(|error| EntrypointSupervisorError::Watch(error.to_string()))?;
     let parent = launch_result_path.parent().ok_or_else(|| {
         EntrypointSupervisorError::Watch("launch-result path has no parent".to_string())
     })?;
     watcher
         .watch(parent, RecursiveMode::NonRecursive)
         .map_err(|error| EntrypointSupervisorError::Watch(error.to_string()))?;
-    Ok((watcher, rx))
+    Ok(watcher)
+}
+
+/// Proves that the watcher reports changes before the child can write its
+/// result. FSEvents starts its stream asynchronously, so a result written
+/// right after `watch` returned could otherwise pass unreported. The watcher
+/// must report a sentinel file written into the same directory.
+fn confirm_watcher_is_live(
+    launch_result_path: &Path,
+    events: &Receiver<LaunchReadinessEvent>,
+    deadline: Instant,
+) -> EntrypointSupervisorResult<()> {
+    let sentinel = launch_result_path.with_extension("watch-ready");
+    fs::write(&sentinel, b"")
+        .map_err(|error| EntrypointSupervisorError::Watch(error.to_string()))?;
+    let outcome = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // timer: deadline — the readiness budget also bounds this check; the sentinel's own event ends the normal wait.
+        match events.recv_timeout(remaining) {
+            // The paths may be canonicalized (/private/var), so compare file names.
+            Ok(LaunchReadinessEvent::Watch(Ok(event)))
+                if event
+                    .paths
+                    .iter()
+                    .any(|path| path.file_name() == sentinel.file_name()) =>
+            {
+                break Ok(());
+            }
+            Ok(LaunchReadinessEvent::Watch(Err(error))) => {
+                break Err(EntrypointSupervisorError::Watch(error.to_string()));
+            }
+            // No child runs yet, so no other event carries a result.
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                break Err(EntrypointSupervisorError::Watch(
+                    "launch-result watcher did not report its sentinel before the readiness deadline"
+                        .to_string(),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(EntrypointSupervisorError::Watch(
+                    "launch-result watcher disconnected".to_string(),
+                ));
+            }
+        }
+    };
+    let _ = fs::remove_file(&sentinel);
+    outcome
+}
+
+/// Sends `ChildExited` when the supervised child exits before `deadline`.
+/// The watch is registered before this returns, so the child cannot be reaped
+/// unobserved.
+fn notify_child_exit(
+    child: &Child,
+    events: mpsc::Sender<LaunchReadinessEvent>,
+    deadline: Instant,
+) -> EntrypointSupervisorResult<()> {
+    let watch = PidExitWatch::register(child.id())
+        .map_err(|error| EntrypointSupervisorError::Watch(error.to_string()))?;
+    thread::spawn(move || {
+        let exited = match watch {
+            Some(mut watch) => watch.wait(deadline).unwrap_or(true),
+            None => true,
+        };
+        if exited {
+            let _ = events.send(LaunchReadinessEvent::ChildExited);
+        }
+    });
+    Ok(())
 }
 
 fn readiness_details(snapshot: &EntrypointProcessSnapshot) -> String {
@@ -747,6 +868,15 @@ fn spawn_reader(pipe: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
     rx
 }
 
+fn push_output_diagnostic(kind: &str, bytes: &[u8], diagnostics: &mut Vec<EntrypointDiagnostic>) {
+    if !bytes.is_empty() {
+        diagnostics.push(EntrypointDiagnostic {
+            kind: kind.to_string(),
+            message: bounded_message(String::from_utf8_lossy(bytes).to_string()),
+        });
+    }
+}
+
 fn drain_output(
     kind: &str,
     rx: &mut Option<Receiver<Vec<u8>>>,
@@ -757,12 +887,7 @@ fn drain_output(
     };
     match receiver.try_recv() {
         Ok(bytes) => {
-            if !bytes.is_empty() {
-                diagnostics.push(EntrypointDiagnostic {
-                    kind: kind.to_string(),
-                    message: bounded_message(String::from_utf8_lossy(&bytes).to_string()),
-                });
-            }
+            push_output_diagnostic(kind, &bytes, diagnostics);
             *rx = None;
         }
         Err(mpsc::TryRecvError::Empty) => {}
@@ -876,8 +1001,96 @@ fn failed_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_exit::{ReapRegistration, ReapWatch, wait_for_pid_exit};
+    use std::io::BufRead;
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc::Sender;
+
+    thread_local! {
+        static AFTER_LAUNCH_RESULT_READ: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs the hook a test installed, right after each launch-result read.
+    pub(super) fn after_launch_result_read() {
+        AFTER_LAUNCH_RESULT_READ.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Writes `contents` to `path` right after the first launch-result read,
+    /// so the result appears only after the wait has read it once.
+    fn publish_after_first_read(path: PathBuf, contents: &'static str) {
+        let mut published = false;
+        AFTER_LAUNCH_RESULT_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if !std::mem::replace(&mut published, true) {
+                    fs::write(&path, contents).expect("publish launch result");
+                }
+            }));
+        });
+    }
+
+    const READY_RESULT: &str =
+        r#"{"entrypoint_id":"web","process_state":"running","local_url":"http://127.0.0.1:4321"}"#;
+
+    fn test_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(2)
+    }
+
+    /// Registers a reap watch while `pid` still runs, so a later
+    /// `assert_reaped` proves the process left the process table.
+    fn watch_reap(pid: u32) -> ReapWatch {
+        match ReapWatch::register(pid).expect("register reap watch") {
+            ReapRegistration::Watching(watch) => watch,
+            _ => panic!("pid {pid} exited before its reap watch"),
+        }
+    }
+
+    fn assert_reaped(mut watch: ReapWatch, pid: u32) {
+        assert!(
+            watch.wait(test_deadline()).expect("wait for reap"),
+            "pid {pid} survived"
+        );
+    }
+
+    /// Spawns `script` as the leader of its own process group, with stdin held
+    /// by the child and stdout piped, and hands the child to a
+    /// SupervisedProcess at once, so a later panic still stops the group. The
+    /// receiver yields the first stdout line.
+    fn supervised_group_leader(
+        script: &str,
+        launch_result_path: PathBuf,
+    ) -> (SupervisedProcess, Receiver<std::io::Result<String>>) {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn controlled process group");
+        let stdout = child.stdout.take().expect("leader stdout");
+        let process = supervised_running_process(child, launch_result_path);
+        let (line_tx, line_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line.trim().to_string());
+            let _ = line_tx.send(result);
+        });
+        (process, line_rx)
+    }
 
     fn unique_test_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -890,32 +1103,25 @@ mod tests {
         ))
     }
 
-    fn controlled_running_process(
-        descendant_pid_path: &Path,
-        launch_result_path: PathBuf,
-    ) -> (SupervisedProcess, libc::pid_t) {
-        let mut command = Command::new("sh");
-        command
-            .args([
-                "-c",
-                &format!(
-                    "sleep 60 & printf '%s\\n' \"$!\" > '{}'; wait",
-                    descendant_pid_path.display()
-                ),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command.spawn().expect("spawn controlled process group");
-        let process = supervised_running_process(child, launch_result_path);
-        let descendant_pid = wait_for_pid_file(descendant_pid_path);
+    fn read_published_line(published: &Receiver<std::io::Result<String>>) -> String {
+        // timer: deadline — the fixture's two seconds to publish; expiry fails the test.
+        published
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the fixture publishes a line within two seconds")
+            .expect("read the published line")
+    }
+
+    /// A group leader whose descendant blocks on the leader's stdin pipe
+    /// through fd 3 until the group is signalled. The leader publishes the
+    /// descendant pid on stdout.
+    fn controlled_running_process(launch_result_path: PathBuf) -> (SupervisedProcess, u32) {
+        let (process, published) = supervised_group_leader(
+            "exec 3<&0; cat <&3 >/dev/null & printf '%s\\n' \"$!\"; exec >/dev/null; wait",
+            launch_result_path,
+        );
+        let descendant_pid = read_published_line(&published)
+            .parse()
+            .expect("controlled descendant pid is published as a number");
         (process, descendant_pid)
     }
 
@@ -939,32 +1145,6 @@ mod tests {
             pending_terminal_state: None,
             output_finalization_deadline: None,
         }
-    }
-
-    fn wait_for_pid_file(path: &Path) -> libc::pid_t {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(pid) = fs::read_to_string(path)
-                .ok()
-                .and_then(|contents| contents.trim().parse().ok())
-            {
-                return pid;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "controlled descendant pid was not published as parseable content: {}",
-                path.display()
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn assert_pid_gone(pid: libc::pid_t) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "pid {pid} survived");
     }
 
     fn controlled_failed_process() -> (SupervisedProcess, Sender<Vec<u8>>, Sender<Vec<u8>>) {
@@ -1002,11 +1182,11 @@ mod tests {
     }
 
     fn observe_child_exit(process: &mut SupervisedProcess) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while process.exited_at.is_none() && Instant::now() < deadline {
-            process.refresh();
-            thread::yield_now();
-        }
+        assert!(
+            wait_for_pid_exit(process.child.id(), test_deadline()).expect("watch child exit"),
+            "controlled child did not exit"
+        );
+        process.refresh();
         assert!(process.exited_at.is_some(), "controlled child did not exit");
     }
 
@@ -1076,17 +1256,23 @@ mod tests {
 
     #[test]
     fn readiness_failure_waits_for_delayed_exit_diagnostics() {
-        let (mut process, stdout_tx, stderr_tx) = controlled_failed_process();
+        let (mut process, stdout_tx, _unused_stderr_tx) = controlled_failed_process();
+        // A rendezvous channel: the send completes only while the supervisor is
+        // receiving, so the diagnostics arrive after the wait has begun.
+        let (stderr_tx, stderr) = mpsc::sync_channel(0);
+        process.stderr = Some(stderr);
         process.launch_result_path = Some(unique_test_path("delayed-readiness-diagnostics"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (events_tx, events) = mpsc::channel();
+        notify_child_exit(&process.child, events_tx.clone(), deadline)
+            .expect("watch controlled child exit");
         let key = EntrypointKey {
             package_name: "fixture".to_string(),
             entrypoint_id: "web".to_string(),
         };
         let mut supervisor = EntrypointSupervisor::default();
         supervisor.processes.insert(key.clone(), process);
-        let (_events_tx, events) = mpsc::channel();
         let output = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
             stdout_tx.send(Vec::new()).expect("finish stdout reader");
             stderr_tx
                 .send(b"delayed fixture failure\n".to_vec())
@@ -1094,8 +1280,12 @@ mod tests {
         });
 
         let error = supervisor
-            .wait_for_launch_result(&key, &events, Duration::from_secs(1))
+            .wait_for_launch_result(&key, &events, deadline)
             .expect_err("exited process must fail readiness");
+        assert!(
+            Instant::now() < deadline,
+            "the child-exit event, not the readiness deadline, must end the wait"
+        );
         output.join().expect("join delayed output fixture");
 
         assert!(matches!(
@@ -1103,6 +1293,88 @@ mod tests {
             EntrypointSupervisorError::ReadinessFailed { details, .. }
                 if details.contains("delayed fixture failure")
         ));
+    }
+
+    /// A running child supervised with a launch-result path in a fresh
+    /// directory. It blocks on its stdin pipe, which the process holds.
+    fn blocked_child_with_launch_result(label: &str) -> (PathBuf, PathBuf, SupervisedProcess) {
+        let directory = unique_test_path(label);
+        fs::create_dir_all(&directory).expect("create launch-result directory");
+        let launch_result_path = directory.join("launch-result.json");
+        let child = Command::new("sh")
+            .args(["-c", "exec cat >/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn blocked child");
+        let process = supervised_running_process(child, launch_result_path.clone());
+        (directory, launch_result_path, process)
+    }
+
+    fn fixture_key() -> EntrypointKey {
+        EntrypointKey {
+            package_name: "fixture".to_string(),
+            entrypoint_id: "web".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_launch_result_written_after_the_first_read_ends_the_wait_through_its_watcher_event() {
+        let (directory, launch_result_path, process) =
+            blocked_child_with_launch_result("launch-result-watch");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (events_tx, events) = mpsc::channel();
+        let _watcher = watch_launch_result_parent(&launch_result_path, &events_tx)
+            .expect("watch launch-result directory");
+        confirm_watcher_is_live(&launch_result_path, &events, deadline)
+            .expect("the watcher reports its sentinel");
+        publish_after_first_read(launch_result_path, READY_RESULT);
+        let mut supervisor = EntrypointSupervisor::default();
+        supervisor.processes.insert(fixture_key(), process);
+
+        let snapshot = supervisor
+            .wait_for_launch_result(&fixture_key(), &events, deadline)
+            .expect("the watcher event for the written result makes the entrypoint ready");
+
+        assert_eq!(
+            snapshot
+                .launch_result
+                .and_then(|result| result.local_url)
+                .as_deref(),
+            Some("http://127.0.0.1:4321")
+        );
+        assert!(
+            Instant::now() < deadline,
+            "readiness came from the event, not expiry"
+        );
+        drop(supervisor);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_launch_result_without_an_event_before_the_deadline_times_out() {
+        let (directory, launch_result_path, process) =
+            blocked_child_with_launch_result("launch-result-no-event");
+        let (_events_tx, events) = mpsc::channel::<LaunchReadinessEvent>();
+        publish_after_first_read(launch_result_path, READY_RESULT);
+        let mut supervisor = EntrypointSupervisor::default();
+        supervisor.processes.insert(fixture_key(), process);
+
+        let error = supervisor
+            .wait_for_launch_result(
+                &fixture_key(),
+                &events,
+                Instant::now() + Duration::from_millis(100),
+            )
+            .expect_err("a result with no event before the deadline does not count");
+
+        assert!(
+            matches!(error, EntrypointSupervisorError::ReadinessTimeout { .. }),
+            "{error:?}"
+        );
+        assert!(supervisor.processes[&fixture_key()].exited_at.is_some());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1172,7 +1444,8 @@ mod tests {
     fn supervisor_drop_terminates_and_reaps_owned_process_group() {
         let mut command = Command::new("sh");
         command
-            .args(["-c", "while :; do sleep 1; done"])
+            .args(["-c", "exec cat >/dev/null"])
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         unsafe {
@@ -1218,63 +1491,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_descendant_pid_publication_reaps_owned_process_group() {
-        let descendant_pid_path = unique_test_path("missing-descendant");
-        let launch_result_path = unique_test_path("missing-result");
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "sleep 60 & wait"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command
-            .spawn()
-            .expect("spawn missing-publication process group");
-        let pid = child.id();
-        let process = supervised_running_process(child, launch_result_path.clone());
+    /// A fixture whose pid publication fails must still leave no process
+    /// group: the panic drops the SupervisedProcess, which stops the group.
+    fn failed_publication_reaps_owned_process_group(label: &str, script: &str) {
+        let launch_result_path = unique_test_path(label);
+        let (process, published) = supervised_group_leader(script, launch_result_path.clone());
+        let pid = process.child.id();
+        let leader_reaped = watch_reap(pid);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _process = process;
-            let _ = wait_for_pid_file(&descendant_pid_path);
+            let _: u32 = read_published_line(&published)
+                .parse()
+                .expect("an unparseable publication must fail loudly");
         }));
 
-        assert!(
-            result.is_err(),
-            "missing descendant PID publication must fail loudly"
-        );
-        assert_pid_gone(pid as libc::pid_t);
+        assert!(result.is_err(), "a failed pid publication must fail loudly");
+        assert_reaped(leader_reaped, pid);
         assert!(
             !process_group_running(pid).expect("inspect owned process group"),
-            "missing publication must leave no owned process group"
+            "a failed publication must leave no owned process group"
         );
-        let _ = fs::remove_file(descendant_pid_path);
         let _ = fs::remove_file(launch_result_path);
     }
 
     #[test]
+    fn missing_descendant_pid_publication_reaps_owned_process_group() {
+        // The leader and its descendant keep stdout open and never write.
+        failed_publication_reaps_owned_process_group(
+            "missing-publication",
+            "exec 3<&0; cat <&3 >/dev/null & wait",
+        );
+    }
+
+    #[test]
+    fn unparseable_descendant_pid_publication_reaps_owned_process_group() {
+        failed_publication_reaps_owned_process_group(
+            "unparseable-publication",
+            "exec 3<&0; cat <&3 >/dev/null & printf 'not-a-pid\\n'; exec >/dev/null; wait",
+        );
+    }
+
+    #[test]
     fn readiness_timeout_stops_real_owned_process_group_and_descendant() {
-        let descendant_pid_path = unique_test_path("timeout-descendant");
         let launch_result_path = unique_test_path("timeout-result");
-        let (process, descendant_pid) =
-            controlled_running_process(&descendant_pid_path, launch_result_path);
+        let (process, descendant_pid) = controlled_running_process(launch_result_path);
+        let descendant_reaped = watch_reap(descendant_pid);
         let key = EntrypointKey {
             package_name: "fixture".to_string(),
             entrypoint_id: "web".to_string(),
         };
         let mut supervisor = EntrypointSupervisor::default();
         supervisor.processes.insert(key.clone(), process);
-        let (_events_tx, events) = mpsc::channel();
+        let (_events_tx, events) = mpsc::channel::<LaunchReadinessEvent>();
 
         let error = supervisor
-            .wait_for_launch_result(&key, &events, Duration::from_millis(100))
+            .wait_for_launch_result(&key, &events, Instant::now() + Duration::from_millis(100))
             .expect_err("missing launch result must time out");
 
         assert!(matches!(
@@ -1285,35 +1557,32 @@ mod tests {
             supervisor.processes[&key].exited_at.is_some(),
             "readiness timeout must reap the supervised child"
         );
-        assert_pid_gone(descendant_pid);
-        let _ = fs::remove_file(descendant_pid_path);
+        assert_reaped(descendant_reaped, descendant_pid);
     }
 
     #[test]
     fn disconnected_launch_result_watcher_stops_owned_process_group() {
-        let descendant_pid_path = unique_test_path("watch-descendant");
         let launch_result_path = unique_test_path("watch-result");
-        let (process, descendant_pid) =
-            controlled_running_process(&descendant_pid_path, launch_result_path);
+        let (process, descendant_pid) = controlled_running_process(launch_result_path);
+        let descendant_reaped = watch_reap(descendant_pid);
         let key = EntrypointKey {
             package_name: "fixture".to_string(),
             entrypoint_id: "web".to_string(),
         };
         let mut supervisor = EntrypointSupervisor::default();
         supervisor.processes.insert(key.clone(), process);
-        let (_events_tx, events) = mpsc::channel::<notify::Result<notify::Event>>();
-        drop(_events_tx);
+        let (events_tx, events) = mpsc::channel::<LaunchReadinessEvent>();
+        drop(events_tx);
 
         let error = supervisor
-            .wait_for_launch_result(&key, &events, Duration::from_secs(1))
+            .wait_for_launch_result(&key, &events, Instant::now() + Duration::from_secs(1))
             .expect_err("disconnected watcher must fail readiness");
 
         assert!(
             matches!(error, EntrypointSupervisorError::Watch(message) if message.contains("disconnected"))
         );
         assert!(supervisor.processes[&key].exited_at.is_some());
-        assert_pid_gone(descendant_pid);
-        let _ = fs::remove_file(descendant_pid_path);
+        assert_reaped(descendant_reaped, descendant_pid);
     }
 
     #[test]
