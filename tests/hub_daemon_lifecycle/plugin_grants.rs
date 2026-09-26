@@ -92,3 +92,82 @@ fn live_daemon_grants_plugin_db_from_each_packages_own_admission() {
     assert_eq!(declared["written"], true, "{declared}");
     daemon.shutdown();
 }
+
+fn write_tool_probe_package(root: &Path, name: &str, capabilities: serde_json::Value) {
+    fs::create_dir_all(root).expect("create tool probe package root");
+    fs::write(
+        root.join("plugin.lua"),
+        format!(
+            r#"return botster.register({{
+  tools = {{{{
+    name = "{name}.ping",
+    description = "Answer a ping.",
+    handler = "ping",
+    call = function() return {{ pong = true }} end,
+  }}}},
+}})
+"#
+        ),
+    )
+    .expect("write tool probe plugin");
+    fs::write(
+        root.join("botster-package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "kind": "plugin",
+            "botster": ">=0.1.0",
+            "source": { "type": "path", "path": "." },
+            "capabilities": capabilities,
+            "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+        }))
+        .expect("serialize tool probe manifest"),
+    )
+    .expect("write tool probe manifest");
+}
+
+/// A handler runs only when its package declared the capability its kind
+/// needs: Core refuses a tool of a package without `mcp`, while a sibling
+/// that declared `mcp` answers.
+#[test]
+fn live_daemon_refuses_tools_of_a_package_without_mcp() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("handler-caps-data");
+    let undeclared_dir = unique_short_test_dir("handler-caps-undeclared");
+    let declared_dir = unique_short_test_dir("handler-caps-declared");
+    write_tool_probe_package(&undeclared_dir, "caps.undeclared", serde_json::json!([]));
+    write_tool_probe_package(
+        &declared_dir,
+        "caps.declared",
+        serde_json::json!([{ "surface": "mcp" }]),
+    );
+
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "handler capability daemon cleanup");
+    for package_dir in [&undeclared_dir, &declared_dir] {
+        let enabled = botster_hub::daemon_transport_request(
+            &explicit_config(&data_dir),
+            botster_hub::DaemonRequest::EnablePackageLocalPath { path: package_dir.clone() },
+        )
+        .expect("enable tool probe package");
+        assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision, "{enabled:?}");
+    }
+
+    let refused = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "caps.undeclared.ping".to_string(),
+            arguments: serde_json::json!({}),
+        },
+    )
+    .expect("call undeclared tool");
+    assert_eq!(refused.kind, botster_hub::DaemonResponseKind::OperatorError, "{refused:?}");
+    let message = &refused.error.as_ref().expect("refusal carries an operator error").message;
+    assert!(
+        message.contains("capability missing from package metadata"),
+        "the Core handler check must refuse the tool: {message}"
+    );
+
+    let answered = call_plugin_tool(&data_dir, "caps.declared.ping", serde_json::json!({}));
+    assert_eq!(answered["pong"], true, "{answered}");
+    daemon.shutdown();
+}
