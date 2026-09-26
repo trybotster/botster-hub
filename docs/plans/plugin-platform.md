@@ -1,8 +1,8 @@
 # Plugin platform design
 
-Status: revision 5 for review (2026-09-26). Owner: plugin-platform Hub writer.
-Revisions 1 (`4e6f5aa2`), 2 (`0bc5c83e`), 3 (`affb2368`), and 4 (`781ebb57`)
-were rejected;
+Status: revision 6 for review (2026-09-26). Owner: plugin-platform Hub writer.
+Revisions 1 (`4e6f5aa2`), 2 (`0bc5c83e`), 3 (`affb2368`), 4 (`781ebb57`), and
+5 (`8e02f13e`) were rejected;
 section 17 maps every finding to its answer.
 
 Scope: the Lua-facing platform that first-party plugins need, starting with
@@ -337,6 +337,28 @@ path) and the Core process-host writer (engine and IPC; premise
    total does not change. A single host-call result larger than 512 KiB fails
    with `{ kind = "failed", detail = "response_too_large" }`; large downloads
    need a future streaming or file capability, not in this plan.
+7. **USER DECISION (completion store, 2026-09-26, Option A).** Every result
+   invocation needs a completion-store reservation for the result it will
+   publish. The Core completion store is Hub-wide, so each plugin's share is
+   reserved at **load**, sized for the 8-plugin maximum:
+   - pool completions: 128 slots x 4 KiB (the existing Background completion
+     allowance) = 512 KiB and 128 entries;
+   - request-response chains: 2 chains x 1 MiB (the existing request-response
+     allowance) and 2 entries. A chain keeps its reservation from root
+     admission through every suspension until its final result is drained.
+   Global store: entries 256 -> 1040 (8 x 130), reservation bytes 8 -> 20 MiB
+   (8 x 2.5 MiB). Both stay inside the unchanged 32 MiB completion queue byte
+   ceiling, so the memory ceiling does not change.
+   - A 3rd concurrent request-response call to one plugin gets a typed
+     `backpressured` error while 2 chains are open; siblings never wait.
+   - A load that cannot reserve its whole share fails with a typed
+     `quota_exceeded` error; a plugin is never partially loaded.
+   - Known ceiling: 8 plugins (128 MiB / 16 MiB per-VM limits); to be
+     revisited with the process-per-plugin host.
+   Slice 3 proofs: 8 plugins load and each uses its full share concurrently;
+   one plugin with both chains suspended does not delay a sibling's MCP call;
+   the 3rd call is backpressured; a 9th plugin's load is refused with
+   `quota_exceeded`.
 
 ### 5.2 Memory outside the pool, and the per-plugin share
 
@@ -557,14 +579,21 @@ local response = botster.capabilities.http.request({
   must equal a granted origin.
 - Transport: Core `HttpCapabilityRuntime` with Hub `RealHttpTransport`.
   Redirects are not followed; a 3xx response returns to the plugin as is.
-- **Pre-admission ceiling.** The helper computes `max_result_bytes` before
-  the call, from fixed numbers only: the envelope overhead, plus the
-  response header ceiling (the Core HTTP header count limit of 64 times the
-  Core header-size limit), plus `max_bytes` of body. The Core response limit
-  (4 MiB) caps `max_bytes`. The transport reads headers and body into a
-  producer buffer charged per growth step (section 5.2) and fails the call
-  with `failed` / `detail = "response_too_large"` the moment either part
-  passes its ceiling; it never truncates.
+- **One total response allowance.** `max_bytes` is required and is the
+  allowance for the whole encoded response: status, every header name and
+  value, the body, and the result envelope. The helper sets
+  `max_result_bytes = max_bytes`; it must fit the free pool room (at most
+  512 KiB), or the call returns `backpressured` at once. There is no default,
+  so no new number exists. The transport counts encoded bytes as it reads
+  the status line, each header, and each body chunk into a producer buffer
+  charged per growth step (section 5.2), and fails the call with `failed` /
+  `detail = "response_too_large"` the moment the running total passes
+  `max_bytes`; it never truncates. The Core header limits (64 headers, 128
+  name bytes, 8192 value bytes) still apply per header, but they are not
+  reserved up front.
+- **Slice 6 proofs.** A small response under its allowance succeeds; a
+  response whose headers alone pass the allowance fails with
+  `response_too_large`; a response whose body passes it fails the same way.
 - **USER DECISION (network policy), Option A approved 2026-09-26**: today the Hub allows loopback only,
   GET and POST only, and denies credential headers. Option A (recommended):
   manifest-declared remote origins, enabled by the operator; credentials
@@ -1015,7 +1044,25 @@ completion_bytes_per_slot)` at load returns a `DeliveryPool` bound to the
 current generation, with `accept_call(call_id, max_result_bytes)`,
 `admit_result(call_id, request)`, and `release_call(call_id)`. On the thread
 host, the Hub's in-process host port calls the same methods, so both hosts
-share one accounting path. Log frames carry `dropped_since_last`.
+share one accounting path.
+
+The completion-store decision (section 5.1 item 7) uses two pools per plugin
+from the same engine API:
+
+- the host-call pool: 128 slots, 512 KiB of request and result bytes,
+  `completion_bytes_per_slot` = 4 KiB (the existing Background allowance);
+  units return when their completion drains;
+- the chain pool: 2 slots with 1 MiB of completion each (the existing
+  request-response allowance). The root request-response invocation and every
+  resume of its chain are admitted from the chain's one held unit. The unit
+  is not returned when the root publishes `suspended`; the Hub releases it
+  explicitly when the chain ledger entry is removed (section 4.2). This needs
+  one engine addition: admission from a held pool unit, and an explicit
+  `release_unit`, for this pool.
+
+Both pools and the ordinary share are reserved at load; if any part cannot
+be reserved, the load fails with `quota_exceeded` and nothing is partially
+reserved. Log frames carry `dropped_since_last`.
 
 Flow control: the standing delivery pool and its credits (section 5.1),
 separate conserved credits for host-call request bodies and for log records
@@ -1066,7 +1113,7 @@ setup.
 | 0 | Sandbox (section 14) | none | Host-file `dofile`/`loadfile` fail; bytecode `load` fails; `string.dump`, `print` absent; `collectgarbage("collect")` refused; a `pcall` spin fails at the budget; text `load` works. Per-guard control VM probes. |
 | 1 | Per-package grants (section 17 item 5); result convention for existing helpers; ABI doc rewrite | none | A package without `plugin_db` gets `capability_denied` while a granted sibling succeeds; the literal grant list is gone (ablation: restore it, the denial test fails). |
 | 2 | `log`, `json`, `clock`, `require` | log limits decision | `require` of a sibling module works; a symlinked or `..` module fails the load; log records reach `get_plugin_logs` with package and level; a flooding plugin drops records and reports the count without blocking. |
-| 3 | Suspendable handlers, delivery pool, credits, call ledger, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload; a host call completed before the issuing invocation's `suspended` result is published still answers the MCP caller (a test gate holds the issuing executor after the yield, before publication); a Hub refusal after the yield resumes the handler with the typed error; a pool-exhausted plugin's next call returns `backpressured` without suspending; a timer fires into an otherwise idle plugin while its pool is fully free, and again while every pool slot is in use (the ordinary 512 KiB carries both); a host-call result above 512 KiB fails with `response_too_large`; a timer record parked on `Backpressured` is delivered after the plugin's next completion, with no new timer fire (ablation: remove the completion-notifier re-arm, the record stays parked); a plugin whose share cannot be reserved fails to load with `quota_exceeded` while a loaded sibling keeps answering; decoded request bytes stay charged until the backend disposes them (ablation: return the credit at dequeue, the accounting assertion fails). |
+| 3 | Suspendable handlers, delivery pool, credits, call ledger, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload; a host call completed before the issuing invocation's `suspended` result is published still answers the MCP caller (a test gate holds the issuing executor after the yield, before publication); a Hub refusal after the yield resumes the handler with the typed error; a pool-exhausted plugin's next call returns `backpressured` without suspending; a timer fires into an otherwise idle plugin while its pool is fully free, and again while every pool slot is in use (the ordinary 512 KiB carries both); a host-call result above 512 KiB fails with `response_too_large`; 8 plugins load and each uses its full completion share concurrently; one plugin with both request-response chains suspended does not delay a sibling's MCP call; its 3rd concurrent call is `backpressured`; a 9th plugin's load is refused with `quota_exceeded`; a timer record parked on `Backpressured` is delivered after the plugin's next completion, with no new timer fire (ablation: remove the completion-notifier re-arm, the record stays parked); a plugin whose share cannot be reserved fails to load with `quota_exceeded` while a loaded sibling keeps answering; decoded request bytes stay charged until the backend disposes them (ablation: return the credit at dequeue, the accounting assertion fails). |
 | 4 | Storage collections (section 11) | key quota decision | Index query returns exactly the bound range with a limit; a batch with one stale revision changes nothing; two watches on one collection each receive one notification for a burst of commits and one batch touching many documents; cancelling one watch leaves the other notified (ablation: remove folding, the second commit queues a second event); a collection projection delivers a delete from the commit diff to an entity subscriber; a collection projection serves a snapshot and a live change to an entity subscriber. |
 | 4b | Declarative views (section 12): schema, admission, projection, action routing; `surface_route` removed | none (user decision made); Web/TUI renderer work scheduled by the orchestrator | A manifest view over an undeclared family, an unknown field, or an unregistered action fails enable; an admitted view is projected to a daemon client; an action reaches the plugin handler with validated input and returns its result; a collection change reaches a client subscribed to the view's family; ablation: removing the field-allowlist check lets the invalid manifest enable. |
 | 5 | Sessions, messaging, caller identity (section 9) | cross-plugin control, message tools, caller auth decisions | A plugin cannot close a session it does not own without `:any`; post/receive round trip between two sessions; a forged caller is refused (option A). |
@@ -1180,6 +1227,20 @@ setup.
    projections read each commit's diff in the commit path (section 11.2);
    slice 4 tests two watches, folding across a many-document batch, and
    cancellation.
+
+### 17.5 Revision 5
+
+1. **HTTP allowance**: `max_bytes` is now the required total allowance for
+   the whole encoded response (status, headers, body, envelope), counted
+   while reading; header limits are enforced per header but never reserved up
+   front (section 8.1). Slice 6 proves a small response succeeds and
+   oversized headers or bodies fail with `response_too_large`.
+2. **Completion store**: the user decided the allocation (Option A): each
+   plugin's share (128 x 4 KiB pool completions plus 2 request-response
+   chains x 1 MiB) is reserved at load; the global store grows to 1040 entries
+   and 20 MiB of reservation bytes inside the unchanged 32 MiB ceiling; a
+   load that cannot reserve its share fails with `quota_exceeded`
+   (section 5.1 item 7, slice 3 proofs).
 
 
 ## 18. User decisions (summary, all approved as Option A on 2026-09-26)
