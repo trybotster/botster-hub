@@ -76,3 +76,99 @@ fn live_daemon_plugin_uses_json_and_clock_basics() {
     assert!(now >= before && now < before + 60_000, "{now} vs {before}");
     daemon.shutdown();
 }
+
+/// A daemon-loaded plugin splits its code across files in `lua/` and loads
+/// them with `require`; a symlinked module fails the package load.
+#[test]
+fn live_daemon_plugin_requires_its_own_modules() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("modules-data");
+    let package_dir = unique_short_test_dir("modules-package");
+    let linked_dir = unique_short_test_dir("modules-linked");
+    for (root, name) in [(&package_dir, "modules.probe"), (&linked_dir, "modules.linked")] {
+        fs::create_dir_all(root.join("lua/lib")).expect("create module tree");
+        fs::write(
+            root.join("lua/lib/greet.lua"),
+            "return { hello = function(who) return 'hello ' .. who end }",
+        )
+        .expect("write module");
+        fs::write(
+            root.join("plugin.lua"),
+            format!(
+                r#"local greet = require("lib.greet")
+return botster.register({{
+  tools = {{{{
+    name = "{name}.greet",
+    description = "Greet through a required module.",
+    handler = "greet",
+    call = function(request) return {{ text = greet.hello(request.who) }} end,
+  }}}},
+}})
+"#
+            ),
+        )
+        .expect("write entrypoint");
+        fs::write(
+            root.join("botster-package.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": name,
+                "version": "1.0.0",
+                "kind": "plugin",
+                "botster": ">=0.1.0",
+                "source": { "type": "path", "path": "." },
+                "capabilities": [{ "surface": "mcp" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }))
+            .expect("serialize module manifest"),
+        )
+        .expect("write module manifest");
+    }
+    std::os::unix::fs::symlink(
+        linked_dir.join("lua/lib/greet.lua"),
+        linked_dir.join("lua/lib/escape.lua"),
+    )
+    .expect("create symlinked module");
+
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "plugin modules daemon cleanup");
+    let enabled = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::EnablePackageLocalPath { path: package_dir.clone() },
+    )
+    .expect("enable module package");
+    assert_eq!(enabled.kind, botster_hub::DaemonResponseKind::PackageDecision, "{enabled:?}");
+    let greeted = call_plugin_tool(&data_dir, "modules.probe.greet", serde_json::json!({ "who": "hub" }));
+    assert_eq!(greeted["text"], "hello hub", "{greeted}");
+
+    // A symlinked module fails the package load. The daemon's enable path
+    // currently drops the client connection on any Lua load failure (a
+    // pre-existing behavior, reported separately), so either outcome is a
+    // refusal here; what matters is that nothing from the package loads and
+    // the daemon keeps serving.
+    let refused = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::EnablePackageLocalPath { path: linked_dir.clone() },
+    );
+    if let Ok(response) = &refused {
+        assert_ne!(
+            response.kind,
+            botster_hub::DaemonResponseKind::PackageDecision,
+            "a symlinked module must fail the load: {response:?}"
+        );
+    }
+    let unserved = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::PluginMcpCallTool {
+            name: "modules.linked.greet".to_string(),
+            arguments: serde_json::json!({ "who": "hub" }),
+        },
+    )
+    .expect("call the refused package's tool");
+    assert_ne!(
+        unserved.kind,
+        botster_hub::DaemonResponseKind::PluginMcpToolResult,
+        "the refused package must not serve tools: {unserved:?}"
+    );
+    let again = call_plugin_tool(&data_dir, "modules.probe.greet", serde_json::json!({ "who": "again" }));
+    assert_eq!(again["text"], "hello again", "the daemon keeps serving: {again}");
+    daemon.shutdown();
+}
