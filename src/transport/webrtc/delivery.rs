@@ -118,6 +118,17 @@ impl InboundTerminalChunkAssembly {
     }
 }
 
+/// Exact wire size of `sealed_terminal_chunks` for a body of `body_len`
+/// bytes: every chunk adds its fixed header and the AES-GCM overhead.
+pub(crate) fn sealed_terminal_wire_len(body_len: usize) -> Option<usize> {
+    let chunk_count = body_len.div_ceil(LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES);
+    chunk_count
+        .checked_mul(
+            LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES + botster_core::AES_GCM_SEALED_OVERHEAD_BYTES,
+        )?
+        .checked_add(body_len)
+}
+
 /// Seal one routed terminal frame into ordered binary chunks.
 ///
 /// `message_id` is the per-channel outbound counter. Each chunk carries the
@@ -450,6 +461,30 @@ mod tests {
         let error = frame_encrypted_daemon_delivery("response-over-budget", &encrypted)
             .expect_err("over-budget response must fail before framing");
         assert!(error.to_string().contains("exceeded 16777216 byte limit"));
+    }
+
+    #[test]
+    fn sealed_terminal_wire_len_is_the_exact_sealed_size() {
+        let key = AesGcmKey::from_slice(&[7; 32]).unwrap();
+        // The sealed body is the whole encoded TerminalBody, output header
+        // included; size the output so the body meets each chunk boundary.
+        let header = routed("sub", 4, 2, b"a").frame.len() - 1;
+        for body_len in [
+            header + 1,
+            LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES - 1,
+            LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES,
+            LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES + 1,
+            30_000,
+        ] {
+            let frame = routed("sub", 4, 2, &vec![0x61; body_len - header]);
+            assert_eq!(frame.frame.len(), body_len);
+            let chunks = sealed_terminal_chunks(&key, &frame, 9).expect("seal");
+            assert_eq!(
+                sealed_terminal_wire_len(body_len),
+                Some(chunks.iter().map(Vec::len).sum()),
+                "body_len {body_len}"
+            );
+        }
     }
 
     #[test]
