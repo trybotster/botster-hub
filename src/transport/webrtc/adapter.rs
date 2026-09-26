@@ -45,7 +45,7 @@ impl std::fmt::Debug for WebRtcTerminalAdapterHandle {
 
 // DIAGNOSTIC restart-route (not for commit).
 pub(crate) fn diagr(route: &str) -> bool {
-    route.contains("web-flood")
+    route.contains("web-flood") || route.starts_with("btui-sub")
 }
 
 pub(crate) fn diagr_log(line: std::fmt::Arguments<'_>) {

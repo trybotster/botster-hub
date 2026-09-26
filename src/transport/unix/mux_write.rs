@@ -338,6 +338,16 @@ pub(crate) async fn flush_unix_mux_writes(
         if terminal_passes > 16 {
             break;
         }
+        for (_, frame) in writes.iter() {
+            if crate::transport::webrtc::adapter::diagr(frame.route.as_str()) {
+                crate::transport::webrtc::adapter::diagr_log(format_args!(
+                    "unix mux flush route={} gen={} bytes={}",
+                    frame.route.as_str(),
+                    frame.generation,
+                    frame.frame.len()
+                ));
+            }
+        }
         for (handle, frame) in writes {
             let Some(header) = UnixTerminalContainerHeader::new(
                 frame.route.as_str(),
