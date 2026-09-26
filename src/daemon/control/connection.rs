@@ -224,7 +224,16 @@ fn inspect_reservation(
         }
         ReservationLookup::Bound => ReservationInspectReply::Bound,
         ReservationLookup::Expired => {
-            emit_reservation_expired(daemon, state, &grant_id, peer_generation, &label, now);
+            // A late open reports the expiry through its own reject.
+            emit_reservation_expired(
+                daemon,
+                state,
+                &grant_id,
+                peer_generation,
+                &label,
+                now,
+                false,
+            );
             match state
                 .pending_runtime
                 .admission
@@ -310,7 +319,16 @@ fn bind_reserved_subscription(
             return false;
         }
         ReservationLookup::Expired => {
-            emit_reservation_expired(daemon, state, &grant_id, peer_generation, &label, now);
+            // A late open reports the expiry through its own reject.
+            emit_reservation_expired(
+                daemon,
+                state,
+                &grant_id,
+                peer_generation,
+                &label,
+                now,
+                false,
+            );
             let _ = reply_tx.send(Err(BindReservedError::Expired));
             return false;
         }
@@ -458,6 +476,23 @@ fn bind_reserved_subscription(
         let _ = reply_tx.send(Err(BindReservedError::OverLimit));
         return false;
     };
+    // Claim the reservation before any Core work. A second channel for this
+    // label now finds it bound and is rejected as a duplicate, so it can
+    // never run an attach that replaces the route this bind creates. The
+    // claim also retires the deadline; every failure below releases the
+    // stream and retires the reservation itself.
+    if state
+        .pending_runtime
+        .admission
+        .reservations
+        .mark_bound(&label, peer_generation)
+        .is_none()
+    {
+        state.budget.release(permit);
+        let _ = reply_tx.send(Err(BindReservedError::Bound));
+        return false;
+    }
+    crate::daemon::owner_loop::retire_reservation_deadline(state, &label);
     let attach_now = tick(&mut state.logical_clock);
     let (adapter, handle) = mux.create_adapter_with_aggregate(aggregate);
     // Core attaches and binds the route in one call on the Core thread, as
@@ -555,16 +590,17 @@ fn bind_reserved_subscription(
                 &identity,
                 generation,
             );
+            // The claim taken before the Core call must still stand: a peer
+            // close forgets it, and nothing else can take a bound label.
             let reservation_bound = still_owned
                 && state
                     .pending_runtime
                     .admission
                     .reservations
-                    .mark_bound(&label, peer_generation)
-                    .is_some();
-            if reservation_bound {
-                crate::daemon::owner_loop::retire_reservation_deadline(state, &label);
-            }
+                    .reservation_for_label(&label, peer_generation)
+                    .is_some_and(|reservation| {
+                        reservation.state == crate::admission::reservations::ReservationState::Bound
+                    });
             if !reservation_bound {
                 handle.close();
                 abandon_unbound_terminal(
@@ -819,6 +855,9 @@ fn admitted_peer_generation(state: &DaemonControlState, grant_id: &str) -> Optio
     }
 }
 
+/// Expire a reservation once: release what it held and, when `announce`,
+/// report the expiry by label. The deadline announces; a late channel open
+/// does not, because its reject is that attempt's one signal.
 pub(crate) fn emit_reservation_expired(
     daemon: &mut HubDaemon,
     state: &mut DaemonControlState,
@@ -826,6 +865,7 @@ pub(crate) fn emit_reservation_expired(
     peer_generation: u64,
     label: &str,
     now: u64,
+    announce: bool,
 ) {
     let Some(reservation) =
         state
@@ -859,12 +899,14 @@ pub(crate) fn emit_reservation_expired(
         // Every class reports the expiry by label when it happens, so a
         // client needs no timer of its own. A terminal reservation has no
         // Core generation, so it sends no terminal_subscription_closed.
-        mux.push_host_event(DaemonEvent::RuntimeObservation {
-            kind: format!(
-                "subscription_channel_rejected:{}:{label}",
-                crate::transport::webrtc::subscription_channel::RESERVATION_EXPIRED_REASON
-            ),
-        });
+        if announce {
+            mux.push_host_event(DaemonEvent::RuntimeObservation {
+                kind: format!(
+                    "subscription_channel_rejected:{}:{label}",
+                    crate::transport::webrtc::subscription_channel::RESERVATION_EXPIRED_REASON
+                ),
+            });
+        }
         let event = match reservation.class {
             ChannelClass::Terminal => return,
             ChannelClass::Entity => DaemonEvent::RuntimeObservation {

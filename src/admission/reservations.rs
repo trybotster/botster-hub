@@ -316,11 +316,10 @@ impl TerminalReservationRegistry {
         if reservation.peer_generation != peer_generation {
             return None;
         }
-        if reservation.state == ReservationState::Bound {
-            return None;
-        }
-        if reservation.state == ReservationState::Live
-            && reservation.expires_at_seconds > now_seconds
+        // Only the Live -> Expired transition reports, so expiry cleanup and
+        // its signal happen once however many late attempts follow.
+        if reservation.state != ReservationState::Live
+            || reservation.expires_at_seconds > now_seconds
         {
             return None;
         }
@@ -342,6 +341,16 @@ impl TerminalReservationRegistry {
         }
         reservation.state = ReservationState::Bound;
         Some(reservation.clone())
+    }
+
+    /// Make a live reservation past due without expiring it, as if its
+    /// deadline had not run yet.
+    #[cfg(test)]
+    pub(crate) fn make_past_due_for_test(&mut self, label: &str) {
+        let key = self.by_label.get(label).expect("reserved label").clone();
+        let reservation = self.by_key.get_mut(&key).expect("reservation");
+        assert_eq!(reservation.state, ReservationState::Live);
+        reservation.expires_at_seconds = 0;
     }
 
     pub(crate) fn forget_label(&mut self, label: &str, peer_generation: u64) -> bool {

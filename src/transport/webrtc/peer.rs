@@ -3967,7 +3967,7 @@ mod tests {
         harness.spawn_on_peer(&mut peer, session_id, IDLE_ECHO);
         let peer_generation = admitted_peer_generation(&harness, &grant_id);
 
-        // Plain expiry releases the reserved stream.
+        // Plain expiry releases the reserved stream and reports it once.
         let expired = harness.reserve_attach_on_peer(&mut peer, session_id, "expiry-sub");
         crate::daemon::control::connection::emit_reservation_expired(
             &mut harness.daemon,
@@ -3976,6 +3976,7 @@ mod tests {
             peer_generation,
             &expired.label,
             u64::MAX,
+            true,
         );
         assert!(
             harness
@@ -3984,15 +3985,128 @@ mod tests {
                 .stream_identity(session_id, "expiry-sub")
                 .is_none()
         );
-        wait_for_observation(
-            &mut harness,
-            &mut peer,
-            &format!(
-                "subscription_channel_rejected:reservation_expired:{}",
-                expired.label
-            ),
+        let expired_kind = format!(
+            "subscription_channel_rejected:reservation_expired:{}",
+            expired.label
+        );
+        let count = |events: &[botster_hub_client::DaemonEvent], kind: &str| {
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        botster_hub_client::DaemonEvent::RuntimeObservation { kind: observed }
+                            if observed == kind
+                    )
+                })
+                .count()
+        };
+        let events = harness.drain_host_events(&mut peer, Duration::from_millis(500));
+        assert_eq!(
+            count(&events, &expired_kind),
+            1,
+            "one signal at expiry: {events:?}"
         );
         assert!(core_route(&harness, session_id, "expiry-sub").is_none());
+        // A second expiry pass is not a transition: nothing is repeated.
+        crate::daemon::control::connection::emit_reservation_expired(
+            &mut harness.daemon,
+            &mut harness.state,
+            &grant_id,
+            peer_generation,
+            &expired.label,
+            u64::MAX,
+            true,
+        );
+        let events = harness.drain_host_events(&mut peer, Duration::from_millis(500));
+        assert_eq!(
+            count(&events, &expired_kind),
+            0,
+            "expiry reports once: {events:?}"
+        );
+        // A late open is one attempt with one signal.
+        assert!(harness.open_reserved_expecting_reject(&mut peer, &expired.label));
+        let events = harness.drain_host_events(&mut peer, Duration::from_millis(500));
+        assert_eq!(
+            count(&events, &expired_kind),
+            1,
+            "one signal per late open: {events:?}"
+        );
+
+        // A late open that is the first to see the expiry reports it once:
+        // the transition is silent and the reject is the one signal.
+        let unnoticed = harness.reserve_attach_on_peer(&mut peer, session_id, "unnoticed-sub");
+        harness
+            .state
+            .pending_runtime
+            .admission
+            .reservations
+            .make_past_due_for_test(&unnoticed.label);
+        assert!(harness.open_reserved_expecting_reject(&mut peer, &unnoticed.label));
+        let unnoticed_kind = format!(
+            "subscription_channel_rejected:reservation_expired:{}",
+            unnoticed.label
+        );
+        let events = harness.drain_host_events(&mut peer, Duration::from_millis(500));
+        assert_eq!(
+            count(&events, &unnoticed_kind),
+            1,
+            "a first-noticed late open reports once: {events:?}"
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .stream_identity(session_id, "unnoticed-sub")
+                .is_none(),
+            "the first-noticed expiry releases the stream"
+        );
+
+        // An entity reservation expires the same way, once.
+        let entity = harness.request_on_peer(
+            &mut peer,
+            DaemonRequest::SubscribeEntities {
+                entity_type: "session".to_string(),
+                subscription_id: "expiry-entities".to_string(),
+            },
+            "SubscribeEntities",
+        );
+        let entity_label = entity
+            .subscription_reservation
+            .expect("entity reservation")
+            .label;
+        for _ in 0..2 {
+            crate::daemon::control::connection::emit_reservation_expired(
+                &mut harness.daemon,
+                &mut harness.state,
+                &grant_id,
+                peer_generation,
+                &entity_label,
+                u64::MAX,
+                true,
+            );
+        }
+        let events = harness.drain_host_events(&mut peer, Duration::from_millis(500));
+        assert_eq!(
+            count(
+                &events,
+                &format!("subscription_channel_rejected:reservation_expired:{entity_label}")
+            ),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    botster_hub_client::DaemonEvent::RuntimeObservation { kind }
+                        if kind.starts_with("entity_subscription_closed:expiry-entities:")
+                ))
+                .count(),
+            1,
+            "{events:?}"
+        );
 
         // A replacement stream on the same route is not the reservation's.
         let fenced = harness.reserve_attach_on_peer(&mut peer, session_id, "fenced-sub");
@@ -4011,6 +4125,7 @@ mod tests {
             peer_generation,
             &fenced.label,
             u64::MAX,
+            true,
         );
         assert!(
             harness
@@ -4145,6 +4260,170 @@ mod tests {
                         .stream_identity(session_id, subscription_id)
                         .is_none()
             },
+        );
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    /// Two channels for one label: the first bind claims the reservation
+    /// before its Core call, so the second is rejected as a duplicate and
+    /// cannot replace the accepted route.
+    #[test]
+    fn overlapping_terminal_binds_for_one_label_accept_exactly_one() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("webrtc-overlapping-bind");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41836");
+        harness.hello_on_peer(&mut peer, webrtc_adapter_hello());
+        let grant_id = peer.grant_id.clone();
+        let session_id = "overlap-session";
+        let subscription_id = "overlap-sub";
+        harness.spawn_on_peer(&mut peer, session_id, IDLE_ECHO);
+        let reservation = harness.reserve_attach_on_peer(&mut peer, session_id, subscription_id);
+        let peer_state = harness
+            .daemon
+            .local_webrtc()
+            .peer_states
+            .get(&grant_id)
+            .expect("live peer state")
+            .clone();
+        let mut channels = Vec::new();
+        let mut hosts = Vec::new();
+        for _ in 0..2 {
+            let channel = Arc::new(FakeDataChannel::default());
+            channel.push_event(encrypted_hello_event(
+                &peer.stream_key,
+                &webrtc_adapter_hello(),
+            ));
+            let host_channel = Arc::clone(&channel);
+            let host_peer_state = Arc::clone(&peer_state);
+            let grant_id = grant_id.clone();
+            let label = reservation.label.clone();
+            let key = peer.stream_key.clone();
+            hosts.push(harness.transport_handle.spawn(async move {
+                crate::transport::webrtc::subscription_channel::admit_reserved_subscription_channel(
+                    &grant_id,
+                    &label,
+                    host_channel.as_ref(),
+                    &key,
+                    host_peer_state.as_ref(),
+                )
+                .await;
+            }));
+            channels.push(channel);
+        }
+        harness.pump_until(
+            Instant::now() + Duration::from_secs(10),
+            "one bind to acknowledge and the other to be rejected",
+            |_| {
+                let acknowledged = channels
+                    .iter()
+                    .filter(|channel| !channel.sent.lock().expect("sent frames").is_empty())
+                    .count();
+                acknowledged == 1 && hosts.iter().any(|host| host.is_finished())
+            },
+        );
+        let acknowledged = channels
+            .iter()
+            .filter(|channel| !channel.sent.lock().expect("sent frames").is_empty())
+            .count();
+        assert_eq!(acknowledged, 1, "exactly one channel receives a HelloAck");
+        let route = core_route(&harness, session_id, subscription_id)
+            .expect("the accepted route stays in Core");
+        assert!(route.adapter_bound, "{route:?}");
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .is_adapter_bound(session_id, subscription_id),
+            "the accepted stream stays bound"
+        );
+        assert_eq!(
+            harness
+                .state
+                .pending_runtime
+                .recorded_generation(session_id, subscription_id),
+            Some(route.generation)
+        );
+        for host in hosts {
+            host.abort();
+        }
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    /// An Attach whose Core query outlived its reply timeout completes after
+    /// another Attach reserved the same route. The late completion must not
+    /// start a stream (that would cancel the live reservation's stream), and a
+    /// completion for a peer generation that no longer matches reserves
+    /// nothing.
+    #[test]
+    fn deferred_same_route_attach_completion_keeps_the_live_reservation_stream() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("webrtc-deferred-attach");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41837");
+        harness.hello_on_peer(&mut peer, webrtc_adapter_hello());
+        let grant_id = peer.grant_id.clone();
+        let session_id = "deferred-session";
+        let subscription_id = "deferred-sub";
+        harness.spawn_on_peer(&mut peer, session_id, IDLE_ECHO);
+        let peer_generation = admitted_peer_generation(&harness, &grant_id);
+        let live = harness.reserve_attach_on_peer(&mut peer, session_id, subscription_id);
+        let identity = harness
+            .state
+            .pending_runtime
+            .stream_identity(session_id, subscription_id)
+            .expect("the live reservation's stream");
+        let owner = crate::subscription::attach_routes::AttachStreamOwner {
+            client_id: identity.client_id.clone(),
+            grant_id: Some(grant_id.clone()),
+        };
+
+        let late = crate::daemon::control::sessions::reserve_webrtc_terminal(
+            &mut harness.state,
+            &owner,
+            session_id,
+            subscription_id,
+            peer_generation,
+        );
+        assert_eq!(
+            late.error.as_ref().map(|error| error.code.as_str()),
+            Some("reservation_label_conflict")
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .stream_matches(session_id, subscription_id, &identity),
+            "the live reservation keeps its stream"
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .admission
+                .reservations
+                .reservation_for_label(&live.label, peer_generation)
+                .is_some()
+        );
+
+        let stale_peer = crate::daemon::control::sessions::reserve_webrtc_terminal(
+            &mut harness.state,
+            &owner,
+            session_id,
+            "deferred-other-sub",
+            peer_generation + 1,
+        );
+        assert_eq!(
+            stale_peer.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid_request")
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .stream_identity(session_id, "deferred-other-sub")
+                .is_none(),
+            "a completion for a replaced peer starts no stream"
         );
         peer.close_offer();
         harness.cleanup();
