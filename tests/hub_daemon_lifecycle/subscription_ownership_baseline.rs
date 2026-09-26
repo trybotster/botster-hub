@@ -2,7 +2,7 @@
 // These pin current Hub behavior so later tickets show an intentional change.
 // They must not change transport behavior.
 
-const LOCKED_CORE_REV: &str = "ac35e32d7d5703178c56aff95f6904c9b1ce3b53";
+const LOCKED_CORE_REV: &str = "67217e11f62ee12e3e681c32430c2b5fe754e136";
 
 fn hub_source(relative: &str) -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
