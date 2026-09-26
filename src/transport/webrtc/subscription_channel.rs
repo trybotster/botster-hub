@@ -1368,11 +1368,15 @@ mod tests {
     }
 
     /// The high mark is a high-water mark: a frame larger than the mark is
-    /// delivered on an idle peer, and the next frame waits for the drain.
+    /// delivered on an idle peer, and the next oversize frame waits for the
+    /// drain. The transport's only drain event is a channel crossing down to
+    /// its low threshold, so that event must resume the waiter even though
+    /// bytes at the threshold remain, and a small sibling that never crossed
+    /// it holds bytes with no event of its own.
     #[test]
     fn an_oversize_frame_on_an_idle_peer_is_delivered_and_the_next_waits_for_the_drain() {
         use crate::admission::connection_budget::{
-            AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
+            AGGREGATE_BUFFERED_HIGH, CHANNEL_DRAINED_BYTES, ChannelClass, ConnectionBudget,
         };
         use crate::transport::webrtc::delivery::{
             LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES, sealed_terminal_wire_len,
@@ -1381,6 +1385,9 @@ mod tests {
         let usage = budget
             .reserve("route".to_string(), ChannelClass::Terminal)
             .expect("reserve route");
+        let sibling_usage = budget
+            .reserve("sibling".to_string(), ChannelClass::Terminal)
+            .expect("reserve sibling");
         let mux = WebRtcConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
         mux.register("s".into(), "route".into(), 1, handle.clone());
@@ -1394,10 +1401,14 @@ mod tests {
         assert!(wire_len > AGGREGATE_BUFFERED_HIGH);
         assert_eq!(budget.aggregate_buffered(), 0);
         assert_eq!(adapter.try_write(&oversize), Ok(()));
+        // A small sibling sends meanwhile. Published at its send and never
+        // above its low threshold, so the transport reports nothing further
+        // for it.
+        sibling_usage.store(1024, Ordering::Release);
         // Above the mark, nothing more is authorized.
-        let small = test_frame(b"next");
+        let next_frame = oversize.clone();
         assert_eq!(
-            next.try_write(&small),
+            next.try_write(&next_frame),
             Err(TerminalAdapterWriteError::WouldBlock)
         );
         assert!(next_handle.aggregate_blocked_for_test());
@@ -1419,16 +1430,20 @@ mod tests {
                 .div_ceil(LOCAL_WEBRTC_CHUNK_PAYLOAD_BYTES)
         );
         assert_eq!(sent.iter().map(Vec::len).sum::<usize>(), wire_len);
-        assert_eq!(budget.aggregate_buffered(), wire_len);
+        assert_eq!(budget.aggregate_buffered(), wire_len + 1024);
         mux.refresh_aggregate_pressure();
         assert!(
             next_handle.aggregate_blocked_for_test(),
             "the next frame waits while the oversize frame is buffered"
         );
 
-        // A drain event: the driver publishes the drained usage, then
-        // refreshes the peer's routes.
-        channel.outstanding_bytes.store(0, Ordering::Release);
+        // The drain event: the channel crosses down to its low threshold
+        // (rtc-sctp fires once, as old > threshold and new <= threshold),
+        // and the driver's event arm publishes usage, then refreshes the
+        // peer's routes. Bytes at the threshold remain.
+        channel
+            .outstanding_bytes
+            .store(CHANNEL_DRAINED_BYTES, Ordering::Release);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1443,7 +1458,7 @@ mod tests {
                     .expect("the drain wakes the waiting frame");
             });
         assert!(!next_handle.aggregate_blocked_for_test());
-        assert_eq!(next.try_write(&small), Ok(()));
+        assert_eq!(next.try_write(&next_frame), Ok(()));
     }
 
     /// A write the aggregate refuses waits, and capacity released outside
@@ -1728,8 +1743,17 @@ mod tests {
             .expect("reserve route");
         let mux = WebRtcConnectionMux::new();
         let (mut adapter, handle) = mux.create_adapter_with_aggregate(budget.aggregate());
-        // Four sealed chunks: the fake accepts the first and hangs the second.
-        assert_eq!(adapter.try_write(&test_frame(&vec![b'x'; 40_000])), Ok(()));
+        // Six sealed chunks: the fake accepts the first and hangs the second.
+        // The frame's sealed bytes exceed one channel's drained mark, so the
+        // admission below counts them rather than the quiescent exception,
+        // and the frame stays within the chunk reassembly limit used below.
+        let frame = test_frame(&vec![b'x'; 65_532]);
+        assert!(
+            crate::transport::webrtc::delivery::sealed_terminal_wire_len(frame.frame.len())
+                .expect("wire len")
+                > crate::admission::connection_budget::CHANNEL_DRAINED_BYTES
+        );
+        assert_eq!(adapter.try_write(&frame), Ok(()));
         let channel = Arc::new(FakeDataChannel::default());
         channel.hang_after_first_send.store(true, Ordering::Release);
         channel.usage_hangs.store(true, Ordering::Release);
