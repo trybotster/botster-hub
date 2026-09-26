@@ -40,6 +40,8 @@ sha2 = "=0.11.0"
 semver = "1.0.28"
 signal-hook = "0.4.4"
 shell-words = "1.1.1"
+# Reads [package].name of a source-update checkout; already locked through proc-macro-crate.
+toml_edit = { version = "=0.25.12", default-features = false, features = ["parse"] }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 webrtc = "0.21.0-rc.1"
 bytes = "1.12.0"

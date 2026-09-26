@@ -103,6 +103,45 @@ pub fn installation_identity() -> DaemonInstallationIdentity {
     resolve_receipt().identity
 }
 
+/// Why this installation refuses a source update. The source update builds
+/// a checkout in place, so it runs only on a development installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceUpdateRefusal {
+    pub reason: &'static str,
+    pub action: &'static str,
+}
+
+impl std::fmt::Display for SourceUpdateRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "hub source update is unavailable on this installation (reason={}, action={})",
+            self.reason, self.action
+        )
+    }
+}
+
+/// The refusal for this installation, or `None` on a development one. It
+/// resolves the same identity `CheckHubUpdate` reports.
+#[must_use]
+pub fn source_update_refusal() -> Option<SourceUpdateRefusal> {
+    source_update_refusal_for(installation_identity().mode)
+}
+
+fn source_update_refusal_for(mode: DaemonInstallationMode) -> Option<SourceUpdateRefusal> {
+    match mode {
+        DaemonInstallationMode::Development => None,
+        DaemonInstallationMode::Managed => Some(SourceUpdateRefusal {
+            reason: "managed_installation",
+            action: "managed_release",
+        }),
+        DaemonInstallationMode::Unmanaged => Some(SourceUpdateRefusal {
+            reason: "unmanaged_installation",
+            action: "manual",
+        }),
+    }
+}
+
 type StatusIdentity = (
     DaemonSoftwareIdentity,
     DaemonInstallationIdentity,
@@ -1069,6 +1108,37 @@ mod tests {
         assert_eq!(
             fixture.resolve().identity.mode,
             DaemonInstallationMode::Managed
+        );
+    }
+
+    /// Unit level only for Unmanaged: a release binary classifies as
+    /// Unmanaged, and no test binary is one, so its entry points are not
+    /// exercised end to end.
+    #[test]
+    fn source_update_runs_only_on_a_development_installation() {
+        assert_eq!(
+            source_update_refusal_for(DaemonInstallationMode::Development),
+            None
+        );
+        assert_eq!(
+            source_update_refusal_for(DaemonInstallationMode::Managed),
+            Some(SourceUpdateRefusal {
+                reason: "managed_installation",
+                action: "managed_release",
+            })
+        );
+        assert_eq!(
+            source_update_refusal_for(DaemonInstallationMode::Unmanaged),
+            Some(SourceUpdateRefusal {
+                reason: "unmanaged_installation",
+                action: "manual",
+            })
+        );
+        // The unmanaged classification is the release-build fallback.
+        let (mode, _) = fallback_installation(false);
+        assert_eq!(
+            source_update_refusal_for(mode).map(|refusal| refusal.reason),
+            Some("unmanaged_installation")
         );
     }
 

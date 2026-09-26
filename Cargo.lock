@@ -462,6 +462,7 @@ dependencies = [
  "shell-words",
  "signal-hook",
  "tokio",
+ "toml_edit",
  "ureq",
  "webrtc",
 ]
