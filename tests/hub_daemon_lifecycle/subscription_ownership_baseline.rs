@@ -160,14 +160,19 @@ fn webrtc_dedicated_channels_carry_control_entity_event_and_terminal_frames() {
         peer.encrypted_hello(&key, &webrtc_package_event_hello())
             .await
             .expect("hello");
-        spawn_and_bind_webrtc(
+        // The marker is printed only after input arrives on the bound route,
+        // so it is live output on that route whatever the attach timing.
+        let (_terminal, terminal_label) = spawn_and_bind_webrtc_channel_with_label(
             &mut peer,
             &key,
             session_id,
             subscription_id,
-            "printf 'so-4cls-ready\\n'; sleep 30",
+            "IFS= read -r go; printf 'so-4cls-ready\\n'; sleep 30",
         )
         .await;
+        peer.send_terminal_input(&key, &terminal_label, &terminal_input_frame_bytes(b"go\r"))
+            .await
+            .expect("release the marker through the bound terminal route");
         let entities = peer
             .encrypted_request(
                 &key,
