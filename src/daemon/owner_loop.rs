@@ -202,6 +202,7 @@ fn run_reservation_deadline_item(
         deadline.peer_generation,
         &deadline.label,
         crate::admission::reservations::now_seconds(),
+        true,
     );
     true
 }

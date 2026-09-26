@@ -58,7 +58,13 @@ use crate::subscription::route_cleanup::{
 /// Reserve one WebRTC terminal channel for a running session: the route key,
 /// the Hub attach stream, the labeled reservation, its channel budget, and
 /// its deadline. Every failure releases what this call took.
-fn reserve_webrtc_terminal(
+///
+/// This runs in the owner turn that completes the Attach's Core query, so it
+/// rechecks what that query's wait could have changed (peer admission and
+/// generation, the peer's budget permit, and a live reservation for the same
+/// route) before it starts a stream: starting one would cancel another
+/// attach's stream on this route.
+pub(crate) fn reserve_webrtc_terminal(
     state: &mut DaemonControlState,
     owner: &AttachStreamOwner,
     session_id: &str,
@@ -68,6 +74,44 @@ fn reserve_webrtc_terminal(
     let session_id = session_id.to_string();
     let subscription_id = subscription_id.to_string();
     let owner = owner.clone();
+    let Some(grant_id) = owner.grant_id.clone() else {
+        return super::attach_bind_operator_error(
+            "invalid_request",
+            "Attach requires an admitted WebRTC adapter",
+        );
+    };
+    let admitted = matches!(
+        state.pending_runtime.admission.webrtc_admissions.get(&grant_id),
+        Some(WebrtcTerminalAdmission::Admitted {
+            peer_generation: current,
+            ..
+        }) if *current == peer_generation
+    );
+    if !admitted {
+        return super::attach_bind_operator_error(
+            "invalid_request",
+            "Attach requires an admitted WebRTC adapter",
+        );
+    }
+    if !state.budget.peer_holds_permit(&grant_id) {
+        return owner_budget_error();
+    }
+    if state
+        .pending_runtime
+        .admission
+        .reservations
+        .has_live_for_route(
+            &session_id,
+            &subscription_id,
+            peer_generation,
+            now_seconds(),
+        )
+    {
+        return super::attach_bind_operator_error(
+            "reservation_label_conflict",
+            "a live reservation already exists for this route",
+        );
+    }
     let route = reserve_attach_route(
         &mut state.pending_runtime,
         &owner,

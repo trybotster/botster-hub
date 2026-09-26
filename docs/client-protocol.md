@@ -1843,8 +1843,9 @@ The browser sends the encrypted `ClientFrame::Hello` on the new channel. Hub
 binds only a live reservation for the current peer generation and matching
 channel class. Expiry and late open follow the terminal rules above: Hub
 sends `subscription_channel_rejected:reservation_expired:<label>` on the
-control channel and closes a late channel. Unknown labels close without an
-event. A live reservation conflict on Attach returns
+control channel and closes a late channel. A channel with an unknown label
+is closed after a `subscription_channel_rejected:unreserved:<label>`
+observation. A live reservation conflict on Attach returns
 `reservation_label_conflict`.
 
 Hub sends entity frames only on the entity subscription channel, as

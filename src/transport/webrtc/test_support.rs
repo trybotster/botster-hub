@@ -507,6 +507,21 @@ impl TestOfferPeer {
             .push_back(serde_json::from_slice(plaintext).expect("parse daemon event"));
     }
 
+    /// Every host event that arrives until none arrives for `quiet`.
+    pub(crate) async fn drain_host_events(
+        &mut self,
+        key: &AesGcmKey,
+        quiet: Duration,
+    ) -> Vec<DaemonEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) =
+            timeout(webrtc_runtime().as_ref(), quiet, self.next_host_event(key)).await
+        {
+            events.push(event);
+        }
+        events
+    }
+
     pub(crate) async fn next_host_event(&mut self, key: &AesGcmKey) -> DaemonEvent {
         if let Some(event) = self.pending_host_events.pop_front() {
             return event;
@@ -1211,6 +1226,53 @@ impl PeerHarness {
         worker.join().expect("request worker joins");
         peer.offer_peer = Some(offer_peer);
         response
+    }
+
+    /// Host events delivered to the peer until none arrives for `quiet`,
+    /// handling owner messages meanwhile.
+    pub(crate) fn drain_host_events(
+        &mut self,
+        peer: &mut LiveSignaledPeer,
+        quiet: Duration,
+    ) -> Vec<DaemonEvent> {
+        let key = peer.stream_key.clone();
+        let mut offer_peer = peer
+            .offer_peer
+            .take()
+            .expect("offer peer available for host events");
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let offer_handle = peer.offer_runtime.handle().clone();
+        let worker = thread::spawn(move || {
+            let events = offer_handle.block_on(offer_peer.drain_host_events(&key, quiet));
+            response_tx
+                .send((offer_peer, events))
+                .expect("return drained host events");
+        });
+        let (offer_peer, events) = loop {
+            if let Ok(result) = response_rx.try_recv() {
+                break result;
+            }
+            match self.try_receive_owner_message() {
+                Ok(message) => {
+                    handle_control_message(
+                        &mut self.daemon,
+                        &mut self.state,
+                        &self.transport_handle,
+                        self.control_tx.clone(),
+                        message,
+                    );
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("control channel closed while draining host events");
+                }
+            }
+        };
+        worker.join().expect("host event drain worker joins");
+        peer.offer_peer = Some(offer_peer);
+        events
     }
 
     pub(crate) fn wait_for_host_event(
