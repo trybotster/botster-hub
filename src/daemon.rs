@@ -189,10 +189,6 @@ impl HubDaemon {
         }
     }
 
-    pub(crate) fn replace_state(&mut self, state: SharedView<HubState>) {
-        self.publish_state(state);
-    }
-
     /// Return the current shared state allocation and its owner revision.
     pub(crate) fn state_view(&self) -> (u64, SharedView<HubState>) {
         self.state.snapshot()

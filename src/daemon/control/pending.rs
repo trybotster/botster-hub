@@ -385,24 +385,6 @@ impl ControlStep {
             ready_class: ReadyClass::CoreCompletion,
         })
     }
-
-    pub(crate) fn pending_retirable_in(
-        ready_class: ReadyClass,
-        continuation: impl FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll
-        + Send
-        + 'static,
-        retire: impl FnOnce(&mut HubDaemon, &mut DaemonControlState, WaiterId, OwnerPermit)
-        + Send
-        + 'static,
-    ) -> Self {
-        Self::Pending(PendingStep {
-            continuation: crate::daemon::control::pending::ControlContinuation::callback(
-                continuation,
-            ),
-            retire: Some(Box::new(retire)),
-            ready_class,
-        })
-    }
 }
 
 impl From<DaemonTransportResult<DaemonResponse>> for ControlStep {
