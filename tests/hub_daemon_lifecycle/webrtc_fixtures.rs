@@ -445,44 +445,47 @@ impl WebrtcInboundMailbox {
         &mut self,
         key: &AesGcmKey,
     ) -> Result<(FixtureDelivery, LocalWebrtcResponseMetrics), Box<dyn std::error::Error>> {
+        // timer: deadline — the fixture's 10 s receive budget; a delivery or a closed channel ends the normal wait.
+        match timeout(
+            webrtc_runtime().as_ref(),
+            Duration::from_secs(10),
+            self.next_delivery(key),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(self.progress_error("timeout")),
+        }
+    }
+
+    fn progress_error(&mut self, reason: &str) -> Box<dyn std::error::Error> {
+        let progress = self.reassembly.take();
+        local_webrtc_response_progress_error(
+            reason,
+            progress.as_ref().and_then(|row| row.message_id.as_deref()),
+            progress
+                .as_ref()
+                .map(|row| row.next_chunk_index)
+                .unwrap_or(0),
+            progress.as_ref().and_then(|row| row.expected_chunk_count),
+        )
+        .into()
+    }
+
+    /// Waits for the next complete delivery with no deadline. Cancel-safe:
+    /// the only await is the channel receive, and reassembly state lives in
+    /// the mailbox, so a caller may drop this future between messages.
+    async fn next_delivery(
+        &mut self,
+        key: &AesGcmKey,
+    ) -> Result<(FixtureDelivery, LocalWebrtcResponseMetrics), Box<dyn std::error::Error>> {
         loop {
-            let message = match timeout(
-                webrtc_runtime().as_ref(),
-                Duration::from_secs(10),
-                self.rx.recv(),
-            )
-            .await
-            {
-                Ok(Some(message)) => {
+            let message = match self.rx.recv().await {
+                Some(message) => {
                     self.occupancy.record_pop(message.len() as u64);
                     message
                 }
-                Ok(None) => {
-                    let progress = self.reassembly.take();
-                    return Err(local_webrtc_response_progress_error(
-                        "channel_closed",
-                        progress.as_ref().and_then(|row| row.message_id.as_deref()),
-                        progress
-                            .as_ref()
-                            .map(|row| row.next_chunk_index)
-                            .unwrap_or(0),
-                        progress.as_ref().and_then(|row| row.expected_chunk_count),
-                    )
-                    .into());
-                }
-                Err(_) => {
-                    let progress = self.reassembly.take();
-                    return Err(local_webrtc_response_progress_error(
-                        "timeout",
-                        progress.as_ref().and_then(|row| row.message_id.as_deref()),
-                        progress
-                            .as_ref()
-                            .map(|row| row.next_chunk_index)
-                            .unwrap_or(0),
-                        progress.as_ref().and_then(|row| row.expected_chunk_count),
-                    )
-                    .into());
-                }
+                None => return Err(self.progress_error("channel_closed")),
             };
             match message {
                 InboundMessage::Text(response) => {
@@ -920,24 +923,16 @@ impl LocalWebrtcOfferPeer {
         .await
         .map_err(|_| std::io::Error::other("timed out waiting for WebRTC connection"))?;
         if let Some(extra_open_rx) = extra_open_rx {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut opened = false;
-            while Instant::now() < deadline && !opened {
-                opened = timeout(
-                    webrtc_runtime().as_ref(),
-                    Duration::from_millis(50),
-                    self.data_channel_open_rx.recv(),
-                )
-                .await
-                .is_ok()
-                    || timeout(
-                        webrtc_runtime().as_ref(),
-                        Duration::from_millis(50),
-                        extra_open_rx.recv(),
-                    )
-                    .await
-                    .is_ok();
-            }
+            let data_channel_open_rx = &mut self.data_channel_open_rx;
+            // timer: deadline — 10 s for either offerer DataChannel to open; the first open event ends the normal wait.
+            let opened = timeout(webrtc_runtime().as_ref(), Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = data_channel_open_rx.recv() => {}
+                    _ = extra_open_rx.recv() => {}
+                }
+            })
+            .await
+            .is_ok();
             if !opened {
                 return Err(std::io::Error::other(
                     "timed out waiting for either offerer DataChannel to open",
@@ -1549,48 +1544,79 @@ impl LocalWebrtcOfferPeer {
             return Err(std::io::Error::other("no reserved subscription channel").into());
         }
         loop {
-            let mut index = 0;
-            while index < self.subscription_inbounds.len() {
-                match timeout(
-                    webrtc_runtime().as_ref(),
-                    Duration::from_millis(50),
-                    self.subscription_inbounds[index].receive_delivery(key),
-                )
-                .await
-                {
-                    Ok(Ok(delivery)) => {
-                        if let FixtureDelivery::Terminal { generation, .. } = &delivery.0 {
-                            let label = self.subscription_labels[index].clone();
-                            self.route_generations.insert(label.clone(), *generation);
-                            self.last_terminal_label = label;
-                        }
-                        return Ok(delivery);
-                    }
-                    Ok(Err(error)) => {
-                        let label = self.subscription_labels.remove(index);
-                        assert!(
-                            self.subscription_receive_errors.len() < 256,
-                            "subscription receive errors exceeded the fixture storage bound: label={label}; error={error}"
-                        );
-                        self.subscription_receive_errors
-                            .push((label, error.to_string()));
-                        self.subscription_channels.remove(index);
-                        self.subscription_inbounds.remove(index);
-                    }
-                    Err(_) => index += 1,
-                }
-            }
-            if let Ok(delivery) = timeout(
+            // timer: deadline — the fixture's 10 s receive budget across every inbound; a delivery ends the normal wait.
+            let Ok((source, result)) = timeout(
                 webrtc_runtime().as_ref(),
-                Duration::from_millis(50),
-                self.inbound.receive_delivery(key),
+                Duration::from_secs(10),
+                next_delivery_from_any(&mut self.subscription_inbounds, &mut self.inbound, key),
             )
             .await
-            {
-                return delivery;
+            else {
+                return Err(std::io::Error::other(
+                    "timed out waiting for a subscription or control delivery",
+                )
+                .into());
+            };
+            let Some(index) = source else {
+                return result;
+            };
+            match result {
+                Ok(delivery) => {
+                    if let FixtureDelivery::Terminal { generation, .. } = &delivery.0 {
+                        let label = self.subscription_labels[index].clone();
+                        self.route_generations.insert(label.clone(), *generation);
+                        self.last_terminal_label = label;
+                    }
+                    return Ok(delivery);
+                }
+                Err(error) => {
+                    let label = self.subscription_labels.remove(index);
+                    assert!(
+                        self.subscription_receive_errors.len() < 256,
+                        "subscription receive errors exceeded the fixture storage bound: label={label}; error={error}"
+                    );
+                    self.subscription_receive_errors
+                        .push((label, error.to_string()));
+                    self.subscription_channels.remove(index);
+                    self.subscription_inbounds.remove(index);
+                }
             }
         }
     }
+}
+
+type DeliveryResult =
+    Result<(FixtureDelivery, LocalWebrtcResponseMetrics), Box<dyn std::error::Error>>;
+
+/// Waits for the first delivery on any subscription mailbox or the control
+/// mailbox. Subscription mailboxes are polled first, as before. Every losing
+/// receive is dropped, which is safe because `next_delivery` is cancel-safe.
+async fn next_delivery_from_any(
+    subscriptions: &mut [WebrtcInboundMailbox],
+    control: &mut WebrtcInboundMailbox,
+    key: &AesGcmKey,
+) -> (Option<usize>, DeliveryResult) {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    let mut receives: Vec<Pin<Box<dyn Future<Output = DeliveryResult> + '_>>> = subscriptions
+        .iter_mut()
+        .map(|mailbox| Box::pin(mailbox.next_delivery(key)) as _)
+        .collect();
+    let mut control_receive = Box::pin(control.next_delivery(key));
+    std::future::poll_fn(|cx| {
+        for (index, receive) in receives.iter_mut().enumerate() {
+            if let Poll::Ready(result) = receive.as_mut().poll(cx) {
+                return Poll::Ready((Some(index), result));
+            }
+        }
+        if let Poll::Ready(result) = control_receive.as_mut().poll(cx) {
+            return Poll::Ready((None, result));
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 #[derive(Debug)]
