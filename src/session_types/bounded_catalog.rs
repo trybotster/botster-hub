@@ -1475,10 +1475,13 @@ fn build_row(winner: &SourceRef<'_>, peers: &[SourceRef<'_>], target_id: &str) -
     }
 }
 
+/// Repository catalog definitions, grouped by the target root they came from.
+type RepoCatalogFiles<'a> = Vec<(&'a str, Vec<RepoCatalogDefinition>)>;
+
 fn collect_repo_files<'a>(
     state: &'a HubState,
     budget: &mut Budget,
-) -> SessionTypeResult<Option<Vec<(&'a str, Vec<RepoCatalogDefinition>)>>> {
+) -> SessionTypeResult<Option<RepoCatalogFiles<'a>>> {
     let count = state
         .spawn_targets
         .iter()
