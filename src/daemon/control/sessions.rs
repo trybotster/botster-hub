@@ -55,6 +55,116 @@ use crate::subscription::route_cleanup::{
 
 /// Typed operator error for one Core failure on a session request.
 /// Operator-facing text for one attach-and-bind failure, with the Core cause.
+/// Reserve one WebRTC terminal channel for a running session: the route key,
+/// the Hub attach stream, the labeled reservation, its channel budget, and
+/// its deadline. Every failure releases what this call took.
+fn reserve_webrtc_terminal(
+    state: &mut DaemonControlState,
+    owner: &AttachStreamOwner,
+    session_id: &str,
+    subscription_id: &str,
+    peer_generation: u64,
+) -> DaemonResponse {
+    let session_id = session_id.to_string();
+    let subscription_id = subscription_id.to_string();
+    let owner = owner.clone();
+    let route = reserve_attach_route(
+        &mut state.pending_runtime,
+        &owner,
+        &session_id,
+        &subscription_id,
+    );
+    if route == RouteReservation::Full {
+        return attach_route_limit_error();
+    }
+    let identity = state.pending_runtime.start_attach(
+        owner.clone(),
+        session_id.clone(),
+        subscription_id.clone(),
+    );
+    let reserved = state.pending_runtime.admission.reservations.reserve(
+        session_id.clone(),
+        subscription_id.clone(),
+        peer_generation,
+        now_seconds(),
+        owner.clone(),
+        identity.clone(),
+        route,
+    );
+    let response = match reserved {
+        Ok(reservation) => {
+            let budget_result = state
+                .pending_runtime
+                .admission
+                .connection_budgets
+                .get_mut(&peer_generation)
+                .ok_or(crate::admission::connection_budget::ChannelBudgetError::ChannelLimit)
+                .and_then(|budget| {
+                    budget
+                        .reserve(
+                            reservation.label.clone(),
+                            crate::admission::connection_budget::ChannelClass::Terminal,
+                        )
+                        .map(|_| ())
+                });
+            if budget_result.is_err() {
+                let _ = state
+                    .pending_runtime
+                    .admission
+                    .reservations
+                    .forget_label(&reservation.label, peer_generation);
+                Err(super::attach_bind_operator_error(
+                    "connection_channel_limit",
+                    "the WebRTC connection channel budget rejected the reservation",
+                ))
+            } else if crate::daemon::owner_loop::arm_reservation_deadline(
+                state,
+                reservation.label.clone(),
+                peer_generation,
+                reservation.expires_in_seconds,
+            ) {
+                Ok(daemon_terminal_reservation(reservation))
+            } else {
+                if let Some(budget) = state
+                    .pending_runtime
+                    .admission
+                    .connection_budgets
+                    .get_mut(&peer_generation)
+                {
+                    let _ = budget.release(&reservation.label);
+                }
+                let _ = state
+                    .pending_runtime
+                    .admission
+                    .reservations
+                    .forget_label(&reservation.label, peer_generation);
+                Err(super::attach_bind_operator_error(
+                    "owner_budget_exhausted",
+                    "the daemon exhausted unique owner waiter identifiers",
+                ))
+            }
+        }
+        Err(ReserveError::LabelConflict) => Err(super::attach_bind_operator_error(
+            "reservation_label_conflict",
+            "a live reservation already exists for this route",
+        )),
+    };
+    match response {
+        Ok(response) => response,
+        Err(error) => {
+            crate::daemon::control::connection::abandon_unbound_terminal(
+                state,
+                &owner,
+                &identity,
+                route,
+                &session_id,
+                &subscription_id,
+            );
+            error
+        }
+    }
+}
+
 fn attach_bind_failure_message(failure: &AttachBindFailure) -> String {
     match failure {
         AttachBindFailure::Attach(error) => {
@@ -1592,100 +1702,53 @@ fn handle_attach(
         if !holds_permit {
             return ControlStep::ready(owner_budget_error());
         }
-        // A WebRTC attach does no Core work. It reserves the route key, opens
-        // the Hub attach stream, and reserves a labeled channel. Core attaches
-        // and binds the route in one call when that channel's Hello arrives,
-        // so a busy session cannot overflow a route that has no adapter yet.
-        let route = reserve_attach_route(pending_runtime, &owner, &session_id, &subscription_id);
-        if route == RouteReservation::Full {
-            return ControlStep::ready(attach_route_limit_error());
-        }
-        let identity = state.pending_runtime.start_attach(
-            owner.clone(),
-            session_id.clone(),
-            subscription_id.clone(),
+        // A WebRTC attach declares nothing in Core. One read-only Core query
+        // rejects a session that is not running before anything is reserved;
+        // a session that ends before its channel binds gets the channel's
+        // bind_failed reject. Core attaches and binds the route in one call
+        // when the reserved channel's Hello arrives, so a busy session cannot
+        // overflow a route that has no adapter yet.
+        let runtime = daemon.runtime().expect("runtime checked by caller");
+        let lookup = SessionId(session_id.clone());
+        let mut ticket = runtime.submit_core_for_owner(
+            state.current_waiter_id.expect("owner waiter is assigned"),
+            move |daemon| daemon.session_registry_state(&lookup),
         );
-        let reserved = state.pending_runtime.admission.reservations.reserve(
-            session_id.clone(),
-            subscription_id.clone(),
-            peer_generation,
-            now_seconds(),
-            owner.clone(),
-            identity.clone(),
-            route,
-        );
-        let response = match reserved {
-            Ok(reservation) => {
-                let budget_result = state
-                    .pending_runtime
-                    .admission
-                    .connection_budgets
-                    .get_mut(&peer_generation)
-                    .ok_or(crate::admission::connection_budget::ChannelBudgetError::ChannelLimit)
-                    .and_then(|budget| {
-                        budget
-                            .reserve(
-                                reservation.label.clone(),
-                                crate::admission::connection_budget::ChannelClass::Terminal,
-                            )
-                            .map(|_| ())
-                    });
-                if budget_result.is_err() {
-                    let _ = state
-                        .pending_runtime
-                        .admission
-                        .reservations
-                        .forget_label(&reservation.label, peer_generation);
-                    Err(super::attach_bind_operator_error(
-                        "connection_channel_limit",
-                        "the WebRTC connection channel budget rejected the reservation",
-                    ))
-                } else if crate::daemon::owner_loop::arm_reservation_deadline(
-                    state,
-                    reservation.label.clone(),
-                    peer_generation,
-                    reservation.expires_in_seconds,
-                ) {
-                    Ok(daemon_terminal_reservation(reservation))
-                } else {
-                    if let Some(budget) = state
-                        .pending_runtime
-                        .admission
-                        .connection_budgets
-                        .get_mut(&peer_generation)
-                    {
-                        let _ = budget.release(&reservation.label);
-                    }
-                    let _ = state
-                        .pending_runtime
-                        .admission
-                        .reservations
-                        .forget_label(&reservation.label, peer_generation);
-                    Err(super::attach_bind_operator_error(
-                        "owner_budget_exhausted",
-                        "the daemon exhausted unique owner waiter identifiers",
-                    ))
+        return ControlStep::pending(move |_, state| {
+            let refusal = match ticket.poll() {
+                CoreTicketPoll::Pending => return ControlPoll::Pending,
+                CoreTicketPoll::Ready(Ok(
+                    botster_core_daemon::SessionRegistryStateLookup::Found(
+                        botster_core_daemon::RegistrySessionState::Running,
+                    ),
+                )) => None,
+                CoreTicketPoll::Ready(Ok(_)) => Some(format!(
+                    "attach failed before adapter bind: session {session_id} is not running"
+                )),
+                CoreTicketPoll::Ready(Err(error)) => {
+                    Some(format!("attach failed before adapter bind: {error}"))
                 }
+                CoreTicketPoll::Lost => Some(attach_bind_failure_message(
+                    &AttachBindFailure::Attach(CoreDaemonError::Shutdown),
+                )),
+                CoreTicketPoll::Refused => Some(attach_bind_failure_message(
+                    &AttachBindFailure::Attach(core_bridge_error(CoreTicketError::Overloaded)),
+                )),
+            };
+            if let Some(message) = refusal {
+                return ControlPoll::Ready(Ok(super::attach_bind_operator_error(
+                    "invalid_request",
+                    &message,
+                )));
             }
-            Err(ReserveError::LabelConflict) => Err(super::attach_bind_operator_error(
-                "reservation_label_conflict",
-                "a live reservation already exists for this route",
-            )),
-        };
-        return match response {
-            Ok(response) => ControlStep::ready(response),
-            Err(error) => {
-                crate::daemon::control::connection::abandon_unbound_terminal(
-                    state,
-                    &owner,
-                    &identity,
-                    route,
-                    &session_id,
-                    &subscription_id,
-                );
-                ControlStep::ready(error)
-            }
-        };
+            ControlPoll::Ready(Ok(reserve_webrtc_terminal(
+                state,
+                &owner,
+                &session_id,
+                &subscription_id,
+                peer_generation,
+            )))
+        });
     }
     let Some(UnixTerminalAdmission::Admitted {
         capabilities, mux, ..

@@ -1339,7 +1339,7 @@ fn webrtc_terminal_adapter_stale_generation_close_does_not_sweep_replacement_own
 }
 
 #[test]
-fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_9() {
+fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_10() {
     let requirement = botster_hub_client::DaemonCompatibilityRequirement::current();
     let mut previous = botster_hub_client::DaemonCompatibility::current();
     previous
@@ -1359,7 +1359,7 @@ fn webrtc_terminal_adapter_close_event_feature_stays_optional_on_protocol_9() {
     assert_eq!(botster_hub_client::PROTOCOL_VERSION, 10);
     assert_eq!(
         botster_hub_client::DEFAULT_MINIMUM_CONFORMANCE_FIXTURE_REVISION,
-        49
+        50
     );
     const _: () = assert!(botster_hub_client::CONFORMANCE_FIXTURE_REVISION >= 45);
 }
