@@ -1126,8 +1126,10 @@ mod tests {
         );
     }
 
+    /// Core resyncs a stalled route once; a second full attempt budget with no
+    /// successful write ends it, and the Hub retires the route.
     #[test]
-    fn sustained_aggregate_pressure_reaches_core_hard_stop_and_retires_route() {
+    fn sustained_aggregate_pressure_resyncs_then_reaches_core_hard_stop_and_retires_route() {
         use crate::admission::connection_budget::{
             AGGREGATE_BUFFERED_HIGH, ChannelClass, ConnectionBudget,
         };
@@ -1203,10 +1205,31 @@ mod tests {
         assert!(worker.filter_bound_terminal_frames(&mut egress).is_empty());
         assert!(egress.is_empty());
 
-        for attempt in 1..512 {
+        // The first exhausted budget is a stall resync: the route stays, and
+        // Core asks for a fresh capture of exactly this route.
+        for attempt in 1..=512 {
             assert!(
                 worker.pump_woken(&route_only).is_empty(),
                 "attempt {attempt} must retain the Core route"
+            );
+            assert!(worker.has_subscription(&session_id, &subscription_id));
+            assert!(!handle.is_closed());
+            if attempt < 512 {
+                assert!(
+                    worker.take_resync_requests().is_empty(),
+                    "attempt {attempt} is inside the first budget"
+                );
+            }
+        }
+        let resyncs = worker.take_resync_requests();
+        assert_eq!(resyncs.len(), 1, "the exhausted budget resyncs once");
+        assert_eq!(resyncs[0].session_id, session_id);
+        assert_eq!(resyncs[0].subscription_id, subscription_id);
+        // No write succeeds after the resync: the next exhausted budget ends it.
+        for attempt in 1..512 {
+            assert!(
+                worker.pump_woken(&route_only).is_empty(),
+                "attempt {attempt} after the resync must retain the Core route"
             );
             assert!(worker.has_subscription(&session_id, &subscription_id));
         }
