@@ -4432,11 +4432,6 @@ impl HubRuntime {
 
     /// Read hub-owned context by context id or session id.
     #[must_use]
-    /// Shared handle to the session context map for deferred completions.
-    pub(crate) fn session_contexts_handle(&self) -> SharedSessionContexts {
-        Arc::clone(&self.session_contexts)
-    }
-
     pub fn session_context(&self, id: &str) -> Option<HubSessionContext> {
         self.session_contexts
             .lock()
@@ -4467,30 +4462,6 @@ impl HubRuntime {
         self.core_daemon.submit_for_owner(waiter_id, move |daemon| {
             attach_and_bind_on_core(daemon, plan)
         })
-    }
-
-    /// Attach one route without an adapter. Core holds the route's frames
-    /// until [`Self::bind_route_adapter`] binds one (WebRTC reserved channel).
-    pub(crate) fn attach_route(
-        &self,
-        client_id: ClientId,
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        now_seconds: u64,
-    ) -> CoreTicket<Result<TerminalSubscriptionGeneration, AttachBindFailure>> {
-        self.core_daemon.submit(move |daemon| {
-            attach_route_on_core(daemon, client_id, session_id, subscription_id, now_seconds)
-        })
-    }
-
-    /// Bind an adapter to an attached generation. On failure Core detaches
-    /// that generation so no route stays without an adapter.
-    pub(crate) fn bind_route_adapter(
-        &self,
-        plan: BindRoutePlan,
-    ) -> CoreTicket<Result<(), AttachBindFailure>> {
-        self.core_daemon
-            .submit(move |daemon| bind_route_on_core(daemon, plan))
     }
 
     /// Detach one subscription through Core's client detach path.
@@ -4643,30 +4614,6 @@ impl HubRuntime {
                     (session_id, subscription_id, generation)
                 })
                 .collect()
-        })
-    }
-
-    /// Detach one route for a client: the exact generation when the owner
-    /// recorded one, otherwise whatever generation the client owns now.
-    pub(crate) fn detach_route_exact_or_owned(
-        &self,
-        client_id: ClientId,
-        session_id: SessionId,
-        subscription_id: SubscriptionId,
-        generation: Option<TerminalSubscriptionGeneration>,
-        now_seconds: u64,
-    ) -> CoreTicket<Result<(), CoreDaemonError>> {
-        self.core_daemon.submit(move |daemon| match generation {
-            Some(generation) => daemon
-                .detach_terminal_subscription(
-                    client_id,
-                    session_id,
-                    subscription_id,
-                    generation,
-                    now_seconds,
-                )
-                .map(|_| ()),
-            None => daemon.detach(client_id, session_id, subscription_id, now_seconds),
         })
     }
 
@@ -4832,17 +4779,6 @@ impl HubRuntime {
                 owner,
             },
         ))
-    }
-
-    /// Cancel one pending Core operation. `true` when it was still pending.
-    pub(crate) fn cancel_core_operation(&self, id: PendingOperationId) -> CoreTicket<bool> {
-        self.core_daemon.submit(move |daemon| daemon.cancel(id))
-    }
-
-    /// Release one open capture. `true` when it was open.
-    pub(crate) fn release_capture(&self, capture: CaptureId) -> CoreTicket<bool> {
-        self.core_daemon
-            .submit(move |daemon| daemon.release_capture(&capture))
     }
 
     /// Read one page of an open capture. The page shares the capture buffer.
@@ -6800,15 +6736,6 @@ impl HubRuntime {
             Some(waiter_id) => self.core_daemon.submit_for_owner(waiter_id, operation),
             None => self.core_daemon.submit(operation),
         }
-    }
-
-    /// Start one two-phase Core operation for an admitted owner waiter.
-    pub(crate) fn begin_core_for_owner(
-        &self,
-        waiter_id: crate::owner_identity::WaiterId,
-        operation: CoreOperation,
-    ) -> CoreOperationTracker {
-        CoreOperationTracker::new(self.core_daemon.begin_for_owner(waiter_id, operation))
     }
 
     /// Current retention accounting, read on the Core owner thread.
