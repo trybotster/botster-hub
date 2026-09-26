@@ -482,7 +482,7 @@ pub(crate) enum TerminalDriverExit {
     FrameEncode,
     PermitRefused,
     /// The sent frame was not released from an open adapter; a later flush
-    /// would send it again.
+    /// would attempt to flush it again.
     CompletionLost,
     SendFailed,
     /// An inbound chunk failed the header, order, generation, size, or
