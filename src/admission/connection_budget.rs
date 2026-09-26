@@ -64,10 +64,15 @@ impl std::fmt::Debug for ConnectionAggregate {
     }
 }
 
+/// Authorization for bytes a sender is about to publish as channel usage.
+/// A permit that ends without that transfer returns its capacity to the
+/// peer, and its drop reports the release to waiting senders, whichever
+/// holder drops it.
 #[derive(Debug)]
 pub(crate) struct AggregateSendPermit {
     aggregate: Arc<ConnectionAggregate>,
     frame_len: usize,
+    transferred: bool,
 }
 
 #[cfg(test)]
@@ -89,35 +94,60 @@ impl ConnectionAggregate {
     /// Register a sender that waits for released capacity. Retired
     /// waiters are pruned here and at each release.
     pub(crate) fn register_waiter(&self, waiter: std::sync::Weak<dyn CapacityWaiter>) {
-        let mut waiters = self
-            .waiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        waiters.retain(|waiter| waiter.upgrade().is_some_and(|waiter| !waiter.retired()));
-        waiters.push(waiter);
-    }
-
-    /// Report released capacity to the waiting senders. The waiters run
-    /// after the list lock is dropped, so a caller may hold any Hub lock.
-    pub(crate) fn capacity_released(&self) {
-        let live = {
+        // Strong handles taken under the lock are dropped after it: the
+        // last one drops an adapter, whose permit reports its release.
+        let mut pruned = Vec::new();
+        {
             let mut waiters = self
                 .waiters
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut live = Vec::with_capacity(waiters.len());
+            waiters.retain(|waiter| match waiter.upgrade() {
+                Some(waiter) if !waiter.retired() => true,
+                Some(waiter) => {
+                    pruned.push(waiter);
+                    false
+                }
+                None => false,
+            });
+            waiters.push(waiter);
+        }
+        drop(pruned);
+    }
+
+    /// Report released capacity to the waiting senders. A waiter resumes
+    /// only below the low mark, so a release above it wakes nobody. The
+    /// waiters run after the list lock is dropped, so a caller may hold any
+    /// Hub lock, and a waiter's strong handle is dropped after the lock too.
+    pub(crate) fn capacity_released(&self) {
+        if !self.below_low_water() {
+            return;
+        }
+        let mut live = Vec::new();
+        let mut pruned = Vec::new();
+        {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            live.reserve(waiters.len());
             waiters.retain(|waiter| match waiter.upgrade() {
                 Some(waiter) if !waiter.retired() => {
                     live.push(waiter);
                     true
                 }
-                _ => false,
+                Some(waiter) => {
+                    pruned.push(waiter);
+                    false
+                }
+                None => false,
             });
-            live
-        };
-        for waiter in live {
+        }
+        for waiter in &live {
             waiter.capacity_released();
         }
+        drop(live);
+        drop(pruned);
     }
 
     fn published_buffered(&self) -> usize {
@@ -133,11 +163,12 @@ impl ConnectionAggregate {
         // Read authorization first so the later usage read includes that transfer.
         let authorized = self.authorized.load(Ordering::Acquire);
         #[cfg(test)]
-        BETWEEN_BUFFERED_READS.with(|observer| {
-            if let Some(observer) = observer.borrow_mut().take() {
-                observer();
-            }
-        });
+        // The observer runs after its cell is released: a permit it drops
+        // reads the aggregate again.
+        if let Some(observer) = BETWEEN_BUFFERED_READS.with(|observer| observer.borrow_mut().take())
+        {
+            observer();
+        }
         self.published_buffered().saturating_add(authorized)
     }
 
@@ -146,6 +177,7 @@ impl ConnectionAggregate {
             .then(|| AggregateSendPermit {
                 aggregate: Arc::clone(self),
                 frame_len,
+                transferred: false,
             })
     }
 
@@ -181,6 +213,12 @@ impl ConnectionAggregate {
 }
 
 impl AggregateSendPermit {
+    /// End the permit after its bytes were published as channel usage. No
+    /// capacity returns, so no waiter is woken.
+    pub(crate) fn transferred(mut self) {
+        self.transferred = true;
+    }
+
     pub(crate) fn try_resize(&mut self, frame_len: usize) -> bool {
         if frame_len > self.frame_len {
             if !self
@@ -206,6 +244,9 @@ impl Drop for AggregateSendPermit {
             .authorized
             .fetch_sub(self.frame_len, Ordering::AcqRel);
         debug_assert!(previous >= self.frame_len);
+        if !self.transferred {
+            self.aggregate.capacity_released();
+        }
     }
 }
 
