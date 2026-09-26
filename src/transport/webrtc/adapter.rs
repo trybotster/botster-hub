@@ -744,7 +744,7 @@ impl WebRtcTerminalAdapterHandle {
     #[cfg(test)]
     pub(crate) fn hold_slot_for_test(
         &self,
-    ) -> std::sync::MutexGuard<'_, Option<RoutedTerminalFrame>> {
+    ) -> crate::transport::shared::adapter_slot::DriverSlotGuard<'_, AdapterWake> {
         self.inner.slot.hold_slot_for_test()
     }
 
@@ -1099,6 +1099,158 @@ mod tests {
             "the driver read waits for the lock and sees the frame"
         );
         assert!(waited, "the driver read waited for the held lock");
+    }
+
+    /// A driver holding the slot mutex over an empty slot is not a full
+    /// slot: Core's probe reads Ready and proceeds to its write.
+    #[test]
+    fn a_contended_empty_slot_reads_ready_to_core() {
+        let (adapter, handle) = WebRtcTerminalAdapter::pair();
+        let slot = handle.hold_slot_for_test();
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::Ready);
+        drop(slot);
+    }
+
+    /// A driver that unlocks after Core's first try but before Core marks
+    /// its wait leaves no holder to wake Core: the retry must write.
+    #[test]
+    fn an_unlock_before_the_wait_mark_is_met_by_the_retry() {
+        let (mut adapter, handle) = WebRtcTerminalAdapter::pair();
+        // The hook outlives this frame; a leaked handle clone keeps the
+        // held guard valid inside it.
+        let holder: &'static WebRtcTerminalAdapterHandle = Box::leak(Box::new(handle.clone()));
+        let slot = holder.hold_slot_for_test();
+        crate::transport::shared::adapter_slot::set_contended_write_hook(move || drop(slot));
+        let frame = test_frame(b"retried");
+        assert_eq!(adapter.try_write(&frame), Ok(()));
+        assert_eq!(adapter.pressure(), TerminalAdapterPressure::Full);
+        assert_eq!(
+            handle
+                .snapshot_active()
+                .map(|active| active.frame.as_bytes().to_vec()),
+            Some(frame.frame.as_bytes().to_vec())
+        );
+    }
+
+    /// Core's write meets a driver holding the slot mutex over an empty
+    /// slot. The frame stays queued in Core, and the driver's unlock wakes
+    /// the route, so the next pump delivers it with no other wake.
+    #[test]
+    fn a_contended_write_on_a_quiet_route_is_delivered_by_the_unlock_wake() {
+        use botster_core::{
+            ClientId, ClientWorker, SessionId, SubscriptionId, TerminalCapabilitySet,
+            TerminalWakeSource,
+        };
+        let mux = WebRtcConnectionMux::new();
+        let (adapter, handle) = mux.create_adapter();
+        let client_id = ClientId("client".into());
+        let session_id = SessionId("session".into());
+        let subscription_id = SubscriptionId("terminal".into());
+        let mut worker = ClientWorker::new();
+        worker.set_wake_source(TerminalWakeSource::new());
+        let (generation, _) = worker
+            .record_attach(
+                client_id.clone(),
+                session_id.clone(),
+                subscription_id.clone(),
+            )
+            .expect("record attach");
+        worker
+            .bind_waking_terminal_adapter(
+                &client_id,
+                session_id.clone(),
+                subscription_id.clone(),
+                generation,
+                TerminalCapabilitySet::empty(),
+                Box::new(adapter),
+            )
+            .expect("bind adapter");
+        // Complete the route's capture, as production does, so live output
+        // reaches it; then deliver every queued frame and drain every wake.
+        assert!(
+            worker
+                .push_route_frame(
+                    &session_id,
+                    &subscription_id,
+                    botster_terminal_protocol::encode_snapshot_ready(&[]).expect("snapshot ready"),
+                )
+                .expect("queue snapshot ready")
+                .is_none()
+        );
+        let route_only = botster_core::TerminalWakeBatch {
+            adapter_routes: vec![botster_core::TerminalWakeRoute {
+                session_id: session_id.clone(),
+                subscription_id: subscription_id.clone(),
+            }],
+            ingress_sessions: Vec::new(),
+        };
+        for _ in 0..16 {
+            assert!(worker.pump_woken(&route_only).is_empty());
+            if handle.complete_active().is_none()
+                && !worker.bound_owner_has_held_frames(&session_id, &subscription_id)
+            {
+                break;
+            }
+        }
+        assert!(!worker.bound_owner_has_held_frames(&session_id, &subscription_id));
+        // Consume every pending wake through the pump, which re-arms each
+        // route's coalescing gate, until none remains.
+        for _ in 0..16 {
+            let pending = worker.wake_source().wait_wakes(Duration::ZERO);
+            if pending.adapter_routes.is_empty() && pending.ingress_sessions.is_empty() {
+                break;
+            }
+            assert!(worker.pump_woken(&pending).is_empty());
+            let _ = handle.complete_active();
+        }
+        assert!(
+            worker
+                .wake_source()
+                .wait_wakes(Duration::ZERO)
+                .adapter_routes
+                .is_empty(),
+            "the route is quiet"
+        );
+        // Setup deliveries may have recorded bound-queue wakes; the case
+        // under test starts from none.
+        let _ = worker.take_bound_queue_wake_sessions();
+
+        // Output arrives while a driver holds the slot mutex over an empty
+        // slot. Core probes pressure at enqueue and records a bound-queue wake
+        // only when the route reads Ready; the host then notifies and pumps
+        // it, as the Core daemon's notify_bound_queue_wakes does.
+        let slot = handle.hold_slot_for_test();
+        assert!(worker.push_session_output(&session_id, b"quiet").is_empty());
+        // This bare worker registers no session wake handle, so the test
+        // pumps the recorded session's route directly, and only when Core
+        // recorded it.
+        if worker
+            .take_bound_queue_wake_sessions()
+            .contains(&session_id)
+        {
+            assert!(worker.pump_woken(&route_only).is_empty());
+        }
+        assert!(
+            worker.bound_owner_has_held_frames(&session_id, &subscription_id),
+            "the contended write left the frame queued in Core"
+        );
+        drop(slot);
+
+        let unlock_wakes = worker.wake_source().wait_wakes(Duration::ZERO);
+        assert!(
+            unlock_wakes.adapter_routes.iter().any(|route| {
+                route.session_id == session_id && route.subscription_id == subscription_id
+            }),
+            "the driver's unlock wakes the route: {unlock_wakes:?}"
+        );
+        assert!(worker.pump_woken(&unlock_wakes).is_empty());
+        let delivered = handle.snapshot_active().expect("delivered frame");
+        assert_eq!(
+            botster_terminal_protocol::TerminalFrame::from_bytes(delivered.frame.as_bytes())
+                .expect("frame")
+                .body(),
+            b"quiet"
+        );
     }
 
     #[test]
