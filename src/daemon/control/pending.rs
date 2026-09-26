@@ -67,6 +67,10 @@ pub(crate) enum ControlPoll {
     DeliverSessionType(ControlReply),
 }
 
+/// One owner-turn continuation closure.
+pub(crate) type ControlCallback =
+    Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>;
+
 /// Retained Host work has a typed owner so terminal disposal can extract its original permit.
 pub(crate) enum ControlContinuation {
     Coordination(
@@ -74,8 +78,8 @@ pub(crate) enum ControlContinuation {
         #[allow(dead_code)] // callback charge retained until the continuation drops
         Option<crate::lua_memory::LuaCallbackCharge>,
     ),
-    Callback(Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>),
-    SpawnCallback(Box<dyn FnMut(&mut HubDaemon, &mut DaemonControlState) -> ControlPoll + Send>),
+    Callback(ControlCallback),
+    SpawnCallback(ControlCallback),
     HostMutation(Box<super::host_work::HostMutationContinuation>),
     Status(Box<super::status::StatusContinuation>),
     ManagedSpawn(Box<super::managed_git::ManagedSpawnOperation>),
