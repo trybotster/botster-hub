@@ -4,6 +4,13 @@ Writer: Claude Hub writer, session `sess-1790388284-006e-2c0553fc5128dca3e436b36
 Checkout: branch `delivery/event-driven-20260925` at Hub main `23b0feaa`. Read only; no cargo.
 Rules: `/private/tmp/botster-event-driven-rewrite-brief-20260925.md`. The allowed categories are deadline, backoff, rate-limit, os-no-event, ui-lifetime (the Hub has no sites) and measurement-window (resource probes and benchmarks only). Everything else is DEFECT. NOT-TIMER marks only true false positives: `set_read_timeout(None)`, a comment or doc, a constant or function definition, a Lua `select`, or a timer API identifier that is not a call (an import, a test name). A fixture `sleep N` is never NOT-TIMER.
 
+## Revision 3 (2026-09-25)
+
+1. test-production-package-runtime:590 moves from measurement-window to DEFECT (reviewer finding; orchestrator ruling revision relayed in the review record). Totals: DEFECT 620, measurement-window 3.
+2. Entrypoint readiness leaves the filesystem (an inherited launch-record fd); the FSEvents registration race is recorded for listener.rs (Follow-up 8).
+3. The launch record size stays unbounded, as before (Follow-up 7).
+4. The M2 and third-party reap notes were corrected earlier for NOTE_REAP (macOS reports a reap to a non-parent; kqueue refuses a zombie).
+
 ## Revision 2 (after reviewer + orchestrator rulings)
 
 What changed from the committed inventory (176e6c72):
@@ -23,7 +30,7 @@ What changed from the committed inventory (176e6c72):
    - macOS takes atomic `proc_listpgrppids` snapshot rounds with NOTE_EXIT per member.
    - Linux watches running members with pidfd POLLIN and zombie members with POLLHUP. The group is empty when `killpg(pgid, 0) == ESRCH`.
    - The group-empty rows in B2, C and D now point to M2.
-6. **measurement-window.** It is applied to probe-hub-resources:232 and test-production-package-runtime:590. It is also applied to the scheduler-lag instruments in event_plane_saturation.rs (1646, 1877), which are host-validity probes whose interval is the metric; the reviewer should confirm. It is not applied to plugin_bounds.rs:231, which asserts an idle-CPU bound for correctness, so that site is DEFECT.
+6. **measurement-window.** It is applied to probe-hub-resources:232 (revision 3: test-production-package-runtime:590 is DEFECT, see its row). It is also applied to the scheduler-lag instruments in event_plane_saturation.rs (1646, 1877), which are host-validity probes whose interval is the metric; the reviewer should confirm. It is not applied to plugin_bounds.rs:231, which asserts an idle-CPU bound for correctness, so that site is DEFECT.
 7. **Reviewer corrections.**
    - Zombie-state waits (D mechanism H, process-census 229/272, selftest 308/355/378) prefer blocking `waitid(WEXITED|WNOWAIT)` for a child, or pidfd/kqueue. Pipe EOF does not prove zombie state.
    - The allocation-oracle shrink suggestion was removed from its row.
@@ -43,11 +50,11 @@ What changed from the committed inventory (176e6c72):
 
 | category | A | B1 | B2 | C | D | total |
 |---|---|---|---|---|---|---|
-| DEFECT | 128 | 114 | 118 | 141 | 118 | **619** |
+| DEFECT | 128 | 114 | 118 | 141 | 119 | **620** |
 | deadline | 58 | 44 | 17 | 78 | 20 | **217** |
 | rate-limit | 0 | 4 | 0 | 0 | 2 | **6** |
 | backoff | 0 | 0 | 0 | 1 | 0 | **1** |
-| measurement-window | 0 | 2 | 0 | 0 | 2 | **4** |
+| measurement-window | 0 | 2 | 0 | 0 | 1 | **3** |
 | os-no-event (candidate) | 0 | 0 | 0 | 0 | 1 | **1** |
 | NOT-TIMER | 0 | 7 | 8 | 1 | 11 | **27** |
 | grep lines | 186 | 171 | 143 | 221 | 154 | **875** |
@@ -59,7 +66,7 @@ Revision 1 totals were DEFECT 539, deadline 214, rate-limit 7, backoff 1, os-no-
 - NOT-TIMER to deadline: 9 lines (primitive forwarders and restores, and allocation_oracle.rs:534).
 - os-no-event to DEFECT: 4 lines (selftest 332 and 410, publish-npm 144, plugin_bounds 231).
 - deadline to DEFECT (slice): 6 lines (event_plane_saturation 3317, packages 7166 and 7648, sessions 1917, 1920 and 4113), applying B2's slice rule to B1. The sessions 3878 extra also became DEFECT (slice).
-- DEFECT to measurement-window: 2 lines (probe-hub-resources 232, test-production-package-runtime 590).
+- DEFECT to measurement-window: 1 line (probe-hub-resources 232). Revision 3 moved test-production-package-runtime 590 back to DEFECT.
 - NOT-TIMER and rate-limit to measurement-window: 2 lines (event_plane_saturation 1877 and 1646).
 
 Bare `timeout(` calls (the webrtc runtime form, outside the original grep) are classified one by one in two tables in group C:
@@ -1122,7 +1129,7 @@ Extra sites the grep missed are marked "(extra, not in grep)": 37 rows (10 DEFEC
     - Linux: pidfd POLLIN for running members and POLLHUP for zombies. The group is empty when `killpg(pgid, 0) == ESRCH`.
   - Every round starts on an event, so no timed `killpg(pgid, 0)` residual remains.
   - The STOP_GRACE / SIGTERM / SIGKILL budgets stay `timer: deadline` on the blocking wait, with unchanged values.
-- No other site qualifies. File readiness (entrypoint_supervisor.rs 329, listener.rs 530) has FSEvents or inotify parent-directory events. Waiting on a foreign pid (local_runtime_process.rs 511, test_support.rs 952/1947) has kqueue `EVFILT_PROC` or pidfd.
+- No other site qualifies. Revision 3: entrypoint readiness no longer uses the filesystem (the launch record moves to an inherited fd, like `--ready-fd`), because FSEvents registers its stream asynchronously and a change made right after `watch()` can go unreported. listener.rs 530 (socket rebind) and SocketPathEvents (listener.rs ~224-262, the socket-path watcher) still use notify, so the same FSEvents registration race applies to them (a finding; see the rows). Waiting on a foreign pid (local_runtime_process.rs 511, test_support.rs 952/1947) has kqueue `EVFILT_PROC` or pidfd.
 
 ### Unverified candidates (not counted; one closer read would settle them)
 - daemon_maintenance.rs 3187-3194 and 3356-3363 repeat `for _ in 0..8 { run_maintenance_kind_to_completion(HostBridge); if baseline.is_some() break }`. If the baseline depends on host-thread work, this is a spin bounded by a count. If each slice finishes the work synchronously, it is not a timer.
@@ -1559,11 +1566,11 @@ Worktree: delivery/event-driven-20260925 at 23b0feaa. Read only. Line numbers ar
 
 | category | count |
 |---|---|
-| DEFECT | 118 |
+| DEFECT | 119 |
 | deadline | 20 |
 | NOT-TIMER | 11 |
 | rate-limit | 2 |
-| measurement-window | 2 (probe-hub-resources 232, test-production-package-runtime 590) |
+| measurement-window | 1 (probe-hub-resources 232; test-production-package-runtime 590 is DEFECT in revision 3) |
 | backoff | 0 |
 | os-no-event | 1 (isolated_hub.rs 2187, candidate; facts below) |
 
@@ -1825,7 +1832,7 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 |---|---|---|---|---|
 | 282 | poll for runtime metadata file | DEFECT | polls file publication | readiness pipe / stdout line from `up` (C) |
 | 474 | `wait_for_status` poll | DEFECT | readiness by status polling | readiness pipe (C) |
-| 590 | `sleep 5` idle window before probe | measurement-window (was DEFECT) | the idle interval is the measured quantity (ruling 3). The value is unchanged | marker `timer: measurement-window — idle Hub CPU/wake rate before the probe` |
+| 590 | `sleep 5` settle pause before capture_resource_probe | DEFECT (revision 3; was measurement-window) | reviewer + orchestrator ruling revision: capture_resource_probe (533-548) launches a fresh probe with no prior snapshot or elapsed interval; probe-hub-resources measures its own 250 ms window (231-245). The 5 s is a settle pause, not a metric | replace with the progress event that proves the state the probe needs (the `--ready-fd` ready line, or the relevant package-load completion), or delete it if the probe already establishes that state |
 | 717 | `assert_failed_up_cleanup` socket/pid poll | DEFECT | polls non-child exit and socket removal | failed `up` exit (already waited) should be the cleanup receipt; else NOTE_EXIT on the pid |
 | 747 | poll TCP connect to the fixture server | DEFECT | polls bind readiness | ruby server prints a ready line after bind; read with deadline |
 | 896 | pre-cutover `status` poll | DEFECT | readiness polling (old binary; may need a ready line from the old Hub) | readiness pipe |
@@ -2034,4 +2041,6 @@ These are value and structure suggestions recorded under ruling 2. None of them 
 3. **package_events.rs:1297.** The 100 ms "must not wait for contended pool" bound is tight under load. The value is unchanged.
 4. **owner_loop.rs:8149/8154.** This test asserts a 500 ms latency bound with `elapsed()`. The reviewer should decide whether a latency assertion belongs in a correctness test. The value is unchanged.
 5. **DATA_PLANE_STOP_BOUND (driver.rs 1449).** When the 1 s watchdog goes, the bound keeps its value as a literal. Whether 2 s + slack is still the right stop bound without a watchdog is a later question.
+7. **Entrypoint launch record size (revision 3).** The launch record read has no size bound, the same as the file-based reader it replaced (fs::read). A limit would be a new product limit needing a user decision.
+8. **SocketPathEvents FSEvents registration race (revision 3, finding).** src/transport/unix/listener.rs watches the socket's parent directory through notify's FSEvents backend on macOS. The stream starts asynchronously, so a socket deletion right after startup can go unreported. Candidate fix: a synchronously registering source (kqueue EVFILT_VNODE on the socket path, inotify on Linux). Not in this rewrite's scope until the orchestrator assigns it.
 6. **plugin_bounds.rs:231.** When the idle-CPU measurement moves to probe-hub-resources, it keeps its 5 s window. Whether a shorter window gives the same signal is a later question.
