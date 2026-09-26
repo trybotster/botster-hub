@@ -45,7 +45,12 @@ const PLUGIN_DB_FILE: &str = "plugin-db.redb";
 
 /// Hub-owned concrete capability runtime.
 pub struct HubCapabilityRuntime {
-    grants: CapabilitySet,
+    /// Scopes the Hub's concrete backends implement. A request also needs the
+    /// calling plugin's own grant from `plugin_grants`.
+    host_grants: CapabilitySet,
+    /// Capabilities that package admission recorded for each loaded plugin,
+    /// keyed by plugin key. Package admission is the only source.
+    plugin_grants: BTreeMap<String, CapabilitySet>,
     filesystem_grants: BTreeMap<String, HubFilesystemScope>,
     plugin_store: Arc<KeyedPluginStore>,
     plugin_store_limits: PluginStoreLimits,
@@ -185,7 +190,7 @@ impl HubCapabilityRuntime {
         let plugin_store = Arc::new(KeyedPluginStore::open(
             &config.data_directory.join(PLUGIN_DB_FILE),
         )?);
-        let grants = default_hub_capability_grants();
+        let grants = host_capability_scopes();
         let filesystem_grants = BTreeMap::from([(
             DEFAULT_FILESYSTEM_SCOPE.to_string(),
             HubFilesystemScope {
@@ -224,7 +229,8 @@ impl HubCapabilityRuntime {
         let (completions_sender, completions_receiver) = mpsc::channel();
 
         Ok(Self {
-            grants,
+            host_grants: grants,
+            plugin_grants: BTreeMap::new(),
             filesystem_grants,
             plugin_store,
             plugin_store_limits: PluginStoreLimits::default(),
@@ -239,10 +245,44 @@ impl HubCapabilityRuntime {
         })
     }
 
-    /// Return the exact scoped grants accepted by the local runtime.
+    /// Return the scopes the Hub's concrete backends implement.
     #[must_use]
-    pub fn granted_capabilities(&self) -> &CapabilitySet {
-        &self.grants
+    pub fn host_capability_scopes(&self) -> &CapabilitySet {
+        &self.host_grants
+    }
+
+    /// Install the capabilities that package admission recorded for one
+    /// plugin. The Hub calls this before the plugin's entrypoint runs.
+    pub fn set_plugin_grants(
+        &mut self,
+        plugin_key: &PluginKey,
+        grants: impl IntoIterator<Item = Capability>,
+    ) {
+        self.plugin_grants
+            .insert(plugin_key.0.clone(), grants.into_iter().collect());
+    }
+
+    /// Remove a plugin's grants when its package unloads.
+    pub fn revoke_plugin_grants(&mut self, plugin_key: &PluginKey) {
+        self.plugin_grants.remove(&plugin_key.0);
+    }
+
+    fn ensure_plugin_grant(
+        &self,
+        plugin_key: &PluginKey,
+        required: &Capability,
+    ) -> Result<(), CapabilityRuntimeError> {
+        let granted = self
+            .plugin_grants
+            .get(&plugin_key.0)
+            .is_some_and(|grants| grants.contains(required));
+        if !granted {
+            return Err(CapabilityRuntimeError::new(
+                CapabilityRuntimeErrorKind::CapabilityDenied,
+                "the plugin's package was not admitted with the required capability",
+            ));
+        }
+        Ok(())
     }
 
     /// Return the current number of Hub-owned timer resources.
@@ -279,10 +319,10 @@ impl HubCapabilityRuntime {
                     "filesystem scope is not granted by this hub",
                 )
             })?;
-        if !self.grants.contains(&request.required_capability()) {
+        if !self.host_grants.contains(&request.required_capability()) {
             return Err(CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::CapabilityDenied,
-                "plugin lacks required filesystem scope capability",
+                "this hub does not implement the requested filesystem scope",
             ));
         }
         if !filesystem.operation.path().is_scoped_relative() {
@@ -412,10 +452,10 @@ impl HubCapabilityRuntime {
         request: CapabilityRuntimeRequest,
         timer: TimerCapabilityRequest,
     ) -> Result<CapabilityRuntimeHandle, CapabilityRuntimeError> {
-        if !self.grants.contains(&request.required_capability()) {
+        if !self.host_grants.contains(&request.required_capability()) {
             return Err(CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::CapabilityDenied,
-                "plugin lacks timer callback capability",
+                "this hub does not implement the requested timer scope",
             ));
         }
 
@@ -603,14 +643,16 @@ impl HubCapabilityRuntime {
         plugin_key: &PluginKey,
         namespace: &str,
     ) -> Result<(), CapabilityRuntimeError> {
-        let required = scoped_capability(CapabilitySurface::PluginDb, namespace);
-        if namespace != plugin_key.0 || !self.grants.contains(&required) {
+        if namespace != plugin_key.0 {
             return Err(CapabilityRuntimeError::new(
                 CapabilityRuntimeErrorKind::CapabilityDenied,
                 "plugin-store namespace must exactly match the plugin key",
             ));
         }
-        Ok(())
+        self.ensure_plugin_grant(
+            plugin_key,
+            &scoped_capability(CapabilitySurface::PluginDb, namespace),
+        )
     }
 
     fn drain_worker_completions(&mut self) -> Result<(), CapabilityRuntimeError> {
@@ -668,6 +710,7 @@ impl PluginCapabilityRuntime for HubCapabilityRuntime {
         &mut self,
         request: CapabilityRuntimeRequest,
     ) -> Result<CapabilityRuntimeHandle, CapabilityRuntimeError> {
+        self.ensure_plugin_grant(&request.plugin_key, &request.required_capability())?;
         match request.operation.clone() {
             CapabilityOperation::Http(_) => self.http.submit(request),
             CapabilityOperation::WebSocket(_) => self.websocket.submit(request),
@@ -1849,13 +1892,13 @@ fn scoped_capability(surface: CapabilitySurface, scope: impl Into<String>) -> Ca
     }
 }
 
-fn default_hub_capability_grants() -> CapabilitySet {
+/// Scopes the Hub's concrete backends implement. No package names appear
+/// here: each plugin's own grants come from package admission.
+fn host_capability_scopes() -> CapabilitySet {
     BTreeSet::from([
         scoped_capability(CapabilitySurface::Network, "http"),
         scoped_capability(CapabilitySurface::Network, "websocket"),
         scoped_capability(CapabilitySurface::Filesystem, DEFAULT_FILESYSTEM_SCOPE),
-        scoped_capability(CapabilitySurface::PluginDb, "project-pipelines"),
-        scoped_capability(CapabilitySurface::PluginDb, "botster-workspaces"),
         scoped_capability(CapabilitySurface::Timers, "callbacks"),
     ])
 }
