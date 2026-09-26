@@ -1,8 +1,8 @@
 # Plugin platform design
 
-Status: revision 2 for review (2026-09-26). Owner: plugin-platform Hub writer.
-Revision 1 (`4e6f5aa2`) was rejected with seven findings; section 17 maps
-each finding to its answer.
+Status: revision 3 for review (2026-09-26). Owner: plugin-platform Hub writer.
+Revision 1 (`4e6f5aa2`) and revision 2 (`0bc5c83e`) were rejected; section 17
+maps every finding to its answer.
 
 Scope: the Lua-facing platform that first-party plugins need, starting with
 the cutover plugins messaging, orchestrator, and project-pipelines.
@@ -130,15 +130,54 @@ bytes.
 ### 4.2 Suspendable handlers
 
 Every handler invocation runs as a Lua coroutine. An asynchronous
-`botster.*` helper does three things:
+`botster.*` helper does four things, in this order:
 
-1. It sends a `HostCall` with a fresh `call_id`.
-2. It yields the coroutine. The invocation returns
-   `InvocationResult{ suspended = call_id }` and the VM is free for other
-   invocations.
-3. When the Hub completes the call, it sends `Invoke` to the reserved handler
-   `botster:resume` with `{ call_id, result }`. The runtime resumes the
-   coroutine, and the helper returns `result` to the plugin code.
+1. It takes one slot and `max_result_bytes` from the plugin's delivery pool
+   (section 5). If the pool cannot fit the call, the helper returns
+   `backpressured` at once and does not suspend.
+2. It records `call_id -> coroutine` in the VM's call table.
+3. It sends a `HostCall` with that `call_id`.
+4. It yields. The invocation returns `InvocationResult{ suspended }` and the
+   VM is free for other invocations.
+
+When the Hub completes the call, it sends `Invoke` to the reserved handler
+`botster:resume` with `{ call_id, root_request_id, result }`. The runtime
+resumes the coroutine, and the helper returns `result` to the plugin code.
+
+**Ordering inside the VM.** The VM runs one invocation at a time on both
+hosts: the thread host holds the VM mutex, and the process host runs
+`Invoke`s one at a time. A resume `Invoke` can therefore start only after the
+invocation that issued the call has yielded and returned. A completion can
+never reach a coroutine that has not suspended yet. The resume trampoline
+removes the call-table entry before it resumes, so a duplicate completion
+finds no entry and is dropped and counted. An unknown `call_id` (from a
+cancelled or retired call) is dropped the same way.
+
+**Ordering at the Hub (the call ledger).** Outside the VM, the Hub can see
+results in either order: on the thread host, one executor can publish the
+final result of a resume before the other executor publishes the
+`suspended` result of the invocation that issued the call. The Hub keeps a
+per-plugin ledger entry for each request-response invocation, keyed by its
+`root_request_id`, which every resume carries:
+
+| Event | Ledger state before | Action |
+| --- | --- | --- |
+| `suspended` for the root | running | mark suspended |
+| `suspended` for the root | final result held | answer the waiter with the held result; remove the entry |
+| final result for the root | running or suspended | answer the waiter; remove the entry |
+| final result for the root | (arrives before `suspended`) | hold it; mark "final held" |
+| deadline or cancel | any | answer the waiter with `timed_out` or `cancelled`; keep a tombstone until the root's last outstanding call completes, then remove it |
+
+Sequential calls in one handler produce one `suspended` result per resume;
+only the root's first `suspended` and its final result change the ledger.
+Resumes of Background handlers need no ledger entry. The ledger holds at most
+one entry per admitted request-response invocation, so the existing
+request-response admission bounds it.
+
+**Refusal after the yield.** A Hub-side refusal (for example
+`capability_denied`) is a completion like any other and uses the call's
+delivery slot, which the plugin took in step 1 before it yielded. So a
+refusal always reaches the suspended handler.
 
 ```lua
 call = function(request)
@@ -196,8 +235,24 @@ end)
 watch.value:cancel()
 ```
 
-A stream's `cancel()` removes the callback inside the VM at once, so the
-callback never runs again; the Hub then releases the resource.
+A stream has three separate lifetimes, each with its own bound:
+
+| Lifetime | What it holds | Charged to | Released when |
+| --- | --- | --- | --- |
+| Setup call | the call that arms the stream | one pool debit, like any call | the setup result is admitted |
+| Armed resource | the timer, watch, or feed itself | one unit of the per-plugin capability operation capacity (128); a recursive inotify watch charges one unit per watched directory | `cancel()`, unload, or generation retirement |
+| Pending event | one undelivered event | nothing until delivery; then one pool debit at admission | the event's invocation is admitted |
+
+- **At most one pending event per stream.** A stream never queues a second
+  event. While an event is pending, new occurrences are folded into it:
+  timers count `missed`, watches mark `overflow` for that watch, and change
+  feeds mark `resync`. So an armed stream holds at most one event's bytes, and
+  the pending event is built only when the pool has room for it.
+- **`cancel()`** removes the callback inside the VM at once, so no new event
+  invocation of that stream runs. The Hub then disarms the resource and drops
+  its pending event. A callback invocation that is already suspended is an
+  independent handler: it keeps its own calls and completes normally. Plugin
+  code that must stop in-flight work checks its own state after each resume.
 
 ### 4.4 Local helpers
 
@@ -208,47 +263,77 @@ results directly and never suspend.
 ## 5. Delivery, reservations, and accounting
 
 This section is the contract with the event-driven writer (Hub delivery
-path) and the Core process-host writer (IPC).
+path) and the Core process-host writer (engine and IPC; premise
+`docs/plans/plugin-process-host.md` on `origin/delivery/plugin-process-host-20260926`).
 
-1. **Credits.** At load, the plugin receives a number of host-call credits
-   and a credit byte allowance. A host call without a free credit returns
-   `{ ok = false, error = { kind = "backpressured" } }` at once, without
-   suspending. The Hub returns a credit when it takes the call out of its
-   ingress queue. The ingress queue can therefore never overflow.
-2. **Delivery reservation.** When a host call is accepted, a delivery
-   reservation is taken for its result: one delivery slot plus
-   `max_result_bytes`. The helper computes `max_result_bytes` per operation:
-   a fixed size for small results, or the caller's `max_bytes` capped by the
-   operation ceiling for reads and HTTP bodies. The size counts the encoded
-   delivery payload (`{ call_id, result }` with headers and field names).
-   If the plugin's reservation caps cannot fit the call, the call returns
-   `backpressured` at once.
-3. **Exactly once.** Every accepted call produces exactly one completion:
-   success, failure, timeout, or cancellation. The completion consumes the
-   reservation, so its `Invoke` cannot be refused for capacity. A result
-   larger than its reservation becomes `{ kind = "failed", detail =
-   "result_exceeds_reservation" }`; the Hub never truncates silently. The
-   resume trampoline resumes each `call_id` once and drops unknown ids.
-4. **Transfer.** A reservation converts into the Core queue charge when the
-   delivery is admitted, in the same owner step. There is no window in which
-   both or neither holds the bytes.
-5. **Release.** A reservation is released on delivery admission, on
-   cancellation, on generation retirement, and on worker kill or crash.
-6. **Owner delivery.** Completions are published to a per-plugin pending
-   queue, and the producer calls an owner-installed notifier (one control
-   message, one maintenance wake). The owner's delivery slice rotates across
-   plugins with pending completions under the existing turn budget (items,
-   bytes, time). A reserved delivery is always admissible, so the slice never
-   parks it.
-7. **Sibling isolation.** Reservations, credits, pending queues, and Core
-   worker queues are all per plugin. A plugin that stops consuming exhausts
-   only its own reservations; its later calls return `backpressured`.
-8. **Numbers.** The credit count, the credit byte allowance, the reservation
-   count, and the reservation byte cap are Hub policy.
-   **PRODUCT DECISION (reservation caps)**: Option A (recommended): reuse
-   existing per-plugin numbers: the capability operation capacity (128) as the
-   count, and the plugin's Background queue byte capacity (1 MiB) as the
-   reservation byte cap. Option B: dedicated new values.
+### 5.1 The delivery pool
+
+1. **Engine reservation.** At load, the Hub asks the Core engine for a
+   standing delivery pool for the plugin's generation: a number of slots,
+   request bytes (Background queue), and completion bytes (completion store).
+   The engine takes them out of the plugin's own Background capacity. The
+   pool invariant is: plugin Background capacity = delivery pool + ordinary
+   Background work (events). Ordinary work can never occupy pool capacity.
+2. **Admission from the pool** never refuses for capacity while the pool has
+   room. It debits one slot and the delivery's actual bytes. The bytes return
+   to the pool when the engine drains the job's completion, or when the job
+   fails or is cancelled. A retired generation's pool is released as a whole.
+3. **Credits are pool room.** The plugin side keeps an exact mirror of the
+   pool's free room. A host call first debits one slot and its
+   `max_result_bytes` from that room (section 4.2 step 1). If the room cannot
+   fit the call, the call returns `backpressured` at once and does not
+   suspend. On the process host, the parent grants credits only from the
+   pool's free room, and a `HostCall` that exceeds its credit is a protocol
+   violation that kills the worker.
+4. **Guaranteed delivery.** Because the plugin debits delivery capacity
+   before it sends and yields, every outcome of an accepted call (success,
+   Hub refusal, timeout, cancellation) has capacity for its `Invoke`.
+5. **Exactly once.** Every accepted call produces exactly one completion.
+   The Hub's call table removes the call when it publishes the completion;
+   the VM's call table drops duplicates and unknown ids (section 4.2).
+6. **Cancellation keeps its slot.** A cancelled call keeps its pool debit
+   until its `cancelled` completion is admitted or the generation retires.
+7. **One terminal per call.** For every accepted call the Hub produces
+   exactly one terminal: a completion admitted from the pool, or
+   `release_call(call_id)` for a call it will never answer (for example
+   because its generation retired). The pool unit returns to the plugin as
+   `Credit{call_id, bytes}` exactly once: when that completion is drained,
+   fails, or is cancelled, or on `release_call`. Request bodies and log
+   records use their own conserved credits (section 5.2), so every
+   plugin-to-Hub frame is credit-bounded and the parent reader never blocks.
+8. **Numbers.** **PRODUCT DECISION (pool size)**: Option A (recommended):
+   reuse existing per-plugin numbers: slots = the capability operation
+   capacity (128), request bytes plus completion bytes = the plugin's
+   Background queue byte capacity (1 MiB) and completion reservation bytes as
+   the engine already configures them. Option B: dedicated values.
+
+### 5.2 Charges outside the pool
+
+| Allocation | Charged to | Bound |
+| --- | --- | --- |
+| `HostCall` request body (store documents, HTTP body) | credit request bytes (process host: parent ingress accounting) | the call's declared request size, checked before the parent reads the body |
+| Decoded request in the Hub | Hub callback account, before decoding | per-callback ceiling (8 MiB) and the call's request size |
+| Producer buffer (HTTP body being read, file read, query page being built) | Hub callback account, before each growth step | the call's `max_result_bytes`; a producer stops and fails the call at that size |
+| Encoded completion | the call's pool debit | `max_result_bytes` (encoded size, including field names and headers) |
+
+- **Serialization overlap.** While the Hub encodes a completion, the
+  producer buffer and the encoded bytes both exist. The producer buffer is
+  released immediately after encoding. So a plugin's peak is at most twice its
+  in-flight `max_result_bytes`, and the pool bounds that sum.
+- **Shared callback account.** The callback account is Hub-wide (64 MiB).
+  Each plugin's share of it is bounded by its own in-flight calls, which the
+  pool bounds (twice the pool bytes at the peak). A plugin therefore cannot
+  consume the account beyond its pool-derived share, and sibling plugins keep
+  theirs.
+
+### 5.3 Owner delivery
+
+Completions are published to a per-plugin pending queue, and the producer
+calls an owner-installed notifier (one control message, one maintenance
+wake). The owner's delivery slice rotates across plugins with pending
+completions under the existing turn budget (items, bytes, time) and admits
+each completion from its plugin's pool. Pool admission cannot refuse for
+capacity, so the slice never parks a completion.
 
 ## 6. The calling convention
 
@@ -353,8 +438,16 @@ local store = require("lib.store")   -- the package file lua/lib/store.lua
 - The Hub walks the module tree from the package root without following
   symlinks and refuses non-UTF-8 names, `..` components, and files larger
   than the per-callback ceiling.
-- Accounting: module text lives in the plugin VM under the per-VM memory
-  limit. Modules compile with the text-only `load` (section 14).
+- **Bounded staging, charged before allocation.** The Hub reserves the
+  staging budget from the callback account before it reads anything: the
+  per-VM memory limit (16 MiB) is the ceiling for the whole module set. For
+  each file it reserves the file's size from that budget, then reads with the
+  existing bounded reader, which refuses a file that grows past its reserved
+  size. A set that exceeds the budget fails the load before the VM exists.
+  The staged text moves into the load message (process host) or the new VM
+  (thread host), and the staging charge is released only after the VM's own
+  memory accounting holds the text.
+- Modules compile with the text-only `load` (section 14).
 - A reload sends the module set again, so there is no stale cache.
 
 ### 7.5 Timers
@@ -382,7 +475,8 @@ tick.value:cancel()
   undelivered does not deliver again; its next delivery carries the missed
   count. So a short interval cannot fill any queue, and no minimum interval
   is needed.
-- Each timer needs one credit while armed (section 5).
+- An armed timer is one armed resource; each fire is one pending event
+  (section 4.3).
 - **PRODUCT DECISION (timer marker)**: the rewrite rules have no category
   for plugin-requested schedules. Option A: add
   `// timer: plugin-schedule — <which plugin API>` for the one Hub site that
@@ -411,8 +505,14 @@ local response = botster.capabilities.http.request({
   must equal a granted origin.
 - Transport: Core `HttpCapabilityRuntime` with Hub `RealHttpTransport`.
   Redirects are not followed; a 3xx response returns to the plugin as is.
-- `max_result_bytes` = the encoded size of status, headers, and `max_bytes`
-  of body, capped by the Core response limit.
+- **Pre-admission ceiling.** The helper computes `max_result_bytes` before
+  the call, from fixed numbers only: the envelope overhead, plus the
+  response header ceiling (the Core HTTP header count limit of 64 times the
+  Core header-size limit), plus `max_bytes` of body. The Core response limit
+  (4 MiB) caps `max_bytes`. The transport reads headers and body into a
+  producer buffer charged per growth step (section 5.2) and fails the call
+  with `failed` / `detail = "response_too_large"` the moment either part
+  passes its ceiling; it never truncates.
 - **PRODUCT DECISION (network policy)**: today the Hub allows loopback only,
   GET and POST only, and denies credential headers. Option A (recommended):
   manifest-declared remote origins, enabled by the operator; credentials
@@ -437,12 +537,31 @@ local listing = botster.capabilities.fs.list({ root = "vault", path = "inbox" })
 - **Path grammar.** `path` is a relative path of non-empty UTF-8 components
   separated by `/`. The Hub refuses absolute paths, `.` and `..` components,
   empty components, and NUL bytes before any I/O.
-- **Race-safe confinement.** The Hub opens each root once, at grant time, as
-  a directory descriptor. Every operation walks the path one component at a
-  time with `openat(..., O_NOFOLLOW)` (plus `O_DIRECTORY` for intermediate
-  components). A symlink at any component fails with `capability_denied`.
-  Because no step resolves a path string, a concurrent rename or symlink swap
-  cannot move the operation outside the root.
+- **Authority.** The Hub opens each root once, at grant time, as a
+  directory descriptor and records the root's device and inode. Every
+  operation resolves relative to that descriptor; no operation resolves a
+  path string from `/`.
+- **Linux enforcement.** `openat2(root_fd, path, RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`. The kernel guarantees that
+  the whole resolution stays beneath the root, including under concurrent
+  renames: it fails with `EXDEV` or `EAGAIN` instead of escaping. The Hub
+  maps both to `capability_denied` and does not retry.
+- **macOS enforcement.** macOS has no `openat2`. The Hub opens with
+  `openat(root_fd, path, O_NOFOLLOW_ANY)`, which refuses a symlink in any
+  component. A component walk alone does not stop a concurrent rename that
+  moves an intermediate directory outside the root, so after the open the
+  Hub verifies containment of the opened object: it reads the object's
+  current path with `fcntl(F_GETPATH)` and requires the root's canonical path
+  as a prefix, and it requires the root's device and inode to be unchanged.
+  If the check fails, the Hub closes the descriptor without reading and
+  returns `capability_denied`. The Hub reads only through the verified
+  descriptor, so what it returns was beneath the root when verified.
+- **Adversarial test (slice 6).** A helper thread in the test renames an
+  intermediate directory between a position inside the root and a position
+  outside it, where the outside copy holds a marker file. The plugin reads
+  and lists the path while the renames run. No response may ever contain the
+  marker. The ablation removes the containment check (macOS) or
+  `RESOLVE_BENEATH` (Linux), and the test must then observe the marker.
 - **Listings** report entries with their kind (`file`, `directory`,
   `symlink`, `other`) and never follow symlinks. The entry count is bounded
   by the existing filesystem grant limit (1024 entries); more entries return
@@ -451,12 +570,18 @@ local listing = botster.capabilities.fs.list({ root = "vault", path = "inbox" })
   limit) and charged to the call's reservation.
 - **Watches** use the OS event source (FSEvents on macOS, inotify on Linux);
   there is no polling watcher. An event carries only a root-relative path and
-  a change kind, never file data; the Hub drops events whose path does not
-  resolve under the root's canonical path at registration. Watcher state
-  counts as one armed resource (one credit). When a watch's undelivered
-  events reach the per-plugin event capacity (256), the Hub discards that
-  watch's queue and delivers one `overflow` event; the plugin rescans with
-  `list`.
+  a change kind, never file data. **Identity rule:** the Hub reports an event
+  only if its path lies under the root's canonical path and the root's device
+  and inode are unchanged; otherwise it drops the event. If the root itself
+  is renamed or removed, the watch ends with `unavailable`. Any later read of
+  an event's path goes through the enforcement above, so an event can never
+  lead to data outside the root.
+- **Watch accounting.** A watch is one armed resource; a recursive inotify
+  watch charges one armed-resource unit per watched directory, and a watch
+  that would exceed the plugin's remaining capacity fails with
+  `quota_exceeded`. A watch holds at most one pending event (section 4.3);
+  further changes fold into it, and a fold that loses information marks it
+  `overflow` so the plugin rescans with `list`.
 
 ### 8.3 Package secrets
 
@@ -611,18 +736,25 @@ store.batch({ ops = {
   { op = "delete", collection = "run_steps", id = "step_9", expected_revision = 2 },
 } })
 store.query({ collection = "run_steps", index = "by_run", equals = { "run_1" },
-              range = { from = { 0 }, to = { 99 } }, order = "asc", limit = 50, cursor = nil })
+              range = { from = { 0 }, to = { 99 } }, order = "asc", limit = 50,
+              max_bytes = 131072, cursor = nil })
 -- { ok, value = { docs = { ... }, cursor = "..." | nil } }
 store.watch({ collection = "run_steps", index = "by_session", equals = { sid } }, function(event) end)
 ```
 
 - Grant: `{ surface = "plugin_db", scope = "<own package name>" }`.
 - Every operation is an asynchronous host call (section 4).
-- **Queries always use an index and a limit.** `equals` binds a prefix of the
-  index fields; `range` bounds the next field. `limit` is required and at
-  most the Core range page (1000 items, 4 MiB). There is no filter
-  expression, so the scanned rows equal the returned rows; the cost is
-  charged to the plugin's reservation.
+- **Queries always use an index, an item limit, and a byte limit.** `equals`
+  binds a prefix of the index fields; `range` bounds the next field. `limit`
+  (items) is required and at most the Core range page (1000 items).
+  `max_bytes` is optional; its default and its cap are the room the plugin's
+  pool can give one call. The helper sets `max_result_bytes` from
+  `max_bytes` before the call. The store stops a page at whichever limit it
+  reaches first and returns `cursor` for the next page, so a page never
+  exceeds the admitted reservation. A document larger than the remaining page
+  room ends the page before it; a document larger than the whole reservation
+  fails with `failed` / `detail = "document_exceeds_page"`. There is no
+  filter expression, so the scanned rows equal the returned rows.
 - **Atomic batches** validate every revision and index change, then commit
   as one Core batch (at most 256 operations, the existing Core ceiling).
   Index entries are written in the same transaction as the documents.
@@ -716,6 +848,22 @@ project-pipelines serves today become manifest entity projections.
 - `surface_route` render handlers and plugin-built `UiNode` trees are
   replaced by view declarations (cold cut). Navigation keeps targeting
   admitted views.
+- Ownership of the replacement:
+  - **This repository (plugin-platform writer):** the view declaration
+    schema and its validation in `crates/botster-ui-contract`; manifest
+    parsing and admission (every view names an admitted entity family of the
+    same package, every field exists in the family's projection allowlist,
+    every action names a registered `ui_action` handler); client projection
+    of admitted views; action routing to the plugin handler with the
+    action's validated input; removal of `surface_route` rendering.
+  - **Web and TUI repositories (their writers, scheduled by the
+    orchestrator):** rendering each component from the declaration over the
+    existing entity subscription, and sending actions. This plan does not
+    change other repositories.
+- Live updates use the existing entity pipeline: a collection projection or
+  `botster.entity_publish` changes an entity, and every client showing a
+  view over that family receives the change. Views never re-render through
+  plugin code.
 - Later escape hatch (not now): sandboxed Web-only plugin bundles.
 
 ## 13. Area 7: Hub-brokered actions
@@ -808,9 +956,13 @@ Messages: section 4.1. Deliveries into the plugin are ordinary `Invoke`s of
 reserved handlers through `PluginWorkerEngine`; Core adds no separate result
 or event message.
 
-Flow control: credits (section 5.1), per-call delivery reservations
-(section 5.2), and a bounded log queue with a dropped counter. A host call
-without a credit is a protocol violation: Core kills the worker.
+Flow control: the standing delivery pool and its credits (section 5.1),
+separate conserved credits for host-call request bodies and for log records
+(section 5.2), and a dropped-record counter for logs. A host call without a
+credit, or with an unknown or duplicate `call_id`, is a protocol violation:
+Core kills the worker. Every delivery into the plugin, including a Hub
+refusal, is an ordinary `Invoke` admitted from the pool, so it runs under
+engine admission and deadline supervision.
 
 Kill and crash: on process exit (the kqueue/pidfd exit watch, never a timer),
 Core fails every in-flight `Invoke` of that generation with `WorkerCrashed`
@@ -847,15 +999,18 @@ setup.
 | 0 | Sandbox (section 14) | none | Host-file `dofile`/`loadfile` fail; bytecode `load` fails; `string.dump`, `print` absent; `collectgarbage("collect")` refused; a `pcall` spin fails at the budget; text `load` works. Per-guard control VM probes. |
 | 1 | Per-package grants (section 17 item 5); result convention for existing helpers; ABI doc rewrite | none | A package without `plugin_db` gets `capability_denied` while a granted sibling succeeds; the literal grant list is gone (ablation: restore it, the denial test fails). |
 | 2 | `log`, `json`, `clock`, `require` | log limits decision | `require` of a sibling module works; a symlinked or `..` module fails the load; log records reach `get_plugin_logs` with package and level; a flooding plugin drops records and reports the count without blocking. |
-| 3 | Suspendable handlers, reservations, credits, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload. |
+| 3 | Suspendable handlers, delivery pool, credits, call ledger, delivery path, timers | reservation caps and timer marker decisions; event-driven writer's delivery path | An MCP tool that suspends on a timer returns its final value to the caller; a saturated plugin (all reservations held) gets `backpressured` while a sibling plugin's timer still fires and its tool still answers; `cancel()` stops a repeating timer (next fire never runs); reload resumes a suspended handler with `cancelled` and a stale-generation completion is dropped and counted; accounting returns to the baseline after completion, cancel, and reload; a host call completed before the issuing invocation's `suspended` result is published still answers the MCP caller (a test gate holds the issuing executor after the yield, before publication); a Hub refusal after the yield resumes the handler with the typed error; a pool-exhausted plugin's next call returns `backpressured` without suspending. |
 | 4 | Storage collections (section 11) | key quota decision | Index query returns exactly the bound range with a limit; a batch with one stale revision changes nothing; a watch receives put and delete events after commit; a flooded watch receives `resync`; a collection projection serves a snapshot and a live change to an entity subscriber. |
+| 4b | Declarative views (section 12): schema, admission, projection, action routing; `surface_route` removed | none (user decision made); Web/TUI renderer work scheduled by the orchestrator | A manifest view over an undeclared family, an unknown field, or an unregistered action fails enable; an admitted view is projected to a daemon client; an action reaches the plugin handler with validated input and returns its result; a collection change reaches a client subscribed to the view's family; ablation: removing the field-allowlist check lets the invalid manifest enable. |
 | 5 | Sessions, messaging, caller identity (section 9) | cross-plugin control, message tools, caller auth decisions | A plugin cannot close a session it does not own without `:any`; post/receive round trip between two sessions; a forged caller is refused (option A). |
 | 6 | HTTP, secrets, filesystem roots (section 8) | network policy decision | A non-granted origin is denied; a secret-bound header is sent only to its origin; a symlink swapped in during a read is refused; `..` is refused before I/O; watch overflow delivers one `overflow`. |
 | 7 | MCP prompts and proxy; repo, gates, worktrees, notifications, package status | proxy, gate, channel decisions | Per the chosen options. |
 | 8 | Process host integration (section 15) | Core process host; process policy decisions | A crashing plugin leaves siblings serving; a spinning plugin is killed at the deadline; the same fixtures pass on both hosts. |
-| 9 | Ports: messaging, orchestrator, project-pipelines | slices 1 to 5 and 7 | Live proofs of each plugin's tool surface. |
+| 9 | Ports: messaging, orchestrator, project-pipelines | slices 1 to 5, 4b, and 7; Web/TUI view renderers for project-pipelines | Live proofs of each plugin's tool surface; for project-pipelines, its views render in Web and TUI from the declarations, and a ticket change appears in both without a reload. |
 
-## 17. Answers to the revision 1 findings
+## 17. Answers to review findings
+
+### 17.1 Revision 1
 
 1. **Admission accounting** (reviewer 1): section 5 now reserves one delivery
    slot and `max_result_bytes` per accepted call at acceptance, sizes the
@@ -887,9 +1042,42 @@ setup.
    result to a request-response handler, because the handler has already
    returned. Section 4 adds suspendable handlers.
 
+### 17.2 Revision 2
+
+1. **Early completion and the suspension handshake**: section 4.2 orders the
+   steps (pool debit, call table, send, yield), shows why a resume cannot
+   precede the yield inside the VM, and adds the Hub call ledger for either
+   order of `suspended` and final results, duplicate and unknown completions,
+   cancellation tombstones, and sequential calls. A Hub refusal after the
+   yield uses the slot debited before the yield.
+2. **Core capacity ownership**: section 5.1 replaces per-call Hub
+   reservations with a standing engine delivery pool (agreed with the Core
+   process-host writer): the engine holds the queue slots, request bytes, and
+   completion bytes; admission from the pool cannot refuse for capacity;
+   ordinary Background work cannot use pool capacity; cancellation keeps its
+   slot until its delivery transfers or the generation retires; every call
+   has exactly one terminal. Section 5.2 charges producer buffers, request
+   bodies, serialization overlap, and the shared callback account.
+3. **Stream lifetimes**: section 4.3 separates the setup call, the armed
+   resource, and the pending event, bounds each, charges recursive watcher
+   directories, and states that `cancel()` stops new event invocations but
+   does not cancel an already suspended callback invocation.
+4. **Bounds before allocation**: module staging reserves before reading
+   (7.4); HTTP derives a pre-admission ceiling from fixed header limits and
+   `max_bytes` and fails rather than truncates (8.1); queries page by items
+   and bytes inside the admitted reservation (11.2).
+5. **UI replacement**: section 12 assigns schema, admission, projection,
+   action routing, and `surface_route` removal to this repository and
+   rendering to the Web and TUI writers; section 16 adds slice 4b with
+   acceptance and ablation, and slice 9 requires the rendered views.
+6. **Filesystem authority**: section 8.2 uses `openat2` with
+   `RESOLVE_BENEATH` on Linux and `O_NOFOLLOW_ANY` plus a post-open
+   `F_GETPATH` and root-identity check on macOS, adds the watch identity
+   rule, and specifies an adversarial rename test with its ablation.
+
 ## 18. Product decisions (summary)
 
-1. Reservation caps (5.8).
+1. Delivery pool size (5.1).
 2. Log limits (7.1).
 3. Timer marker (7.5).
 4. Network policy (8.1).
