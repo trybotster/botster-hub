@@ -1964,22 +1964,25 @@ impl HubRuntime {
                     match finished {
                         CoreTicketPoll::Pending => index += 1,
                         CoreTicketPoll::Ready(result) => {
-                            let InflightPluginCore::Coordination { response, .. } =
-                                inflight.swap_remove(index);
+                            // Bind the record so its unbound fields drop after the send.
+                            let record = inflight.swap_remove(index);
+                            let InflightPluginCore::Coordination { response, .. } = record;
                             let _ = response.send(result);
                         }
                         CoreTicketPoll::Lost => {
-                            let InflightPluginCore::Coordination { response, .. } =
-                                inflight.swap_remove(index);
+                            // Bind the record so its unbound fields drop after the send.
+                            let record = inflight.swap_remove(index);
+                            let InflightPluginCore::Coordination { response, .. } = record;
                             let _ =
                                 response.send(crate::lua_runtime::CoordinationDelivery::Refused(
                                     crate::lua_runtime::CoordinationRefusal::HelperStopped,
                                 ));
                         }
                         CoreTicketPoll::Refused => {
+                            let record = inflight.swap_remove(index);
                             let InflightPluginCore::Coordination {
                                 response, rejected, ..
-                            } = inflight.swap_remove(index);
+                            } = record;
                             let refusal = if rejected.as_ref().is_some_and(|rejected| {
                                 rejected.reason == crate::data_plane::driver::CoreRefusal::Stopped
                             }) {
