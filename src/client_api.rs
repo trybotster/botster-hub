@@ -448,7 +448,13 @@ impl HubClientApi {
                             .map(|page| {
                                 respond(HubClientResponseBody::SessionLifecycleBaselinePage(page))
                             })
-                            .map_err(|_| core_error(CoreDaemonError::Shutdown))
+                            .map_err(|error| {
+                                // The returned Shutdown hides this cause from the client.
+                                crate::hub_log::hub_log!(
+                                    "hub_client_subscribe_entities_baseline_failed error={error:?}"
+                                );
+                                core_error(CoreDaemonError::Shutdown)
+                            })
                     }),
                 )));
             }
@@ -2359,7 +2365,10 @@ pub(crate) fn runtime_error(
     operation: HubClientOperation,
     error: impl Into<HubRuntimeError>,
 ) -> HubClientError {
-    let kind = match error.into() {
+    let error = error.into();
+    // The client sees only the kind; the Hub log keeps the cause.
+    let cause = error.to_string();
+    let kind = match error {
         HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::UnknownSession(_)) => {
             HubClientRuntimeErrorKind::UnknownSession
         }
@@ -2398,6 +2407,10 @@ pub(crate) fn runtime_error(
         | HubRuntimeError::Credentials(_)
         | HubRuntimeError::IncompatibleWorkers { .. } => HubClientRuntimeErrorKind::State,
     };
+    crate::hub_log::hub_log!(
+        "hub_client_runtime_error request_id={} operation={operation:?} kind={kind:?} error={cause}",
+        request_id.0
+    );
     HubClientError::Runtime {
         request_id,
         operation,
@@ -2408,6 +2421,48 @@ pub(crate) fn runtime_error(
 #[cfg(test)]
 mod runtime_error_tests {
     use super::*;
+
+    #[test]
+    fn runtime_error_logs_the_cause_the_client_does_not_see() {
+        let request_id = "log-runtime-cause-spawn-failed";
+        let error = runtime_error(
+            RequestId(request_id.to_string()),
+            HubClientOperation::SpawnSessionType,
+            HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Engine(
+                botster_core::DefaultBotsterEngineError::Runtime(SessionRuntimeError {
+                    kind: SessionRuntimeErrorKind::SpawnFailed,
+                    message: "worker exec failed: log-cause-marker-7f3a".to_string(),
+                }),
+            )),
+        );
+        assert!(!format!("{error:?}").contains("log-cause-marker-7f3a"));
+        let lines = crate::hub_log::captured_matching(&[
+            "hub_client_runtime_error",
+            &format!("request_id={request_id}"),
+        ]);
+        assert_eq!(lines.len(), 1, "one log line per runtime error: {lines:?}");
+        assert!(lines[0].contains("operation=SpawnSessionType"), "{lines:?}");
+        assert!(lines[0].contains("kind=SpawnFailed"), "{lines:?}");
+        assert!(lines[0].contains("log-cause-marker-7f3a"), "{lines:?}");
+    }
+
+    #[test]
+    fn runtime_error_logs_a_generic_core_failure_with_its_kind() {
+        let request_id = "log-runtime-cause-shutdown";
+        runtime_error(
+            RequestId(request_id.to_string()),
+            HubClientOperation::SpawnSessionType,
+            HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Shutdown),
+        );
+        let lines = crate::hub_log::captured_matching(&[
+            "hub_client_runtime_error",
+            &format!("request_id={request_id}"),
+        ]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("kind=Runtime"), "{lines:?}");
+        let shutdown = botster_core_daemon::CoreDaemonError::Shutdown.to_string();
+        assert!(lines[0].contains(&shutdown), "{lines:?}");
+    }
     use botster_core::SessionRuntimeError;
 
     #[test]
