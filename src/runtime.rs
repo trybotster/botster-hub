@@ -165,6 +165,11 @@ pub struct HubRuntime {
     reconciliation: HubSessionReconciliation,
     plugin_lifecycle: Option<HubPluginLifecycle>,
     capability_runtime: SharedHubCapabilityRuntime,
+    /// Raised by capability runtimes after they queue an event.
+    capability_wake: Arc<CapabilityWake>,
+    /// Callback deliveries that admission refused, retained in order.
+    capability_backlog:
+        Mutex<std::collections::VecDeque<crate::capabilities::CapabilityCallbackEvent>>,
     session_type_spawner: SharedSessionTypeSpawner,
     host_executor: crate::host_executor::HostExecutor,
     coordination_bridge: HubCoordinationBridge,
@@ -662,10 +667,12 @@ impl HubRuntime {
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
         let inflight_account = Arc::clone(&lua_memory);
+        let capability_wake = Arc::new(CapabilityWake::default());
+        let capability_runtime = new_capability_runtime(&config, &capability_wake)?;
         Ok(Self {
-            capability_runtime: Arc::new(Mutex::new(
-                HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
-            )),
+            capability_runtime: Arc::clone(&capability_runtime),
+            capability_wake: Arc::clone(&capability_wake),
+            capability_backlog: Mutex::new(std::collections::VecDeque::new()),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(
                 &lua_memory,
             ))),
@@ -855,10 +862,12 @@ impl HubRuntime {
         ));
         let event_plane_counters = Arc::clone(package_event_router.counters());
         let inflight_account = Arc::clone(&lua_memory);
+        let capability_wake = Arc::new(CapabilityWake::default());
+        let capability_runtime = new_capability_runtime(&config, &capability_wake)?;
         let mut runtime = Self {
-            capability_runtime: Arc::new(Mutex::new(
-                HubCapabilityRuntime::from_config(&config).map_err(HubRuntimeError::Capability)?,
-            )),
+            capability_runtime: Arc::clone(&capability_runtime),
+            capability_wake: Arc::clone(&capability_wake),
+            capability_backlog: Mutex::new(std::collections::VecDeque::new()),
             session_type_spawner: Arc::new(HubSessionTypeSpawner::new_with_account(Arc::clone(
                 &lua_memory,
             ))),
@@ -1744,10 +1753,14 @@ impl HubRuntime {
         &mut self,
         request: botster_core::CapabilityRuntimeRequest,
     ) -> Result<botster_core::CapabilityRuntimeHandle, botster_core::CapabilityRuntimeError> {
-        self.capability_runtime
+        let handle = self
+            .capability_runtime
             .lock()
             .expect("hub capability runtime lock")
-            .submit(request)
+            .submit(request)?;
+        // The submission can move the earliest deadline, so the owner re-arms it.
+        self.capability_wake.notify();
+        Ok(handle)
     }
 
     /// Cancel one plugin-owned capability operation.
@@ -4535,6 +4548,74 @@ impl HubRuntime {
         self.host_executor.bind_owner_wake(sender);
     }
 
+    pub(crate) fn bind_capability_owner_wake(
+        &self,
+        sender: crate::daemon::control::message::ControlSender,
+    ) {
+        self.capability_wake.bind(sender);
+    }
+
+    /// Takes the capability notification. The owner reads it on every turn, so
+    /// a full control channel cannot lose it.
+    pub(crate) fn take_capability_notification(&self) -> bool {
+        self.capability_wake.take()
+    }
+
+    /// Earliest pending capability deadline.
+    pub(crate) fn capability_next_deadline(&self) -> Option<std::time::Instant> {
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .next_deadline()
+    }
+
+    /// Takes retained deliveries first, then newly drained ones, in order.
+    /// Retained deliveries whose callback was retired by cleanup are dropped.
+    pub(crate) fn take_capability_deliveries(
+        &self,
+    ) -> Result<
+        Vec<crate::capabilities::CapabilityCallbackEvent>,
+        botster_core::CapabilityRuntimeError,
+    > {
+        let mut runtime = self
+            .capability_runtime
+            .lock()
+            .expect("hub capability runtime lock");
+        let mut deliveries = self
+            .capability_backlog
+            .lock()
+            .expect("capability backlog lock")
+            .drain(..)
+            .filter(|delivery| runtime.has_callback(delivery))
+            .collect::<Vec<_>>();
+        deliveries.extend(runtime.drain_callback_events()?);
+        Ok(deliveries)
+    }
+
+    /// Returns refused deliveries to the front of the backlog, in order.
+    pub(crate) fn retain_capability_deliveries(
+        &self,
+        refused: Vec<crate::capabilities::CapabilityCallbackEvent>,
+    ) {
+        let mut backlog = self
+            .capability_backlog
+            .lock()
+            .expect("capability backlog lock");
+        for delivery in refused.into_iter().rev() {
+            backlog.push_front(delivery);
+        }
+    }
+
+    pub(crate) fn retire_capability_callback(
+        &self,
+        delivery: &crate::capabilities::CapabilityCallbackEvent,
+    ) {
+        self.capability_runtime
+            .lock()
+            .expect("hub capability runtime lock")
+            .retire_callback(delivery);
+    }
+
     pub(crate) fn bind_managed_spawn_owner_wake(
         &self,
         sender: crate::daemon::control::message::ControlSender,
@@ -5538,6 +5619,115 @@ impl HubSessionTypeSpawner {
             self.publish_managed_spawn();
         }
         result
+    }
+}
+
+/// Builds the capability runtime with its event notifier installed, so no
+/// submission can precede the notifier.
+fn new_capability_runtime(
+    config: &HubConfig,
+    wake: &Arc<CapabilityWake>,
+) -> Result<SharedHubCapabilityRuntime, HubRuntimeError> {
+    let mut runtime =
+        HubCapabilityRuntime::from_config(config).map_err(HubRuntimeError::Capability)?;
+    let notifier_wake = Arc::clone(wake);
+    runtime.set_event_notifier(Arc::new(move || notifier_wake.notify()));
+    Ok(Arc::new(Mutex::new(runtime)))
+}
+
+/// Coalesced owner wake for capability events. The pending flag survives a
+/// full control channel: the owner takes it on every turn.
+#[derive(Default)]
+pub(crate) struct CapabilityWake {
+    pending: std::sync::atomic::AtomicBool,
+    owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
+}
+
+impl CapabilityWake {
+    fn notify(&self) {
+        if !self.pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.send();
+        }
+    }
+
+    fn bind(&self, sender: crate::daemon::control::message::ControlSender) {
+        *self.owner.lock().unwrap_or_else(|error| error.into_inner()) = Some(sender);
+        if self.pending.load(std::sync::atomic::Ordering::Acquire) {
+            self.send();
+        }
+    }
+
+    fn take(&self) -> bool {
+        self.pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn send(&self) {
+        if let Some(owner) = self
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            let _ = owner.try_send(
+                crate::daemon::control::message::ControlMessage::CapabilityEventsPublished,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod capability_wake_tests {
+    use super::*;
+    use crate::daemon::control::message::ControlMessage;
+
+    #[test]
+    fn a_full_control_channel_keeps_the_capability_wake_pending() {
+        let wake = CapabilityWake::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(ControlMessage::PluginCompletionPublished)
+            .expect("fill the channel");
+        wake.bind(sender);
+
+        wake.notify();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::PluginCompletionPublished)
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "the full channel refused the wake"
+        );
+        assert!(wake.take(), "the owner still reads the pending flag");
+        assert!(!wake.take());
+    }
+
+    #[test]
+    fn a_notification_before_binding_is_sent_at_bind() {
+        let wake = CapabilityWake::default();
+        wake.notify();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        wake.bind(sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControlMessage::CapabilityEventsPublished)
+        ));
+        assert!(wake.take());
+    }
+
+    #[test]
+    fn notifications_coalesce_until_the_owner_takes_them() {
+        let wake = CapabilityWake::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        wake.bind(sender);
+        wake.notify();
+        wake.notify();
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err(), "one message per pending flag");
+        assert!(wake.take());
+        wake.notify();
+        assert!(receiver.try_recv().is_ok(), "a new flag sends again");
     }
 }
 

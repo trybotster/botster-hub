@@ -325,9 +325,9 @@ fn background_ready_class(work: BackgroundWork) -> crate::daemon::owner_schedule
         BackgroundWork::Maintenance(MaintenanceSliceKind::SubscriberDelivery) => {
             ReadyClass::SubscriberDelivery
         }
-        BackgroundWork::Maintenance(MaintenanceSliceKind::CompletionDrain) => {
-            ReadyClass::PluginCompletion
-        }
+        BackgroundWork::Maintenance(
+            MaintenanceSliceKind::CompletionDrain | MaintenanceSliceKind::CapabilityDelivery,
+        ) => ReadyClass::PluginCompletion,
         BackgroundWork::Maintenance(MaintenanceSliceKind::ProviderResync) => {
             ReadyClass::ProviderResync
         }
@@ -389,6 +389,121 @@ pub(crate) fn arm_package_entity_resync_deadline(
         .arm(waiter_id, deadline, now)
         .expect("a future resync deadline is later than every fired deadline");
     state.package_entity_resync_scan.deadline_key = Some(arm.key());
+}
+
+/// Arms the owner deadline at the earliest capability deadline. On expiry the
+/// capability slice drains, and the capability runtime returns each expired
+/// operation's timeout event.
+pub(crate) fn arm_capability_deadline(state: &mut DaemonControlState, deadline: Option<Instant>) {
+    if let Some(key) = state.capability_deadline_key.take() {
+        state.deadlines.disarm(key);
+    }
+    let Some(deadline) = deadline else {
+        return;
+    };
+    let now = Instant::now();
+    if deadline <= now {
+        state
+            .maintenance
+            .wakes
+            .mark(MaintenanceSliceKind::CapabilityDelivery);
+        return;
+    }
+    // The capability slice runs under this background waiter, which stays registered.
+    let waiter_id = background_waiter_id(
+        state,
+        BackgroundWork::Maintenance(MaintenanceSliceKind::CapabilityDelivery),
+    )
+    .expect("capability dispatch retains its background waiter");
+    let arm = state
+        .deadlines
+        .arm(waiter_id, deadline, now)
+        .expect("a future capability deadline is later than every fired deadline");
+    state.capability_deadline_key = Some(arm.key());
+}
+
+pub(crate) fn mark_capability_deadline_ready(
+    state: &mut DaemonControlState,
+    waiter_id: crate::owner_identity::WaiterId,
+) -> bool {
+    if state.capability_deadline_key.map(|key| key.waiter_id()) != Some(waiter_id) {
+        return false;
+    }
+    state.capability_deadline_key = None;
+    state
+        .maintenance
+        .wakes
+        .mark(MaintenanceSliceKind::CapabilityDelivery);
+    true
+}
+
+#[cfg(test)]
+mod capability_deadline_tests {
+    use super::*;
+
+    fn take_capability_wake(state: &mut DaemonControlState) -> bool {
+        state
+            .maintenance
+            .wakes
+            .take(MaintenanceSliceKind::CapabilityDelivery)
+    }
+
+    #[test]
+    fn a_due_capability_deadline_marks_the_capability_slice() {
+        let mut state = DaemonControlState::default();
+        // The default state marks every slice; consume the bit first.
+        take_capability_wake(&mut state);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        arm_capability_deadline(&mut state, Some(deadline));
+        assert_eq!(state.deadlines.len(), 1);
+        assert!(!take_capability_wake(&mut state));
+
+        let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+        crate::daemon::control::pending::mark_due_owner_deadlines(
+            &mut state,
+            deadline - Duration::from_millis(1),
+            &mut budget,
+        );
+        assert!(!take_capability_wake(&mut state), "not due yet");
+        assert_eq!(state.deadlines.len(), 1);
+
+        let mut budget = crate::daemon::owner_turn::OwnerTurnBudget::new(Instant::now());
+        crate::daemon::control::pending::mark_due_owner_deadlines(
+            &mut state,
+            deadline,
+            &mut budget,
+        );
+        assert!(take_capability_wake(&mut state));
+        assert!(state.capability_deadline_key.is_none());
+        assert!(state.deadlines.is_empty());
+    }
+
+    #[test]
+    fn rearming_replaces_the_previous_capability_deadline() {
+        let mut state = DaemonControlState::default();
+        let later = Instant::now() + Duration::from_secs(60);
+        arm_capability_deadline(&mut state, Some(later));
+        let previous = state.capability_deadline_key.expect("armed");
+
+        let earlier = later - Duration::from_secs(30);
+        arm_capability_deadline(&mut state, Some(earlier));
+        assert_eq!(state.deadlines.len(), 1);
+        assert!(!state.deadlines.disarm(previous), "the old key is gone");
+
+        arm_capability_deadline(&mut state, None);
+        assert!(state.capability_deadline_key.is_none());
+        assert!(state.deadlines.is_empty());
+    }
+
+    #[test]
+    fn a_passed_capability_deadline_marks_the_slice_without_arming() {
+        let mut state = DaemonControlState::default();
+        take_capability_wake(&mut state);
+        arm_capability_deadline(&mut state, Some(Instant::now()));
+        assert!(take_capability_wake(&mut state));
+        assert!(state.capability_deadline_key.is_none());
+        assert!(state.deadlines.is_empty());
+    }
 }
 
 pub(crate) fn mark_package_entity_resync_deadline_ready(
@@ -453,6 +568,12 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
         }
     }
     if let Some(runtime) = daemon.runtime() {
+        if runtime.take_capability_notification() {
+            state
+                .maintenance
+                .wakes
+                .mark(MaintenanceSliceKind::CapabilityDelivery);
+        }
         if runtime.take_event_plane_owner_ops_notification() {
             mark_event_owner_ready(state);
         }
@@ -674,6 +795,7 @@ fn control_ready_class(message: &ControlMessage) -> crate::daemon::owner_schedul
             ReadyClass::CoreCompletion
         }
         ControlMessage::HostProgressPublished
+        | ControlMessage::CapabilityEventsPublished
         | ControlMessage::EntityPublishProgress
         | ControlMessage::CoordinationProgress
         | ControlMessage::CausalProgressPublished
@@ -732,6 +854,18 @@ fn run_owner_maintenance_slice(
                     &mut state.maintenance_reads,
                     MaintenanceSliceKind::PackageEventDelivery,
                 );
+            }
+        }
+        MaintenanceSliceKind::CapabilityDelivery => {
+            if let Some(runtime) = daemon.runtime() {
+                crate::daemon_maintenance::run_maintenance_kind(
+                    runtime,
+                    &mut state.maintenance,
+                    &mut state.maintenance_reads,
+                    MaintenanceSliceKind::CapabilityDelivery,
+                );
+                let deadline = runtime.capability_next_deadline();
+                arm_capability_deadline(state, deadline);
             }
         }
         MaintenanceSliceKind::CompletionDrain => {
@@ -1185,6 +1319,7 @@ fn serve_daemon_inner(
         runtime.bind_data_plane_owner_wake(control_tx.clone());
         runtime.bind_host_owner_wake(control_tx.clone());
         runtime.bind_managed_spawn_owner_wake(control_tx.clone());
+        runtime.bind_capability_owner_wake(control_tx.clone());
     }
     let mut control_state = DaemonControlState {
         event_plane: daemon.local_webrtc().event_plane(),
@@ -1938,6 +2073,8 @@ pub(crate) struct DaemonControlState {
     pub(crate) plugin_entities: crate::daemon::control::entities::PluginEntityState,
     pub(crate) package_entity_resync_scan:
         crate::subscription::entity_resync::PackageEntityResyncScan,
+    /// The armed owner deadline for the earliest capability deadline.
+    pub(crate) capability_deadline_key: Option<crate::daemon::owner_schedule::DeadlineKey>,
     /// Global logical-byte ownership for drained plugin results and replies.
     pub(crate) plugin_result_budget: crate::daemon::control::reply::RetainedPluginResultBudget,
     /// Bounded ownership of connections, pending requests, and cleanup
@@ -2188,6 +2325,7 @@ impl Default for DaemonControlState {
             plugin_entities: crate::daemon::control::entities::PluginEntityState::default(),
             package_entity_resync_scan:
                 crate::subscription::entity_resync::PackageEntityResyncScan::default(),
+            capability_deadline_key: None,
             plugin_result_budget:
                 crate::daemon::control::reply::RetainedPluginResultBudget::default(),
             budget: crate::daemon::owner_budget::OwnerBudget::default(),

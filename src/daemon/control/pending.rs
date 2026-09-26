@@ -698,6 +698,9 @@ pub(crate) fn mark_due_owner_deadlines(
     {
         return;
     }
+    if crate::daemon::owner_loop::mark_capability_deadline_ready(state, key.waiter_id()) {
+        return;
+    }
     if state.plugin_entities.clear_deadline(key.waiter_id()) {
         crate::daemon::control::entities::mark_plugin_entity_ready(
             state,

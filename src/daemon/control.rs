@@ -131,7 +131,12 @@ pub(crate) fn dispatch_control_message(
             );
             false
         }
-        ControlMessage::PluginResultCapacityReleased
+        ControlMessage::PluginResultCapacityReleased => {
+            crate::daemon_maintenance::resume_parked_admissions(&mut state.maintenance);
+            crate::daemon::owner_loop::publish_completion_wakes(daemon, state);
+            false
+        }
+        ControlMessage::CapabilityEventsPublished
         | ControlMessage::PluginCompletionPublished
         | ControlMessage::EntityPublishProgress
         | ControlMessage::CausalProgressPublished

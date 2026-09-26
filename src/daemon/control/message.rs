@@ -151,6 +151,9 @@ pub(crate) enum ControlMessage {
     PluginCompletionPublished,
     /// A host job completed or released bounded executor capacity.
     HostProgressPublished,
+    /// A capability runtime queued an event, or a submission changed the
+    /// earliest capability deadline.
+    CapabilityEventsPublished,
     /// The causal table published queue capacity or a mutex release.
     CausalProgressPublished,
     /// A Lua publication or bridge unlock requires owner attention.

@@ -23,10 +23,10 @@ use botster_core::{
     FilesystemMetadata, FilesystemOperation, HttpCapabilityEndpointPolicy, HttpCapabilityResponse,
     HttpCapabilityRuntime, HttpCapabilityRuntimeConfig, HttpCapabilityTransport, HttpHeader,
     HttpTransportRequest, InMemoryWebSocketCapabilityRuntime, PluginCancellationToken,
-    PluginCapabilityRuntime, PluginCleanupResult, PluginKey, PluginResourceKind, PluginResourceRef,
-    PluginStoreBackend, PluginStoreCapabilityRequest, PluginStoreEntry, PluginStoreKey,
-    PluginStoreLimits, PluginStoreOperation, PluginStoreRecord, PluginStoreResult, RequestId,
-    ScopedRelativePath, TimerCapabilityRequest, WebSocketCapabilityRuntimeConfig,
+    PluginCapabilityRuntime, PluginCleanupResult, PluginHandlerRef, PluginKey, PluginResourceKind,
+    PluginResourceRef, PluginStoreBackend, PluginStoreCapabilityRequest, PluginStoreEntry,
+    PluginStoreKey, PluginStoreLimits, PluginStoreOperation, PluginStoreRecord, PluginStoreResult,
+    RequestId, ScopedRelativePath, TimerCapabilityRequest, WebSocketCapabilityRuntimeConfig,
     apply_plugin_store_merge_patch, plugin_store_payload_bytes,
 };
 use botster_core::{
@@ -57,6 +57,18 @@ pub struct HubCapabilityRuntime {
     completions_receiver: mpsc::Receiver<HubCapabilityCompletion>,
     /// Called after a worker thread queues a completion, so the owner drains it.
     notifier: Option<CapabilityEventNotifier>,
+    /// Plugin handler to invoke with each event of an operation, keyed by
+    /// (plugin key, operation id), with the serial of its registration. Plugin
+    /// cleanup removes a plugin's callbacks.
+    callbacks: BTreeMap<(String, String), (u64, PluginHandlerRef)>,
+    /// Serial of the last callback registration. A retained delivery matches
+    /// only its own registration, so it cannot reach a later plugin generation
+    /// that reuses the operation id.
+    callback_serial: u64,
+    /// Plugins that submitted an operation since their last cleanup. The owner
+    /// drains all of them, so an expired deadline is always cancelled and
+    /// `next_deadline` moves forward even when no callback is registered.
+    submitters: BTreeSet<String>,
     operation_capacity: usize,
     event_capacity: usize,
 }
@@ -237,6 +249,9 @@ impl HubCapabilityRuntime {
             completions_sender,
             completions_receiver,
             notifier: None,
+            callbacks: BTreeMap::new(),
+            callback_serial: 0,
+            submitters: BTreeSet::new(),
             operation_capacity: DEFAULT_CAPABILITY_OPERATION_CAPACITY,
             event_capacity: DEFAULT_CAPABILITY_EVENT_CAPACITY,
         })
@@ -265,6 +280,61 @@ impl HubCapabilityRuntime {
     ) -> Result<Vec<CapabilityRuntimeEvent>, CapabilityRuntimeError> {
         self.enqueue_due_timers(plugin_key, now_ms)?;
         self.drain_events(plugin_key)
+    }
+
+    /// Drains the events of every plugin that submitted an operation, which
+    /// also cancels every expired operation. Events whose operation has a
+    /// callback are returned for delivery; the rest go back to the plugin's
+    /// queue for its own `drain_events` caller.
+    pub(crate) fn drain_callback_events(
+        &mut self,
+    ) -> Result<Vec<CapabilityCallbackEvent>, CapabilityRuntimeError> {
+        let plugins = self.submitters.clone();
+        let mut deliveries = Vec::new();
+        for plugin in plugins {
+            let plugin_key = PluginKey(plugin);
+            for event in PluginCapabilityRuntime::drain_events(self, &plugin_key)? {
+                let callback = event_operation_id(&event).and_then(|operation_id| {
+                    self.callbacks
+                        .get(&(plugin_key.0.clone(), operation_id.0.clone()))
+                        .cloned()
+                });
+                match callback {
+                    Some((registration, handler)) => deliveries.push(CapabilityCallbackEvent {
+                        plugin_key: plugin_key.clone(),
+                        registration,
+                        handler,
+                        terminal: event_is_terminal(&event),
+                        event,
+                    }),
+                    None => self.push_local_event(event),
+                }
+            }
+        }
+        Ok(deliveries)
+    }
+
+    /// Forgets the callback of an operation whose terminal event is delivered
+    /// or retired. A later registration under the same key stays.
+    pub(crate) fn retire_callback(&mut self, delivery: &CapabilityCallbackEvent) {
+        if self.has_callback(delivery)
+            && let Some(operation_id) = event_operation_id(&delivery.event)
+        {
+            self.callbacks
+                .remove(&(delivery.plugin_key.0.clone(), operation_id.0.clone()));
+        }
+    }
+
+    /// Reports whether this delivery's own registration is still in place. A
+    /// retained delivery whose plugin was cleaned up (unload or reload) has
+    /// none, so it cannot reach the plugin's next generation, even when that
+    /// generation registers the same operation id and handler.
+    pub(crate) fn has_callback(&self, delivery: &CapabilityCallbackEvent) -> bool {
+        event_operation_id(&delivery.event).is_some_and(|operation_id| {
+            self.callbacks
+                .get(&(delivery.plugin_key.0.clone(), operation_id.0.clone()))
+                .is_some_and(|(registration, _)| *registration == delivery.registration)
+        })
     }
 
     fn submit_filesystem(
@@ -696,7 +766,14 @@ impl PluginCapabilityRuntime for HubCapabilityRuntime {
         &mut self,
         request: CapabilityRuntimeRequest,
     ) -> Result<CapabilityRuntimeHandle, CapabilityRuntimeError> {
-        match request.operation.clone() {
+        let callback = request.callback.clone().map(|handler| {
+            (
+                (request.plugin_key.0.clone(), request.operation_id.0.clone()),
+                handler,
+            )
+        });
+        let request_plugin = request.plugin_key.0.clone();
+        let handle = match request.operation.clone() {
             CapabilityOperation::Http(_) => self.http.submit(request),
             CapabilityOperation::WebSocket(_) => self.websocket.submit(request),
             CapabilityOperation::Watch(_) => Err(CapabilityRuntimeError::new(
@@ -708,7 +785,13 @@ impl PluginCapabilityRuntime for HubCapabilityRuntime {
             }
             CapabilityOperation::PluginStore(store) => self.submit_plugin_store(request, store),
             CapabilityOperation::Timer(timer) => self.submit_timer(request, timer),
+        }?;
+        self.submitters.insert(request_plugin);
+        if let Some((key, handler)) = callback {
+            self.callback_serial += 1;
+            self.callbacks.insert(key, (self.callback_serial, handler));
         }
+        Ok(handle)
     }
 
     fn cancel(
@@ -772,6 +855,9 @@ impl PluginCapabilityRuntime for HubCapabilityRuntime {
             self.timers.remove(resource_id);
         }
         self.pending_events.remove(&plugin_key.0);
+        self.callbacks
+            .retain(|(plugin, _), _| plugin != &plugin_key.0);
+        self.submitters.remove(&plugin_key.0);
 
         let mut removed_resources = local_removed
             .into_iter()
@@ -1902,6 +1988,41 @@ fn event_plugin_key(event: &CapabilityRuntimeEvent) -> Option<PluginKey> {
         CapabilityRuntimeEvent::Backpressure(event) => event.route.plugin_key.clone(),
         CapabilityRuntimeEvent::CleanupCompleted(event) => Some(event.plugin_key.clone()),
     }
+}
+
+/// One capability event bound for the plugin handler its operation named.
+#[derive(Debug, Clone)]
+pub(crate) struct CapabilityCallbackEvent {
+    pub(crate) plugin_key: PluginKey,
+    /// Serial of the callback registration this delivery belongs to.
+    pub(crate) registration: u64,
+    pub(crate) handler: PluginHandlerRef,
+    pub(crate) event: CapabilityRuntimeEvent,
+    /// The operation ends with this event, so its callback can be retired
+    /// once the delivery is admitted.
+    pub(crate) terminal: bool,
+}
+
+fn event_operation_id(event: &CapabilityRuntimeEvent) -> Option<&CapabilityOperationId> {
+    match event {
+        CapabilityRuntimeEvent::Completed(completed) => Some(&completed.operation_id),
+        CapabilityRuntimeEvent::ResourceOpened(resource)
+        | CapabilityRuntimeEvent::ResourceReleased(resource) => Some(&resource.operation_id),
+        CapabilityRuntimeEvent::TimedOut(failure)
+        | CapabilityRuntimeEvent::Cancelled(failure)
+        | CapabilityRuntimeEvent::Failed(failure) => Some(&failure.operation_id),
+        _ => None,
+    }
+}
+
+fn event_is_terminal(event: &CapabilityRuntimeEvent) -> bool {
+    matches!(
+        event,
+        CapabilityRuntimeEvent::Completed(_)
+            | CapabilityRuntimeEvent::TimedOut(_)
+            | CapabilityRuntimeEvent::Cancelled(_)
+            | CapabilityRuntimeEvent::Failed(_)
+    )
 }
 
 #[cfg(test)]

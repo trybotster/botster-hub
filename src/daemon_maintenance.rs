@@ -22,6 +22,9 @@ use botster_core_daemon::{
 use crate::HubRuntime;
 use crate::data_plane::driver::{CoreTicket, CoreTicketPoll};
 use crate::lifecycle::{PACKAGE_EVENT_INVOCATION_ORIGIN, SESSION_FAMILY_INVOCATION_ORIGIN};
+
+/// Invocation origin of a capability callback delivery.
+const CAPABILITY_INVOCATION_ORIGIN: &str = "capability-callback";
 use crate::session_projection::SessionProjection;
 
 /// Published owner-turn budget after isolated-path measurement.
@@ -94,10 +97,11 @@ pub enum MaintenanceSliceKind {
     CompletionDrain,
     ProviderResync,
     PackageEventDelivery,
+    CapabilityDelivery,
 }
 
 impl MaintenanceSliceKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Observe,
         Self::JournalPull,
         Self::ProjectionApply,
@@ -107,6 +111,7 @@ impl MaintenanceSliceKind {
         Self::CompletionDrain,
         Self::ProviderResync,
         Self::PackageEventDelivery,
+        Self::CapabilityDelivery,
     ];
 
     const fn bit(self) -> u16 {
@@ -120,6 +125,7 @@ impl MaintenanceSliceKind {
             Self::CompletionDrain => 1 << 6,
             Self::ProviderResync => 1 << 7,
             Self::PackageEventDelivery => 1 << 8,
+            Self::CapabilityDelivery => 1 << 9,
         }
     }
 }
@@ -513,6 +519,12 @@ pub struct MaintenanceState {
     pub pending_retirements: VecDeque<EventDeliveryFlight>,
     pub event_causal_blocked: bool,
     pub event_causal_faulted: bool,
+    /// Capability callback admission was refused; the retained deliveries wait
+    /// for a plugin completion or released result capacity, not a self-wake.
+    pub capability_admission_parked: bool,
+    /// Request ids of admitted capability callbacks.
+    pub capability_in_flight: BTreeSet<String>,
+    capability_sequence: u64,
     /// Core reported a lifecycle-journal advance since the last consumer read it.
     pub journal_wake_pending: bool,
 }
@@ -609,7 +621,7 @@ impl MaintenanceState {
 
     pub fn needs_work(&self) -> bool {
         // `observe_resume` is continuation state for the next Observe kind.
-        // It must not rearm the whole nine-kind rotation as idle wakes.
+        // It must not rearm the whole slice rotation as idle wakes.
         self.wakes.has_any()
             || self.baseline.is_some()
             || !self.pending_changes.is_empty()
@@ -848,6 +860,7 @@ fn run_maintenance_kind_with_owner(
         MaintenanceSliceKind::PackageEventDelivery => {
             run_package_event_delivery_slice(runtime, state)
         }
+        MaintenanceSliceKind::CapabilityDelivery => run_capability_delivery_slice(runtime, state),
         MaintenanceSliceKind::SubscriberDelivery | MaintenanceSliceKind::ProviderResync => {}
     }
 }
@@ -892,7 +905,7 @@ fn handle_unavailable_observe_pass(state: &mut MaintenanceState) {
 /// Apply a successful observe slice to Maintenance scheduling.
 ///
 /// An incomplete pass stores [`MaintenanceState::observe_resume`] and leaves
-/// the nine-kind pointer unchanged. A journal-advanced wake prefers
+/// the slice pointer unchanged. A journal-advanced wake prefers
 /// JournalPull. This function is the only incomplete-pass scheduler
 /// transition in production.
 fn apply_observe_pass_result(
@@ -1454,6 +1467,71 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
     }
 }
 
+/// Admits each capability callback event as a background plugin invocation,
+/// in order. A refusal retains the refused delivery and every later one, in
+/// order, and parks the slice until a plugin completion or released result
+/// capacity resumes it; the slice never re-wakes itself.
+fn run_capability_delivery_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
+    if state.capability_admission_parked {
+        return;
+    }
+    let Ok(deliveries) = runtime.take_capability_deliveries() else {
+        return;
+    };
+    let mut deliveries = deliveries.into_iter();
+    while let Some(delivery) = deliveries.next() {
+        state.capability_sequence = state.capability_sequence.wrapping_add(1);
+        let request_id = RequestId(format!(
+            "capability-{}-{}",
+            delivery.plugin_key.0, state.capability_sequence
+        ));
+        let payload = serde_json::to_value(&delivery.event).unwrap_or(serde_json::Value::Null);
+        let admission = runtime.try_admit_plugin(
+            PluginInvocationClass::Background,
+            PluginInvocationRequest {
+                request_id: request_id.clone(),
+                handler: delivery.handler.clone(),
+                timeout_ms: EVENT_INVOCATION_TIMEOUT_MS,
+                context: PluginInvocationContext {
+                    client_id: None,
+                    session_id: None,
+                    subscription_id: None,
+                    surface_id: None,
+                    origin: Some(CAPABILITY_INVOCATION_ORIGIN.to_string()),
+                    metadata: None,
+                },
+                payload: BoundaryJson(payload),
+            },
+        );
+        match admission {
+            PluginAdmissionResult::Queued { .. } => {
+                state.capability_in_flight.insert(request_id.0);
+                if delivery.terminal {
+                    runtime.retire_capability_callback(&delivery);
+                }
+            }
+            PluginAdmissionResult::Backpressured { .. } => {
+                let mut refused = vec![delivery];
+                refused.extend(deliveries);
+                runtime.retain_capability_deliveries(refused);
+                state.capability_admission_parked = true;
+                return;
+            }
+            // The handler cannot run (the plugin stopped or the handler is
+            // missing), so this operation's callback is retired.
+            _ => runtime.retire_capability_callback(&delivery),
+        }
+    }
+}
+
+/// A plugin completion or released result capacity can admit a parked
+/// delivery again.
+pub(crate) fn resume_parked_admissions(state: &mut MaintenanceState) {
+    if std::mem::take(&mut state.capability_admission_parked) {
+        state.wakes.mark(MaintenanceSliceKind::CapabilityDelivery);
+    }
+}
+
 fn run_completion_drain_slice(runtime: &HubRuntime, state: &mut MaintenanceState) {
     let budget = crate::daemon::control::reply::RetainedPluginResultBudget::new();
     let _ = run_completion_drain_slice_with_controls(runtime, state, &budget);
@@ -1539,6 +1617,11 @@ fn apply_plugin_completion(
         PluginInvocationResult::Completed(success) => success.request_id.clone(),
         PluginInvocationResult::Failed(failure) => failure.request_id.clone(),
     };
+    // Any completion frees admission capacity.
+    resume_parked_admissions(state);
+    if state.capability_in_flight.remove(&request_id.0) {
+        return;
+    }
     if state.event_in_flight.contains_key(&request_id.0) {
         match &completion.result {
             PluginInvocationResult::Completed(_) => {
@@ -4254,6 +4337,375 @@ return botster.register({})
         assert_eq!(snap.event_handler_timed_out, 1);
         assert_eq!(snap.event_handler_failed, 1);
         assert_eq!(snap.event_handler_cancelled, 0);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    const CAPABILITY_PLUGIN: &str = "event-probe.plugin";
+
+    fn install_capability_callback_plugin(name: &str) -> (HubRuntime, PathBuf, PathBuf) {
+        let (registry, package_root) = install_lua_event_plugin(
+            name,
+            r#"
+return botster.register({ handlers = {
+  { id = "on_capability", kind = "timer", call = function(event) return event end },
+} })
+"#,
+        );
+        let (mut runtime, data_directory) = event_delivery_runtime(name);
+        runtime
+            .load_lua_plugin_package(&registry, CAPABILITY_PLUGIN)
+            .expect("load capability callback plugin");
+        (runtime, package_root, data_directory)
+    }
+
+    /// Forwards the owner control channel to a std channel, so the test can
+    /// block on the next capability wake with a deadline.
+    fn capability_wake_channel(
+        runtime: &HubRuntime,
+    ) -> std::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        runtime.bind_capability_owner_wake(sender);
+        let (forward, wakes) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Some(message) = receiver.blocking_recv() {
+                if forward.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        wakes
+    }
+
+    fn expect_capability_wake(
+        runtime: &HubRuntime,
+        wakes: &std::sync::mpsc::Receiver<crate::daemon::control::message::ControlMessage>,
+    ) {
+        // timer: deadline — bounds a missing wake so the test fails instead of hanging.
+        let message = wakes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the capability runtime wakes the owner");
+        assert!(matches!(
+            message,
+            crate::daemon::control::message::ControlMessage::CapabilityEventsPublished
+        ));
+        assert!(runtime.take_capability_notification());
+    }
+
+    /// Accepts one HTTP request and holds the response until `release` sends.
+    fn held_http_server() -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let endpoint = format!(
+            "http://127.0.0.1:{}/status",
+            listener.local_addr().expect("local address").port()
+        );
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes = stream.read(&mut buffer).expect("read request");
+                if bytes == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..bytes]);
+            }
+            if released.recv().is_ok() {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        (endpoint, release, join)
+    }
+
+    fn http_callback_request(
+        operation_id: &str,
+        endpoint: &str,
+        timeout_ms: u64,
+    ) -> botster_core::CapabilityRuntimeRequest {
+        botster_core::CapabilityRuntimeRequest {
+            plugin_key: botster_core::PluginKey(CAPABILITY_PLUGIN.to_string()),
+            operation_id: botster_core::CapabilityOperationId(operation_id.to_string()),
+            operation: botster_core::CapabilityOperation::Http(
+                botster_core::HttpCapabilityRequest {
+                    method: "GET".to_string(),
+                    endpoint: endpoint.to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            ),
+            timeout_ms,
+            callback: Some(PluginHandlerRef {
+                plugin_key: botster_core::PluginKey(CAPABILITY_PLUGIN.to_string()),
+                kind: PluginHandlerKind::Timer,
+                handler_id: "on_capability".to_string(),
+            }),
+        }
+    }
+
+    /// Blocks on the Core completion notifier, then returns the payload of the
+    /// callback invocation `request_id`.
+    fn capability_callback_payload(
+        runtime: &HubRuntime,
+        completions: &std::sync::mpsc::Receiver<()>,
+        request_id: &str,
+    ) -> serde_json::Value {
+        loop {
+            let drain = runtime.drain_plugin_completions(64, usize::MAX);
+            for item in drain.completions {
+                if let PluginInvocationResult::Completed(success) = item.completion.result
+                    && success.request_id.0 == request_id
+                {
+                    return success.payload.expect("the handler returns the event").0;
+                }
+            }
+            // timer: deadline — bounds a missing completion so the test fails instead of hanging.
+            completions
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the callback invocation completes");
+        }
+    }
+
+    fn completion_notifications(runtime: &HubRuntime) -> std::sync::mpsc::Receiver<()> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = std::sync::Mutex::new(sender);
+        runtime.install_plugin_completion_notifier(std::sync::Arc::new(move || {
+            let _ = sender.lock().unwrap_or_else(|e| e.into_inner()).send(());
+        }));
+        receiver
+    }
+
+    #[test]
+    fn a_capability_event_reaches_its_lua_callback_through_the_owner_wake() {
+        let (mut runtime, package_root, data_directory) =
+            install_capability_callback_plugin("capability-callback");
+        let wakes = capability_wake_channel(&runtime);
+        let completions = completion_notifications(&runtime);
+        let (endpoint, release, server) = held_http_server();
+        let mut state = MaintenanceState::default();
+
+        runtime
+            .submit_capability_request(http_callback_request("probe", &endpoint, 5_000))
+            .expect("submit the HTTP request");
+        // The submission moves the earliest deadline, so it wakes the owner.
+        expect_capability_wake(&runtime, &wakes);
+        assert!(runtime.capability_next_deadline().is_some());
+        run_capability_delivery_slice(&runtime, &mut state);
+        assert!(
+            state.capability_in_flight.is_empty(),
+            "no event before the response"
+        );
+
+        release.send(()).expect("release the response");
+        // Only the capability event notifier can deliver this wake.
+        expect_capability_wake(&runtime, &wakes);
+        run_capability_delivery_slice(&runtime, &mut state);
+        assert_eq!(state.capability_in_flight.len(), 1);
+        let request_id = state.capability_in_flight.iter().next().unwrap().clone();
+
+        let payload = capability_callback_payload(&runtime, &completions, &request_id);
+        assert_eq!(payload["kind"], "completed", "{payload}");
+        assert_eq!(payload["operation_id"], "probe", "{payload}");
+        assert_eq!(runtime.capability_next_deadline(), None);
+        assert!(
+            runtime.take_capability_deliveries().unwrap().is_empty(),
+            "the terminal event retired the callback"
+        );
+        server.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_capability_timeout_reaches_its_lua_callback_at_the_deadline() {
+        let (mut runtime, package_root, data_directory) =
+            install_capability_callback_plugin("capability-timeout");
+        let wakes = capability_wake_channel(&runtime);
+        let completions = completion_notifications(&runtime);
+        let (endpoint, release, server) = held_http_server();
+        let mut state = MaintenanceState::default();
+
+        let submitted = Instant::now();
+        runtime
+            .submit_capability_request(http_callback_request("slow", &endpoint, 200))
+            .expect("submit the HTTP request");
+        expect_capability_wake(&runtime, &wakes);
+        let deadline = runtime
+            .capability_next_deadline()
+            .expect("the operation has a deadline");
+        assert!(deadline >= submitted + Duration::from_millis(200));
+
+        // The owner sleeps until the earliest deadline or an earlier wake.
+        // timer: deadline — the operation deadline is the event under test.
+        match wakes.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(_) => assert!(runtime.take_capability_notification()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => panic!("wake channel closed: {error}"),
+        }
+        assert!(Instant::now() >= deadline, "no event before the deadline");
+        run_capability_delivery_slice(&runtime, &mut state);
+        assert_eq!(state.capability_in_flight.len(), 1);
+        let request_id = state.capability_in_flight.iter().next().unwrap().clone();
+
+        let payload = capability_callback_payload(&runtime, &completions, &request_id);
+        assert_eq!(payload["kind"], "timed_out", "{payload}");
+        assert_eq!(payload["operation_id"], "slow", "{payload}");
+        assert_eq!(runtime.capability_next_deadline(), None);
+        drop(release);
+        server.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    fn operation_ids(deliveries: &[crate::capabilities::CapabilityCallbackEvent]) -> Vec<String> {
+        deliveries
+            .iter()
+            .map(|delivery| match &delivery.event {
+                botster_core::CapabilityRuntimeEvent::Completed(completed) => {
+                    completed.operation_id.0.clone()
+                }
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_refused_capability_admission_retains_every_delivery_in_order_and_parks() {
+        let (mut runtime, package_root, data_directory) =
+            install_capability_callback_plugin("capability-refusal");
+        let wakes = capability_wake_channel(&runtime);
+        let (first_endpoint, first_release, first_server) = held_http_server();
+        let (second_endpoint, second_release, second_server) = held_http_server();
+        let mut state = MaintenanceState::default();
+        runtime
+            .submit_capability_request(http_callback_request("first", &first_endpoint, 5_000))
+            .expect("submit the first request");
+        expect_capability_wake(&runtime, &wakes);
+        runtime
+            .submit_capability_request(http_callback_request("second", &second_endpoint, 5_000))
+            .expect("submit the second request");
+        expect_capability_wake(&runtime, &wakes);
+        first_release.send(()).expect("release the first response");
+        expect_capability_wake(&runtime, &wakes);
+        second_release
+            .send(())
+            .expect("release the second response");
+        expect_capability_wake(&runtime, &wakes);
+
+        runtime.set_test_plugin_admit_backpressure(true);
+        state.wakes.take(MaintenanceSliceKind::CapabilityDelivery);
+        run_capability_delivery_slice(&runtime, &mut state);
+        assert!(state.capability_in_flight.is_empty());
+        assert!(state.capability_admission_parked);
+        assert!(
+            !state.wakes.take(MaintenanceSliceKind::CapabilityDelivery),
+            "a refused slice parks instead of waking itself"
+        );
+        let retained = runtime.take_capability_deliveries().unwrap();
+        assert_eq!(operation_ids(&retained), ["first", "second"]);
+        runtime.retain_capability_deliveries(retained);
+
+        // A parked slice does not retry admission.
+        runtime.set_test_plugin_admit_backpressure(false);
+        run_capability_delivery_slice(&runtime, &mut state);
+        assert!(state.capability_in_flight.is_empty());
+
+        // Released capacity resumes the parked slice.
+        resume_parked_admissions(&mut state);
+        assert!(!state.capability_admission_parked);
+        assert!(state.wakes.take(MaintenanceSliceKind::CapabilityDelivery));
+        run_capability_delivery_slice(&runtime, &mut state);
+        assert_eq!(state.capability_in_flight.len(), 2);
+        assert!(runtime.take_capability_deliveries().unwrap().is_empty());
+        first_server.join().expect("first server");
+        second_server.join().expect("second server");
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_retained_capability_delivery_cannot_reach_a_later_registration() {
+        let (mut runtime, package_root, data_directory) =
+            install_capability_callback_plugin("capability-generation");
+        let wakes = capability_wake_channel(&runtime);
+        let (first_endpoint, first_release, first_server) = held_http_server();
+        runtime
+            .submit_capability_request(http_callback_request("probe", &first_endpoint, 5_000))
+            .expect("submit the first request");
+        expect_capability_wake(&runtime, &wakes);
+        first_release.send(()).expect("release the first response");
+        expect_capability_wake(&runtime, &wakes);
+        let stale = runtime.take_capability_deliveries().unwrap();
+        assert_eq!(operation_ids(&stale), ["probe"]);
+
+        // Cleanup ends the generation; the next one reuses the operation id
+        // and the handler.
+        runtime
+            .cleanup_plugin_capabilities(&botster_core::PluginKey(CAPABILITY_PLUGIN.to_string()))
+            .expect("clean up plugin capabilities");
+        let (second_endpoint, second_release, second_server) = held_http_server();
+        runtime
+            .submit_capability_request(http_callback_request("probe", &second_endpoint, 5_000))
+            .expect("submit the second request");
+        expect_capability_wake(&runtime, &wakes);
+
+        runtime.retain_capability_deliveries(stale.clone());
+        assert!(
+            runtime.take_capability_deliveries().unwrap().is_empty(),
+            "the retained delivery belongs to the cleaned-up registration"
+        );
+        runtime.retire_capability_callback(&stale[0]);
+
+        second_release
+            .send(())
+            .expect("release the second response");
+        expect_capability_wake(&runtime, &wakes);
+        let current = runtime.take_capability_deliveries().unwrap();
+        assert_eq!(
+            operation_ids(&current),
+            ["probe"],
+            "retiring the stale delivery kept the later registration"
+        );
+        assert_ne!(current[0].registration, stale[0].registration);
+        first_server.join().expect("first server");
+        second_server.join().expect("second server");
+        let _ = std::fs::remove_dir_all(package_root);
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn an_expired_capability_without_a_callback_moves_the_next_deadline() {
+        let (mut runtime, package_root, data_directory) =
+            install_capability_callback_plugin("capability-expiry");
+        let (endpoint, release, server) = held_http_server();
+        let mut request = http_callback_request("plain", &endpoint, 100);
+        request.callback = None;
+        runtime
+            .submit_capability_request(request)
+            .expect("submit the request");
+        let deadline = runtime
+            .capability_next_deadline()
+            .expect("the operation has a deadline");
+        // timer: deadline — the operation deadline is the event under test.
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+
+        let mut state = MaintenanceState::default();
+        run_capability_delivery_slice(&runtime, &mut state);
+        assert!(state.capability_in_flight.is_empty());
+        assert_eq!(
+            runtime.capability_next_deadline(),
+            None,
+            "the slice cancels the expired operation, so the owner does not re-arm a passed deadline"
+        );
+        drop(release);
+        server.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(package_root);
         let _ = std::fs::remove_dir_all(data_directory);
     }
 }
