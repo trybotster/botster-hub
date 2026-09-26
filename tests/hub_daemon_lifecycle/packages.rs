@@ -5117,14 +5117,21 @@ fn live_hub_lua_caller_sees_session_types_of_packages_enabled_after_it_loads() {
         true,
     );
     let session_type_id = "managed-session-type.plugin/init";
-    let listed = |inspected: &serde_json::Value| {
-        inspected["list"].as_array().is_some_and(|list| {
-            list.iter()
-                .any(|session_type| session_type["session_type_id"] == session_type_id)
-        })
+    // list runs alone so a show failure cannot hide its result.
+    let listed_now = |data_dir: &Path| {
+        let listed = call_plugin_tool(
+            data_dir,
+            "cross_package.list",
+            serde_json::json!({ "target_id": "tgt_late_contributor" }),
+        );
+        listed["list"]
+            .as_array()
+            .expect("list returns an array")
+            .iter()
+            .any(|session_type| session_type["session_type_id"] == session_type_id)
     };
-    let list_only = |data_dir: &Path| {
-        botster_hub::daemon_transport_request(
+    let show_error = |data_dir: &Path| {
+        let response = botster_hub::daemon_transport_request(
             &explicit_config(data_dir),
             botster_hub::DaemonRequest::PluginMcpCallTool {
                 name: "cross_package.inspect".to_string(),
@@ -5134,18 +5141,24 @@ fn live_hub_lua_caller_sees_session_types_of_packages_enabled_after_it_loads() {
                 }),
             },
         )
-        .expect("call the inspect tool")
+        .expect("call the inspect tool");
+        assert_eq!(
+            response.kind,
+            botster_hub::DaemonResponseKind::OperatorError,
+            "show of an absent type fails: {response:?}"
+        );
+        response.error.expect("operator error").message
     };
 
     let daemon = PanicSafeCliDaemon::start(&data_dir, "late contributor cleanup");
     // The caller loads first; the contributor does not exist yet.
     enable_local_package(&data_dir, &caller_dir);
     create_git_target(&data_dir, "tgt_late_contributor", &repository);
-    let before = list_only(&data_dir);
+    assert!(!listed_now(&data_dir), "no contributor yet");
+    let message = show_error(&data_dir);
     assert!(
-        before.kind != botster_hub::DaemonResponseKind::PluginMcpToolResult
-            || !listed(&before.plugin_tool_result),
-        "no contributor yet: {before:?}"
+        message.contains("unknown_session_type"),
+        "show before the contributor: {message}"
     );
 
     // Enable the contributor after the caller loaded; the next call sees it.
@@ -5192,11 +5205,13 @@ fn live_hub_lua_caller_sees_session_types_of_packages_enabled_after_it_loads() {
         botster_hub::DaemonResponseKind::PackageDecision,
         "{disabled:?}"
     );
-    let after = list_only(&data_dir);
+    assert!(!listed_now(&data_dir), "a disabled contributor's type is not listed");
+    // A disabled contributor's record stays installed with an unavailable
+    // source, so its type is ineligible rather than unknown.
+    let message = show_error(&data_dir);
     assert!(
-        after.kind != botster_hub::DaemonResponseKind::PluginMcpToolResult
-            || !listed(&after.plugin_tool_result),
-        "a disabled contributor's type is gone: {after:?}"
+        message.contains("session_type_not_eligible"),
+        "show after disable: {message}"
     );
     let refused = call_plugin_tool(
         &data_dir,
@@ -5208,6 +5223,10 @@ fn live_hub_lua_caller_sees_session_types_of_packages_enabled_after_it_loads() {
         }),
     );
     assert_eq!(refused["ok"], false, "disabled contributor spawn: {refused}");
+    assert_eq!(
+        refused["error"]["kind"], "session_type_not_eligible",
+        "disabled contributor spawn: {refused}"
+    );
 
     daemon.shutdown();
 }
