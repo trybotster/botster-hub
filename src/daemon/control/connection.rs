@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
-use botster_hub_client::{DaemonEvent, TERMINAL_SUBSCRIPTION_CLOSED_RESERVATION_EXPIRED};
+use botster_hub_client::DaemonEvent;
 
 use crate::HubDaemon;
 use crate::admission::connection_budget::AggregateSendPermit;
@@ -23,7 +23,6 @@ use crate::daemon::owner_budget::{
 use crate::daemon::owner_loop::DaemonControlState;
 use crate::daemon::owner_loop::tick;
 use crate::data_plane::driver::CoreTicket;
-use crate::runtime::BindRoutePlan;
 use crate::subscription::attach_routes::{BoundAdapterHandle, negotiated_unix_capability_set};
 
 pub(crate) fn handle(
@@ -411,16 +410,29 @@ fn bind_reserved_subscription(
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
     }
-    // The attachment identity captured here fences the deferred completion:
-    // a replacement stream on the same route has a different epoch.
-    let Some(identity) = state
-        .pending_runtime
-        .stream_identity(&reservation.session_id, &reservation.subscription_id)
+    // The reservation's attachment identity fences every step: a
+    // replacement stream on the same route has a different epoch.
+    let ReservationBinding::Terminal {
+        owner: route_owner,
+        identity,
+        route: route_reservation,
+    } = reservation.binding.clone()
     else {
         retire_reserved_subscription(daemon, state, &grant_id, &label);
         let _ = reply_tx.send(Err(BindReservedError::BindFailed));
         return false;
     };
+    if daemon.runtime().is_none()
+        || !state.pending_runtime.stream_matches(
+            &reservation.session_id,
+            &reservation.subscription_id,
+            &identity,
+        )
+    {
+        retire_reserved_subscription(daemon, state, &grant_id, &label);
+        let _ = reply_tx.send(Err(BindReservedError::BindFailed));
+        return false;
+    }
     let Ok(capabilities) =
         negotiated_unix_capability_set(&required_features, terminal_requirement.as_ref())
     else {
@@ -446,18 +458,18 @@ fn bind_reserved_subscription(
         let _ = reply_tx.send(Err(BindReservedError::OverLimit));
         return false;
     };
-    let bind_now = tick(&mut state.logical_clock);
-    let generation = botster_core::TerminalSubscriptionGeneration(reservation.generation);
+    let attach_now = tick(&mut state.logical_clock);
     let (adapter, handle) = mux.create_adapter_with_aggregate(aggregate);
-    // The bind runs on the Core owner thread; the reply follows as owner work.
+    // Core attaches and binds the route in one call on the Core thread, as
+    // the Unix path does. No Core route exists before this call, so a busy
+    // session cannot overflow a declared route that has no adapter yet.
     let client_id = identity.client_id.clone();
-    let mut bind_plan = Some(BindRoutePlan {
+    let mut attach_plan = Some(crate::runtime::AttachBindPlan {
         client_id: botster_core::ClientId(client_id.clone()),
         session_id: botster_core::SessionId(reservation.session_id.clone()),
         subscription_id: botster_core::SubscriptionId(reservation.subscription_id.clone()),
-        generation,
         capabilities,
-        now_seconds: bind_now,
+        now_seconds: attach_now,
         adapter: Box::new(adapter),
     });
     let mut ticket = None;
@@ -465,8 +477,8 @@ fn bind_reserved_subscription(
     let subscription_id = reservation.subscription_id.clone();
     let mut reply_tx = Some(reply_tx);
     let mut usage = Some(usage);
-    // Phase two of the obligation: release exactly the generation this bind
-    // created when the bind turned out stale or undeliverable.
+    // Phase two of the obligation: release exactly the generation this
+    // attach created when it turned out stale or undeliverable.
     let mut stale_generation: Option<botster_core::TerminalSubscriptionGeneration> = None;
     let mut detach_slot: Option<CoreTicket<Result<(), botster_core_daemon::CoreDaemonError>>> =
         None;
@@ -498,39 +510,51 @@ fn bind_reserved_subscription(
                     CoreWorkPoll::Lost | CoreWorkPoll::Ready(_) => ObligationPoll::Done,
                 };
             }
-            let bound = match drive_core_slot(
+            let attached = match drive_core_slot(
                 &mut ticket,
                 daemon,
                 state,
                 waiter_id,
                 |runtime, _, waiter_id| {
-                    let plan = bind_plan.take().expect("a bind plan is submitted once");
-                    runtime.submit_core_for_owner(waiter_id, move |daemon| {
-                        crate::runtime::bind_route_on_core(daemon, plan)
-                    })
+                    let plan = attach_plan
+                        .take()
+                        .expect("an attach plan is submitted once");
+                    runtime.attach_and_bind_terminal_for_owner(waiter_id, plan)
                 },
             ) {
                 CoreWorkPoll::Pending => return ObligationPoll::Pending,
-                CoreWorkPoll::Retry => false,
-                CoreWorkPoll::Lost => false,
-                CoreWorkPoll::Ready(result) => result.is_ok(),
+                CoreWorkPoll::Retry | CoreWorkPoll::Lost => None,
+                CoreWorkPoll::Ready(result) => result.ok(),
             };
             let (Some(reply_tx), Some(usage)) = (reply_tx.take(), usage.take()) else {
                 return ObligationPoll::Done;
             };
-            if !bound {
+            let Some(generation) = attached else {
+                // Core holds no route: attach_and_bind_on_core undoes its own
+                // partial work. Release the Hub stream this attach opened.
                 handle.close();
+                abandon_unbound_terminal(
+                    state,
+                    &route_owner,
+                    &identity,
+                    route_reservation,
+                    &session_id,
+                    &subscription_id,
+                );
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
                 let _ = reply_tx.send(Err(BindReservedError::BindFailed));
                 return ObligationPoll::Done;
-            }
-            // The adapter is bound in Core. Fence every owner-side mutation
-            // on the attachment identity and on the reservation still being
-            // live; on any failure release exactly this generation.
-            let still_owned =
-                state
-                    .pending_runtime
-                    .stream_matches(&session_id, &subscription_id, &identity);
+            };
+            // The route is attached and bound in Core. Fence every
+            // owner-side mutation on the attachment identity and on the
+            // reservation still being live; otherwise release exactly this
+            // generation.
+            let still_owned = state.pending_runtime.record_generation_if(
+                &session_id,
+                &subscription_id,
+                &identity,
+                generation,
+            );
             let reservation_bound = still_owned
                 && state
                     .pending_runtime
@@ -543,6 +567,14 @@ fn bind_reserved_subscription(
             }
             if !reservation_bound {
                 handle.close();
+                abandon_unbound_terminal(
+                    state,
+                    &route_owner,
+                    &identity,
+                    route_reservation,
+                    &session_id,
+                    &subscription_id,
+                );
                 retire_reserved_subscription(daemon, state, &grant_id, &label);
                 let _ = reply_tx.send(Err(BindReservedError::BindFailed));
                 stale_generation = Some(generation);
@@ -566,11 +598,13 @@ fn bind_reserved_subscription(
                 .send(Ok(BoundSubscription::Terminal {
                     handle: handle.clone(),
                     usage,
+                    generation: generation.0,
                 }))
                 .is_err()
             {
                 // The channel gave up waiting: nobody will drive this
                 // adapter. Undo the bind for exactly this attachment.
+                handle.close();
                 let _ = state.pending_runtime.cancel_stream_if(
                     &session_id,
                     &subscription_id,
@@ -584,6 +618,29 @@ fn bind_reserved_subscription(
         },
     );
     false
+}
+
+/// Release the Hub attach stream of a terminal reservation that never
+/// bound: cancel exactly `identity` and return the route key this attach
+/// reserved. A replacement stream on the same route is left alone.
+pub(crate) fn abandon_unbound_terminal(
+    state: &mut DaemonControlState,
+    owner: &crate::subscription::attach_routes::AttachStreamOwner,
+    identity: &crate::subscription::attach_routes::AttachmentIdentity,
+    route: crate::subscription::attach_routes::RouteReservation,
+    session_id: &str,
+    subscription_id: &str,
+) {
+    let _ = state
+        .pending_runtime
+        .cancel_stream_if(session_id, subscription_id, identity);
+    crate::subscription::route_cleanup::release_failed_attach_route(
+        &mut state.pending_runtime,
+        owner,
+        session_id,
+        subscription_id,
+        route,
+    );
 }
 
 fn retire_reserved_subscription(
@@ -648,7 +705,28 @@ pub(crate) fn retire_route_owner(
                 crate::daemon::client_events::retire_mailbox(state, mailbox);
             }
         }
-        ChannelClass::Control | ChannelClass::Terminal => {}
+        ChannelClass::Terminal => {
+            // A reservation that never bound owns no Core route; release
+            // only the Hub stream it opened. A bound route is released by
+            // its adapter close.
+            if reservation.state != crate::admission::reservations::ReservationState::Bound
+                && let ReservationBinding::Terminal {
+                    owner,
+                    identity,
+                    route,
+                } = &reservation.binding
+            {
+                abandon_unbound_terminal(
+                    state,
+                    owner,
+                    identity,
+                    *route,
+                    &reservation.session_id,
+                    &reservation.subscription_id,
+                );
+            }
+        }
+        ChannelClass::Control => {}
     }
 }
 
@@ -694,13 +772,23 @@ fn authorize_subscription_hello_ack(
         let _ = reply_tx.send(None);
         return false;
     };
+    // Entity and event channels acknowledge before the bind; a terminal
+    // channel acknowledges after its attach+bind, when the reservation is
+    // already bound.
     let live = state
         .pending_runtime
         .admission
         .reservations
         .reservation_for_label(label, peer_generation)
         .is_some_and(|reservation| {
-            reservation.state == crate::admission::reservations::ReservationState::Live
+            matches!(
+                (reservation.class, reservation.state),
+                (_, crate::admission::reservations::ReservationState::Live)
+                    | (
+                        ChannelClass::Terminal,
+                        crate::admission::reservations::ReservationState::Bound
+                    )
+            )
         });
     let permit = live.then(|| {
         state
@@ -768,13 +856,17 @@ pub(crate) fn emit_reservation_expired(
             | WebrtcTerminalAdmission::Rejected { mux, .. } => mux,
         })
     {
+        // Every class reports the expiry by label when it happens, so a
+        // client needs no timer of its own. A terminal reservation has no
+        // Core generation, so it sends no terminal_subscription_closed.
+        mux.push_host_event(DaemonEvent::RuntimeObservation {
+            kind: format!(
+                "subscription_channel_rejected:{}:{label}",
+                crate::transport::webrtc::subscription_channel::RESERVATION_EXPIRED_REASON
+            ),
+        });
         let event = match reservation.class {
-            ChannelClass::Terminal => DaemonEvent::TerminalSubscriptionClosed {
-                session_id: reservation.session_id,
-                subscription_id: reservation.subscription_id,
-                generation: reservation.generation,
-                reason: TERMINAL_SUBSCRIPTION_CLOSED_RESERVATION_EXPIRED.to_string(),
-            },
+            ChannelClass::Terminal => return,
             ChannelClass::Entity => DaemonEvent::RuntimeObservation {
                 kind: format!(
                     "entity_subscription_closed:{}:{}:reservation_expired",

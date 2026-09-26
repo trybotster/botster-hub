@@ -3795,4 +3795,358 @@ mod tests {
             "an unbound reservation holds a Core attach, so disconnect must clean it up"
         );
     }
+
+    fn admitted_peer_generation(harness: &PeerHarness, grant_id: &str) -> u64 {
+        match harness
+            .state
+            .pending_runtime
+            .admission
+            .webrtc_admissions
+            .get(grant_id)
+        {
+            Some(WebrtcTerminalAdmission::Admitted {
+                peer_generation, ..
+            }) => *peer_generation,
+            other => panic!("peer must be admitted: {other:?}"),
+        }
+    }
+
+    fn core_route(
+        harness: &PeerHarness,
+        session_id: &str,
+        subscription_id: &str,
+    ) -> Option<botster_core::TerminalSubscriptionRecord> {
+        harness
+            .daemon
+            .runtime()
+            .expect("runtime")
+            .list_terminal_subscriptions_for_test()
+            .into_iter()
+            .find(|row| row.session_id.0 == session_id && row.subscription_id.0 == subscription_id)
+    }
+
+    fn wait_for_observation(harness: &mut PeerHarness, peer: &mut LiveSignaledPeer, kind: &str) {
+        let mut seen = Vec::new();
+        for _ in 0..32 {
+            match harness.wait_for_host_event(peer, kind) {
+                botster_hub_client::DaemonEvent::RuntimeObservation { kind: observed }
+                    if observed == kind =>
+                {
+                    return;
+                }
+                other => seen.push(other),
+            }
+        }
+        panic!("observation {kind} not delivered; saw {seen:?}");
+    }
+
+    fn webrtc_adapter_hello() -> DaemonHello {
+        DaemonHello {
+            protocol: PROTOCOL.to_string(),
+            compatibility:
+                botster_hub_client::DaemonCompatibilityRequirement::for_webrtc_terminal_adapter(),
+            terminal_compatibility: None,
+        }
+    }
+
+    const IDLE_ECHO: &str =
+        "printf 'reserve-ready\\n'; while IFS= read -r line; do printf 'r:%s\\n' \"$line\"; done";
+
+    /// Protocol 10: Attach reserves a channel and creates no Core route. The
+    /// channel's Hello attaches and binds in one Core call, and the HelloAck
+    /// names the Core generation of that bound route.
+    #[test]
+    fn webrtc_attach_holds_no_core_route_until_the_channel_binds_it_atomically() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("webrtc-declare-at-ready");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41831");
+        harness.hello_on_peer(&mut peer, webrtc_adapter_hello());
+        let session_id = "declare-at-ready-session";
+        let subscription_id = "declare-at-ready-sub";
+        harness.spawn_on_peer(&mut peer, session_id, IDLE_ECHO);
+
+        let reservation = harness.reserve_attach_on_peer(&mut peer, session_id, subscription_id);
+        assert!(
+            core_route(&harness, session_id, subscription_id).is_none(),
+            "a reservation must not declare a Core route"
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .stream_identity(session_id, subscription_id)
+                .is_some(),
+            "the Hub attach stream exists before the bind"
+        );
+        assert!(
+            !harness
+                .state
+                .pending_runtime
+                .is_adapter_bound(session_id, subscription_id)
+        );
+
+        let generation = harness
+            .bind_reserved_on_peer(&mut peer, &reservation.label)
+            .expect("terminal HelloAck carries terminal_generation");
+        harness.wait_until_adapter_bound(session_id, subscription_id);
+        let route = core_route(&harness, session_id, subscription_id)
+            .expect("the bind created the Core route");
+        assert!(
+            route.adapter_bound,
+            "attach and bind land together: {route:?}"
+        );
+        assert_eq!(
+            route.generation.0, generation,
+            "the HelloAck names the bound route's Core generation"
+        );
+        assert_eq!(
+            harness
+                .state
+                .pending_runtime
+                .recorded_generation(session_id, subscription_id)
+                .map(|recorded| recorded.0),
+            Some(generation)
+        );
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    /// A Core attach+bind that fails rejects the channel with bind_failed,
+    /// sends no HelloAck, and leaves no Core route and no Hub stream.
+    #[test]
+    fn failed_webrtc_attach_bind_rejects_the_channel_and_leaves_nothing() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("webrtc-bind-failure");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41832");
+        harness.hello_on_peer(&mut peer, webrtc_adapter_hello());
+        let session_id = "bind-failure-session";
+        let subscription_id = "bind-failure-sub";
+        harness.spawn_on_peer(&mut peer, session_id, IDLE_ECHO);
+        let reservation = harness.reserve_attach_on_peer(&mut peer, session_id, subscription_id);
+        // The session ends before the channel opens, so Core refuses the attach.
+        harness
+            .shutdown_owned_sessions()
+            .expect("the session shuts down and is removed");
+
+        assert!(
+            harness.open_reserved_expecting_reject(&mut peer, &reservation.label),
+            "Hub must close the channel without a HelloAck"
+        );
+        wait_for_observation(
+            &mut harness,
+            &mut peer,
+            &format!(
+                "subscription_channel_rejected:bind_failed:{}",
+                reservation.label
+            ),
+        );
+        assert!(core_route(&harness, session_id, subscription_id).is_none());
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .stream_identity(session_id, subscription_id)
+                .is_none(),
+            "the failed attach releases its Hub stream"
+        );
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    /// Expiry of an unopened terminal reservation reports it by label and
+    /// releases only its own stream: a replacement stream on the same route
+    /// survives. Nothing exists in Core either way.
+    #[test]
+    fn terminal_reservation_expiry_reports_by_label_and_spares_a_replacement_stream() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("webrtc-reservation-expiry");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41833");
+        let grant_id = peer.grant_id.clone();
+        harness.hello_on_peer(&mut peer, webrtc_adapter_hello());
+        let session_id = "expiry-session";
+        harness.spawn_on_peer(&mut peer, session_id, IDLE_ECHO);
+        let peer_generation = admitted_peer_generation(&harness, &grant_id);
+
+        // Plain expiry releases the reserved stream.
+        let expired = harness.reserve_attach_on_peer(&mut peer, session_id, "expiry-sub");
+        crate::daemon::control::connection::emit_reservation_expired(
+            &mut harness.daemon,
+            &mut harness.state,
+            &grant_id,
+            peer_generation,
+            &expired.label,
+            u64::MAX,
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .stream_identity(session_id, "expiry-sub")
+                .is_none()
+        );
+        wait_for_observation(
+            &mut harness,
+            &mut peer,
+            &format!(
+                "subscription_channel_rejected:reservation_expired:{}",
+                expired.label
+            ),
+        );
+        assert!(core_route(&harness, session_id, "expiry-sub").is_none());
+
+        // A replacement stream on the same route is not the reservation's.
+        let fenced = harness.reserve_attach_on_peer(&mut peer, session_id, "fenced-sub");
+        let replacement = harness.state.pending_runtime.start_attach(
+            crate::subscription::attach_routes::AttachStreamOwner {
+                client_id: "replacement-client".to_string(),
+                grant_id: None,
+            },
+            session_id.to_string(),
+            "fenced-sub".to_string(),
+        );
+        crate::daemon::control::connection::emit_reservation_expired(
+            &mut harness.daemon,
+            &mut harness.state,
+            &grant_id,
+            peer_generation,
+            &fenced.label,
+            u64::MAX,
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .stream_matches(session_id, "fenced-sub", &replacement),
+            "an old reservation must not cancel a replacement stream"
+        );
+        let _ =
+            harness
+                .state
+                .pending_runtime
+                .cancel_stream_if(session_id, "fenced-sub", &replacement);
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    /// A bind whose stream was replaced after the reservation is refused
+    /// before any Core work: no Core route, and the replacement survives.
+    #[test]
+    fn webrtc_bind_for_a_replaced_stream_rejects_before_core_and_spares_the_replacement() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("webrtc-bind-fence");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41834");
+        harness.hello_on_peer(&mut peer, webrtc_adapter_hello());
+        let session_id = "bind-fence-session";
+        let subscription_id = "bind-fence-sub";
+        harness.spawn_on_peer(&mut peer, session_id, IDLE_ECHO);
+        let reservation = harness.reserve_attach_on_peer(&mut peer, session_id, subscription_id);
+        let replacement = harness.state.pending_runtime.start_attach(
+            crate::subscription::attach_routes::AttachStreamOwner {
+                client_id: "replacement-client".to_string(),
+                grant_id: None,
+            },
+            session_id.to_string(),
+            subscription_id.to_string(),
+        );
+
+        assert!(
+            harness.open_reserved_expecting_reject(&mut peer, &reservation.label),
+            "a bind for a replaced stream must not acknowledge"
+        );
+        harness.pump_until(
+            Instant::now() + Duration::from_secs(10),
+            "no Core route for the refused bind",
+            |harness| core_route(harness, session_id, subscription_id).is_none(),
+        );
+        assert!(
+            harness
+                .state
+                .pending_runtime
+                .stream_matches(session_id, subscription_id, &replacement),
+            "the replacement stream survives the stale bind"
+        );
+        let _ = harness.state.pending_runtime.cancel_stream_if(
+            session_id,
+            subscription_id,
+            &replacement,
+        );
+        peer.close_offer();
+        harness.cleanup();
+    }
+
+    /// The bind succeeded but the terminal HelloAck could not be sent, so the
+    /// client never learned the generation. Hub closes the bound adapter,
+    /// Core ends exactly that route, and the reservation and stream retire.
+    #[test]
+    fn terminal_hello_ack_failure_after_bind_ends_the_route_and_retires_the_stream() {
+        let _teardown_guard = teardown_test_lock();
+        let mut harness = PeerHarness::new("webrtc-ack-failure");
+        let mut peer = harness.signal_peer("http://127.0.0.1:41835");
+        harness.hello_on_peer(&mut peer, webrtc_adapter_hello());
+        let grant_id = peer.grant_id.clone();
+        let session_id = "ack-failure-session";
+        let subscription_id = "ack-failure-sub";
+        harness.spawn_on_peer(&mut peer, session_id, IDLE_ECHO);
+        let reservation = harness.reserve_attach_on_peer(&mut peer, session_id, subscription_id);
+        let peer_generation = admitted_peer_generation(&harness, &grant_id);
+        let peer_state = harness
+            .daemon
+            .local_webrtc()
+            .peer_states
+            .get(&grant_id)
+            .expect("live peer state")
+            .clone();
+
+        let channel = Arc::new(FakeDataChannel::default());
+        channel.push_event(encrypted_hello_event(
+            &peer.stream_key,
+            &webrtc_adapter_hello(),
+        ));
+        channel
+            .send_fails
+            .store(true, std::sync::atomic::Ordering::Release);
+        let host_channel = Arc::clone(&channel);
+        let label = reservation.label.clone();
+        let key = peer.stream_key.clone();
+        let host = harness.transport_handle.spawn(async move {
+            crate::transport::webrtc::subscription_channel::admit_reserved_subscription_channel(
+                &grant_id,
+                &label,
+                host_channel.as_ref(),
+                &key,
+                peer_state.as_ref(),
+            )
+            .await;
+        });
+        harness.pump_until(
+            Instant::now() + Duration::from_secs(10),
+            "the channel host to finish after the failed HelloAck",
+            |_| host.is_finished(),
+        );
+        assert!(
+            channel.sent.lock().expect("sent frames").is_empty(),
+            "no HelloAck reached the client"
+        );
+        harness.pump_until(
+            Instant::now() + Duration::from_secs(10),
+            "Core to end the bound route and Hub to retire it",
+            |harness| {
+                core_route(harness, session_id, subscription_id).is_none()
+                    && harness
+                        .state
+                        .pending_runtime
+                        .admission
+                        .reservations
+                        .reservation_for_label(&reservation.label, peer_generation)
+                        .is_none()
+                    && harness
+                        .state
+                        .pending_runtime
+                        .stream_identity(session_id, subscription_id)
+                        .is_none()
+            },
+        );
+        peer.close_offer();
+        harness.cleanup();
+    }
 }

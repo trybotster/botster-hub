@@ -46,7 +46,7 @@ enum SubscriptionChannelRejectReason {
 impl SubscriptionChannelRejectReason {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Late => "late",
+            Self::Late => RESERVATION_EXPIRED_REASON,
             Self::Stale => "stale",
             Self::Duplicate => "duplicate",
             Self::Unreserved => "unreserved",
@@ -56,6 +56,10 @@ impl SubscriptionChannelRejectReason {
         }
     }
 }
+
+/// Typed reason for a reservation that expired before its channel opened.
+/// Sent at expiry and again if the channel opens later.
+pub(crate) const RESERVATION_EXPIRED_REASON: &str = "reservation_expired";
 
 pub(crate) async fn reject_extra_data_channel<C>(grant_id: &str, label: &str, data_channel: &C)
 where
@@ -143,7 +147,7 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
             return;
         }
     };
-    let (subscription_id, generation) = match inspect {
+    let (class, subscription_id, generation) = match inspect {
         ReservationInspectReply::Unknown => {
             reject_reserved_data_channel(
                 grant_id,
@@ -200,15 +204,41 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
             return;
         }
         ReservationInspectReply::Live {
+            class,
             subscription_id,
             generation,
             ..
-        } => (subscription_id, generation),
+        } => (class, subscription_id, generation),
     };
-    let hello_permits =
-        match admit_subscription_hello(data_channel, stream_key, peer_state, grant_id, label).await
+    let Ok(hello) = receive_subscription_hello(data_channel, stream_key).await else {
+        reject_reserved_data_channel(
+            grant_id,
+            label,
+            SubscriptionChannelRejectReason::InvalidHello,
+            data_channel,
+            peer_state,
+        )
+        .await;
+        return;
+    };
+    // A terminal channel acknowledges its Hello only after Core attached and
+    // bound the route, because the HelloAck carries that route's generation.
+    // Entity and event channels acknowledge before the bind.
+    let early_permits = if class == crate::admission::connection_budget::ChannelClass::Terminal {
+        None
+    } else {
+        match acknowledge_subscription_hello(
+            data_channel,
+            stream_key,
+            &hello,
+            peer_state,
+            grant_id,
+            label,
+            None,
+        )
+        .await
         {
-            Ok(permits) => permits,
+            Ok(permits) => Some(permits),
             Err(()) => {
                 reject_reserved_data_channel(
                     grant_id,
@@ -220,7 +250,21 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
                 .await;
                 return;
             }
-        };
+        }
+    };
+    if class == crate::admission::connection_budget::ChannelClass::Terminal
+        && validate_subscription_hello(&hello).is_err()
+    {
+        reject_reserved_data_channel(
+            grant_id,
+            label,
+            SubscriptionChannelRejectReason::InvalidHello,
+            data_channel,
+            peer_state,
+        )
+        .await;
+        return;
+    }
     let (bind_tx, bind_rx) = oneshot::channel();
     if peer_state
         .runtime_tx
@@ -237,6 +281,51 @@ pub(crate) async fn admit_reserved_subscription_channel<C>(
     }
     match bind_rx.await {
         Ok(Ok(bound)) => {
+            let (generation, hello_permits) = match (&bound, early_permits) {
+                (
+                    BoundSubscription::Terminal {
+                        handle, generation, ..
+                    },
+                    _,
+                ) => {
+                    match acknowledge_subscription_hello(
+                        data_channel,
+                        stream_key,
+                        &hello,
+                        peer_state,
+                        grant_id,
+                        label,
+                        Some(*generation),
+                    )
+                    .await
+                    {
+                        Ok(permits) => (*generation, permits),
+                        Err(()) => {
+                            // The route is bound but the client never learned
+                            // its generation. Close the adapter so Core ends
+                            // exactly this route, then retire the reservation
+                            // as a driver exit does.
+                            handle.close();
+                            close_subscription_channel_or_fail_peer(data_channel, peer_state).await;
+                            if !peer_state
+                                .cleanup_sent
+                                .load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                let _ = peer_state
+                                    .runtime_tx
+                                    .send(ControlMessage::RetireReservedSubscription {
+                                        grant_id: grant_id.to_string(),
+                                        label: label.to_string(),
+                                    })
+                                    .await;
+                            }
+                            return;
+                        }
+                    }
+                }
+                (_, Some(permits)) => (generation, permits),
+                (_, None) => unreachable!("entity and event channels acknowledge before the bind"),
+            };
             let route = BoundSubscriptionRoute {
                 peer_state,
                 grant_id,
@@ -304,13 +393,10 @@ async fn run_bound_subscription_channel_and_retire<C>(
         .await;
 }
 
-async fn admit_subscription_hello<C>(
+async fn receive_subscription_hello<C>(
     data_channel: &C,
     stream_key: &AesGcmKey,
-    peer_state: &LocalWebrtcPeerState,
-    grant_id: &str,
-    label: &str,
-) -> Result<Vec<crate::admission::connection_budget::AggregateSendPermit>, ()>
+) -> Result<DaemonHello, ()>
 where
     C: LocalWebrtcDataChannel + ?Sized,
 {
@@ -318,17 +404,7 @@ where
         match data_channel.local_poll().await {
             Some(webrtc::data_channel::DataChannelEvent::OnMessage(message)) => {
                 match decrypt_client_frame(stream_key, message.data.as_ref()) {
-                    Some(ClientFrame::Hello { hello }) => {
-                        return acknowledge_subscription_hello(
-                            data_channel,
-                            stream_key,
-                            &hello,
-                            peer_state,
-                            grant_id,
-                            label,
-                        )
-                        .await;
-                    }
+                    Some(ClientFrame::Hello { hello }) => return Ok(hello),
                     _ => return Err(()),
                 }
             }
@@ -340,17 +416,7 @@ where
     }
 }
 
-async fn acknowledge_subscription_hello<C>(
-    data_channel: &C,
-    stream_key: &AesGcmKey,
-    hello: &DaemonHello,
-    peer_state: &LocalWebrtcPeerState,
-    grant_id: &str,
-    label: &str,
-) -> Result<Vec<crate::admission::connection_budget::AggregateSendPermit>, ()>
-where
-    C: LocalWebrtcDataChannel + ?Sized,
-{
+fn validate_subscription_hello(hello: &DaemonHello) -> Result<(), ()> {
     if hello.protocol != PROTOCOL || hello.compatibility.protocol_version != PROTOCOL_VERSION {
         return Err(());
     }
@@ -359,11 +425,28 @@ where
     {
         return Err(());
     }
+    Ok(())
+}
+
+async fn acknowledge_subscription_hello<C>(
+    data_channel: &C,
+    stream_key: &AesGcmKey,
+    hello: &DaemonHello,
+    peer_state: &LocalWebrtcPeerState,
+    grant_id: &str,
+    label: &str,
+    terminal_generation: Option<u64>,
+) -> Result<Vec<crate::admission::connection_budget::AggregateSendPermit>, ()>
+where
+    C: LocalWebrtcDataChannel + ?Sized,
+{
+    validate_subscription_hello(hello)?;
     let ack = DaemonHelloAck {
         protocol: PROTOCOL.to_string(),
         compatibility: DaemonCompatibility::current(),
         terminal_compatibility: Some(TerminalCompatibility::current()),
         diagnostics: vec![DaemonDiagnostic::connected("hello")],
+        terminal_generation,
     };
     let frames = framed_server_frame(stream_key, &ServerFrame::HelloAck { ack }).map_err(|_| ())?;
     let mut permits = Vec::with_capacity(frames.len());
@@ -481,7 +564,7 @@ async fn run_bound_subscription_channel<C>(
     }
     drop(hello_permits);
     match bound {
-        BoundSubscription::Terminal { handle, usage } => {
+        BoundSubscription::Terminal { handle, usage, .. } => {
             let exit = run_bound_terminal_channel(
                 data_channel,
                 stream_key,
@@ -1203,6 +1286,7 @@ mod tests {
             BoundSubscription::Terminal {
                 handle: handle.clone(),
                 usage,
+                generation: 1,
             },
             Vec::new(),
         ));
@@ -1517,7 +1601,11 @@ mod tests {
                         subscription_id: "sub-truncated",
                         generation: 1,
                     },
-                    BoundSubscription::Terminal { handle, usage },
+                    BoundSubscription::Terminal {
+                        handle,
+                        usage,
+                        generation: 1,
+                    },
                     Vec::new(),
                 )
                 .await;
@@ -1903,7 +1991,11 @@ mod tests {
                     &channel,
                     &key,
                     route,
-                    BoundSubscription::Terminal { handle, usage },
+                    BoundSubscription::Terminal {
+                        handle,
+                        usage,
+                        generation: 1,
+                    },
                     Vec::new(),
                 ),
             )
@@ -2010,6 +2102,7 @@ mod tests {
                     &peer_state,
                     "grant",
                     "route",
+                    None,
                 )
                 .await
                 .is_err()

@@ -20,7 +20,7 @@ repository.
 
 Implementation baseline before this split: `9b39f1607144319138151cdf776e8909f35a63d4`. The pipeline implementation commit should be treated as the final protocol revision once merged.
 
-External same-device clients should depend on the `botster-hub-client` crate and use `DaemonEndpoint`, `DaemonConnection`, `request`, or `stream_attach` to talk to a running `botster-hub` daemon socket. The crate owns the client-facing handshake, correlated request and response frames, event frames, the Unix container framing, and the WebRTC chunk headers described under "Host-control protocol 9" below.
+External same-device clients should depend on the `botster-hub-client` crate and use `DaemonEndpoint`, `DaemonConnection`, `request`, or `stream_attach` to talk to a running `botster-hub` daemon socket. The crate owns the client-facing handshake, correlated request and response frames, event frames, the Unix container framing, and the WebRTC chunk headers described under "Host-control protocol 10" below.
 
 Browser clients should import the checked generated TypeScript protocol artifact
 instead of maintaining handwritten DTO mirrors:
@@ -125,7 +125,7 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 49.
+- conformance fixture revision 50.
 
 `DaemonPackage.notice_reactions` is an additive optional field. Empty vectors
 are omitted on the wire. Each projected descriptor always carries a required
@@ -1638,11 +1638,14 @@ success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket adapter receives READY before later PAGE/FINISH frames. There is no
 host `Drain` JSON request.
 
-## Host-control protocol 9
+## Host-control protocol 10
 
-`PROTOCOL_VERSION` is 9 and `CONFORMANCE_FIXTURE_REVISION` is 49. This is a
-cold cut: a protocol-8 client fails closed at `ensure_compatible()`. There is
-no negotiation and no fallback path. `MCP_PROTOCOL_VERSION` and
+`PROTOCOL_VERSION` is 10 and `CONFORMANCE_FIXTURE_REVISION` is 50. This is a
+cold cut: a protocol-9 client fails closed at `ensure_compatible()`. There is
+no negotiation and no fallback path. Protocol 10 moves the WebRTC terminal
+route declaration from `Attach` to the reserved channel's Hello, so the
+`terminal_reservation` reply no longer carries a generation (see "Terminal
+routes"). `MCP_PROTOCOL_VERSION` and
 `botster_terminal_protocol::PROTOCOL_VERSION` stay unchanged.
 
 Every control message is one typed frame:
@@ -1735,11 +1738,35 @@ base64-wraps, or inspects `TerminalBody` bytes.
 Unix `Attach` binds the connection's adapter in one Core turn and answers
 `DaemonResponseKind::TerminalAttached` with `terminal_attach { session_id,
 subscription_id, generation }`. WebRTC `Attach` answers
-`DaemonResponseKind::TerminalReservation`; the browser opens one reliable
-ordered DataChannel with the reserved label, completes `ClientFrame::Hello`
-on it, and Hub binds the adapter when that channel is admitted. Terminal
-frames travel only on the bound route. The control channel carries no
-terminal frames.
+`DaemonResponseKind::TerminalReservation` with `terminal_reservation {
+session_id, subscription_id, peer_generation, label, expires_in_seconds }`.
+The reservation creates no Core route. The browser opens one reliable ordered
+DataChannel with the reserved label and sends `ClientFrame::Hello` on it. Hub
+then attaches and binds the route in one Core call, as the Unix path does, so
+a session that floods output while the channel opens cannot end a route that
+has no adapter yet. The channel's `HelloAck` carries `terminal_generation`,
+the Core generation of the bound route. Input chunks and
+`terminal_subscription_closed` matching use that generation; a client sends
+no input and matches no close event on the route before the `HelloAck`.
+Terminal frames travel only on the bound route. The control channel carries
+no terminal frames.
+
+A reserved channel that Hub refuses is closed without a `HelloAck`. Hub first
+sends a control-channel `RuntimeObservation` with kind
+`subscription_channel_rejected:<reason>:<label>`. The reasons are
+`unreserved`, `stale`, `duplicate`, `over_limit`, `invalid_hello`,
+`bind_failed` (the Core attach and bind failed; no route exists), and
+`reservation_expired`. A refused terminal channel never received a
+generation, so Hub sends no `terminal_subscription_closed` for it.
+
+A reservation expires `expires_in_seconds` after the reply. At expiry Hub
+sends `subscription_channel_rejected:reservation_expired:<label>` on the
+control channel for every channel class, and again if the channel opens
+later. `reservation_expired` is the one retryable reason: the client can
+attach again. There is no unsolicited `terminal_subscription_closed` for an
+unopened terminal reservation. A client learns that its channel never opened
+from its own DataChannel close or error event or from peer loss; it keeps no
+reservation timer.
 
 Capture and paging replace inline snapshots. `CaptureSnapshot` starts a Core
 capture and answers `capture_snapshot { capture_id, total_bytes, page_bytes,
@@ -1814,9 +1841,9 @@ contains `kind`, `subscription_id`, `generation`, `peer_generation`, an opaque
 The browser creates one reliable ordered DataChannel with that exact label.
 The browser sends the encrypted `ClientFrame::Hello` on the new channel. Hub
 binds only a live reservation for the current peer generation and matching
-channel class. Late reserved-channel open after expiry emits unsolicited
-`TerminalSubscriptionClosed` with reason `reservation_expired` on the peer
-control channel, then closes that channel. Unknown labels close without an
+channel class. Expiry and late open follow the terminal rules above: Hub
+sends `subscription_channel_rejected:reservation_expired:<label>` on the
+control channel and closes a late channel. Unknown labels close without an
 event. A live reservation conflict on Attach returns
 `reservation_label_conflict`.
 

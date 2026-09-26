@@ -208,6 +208,9 @@ pub(crate) enum BoundSubscription {
     Terminal {
         handle: crate::transport::webrtc::WebRtcTerminalAdapterHandle,
         usage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Core generation from the attach+bind; the channel's HelloAck
+        /// carries it to the client.
+        generation: u64,
     },
     Entity {
         receiver: tokio_mpsc::Receiver<crate::entity_delivery::EntityDelivery>,

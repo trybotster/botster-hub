@@ -2640,7 +2640,6 @@ fn print_daemon_response(response: DaemonResponse) -> Result<(), OperatorError> 
             if let Some(reservation) = response.terminal_reservation {
                 println!("session_id={}", reservation.session_id);
                 println!("subscription_id={}", reservation.subscription_id);
-                println!("generation={}", reservation.generation);
                 println!("peer_generation={}", reservation.peer_generation);
                 println!("label={}", reservation.label);
                 println!("expires_in_seconds={}", reservation.expires_in_seconds);
