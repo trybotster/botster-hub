@@ -2,7 +2,35 @@
 
 Writer: Claude Hub writer, session `sess-1790388284-006e-2c0553fc5128dca3e436b363414462b1`.
 Checkout: branch `delivery/event-driven-20260925` at Hub main `23b0feaa`. Read only; no cargo.
-Rules: `/private/tmp/botster-event-driven-rewrite-brief-20260925.md`. The allowed categories are deadline, backoff, rate-limit, os-no-event, and ui-lifetime (the orchestrator's addition; the Hub has no sites). Everything else is DEFECT. NOT-TIMER marks false positives, such as `set_read_timeout(None)`, a `sleep N` fixture lifetime, a comment, or a Lua `select`.
+Rules: `/private/tmp/botster-event-driven-rewrite-brief-20260925.md`. The allowed categories are deadline, backoff, rate-limit, os-no-event, ui-lifetime (the Hub has no sites) and measurement-window (resource probes and benchmarks only). Everything else is DEFECT. NOT-TIMER marks only true false positives: `set_read_timeout(None)`, a comment or doc, a constant or function definition, a Lua `select`, or a timer API identifier that is not a call (an import, a test name). A fixture `sleep N` is never NOT-TIMER.
+
+## Revision 2 (after reviewer + orchestrator rulings)
+
+What changed from the committed inventory (176e6c72):
+
+1. **Fixture sleeps are DEFECT.** Every `sleep N` / `exec sleep N` / `while true; do sleep 1; done` / Python `time.sleep` / Ruby `sleep` / Node `setInterval` that keeps a test child alive or delays a fixture is now DEFECT. Replacement for all of them: *blocking read the test ends: `cat` on stdin or a FIFO the test closes.* Every former NOT-TIMER row was re-examined; each now states its new category. The subtype **DEFECT (mechanical)** marks a timer call that does not wait at all, such as `recv_timeout(Duration::ZERO)`. Its replacement drops the timer API, for example `try_recv()`.
+2. **Timeout values never change.** No row suggests a new value any more. Suggestions moved to "Follow-ups (not applied)" at the end, among them allocation_oracle.rs:534.
+3. **os-no-event must hold on macOS and on Linux.** Child-process exit is never os-no-event.
+   - run-loaded-daemon-lifecycle-selftest 332 and 410 are now DEFECT. Both are inside `runner_platform == Linux` blocks, so pidfd EPOLLHUP at reap is the event.
+   - publish-npm-packages 144 is now DEFECT. It needs an orchestrator decision.
+   - isolated_hub.rs 2187 stays os-no-event (candidate), with the facts for both platforms.
+   - plugin_bounds.rs:231 is now DEFECT (rule 6).
+   - The group-empty "os-no-event part" of the C and D rows is gone (M2).
+4. **Library APIs that poll internally are polls.** Python `Popen.wait(timeout)`, `subprocess.run(timeout=)` and `communicate(timeout=)` use WNOHANG plus sleep.
+   - Replacements that proposed them now say: blocking wait on a thread plus a completion queue (or pidfd/kqueue).
+   - 18 script sites whose own mechanism is one of these calls are added to group D as DEFECT (extra, not in grep).
+5. **M2 (process group empty)** now describes the final implementation in `src/process_exit.rs` and has no os-no-event residual.
+   - macOS takes atomic `proc_listpgrppids` snapshot rounds with NOTE_EXIT per member.
+   - Linux watches running members with pidfd POLLIN and zombie members with POLLHUP. The group is empty when `killpg(pgid, 0) == ESRCH`.
+   - The group-empty rows in B2, C and D now point to M2.
+6. **measurement-window.** It is applied to probe-hub-resources:232 and test-production-package-runtime:590. It is also applied to the scheduler-lag instruments in event_plane_saturation.rs (1646, 1877), which are host-validity probes whose interval is the metric; the reviewer should confirm. It is not applied to plugin_bounds.rs:231, which asserts an idle-CPU bound for correctness, so that site is DEFECT.
+7. **Reviewer corrections.**
+   - Zombie-state waits (D mechanism H, process-census 229/272, selftest 308/355/378) prefer blocking `waitid(WEXITED|WNOWAIT)` for a child, or pidfd/kqueue. Pipe EOF does not prove zombie state.
+   - The allocation-oracle shrink suggestion was removed from its row.
+8. **Coverage additions.**
+   - Bare `webrtc::runtime::timeout(` calls were outside the original grep. All 63 are now classified one by one in group C: 24 in `src/` (all deadline) and 39 in the lifecycle test files (25 DEFECT, 12 deadline, 2 NOT-TIMER).
+   - Sites added between 23b0feaa and 20b201bd are in a new section at the end, with line numbers at 20b201bd.
+   - **All other line numbers are at 23b0feaa.** The same section maps the moved lines.
 
 ## Method
 
@@ -15,27 +43,58 @@ Rules: `/private/tmp/botster-event-driven-rewrite-brief-20260925.md`. The allowe
 
 | category | A | B1 | B2 | C | D | total |
 |---|---|---|---|---|---|---|
-| DEFECT | 121 | 89 | 97 | 135 | 97 | **539** |
-| deadline | 58 | 50 | 15 | 77 | 14 | **214** |
-| rate-limit | 0 | 5 | 0 | 0 | 2 | **7** |
+| DEFECT | 128 | 114 | 118 | 141 | 118 | **619** |
+| deadline | 58 | 44 | 17 | 78 | 20 | **217** |
+| rate-limit | 0 | 4 | 0 | 0 | 2 | **6** |
 | backoff | 0 | 0 | 0 | 1 | 0 | **1** |
-| os-no-event (candidate) | 0 | 0 | 1 | 0 | 4 | **5** |
-| NOT-TIMER | 7 | 27 | 30 | 8 | 37 | **109** |
+| measurement-window | 0 | 2 | 0 | 0 | 2 | **4** |
+| os-no-event (candidate) | 0 | 0 | 0 | 0 | 1 | **1** |
+| NOT-TIMER | 0 | 7 | 8 | 1 | 11 | **27** |
 | grep lines | 186 | 171 | 143 | 221 | 154 | **875** |
-| extra poll sites (not in grep) | 13 | 2 | ~55 | 13 | 2 | ~85 |
+| extra DEFECT sites (not in grep) | 13 | 5 | ~56 | 10 | 44 | ~128 |
+| bare `timeout(` calls (not in grep): DEFECT / deadline / NOT-TIMER | 0 | 2 / 0 / 0 | 23 / 12 / 2 | 0 / 24 / 0 | 0 | **25 / 36 / 2** |
 
-Production DEFECTs: A 0 (only the deadlines `owner_loop.rs:659` and `:1466` are production), C 30, D the production parts of `crates/botster-hub-installer` and the Hub client. Every other DEFECT is in tests, harnesses, or scripts.
+Revision 1 totals were DEFECT 539, deadline 214, rate-limit 7, backoff 1, os-no-event 5 and NOT-TIMER 109. The moves:
+- NOT-TIMER to DEFECT: 72 lines. 59 are fixture sleeps (B1 18, B2 20, C 1, D 20). 13 are mechanical zero-duration or scheduler-yield calls (A 7, B1 1, C 5).
+- NOT-TIMER to deadline: 9 lines (primitive forwarders and restores, and allocation_oracle.rs:534).
+- os-no-event to DEFECT: 4 lines (selftest 332 and 410, publish-npm 144, plugin_bounds 231).
+- deadline to DEFECT (slice): 6 lines (event_plane_saturation 3317, packages 7166 and 7648, sessions 1917, 1920 and 4113), applying B2's slice rule to B1. The sessions 3878 extra also became DEFECT (slice).
+- DEFECT to measurement-window: 2 lines (probe-hub-resources 232, test-production-package-runtime 590).
+- NOT-TIMER and rate-limit to measurement-window: 2 lines (event_plane_saturation 1877 and 1646).
+
+Bare `timeout(` calls (the webrtc runtime form, outside the original grep) are classified one by one in two tables in group C:
+- 24 in `src/`: all deadline.
+- 39 in the lifecycle test files: 25 DEFECT, 12 deadline, 2 NOT-TIMER.
+- Of the 25 DEFECT, 22 repeat extras already listed. The 3 new ones are webrtc_fixtures 2618 (B2) and event_plane_saturation 3385 and 3444 (B1), and they are counted in the extra DEFECT row. Sites added between 23b0feaa and 20b201bd are counted separately in that section: 10 new grep lines and 2 extras.
+
+Production DEFECTs:
+- A: 0. Only the deadlines `owner_loop.rs:659` and `:1466` are production.
+- C: 30, plus 1 mechanical extra (control_channel.rs:750).
+- D: the production parts of `crates/botster-hub-installer` and the Hub client, and `script/publish-npm-packages:144`.
+
+Every other DEFECT is in tests, harnesses, or scripts.
 
 ## Cross-cutting mechanisms (one each, shared by many sites)
 
 - **M1 — Process exit event.** The Hub and Core have no Rust process-exit watcher today. The only kqueue EVFILT_PROC code is `script/measure-processes.c`. Plan: one Hub module.
   - Own child: the wait handle runs on a thread and sends on a channel.
-  - Other pid: kqueue EVFILT_PROC NOTE_EXIT on macOS, pidfd on Linux.
+  - Other pid: kqueue EVFILT_PROC NOTE_EXIT on macOS. On Linux, pidfd: it turns readable (EPOLLIN) at exit and reports EPOLLHUP at reap, per pidfd_open(2).
   - The caller receives with `recv_timeout(deadline)`, marked `timer: deadline`.
+  - Child-process exit is never os-no-event, on either platform.
+  - Python and shell users must not use `Popen.wait(timeout)`, `subprocess.run(timeout=)` or `communicate(timeout=)`: these poll with WNOHANG plus sleep. Use a blocking `wait()` on a thread that puts the status on a `queue.Queue`, then `get(timeout=remaining)`. Alternatively use pidfd/kqueue.
   - Users: local_runtime_process, entrypoint_supervisor stop, managed_git_worktrees, update.rs, installer run.rs, test-support, and the lifecycle harness (harness/common/process/cli).
-- **M2 — Process-group empty.** No OS event exists for "the group has no members", only per-pid events. Plan: enumerate the members (macOS `proc_listpids(PROC_PGRP_ONLY)`; Linux /proc), watch each pid with M1, and re-enumerate on NOTE_FORK.
-  - os-no-event claim, for the reviewer: descendants that fork after the enumeration and before the watch is registered cannot be seen by event. A final re-enumeration after all watched pids exit closes that window without a timer.
-  - A second enumeration that finds new members means one more event round, not a sleep.
+- **M2 — Process-group empty.** This is the final implementation in `src/process_exit.rs`, and it has no os-no-event residual.
+  - **macOS.** `proc_listpgrppids(pgid)` returns an atomic snapshot.
+    1. Each round takes snapshot S1 and registers NOTE_EXIT for every member of S1.
+    2. After all registrations, it takes snapshot S2. New pids in S2 extend the round and are registered too.
+    3. The group is empty when a round ends with no new pid and zero live registrations.
+    - Zombie members count as exited, because no reap event reaches a non-parent on macOS.
+  - **Linux.** `/proc` is not atomic, so "empty" means `killpg(pgid, 0) == ESRCH`.
+    - Running members are watched for exit (pidfd POLLIN). Zombie members are watched for reap (pidfd POLLHUP).
+    - Every round starts on one of those events.
+    - If `/proc` lists no member while `killpg` still succeeds, the code re-reads `/proc` once and then returns an error.
+  - The caller's absolute deadline bounds every round on both platforms. That phase budget (TERM grace, KILL grace) stays a `timer: deadline`, and its value is unchanged.
+  - In the rows below, "M2" means this design.
 - **M3 — Hub daemon readiness pipe (production).** No readiness signal exists. Tests and the local runtime poll Status or connect every 20–50 ms; `cli.rs wait_for_status` spawns a `botster-hub status` process every 20 ms. Plan: the daemon writes one line to an inherited fd after it binds and admits. The launcher reads it with a deadline, and child exit shows as EOF.
   - This touches `src/main.rs` / daemon startup, which are in the other writer's in-flight set. Deferred until that work lands on main.
 - **M4 — Test owner-turn driver.** About 62 sites in A and many in C spin `drive_ready_test_turn` with yield or sleep. Plan: one test driver that binds the production owner wakes (`bind_host_owner_wake`, `bind_data_plane_owner_wake`, the plugin result wake) to a test channel and blocks on `control_rx.recv()` under one deadline. `pending.rs:1013`, `sessions.rs:2086`, and `session_spawn.rs:906` already use this pattern.
@@ -46,16 +105,23 @@ Production DEFECTs: A 0 (only the deadlines `owner_loop.rs:659` and `:1466` are 
 
 1. Status lifecycle counters: do not add a new host-event frame kind. Publish Hub lifecycle status (cleanup_completed, live_connections, live_entity_subscriptions, attach occupancy, and similar) as a subscribable **entity** through the existing entity-subscription mechanism. The owner publishes it on change, with the existing snapshot/delta, capacity, and resync semantics. Tests wait for the delta. The Status request stays a one-shot read. This is a protocol addition, so it comes after protocol 10 and is coordinated with the Foundation writer for docs/client-protocol.md.
 2. Data-plane watchdog: APPROVED. `close_work.requeue()` raises the existing owner wake, and the 1 s watchdog is removed. `DATA_PLANE_STOP_BOUND` keeps its value as `// timer: deadline`. Proof: a test shows that requeued close work progresses without the watchdog and fails when the requeue wake is removed (September timer audit item W01).
-3. New category `// timer: measurement-window — <what rate is measured>`: allowed ONLY in resource probes and benchmarks where the interval is the metric. It applies to probe-hub-resources:232 and test-production-package-runtime:590. It applies to plugin_bounds.rs:231 only if that test is a measurement, not a correctness assertion.
+3. New category `// timer: measurement-window — <what rate is measured>`: allowed ONLY in resource probes and benchmarks where the interval is the metric. It applies to probe-hub-resources:232 and test-production-package-runtime:590. It applies to plugin_bounds.rs:231 only if that test is a measurement, not a correctness assertion. **Outcome:** plugin_bounds.rs:231 asserts an idle-CPU bound when `BOTSTER_ASSERT_IDLE_CPU_BOUND` is set, so it is a correctness assertion and is classified DEFECT (see its row).
+4. There is no NOT-TIMER exemption for fixture sleeps. A test child that must stay alive blocks on a read the test ends explicitly: `cat` on stdin, or a read on a FIFO the test closes.
+5. Timeout VALUES do not change in this rewrite. Suggestions are recorded under "Follow-ups (not applied)".
+6. An os-no-event claim must name the OS fact and hold on both macOS (kqueue EVFILT_PROC) and Linux (pidfd: EPOLLIN at exit, EPOLLHUP at reap; waitid). Child-process exit is never os-no-event. Library APIs that poll internally, such as Python `Popen.wait(timeout)`, are polls.
 
-Line numbers below are at 23b0feaa. The branch was rebased onto main a69b70cc (protocol 10) after the inventory was taken, so some lines in the protocol-10 files have moved.
+Line numbers below are at 23b0feaa, except in the section "Sites added between 23b0feaa and 20b201bd", which uses 20b201bd. That section also maps the inventoried lines that moved in files changed since 23b0feaa.
 
 ## Design questions (need a ruling before the related sites change) — superseded by the rulings above
 
 1. **Status lifecycle counters have no push source (B1 group D, B2 D4, D).** About 30 test sites poll Status counters (`cleanup_completed`, `live_connections`, `live_entity_subscriptions`, attach occupancy). They cannot become event waits unless the Hub emits an event for these transitions: a host-event frame, or a synchronous release acknowledgement. **This is a product change to the Hub protocol.** Writer proposal: add a host-event subscription frame for disconnect cleanup / subscription close, and wait on it.
 2. **Data-plane 1 s watchdog is load-bearing (C, `src/data_plane/driver.rs:1484/1490`).** `close_work.requeue()` raises no wake, so requeued close work only moves when the watchdog fires. Writer proposal: requeue raises the existing data-plane owner wake, and the watchdog goes. `DATA_PLANE_STOP_BOUND` is defined as 2× the watchdog. It needs a new basis at the same value, because values must not change. **This is a production behavior change.**
 3. **Idle-rate measurement windows** (`script/probe-hub-resources:232`, `script/test-production-package-runtime:590`, `tests/hub_daemon_lifecycle/plugin_bounds.rs:231`). These tests measure the wake/CPU rate while idle, so the interval is the measured quantity. Writer proposal: accept them as `timer: os-no-event — CPU/wake accounting has no event; the interval is the measurement`. The alternative is a new category.
-4. **os-no-event candidates for the reviewer:** `crates/botster-hub-test-support/src/isolated_hub.rs:2187` (SIGSTOP effect on non-children: macOS kqueue has no stop note), `script/run-loaded-daemon-lifecycle-selftest:332,410` (init reaps an orphan zombie; nothing notifies a non-parent of a reap), `script/publish-npm-packages:144` (the npm registry has no push; this is not an OS fact, so it may need a different marker), and the M2 residual.
+4. **os-no-event candidates for the reviewer:** `crates/botster-hub-test-support/src/isolated_hub.rs:2187` (SIGSTOP effect on non-children: macOS kqueue has no stop note), `script/run-loaded-daemon-lifecycle-selftest:332,410` (init reaps an orphan zombie; nothing notifies a non-parent of a reap), `script/publish-npm-packages:144` (the npm registry has no push; this is not an OS fact, so it may need a different marker), and the M2 residual. **Revision 2 outcome:**
+   - isolated_hub.rs:2187 stays an os-no-event candidate, with facts for both platforms.
+   - Selftest 332 and 410 are DEFECT: a pidfd reports the reap with EPOLLHUP.
+   - publish-npm 144 is DEFECT and needs an orchestrator decision.
+   - M2 has no residual.
 
 ## Commit plan (order follows the parallel-writer rule)
 
@@ -87,10 +153,10 @@ sessions.rs from 2051; entities/worker.rs from 437; session_spawn.rs test mods f
 
 | category | count |
 |---|---|
-| DEFECT | 121 |
+| DEFECT | 128 (7 of them mechanical: session_spawn.rs zero-duration receives) |
 | deadline | 58 |
-| NOT-TIMER | 7 |
-| backoff / rate-limit / os-no-event | 0 |
+| NOT-TIMER | 0 |
+| backoff / rate-limit / measurement-window / os-no-event | 0 |
 
 Production sites: only owner_loop.rs:659 and :1466, and both are deadlines. **Every DEFECT is in test code.**
 os-no-event candidates: **none**. Every waited condition has an in-process event source: Host/Core/data-plane owner wakes via `bind_owner_wake(ControlSender)`, a Core completion notification, a plugin completion notifier, the TestHostGate Condvar, channels, or join/reply channels. Filesystem polls (H) wait on Host work whose completion receipt is the event, so FSEvents is not needed.
@@ -299,8 +365,8 @@ Test module (from 2345):
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 769, 804, 1035, 1133, 1180 | `receiver.recv_timeout(Duration::ZERO).unwrap()` | NOT-TIMER | test: zero-duration non-blocking take after a synchronous same-thread delivery (`deliver_admitted_failure` / `operation.poll`) | |
-| 1024, 1166 | `receiver.recv_timeout(ZERO)` expecting `Timeout` | NOT-TIMER | test: absence check right after a synchronous poll on the same thread; delivery would have been synchronous. Deterministic, not a window | |
+| 769, 804, 1035, 1133, 1180 | `receiver.recv_timeout(Duration::ZERO).unwrap()` | DEFECT (mechanical; was NOT-TIMER) | test: a zero-duration non-blocking take after a synchronous same-thread delivery (`deliver_admitted_failure` / `operation.poll`). Nothing waits, but it is a timer-API call and not a listed false positive | `receiver.try_recv().unwrap()` |
+| 1024, 1166 | `receiver.recv_timeout(ZERO)` expecting `Timeout` | DEFECT (mechanical; was NOT-TIMER) | test: an absence check right after a synchronous poll on the same thread. Delivery would have been synchronous, so it is deterministic, not a window, but it still uses a timer API | `assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)))` |
 | 906 | `timeout(10s, loop { take_owner_core_completions; receiver.recv().await })` | deadline | test: event-driven Core wake | |
 
 ### src/daemon/client_events.rs
@@ -336,13 +402,16 @@ Files: `tests/hub_daemon_lifecycle/{sessions,packages,event_plane_saturation,shu
 
 | category | sessions | packages | event_plane_saturation | shutdown | total |
 |---|---|---|---|---|---|
-| DEFECT | 48 (+2 extra) | 17 | 11 | 13 | **89 (+2 extra = 91)** |
-| deadline | 20 | 15 | 4 | 11 | **50** |
-| rate-limit | 1 | 0 | 4 | 0 | **5** |
+| DEFECT | 51 (+3 extra) | 26 | 22 (+2 extra: 3385, 3444) | 15 | **114 (+5 extra = 119)** |
+| deadline | 17 | 13 | 3 | 11 | **44** |
+| rate-limit | 1 | 0 | 3 | 0 | **4** |
+| measurement-window | 0 | 0 | 2 | 0 | **2** |
 | backoff | 0 | 0 | 0 | 0 | 0 |
 | os-no-event | 0 | 0 | 0 | 0 | **0** |
-| NOT-TIMER | 0 | 7 | 18 | 2 | **27** |
+| NOT-TIMER | 0 | 0 | 7 | 0 | **7** (all `set_read_timeout(None)`) |
 | hits | 69 | 39 | 37 | 26 | 171 |
+
+Revision 2 moved 19 former NOT-TIMER lines to DEFECT: 18 fixture sleeps and the packages.rs:7324 1 ms read, which is mechanical. event_plane_saturation 1877 (was NOT-TIMER) and 1646 (was rate-limit) moved to measurement-window. B2's slice rule is now applied here too: event_plane_saturation 3317, packages 7166 and 7648, and sessions 1917, 1920 and 4113 moved from deadline to DEFECT (slice). The sessions 3878 extra also became DEFECT (slice).
 
 **os-no-event: none claimed.** Every process wait has an OS event source:
 - Own child: `Child::wait` on a thread, sending to a channel.
@@ -417,7 +486,7 @@ So group D below needs a new Hub event before its polls can be removed. That is 
 | 1638 | pid liveness loop over worker+shell pids, sleep 40 | DEFECT | process-absence poll | I: kqueue EVFILT_PROC NOTE_EXIT per pid (pidfd on Linux) |
 | 1669 | ListSessions loop until exited/absent, sleep 50 | DEFECT | lifecycle poll | C: entity Patch exited / Remove |
 | 1767, 1783 | entity sub `set_read_timeout(5s)` then `next_frame()` | deadline | bounded give-up on expected Snapshot | – |
-| 1917, 1920 | 5 s read timeouts inside 15 s exit_deadline loop over two subs | deadline | completion is the exited Patch frame; timeouts swallowed until deadline (could read each sub sequentially) | – |
+| 1917, 1920 | 5 s read timeouts inside 15 s exit_deadline loop over two subs | DEFECT (slice; was deadline) | 5 s chunks alternate between two subscriptions and only re-check the 15 s deadline (B2 slice rule) | a reader thread per subscription feeding one channel, `recv_timeout(exit_deadline - now)` until both exited Patches; 15 s unchanged |
 | 1966 | ListSessions loop (also re-sends resize), sleep 200 | DEFECT | poll after exit Patch already received | C: exit Patch already received, so do one ListSessions (or a Hub ordering guarantee) |
 | 2006 | RemoveSession retry loop, sleep 200 | DEFECT | retry until state allows | C: after exit Patch, one RemoveSession |
 | 2026 | ListSessions absence loop, sleep 50 | DEFECT | poll after SessionRemoved | C: read Remove frame (2033) first, then one ListSessions |
@@ -447,7 +516,7 @@ So group D below needs a new Hub event before its polls can be removed. That is 
 | 3960 | entity `set_read_timeout(80ms)` interleaved with `poll_adapter_events` | DEFECT | short timeout used to re-check another stream | B: reader threads, channel |
 | 4085 | fixture `sleep 0.3; printf; sleep 0.6; exit 7` | DEFECT | fixture timing vs attach/disconnect | G |
 | 4109 | sleep 500 after Attach before drop(terminal) | DEFECT | settle for pending output | F / G: fixture gated, observe output then drop |
-| 4113 | `set_read_timeout(2s)` in 8 s loop for exit Patch | deadline | completion is frame; timeouts retried to deadline | – |
+| 4113 | `set_read_timeout(2s)` in 8 s loop for exit Patch | DEFECT (slice; was deadline) | 2 s chunks retried until the 8 s deadline (B2 slice rule) | reader thread feeding a channel, `recv_timeout(deadline - now)` until the exit Patch; 8 s unchanged |
 | 4606, 4634, 4705 | Status+ReadScreen loop, sleep 25 | DEFECT | screen poll | A |
 | 4760 | `for 0..20` poll_route_events(25)+sleep 25 until attached | DEFECT | route poll | B: blocking route read with deadline |
 | 4803 | poll_route_events(30)+ReadScreen loop, sleep 30 | DEFECT | route/screen poll | A |
@@ -457,8 +526,7 @@ So group D below needs a new Hub event before its polls can be removed. That is 
 | 5255 | Status loop on cleanup_completed, sleep 20 | DEFECT | counter poll | D |
 | 780–788 (extra, not in grep) | `for 0..5` poll_route_events(20) asserting no second frame | DEFECT | negative assertion over fixed 100 ms | E: rely on order of frames after release |
 | 3896 (extra, not in grep) | poll_route_events(100ms) asserting no duplicate exit | DEFECT | negative assertion over fixed time | E: barrier (Detach → Detached) then assert none before it |
-
-Reviewed, not defects (not in grep): 3878 (chunked 25 ms route reads until PROCESS_EXIT, rechecks only its deadline, so this is a deadline).
+| 3878 (extra, not in grep) | chunked 25 ms route reads until PROCESS_EXIT | DEFECT (slice; revision 2, was "reviewed, not a defect") | 25 ms chunks only re-check the deadline (B2 slice rule) | reader thread feeding a channel, or `poll_route_events(deadline - now)`; deadline value unchanged |
 
 ### packages.rs
 
@@ -466,9 +534,9 @@ Reviewed, not defects (not in grep): 3878 (chunked 25 ms route reads until PROCE
 |---|---|---|---|---|
 | 363, 1914, 2010, 2114, 2189, 2782, 2793, 3012, 3320, 3437, 3638, 6715, 6759 | entity sub/connection `set_read_timeout(2–5s)` before expected frames | deadline | bounded give-up | – |
 | 409 | Status loop live_entity_subscriptions==0, sleep 20 | DEFECT | counter poll | D |
-| 1041, 4018, 4090, 4151 | supervised fixture `while true; do sleep 1; done` | NOT-TIMER | keep-alive process, checks no condition | – |
-| 1358 | expected `...; sleep 30` in asserted shell contract args | NOT-TIMER | string literal in an assertion (fixture lifetime) | – |
-| 3873 | fixture writes env then `while true; do sleep 1` | NOT-TIMER | keep-alive | – |
+| 1041, 4018, 4090, 4151 | supervised fixture `while true; do sleep 1; done` | DEFECT (was NOT-TIMER) | fixture sleep that keeps a supervised entrypoint alive | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
+| 1358 | expected `...; sleep 30` in asserted shell contract args | DEFECT (was NOT-TIMER) | the assertion's string is the arguments of the session-type fixture that really runs (`... > shell-output.txt; sleep 30`); it changes with that fixture | rewrite the fixture command to end in a blocking read the test ends (`cat` on stdin or a FIFO the test closes), and update this expected string with it |
+| 3873 | fixture writes env then `while true; do sleep 1` | DEFECT (was NOT-TIMER) | fixture keep-alive sleep | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
 | 1280 | read context-output.json loop, sleep 30 | DEFECT | file poll | H: FIFO / PTY output |
 | 1379 | exists() loop for two output files, sleep 30 | DEFECT | file poll | H |
 | 2596 | `worktree_recorder.seen` tool call loop, sleep 50 | DEFECT | plugin state poll | J: package-event subscription on worktree subjects |
@@ -479,14 +547,14 @@ Reviewed, not defects (not in grep): 3878 (chunked 25 ms route reads until PROCE
 | 4855 | output/context loop, sleep 25 | DEFECT | file poll | H |
 | 6740 | Status loop live_entity_subscriptions==0, sleep 20 | DEFECT | counter poll | D |
 | 7074 | sub_a `set_read_timeout(400ms)`: A must not get behind snapshot | DEFECT | negative assertion over fixed window | E: publish follow-up mutation, read A to it, assert no seq-0 snapshot |
-| 7166 | `remaining.min(200ms)` chunked read in 10 s loop | deadline | completion is frame; chunk only rechecks deadline (could use `remaining`) | – |
+| 7166 | `remaining.min(200ms)` chunked read in 10 s loop | DEFECT (slice; was deadline) | the 200 ms chunk only re-checks the deadline (B2 slice rule) | B mechanism: a reader thread per subscription feeding a channel, `recv_timeout(deadline - now)`; or one read with `remaining`; the 10 s value is unchanged |
 | 7318 | Status loop until resync_degraded, sleep 50 | DEFECT | counter poll | D (or a degraded/Error frame on sub_b, if the Hub emits one) |
-| 7324 | 1 ms timeout census read on failure path | NOT-TIMER | nonblocking diagnostic drain before panic; not a wait | – |
+| 7324 | 1 ms timeout census read on failure path | DEFECT (mechanical; was NOT-TIMER) | a diagnostic drain before the panic that uses a 1 ms timer per read (up to 16) instead of a non-blocking read | `set_nonblocking(true)` and read until `WouldBlock`; no timer |
 | 7352 | 3 s loop asserting counters unchanged, sleep 50 | DEFECT | negative assertion over fixed time | E |
 | 7361 | 400 ms loop A must not roll back | DEFECT | negative window | E |
 | 7494 | Status loop until degraded, sleep 50 | DEFECT | counter poll | D |
 | 7517 | 3 s loop asserting attempts unchanged, sleep 100 | DEFECT | negative window | E |
-| 7648 | 200 ms chunked reads until 3 Upserts, 10 s deadline | deadline | completion is frames | – |
+| 7648 | 200 ms chunked reads until 3 Upserts, 10 s deadline | DEFECT (slice; was deadline) | the 200 ms chunks only re-check the deadline (B2 slice rule) | reader thread feeding a channel, `recv_timeout(deadline - now)` per frame until 3 Upserts; 10 s unchanged |
 | 7705 | per-mutation `set_read_timeout(200ms)`; `let _ = next_frame()` | DEFECT | best-effort drain, a 200 ms delay per missing frame | L: read until that seq's Upsert with deadline, or a drain thread |
 
 Helper calls (not hits; mechanism belongs to the helper files): `wait_for_process_exit` 4049, 4115, 4139, 4179 (pid-exit poll, so I: kqueue); `wait_for_app_local_url` 1162, 5605, 5626; `wait_for_managed_git_session_exit` 4953; `wait_for_entity_frame` (event read, 200 ms chunks, deadline).
@@ -497,12 +565,12 @@ Helper calls (not hits; mechanism belongs to the helper files): `wait_for_proces
 |---|---|---|---|---|
 | 101 | noisy python producer `time.sleep(0.1)` | rate-limit | deliberate 10 lines/s output rate | – |
 | 489 | unit test sleep 15 before stopping watchdog, asserts samples≥1 | DEFECT | sleep standing in for "first sample taken" | F: watchdog signals first sample on channel |
-| 1646 | watchdog `thread::sleep(period=1ms)` measuring oversleep | rate-limit | sampling period of the scheduler-lag instrument; not waiting on a condition (reviewer: judgment call) | – |
-| 1877 | `spin_loop()` in `probe_scheduler_lag` | NOT-TIMER | deliberate fixed-duration busy measurement, not waiting for another actor | – |
-| 3317 | `set_read_timeout(250ms)` in 5 s marker/gap loop | deadline | completion is event; chunk only rechecks deadline | – |
+| 1646 | watchdog `thread::sleep(period=1ms)` measuring oversleep | measurement-window (was rate-limit) | the sampling period of the scheduler-lag instrument, whose metric is the oversleep of this interval. Its output feeds `classify_host_validity` (host contention), not a Hub correctness assertion. Reviewer: confirm that a host-validity probe inside the saturation suite counts as a resource probe | – |
+| 1877 | `spin_loop()` in `probe_scheduler_lag` | measurement-window (was NOT-TIMER) | a fixed-duration busy measurement: the requested busy interval (`MAX_OWNER_TURN_MS`) is the metric, and the observed lag feeds host-validity classification. It does not wait for another actor. Same reviewer check as 1646 | – |
+| 3317 | `set_read_timeout(250ms)` in 5 s marker/gap loop | DEFECT (slice; was deadline) | the 250 ms chunk only re-checks the deadline (B2 slice rule) | reader thread feeding a channel, `recv_timeout(deadline - now)` until the marker or gap; 5 s unchanged |
 | 3323, 3327, 3333, 3888, 4752, 5427, 5624 | `set_read_timeout(None)` | NOT-TIMER | clears timeout | – |
 | 3523 | burst driver `sleep(interval - elapsed)` | rate-limit | deliberate bursts/sec cap | – |
-| 3537, 5025, 5040, 5063, 5072, 5095, 5134, 5458, 5517, 5528 | session command `exec sleep N` | NOT-TIMER | idle fixture process body | – |
+| 3537, 5025, 5040, 5063, 5072, 5095, 5134, 5458, 5517, 5528 | session command `exec sleep N` | DEFECT (was NOT-TIMER) | fixture sleep: the session's lifetime is a duration, not an event the test controls | blocking read the test ends: `exec cat` on stdin, or a FIFO the test closes |
 | 3551 | `sleep(EVENT_PLANE_WAVE_GAP=200ms)` between spawn waves | rate-limit | deliberate spawn pacing (Spawn is synchronous). If it exists to let a wave reach running, it becomes C | – |
 | 3583 | ListSessions loop until N running, sleep 50 | DEFECT | lifecycle poll | C: count `running` Upserts on session entity sub |
 | 3745 | `set_read_timeout(20ms)` on unix events inside measurement loop | DEFECT | short timeout multiplexed with other work | B: event reader thread → channel |
@@ -517,7 +585,7 @@ Helper calls (not hits; mechanism belongs to the helper files): `wait_for_proces
 | 5512 | sleep 50 after writing hold file | DEFECT | settle for fault-hook pickup | F: hook ack (and the hold reader is itself likely a file poll, outside this group) |
 | 5562 | Status+ListSessions loop, sleep 50 | DEFECT | counter + lifecycle poll | C + D |
 
-Reviewed, not defects (not in grep): 813 (`try_recv` drain after `drop(tx)`), 3444 (250 ms async timeout chunks to a 5 s deadline, so a deadline), 3691 (churn load generator, no wait), 3730 (`try_recv` drain inside the 3884 loop, which is covered there).
+Reviewed, not defects (not in grep): 813 (`try_recv` drain after `drop(tx)`), 3444 (250 ms async timeout chunks to a 5 s deadline; **revision 2: DEFECT (slice)**, see "Bare webrtc timeouts in the lifecycle test files" in group C), 3691 (churn load generator, no wait), 3730 (`try_recv` drain inside the 3884 loop, which is covered there).
 
 ### shutdown.rs
 
@@ -527,7 +595,7 @@ Reviewed, not defects (not in grep): 813 (`try_recv` drain after `drop(tx)`), 34
 | 49 | `recv_timeout(1s)` expect acquisition | deadline | event channel | – |
 | 326, 386, 420, 433 | `recv_timeout(2–5s)` on fixture/update channels | deadline | event channels; expiry is failure | – |
 | 389, 397 | `recv_timeout(3s/5s)` inside failure-diagnostic branch | deadline | error path only | – |
-| 449 | fixture `...; exec sleep 60` | NOT-TIMER | never-ready fixture keep-alive | – |
+| 449 | fixture `...; exec sleep 60` | DEFECT (was NOT-TIMER) | fixture keep-alive sleep (a fixture that never becomes ready) | blocking read the test ends: `exec cat` on stdin or a FIFO the test closes |
 | 987 | 500 ms window loop `try_wait` on shutdown cmd, sleep 20 | DEFECT | negative assertion over fixed window | E: shutdown progress line on piped output, then `try_wait` None |
 | 1061, 1114 | `for 0..100` socket exists, sleep 20 | DEFECT | file-absence poll | H/I: wait for daemon exit (kqueue/child wait), then check once |
 | 1164 | `for 0..500` metadata exists + `up.try_wait`, sleep 10 | DEFECT | file poll | H: kqueue EVFILT_VNODE on data dir or `up` stdout line; child exit via wait thread |
@@ -535,7 +603,7 @@ Reviewed, not defects (not in grep): 813 (`try_recv` drain after `drop(tx)`), 34
 | 1681 | nonblocking accept + sleep 10 checking stop flag | DEFECT | poll loop | K: blocking accept, wake by self-connect/shutdown |
 | 1687, 1690 | fake daemon stream read/write timeout 2s | deadline | bounded I/O | – |
 | 2110 | in-process observe slice + ReadScreen, `for 0..100`, sleep 20 | DEFECT | screen poll | A: runtime output/lifecycle wake |
-| 2243 | session command `printf ...; sleep 1` | NOT-TIMER | fixture lifetime, not a wait | – |
+| 2243 | session command `printf ...; sleep 1` | DEFECT (was NOT-TIMER) | fixture sleep: the session's lifetime is 1 s instead of an event the test controls | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
 | 2264 | `recv_timeout(15s)` deadlock watchdog | deadline | error path | – |
 | 2437, 2512, 2534 | Status+ReadScreen (+poll_route_events) loops, sleep 25 | DEFECT | screen/route poll | A |
 | 2646 | entity `set_read_timeout(5s)` | deadline | bounded | – |
@@ -555,14 +623,20 @@ Checkout: 23b0feaa. Read-only; no cargo run. Every line in g-B2.txt (143) is cla
 
 | category | count |
 |---|---|
-| DEFECT | 97 (4 of them are the "slice" subtype: a short read/recv period that only re-checks the deadline) |
-| NOT-TIMER | 30 |
-| deadline | 15 |
-| os-no-event | 1 (plugin_bounds.rs:231, measurement window; flagged below) |
+| DEFECT | 118 (4 of them are the "slice" subtype: a short read/recv period that only re-checks the deadline) |
+| NOT-TIMER | 8 (7 `set_read_timeout(None)`, 1 function definition) |
+| deadline | 17 |
+| os-no-event | 0 |
+| measurement-window | 0 |
 | backoff | 0 |
 | rate-limit | 0 |
 
-Extras (not in grep): about 55 more DEFECT sites, listed per file.
+Revision 2 moves:
+- 20 former NOT-TIMER fixture sleeps are now DEFECT.
+- plugin_bounds.rs:231 moved from os-no-event to DEFECT, because it is a correctness assertion.
+- terminal_stream.rs:106 and hub_daemon_lifecycle_test.rs:63 moved from NOT-TIMER to deadline, because they are the primitive forwarders that carry the marker.
+
+Extras (not in grep): about 56 more DEFECT sites, listed per file. Revision 2 added webrtc_fixtures.rs 2618, which is listed in group C's table of bare webrtc timeouts in the lifecycle test files.
 
 ### DEFECT mechanism groups (for commit planning)
 
@@ -633,16 +707,26 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 
 ### os-no-event candidates (explicit)
 
-- **plugin_bounds.rs:231. Classified os-no-event.** It sleeps 5 s between two `/proc/pid/stat` CPU-tick reads (Linux only) to measure idle CPU. CPU accounting has no event source, and the interval is the quantity being measured, not a stand-in for a condition. The reviewer should confirm this measurement-window use is acceptable under the rule.
+- **plugin_bounds.rs:231. Reclassified DEFECT in revision 2** (formerly os-no-event).
+  - It sleeps 5 s between two `/proc/pid/stat` CPU-tick reads (Linux only), inside the lifecycle correctness test `plugin_bounds.rs`.
+  - When `BOTSTER_ASSERT_IDLE_CPU_BOUND` is set, it asserts `delta_ticks * 4 <= CLK_TCK`, an idle-CPU bound of at most 250 ms of CPU in 5 s. Otherwise it only prints the number.
+  - Because it asserts a bound for correctness, the measurement-window category does not apply (ruling 3).
+  - Replacement, in two parts:
+    - (a) Move the CPU measurement into `script/probe-hub-resources`, which is a resource probe, as a `timer: measurement-window` with the same 5 s value.
+    - (b) In this test, assert the structural cause of idle CPU instead of its effect. After the reload, read one Status/PluginLifecycleStatus and assert that no owner deadline is armed, that `active_timer_resources == 0` (already asserted at 224) and that no Host/plugin work is queued. An owner blocked on `control_rx.recv()` with no armed deadline cannot wake without an event.
+  - Status does not expose the owner's armed deadlines today. Part (b) needs that field (or the lifecycle-status entity from ruling 1).
 - **common.rs:719. Classified DEFECT.**
   - It samples FIONREAD every 20 ms until the pipe byte count is ≥ min and stable for 5 samples, as a proxy for "attach child is blocked on stdout".
   - OS fact: no kernel event tells a pipe's reader that its writer is blocked; kqueue EVFILT_READ gives only readability.
   - So the pipe side really is os-no-event. The preferred replacement is a Hub-side stall or backpressure event (the Hub knows when the route is stalled). If no such event exists, this becomes a legitimate os-no-event site.
+  - Revision 2 check on both platforms: macOS kqueue EVFILT_READ/EVFILT_WRITE and Linux epoll EPOLLIN/EPOLLOUT report only the readiness of the caller's own end. Neither tells a reader that the writer is blocked. The pipe-side fact therefore holds on both. The site stays DEFECT because the Hub-side event is the replacement.
 - **process.rs:113 (setsid/pgid predicates at harness_isolation.rs 282, 543, 580, 986).** No kernel event reports a pgid or sid change; kqueue EVFILT_PROC has no such note. It is still DEFECT, for two reasons: setsid/setpgid run in pre_exec before exec, so the session-ready event (or `spawn()` returning, at 986) implies the state; and one snapshot after that event suffices. The zombie predicate (shutdown.rs 947, harness_isolation.rs 857) has an event: NOTE_EXIT or pidfd-readable fires at exit, before reaping.
 - **process.rs 833/902/959/1025 and harness.rs 886: group-empty and argv-marker census.**
   - No kernel event reports "process group now empty" or "no process with argv X".
-  - The members are captured before signalling, so NOTE_EXIT on each captured pid covers it, followed by one confirming census.
-  - Only members forked after capture would escape. In that case the census must repeat after each exit event, which is event-driven, not timed.
+  - Use M2 (`src/process_exit.rs`; see the header), which is event-driven with no os-no-event residual.
+    - macOS: atomic snapshot rounds with NOTE_EXIT per member.
+    - Linux: pidfd POLLIN for running members and POLLHUP for zombie members, with emptiness decided by `killpg(pgid, 0) == ESRCH`.
+  - The argv-marker variant has no pgid. It enumerates by marker and watches each pid the same way, and the set is empty when a round started by an event finds no member.
 - **unix_terminal_adapter.rs:898.** The test must not attach before `stream_attach`, and ReadScreen is the only way to see Core screen state without a route. An observer route on a second connection gives an Output event. If that changes the test's semantics, the Hub needs a screen or session-output host event. Classified DEFECT.
 
 ---
@@ -709,7 +793,7 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 | 488 | `foreign.recv_timeout(5s)` | deadline | channel event | — |
 | 505 | `recv_timeout(5s)` | deadline | channel event | — |
 | 727 | updater thread sleep 100 before writing Exited | DEFECT | sleep-timed race against the collector's 25 ms reread poll | handshake: collector signals after first registry load (test hook), updater writes on signal; reread waits on vnode event |
-| 1055 | `while true; do sleep 1; done` entrypoint body | NOT-TIMER | fixture keep-alive process; nothing waits on it | — |
+| 1055 | `while true; do sleep 1; done` entrypoint body | DEFECT (was NOT-TIMER) | fixture keep-alive sleep | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
 | 755 (extra, not in grep) | `spawn_and_reap_sleep` → `wait_for_process_exit` after `child.wait()` | DEFECT | redundant poll; `wait()` already reaped | delete the call |
 | 282, 543, 580 (extra) | `wait_for_process_snapshot(.. "own setsid")` | DEFECT | ps poll for pgid/sid change | session-ready event then one snapshot |
 | 857 (extra) | wait for zombie state | DEFECT | ps poll | NOTE_EXIT / pidfd on the pid |
@@ -720,9 +804,9 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 78 | fixture `sleep 60` | NOT-TIMER | fixture process lifetime | — |
-| 145 | fixture `exec sleep 60` | NOT-TIMER | intentionally wedged console (never ready) | — |
-| 468 | session command `sleep 300` | NOT-TIMER | sentinel session lifetime | — |
+| 78 | fixture `sleep 60` | DEFECT (was NOT-TIMER) | fixture sleep sets the process lifetime | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
+| 145 | fixture `exec sleep 60` | DEFECT (was NOT-TIMER) | intentionally wedged console (never ready); the wedge is a duration | `exec cat` on stdin or a FIFO the test closes |
+| 468 | session command `sleep 300` | DEFECT (was NOT-TIMER) | sentinel session lifetime is a duration | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
 | 545 | sleep 100 after `up\n`, before Ctrl-C | DEFECT | fixed delay for inline work to start | wait for console output showing `up` began (checkpoint + `wait_for_output_after`), then send ^C |
 | 305-306 (extra, not in grep) | `wait_for_owned_pid_exit` ×2 | DEFECT | via common.rs:468 | NOTE_EXIT / pidfd |
 
@@ -730,7 +814,7 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 55 | node `setInterval(() => {}, 1000)` in script | NOT-TIMER | keep-alive for foreground fixture | — |
+| 55 | node `setInterval(() => {}, 1000)` in script | DEFECT (was NOT-TIMER) | a timer that keeps the foreground fixture alive | keep it alive on a blocking read the test ends: `process.stdin.resume()` and exit on stdin `end`, or a FIFO the test closes |
 | 260 | socket-path `exists()` loop sleep 20 after shutdown | DEFECT | polls unlink | NOTE_EXIT on owned daemon pid (awaited just above), then one check; or EVFILT_VNODE on dir |
 | 477 | `try_wait_for_output_after` sleep 20 | DEFECT | polls output buffer + `try_wait` | reader thread notifies Condvar/channel per chunk and EOF; child wait thread on same channel; deadline |
 | 613 | `wait_for_exit` `try_wait` sleep 20 (30 s) | DEFECT | polls child exit | portable_pty wait thread → channel `recv_timeout(30s)` |
@@ -741,7 +825,7 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 68 | spawn request `printf 'daemon-ready'; sleep 1` | NOT-TIMER | fixture lifetime (a caller that waits for its exit inherits a built-in 1 s) | — |
+| 68 | spawn request `printf 'daemon-ready'; sleep 1` | DEFECT (was NOT-TIMER) | fixture sleep: a caller that waits for its exit inherits a built-in 1 s | blocking read the test ends: `cat` on stdin or a FIFO the test closes; callers that need the exit close it |
 | 146 | `wait_for_mode_flags` sleep 20 (non-ReadModeFlags reply) | DEFECT | polls ReadModeFlags | `TerminalEvent::Modes` route event, deadline |
 | 157 | `wait_for_mode_flags` sleep 20 (predicate false) | DEFECT | same | same |
 | 191 | `collect_attach_events` ReadScreen + sleep 30 | DEFECT | polls screen for marker | route Output event containing marker (read with remaining deadline) |
@@ -755,7 +839,7 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
 | 85 | `wait_for_path` sleep 50 | DEFECT | file-exists poll; helper has no callers | delete |
-| 168 | fixture `sleep 30` | NOT-TIMER | fixture lifetime | — |
+| 168 | fixture `sleep 30` | DEFECT (was NOT-TIMER) | fixture sleep (at 20b201bd this is line 170, `IFS= read -r go; ...; sleep 30`) | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
 | 957 | shell gate `while [ ! -f gate ]; do sleep 0.01` | DEFECT | fixture-side poll | fixture blocks on FIFO read / stdin line; test writes release |
 | 961 | same, peer B | DEFECT | same | same |
 | 41 (extra, not in grep) | `wait_for_webrtc_marker` 200 ms slices, 45 s deadline | DEFECT (slice) | slices only re-check deadline | one `timeout(remaining)` per frame |
@@ -766,16 +850,16 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 301 | `sleep 30` session cmd | NOT-TIMER | fixture lifetime | — |
-| 376 | same | NOT-TIMER | fixture lifetime | — |
-| 434 | same | NOT-TIMER | fixture lifetime | — |
-| 509 | same | NOT-TIMER | fixture lifetime | — |
+| 301 | `sleep 30` session cmd | DEFECT (was NOT-TIMER) | fixture sleep | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
+| 376 | same | DEFECT (was NOT-TIMER) | fixture sleep | same |
+| 434 | same | DEFECT (was NOT-TIMER) | fixture sleep | same |
+| 509 | same | DEFECT (was NOT-TIMER) | fixture sleep | same |
 | 561 | ReadScreen loop with blocking `std::thread::sleep(25)` inside async block | DEFECT | polls screen (and blocks the runtime thread) | marker Output event on a Unix observer route (peer is unbound), then one ReadScreen |
 | 583 | shell gate poll | DEFECT | fixture-side poll | FIFO/stdin release |
 | 652 | Status `bound_adapter_close` counter poll | DEFECT | polls counter after peer close | host-event subscription on Unix connection for the cleanup (Hub gap if none emitted) |
 | 782 | sleep 400 after peer close | DEFECT | settle sleep; assertion (grant one-use) does not depend on close timing | delete; if ordering needed, await peer Closed state / peer-disconnected event |
-| 971 | `sleep 30` | NOT-TIMER | fixture lifetime | — |
-| 979 | `sleep 30` | NOT-TIMER | fixture lifetime | — |
+| 971 | `sleep 30` | DEFECT (was NOT-TIMER) | fixture sleep | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
+| 979 | `sleep 30` | DEFECT (was NOT-TIMER) | fixture sleep | same |
 | 1444 | Status occupancy poll after WebRTC peer loss | DEFECT | polls occupancy | peer-disconnected / TerminalSubscriptionClosed host event on the Unix sibling, then one Status |
 | 201, 215 (extra, not in grep) | `wait_for_webrtc_subscription_closed` 200 ms slices; 20 ms terminal drain on miss | DEFECT (slice) | slices re-check deadline | `select!` host-event / terminal recv with remaining deadline |
 | 327, 402, 459, 939 (extra) | first-frame wait in 200 ms slices | DEFECT (slice) | same | one `timeout(remaining)` |
@@ -812,8 +896,8 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 104 | `fn set_read_timeout` wrapper | NOT-TIMER | helper definition | — |
-| 106 | inner `set_read_timeout(timeout)` | NOT-TIMER | pass-through | — |
+| 104 | `fn set_read_timeout` wrapper | NOT-TIMER | function definition (an identifier, not a call) | — |
+| 106 | inner `set_read_timeout(timeout)` | deadline (was NOT-TIMER) | the primitive forwarder: it applies the caller's read bound to the socket, and the marker goes here. Callers are classified at their own sites | — |
 | 198 | `poll_unsolicited` reads until socket quiet for `timeout` | DEFECT | quiet window stands in for "no more frames" | `request_collecting(Status)` ordering barrier, or read until marker with deadline |
 | 209 | `set_read_timeout(None)` | NOT-TIMER | clears timeout | — |
 | 219 | `read_terminal_until` 200 ms slice | DEFECT (slice) | slice re-checks deadline; `done` only changes on reads | set read timeout to `deadline - now` each read |
@@ -824,7 +908,7 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
 | 50 | `wait_for_ingress_admissions` file poll sleep 10 | DEFECT | polls a log file; helper has no callers | delete (or EVFILT_VNODE) |
-| 66 | sink `... ; sleep 30` | NOT-TIMER | fixture lifetime | — |
+| 66 | sink `... ; sleep 30` | DEFECT (was NOT-TIMER) | fixture sleep after `done` | blocking read the test ends: `cat` on a FIFO the test closes (stdin is the paste sink, so use a FIFO) |
 | 116 | `collect_unix_mux_for(duration)` 50 ms reads over fixed windows (100 ms waiting; trailing 500 ms) | DEFECT | fixed windows; trailing 500 ms is a negative "exactly one result" window | read with remaining deadline until result + done; then `request_collecting(Status)` barrier for the negative |
 | 130 | `set_read_timeout(None)` | NOT-TIMER | clears timeout | — |
 | 224 | `wait_for_unix_ready_and_mode` ReadModeFlags sleep 20 | DEFECT | polls mode flags | ready marker Output + `TerminalEvent::Modes` route event |
@@ -836,16 +920,16 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 231 | `thread::sleep(5s)` between CPU-tick reads (Linux) | os-no-event | measurement interval; CPU accounting has no event; not a wait for a condition | — (flagged for reviewer) |
+| 231 | `thread::sleep(5s)` between CPU-tick reads (Linux) | DEFECT (was os-no-event) | a correctness assertion, not a measurement: with `BOTSTER_ASSERT_IDLE_CPU_BOUND` set it asserts idle CPU ≤ 250 ms per 5 s, and it lives in a correctness test, so measurement-window does not apply | move the CPU measurement (5 s, unchanged) into `script/probe-hub-resources` as measurement-window. Here, assert once that no owner deadline is armed and no timer resource or queued work exists (needs a Status field; see the os-no-event candidates note) |
 
 ### tests/hub_daemon_lifecycle/package_fixtures.rs
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 636 | `...; sleep 30` | NOT-TIMER | fixture lifetime | — |
-| 675 | `while true; do sleep 1; done` | NOT-TIMER | entrypoint keep-alive | — |
-| 714 | same | NOT-TIMER | entrypoint keep-alive | — |
-| 771 | node `setInterval` keep-alive | NOT-TIMER | entrypoint keep-alive | — |
+| 636 | `...; sleep 30` | DEFECT (was NOT-TIMER) | fixture sleep. It is the session-type command whose arguments packages.rs:1358 asserts | blocking read the test ends: `cat` on stdin or a FIFO the test closes; update packages.rs:1358 with it |
+| 675 | `while true; do sleep 1; done` | DEFECT (was NOT-TIMER) | entrypoint keep-alive sleep | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
+| 714 | same | DEFECT (was NOT-TIMER) | entrypoint keep-alive sleep | same |
+| 771 | node `setInterval` keep-alive | DEFECT (was NOT-TIMER) | a timer keeps the entrypoint alive | `process.stdin.resume()` and exit on `end`, or a FIFO the test closes |
 | 1261 | python `while not os.path.exists: time.sleep(0.01)` ×2 | DEFECT | fixture-side poll | `os.open(fifo, O_RDONLY)` / `sys.stdin.readline()` release |
 | 1282 | same ×2 | DEFECT | same | same |
 | 1304 | same ×3 | DEFECT | same | same |
@@ -866,7 +950,7 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 126 | `sleep 30` | NOT-TIMER | fixture lifetime | — |
+| 126 | `sleep 30` | DEFECT (was NOT-TIMER) | fixture sleep | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
 | 152 | `poll_unsolicited(50ms)` + sleep 50 loop | DEFECT | quiet-window read + sleep until any envelope | `read_terminal_until` with remaining deadline |
 | 206 | Status counter poll after disconnect | DEFECT | polls `bound_adapter_close` | host-event subscription (Hub gap if none) |
 | 337 | ReadScreen poll sleep 25 | DEFECT | polls screen for echo (connection is bound) | route Output event, then one ReadScreen |
@@ -883,7 +967,7 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 | 723 | occupancy poll | DEFECT | polls occupancy after cleanup | assert once after cleanup event |
 | 787 | shell gate poll | DEFECT | fixture-side poll | FIFO/stdin |
 | 828 | ReadScreen poll sleep 25 | DEFECT | polls screen (route attached) | route Output event, then one ReadScreen |
-| 869 | `printf x > ready; sleep 30` | NOT-TIMER | fixture lifetime (ready file itself handled at 877) | — |
+| 869 | `printf x > ready; sleep 30` | DEFECT (was NOT-TIMER) | fixture sleep (the ready file itself is handled at 877) | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
 | 877 | ready-file `exists()` poll | DEFECT | polls file | child writes to FIFO the test reads with deadline (or EVFILT_VNODE) |
 | 898 | ReadScreen poll before stream_attach | DEFECT | polls screen; no route by design | Output event on a second observer route; else Hub screen-change event (see os-no-event note) |
 | 1003 | `set_read_timeout(None)` | NOT-TIMER | clears | — |
@@ -915,7 +999,7 @@ Extras (not in grep): about 55 more DEFECT sites, listed per file.
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 63 | `timeout()` wrapper | NOT-TIMER | deadline primitive definition | — |
+| 63 | `webrtc::runtime::timeout(...)` inside the `timeout()` wrapper | deadline (was NOT-TIMER) | the shared async deadline primitive: the call inside the wrapper is where the marker goes. Callers are classified at their own sites | — |
 | 66 | `async fn sleep` helper | DEFECT | plain sleep; only callers webrtc_proofs.rs 812, 986 are DEFECT | delete with callers |
 | 67 | `webrtc_runtime().sleep(duration)` | DEFECT | same helper body | delete |
 
@@ -937,16 +1021,27 @@ Scope column: **P** = production code, **T** = test code (`#[cfg(test)]` module/
 
 | category | hits |
 |---|---|
-| DEFECT | 135 (production 30, test 105) |
-| deadline | 77 |
-| NOT-TIMER | 8 |
+| DEFECT | 141 (production 30, test 111) |
+| deadline | 78 |
+| NOT-TIMER | 1 (control_channel.rs:28, an import) |
 | backoff | 1 (listener.rs:186) |
 | rate-limit | 0 |
-| os-no-event | 0 as a whole site; 3 sites have an os-no-event *part* (see below) |
+| measurement-window | 0 |
+| os-no-event | 0. The former group-empty "os-no-event part" of 3 sites is gone (M2) |
+
+Revision 2 moves:
+- Six former NOT-TIMER lines are now DEFECT:
+  - entrypoint_supervisor.rs:1162 is a fixture sleep.
+  - session_type_spawn.rs:292 and session_spawn/reply.rs:126 and 128 are mechanical zero-duration receives.
+  - package_event_router.rs:6106 and peer.rs:3387 are scheduler yields.
+- allocation_oracle.rs:534 moved from NOT-TIMER to deadline.
 
 How rows were counted: a row written as `a+b` is one `tokio::time::timeout` (deadline) wrapped around a `yield_now` spin (DEFECT), so it counts as one of each.
 
-Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT, 2 deadline, 2 NOT-TIMER). They include the `wait_until` / `soft_wait_until` callers, the bare `webrtc::runtime::timeout(` calls in control_channel.rs, and the no-sleep spin loops.
+Extra sites the grep missed are marked "(extra, not in grep)": 37 rows (10 DEFECT, 26 deadline, 1 NOT-TIMER).
+- The first 13 include the `wait_until` / `soft_wait_until` callers, the bare `webrtc::runtime::timeout(` calls in control_channel.rs, and the no-sleep spin loops.
+- In revision 2, control_channel.rs:750 moved from NOT-TIMER to DEFECT (mechanical).
+- Revision 2 adds 24 deadline rows: the bare `webrtc::runtime::timeout(` calls in local_webrtc_smoke.rs, signaling.rs, peer.rs tests and test_support.rs. See the "Bare webrtc timeouts" table at the end of group C.
 
 ### Reviewer hints: all three confirmed
 - **runtime.rs:1618**: confirmed DEFECT. `invoke_plugin` loops `recv_timeout(1ms)` and calls `fulfill_pending_plugin_requests()` on every timeout. The timeout exists only to pump bridge requests.
@@ -984,7 +1079,7 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 6. **Data-plane watchdog (production)**
    - driver.rs 1484/1490: `wait_pump(DATA_PLANE_WATCHDOG = 1s)`. `close_work.requeue()` (close_work.rs:226) and the overflow remainder raise no wake, so requeued close decisions only advance on the next Core wake or when the watchdog fires.
    - Make requeue and overflow raise the pump wake (or let the Core session-registry transition drive them), then drop the watchdog.
-   - `DATA_PLANE_STOP_BOUND` (driver.rs 1449) is defined as `2*WATCHDOG + slack`, so it needs a new basis once the watchdog is gone.
+   - `DATA_PLANE_STOP_BOUND` (driver.rs 1449) is defined as `2*WATCHDOG + slack`. Its value stays the same (ruling 2). Only its definition changes to a literal with the same value, stated in its `timer: deadline` marker.
 7. **Child-process exit (production and tests): a wait thread feeding a channel, or kqueue `EVFILT_PROC` / pidfd, bounded by a deadline**
    - Production: local_runtime_process.rs 245, 261, 511, 525; managed_git_worktrees.rs 968, 1006, 1015; entrypoint_supervisor.rs 445, 461; update.rs 241, 305, 313
    - Tests: entrypoint_supervisor.rs 952, 995; peer.rs 3368; test_support.rs 1947, and the `is_fully_gone` callers 992, 1016, 1964 (extra)
@@ -1019,12 +1114,14 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 14. **Test helper to delete**
     - test_support.rs 761: the `wait_until` / `soft_wait_until` poll helper (10 ms sleep). Every caller is listed in groups 7 and 13.
 
-### os-no-event candidates (flagged, not granted)
-- **Process-group emptiness.** Affected sites: local_runtime_process.rs 245/261, managed_git_worktrees.rs 1006/1015, entrypoint_supervisor.rs 445/461.
-  - What needs no poll: exit of the group leader (the owned child) has an event, via the wait handle, kqueue `EVFILT_PROC NOTE_EXIT`, or pidfd.
-  - The OS fact: neither kqueue nor pidfd reports "this process group has no members left" for descendants whose pids are unknown. macOS has no `PR_SET_CHILD_SUBREAPER`, and on Linux the subreaper only reports children that get reparented to it.
-  - A residual `killpg(pgid, 0)` check after the leader exits is therefore the only os-no-event part.
-  - Recommended: remove the timed poll anyway. After the leader exits, send SIGKILL to the group, then run one `killpg(0)` check. Only if the design must *wait* for unknown descendants does it need a bounded os-no-event poll, and that must be stated explicitly.
+### os-no-event candidates (revision 2: none)
+- **Process-group emptiness** is DEFECT with no os-no-event part. Affected sites: local_runtime_process.rs 245/261, managed_git_worktrees.rs 1006/1015, entrypoint_supervisor.rs 445/461.
+  - The group leader is the owned child. Its exit has an event: the wait handle on a thread, kqueue `EVFILT_PROC NOTE_EXIT`, or pidfd.
+  - The other members use M2 (`src/process_exit.rs`; see the header).
+    - macOS: rounds of atomic `proc_listpgrppids` snapshots with NOTE_EXIT per member. The group is empty when a round ends with no new pid and zero live registrations.
+    - Linux: pidfd POLLIN for running members and POLLHUP for zombies. The group is empty when `killpg(pgid, 0) == ESRCH`.
+  - Every round starts on an event, so no timed `killpg(pgid, 0)` residual remains.
+  - The STOP_GRACE / SIGTERM / SIGKILL budgets stay `timer: deadline` on the blocking wait, with unchanged values.
 - No other site qualifies. File readiness (entrypoint_supervisor.rs 329, listener.rs 530) has FSEvents or inotify parent-directory events. Waiting on a foreign pid (local_runtime_process.rs 511, test_support.rs 952/1947) has kqueue `EVFILT_PROC` or pidfd.
 
 ### Unverified candidates (not counted; one closer read would settle them)
@@ -1032,8 +1129,8 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 - subscription/entity.rs 3992-3999 and 4091-4098 repeat `drive_all_maintenance` + `try_recv` up to 32 times, waiting for the first snapshot frame. Same question.
 
 ### Notes for the writer
-- allocation_oracle.rs:534 (`recv_timeout(1s)` asserted `Timeout`) is classified NOT-TIMER but borderline. It deliberately exercises the expiry path of `recv_timeout` to measure allocation, and nothing is awaited. Shrinking the bound to about 0 would remove 1 s of dead time. A reviewer could reasonably call it a fixed-delay negative instead.
-- package_event_router.rs:6106 is NOT-TIMER. Every iteration publishes, as load generation during an unload, and the loop ends on the worker's `done` flag.
+- allocation_oracle.rs:534 (`recv_timeout(1s)` asserted `Timeout`) is classified deadline in revision 2. The allocation oracle's `Phase::Wait` deliberately drives the reply channel's deadline to expiry, which is the error path production reply waits take, so that the oracle can account the allocations on that path. The 1 s value is unchanged. A value suggestion is recorded under "Follow-ups (not applied)".
+- package_event_router.rs:6106 is DEFECT in revision 2 (it was NOT-TIMER). Every iteration publishes, as load generation during an unload, and the loop ends on the worker's `done` flag. The `yield_now` is a scheduler-timing call, not load. Remove it; the publications are the load.
 - entrypoint_supervisor.rs:505 (extra) is a real deadline (`output_finalization_deadline`). Today it is only evaluated when a poll loop calls `refresh()`, so the event-driven rewrite must arm it as an actual timer.
 
 ### src/client_api.rs
@@ -1058,26 +1155,26 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 | line | scope | site (short code) | category | reason (one line) | replacement |
 |---|---|---|---|---|---|
 | 782 | P | typed CoreTicket::wait: recv_timeout(remaining) loop, dropping stale phases | deadline | completion channel is the event; stale phases consumed without extending the deadline | - |
-| 1449 | P | stop_and_join: done.recv_timeout(DATA_PLANE_STOP_BOUND) | deadline | driver done channel is the event; NOTE the bound is derived from 2*DATA_PLANE_WATCHDOG, so it changes when the watchdog goes | - |
+| 1449 | P | stop_and_join: done.recv_timeout(DATA_PLANE_STOP_BOUND) | deadline | driver done channel is the event. The bound is derived from 2*DATA_PLANE_WATCHDOG today; when the watchdog goes, the bound keeps its value as a literal (ruling 2) | - |
 | 1484, 1490 | P | run_loop: core_daemon.wait_pump(DATA_PLANE_WATCHDOG=1s) when no request pending | DEFECT | 1s watchdog wake re-runs close_work: requeue() (close_work.rs:226) and the overflow remainder send no wake, so requeued close decisions and overflow keys only progress on the next Core wake or watchdog expiry | wait with no timeout; requeue/overflow-remainder must raise the pump wake (or be re-driven by the Core session-registry transition that makes session_close_event_decision Some); stop already interrupts via request_stop+unpark |
 
 ### src/data_plane/driver/allocation_oracle.rs
 
 | line | scope | site (short code) | category | reason (one line) | replacement |
 |---|---|---|---|---|---|
-| 534 | F | callback_reply: assert recv_timeout(1s)==Timeout | NOT-TIMER (borderline) | feature allocation-oracle diagnostic; deliberately exercises recv_timeout's expiry path to measure allocation, nothing is awaited; could be Duration::ZERO | - |
+| 534 | F | callback_reply: assert recv_timeout(1s)==Timeout | deadline (was NOT-TIMER) | allocation-oracle diagnostic (`Phase::Wait`): it drives the reply channel's deadline to its expiry (error) path so the oracle can account that path's allocations. The value is unchanged | - |
 
 ### src/entrypoint_supervisor.rs
 
 | line | scope | site (short code) | category | reason (one line) | replacement |
 |---|---|---|---|---|---|
 | 329 | P | readiness: events.recv_timeout(min(remaining,50ms)); on Timeout reread launch result + refresh child | DEFECT | 50ms cap re-checks child exit/output and rereads file on expiry (reviewer hint confirmed) | feed child-exit (wait thread) and stdout/stderr EOF into the same event channel as the notify watcher; any watcher event on file or parent triggers reread; single recv_timeout(remaining) deadline. FS fact: FSEvents/inotify coalesce but still deliver a parent-dir event, so no timed fallback is needed |
-| 445, 461 | P | stop: refresh + supervised_process_group_exists every 20ms (STOP_GRACE, then SIGKILL 2s) | DEFECT (group-empty part os-no-event) | poll for child exit + group empty | child exit via wait thread/kqueue EVFILT_PROC/pidfd -> channel with deadline; group-emptiness for unknown descendants has no OS event (no subreaper on macOS, kqueue/pidfd are per-pid) - flag as os-no-event |
+| 445, 461 | P | stop: refresh + supervised_process_group_exists every 20ms (STOP_GRACE, then SIGKILL 2s) | DEFECT | poll for child exit + group empty | child exit via wait thread/kqueue EVFILT_PROC/pidfd -> channel with deadline; group emptiness via M2 (`src/process_exit.rs`); STOP_GRACE and 2s stay deadlines |
 | 945 | T | wait_for_pid_file: read file + sleep(10ms) | DEFECT | poll for fixture pid file | fixture writes pid to a pipe (stdout) the test reads with deadline, or notify watcher on the file |
 | 952 | T | assert_pid_gone: kill(pid,0) + sleep(20ms) | DEFECT | poll for descendant exit | kqueue EVFILT_PROC NOTE_EXIT / pidfd_open on the pid with 2s deadline |
 | 995 | T | observe_child_exit: refresh + yield_now until exited_at | DEFECT | spin on try_wait | child-exit event (wait thread -> channel, same source production should use) with deadline |
 | 1076 | T | fixture thread sleep(100ms) before sending output EOF | DEFECT | fixed delay to order "output arrives after exit observed" | gate the fixture on a positive event: test hook signalled when wait_for_launch_result has recorded exit with pending output |
-| 1162 | T | sh -c "while :; do sleep 1; done" fixture | NOT-TIMER | long-lived child process body, nothing awaited | - |
+| 1162 | T | sh -c "while :; do sleep 1; done" fixture | DEFECT (was NOT-TIMER) | fixture keep-alive sleep | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
 | 505 (extra, not in grep) | P | output_finalization_deadline checked in refresh | deadline | give-up for output readers after exit; but it is only evaluated when a poll loop calls refresh (329/445/461), so the event-driven rewrite must arm it as a real timer | - |
 
 ### src/event_plane_counters.rs
@@ -1121,7 +1218,7 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 |---|---|---|---|---|---|
 | 180 | P | child exited -> sleep(20ms) then drain stderr | DEFECT | let-it-settle for stderr reader thread | read stderr to EOF: stderr reader thread closes channel on EOF; recv until Disconnected with deadline |
 | 194 | P | readiness loop: Status probe then sleep(50ms) | DEFECT | poll for daemon readiness | readiness pipe fd inherited by daemon (written after listener bind) + child-wait thread -> channel, select with readiness_budget deadline |
-| 245, 261 | P | terminate: try_wait + process_group_exists every 20ms (SIGTERM 500ms, SIGKILL 2s) | DEFECT (group-empty part is os-no-event) | poll for child exit and group emptiness | leader exit: child-wait thread -> channel (or kqueue EVFILT_PROC/pidfd) with deadline. Group emptiness: OS fact - neither kqueue nor pidfd reports "process group empty" for unknown descendants; macOS has no subreaper; a residual killpg(0) check after leader exit is os-no-event |
+| 245, 261 | P | terminate: try_wait + process_group_exists every 20ms (SIGTERM 500ms, SIGKILL 2s) | DEFECT | poll for child exit and group emptiness | leader exit: child-wait thread -> channel (or kqueue EVFILT_PROC/pidfd) with deadline. Group emptiness: M2 (`src/process_exit.rs`); no os-no-event residual. 500ms/2s stay deadlines |
 | 511 | P | wait_for_runtime_daemon_exit(non-child pid): ps -p every 50ms | DEFECT | poll for foreign pid exit | kqueue EVFILT_PROC NOTE_EXIT (macOS) / pidfd_open+poll (Linux) with 10s deadline |
 | 525 | P | wait_for_owned_runtime_daemon_reaped: waitpid WNOHANG / ps every 50ms | DEFECT | poll for owned child exit | kqueue EVFILT_PROC/pidfd on pid then waitpid; or blocking waitpid on a thread -> channel with deadline |
 
@@ -1179,7 +1276,7 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 
 | line | scope | site (short code) | category | reason (one line) | replacement |
 |---|---|---|---|---|---|
-| 292 | T | recv_timeout(Duration::ZERO) | NOT-TIMER | non-blocking receive of an already-sent value | - |
+| 292 | T | recv_timeout(Duration::ZERO) | DEFECT (mechanical; was NOT-TIMER) | non-blocking receive of an already-sent value through a timer API | `try_recv()` |
 
 ### src/main.rs
 
@@ -1195,7 +1292,7 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 | line | scope | site (short code) | category | reason (one line) | replacement |
 |---|---|---|---|---|---|
 | 968 | P | wait_for_child: try_wait + sleep(10ms) until MANAGED_GIT_COMMAND_TIMEOUT | DEFECT | poll for git child exit | child wait thread -> channel (or kqueue EVFILT_PROC / pidfd) with command deadline; timeout path terminates |
-| 1006, 1015 | P | terminate_owned_child_group: try_wait + owned_process_group_exists every 10ms | DEFECT (group-empty part os-no-event) | poll for leader exit and group empty | leader exit event as above; group emptiness of unknown descendants is os-no-event (flag) |
+| 1006, 1015 | P | terminate_owned_child_group: try_wait + owned_process_group_exists every 10ms | DEFECT | poll for leader exit and group empty | leader exit event as above; group emptiness via M2 (no os-no-event residual) |
 
 ### src/operator_console.rs
 
@@ -1207,7 +1304,7 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 
 | line | scope | site (short code) | category | reason (one line) | replacement |
 |---|---|---|---|---|---|
-| 6106 | T | load-generator loop: try_ingress + yield_now until worker sets done | NOT-TIMER | each iteration performs a publication (concurrent load during unload); exit is the worker's done flag, not a waited-for condition | - |
+| 6106 | T | load-generator loop: try_ingress + yield_now until worker sets done | DEFECT (was NOT-TIMER) | each iteration performs a publication (concurrent load during unload), but the `yield_now` is scheduler timing inside a loop that ends on another thread's flag | drop the `yield_now`; the publications are the load, and the loop still ends on the worker's `done` flag |
 | 6153, 7006, 7072, 7098 | T | sleep(3ms) to age/expire queued copy before pull/ingress | DEFECT | fixed delay to advance wall clock | APIs already take `Instant` arguments: pass synthetic instants (t0, t0+ttl) instead of Instant::now() after a sleep |
 | 7154-7196 (extra, not in grep) | T | loop pull_ready_batch(Instant::now())/requeue until batch empty, 200ms deadline | DEFECT | busy cycle waiting for wall-clock queue_age expiry | pass a synthetic `now` beyond queue_age to pull_ready_batch (API already takes the instant) |
 
@@ -1249,7 +1346,7 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 | line | scope | site (short code) | category | reason (one line) | replacement |
 |---|---|---|---|---|---|
 | 75, 76 | P (dead_code) | SpawnReplyReceiver::recv_timeout wrapper | deadline | thin wrapper over channel recv with caller-supplied bound; no poll | - |
-| 126, 128 | T | recv_timeout(Duration::ZERO) | NOT-TIMER | zero timeout = non-blocking receive of an already-sent value | - |
+| 126, 128 | T | recv_timeout(Duration::ZERO) | DEFECT (mechanical; was NOT-TIMER) | zero timeout = non-blocking receive of an already-sent value through a timer API | `try_recv()` (add it to `SpawnReplyReceiver` if missing) |
 
 ### src/subscription/attach_routes.rs
 
@@ -1340,7 +1437,7 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 | 177 | P | send_text_or_peer_terminal: sleep(LOCAL_WEBRTC_PEER_CLOSE_BOUND) raced in select with the send and peer_terminal_rx | deadline | send completion / peer terminal watch are the events | - |
 | 492 | P | timeout(5s, reply_rx) for owner reply | deadline | oneshot reply is the event; expiry -> OPERATOR_ERROR_RUNTIME_REQUEST_TIMED_OUT | - |
 | 641, 656 | P | close_data_channel: timeout(LOCAL_WEBRTC_PEER_CLOSE_BOUND) around close-frame sends and local_close | deadline | send/close futures are the events | - |
-| 750 (extra, not in grep) | P | timeout(webrtc runtime, LOCAL_WEBRTC_EVENT_PROBE=Duration::ZERO, local_poll()) | NOT-TIMER | zero-duration non-blocking probe for pressure events between chunks; nothing awaited | - |
+| 750 (extra, not in grep) | P | timeout(webrtc runtime, LOCAL_WEBRTC_EVENT_PROBE=Duration::ZERO, local_poll()) | DEFECT (mechanical; was NOT-TIMER) | a zero-duration non-blocking probe for pressure events between chunks. Nothing is awaited, but it uses a timer API | poll `local_poll()` once without a timer (`now_or_never()`, or the runtime's non-blocking form); verify it has the same single-poll semantics |
 | 1185+1195 | T | timeout(2s){ loop read sent log until HelloAck chunks complete; task::yield_now } | DEFECT (outer timeout = deadline) | async spin on mock sent log | mock send_notify (test_support.rs:84) notified on each send; await it inside the deadline |
 | 1226, 1253, 1282, 1291 | T | timeout(2s) around runtime_rx.recv() / driver join | deadline | channel recv / task join are events | - |
 | 1270+1272 | T | timeout(2s){ while !send_entered { yield_now } } | DEFECT (outer timeout = deadline) | async spin on mock flag | await data_channel.send_notify.notified() (register before flag check) |
@@ -1359,7 +1456,7 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 | 1937 | T | mailbox.try_push retry on ShedBusy with yield_now (<=1000 attempts) | DEFECT | spin waiting for mailbox lock/capacity held by another thread | mailbox capacity/lock-release wake (event-plane capacity notification) or a blocking admission call with deadline |
 | 3229 | T | control_rx.try_recv Empty => sleep(5ms) until PeerClosed | DEFECT | poll owner control channel | blocking control_rx.recv under the 10s deadline |
 | 3368 | T | hang-close child: try_wait + sleep(20ms) until HANG_CLOSE_CHILD_DEADLINE | DEFECT | poll for child exit | child.wait() on a thread -> channel recv_timeout(HANG_CLOSE_CHILD_DEADLINE) (or kqueue/pidfd) |
-| 3387 | T | task::yield_now inside spawned task body | NOT-TIMER | creates a suspension point to prove detached task runs to completion; nothing awaited | - |
+| 3387 | T | task::yield_now inside spawned task body | DEFECT (was NOT-TIMER) | a scheduler yield used as the suspension point that proves a detached task runs to completion | await a oneshot/Notify the test fires after spawning; that is a deterministic suspension point with no scheduler timing |
 | 3391, 3395 | T | started_rx/done_rx.recv_timeout(2s) | deadline | task sends are the events | - |
 | 1424, 2039, 2345, 3291 (callers, extra) | T | wait_until(dedicated_runtime_worker_threads()==0, 2s) | DEFECT | poll a thread counter | join the dedicated runtime's worker threads (or a condvar notified when the counter reaches 0) with deadline |
 
@@ -1396,6 +1493,61 @@ Extra sites the grep missed are marked "(extra, not in grep)": 13 rows (9 DEFECT
 | 241 | P | capture: try_wait + sleep(25ms) until deadline | DEFECT | poll for child exit | child wait thread -> channel with recv_timeout(deadline) (stdout/stderr readers already threads) |
 | 305, 313 | P | stream: try_wait + sleep(25ms) (main loop and 2s SIGTERM grace) | DEFECT | poll for child exit | child wait thread -> channel; recv_timeout(deadline) then recv_timeout(grace) after SIGTERM |
 
+### Bare webrtc timeouts (revision 2; extra, not in grep)
+
+The original grep matched `time::timeout`, not a bare `timeout(` imported from `webrtc::runtime`. These are the `src/` sites it missed. Each wraps one expected event, so each is a deadline. Values are unchanged.
+
+| file:line | scope | site (short code) | category | reason (one line) | replacement |
+|---|---|---|---|---|---|
+| src/local_webrtc_smoke.rs:302 | P (smoke CLI) | `let _ = timeout(5s, gather_complete_rx.recv())` | deadline | ICE gathering completion is the event. On expiry the offer goes out with the candidates gathered so far, which is a give-up path and not a receipt. The reviewer should confirm that proceeding is acceptable, or make expiry an error | - |
+| src/local_webrtc_smoke.rs:335, 342, 397, 416, 452, 497 | P (smoke CLI) | timeout(10-15s) around connected / data-channel open / message recv | deadline | channel recv is the event; expiry maps to `SmokeError` | - |
+| src/transport/webrtc/signaling.rs:114 | P | `let _ = timeout(5s, gather_complete_rx.recv())` | deadline | same give-up as smoke 302: expiry proceeds with the candidates gathered so far. Same reviewer check | - |
+| src/transport/webrtc/peer.rs:3496, 3517, 3534, 3542, 3550, 3558, 3615, 3652, 3660, 3673 | T | timeout(5-15s) around gather / connected / open / incoming / message recv | deadline | each awaits one expected event; expiry fails the test | - |
+| src/transport/webrtc/test_support.rs:402 | T | `let _ = timeout(5s, gather_complete_rx.recv())` | deadline | same gather give-up (test harness) | - |
+| src/transport/webrtc/test_support.rs:435, 443, 591, 645, 673 | T | timeout(10-15s) around connected / open / reserved message recv | deadline | expected-event recv; expiry fails | - |
+
+### Bare webrtc timeouts in the lifecycle test files (revision 2; extra, not in grep)
+
+These are the 39 bare `timeout(` calls in `tests/hub_daemon_lifecycle/*` at 23b0feaa, each classified on its own. File:line is at **20b201bd**, and the 23b0feaa line is in parentheses where it differs.
+- webrtc_proofs.rs:1735 is the 40th call at 20b201bd. It is new since 23b0feaa and is classified in "Sites added between 23b0feaa and 20b201bd".
+- Rows marked "already listed" repeat an extra that B1 or B2 already has, so they add no new site.
+- Tally: 25 DEFECT (22 already listed, 3 new: webrtc_fixtures 2618, event_plane_saturation 3385 and 3444), 12 deadline, 2 NOT-TIMER. Values are unchanged throughout.
+
+| file:line (20b201bd) | site | category | reason | replacement |
+|---|---|---|---|---|
+| webrtc_fixtures.rs:435 | `recv_raw(bound)`: `timeout(bound, rx.recv())` | deadline | primitive: one receive bounded by the caller's `bound`; callers are classified at their own sites | - |
+| webrtc_fixtures.rs:449 | `loop { timeout(10s, rx.recv()) }` while reassembling a response | deadline | each receive expects the next chunk, and expiry returns an error. Note: the 10 s restarts after each skipped message, so the absolute bound is 10 s per message, not per response | - (optionally `remaining` against one absolute deadline; the value is unchanged) |
+| webrtc_fixtures.rs:687 | `count_terminal_frames(bound)`: 50 ms slices over a fixed window | DEFECT | fixed negative window (already listed at 684-690) | await the channel close/reject event, then count |
+| webrtc_fixtures.rs:852 | `let _ = timeout(5s, gather_complete_rx.recv())` | deadline | ICE gathering give-up: expiry proceeds with the candidates gathered so far (same as signaling.rs:114) | - |
+| webrtc_fixtures.rs:915 | `timeout(15s, connected_rx.recv())` | deadline | expected connection event; expiry errors | - |
+| webrtc_fixtures.rs:926, 933 | alternating `timeout(50ms, data_channel_open_rx)` / `timeout(50ms, extra_open_rx)` | DEFECT | round-robin poll of two receivers (already listed at 923-935) | `select!` both receivers with one 10 s deadline |
+| webrtc_fixtures.rs:948 | `timeout(10s, data_channel_open_rx.recv())` | deadline | expected open event | - |
+| webrtc_fixtures.rs:984 | `timeout(3s, encrypted_hello(...))` | deadline | expected HelloAck; expiry errors | - |
+| webrtc_fixtures.rs:1416 (1420) | `timeout(5s, extra_channel.open_rx.recv())` | deadline | expected open-or-fail event | - |
+| webrtc_fixtures.rs:1440 (1444) | `timeout(500ms, data_channel.ready_state())` on the failure path | deadline | bounds a diagnostic read so that the failure path cannot hang; it is not a wait for progress | - |
+| webrtc_fixtures.rs:1554, 1583 (1553, 1582) | round-robin `timeout(50ms, receive_delivery)` across subscription inbounds and the main inbound | DEFECT | round-robin poll that also cancels in-flight receives (already listed at 1550-1590) | merge the inbounds into one channel or `select!`, one deadline |
+| webrtc_fixtures.rs:2618 (2617) | unit test: `timeout(50ms, receive_delivery)` expected `Err` after admitting only the first chunk | DEFECT (mechanical; new) | fixed 50 ms negative window. Admission is synchronous, so "still waiting for the remainder" is decidable with one poll | poll `receive_delivery` once (`now_or_never()` is `None`), then drop the future and assert that reassembly is kept |
+| webrtc_terminal_adapter.rs:200, 214 (201, 215) | `wait_for_webrtc_subscription_closed`: 200 ms host-event slices; 20 ms terminal drain on a miss | DEFECT (slice) | slices re-check the deadline (already listed) | `select!` host event / terminal recv with the remaining deadline |
+| webrtc_terminal_adapter.rs:326, 401, 458, 938 (327, 402, 459, 939) | first-frame wait in 200 ms slices | DEFECT (slice) | already listed | one `timeout(remaining)` |
+| webrtc_terminal_adapter.rs:472 (473) | 400 ms window counting extra-channel frames, 50 ms slices | DEFECT | fixed negative window (already listed at 470-473) | await `extra.closed` (reject), then assert zero frames |
+| webrtc_terminal_adapter.rs:984 (985) | 6 s loop of 200 ms frame reads that runs its full length | DEFECT | fixed negative window (already listed at 982-1002) | after the sibling frame, use one Status response as a barrier, then assert |
+| webrtc_terminal_adapter.rs:1028 (1029) | `timeout(deadline - now, next_terminal_frame_with_label)` | deadline | already the correct form: the remaining absolute deadline for an expected frame | - |
+| webrtc_terminal_adapter.rs:1183 (1184) | 2 s loop of `let _ = timeout(100ms, next_host_event)` before "no close" | DEFECT | fixed negative window (already listed at 1182-1185) | a later host event as the barrier, then assert |
+| webrtc_terminal_adapter.rs:1510 (1511) | `timeout(5s, next_host_event)`, "package event arrives without later traffic" | deadline | expected event; expiry fails | - |
+| webrtc_terminal_adapter.rs:1632 (1633) | `timeout(5s, extra.closed.recv())` | deadline | close is the expected event | - |
+| webrtc_terminal_adapter.rs:1637 (1638) | 1 s loop of `timeout(100ms, next_host_event)` before "no close" | DEFECT | fixed negative window (already listed at 1636-1639) | barrier event after `extra.closed` |
+| webrtc_terminal_adapter.rs:1700 (1701) | `timeout(5s, wrong_channel.closed.recv())` | deadline | close is the expected event | - |
+| subscription_ownership_baseline.rs:41 | `wait_for_webrtc_marker`: 200 ms slices to a 45 s deadline | DEFECT (slice) | already listed | one `timeout(remaining)` per frame |
+| subscription_ownership_baseline.rs:121, 125 | `"... timeout(local_close) ..."` inside assertion message strings | NOT-TIMER | text in a string literal, not a call | - |
+| subscription_ownership_baseline.rs:223 (218) | entity-frame wait in 250 ms slices to 20 s | DEFECT (slice) | already listed at 216-232 | recv with the remaining deadline |
+| subscription_ownership_baseline.rs:237 (232) | host-event 250 ms slices, re-emitting `sample.ready` after 8 s | DEFECT | slices plus a re-emit retry that waits for state (already listed at 216-232) | recv with the remaining deadline; no re-emit |
+| subscription_ownership_baseline.rs:809 (804) | `await_next_webrtc_terminal_frame`: 200 ms | DEFECT (slice) | slice inside backstop loops (already listed) | recv with the remaining backstop |
+| paste_transaction.rs:375 (362) | ready-marker wait in 200 ms slices to 8 s | DEFECT (slice) | already listed | `timeout(remaining)` |
+| paste_transaction.rs:420 (407) | 100 ms slices plus a 500 ms post-completion hold | DEFECT | fixed negative window (already listed at 406-420) | request/response barrier on the peer after completion |
+| event_plane_saturation.rs:3385 | `drain_webrtc_host_events`: `timeout(10ms, next_host_event)` until 10 ms quiet or a 100 ms slice end | DEFECT (new, group B1) | quiet window stands in for "nothing pending" | non-blocking drain: poll `next_host_event` with `now_or_never()` until `None`; no timer |
+| event_plane_saturation.rs:3444 | `timeout(250ms, next_host_event)` chunks to a 5 s deadline, waiting for a token event or EventGap | DEFECT (slice; new, group B1) | slice that only re-checks the deadline. B1 had noted this as a deadline under "Reviewed, not defects"; the B2 slice rule governs | `timeout(deadline - now, next_host_event)` |
+| webrtc_proofs.rs:2046 (1877) | entity upsert in 500 ms slices to 10 s | DEFECT (slice) | already listed | `timeout(remaining)` |
+
 
 # Group D
 
@@ -1407,28 +1559,59 @@ Worktree: delivery/event-driven-20260925 at 23b0feaa. Read only. Line numbers ar
 
 | category | count |
 |---|---|
-| DEFECT | 97 |
-| deadline | 14 |
-| NOT-TIMER | 37 |
+| DEFECT | 118 |
+| deadline | 20 |
+| NOT-TIMER | 11 |
 | rate-limit | 2 |
+| measurement-window | 2 (probe-hub-resources 232, test-production-package-runtime 590) |
 | backoff | 0 |
-| os-no-event | 4 (all flagged below; each has a partial event alternative) |
+| os-no-event | 1 (isolated_hub.rs 2187, candidate; facts below) |
 
-Extras not in the grep: 2 DEFECT (test-support lib.rs 4412, update_command_test.rs 745). The rest are non-defect: fixture lifetimes, deadline primitives, owner-drive loops, and sampling cadence. They are listed at the end.
+Revision 2 moves:
+- 20 fixture sleeps went from NOT-TIMER to DEFECT: run.rs 367/417/459; isolated_hub 1506; lib.rs 6890/7067/7091/7114/7255; selftest 75/292/428/460/469; process-census 213/256; test-harness-control.py 34/41; hub_client_api_test 3578/3670.
+- 6 Hub-client forwarders and restores went from NOT-TIMER to deadline: 1017, 1102, 1246, 1269, 1488, 1489.
+- 3 lines went from os-no-event to DEFECT: selftest 332/410 and publish-npm 144.
+- 2 lines went from DEFECT to measurement-window.
+
+Extras not in the grep: 44 DEFECT.
+- test-support lib.rs 4412 and update_command_test.rs 745.
+- 24 fixture-lifetime sleeps (these were NOT-TIMER in revision 1).
+- 18 Python library-timeout waits (new in revision 2; see "Python library timeouts").
+
+The other extras are non-defect: deadline primitives, owner-drive loops, and sampling cadence. They are listed at the end.
 
 packages/** has no timer sites. The only matches are the protocol type fields `active_timer_resources` and `stalled_write_timeouts` in packages/hub-test-support/daemon-protocol.ts at 914 and 1061. tests/support/mod.rs has none, and test.sh has none. The fixture plugin.lua copies have no timers.
 
 ### os-no-event candidates (OS facts)
 
-- **isolated_hub.rs 2187** waits for SIGSTOP to take effect on every Hub-group member. macOS kqueue EVFILT_PROC reports only NOTE_EXIT, NOTE_FORK and NOTE_EXEC, with no stop notification. On Linux, waitid(WSTOPPED) works only for your own children, and pidfd does not report stop. The Hub pid is our child, so `waitpid(hub, WUNTRACED)` gives an event for the Hub. The members are the Hub's children, not ours, so they have no stop event. This is genuinely os-no-event for the non-child members only.
-- **run-loaded-daemon-lifecycle-selftest 332 and 410** wait for an orphaned zombie to be reaped by init. On Linux, a pidfd turns readable at exit, not at reap, and nothing notifies a non-parent of a reap. There is an alternative event source: the fixture's grandparent can become a subreaper with `prctl(PR_SET_CHILD_SUBREAPER)` and then waitpid the reparented zombie. That changes what the test proves (reap by init), so the owner has to decide.
-- **publish-npm-packages 144** waits for npm registry visibility. This is an external service with no push notification to the publishing CLI. It is bounded at 12 x 5 s. It is not an OS fact, but it is the same class: there is no event source.
-- Partial candidates classed as DEFECT. The OS provides no **process-group-empty** event, only per-pid NOTE_EXIT or pidfd. That affects run.rs 264, test-support lib.rs 7989 and run-loaded-daemon-lifecycle 664/670. The replacement is to enumerate members (macOS `proc_listpids(PROC_PGRP_ONLY)`, Linux /proc) and register NOTE_EXIT or pidfd per pid, then re-enumerate once to close the fork race. **Third-party zombie reaping** has no event for a non-parent. That affects process-census 87 and run-loaded-daemon-lifecycle 411. It is os-no-event only for the residue left after the owner's own cleanup receipt.
+- **isolated_hub.rs 2187 (os-no-event candidate; the reviewer must agree).** It waits for SIGSTOP to take effect on every Hub-group member. `group_quiescent` requires every non-zombie member in state `T`.
+  - Checked on both platforms.
+  - **macOS:** kqueue EVFILT_PROC offers NOTE_EXIT, NOTE_FORK, NOTE_EXEC, NOTE_SIGNAL, NOTE_EXITSTATUS and the deprecated NOTE_REAP (SDK `sys/event.h`). None of them is a stop note. NOTE_SIGNAL reports that a signal was posted, not that the target has stopped.
+  - **Linux:** a pidfd reports only exit (EPOLLIN) and reap (EPOLLHUP). `waitid(WSTOPPED)` works only for the caller's own children. The only stop notification for a non-child is ptrace (`PTRACE_SEIZE`, then `waitpid` reports group-stop). It is rejected here. It makes the harness a tracer of every Hub member, which changes their stop/continue semantics: FreezeGuard's SIGCONT would no longer resume a traced group-stop without `PTRACE_LISTEN` handling. It also collides with any debugger. macOS has no counterpart, so the harness would split by platform.
+  - **The Hub itself** is our child, so `waitid(P_PID, hub, WSTOPPED|WNOWAIT)` gives a real event for it, and that part must become an event wait. The os-no-event claim covers only the Hub's children, which are not our children.
+  - The remaining bounded census loop keeps `WAIT_POLL` and `FREEZE_CONFIRM_BUDGET` unchanged. It is marked `timer: os-no-event — SIGSTOP taking effect on non-child processes: no stop note in kqueue EVFILT_PROC (macOS), no stop event in pidfd and waitid is children-only (Linux)`.
+  - Unverified: XNU may apply SIGSTOP synchronously inside kill(2) (psignal, then task suspend). If so, the first census already confirms on macOS, and the loop body runs once there.
+- **run-loaded-daemon-lifecycle-selftest 332 and 410. Reclassified DEFECT.** Both sites are inside `if [[ "$(runner_platform)" == Linux ]]` blocks (lines 279-341 and 343-422 at 23b0feaa), so they run only on Linux. They wait for an orphaned zombie to be reaped by init after its parent exits.
+  - A pidfd reports the reap: per pidfd_open(2) it turns readable at exit and reports EPOLLHUP when the process is reaped.
+  - Replacement: open a pidfd on each zombie pid while its parent is still alive, then signal the parent. This is a small Python helper, `os.pidfd_open` plus `select.poll`. Wait for POLLHUP with the existing 5 s budget (100 × 0.05 s) as a `timer: deadline`.
+  - The tested claim (reap by init) is unchanged. No subreaper is needed.
+  - Verify that the CI kernel reports EPOLLHUP at reap. If it does not, stop and escalate; do not fall back to a poll.
+- **publish-npm-packages 144. Reclassified DEFECT; needs an orchestrator decision.** Registry visibility is not an OS fact, so os-no-event cannot apply.
+  - Proposed replacement: remove the post-publish visibility poll. `npm publish` success is the receipt. Run one `npm view <pkg>@<version>` check that fails with a clear error and does not retry.
+  - Tradeoff for the orchestrator: registry read-after-write lag can make that single check fail spuriously right after a successful publish. The alternative is to drop the check entirely.
+- **Process-group empty** (run.rs 264, test-support lib.rs 7989, run-loaded-daemon-lifecycle 664/670) is DEFECT with no os-no-event part. It uses M2 (`src/process_exit.rs`; see the header).
+  - macOS: atomic snapshot rounds with NOTE_EXIT per member.
+  - Linux: pidfd POLLIN for running members and POLLHUP for zombies. The group is empty when `killpg(pgid, 0) == ESRCH`.
+  - The shell script (run-loaded-daemon-lifecycle) needs a small helper binary or Python helper to reach these APIs.
+- **Third-party zombie reaping** (process-census 87, run-loaded-daemon-lifecycle 411) has no os-no-event residue.
+  - On Linux, a pidfd taken while the zombie exists reports its reap with EPOLLHUP.
+  - Where these run on macOS, the wait must end on the owner's own reap receipt (the owner reaps its children). The zero-settle census then runs once. It must not wait for a third party's reap.
 
 ### DEFECT mechanism groups (for commit planning)
 
 - **A. Direct-child exit polled with try_wait/poll()**
-  - Replacement: a child-wait thread that sends to a channel, received with `recv_timeout(deadline)`. Alternatives are kqueue NOTE_EXIT or pidfd, `Popen.wait(timeout)`, or bash `wait` plus a watchdog.
+  - Replacement: a child-wait thread that sends to a channel, received with `recv_timeout(deadline)`. Alternatives are kqueue NOTE_EXIT or pidfd, or bash `wait` plus a watchdog.
+  - In Python, do not use `Popen.wait(timeout)`: it polls with WNOHANG plus sleep. Use a blocking `wait()` on a thread that puts the result on a `queue.Queue`, then `get(timeout=remaining)`.
   - Sites: run.rs 92, 278; isolated_hub.rs 1626, 1635, 2282; hub_mcp_test.rs 132, 141; prove-north-star 324, 440, 472, 724; run-loaded-daemon-lifecycle 971.
 - **B. Non-child pid exit polled with kill -0, ps or killpg(0)**
   - Replacement: kqueue EVFILT_PROC NOTE_EXIT on macOS or `pidfd_open` on Linux per pid, with a deadline.
@@ -1461,7 +1644,10 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
   - Sites: installer tests/support/mod.rs 395; installer src/inject.rs 143 (release file; expiry silently continues, which is not an error path); test-support lib.rs 7943; run-loaded-daemon-lifecycle-selftest 81, 298, 441, 487; process-census 196, 318; run-lifecycle-suite 173; run-loaded-daemon-lifecycle 775, 786, 808 (pgid/sid established after launch: have the launcher signal after setpgid/setsid).
   - test-support lib.rs 7137, 7171, 7194: the worker must publish from inside itself after exec. For 7171 and 7194, the descendant pid file has already been awaited and proves the worker shell is alive, so a single census would do.
 - **H. Zombie-state polling**
-  - Replacement: have the fixture parent observe the child's exit without reaping, then publish. Either the child holds a pipe write end and the parent reads EOF, or the parent calls `waitid(P_PID, child, WEXITED|WNOWAIT)`.
+  - Replacement: have the fixture parent observe the child's exit without reaping, then publish.
+  - Prefer a blocking `waitid(P_PID, child, WEXITED|WNOWAIT)` in the parent. It returns once the child has exited, and the child stays a zombie because WNOWAIT does not reap.
+  - Alternatively use a pidfd (Linux: EPOLLIN at exit) or kqueue NOTE_EXIT (macOS). NOTE_EXIT fires at exit, when the child is a zombie of its unreaped parent.
+  - Revision 2: a pipe EOF is not acceptable. It proves only that the write end was closed, which can happen before exit, or be delayed past it by an inherited copy. It does not prove zombie state.
   - Sites: process-census 229, 272; run-loaded-daemon-lifecycle-selftest 308, 355, 378.
 - **I. Fixed delays, race windows and negative assertions after a time window**
   - Replacement: a rendezvous channel, or a positive event proving the system passed the point.
@@ -1471,7 +1657,7 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
   - hub_lua_runtime_test.rs 1314: 2 s before asserting no outcomes. Wait for the requeue or admission-refused event instead.
   - hub_client_api_test.rs 3043 (`observe_for(200ms)`, called at 3407): a settle before shutdown.
   - hub_capability_runtime_test.rs 188: the HTTP server delay models an in-flight request. Gate the response on a channel released after hot-path responsiveness is proven.
-  - probe-hub-resources 232 and test-production-package-runtime 590: idle windows for wake-rate measurement. An idle-spin measurement fundamentally needs an observation window, so the owner has to decide whether a measurement window counts as an allowed timer.
+  - probe-hub-resources 232 and test-production-package-runtime 590: idle windows for wake-rate measurement. **Resolved by ruling 3.** Both are measurement-window, with values unchanged.
 - **J. Spin waits**
   - core_ticket_allocations/main.rs 278 (yield until START_WORKER): replace with a Barrier or park/unpark.
   - core_ticket_allocations/main.rs 291 (yield until `is_finished`, then join): plain `join()` blocks and is enough.
@@ -1480,7 +1666,7 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
   - test-support lib.rs 479: re-subscribe with the same id until the Hub frees it.
   - No client-visible event exists. Needs a Hub subscription-closed or connection-cleanup event, or an explicit unsubscribe ack before drop (the test is proving disconnect cleanup, so the event must come from the Hub).
 - **L. Zombie settle windows**
-  - run-loaded-daemon-lifecycle 411 and process-census 87: they stand in for the owner's cleanup-complete receipt. Once the owner reaps its own children, run a zero-settle census. Only third-party reaping is os-no-event.
+  - run-loaded-daemon-lifecycle 411 and process-census 87: they stand in for the owner's cleanup-complete receipt. Once the owner reaps its own children, run a zero-settle census. Third-party reaping is not os-no-event either: a pidfd reports the reap on Linux (see the os-no-event notes above).
   - process-census 157 and 170 (live processes) belong in B.
 
 ---
@@ -1491,9 +1677,9 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 |---|---|---|---|---|
 | 92 | `run_bounded` try_wait loop + sleep(POLL_INTERVAL) | DEFECT | polls the direct child's exit every 20 ms | child-wait thread -> channel `recv_timeout(deadline)` (or kqueue NOTE_EXIT / pidfd on the child) |
 | 224 | `rx.recv_timeout(DRAIN_TIMEOUT)` | deadline | the drain thread sends at EOF; expiry is reported as an error | - |
-| 264 | `wait_for_group_exit` killpg(0) poll | DEFECT | polls for the process group to empty; no group-empty event (partial os-no-event) | enumerate group pids (proc_listpids PGRP) -> kqueue NOTE_EXIT / pidfd each, deadline |
+| 264 | `wait_for_group_exit` killpg(0) poll | DEFECT | polls for the process group to empty | M2 (`src/process_exit.rs`): macOS snapshot rounds with NOTE_EXIT; Linux pidfd POLLIN/POLLHUP with `killpg(0)==ESRCH` as empty; caller's deadline |
 | 278 | `terminate_group` try_wait + group poll | DEFECT | polls leader reap and group emptiness during TERM grace | child-wait channel for the leader + per-member NOTE_EXIT, grace as deadline |
-| 367, 417, 459 | `sleep 60` in test child scripts | NOT-TIMER | long-lived descendant fixture that the code under test must kill | - |
+| 367, 417, 459 | `sleep 60` in test child scripts | DEFECT (was NOT-TIMER) | fixture sleep keeps a descendant alive for the code under test to kill | blocking read the test ends: `cat` on a FIFO the test closes (the test may also leave it open, since the code under test kills the descendant) |
 | 385, 435, 476 | test loop `kill(descendant,0)` + sleep | DEFECT | polls a non-child descendant's exit; run_bounded already swept the group, so an immediate assert may suffice | kqueue NOTE_EXIT / pidfd on the descendant pid with deadline |
 
 ### crates/botster-hub-installer/tests/support/mod.rs
@@ -1515,11 +1701,11 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 |---|---|---|---|---|
 | 1460 | `wait_for_owned_workers` census poll | DEFECT | polls ps until a worker appears after Spawn | attach the session and await the `OLD-READY` output frame (deadline), then one census |
 | 1471 | `assert_process_gone` process_pgid poll | DEFECT | polls pid disappearance (old Hub was reaped by restart; workers are non-children) | NOTE_EXIT / pidfd per pid with deadline; a reaped child needs no wait |
-| 1506 | session command `printf OLD-READY; sleep 60` | NOT-TIMER | long-lived session fixture | - |
+| 1506 | session command `printf OLD-READY; sleep 60` | DEFECT (was NOT-TIMER) | fixture sleep keeps the session alive | `printf OLD-READY; cat` on stdin or a FIFO the test closes |
 | 1607 | `wait_for_ready` Status request + try_wait + sleep 50ms | DEFECT | readiness by polling Status | new Hub readiness pipe/fd written after listen; read with deadline, EOF = exit |
 | 1626, 1635 | `cleanup_child` try_wait + group poll in TERM/KILL phases | DEFECT | polls child reap and group emptiness | child-wait channel + per-member NOTE_EXIT; phases as deadlines |
 | 1886 | `run_after_taint_check_hook` sleep 50ms after `matched.send` | DEFECT | race-window sleep so the test thread injects taint before start continues | hook blocks on a `resume` channel `recv_timeout` that the test sends after injecting |
-| 2187 | `freeze_confirm_snapshot` census loop + sleep(WAIT_POLL) | os-no-event | waits for SIGSTOP to stop all group members; no stop event for non-child processes (see facts) | only the Hub itself: `waitpid(WUNTRACED)`; members have no event |
+| 2187 | `freeze_confirm_snapshot` census loop + sleep(WAIT_POLL) | os-no-event (candidate) | waits for SIGSTOP to stop all non-zombie group members. Stop of a non-child has no event on macOS (EVFILT_PROC has no stop note; NOTE_SIGNAL is posting only) or on Linux (pidfd reports exit/reap only; `waitid(WSTOPPED)` is children-only; ptrace rejected, see the facts) | the Hub itself (our child): blocking `waitid(WSTOPPED\|WNOWAIT)` first; then the bounded census for the members, with values unchanged, marked os-no-event |
 | 2240 | `reap_owned_session_workers` census/signal loop + sleep(REAP_POLL) | DEFECT | polls for captured workers/descendants to exit | register NOTE_EXIT / pidfd on the captured set, re-census once for the fork race, SIGKILL escalation on the deadline |
 | 2282 | `wait_child_bounded` try_wait + sleep | DEFECT | polls direct child exit | child-wait thread -> channel `recv_timeout` |
 
@@ -1535,28 +1721,29 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 | 1503 | attach loop: frames + ReadScreen + sleep 25ms | DEFECT | polls for attached frame + READY text | block on route frames (`poll_terminal(remaining)`), one ReadScreen |
 | 1540, 1560 | echo / resize ReadScreen polls + sleep 25ms | DEFECT | polls the screen for echo and winsize text | route output frames with deadline |
 | 1970 | `set_read_timeout(min(remaining,50ms))` + Status "flush" loop | DEFECT | short read slice that re-issues Status each turn | single `next_event` with read timeout = remaining deadline |
-| 6890 | fake hub `while :; do sleep 1; done` | NOT-TIMER | never-ready hung-process fixture | - |
-| 7067, 7091, 7114 | python `time.sleep(60)` descendant | NOT-TIMER | long-lived descendant fixture | - |
+| 6890 | fake hub `while :; do sleep 1; done` | DEFECT (was NOT-TIMER) | fixture keep-alive sleep (never-ready hung process) | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
+| 7067, 7091, 7114 | python `time.sleep(60)` descendant | DEFECT (was NOT-TIMER) | fixture sleep keeps a descendant alive | `sys.stdin.read()` or a read on a FIFO the test closes |
 | 7109 | python `time.sleep(2)` before fork | DEFECT | fixed delay so the descendant appears after the early snapshot (skip_freeze test 7513) | gate the fork on a FIFO released by a seam after the snapshot |
 | 7137, 7171, 7194 | loop until `owned_session_worker_pids()` non-empty + sleep 20ms | DEFECT | census poll for worker visibility | worker publishes readiness from inside itself after exec (pipe); 7171/7194 already awaited the descendant pid, so one census suffices |
-| 7255 | shutdown script `dd ...; sleep 60` | NOT-TIMER | stalled-command fixture; the tested path is the deadline | - |
+| 7255 | shutdown script `dd ...; sleep 60` | DEFECT (was NOT-TIMER) | fixture sleep models a stalled command (the tested path is the deadline) | `dd ...; cat` on a FIFO the test never writes and closes at teardown; the stall is still unbounded from the Hub's view |
 | 7278 | test name `hub_child_wait_timeout_...` | NOT-TIMER | identifier only | - |
 | 7710, 7762 | boundary `matched`/`foreign` `.recv_timeout(2s)` | deadline | channel event with bounded give-up; 7765 `try_recv` negative is proven by the foreign event | - |
 | 7943 | `wait_for_fake_pid_within` file poll + sleep 10ms | DEFECT | polls a pid file | fixture writes pid to a pipe/FIFO; read with deadline |
 | 7979 | `assert_process_exits` kill -0 poll + sleep 25ms | DEFECT | polls non-child pid exit | NOTE_EXIT / pidfd with deadline |
-| 7989 | `assert_process_group_exits` killpg(0) poll | DEFECT | polls group emptiness (partial os-no-event) | enumerate members -> per-pid NOTE_EXIT / pidfd |
+| 7989 | `assert_process_group_exits` killpg(0) poll | DEFECT | polls group emptiness | M2 (`src/process_exit.rs`), caller's deadline |
 
 ### crates/botster-hub-client/src/lib.rs
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
 | 1004 | `poll_frame` set_read_timeout(timeout) | deadline | primitive: one frame read bounded by the caller's timeout (callers are classified at their own sites) | - |
-| 1017, 1246 | restore previous read timeout | NOT-TIMER | restoring state | - |
-| 1100, 1102, 1268, 1269 | `set_read_timeout` definitions/forwarders | NOT-TIMER | API definition | - |
+| 1017, 1246 | restore previous read timeout | deadline (was NOT-TIMER) | part of the `poll_frame` / `poll_terminal` deadline primitive: restores the caller's bound; marker goes with the primitive | - |
+| 1100, 1268 | `pub fn set_read_timeout` signatures | NOT-TIMER | function definition (identifier, not a call) | - |
+| 1102, 1269 | forwarding `set_read_timeout(timeout)` calls | deadline (was NOT-TIMER) | the primitive forwarder that applies the caller's bound; callers are classified at their own sites | - |
 | 1210 | `poll_terminal` read timeout = remaining absolute deadline | deadline | blocks on frames; skipped events do not restart the deadline | - |
 | 1479, 1484 | handshake write/read deadlines | deadline | bounds the Hello/HelloAck exchange | - |
-| 1488, 1489 | restore handshake timeouts | NOT-TIMER | restoring state | - |
-| 1508, 1511, 1534, 1537 | test sets 80/90 ms timeouts to check restoration | NOT-TIMER | values under test, no wait | - |
+| 1488, 1489 | restore handshake timeouts | deadline (was NOT-TIMER) | part of the `with_handshake_deadlines` primitive (1479/1484) | - |
+| 1508, 1511, 1534, 1537 | test sets 80/90 ms timeouts to check restoration | NOT-TIMER | sentinel configuration values that `read_timeout()`/`write_timeout()` read back. No I/O blocks under them: the handshake op runs under its own 20-40 ms bounds, and the 80/90 ms values are only compared. A configuration, not a wait | - |
 | 5114 | test writer thread: event every 5 ms for 600 ms | rate-limit | deliberate pacing of a continuous event stream (the loop is also bounded at 600 ms) | - |
 | 5116 | writer `sleep(250ms)` to stay alive for `!is_finished()` | DEFECT | timing keeps the thread alive for an assertion | writer loops until a stop channel; test asserts, then signals stop |
 | 8248 | socketpair `set_read_timeout(30ms)` | deadline | expiry on a partial frame is the tested path | - |
@@ -1572,7 +1759,7 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
 | 168 | `wait_for_convergence` status poll + sleep(0.02) | DEFECT | polls counters until disconnect cleanup converges | Hub cleanup-complete event / barrier request (F) |
-| 232 | `sleep(0.25)` idle window, then wake-counter delta | DEFECT | fixed window before a negative (no-wake) assertion; judgment: idle-rate measurement (I) | positive barrier event, or owner rules a measurement window allowed |
+| 232 | `sleep(0.25)` idle window, then wake-counter delta | measurement-window (was DEFECT) | resource probe: the idle wake rate over this interval is the metric (ruling 3). The value is unchanged | marker `timer: measurement-window — idle Hub wake-counter rate` |
 
 ### script/prove-north-star-shared-session
 
@@ -1583,17 +1770,17 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 | 200 | `wait_for_history` read_screen poll | DEFECT | polls the screen | attach route output frames |
 | 219 | `wait_for_package_app_url` list_apps poll | DEFECT | polls app launch_target | app/package entity subscription (verify it exists) |
 | 239 | `wait_for_http_ok` /health poll | DEFECT | polls HTTP readiness | local_url publication should imply listening; else an entrypoint readiness event |
-| 324 | `run_*` readline loop: after EOF `poll()` + sleep 0.05 | DEFECT | polls child exit after stdout EOF; blocking readline also defeats the deadline | selectors on stdout with deadline; after EOF `process.wait(timeout=remaining)` |
+| 324 | `run_*` readline loop: after EOF `poll()` + sleep 0.05 | DEFECT | polls child exit after stdout EOF; blocking readline also defeats the deadline | selectors on stdout with deadline; after EOF, a blocking `process.wait()` on a thread feeding a `queue.Queue`, `get(timeout=remaining)` (not `wait(timeout=)`, which polls) |
 | 440 | `wait_for_line` EOF branch sleep 0.05 | DEFECT | same pattern | same |
-| 472 | `wait_exit` EOF branch sleep 0.05 | DEFECT | same pattern | `process.wait(timeout=remaining)` |
+| 472 | `wait_exit` EOF branch sleep 0.05 | DEFECT | same pattern | blocking `process.wait()` on a thread + queue, `get(timeout=remaining)` |
 | 594 | `wait_for_empty_occupancy` status poll | DEFECT | polls live_attach_occupancy | occupancy change carried on a session entity / detach event |
-| 724 | `hub.poll()` loop + sleep 0.1 after shutdown | DEFECT | polls direct child exit | `hub.wait(timeout=8)` |
+| 724 | `hub.poll()` loop + sleep 0.1 after shutdown | DEFECT | polls direct child exit | blocking `hub.wait()` on a thread + queue, `get(timeout=8)` (8 s unchanged; not `hub.wait(timeout=8)`, which polls) |
 
 ### script/run-loaded-daemon-lifecycle
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 411 | `capture_settled_zombie_survivors` settle loop | DEFECT | settle window stands in for the owner's cleanup receipt; residual third-party reap is os-no-event (L) | zero-settle census after the owner's reap receipt |
+| 411 | `capture_settled_zombie_survivors` settle loop | DEFECT | settle window stands in for the owner's cleanup receipt; no os-no-event residue (L: third-party reap is reported by pidfd EPOLLHUP on Linux) | zero-settle census after the owner's reap receipt; for a third-party reap, a pidfd POLLHUP wait bounded by ZOMBIE_SETTLE_SECONDS (unchanged) |
 | 664 | TERM grace `group_is_alive` + sleep 1 | DEFECT | polls group emptiness | per-member NOTE_EXIT / pidfd with grace deadline |
 | 670 | `sleep 1` after KILL | DEFECT | fixed settle | `wait $pid` + per-member exit events |
 | 775 | `record_group` pgid poll | DEFECT | polls until the launched process setpgid's itself | launcher signals on a pipe/FIFO after setpgid, before exec |
@@ -1606,11 +1793,11 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 75, 292 | python `time.sleep(300)` parent | NOT-TIMER | keeps the zombie unreaped (fixture lifetime) | - |
+| 75, 292 | python `time.sleep(300)` parent | DEFECT (was NOT-TIMER) | fixture sleep keeps the zombie's parent alive (and the zombie unreaped) | `sys.stdin.read()` or a read on a FIFO the test closes; the test's `kill -TERM` still ends it |
 | 81, 298 | pid-file poll + sleep 0.05 | DEFECT | polls file publication | FIFO/pipe handshake (G) |
-| 308, 355, 378 | poll census until zombie row appears | DEFECT | waits for the child to become a zombie | parent `waitid(WEXITED|WNOWAIT)` (or pipe EOF) before publishing the pid (H) |
-| 332, 410 | poll `kill -0` until zombie reaped after parent exit | os-no-event | reap by init has no event for a non-parent (Linux pidfd signals exit, not reap) | alternative: subreaper + waitpid (changes the tested claim) |
-| 428, 460, 469 | `setsid sleep 300` fixtures | NOT-TIMER | long-lived process fixtures | - |
+| 308, 355, 378 | poll census until zombie row appears | DEFECT | waits for the child to become a zombie | parent blocks in `waitid(P_PID, child, WEXITED\|WNOWAIT)` before publishing the pid (H); pipe EOF does not prove zombie state |
+| 332, 410 | poll `kill -0` until zombie reaped after parent exit | DEFECT (was os-no-event) | Linux-only (inside `runner_platform == Linux` blocks). A pidfd reports the reap with EPOLLHUP (pidfd_open(2)), so an event exists | open a pidfd on each zombie pid before signalling its parent (Python `os.pidfd_open` + `select.poll`), wait for POLLHUP with the existing 5 s budget (100 × 0.05 s) as `timer: deadline`; the tested claim (reap by init) is unchanged |
+| 428, 460, 469 | `setsid sleep 300` fixtures | DEFECT (was NOT-TIMER) | fixture sleeps keep escaped setsid processes alive | `setsid cat` on a FIFO the test closes (stdin of a setsid'd background process is not usable) |
 | 441 | poll run-token rows for escaped setsid child | DEFECT | polls visibility after fork/setsid | child signals on a FIFO after setsid |
 | 487 | poll until 85 workers + nested pgid visible | DEFECT | polls fixture readiness | inner bash writes a ready line to a FIFO after spawning, then one census |
 
@@ -1618,12 +1805,12 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 87 | `assert_no_new_zombies` settle loop | DEFECT | settle for zombie reaping; residue os-no-event (L) | owner cleanup receipt, then zero-settle census |
+| 87 | `assert_no_new_zombies` settle loop | DEFECT | settle for zombie reaping; no os-no-event residue (L) | owner cleanup receipt, then zero-settle census; a third-party reap uses a pidfd POLLHUP wait (Linux) bounded by `settle_seconds` (unchanged) |
 | 157 | `assert_no_dev_artifacts` settle loop | DEFECT | polls for live processes to exit | NOTE_EXIT / pidfd on captured pids, or owner cleanup receipt |
 | 170 | `assert_no_live_executables` settle loop | DEFECT | same | same |
 | 196 | self-test poll until marker visible | DEFECT | polls exec visibility | marker writes a ready line to a FIFO, then one census |
-| 213, 256 | ruby `sleep(30)` parent | NOT-TIMER | zombie-holder fixture lifetime | - |
-| 229, 272 | poll until child is a zombie | DEFECT | waits for child exit state | child holds a pipe write end; parent reads EOF, then publishes (H) |
+| 213, 256 | ruby `sleep(30)` parent | DEFECT (was NOT-TIMER) | fixture sleep keeps the zombie holder alive | `$stdin.read` or a read on a FIFO the test closes |
+| 229, 272 | poll until child is a zombie | DEFECT | waits for child exit state | parent blocks in `waitid(P_PID, child, WEXITED\|WNOWAIT)` (Ruby: via Fiddle/`syscall`, or a tiny C/Python helper), then publishes (H); pipe EOF does not prove zombie state |
 | 318 | poll until dev-artifact workers visible | DEFECT | polls exec visibility | ready-line handshake |
 
 ### script/run-lifecycle-suite
@@ -1638,7 +1825,7 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 |---|---|---|---|---|
 | 282 | poll for runtime metadata file | DEFECT | polls file publication | readiness pipe / stdout line from `up` (C) |
 | 474 | `wait_for_status` poll | DEFECT | readiness by status polling | readiness pipe (C) |
-| 590 | `sleep 5` idle window before probe | DEFECT | fixed delay before assertion (idle measurement; I) | positive barrier or owner ruling |
+| 590 | `sleep 5` idle window before probe | measurement-window (was DEFECT) | the idle interval is the measured quantity (ruling 3). The value is unchanged | marker `timer: measurement-window — idle Hub CPU/wake rate before the probe` |
 | 717 | `assert_failed_up_cleanup` socket/pid poll | DEFECT | polls non-child exit and socket removal | failed `up` exit (already waited) should be the cleanup receipt; else NOTE_EXIT on the pid |
 | 747 | poll TCP connect to the fixture server | DEFECT | polls bind readiness | ruby server prints a ready line after bind; read with deadline |
 | 896 | pre-cutover `status` poll | DEFECT | readiness polling (old binary; may need a ready line from the old Hub) | readiness pipe |
@@ -1647,21 +1834,22 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 144 | `sleep 5` x12 visibility poll | os-no-event | external registry; no push notification to the publisher | - |
+| 144 | `sleep 5` x12 visibility poll | DEFECT (was os-no-event) | registry visibility is not an OS fact, so os-no-event cannot apply; this is a poll for external state | **needs orchestrator decision.** Proposed: remove the post-publish visibility poll; `npm publish` success is the receipt; one `npm view` check that fails with a clear error, no retry loop |
 
 ### script/measure-processes.c, script/test-measure-processes/stable-unit.c
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| measure 460 | `kevent(..., &zero)` drain | NOT-TIMER | non-blocking drain of already-queued events | - |
-| measure 502 | `kevent` EV_RECEIPT registration, zero timeout | NOT-TIMER | registration, no wait | - |
+| measure 460 | `kevent(..., &zero)` drain | NOT-TIMER (re-examined) | this is the kqueue event API itself, with a zero timeout: a non-blocking drain of already-queued events. It is not a timer and not a wait | - |
+| measure 502 | `kevent` EV_RECEIPT registration, zero timeout | NOT-TIMER (re-examined) | event-source registration, no wait | - |
 | stable-unit 1, 12 | `#define kevent` test shim | NOT-TIMER | shim definition | - |
 
 ### script/test-harness-control.py
 
 | line | site | category | reason | replacement |
 |---|---|---|---|---|
-| 34, 41 | FAKE adapter `time.sleep(60)` | NOT-TIMER | hung-adapter fixture for the deadline path | - |
+| 34, 41 | FAKE adapter `time.sleep(60)` | DEFECT (was NOT-TIMER) | fixture sleep models a hung adapter for the deadline path | `sys.stdin.read()` (or a FIFO the test closes); still hung from the caller's view |
+| 77-79 (extra, not in grep) | `subprocess.run(..., timeout=8)` | DEFECT | `run(timeout=)` waits through `communicate(timeout)`/`wait(timeout)`, which poll (WNOHANG + sleep) | `Popen` + blocking `communicate()` on a thread feeding a `queue.Queue`; `get(timeout=8)` (value unchanged); on expiry kill and fail |
 
 ### tests/core_ticket_allocations/main.rs
 
@@ -1704,7 +1892,7 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 | 2975 | `drain_until` ReadScreen poll | DEFECT | polls the screen | Core/owner wake |
 | 3022 | `read_screen_until` poll | DEFECT | same | same |
 | 3043 | `observe_for(duration)` pump + sleep (caller 3407: 200 ms before shutdown) | DEFECT | settle window | positive event (output observed / cursor caught up), then proceed |
-| 3578, 3670 | session `...; sleep 5` | NOT-TIMER | session lifetime fixture | - |
+| 3578, 3670 | session `...; sleep 5` | DEFECT (was NOT-TIMER) | fixture sleep sets the session lifetime | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
 | 3611 | ReadScreen poll for `screen-ready` | DEFECT | polls the screen | Core/owner wake |
 | 3745 | ReadModeFlags poll for mouse_mode 9 | DEFECT | polls mode flags | Core/owner wake (output processed), then one read |
 
@@ -1744,5 +1932,106 @@ packages/** has no timer sites. The only matches are the protocol type fields `a
 | tests/hub_lua_runtime_test.rs:4129-4381 | `try_recv().is_err()` after `test_fulfill_pending_publishes` | NOT-TIMER | deterministic synchronous stepping | - |
 | tests/hub_lua_runtime_test.rs:2471 | Lua `while true do timer_once(1) end` | NOT-TIMER | runaway-budget fixture | - |
 | tests/hub_capability_runtime_test.rs:748-1115 | plugin Timer capability requests, `drain_capability_events_at(now_ms)` | NOT-TIMER | product timer feature under test on a logical clock | - |
-| fixture lifetimes: test-support lib.rs 6947, 6982, 7257, 7417, 7431, 7459, 7533, 7543, 7559, 7595, 7621, 7642, 7662, 7688, 7743; hub_client_api_test.rs 755, 3667; update_command_test.rs 435, 509; process-census 191, 294-297; run-lifecycle-suite 158 | `sleep 30/60/120` or `sleep 5` commands | NOT-TIMER | long-lived process/session fixtures | - |
-| script/process-census:211, 254 | zombie child `exec sleep 0.01` | NOT-TIMER | child exits almost at once to become a zombie; could be `sleep 0` | - |
+| fixture lifetimes: test-support lib.rs 6947, 6982, 7257, 7417, 7431, 7459, 7533, 7543, 7559, 7595, 7621, 7642, 7662, 7688, 7743; hub_client_api_test.rs 755, 3667; update_command_test.rs 435, 509; process-census 191, 294-297; run-lifecycle-suite 158 (22 sites) | `sleep 30/60/120` or `sleep 5` commands | DEFECT (extra, not in grep; was NOT-TIMER) | fixture sleeps set process/session lifetimes | blocking read the test ends: `cat` on stdin or a FIFO the test closes |
+| script/process-census:211, 254 | zombie child `exec sleep 0.01` | DEFECT (extra, not in grep; was NOT-TIMER) | fixture delay: the child sleeps briefly, then exits to become a zombie | `exec cat` on a FIFO the test closes: the zombie transition then happens when the test says, and the parent observes it with blocking `waitid(WEXITED\|WNOWAIT)` (229/272) |
+
+The remaining extras marked NOT-TIMER above were re-examined in revision 2, and they stay NOT-TIMER because none of them waits on a timer call:
+- run-loaded-daemon-lifecycle:865 is a CPU-load generator with no timer.
+- test-production-package-runtime:780 is a bind retry with no timer and no state wait.
+- hub_lua_runtime_test.rs 33-39 etc. and 4129-4381 are same-thread owner stepping.
+- hub_lua_runtime_test.rs:2471 and hub_capability_runtime_test.rs:748-1115 exercise the product Timer capability on a logical clock or budget. They are the feature under test, not waits.
+
+### Python library timeouts (revision 2; extra, not in grep)
+
+Ruling 6 applies to all of these. `Popen.wait(timeout)`, `subprocess.run(timeout=)` and `communicate(timeout=)` poll internally (WNOHANG plus sleep), so they are DEFECT even though they read like deadlines.
+
+The common replacement: call `Popen` and run a blocking `wait()` or `communicate()` on a thread that puts the result on a `queue.Queue`. The caller does `get(timeout=<same value>)`, marked `timer: deadline`. On expiry the caller kills the child and fails. Pidfd or kqueue is an alternative where one is already in use. Values are unchanged. test-harness-control.py:77-79 is listed in its own table above.
+
+| file:line | site | category | reason | replacement |
+|---|---|---|---|---|
+| script/core-ticket-allocation-oracle:73 | `wait_bounded`: `process.wait(timeout=seconds)` then killpg | DEFECT | `wait(timeout)` polls | wait thread + queue, `get(timeout=seconds)`; killpg on expiry |
+| script/prove-north-star-shared-session:144-149 | `subprocess.run(adapter request, timeout=30)` | DEFECT | `run(timeout=)` polls | Popen + `communicate()` thread + queue, `get(timeout=30)` |
+| script/prove-north-star-shared-session:301, 481, 728 | `process.wait(timeout=5)` after SIGTERM, then kill | DEFECT | `wait(timeout)` polls | wait thread + queue, `get(timeout=5)`, then SIGKILL |
+| script/test-build-dev-artifacts.py:89-91 | `subprocess.run(..., timeout=15)` | DEFECT | `run(timeout=)` polls | Popen + `communicate()` thread + queue, `get(timeout=15)` |
+| script/test-measure-processes/run.py:46-47, 50, 62, 67, 73, 89-91 | `subprocess.run(..., timeout=10/30)` (compile, unit, native, stable-unit, invalid-args, sampler) | DEFECT | `run(timeout=)` polls | one shared helper: Popen + `communicate()` thread + queue, `get(timeout=<same>)` |
+| script/test-measure-processes/run.py:83 | fixture string: `child.wait(timeout=10)` | DEFECT | `wait(timeout)` polls, inside the fixture | plain blocking `child.wait()`: the child exits when its stdin closes, and the test's own deadline bounds the fixture |
+| script/test-measure-processes/run.py:124 | `owned.wait(timeout=15)` in `finally` | DEFECT | `wait(timeout)` polls | wait thread + queue, `get(timeout=15)` |
+| script/test-measure-processes/stable_checks.py:55, 112, 115 | `sampler.wait(timeout=10)`, `owned.wait(timeout=10)` | DEFECT | `wait(timeout)` polls | wait thread + queue, `get(timeout=10)` |
+
+These are not in scope for ruling 6: `script/probe-hub-resources:27,36` (Ruby `Timeout.timeout`, a watchdog thread around one blocking read; it stays a deadline), `stable_checks.py:18` (`select.select(remaining)`, a kernel wait; deadline), and prove-north-star `urlopen(timeout=2)` (a socket timeout inside the 239 poll row, which is already DEFECT).
+
+---
+
+# Sites added between 23b0feaa and 20b201bd
+
+Scope: `git diff 23b0feaa..20b201bd` (origin/main 20b201bd, which contains a69b70cc).
+- Grep patterns: `sleep(`, shell `sleep N`, `recv_timeout|wait_timeout|park_timeout`, `set_read_timeout|set_write_timeout`, `setTimeout|setInterval|waitForTimeout`, `time::timeout|timeout_at|interval(`, `yield_now|spin_loop`, plus bare `timeout(`.
+- Every added or changed line that matched is listed, plus the poll-shaped extras found by reading the new tests.
+- a69b70cc..20b201bd (0a1842a2, ff8b22bb, 20b201bd) added no timer lines. So the new sites all come from 004391dc..a69b70cc, and their line numbers are the same at a69b70cc and at 20b201bd.
+- **Line numbers in this section are at 20b201bd. Every other line number in this document is at 23b0feaa.**
+
+## New sites
+
+| file:line (20b201bd) | site | category | reason | replacement |
+|---|---|---|---|---|
+| src/transport/webrtc/peer.rs:4337 | `mod tests`, duplicate-channel overlap test (a69b70cc): `try_receive_owner_message` Empty => `thread::sleep(5ms)` until both `BindReservedSubscription` messages are held | DEFECT | 5 ms receive poll of the owner control channel (C mechanism 1) | blocking `control_rx.recv()` under the existing 10 s deadline; hold `BindReservedSubscription` messages, handle the others |
+| src/transport/webrtc/peer.rs:4357-4360 (extra, not in grep) | `let settle = now + 1s; pump_until(settle + 1s, "the settle window", \|_\| Instant::now() >= settle)` | DEFECT | a one-second settle window ("let every Core completion of both binds apply") before asserting that exactly one channel was acknowledged, which is a negative claim about the other channel | wait for the positive events: both binds' Core completions applied (no bind pending in `pending_runtime` for the subscription) and the losing channel's host finished or rejected; then assert once. With mechanism 1 this is a blocking control recv, not `pump_until` |
+| src/transport/webrtc/test_support.rs:518 | `drain_host_events(key, quiet)`: collect host events until none arrives for `quiet` | DEFECT | quiet window stands in for "no more events". Callers: peer.rs 4004, 4021, 4029, 4050, 4089, each with 500 ms, asserting "exactly one signal at expiry" | positive barrier: trigger a later observable host event on the same peer (or a request whose response is ordered after the events), read up to it, and count the events before it |
+| src/transport/webrtc/test_support.rs:1246 (caller of 518) | sync `drain_host_events` wrapper that `block_on`s the quiet window | DEFECT | same | same |
+| src/transport/webrtc/test_support.rs:681 | `timeout(10s, open_rx.recv())` in `open_reserved_expecting_close` | deadline | channel open is the event; expiry panics | - |
+| src/transport/webrtc/test_support.rs:692 | `timeout(10s, message_rx.recv())` | deadline | HelloAck or close is the event; expiry panics | - |
+| src/transport/webrtc/test_support.rs:1266 | `try_receive_owner_message` Empty => `sleep(5ms)` while waiting for the offer response | DEFECT | owner control-channel poll (mechanism 1) | blocking `control_rx.recv()` under a deadline, selected with `response_rx` |
+| src/transport/webrtc/test_support.rs:1545 | `open_reserved_expecting_reject`: Empty => `sleep(5ms)` | DEFECT | owner control-channel poll (mechanism 1) | blocking recv under the existing deadline |
+| src/transport/webrtc/test_support.rs:1913 | `pump_until(deadline, what, done)` helper: Empty => `sleep(5ms)` | DEFECT | new generic poll helper (mechanism 1). Callers: peer.rs 4171, 4236, 4245, 4351, 4358 | rebuild as a blocking `control_rx.recv()` under the deadline, re-checking `done` after each handled message |
+| tests/hub_daemon_lifecycle/paste_transaction.rs:76 | `paste_sink_command_after_go`: `...; printf '{done}'; sleep 30` | DEFECT | fixture sleep (same as 23b0feaa:66) | blocking read the test ends: `cat` on a FIFO the test closes (stdin is the sink) |
+| tests/hub_daemon_lifecycle/webrtc_proofs.rs:1698 | `sleep(Duration::from_secs(2)).await` then `assert!(held_open >= 2s)` in `local_webrtc_attach_to_a_flooding_session_binds_after_a_slow_channel_open` | DEFECT | a fixed 2 s stands in for "the session flooded output while the channel was slow to open" | wait for a positive event: an observer route on a Unix connection has received N flood lines, or a Hub output/backpressure counter crossed the tested bound. If the claim is about the reservation surviving elapsed time, inject the reservation clock (as peer.rs 1683) |
+| tests/hub_daemon_lifecycle/webrtc_proofs.rs:1735 | `timeout(200ms, next_terminal_frame)` inside a 20 s deadline loop | DEFECT (slice) | the slice only re-checks the deadline | `timeout(deadline - now, next_terminal_frame)` |
+
+## Moved and removed sites
+
+- **subscription_ownership_baseline.rs:168 → 170.** The line was rewritten to `IFS= read -r go; printf 'so-4cls-ready\n'; sleep 30`, and it is still a fixture sleep. The row at 168 above covers it (DEFECT).
+- **Removed: tests/hub_lua_runtime_test.rs:1937** (marker-file poll, group D). 004391dc moved that coverage to `tests/hub_daemon_lifecycle/packages.rs:5035` (20b201bd), which uses `wait_for_managed_git_session_exit`. That helper is common.rs:847, already DEFECT (D1). The removal also deletes the 1937 row's replacement work.
+
+## Line numbers moved in files changed since 23b0feaa (23b0feaa → 20b201bd)
+
+These are only the grep-hit lines of the files the diff touched. Files not listed have unchanged line numbers.
+
+- crates/botster-hub-client/src/lib.rs: 1004→1002, 1017→1015, 1100→1098, 1102→1100, 1210→1208, 1246→1244, 1268→1266, 1269→1267, 1479→1477, 1484→1482, 1488→1486, 1489→1487, 1508→1506, 1511→1509, 1534→1532, 1537→1535, 8248→8267
+- src/daemon.rs: 861→866
+- src/daemon/control/sessions.rs: 2086→2098, 2524→2536, 2527→2539, 2544→2556, 2659→2671, 2668→2680, 2810→2822, 2827→2839, 3059→3071, 3062→3074, 3316→3328, 3350→3362, 3607→3624, 3697→3714, 3825→3842, 3862→3879, 4146→4163, 4148→4165, 4240→4257, 4471→4488, 4524→4541, 4537→4554, 4651→4668, 4671→4688, 4691→4708, 4794→4811, 4810→4827, 4857→4874, 4874→4891, 4914→4931, 4934→4951, 4983→5000, 5044→5061, 5088→5105, 5118→5135, 5167→5184, 5200→5217, 5228→5245, 5238→5255, 5256→5273, 5357→5374, 5381→5398
+- src/daemon/owner_loop.rs: every line from 1466 onward is +1 (1466→1467 … 10483→10484); 659 is unchanged
+- src/local_webrtc_smoke.rs: 147→146, 208→207, 302→301, 335→334, 342→341, 397→396, 416→415, 452→453, 497→498
+- src/lua_runtime.rs: 3867→3870, 3967→3970, 4021→4024
+- src/main.rs: 4075→4074, 4084→4083
+- src/runtime.rs: 394→437, 1618→1689, 5368→5426, 5452→5512, 6176→6251, 7374→7466, 7391→7483, 7406→7498, 7418→7510, 8328→8420
+- src/transport/webrtc/control_channel.rs: every line from 492 onward is +1 (492→493 … 2147→2148)
+- src/transport/webrtc/subscription_channel.rs: 848→931, 1134→1217, 1148→1231, 1298→1382, 1300→1384, 1340→1424, 1416→1500, 1420→1504, 1431→1515, 1433→1517, 1456→1540, 1527→1615, 1531→1619, 1541→1629, 1697→1785, 1719→1807, 1817→1905, 1900→1988, 2202→2295, 2344→2437, 2539→2632, 2590→2683
+- src/transport/webrtc/test_support.rs: 591→608, 645→729, 673→757, 761→845, 904→988, 1051→1135, 1135→1219, 1185→1316, 1291→1422, 1343→1484, 1393→1596, 1437→1640, 1494→1697, 1529→1732, 1637→1855, 1947→2218, 2032→2303
+- tests/hub_daemon_lifecycle/package_fixtures.rs: 636→754, 675→793, 714→832, 771→889, 1261→1379, 1282→1400, 1304→1422, 1326→1444, 1408→1526
+- tests/hub_daemon_lifecycle/packages.rs: 6715→7081, 6740→7106, 6759→7125, 7074→7440, 7166→7532, 7318→7684, 7324→7690, 7352→7718, 7361→7727, 7494→7860, 7517→7883, 7648→8014, 7705→8071
+- tests/hub_daemon_lifecycle/paste_transaction.rs: 116→126, 130→140, 224→234, 362→375, 407→420
+- tests/hub_daemon_lifecycle/shutdown.rs: 2110→2111, 2243→2244, 2264→2265, 2437→2438, 2512→2513, 2534→2535, 2564→2565, 2646→2647, 3226→3227, 3291→3292, 3304→3305
+- tests/hub_daemon_lifecycle/subscription_ownership_baseline.rs: 168→170 (rewritten), 218→223, 232→237, 692→697, 804→809, 957→962, 961→966
+- tests/hub_daemon_lifecycle/webrtc_fixtures.rs: 1420→1416, 1444→1440, 1553→1554, 1582→1583, 1981→1982, 2145→2146, 2236→2237, 2371→2372, 2617→2618
+- tests/hub_daemon_lifecycle/webrtc_proofs.rs: 941→944, 986→989, 997→1000, 1519→1522, 1572→1575, 1877→2046
+- tests/hub_daemon_lifecycle/webrtc_terminal_adapter.rs: every line from 201 onward is −1 (201→200 … 1701→1700)
+
+## Counts for this section
+
+- New grep lines: 10. 8 are DEFECT (peer 4337, test_support 518, 1266, 1545 and 1913, paste 76, webrtc_proofs 1698 and 1735) and 2 are deadline (test_support 681 and 692).
+- Extras: 2 DEFECT (peer 4357-4360 and test_support 1246).
+- Moved: 1 (subscription_ownership_baseline 168→170). Removed: 1 (hub_lua_runtime_test 1937).
+- At 20b201bd the grep therefore has 875 + 10 − 1 = 884 lines. The totals table at the top stays at 23b0feaa.
+
+---
+
+# Follow-ups (not applied)
+
+These are value and structure suggestions recorded under ruling 2. None of them is part of this rewrite, and all values stay as they are.
+
+1. **allocation_oracle.rs:534.** The 1 s `recv_timeout` exists only so the oracle can measure the expiry path. `Duration::ZERO` (or a few ms) would remove 1 s of dead time per oracle run with the same allocation evidence. The value is unchanged in this rewrite.
+2. **event_plane_saturation.rs:4729.** The 50 ms read budget per frame looks tight under host load (flake risk). The value is unchanged.
+3. **package_events.rs:1297.** The 100 ms "must not wait for contended pool" bound is tight under load. The value is unchanged.
+4. **owner_loop.rs:8149/8154.** This test asserts a 500 ms latency bound with `elapsed()`. The reviewer should decide whether a latency assertion belongs in a correctness test. The value is unchanged.
+5. **DATA_PLANE_STOP_BOUND (driver.rs 1449).** When the 1 s watchdog goes, the bound keeps its value as a literal. Whether 2 s + slack is still the right stop bound without a watchdog is a later question.
+6. **plugin_bounds.rs:231.** When the idle-CPU measurement moves to probe-hub-resources, it keeps its 5 s window. Whether a shorter window gives the same signal is a later question.
