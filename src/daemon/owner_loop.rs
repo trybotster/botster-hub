@@ -644,16 +644,69 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
             mark_background_ready(state, BackgroundWork::OrdinarySpawn);
         }
     }
+    publish_plugin_result_wakes(state);
+    if state.deadlines.has_due(Instant::now()) {
+        mark_background_ready(state, BackgroundWork::Deadline);
+    }
+}
+
+/// Takes Core's completion notification and the result-capacity release.
+/// Either one marks the completion drain and resumes parked admissions: Core
+/// also fires the completion notifier when it releases admission state that a
+/// lock-busy refusal waited on, with no completion to drain.
+fn publish_plugin_result_wakes(state: &mut DaemonControlState) {
     let completed = state.plugin_result_budget.take_completion_notification();
     let released = state.plugin_result_budget.take_release_notification();
     if completed || released {
+        crate::daemon_maintenance::resume_parked_admissions(&mut state.maintenance);
         mark_background_ready(
             state,
             BackgroundWork::Maintenance(MaintenanceSliceKind::CompletionDrain),
         );
     }
-    if state.deadlines.has_due(Instant::now()) {
-        mark_background_ready(state, BackgroundWork::Deadline);
+}
+
+#[cfg(test)]
+mod plugin_result_wake_tests {
+    use super::*;
+
+    #[test]
+    fn a_completion_notification_resumes_parked_admissions() {
+        let mut state = DaemonControlState::default();
+        state.maintenance.event_admission_parked = true;
+        state.maintenance.capability_admission_parked = true;
+        state
+            .maintenance
+            .wakes
+            .take(MaintenanceSliceKind::PackageEventDelivery);
+        state
+            .maintenance
+            .wakes
+            .take(MaintenanceSliceKind::CapabilityDelivery);
+
+        publish_plugin_result_wakes(&mut state);
+        assert!(
+            state.maintenance.event_admission_parked,
+            "no notification yet"
+        );
+
+        // Core's notifier: a completion, or a lock-busy retry wake.
+        (state.plugin_result_budget.completion_notifier())();
+        publish_plugin_result_wakes(&mut state);
+        assert!(!state.maintenance.event_admission_parked);
+        assert!(!state.maintenance.capability_admission_parked);
+        assert!(
+            state
+                .maintenance
+                .wakes
+                .take(MaintenanceSliceKind::PackageEventDelivery)
+        );
+        assert!(
+            state
+                .maintenance
+                .wakes
+                .take(MaintenanceSliceKind::CapabilityDelivery)
+        );
     }
 }
 
