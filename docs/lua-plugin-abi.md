@@ -206,6 +206,29 @@ applicable. They do not include raw absolute worktree paths by default.
 `worktree_deleted` is the canonical successful delete event; the hub deletes the
 record and does not delete filesystem contents.
 
+## Runtime Basics
+
+Every plugin receives these helpers with no grant. They run inside the plugin
+VM, never wait, and return the platform result shape: `{ ok = true, value =
+... }` or `{ ok = false, error = { kind, message, retryable } }` (the kinds
+are listed in docs/plans/plugin-platform.md section 6). They never raise for
+bad input.
+
+- `botster.json.encode({ value = <any>, arrays = nil | "empty" })` returns
+  the JSON text. Empty tables encode as `{}` unless `arrays = "empty"`, which
+  encodes them as `[]`. Functions, userdata, cycles, and invalid UTF-8 return
+  `invalid_request`. The encoder measures the value and charges the callback
+  account before it allocates; work beyond the account returns
+  `quota_exceeded`.
+- `botster.json.decode({ text = <string> })` returns the decoded value. JSON
+  arrays decode to tables that encode back as arrays. Malformed text returns
+  `invalid_request`. The decoder builds Lua values directly (under the VM
+  memory limit) and charges the input length for its parser scratch.
+- `botster.json.null` is the value that encodes as `null`.
+- `botster.clock.now()` returns Unix epoch milliseconds.
+- `botster.clock.monotonic()` returns milliseconds since the Hub process
+  started; it never goes backward.
+
 ## Capability Access
 
 Lua has no ambient `os`, `io`, or `package` globals. Filesystem, network,
