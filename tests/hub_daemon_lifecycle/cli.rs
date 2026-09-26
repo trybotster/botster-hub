@@ -64,9 +64,11 @@ pub(crate) fn start_cli_daemon(data_dir: &Path) -> PanicSafeCliDaemon {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_test_process_group(&mut command);
+    let ready = attach_ready_fd(&mut command);
     let child = command.spawn().expect("spawn botster-hub start");
+    let ready = ready.spawned();
     let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "lifecycle daemon");
-    wait_for_status(data_dir, daemon.child_mut());
+    wait_for_ready(ready, daemon.child_mut());
     daemon
 }
 
@@ -92,12 +94,14 @@ pub(crate) fn start_cli_daemon_with_env(
         command.env(key, value);
     }
     configure_test_process_group(&mut command);
+    let ready = attach_ready_fd(&mut command);
     let child = command
         .spawn()
         .expect("spawn botster-hub start with test environment");
+    let ready = ready.spawned();
     let mut daemon =
         PanicSafeCliDaemon::from_child(data_dir, child, "environment-scoped lifecycle daemon");
-    wait_for_status(data_dir, daemon.child_mut());
+    wait_for_ready(ready, daemon.child_mut());
     daemon
 }
 
@@ -117,9 +121,11 @@ pub(crate) fn start_cli_daemon_with_home(data_dir: &Path, home: &Path) -> PanicS
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_test_process_group(&mut command);
+    let ready = attach_ready_fd(&mut command);
     let child = command.spawn().expect("spawn botster-hub start");
+    let ready = ready.spawned();
     let mut daemon = PanicSafeCliDaemon::from_child(data_dir, child, "home-scoped daemon");
-    wait_for_status(data_dir, daemon.child_mut());
+    wait_for_ready(ready, daemon.child_mut());
     daemon
 }
 
@@ -327,37 +333,101 @@ pub(crate) fn stable_path_string(path: &Path) -> String {
         .to_string()
 }
 
-pub(crate) fn wait_for_status(data_dir: &Path, child: &mut Child) {
-    wait_for_status_with_budget(data_dir, child, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET)
+/// The write end of a readiness pipe that a `botster-hub start` child inherits
+/// at fd 3, and the read end the test keeps.
+pub(crate) struct ReadyPipe {
+    reader: io::PipeReader,
+    writer: Option<io::PipeWriter>,
+}
+
+const READY_FD: libc::c_int = 3;
+
+/// Adds `--ready-fd 3` to a `botster-hub start` command and places a fresh
+/// pipe's write end at fd 3 in the child.
+pub(crate) fn attach_ready_fd(command: &mut Command) -> ReadyPipe {
+    let (reader, writer) = io::pipe().expect("create readiness pipe");
+    let writer_fd = writer.as_raw_fd();
+    command.arg("--ready-fd").arg(READY_FD.to_string());
+    unsafe {
+        // SAFETY: this hook runs in the child after fork; fcntl and dup2 are
+        // async-signal-safe. The write end lands at READY_FD without close-on-exec.
+        command.pre_exec(move || {
+            let placed = if writer_fd == READY_FD {
+                libc::fcntl(READY_FD, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(writer_fd, READY_FD)
+            };
+            if placed == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    ReadyPipe {
+        reader,
+        writer: Some(writer),
+    }
+}
+
+impl ReadyPipe {
+    /// Call after spawn: only the child may hold the write end, so its exit
+    /// closes the pipe.
+    pub(crate) fn spawned(mut self) -> io::PipeReader {
+        drop(self.writer.take());
+        self.reader
+    }
+}
+
+pub(crate) fn wait_for_ready(ready: io::PipeReader, child: &mut Child) {
+    wait_for_ready_with_budget(ready, child, LOCAL_RUNTIME_DAEMON_READINESS_BUDGET)
         .unwrap_or_else(|error| panic!("{error}"));
 }
 
-pub(crate) fn wait_for_status_with_budget(
-    data_dir: &Path,
+/// Waits for the daemon's ready line. EOF without it means the daemon is
+/// exiting, and the error carries its exit status and output. Expiry
+/// terminates and reaps the child.
+pub(crate) fn wait_for_ready_with_budget(
+    ready: io::PipeReader,
     child: &mut Child,
     readiness_budget: Duration,
 ) -> Result<(), String> {
-    let mut last_status = "status probe not attempted".to_string();
-    wait_for_child_condition_with_budget(
-        child,
-        "waiting for typed daemon status readiness",
-        readiness_budget,
-        || {
-        let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-            .arg("status")
-            .arg("--data-dir")
-            .arg(data_dir)
-            .output()
-            .expect("run botster-hub status");
-        last_status = command_output_text(&output);
-            output.status.success()
-        },
-    )
-    .map_err(|error| {
-        format!(
-            "daemon did not become ready (readiness budget {readiness_budget:?}); last status output={last_status:?}; {error}"
-        )
-    })
+    let started_at = Instant::now();
+    let deadline = started_at + readiness_budget;
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let result = io::BufReader::new(ready).read_line(&mut line).map(|_| line);
+        let _ = line_tx.send(result);
+    });
+    // timer: deadline — the product readiness budget; the ready line or pipe EOF ends the normal wait.
+    let line = match line_rx.recv_timeout(readiness_budget) {
+        Ok(Ok(line)) => line,
+        Ok(Err(error)) => format!("<read error: {error}>"),
+        Err(_) => {
+            let child_status = child.terminate_and_reap();
+            let output = drain_buffered_child_output(child);
+            return Err(format!(
+                "daemon did not become ready (readiness budget {readiness_budget:?}) after {:?}; child_status={child_status}; {output}",
+                started_at.elapsed()
+            ));
+        }
+    };
+    if botster_hub::daemon::readiness::ReadyLine::parse(&line).is_some() {
+        return Ok(());
+    }
+    let child_status = match botster_hub::process_exit::wait_for_pid_exit(child.id(), deadline) {
+        Ok(true) => child
+            .wait()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|error| format!("wait_error={error}")),
+        Ok(false) => child.terminate_and_reap(),
+        Err(error) => format!("exit_watch_error={error}; {}", child.terminate_and_reap()),
+    };
+    let output = drain_buffered_child_output(child);
+    Err(format!(
+        "daemon closed its readiness pipe without a ready line (got {line:?}) after {:?}; child_status={child_status}; {output}",
+        started_at.elapsed()
+    ))
 }
 
 pub(crate) fn shutdown_cli_daemon(data_dir: &Path, daemon: PanicSafeCliDaemon) -> Output {
