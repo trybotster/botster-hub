@@ -7156,6 +7156,23 @@ fn validate_plugin_surface_action_result(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A reader keeps the view it took; a later publish replaces only the
+    /// current view.
+    #[test]
+    fn package_publication_readers_keep_their_admitted_view_across_a_publish() {
+        let publication = package_publication_for_test(Vec::new());
+        let admitted = publication.current();
+        let next = package_view_for_test(Vec::new());
+        publication.publish(next.clone());
+        let current = publication.current();
+        assert!(SharedView::ptr_eq(&current, &next));
+        assert!(!SharedView::ptr_eq(&current, &admitted));
+        assert!(
+            admitted.packages().is_empty(),
+            "the admitted view stays readable"
+        );
+    }
     use crate::{
         DataDirectoryOption, HostIdentityOptions, HubStartupOptions, RuntimeEnvironment,
         SessionDefaults, TransportBindings,
