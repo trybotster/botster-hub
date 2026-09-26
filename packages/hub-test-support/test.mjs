@@ -132,10 +132,10 @@ function assertDialogFormComposition(source) {
 }
 
 assert.equal(metadata.package_name, "@trybotster/hub-test-support");
-assert.equal(metadata.package_version, "0.1.45");
+assert.equal(metadata.package_version, "0.1.46");
 assert.equal(metadata.protocol, "botster-hub-daemon-v1");
-assert.equal(metadata.protocol_version, 9);
-assert.equal(metadata.conformance_fixture_revision, 49);
+assert.equal(metadata.protocol_version, 10);
+assert.equal(metadata.conformance_fixture_revision, 50);
 
 // Package README ships in the npm tarball; keep install pin sites tied to package.json.
 {
@@ -174,8 +174,8 @@ assert.equal(metadata.conformance_fixture_revision, 49);
     ...readme.matchAll(/"@trybotster\/hub-test-support":\s*"([^"]+)"/g),
   ].map((match) => match[1]);
   assert.deepEqual(packageSpecPins, [version]);
-  assert.match(readme, /protocol version 9/);
-  assert.match(readme, /conformance revision 49/);
+  assert.match(readme, /protocol version 10/);
+  assert.match(readme, /conformance revision 50/);
   assert.doesNotMatch(readme, /mode_gated_input|ModeGatedInput|SendInput/);
 }
 assert.deepEqual(metadata.ui_contract, {
@@ -246,7 +246,7 @@ assert.match(protocol, /read_snapshot_page/);
 assert.match(protocol, /export type HistoryUnavailableReason/);
 assert.match(protocol, /export type ClientFrame/);
 assert.match(protocol, /export type ServerFrame/);
-assert.match(protocol, /export const PROTOCOL_VERSION = 9;/);
+assert.match(protocol, /export const PROTOCOL_VERSION = 10;/);
 assert.match(protocol, /export const MAX_OUTSTANDING_REQUESTS = 32;/);
 assert.match(protocol, /export const UNIX_CONTAINER_TERMINAL = 2;/);
 assert.match(protocol, /export const LOCAL_WEBRTC_TERMINAL_CHUNK_HEADER_BYTES = 33;/);
@@ -390,7 +390,7 @@ assert.deepEqual(
 );
 assert.equal(supportMatrix.session_type_authoring.admission_group, "allow_runtime");
 
-assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 48);
+assert.equal(sessionLifecycleFixture.conformance_fixture_revision, 50);
 assert.equal(sessionLifecycleFixture.entity_type, "session");
 assert.deepEqual(
   sessionLifecycleFixture.normalized_frames.map((frame) => frame.type),
@@ -428,7 +428,7 @@ assert.equal(
 assert.equal(sessionLifecycleFixture.overflow.snapshot_precedes_later_deltas, true);
 assert.equal(sessionLifecycleFixture.overflow.failed_snapshot_delivery_closes_subscription, true);
 
-assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 48);
+assert.equal(sessionPluginBindingFixture.conformance_fixture_revision, 50);
 assert.equal(sessionPluginBindingFixture.binding_family, "/session");
 const sessionPluginMaterialization = materializeSessionPluginBindingScenario(
   sessionPluginBindingFixture,
@@ -750,7 +750,7 @@ assert.equal(
   true,
 );
 assert.equal(kindIndex(unavailableFrames, "snapshot_history"), -1);
-assert.equal(lateAttachFixture.conformance_fixture_revision, 49);
+assert.equal(lateAttachFixture.conformance_fixture_revision, 50);
 
 const verification = verifyPackageAssets();
 assert.deepEqual(verification, { ok: true, failures: [] });

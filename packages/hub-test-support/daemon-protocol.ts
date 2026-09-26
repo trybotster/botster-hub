@@ -5,10 +5,10 @@ import type { PackageNoticeReactionDescriptor, PackageSurfaceDescriptor, UiActio
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
-// Host-control protocol 9 constants. See botster-hub-client/src/lib.rs.
+// Host-control protocol 10 constants. See botster-hub-client/src/lib.rs.
 export const PROTOCOL = "botster-hub-daemon-v1";
-export const PROTOCOL_VERSION = 9;
-export const CONFORMANCE_FIXTURE_REVISION = 49;
+export const PROTOCOL_VERSION = 10;
+export const CONFORMANCE_FIXTURE_REVISION = 50;
 export const MAX_REQUEST_ID_BYTES = 20;
 export const MAX_OUTSTANDING_REQUESTS = 32;
 export const MAX_CONTROL_REQUEST_BYTES = 1048576;
@@ -106,6 +106,7 @@ export interface DaemonHelloAck {
   compatibility: DaemonCompatibility;
   terminal_compatibility?: TerminalCompatibility;
   diagnostics?: DaemonDiagnostic[];
+  terminal_generation?: number;
 }
 
 export interface TerminalCompatibility {
@@ -296,7 +297,6 @@ export interface DaemonTerminalAttach {
 export interface DaemonTerminalReservation {
   session_id: string;
   subscription_id: string;
-  generation: number;
   peer_generation: number;
   label: string;
   expires_in_seconds: number;
