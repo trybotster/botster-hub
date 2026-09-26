@@ -1,15 +1,25 @@
 #![cfg(unix)]
 
+use std::ffi::OsStr;
 use std::fs;
+use std::io::{self, BufRead, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod support;
 use botster_terminal_protocol::TerminalKind;
 use support::{candidate_hub_binary_path, candidate_session_worker_binary_path};
+
+/// Bound for a fixture daemon to report ready or to exit.
+const DAEMON_BUDGET: Duration = Duration::from_secs(30);
+/// Bound for a detached updater to finish a fixture update.
+const UPDATE_BUDGET: Duration = Duration::from_secs(600);
 
 #[test]
 fn update_requires_an_explicit_scope() {
@@ -22,33 +32,25 @@ fn update_requires_an_explicit_scope() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("usage: botster-hub update <core|all> [--data-dir <path>]")
+            .contains("usage: botster-hub update <core|all> [--source <path>] [--data-dir <path>]")
     );
 }
 
 #[test]
-#[ignore = "blocked: update tests would operate on the real checkout via CARGO_MANIFEST_DIR; seam removed in cold cut"]
 fn update_rejects_a_dirty_source_repository_through_the_production_cli() {
     let root = unique_test_dir("dirty-source");
+    let home = fixture_home(&root);
     let data_dir = root.join("data");
-    let source = root.join("source");
-    fs::create_dir_all(&source).expect("create source fixture");
-    git(&source, &["init"]);
-    git(
-        &source,
-        &["config", "user.email", "update-test@example.invalid"],
-    );
-    git(&source, &["config", "user.name", "Update Test"]);
-    fs::write(source.join("tracked"), "clean\n").expect("write tracked fixture");
-    git(&source, &["add", "tracked"]);
-    git(&source, &["commit", "-m", "fixture"]);
+    let source = create_plain_source(&root);
     fs::write(source.join("operator-change"), "preserve\n").expect("write dirty fixture");
 
     let output = Command::new(env!("CARGO_BIN_EXE_botster-hub"))
-        .args(["update", "core", "--data-dir"])
+        .args(["update", "core", "--source"])
+        .arg(&source)
+        .arg("--data-dir")
         .arg(&data_dir)
         .env("BOTSTER_ENV", "test")
-        .env("BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT", &source)
+        .env("HOME", &home)
         .output()
         .expect("run dirty update");
 
@@ -62,41 +64,27 @@ fn update_rejects_a_dirty_source_repository_through_the_production_cli() {
 }
 
 #[test]
-#[ignore = "blocked: update tests would operate on the real checkout via CARGO_MANIFEST_DIR; seam removed in cold cut"]
 fn daemon_api_starts_and_reports_a_failed_source_update() {
     let root = unique_test_dir("daemon-api-update");
+    let home = fixture_home(&root);
     let data_dir = root.join("data");
-    let source = root.join("source");
-    fs::create_dir_all(&source).unwrap();
-    git(&source, &["init"]);
-    git(
-        &source,
-        &["config", "user.email", "update-test@example.invalid"],
-    );
-    git(&source, &["config", "user.name", "Update Test"]);
-    fs::write(source.join("tracked"), "clean\n").unwrap();
-    git(&source, &["add", "tracked"]);
-    git(&source, &["commit", "-m", "fixture"]);
+    let source = create_plain_source(&root);
     fs::write(source.join("operator-change"), "preserve\n").unwrap();
 
     let hub_bin = candidate_hub_binary_path().canonicalize().unwrap();
     let worker_bin = candidate_session_worker_binary_path()
         .canonicalize()
         .unwrap();
-    let daemon_pid =
-        start_detached_daemon_with_update_source(&hub_bin, &worker_bin, &data_dir, &source, &root);
-    wait_for_status(&hub_bin, &data_dir);
-    write_runtime_metadata(&data_dir, &data_dir, &hub_bin, &worker_bin, daemon_pid);
-    let daemon_command = Command::new("ps")
-        .args(["-p", &daemon_pid.to_string(), "-o", "command="])
-        .output()
-        .unwrap();
-    assert!(daemon_command.status.success());
-    assert!(
-        String::from_utf8_lossy(&daemon_command.stdout).contains(" start "),
-        "{}",
-        String::from_utf8_lossy(&daemon_command.stdout)
+    // The local user fixes the source root at daemon start; no request names it.
+    let daemon = FixtureDaemon::start(
+        &hub_bin,
+        &worker_bin,
+        &data_dir,
+        &home,
+        &[OsStr::new("--update-source-root"), source.as_os_str()],
+        None,
     );
+    write_runtime_metadata(&data_dir, &data_dir, &hub_bin, &worker_bin, daemon.pid);
     let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
 
     let accepted = botster_hub_client::request(
@@ -117,11 +105,15 @@ fn daemon_api_starts_and_reports_a_failed_source_update() {
     );
     assert!(accepted.updater_pid > 0);
 
-    let failed = wait_for_update_execution(
-        &endpoint,
-        botster_hub_client::DaemonHubUpdateExecutionState::Failed,
-    );
+    wait_for_updater(accepted.updater_pid);
+    let failed = read_update_execution(&endpoint);
     assert_eq!(failed.update_id, accepted.update_id);
+    assert_eq!(
+        failed.state,
+        botster_hub_client::DaemonHubUpdateExecutionState::Failed
+    );
+    // A lost root fails `source_root_required` under BOTSTER_ENV=test; this
+    // failure comes from the fixture checkout.
     assert!(
         failed
             .error
@@ -140,16 +132,17 @@ fn daemon_api_starts_and_reports_a_failed_source_update() {
     let shutdown = Command::new(&hub_bin)
         .args(["down", "--data-dir"])
         .arg(&data_dir)
+        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(shutdown.status.success());
-    wait_for_process_exit(daemon_pid);
+    assert!(daemon.wait_exit().success());
 }
 
 #[test]
-#[ignore = "blocked: update tests would operate on the real checkout via CARGO_MANIFEST_DIR; seam removed in cold cut"]
 fn update_build_failure_leaves_the_running_daemon_unchanged() {
     let root = unique_test_dir("build-failure");
+    let home = fixture_home(&root);
     let data_dir = root.join("data");
     fs::create_dir_all(&data_dir).unwrap();
     let source = create_clean_update_source(&root, false);
@@ -157,45 +150,25 @@ fn update_build_failure_leaves_the_running_daemon_unchanged() {
     let worker_bin = candidate_session_worker_binary_path()
         .canonicalize()
         .unwrap();
-    let mut daemon = Command::new(&hub_bin)
-        .args(["start", "--data-dir"])
-        .arg(&data_dir)
-        .arg("--session-worker-bin")
-        .arg(&worker_bin)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start fixture daemon");
-    wait_for_status(&hub_bin, &data_dir);
+    let daemon = FixtureDaemon::start(&hub_bin, &worker_bin, &data_dir, &home, &[], None);
     let data_directory_arg = data_dir.clone();
     let data_dir = data_dir.canonicalize().unwrap();
-    let socket_path = data_dir.join("botster-hub.sock");
-    let metadata = serde_json::json!({
-        "pid": daemon.id(),
-        "data_directory": data_dir.to_string_lossy(),
-        "data_directory_arg": data_directory_arg.to_string_lossy(),
-        "socket_path": socket_path.to_string_lossy(),
-        "hub_bin": hub_bin.to_string_lossy(),
-        "session_worker_bin": worker_bin.to_string_lossy()
-    });
-    fs::write(
-        data_dir.join(".botster-hub-runtime-daemon.json"),
-        serde_json::to_vec_pretty(&metadata).unwrap(),
-    )
-    .unwrap();
-
-    let fake_bin = source.join("fake-bin");
-    let path = format!(
-        "{}:{}",
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
+    write_runtime_metadata(
+        &data_dir,
+        &data_directory_arg,
+        &hub_bin,
+        &worker_bin,
+        daemon.pid,
     );
+
     let output = Command::new(&hub_bin)
-        .args(["update", "core", "--data-dir"])
+        .args(["update", "core", "--source"])
+        .arg(&source)
+        .arg("--data-dir")
         .arg(&data_dir)
         .env("BOTSTER_ENV", "test")
-        .env("BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT", &source)
-        .env("PATH", path)
+        .env("HOME", &home)
+        .env("PATH", fake_bin_path(&source))
         .output()
         .expect("run build-failing update");
 
@@ -203,20 +176,24 @@ fn update_build_failure_leaves_the_running_daemon_unchanged() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("build Hub failed"), "{stderr}");
     assert!(
-        daemon.try_wait().unwrap().is_none(),
+        daemon.running(),
         "old daemon stopped after a pre-stop build failure"
     );
     let persisted: serde_json::Value = serde_json::from_slice(
         &fs::read(data_dir.join(".botster-hub-runtime-daemon.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(persisted["pid"].as_u64(), Some(daemon.id() as u64));
-    wait_for_status(&hub_bin, &data_dir);
+    assert_eq!(persisted["pid"].as_u64(), Some(u64::from(daemon.pid)));
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+    let status =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status).unwrap();
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
 
     fs::remove_file(data_dir.join(".botster-hub-runtime-daemon.json")).unwrap();
     let shutdown = Command::new(&hub_bin)
         .args(["shutdown", "--data-dir"])
         .arg(&data_dir)
+        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(
@@ -224,13 +201,13 @@ fn update_build_failure_leaves_the_running_daemon_unchanged() {
         "{}",
         String::from_utf8_lossy(&shutdown.stderr)
     );
-    assert!(daemon.wait().unwrap().success());
+    assert!(daemon.wait_exit().success());
 }
 
 #[test]
-#[ignore = "blocked: update tests would operate on the real checkout via CARGO_MANIFEST_DIR; seam removed in cold cut"]
-fn update_replaces_the_daemon_before_a_verification_failure() {
+fn update_replaces_the_daemon_and_the_replacement_keeps_the_selected_source() {
     let root = unique_test_dir("replace-verification");
+    let home = fixture_home(&root);
     let data_dir = root.join("data");
     fs::create_dir_all(&data_dir).unwrap();
     let source = create_clean_update_source(&root, true);
@@ -243,8 +220,7 @@ fn update_replaces_the_daemon_before_a_verification_failure() {
     fs::copy(&hub_bin, source_target.join("botster-hub")).unwrap();
     fs::copy(&worker_bin, source_target.join("botster-session-worker")).unwrap();
 
-    let old_pid = start_detached_daemon(&hub_bin, &worker_bin, &data_dir, &root);
-    wait_for_status(&hub_bin, &data_dir);
+    let old_daemon = FixtureDaemon::start(&hub_bin, &worker_bin, &data_dir, &home, &[], None);
     let data_directory_arg = data_dir.clone();
     let data_dir = data_dir.canonicalize().unwrap();
     write_runtime_metadata(
@@ -252,20 +228,17 @@ fn update_replaces_the_daemon_before_a_verification_failure() {
         &data_directory_arg,
         &hub_bin,
         &worker_bin,
-        old_pid,
+        old_daemon.pid,
     );
 
-    let path = format!(
-        "{}:{}",
-        source.join("fake-bin").display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
     let output = Command::new(&hub_bin)
-        .args(["update", "core", "--data-dir"])
+        .args(["update", "core", "--source"])
+        .arg(&source)
+        .arg("--data-dir")
         .arg(&data_dir)
         .env("BOTSTER_ENV", "test")
-        .env("BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT", &source)
-        .env("PATH", path)
+        .env("HOME", &home)
+        .env("PATH", fake_bin_path(&source))
         .output()
         .expect("run verification-failing update");
 
@@ -277,12 +250,58 @@ fn update_replaces_the_daemon_before_a_verification_failure() {
     )
     .unwrap();
     let new_pid = metadata["pid"].as_u64().unwrap() as u32;
-    assert_ne!(new_pid, old_pid, "update silently reused the old daemon");
-    wait_for_status(&source_target.join("botster-hub"), &data_dir);
+    assert_ne!(
+        new_pid, old_daemon.pid,
+        "update silently reused the old daemon"
+    );
+    assert!(old_daemon.wait_exit().success());
+    // The update waited for the replacement's readiness before it returned.
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+    let status =
+        botster_hub_client::request(&endpoint, botster_hub_client::DaemonRequest::Status).unwrap();
+    assert_eq!(status.kind, botster_hub_client::DaemonResponseKind::Status);
+
+    // The replacement daemon keeps the checkout the operator selected.
+    let command = Command::new("ps")
+        .args(["-p", &new_pid.to_string(), "-o", "command="])
+        .output()
+        .unwrap();
+    let command = String::from_utf8_lossy(&command.stdout);
+    let canonical_source = source.canonicalize().unwrap();
+    assert!(
+        command.contains(&format!(
+            "--update-source-root {}",
+            canonical_source.display()
+        )),
+        "{command}"
+    );
+    // A second update through the replacement reaches that same checkout: a
+    // lost root would fail `source_root_required` under BOTSTER_ENV=test.
+    fs::write(source.join("second-update-marker"), "dirty\n").unwrap();
+    let accepted = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartHubUpdate {
+            scope: botster_hub_client::DaemonHubUpdateScope::Core,
+        },
+    )
+    .unwrap()
+    .hub_update_execution
+    .expect("accepted second update");
+    wait_for_updater(accepted.updater_pid);
+    let second = read_update_execution(&endpoint);
+    assert_eq!(second.update_id, accepted.update_id);
+    assert!(
+        second
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("repository is dirty")),
+        "{second:?}"
+    );
 
     let shutdown = Command::new(source_target.join("botster-hub"))
         .args(["shutdown", "--data-dir"])
         .arg(&data_dir)
+        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(
@@ -290,12 +309,13 @@ fn update_replaces_the_daemon_before_a_verification_failure() {
         "{}",
         String::from_utf8_lossy(&shutdown.stderr)
     );
+    wait_for_pid_exit(new_pid);
 }
 
 #[test]
-#[ignore = "blocked: update tests would operate on the real checkout via CARGO_MANIFEST_DIR; seam removed in cold cut"]
 fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
     let root = unique_test_dir("all-missing-contract");
+    let home = fixture_home(&root);
     let data_dir = root.join("data");
     fs::create_dir_all(&data_dir).unwrap();
     let source = create_clean_update_source(&root, true);
@@ -306,16 +326,7 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
     let worker_bin = candidate_session_worker_binary_path()
         .canonicalize()
         .unwrap();
-    let mut daemon = Command::new(&hub_bin)
-        .args(["start", "--data-dir"])
-        .arg(&data_dir)
-        .arg("--session-worker-bin")
-        .arg(&worker_bin)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    wait_for_status(&hub_bin, &data_dir);
+    let daemon = FixtureDaemon::start(&hub_bin, &worker_bin, &data_dir, &home, &[], None);
     let data_directory_arg = data_dir.clone();
     let data_dir = data_dir.canonicalize().unwrap();
     write_runtime_metadata(
@@ -323,7 +334,7 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
         &data_directory_arg,
         &hub_bin,
         &worker_bin,
-        daemon.id(),
+        daemon.pid,
     );
     for args in [
         vec![
@@ -342,7 +353,11 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
             "runtime.synthetic-plugin",
         ],
     ] {
-        let output = Command::new(&hub_bin).args(args).output().unwrap();
+        let output = Command::new(&hub_bin)
+            .args(args)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
             "{}",
@@ -350,18 +365,15 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
         );
     }
 
-    let path = format!(
-        "{}:{}",
-        source.join("fake-bin").display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
     let output = Command::new(&hub_bin)
-        .args(["update", "all", "--data-dir"])
+        .args(["update", "all", "--source"])
+        .arg(&source)
+        .arg("--data-dir")
         .arg(&data_dir)
         .env("BOTSTER_ENV", "test")
-        .env("BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT", &source)
+        .env("HOME", &home)
         .env("BOTSTER_UPDATE_TEST_MARKER", root.join("cargo-was-run"))
-        .env("PATH", path)
+        .env("PATH", fake_bin_path(&source))
         .output()
         .expect("run update all without package contract");
 
@@ -377,25 +389,180 @@ fn update_all_missing_package_contract_leaves_the_running_daemon_unchanged() {
     );
     assert_eq!(git_output(&source, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(fs::read(source.join("Cargo.lock")).unwrap(), lock_before);
-    assert!(daemon.try_wait().unwrap().is_none());
+    assert!(daemon.running());
     let metadata: serde_json::Value = serde_json::from_slice(
         &fs::read(data_dir.join(".botster-hub-runtime-daemon.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(metadata["pid"].as_u64(), Some(daemon.id() as u64));
+    assert_eq!(metadata["pid"].as_u64(), Some(u64::from(daemon.pid)));
 
     fs::remove_file(data_dir.join(".botster-hub-runtime-daemon.json")).unwrap();
     let shutdown = Command::new(&hub_bin)
         .args(["shutdown", "--data-dir"])
         .arg(&data_dir)
+        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(shutdown.status.success());
-    assert!(daemon.wait().unwrap().success());
+    assert!(daemon.wait_exit().success());
+}
+
+/// A managed installation refuses the source update at every entry point
+/// before it takes a lock or runs a command. The unmanaged classification is
+/// the release-build fallback, which no test binary is; its refusal is proven
+/// at unit level only.
+#[test]
+fn managed_installation_refuses_the_source_update_at_every_entry_point() {
+    let root = unique_test_dir("managed-refusal");
+    let hub_bin = candidate_hub_binary_path().canonicalize().unwrap();
+    let worker_bin = candidate_session_worker_binary_path()
+        .canonicalize()
+        .unwrap();
+    let home = fixture_home(&root);
+    let receipt = home.join(".botster/installations/botster-hub.json");
+    fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&managed_receipt(&hub_bin)).unwrap(),
+    )
+    .unwrap();
+    let source = create_plain_source(&root);
+    let source_lock = source.join(".git/.botster-update.lock");
+    let refused = |text: &str| {
+        text.contains("reason=managed_installation") && text.contains("action=managed_release")
+    };
+
+    // CLI update.
+    let data_dir = root.join("cli-data");
+    let output = Command::new(&hub_bin)
+        .args(["update", "core", "--source"])
+        .arg(&source)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .env("BOTSTER_ENV", "test")
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(refused(&stderr), "{stderr}");
+    assert!(!source_lock.exists(), "no source lock before the refusal");
+
+    // Daemon start with a source root. A start that does not refuse would
+    // serve until stopped, so its exit is awaited under a deadline.
+    let mut start = Command::new(&hub_bin)
+        .args(["start", "--data-dir"])
+        .arg(root.join("start-data"))
+        .arg("--session-worker-bin")
+        .arg(&worker_bin)
+        .arg("--update-source-root")
+        .arg(&source)
+        .env("BOTSTER_ENV", "test")
+        .env("HOME", &home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let exited =
+        botster_hub::process_exit::wait_for_pid_exit(start.id(), Instant::now() + DAEMON_BUDGET)
+            .expect("watch start exit");
+    if !exited {
+        let _ = start.kill();
+    }
+    let output = start.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(exited, "start with a source root did not refuse: {stderr}");
+    assert!(!output.status.success());
+    assert!(refused(&stderr), "{stderr}");
+
+    // Daemon StartHubUpdate.
+    let data_dir = root.join("daemon-data");
+    let daemon = FixtureDaemon::start(&hub_bin, &worker_bin, &data_dir, &home, &[], None);
+    let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
+    let response = botster_hub_client::request(
+        &endpoint,
+        botster_hub_client::DaemonRequest::StartHubUpdate {
+            scope: botster_hub_client::DaemonHubUpdateScope::Core,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        response.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError
+    );
+    let error = response.error.expect("typed refusal");
+    assert_eq!(error.code, "hub_update_unavailable");
+    assert!(refused(&error.message), "{error:?}");
+    assert!(
+        response.hub_update_execution.is_none(),
+        "no updater was started"
+    );
+    assert!(
+        !data_dir.join(".botster-hub-update-execution.json").exists(),
+        "no update execution was recorded"
+    );
+    let shutdown = Command::new(&hub_bin)
+        .args(["shutdown", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(shutdown.status.success());
+    assert!(daemon.wait_exit().success());
+
+    // The detached updater.
+    let data_dir = root.join("handoff-data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let execution = botster_hub_client::DaemonHubUpdateExecution {
+        update_id: "managed-handoff".to_string(),
+        scope: botster_hub_client::DaemonHubUpdateScope::Core,
+        state: botster_hub_client::DaemonHubUpdateExecutionState::Started,
+        updater_pid: std::process::id(),
+        error: None,
+    };
+    fs::write(
+        data_dir.join(".botster-hub-update-execution.json"),
+        serde_json::to_vec(&execution).unwrap(),
+    )
+    .unwrap();
+    let mut handoff = Command::new(&hub_bin)
+        .args(["__update-handoff", "core", "--data-dir"])
+        .arg(&data_dir)
+        .args(["--update-id", "managed-handoff", "--source"])
+        .arg(&source)
+        .env("BOTSTER_ENV", "test")
+        .env("HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    handoff
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"g")
+        .expect("release the handoff gate");
+    let output = handoff.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let recorded: botster_hub_client::DaemonHubUpdateExecution = serde_json::from_slice(
+        &fs::read(data_dir.join(".botster-hub-update-execution.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        recorded.state,
+        botster_hub_client::DaemonHubUpdateExecutionState::Failed
+    );
+    assert!(
+        recorded.error.as_deref().is_some_and(refused),
+        "{recorded:?}"
+    );
+    assert!(!source_lock.exists(), "no source lock before the refusal");
 }
 
 #[test]
-#[ignore = "blocked: update tests would operate on the real checkout via CARGO_MANIFEST_DIR; seam removed in cold cut; do not run script/test-update-preupdate-worker"]
+#[ignore = "needs BOTSTER_PREUPDATE_WORKER_BIN from script/test-update-preupdate-worker, which must not run in a main checkout; do not run"]
 fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order() {
     let preupdate_worker = PathBuf::from(
         std::env::var_os("BOTSTER_PREUPDATE_WORKER_BIN")
@@ -404,26 +571,27 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
     .canonicalize()
     .expect("resolve pre-update worker");
     let root = unique_test_dir("preupdate-worker");
+    let home = fixture_home(&root);
     let data_dir = root.join("data");
     fs::create_dir_all(&data_dir).unwrap();
     let source = create_real_build_update_source(&root);
     let source_target = source.join("target/debug");
     let hub_bin = candidate_hub_binary_path().canonicalize().unwrap();
-    let old_pid = start_detached_daemon_with_update_source(
+    let old_daemon = FixtureDaemon::start(
         &hub_bin,
         &preupdate_worker,
         &data_dir,
-        &source,
-        &root,
+        &home,
+        &[OsStr::new("--update-source-root"), source.as_os_str()],
+        Some(&source.join("fake-bin")),
     );
-    wait_for_status(&hub_bin, &data_dir);
     let data_directory_arg = data_dir.clone();
     write_runtime_metadata(
         &data_directory_arg,
         &data_directory_arg,
         &hub_bin,
         &preupdate_worker,
-        old_pid,
+        old_daemon.pid,
     );
     let data_dir = data_dir.canonicalize().unwrap();
     let endpoint = botster_hub_client::DaemonEndpoint::new(data_dir.join("botster-hub.sock"));
@@ -470,11 +638,14 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
         accepted.state,
         botster_hub_client::DaemonHubUpdateExecutionState::Started
     );
-    let completed = wait_for_update_execution(
-        &endpoint,
-        botster_hub_client::DaemonHubUpdateExecutionState::Complete,
-    );
+    wait_for_updater(accepted.updater_pid);
+    let completed = read_update_execution(&endpoint);
     assert_eq!(completed.update_id, accepted.update_id);
+    assert_eq!(
+        completed.state,
+        botster_hub_client::DaemonHubUpdateExecutionState::Complete,
+        "{completed:?}"
+    );
     let update_log = fs::read_to_string(
         data_dir.join(format!(".botster-hub-update-{}.log", accepted.update_id)),
     )
@@ -582,6 +753,7 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
     let shutdown = Command::new(source_target.join("botster-hub"))
         .args(["shutdown", "--data-dir"])
         .arg(&data_dir)
+        .env("HOME", &home)
         .output()
         .expect("shutdown updated daemon");
     assert!(
@@ -589,6 +761,197 @@ fn update_all_replaces_an_incompatible_preupdate_worker_and_proves_attach_order(
         "{}",
         String::from_utf8_lossy(&shutdown.stderr)
     );
+}
+
+/// A `botster-hub start` child that reported ready on its `--ready-fd` pipe.
+/// A thread reaps it as soon as it exits, so an updater that waits for the
+/// old daemon's reap never waits on the test.
+struct FixtureDaemon {
+    pid: u32,
+    exited: mpsc::Receiver<ExitStatus>,
+}
+
+impl FixtureDaemon {
+    fn start(
+        hub_bin: &Path,
+        worker_bin: &Path,
+        data_dir: &Path,
+        home: &Path,
+        extra_args: &[&OsStr],
+        path_prefix: Option<&Path>,
+    ) -> Self {
+        const READY_FD: libc::c_int = 3;
+        let mut command = Command::new(hub_bin);
+        command
+            .arg("start")
+            .arg("--data-dir")
+            .arg(data_dir)
+            .arg("--session-worker-bin")
+            .arg(worker_bin)
+            .args(extra_args)
+            .arg("--ready-fd")
+            .arg(READY_FD.to_string())
+            .env("BOTSTER_ENV", "test")
+            .env("HOME", home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(prefix) = path_prefix {
+            command.env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    prefix.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+        }
+        let (reader, writer) = io::pipe().expect("create readiness pipe");
+        let writer_fd = writer.as_raw_fd();
+        unsafe {
+            // SAFETY: fcntl and dup2 are async-signal-safe; the write end
+            // lands at READY_FD without close-on-exec.
+            command.pre_exec(move || {
+                let placed = if writer_fd == READY_FD {
+                    libc::fcntl(READY_FD, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(writer_fd, READY_FD)
+                };
+                if placed == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn fixture daemon");
+        // Only the child may hold the write end, so its exit closes the pipe.
+        drop(writer);
+        let (line_tx, line_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let _ = io::BufReader::new(reader).read_line(&mut line);
+            let _ = line_tx.send(line);
+        });
+        // timer: deadline — the ready line or the pipe's EOF ends the wait.
+        let line = line_rx.recv_timeout(DAEMON_BUDGET);
+        if !matches!(&line, Ok(line) if !line.is_empty()) {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("collect failed daemon");
+            panic!(
+                "fixture daemon did not report ready ({line:?}): {} {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let pid = child.id();
+        let (exit_tx, exited) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok(status) = child.wait() {
+                let _ = exit_tx.send(status);
+            }
+        });
+        Self { pid, exited }
+    }
+
+    /// Whether the daemon has not exited.
+    fn running(&self) -> bool {
+        matches!(self.exited.try_recv(), Err(mpsc::TryRecvError::Empty))
+    }
+
+    fn wait_exit(self) -> ExitStatus {
+        // timer: deadline — the reaper's exit report ends the wait.
+        self.exited
+            .recv_timeout(DAEMON_BUDGET)
+            .expect("fixture daemon exits")
+    }
+}
+
+/// Waits on the updater's exit event; it records its outcome before exiting.
+fn wait_for_updater(pid: u32) {
+    assert!(
+        botster_hub::process_exit::wait_for_pid_exit(pid, Instant::now() + UPDATE_BUDGET)
+            .expect("watch updater exit"),
+        "updater {pid} did not exit"
+    );
+}
+
+fn wait_for_pid_exit(pid: u32) {
+    assert!(
+        botster_hub::process_exit::wait_for_pid_exit(pid, Instant::now() + DAEMON_BUDGET)
+            .expect("watch daemon exit"),
+        "process {pid} did not exit"
+    );
+}
+
+fn read_update_execution(
+    endpoint: &botster_hub_client::DaemonEndpoint,
+) -> botster_hub_client::DaemonHubUpdateExecution {
+    botster_hub_client::request(
+        endpoint,
+        botster_hub_client::DaemonRequest::GetHubUpdateExecution,
+    )
+    .expect("read Hub update execution")
+    .hub_update_execution
+    .expect("Hub update execution body")
+}
+
+/// An empty HOME, so the installation classification never depends on the
+/// host: no receipt means a development build.
+fn fixture_home(root: &Path) -> PathBuf {
+    let home = root.join("home");
+    fs::create_dir_all(&home).expect("create fixture home");
+    home
+}
+
+/// A schema-2 managed receipt the candidate binary accepts.
+fn managed_receipt(hub_bin: &Path) -> serde_json::Value {
+    let version = Command::new(hub_bin)
+        .arg("version")
+        .output()
+        .expect("candidate Hub version");
+    assert!(version.status.success());
+    let version = String::from_utf8(version.stdout).expect("version is UTF-8");
+    let embedded = version
+        .lines()
+        .find_map(|line| line.strip_prefix("build_revision="))
+        .expect("candidate reports its build revision");
+    let build_revision = if embedded == "unknown" {
+        "release1"
+    } else {
+        embedded
+    };
+    serde_json::json!({
+        "schema_version": 2,
+        "product_id": "botster-hub",
+        "binary_version": env!("CARGO_PKG_VERSION"),
+        "installation_mode": "managed",
+        "release_channel": "stable",
+        "provider": "http_json",
+        "source_url": "http://127.0.0.1:9/botster-hub.json",
+        "build_revision": build_revision,
+        "artifacts": [
+            {"name": "botster-hub", "sha256": "a".repeat(64), "size": 1024},
+            {"name": "botster-session-worker", "sha256": "b".repeat(64), "size": 2048}
+        ],
+        "source_revisions": {
+            "botster_hub": "0".repeat(40),
+            "botster_core": "1".repeat(40)
+        },
+        "signature": {
+            "algorithm": "ed25519",
+            "key_id": "test-only-do-not-trust",
+            "signed_manifest_sha256": "c".repeat(64)
+        },
+        "installer": {"id": "botster-hub-installer", "version": "0.1.0"}
+    })
+}
+
+fn fake_bin_path(source: &Path) -> String {
+    format!(
+        "{}:{}",
+        source.join("fake-bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
 }
 
 fn git(root: &Path, args: &[&str]) {
@@ -610,22 +973,43 @@ fn git_output(root: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
+/// The manifest a source-update checkout must carry.
+const HUB_MANIFEST: &str = "[package]\nname = \"botster-hub\"\nversion = \"0.1.0\"\n";
+
+/// A committed `botster-hub` checkout with no remote.
+fn create_plain_source(root: &Path) -> PathBuf {
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("create source fixture");
+    git(&source, &["init", "-q", "-b", "main"]);
+    git(
+        &source,
+        &["config", "user.email", "update-test@example.invalid"],
+    );
+    git(&source, &["config", "user.name", "Update Test"]);
+    fs::write(source.join("Cargo.toml"), HUB_MANIFEST).unwrap();
+    fs::write(source.join("tracked"), "clean\n").expect("write tracked fixture");
+    git(&source, &["add", "Cargo.toml", "tracked"]);
+    git(&source, &["commit", "-q", "-m", "fixture"]);
+    source
+}
+
 fn create_clean_update_source(root: &Path, builds_succeed: bool) -> PathBuf {
     let remote = root.join("remote.git");
     let status = Command::new("git")
-        .args(["init", "--bare"])
+        .args(["init", "-q", "--bare"])
         .arg(&remote)
         .status()
         .unwrap();
     assert!(status.success());
     let source = root.join("source");
     fs::create_dir_all(source.join("fake-bin")).unwrap();
-    git(&source, &["init"]);
+    git(&source, &["init", "-q", "-b", "main"]);
     git(
         &source,
         &["config", "user.email", "update-test@example.invalid"],
     );
     git(&source, &["config", "user.name", "Update Test"]);
+    fs::write(source.join("Cargo.toml"), HUB_MANIFEST).unwrap();
     fs::write(
         source.join("Cargo.lock"),
         r#"[[package]]
@@ -651,12 +1035,18 @@ source = "git+https://example.invalid/core#abc123"
     fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
     git(
         &source,
-        &["add", ".gitignore", "Cargo.lock", "fake-bin/cargo"],
+        &[
+            "add",
+            ".gitignore",
+            "Cargo.toml",
+            "Cargo.lock",
+            "fake-bin/cargo",
+        ],
     );
-    git(&source, &["commit", "-m", "fixture"]);
+    git(&source, &["commit", "-q", "-m", "fixture"]);
     let remote_text = remote.to_string_lossy().into_owned();
     git(&source, &["remote", "add", "origin", &remote_text]);
-    git(&source, &["push", "-u", "origin", "main"]);
+    git(&source, &["push", "-q", "-u", "origin", "main"]);
     source
 }
 
@@ -664,7 +1054,7 @@ fn create_real_build_update_source(root: &Path) -> PathBuf {
     let remote = root.join("real-build-remote.git");
     assert!(
         Command::new("git")
-            .args(["init", "--bare"])
+            .args(["init", "-q", "--bare"])
             .arg(&remote)
             .status()
             .unwrap()
@@ -672,12 +1062,13 @@ fn create_real_build_update_source(root: &Path) -> PathBuf {
     );
     let source = root.join("real-build-source");
     fs::create_dir_all(source.join("fake-bin")).unwrap();
-    git(&source, &["init"]);
+    git(&source, &["init", "-q", "-b", "main"]);
     git(
         &source,
         &["config", "user.email", "update-test@example.invalid"],
     );
     git(&source, &["config", "user.name", "Update Test"]);
+    fs::write(source.join("Cargo.toml"), HUB_MANIFEST).unwrap();
     fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
         source.join("Cargo.lock"),
@@ -700,12 +1091,18 @@ fn create_real_build_update_source(root: &Path) -> PathBuf {
     fs::set_permissions(&cargo_script, fs::Permissions::from_mode(0o755)).unwrap();
     git(
         &source,
-        &["add", ".gitignore", "Cargo.lock", "fake-bin/cargo"],
+        &[
+            "add",
+            ".gitignore",
+            "Cargo.toml",
+            "Cargo.lock",
+            "fake-bin/cargo",
+        ],
     );
-    git(&source, &["commit", "-m", "fixture"]);
+    git(&source, &["commit", "-q", "-m", "fixture"]);
     let remote_text = remote.to_string_lossy().into_owned();
     git(&source, &["remote", "add", "origin", &remote_text]);
-    git(&source, &["push", "-u", "origin", "main"]);
+    git(&source, &["push", "-q", "-u", "origin", "main"]);
     source
 }
 
@@ -723,30 +1120,24 @@ fn read_worker_identity(data_dir: &Path, session_id: &str) -> (u32, PathBuf) {
     )
 }
 
-fn wait_for_process_exit(pid: u32) {
-    for _ in 0..400 {
-        let exists = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-        if !exists {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("process {pid} did not exit");
-}
-
-/// Read the attach stream on one route until SNAPSHOT_FINISH.
+/// Read the attach stream on one route until SNAPSHOT_FINISH. Each read
+/// blocks until a frame arrives or the one deadline passes.
 fn collect_attach_frames(
     connection: &mut botster_hub_client::DaemonConnection,
     session_id: &str,
     subscription_id: &str,
 ) -> Vec<botster_terminal_protocol::TerminalFrame> {
     let mut frames = Vec::new();
+    // timer: deadline — each frame arrival ends a read.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Ok(Some(frame)) = connection.poll_terminal(Duration::from_millis(25))
-            && frame.route == subscription_id
-            && let Ok(decoded) = botster_terminal_protocol::TerminalFrame::from_bytes(&frame.body)
-        {
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let Ok(Some(frame)) = connection.poll_terminal(remaining) else {
+            break;
+        };
+        if frame.route != subscription_id {
+            continue;
+        }
+        if let Ok(decoded) = botster_terminal_protocol::TerminalFrame::from_bytes(&frame.body) {
             let finished = decoded.kind() == TerminalKind::SnapshotFinish;
             frames.push(decoded);
             if finished {
@@ -764,7 +1155,7 @@ fn create_direct_local_package(root: &Path) -> PathBuf {
     let remote = root.join("package-remote.git");
     assert!(
         Command::new("git")
-            .args(["init", "--bare"])
+            .args(["init", "-q", "--bare"])
             .arg(&remote)
             .status()
             .unwrap()
@@ -783,73 +1174,18 @@ fn create_direct_local_package(root: &Path) -> PathBuf {
         package.join("plugin.lua"),
     )
     .unwrap();
-    git(&package, &["init"]);
+    git(&package, &["init", "-q", "-b", "main"]);
     git(
         &package,
         &["config", "user.email", "update-test@example.invalid"],
     );
     git(&package, &["config", "user.name", "Update Test"]);
     git(&package, &["add", "botster-package.json", "plugin.lua"]);
-    git(&package, &["commit", "-m", "fixture"]);
+    git(&package, &["commit", "-q", "-m", "fixture"]);
     let remote_text = remote.to_string_lossy().into_owned();
     git(&package, &["remote", "add", "origin", &remote_text]);
-    git(&package, &["push", "-u", "origin", "main"]);
+    git(&package, &["push", "-q", "-u", "origin", "main"]);
     package
-}
-
-fn start_detached_daemon(hub_bin: &Path, worker_bin: &Path, data_dir: &Path, root: &Path) -> u32 {
-    let pid_file = root.join("daemon.pid");
-    let command = format!(
-        "{} start --data-dir {} --session-worker-bin {} >/dev/null 2>&1 & echo $! > {}",
-        hub_bin.display(),
-        data_dir.display(),
-        worker_bin.display(),
-        pid_file.display()
-    );
-    let status = Command::new("/bin/sh")
-        .args(["-c", &command])
-        .status()
-        .unwrap();
-    assert!(status.success());
-    fs::read_to_string(pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn start_detached_daemon_with_update_source(
-    hub_bin: &Path,
-    worker_bin: &Path,
-    data_dir: &Path,
-    source: &Path,
-    root: &Path,
-) -> u32 {
-    let pid_file = root.join("daemon-api.pid");
-    let path_prefix = source.join("fake-bin");
-    let path_assignment = if path_prefix.is_dir() {
-        format!("PATH={}:$PATH ", path_prefix.display())
-    } else {
-        String::new()
-    };
-    let command = format!(
-        "BOTSTER_ENV=test BOTSTER_HUB_TEST_UPDATE_SOURCE_ROOT={} {path_assignment}{} start --data-dir {} --session-worker-bin {} >/dev/null 2>&1 & echo $! > {}",
-        source.display(),
-        hub_bin.display(),
-        data_dir.display(),
-        worker_bin.display(),
-        pid_file.display()
-    );
-    let status = Command::new("/bin/sh")
-        .args(["-c", &command])
-        .status()
-        .unwrap();
-    assert!(status.success());
-    fs::read_to_string(pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
 }
 
 fn write_runtime_metadata(
@@ -875,44 +1211,6 @@ fn write_runtime_metadata(
         serde_json::to_vec_pretty(&metadata).unwrap(),
     )
     .unwrap();
-}
-
-fn wait_for_status(hub_bin: &Path, data_dir: &Path) {
-    for _ in 0..200 {
-        let status = Command::new(hub_bin)
-            .args(["status", "--data-dir"])
-            .arg(data_dir)
-            .output()
-            .unwrap();
-        if status.status.success() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("daemon did not become ready");
-}
-
-fn wait_for_update_execution(
-    endpoint: &botster_hub_client::DaemonEndpoint,
-    expected: botster_hub_client::DaemonHubUpdateExecutionState,
-) -> botster_hub_client::DaemonHubUpdateExecution {
-    for _ in 0..8_000 {
-        let Ok(response) = botster_hub_client::request(
-            endpoint,
-            botster_hub_client::DaemonRequest::GetHubUpdateExecution,
-        ) else {
-            thread::sleep(Duration::from_millis(25));
-            continue;
-        };
-        let execution = response
-            .hub_update_execution
-            .expect("Hub update execution body");
-        if execution.state == expected {
-            return execution;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("Hub update execution did not reach {expected:?}");
 }
 
 fn unique_test_dir(label: &str) -> PathBuf {

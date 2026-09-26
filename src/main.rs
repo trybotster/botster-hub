@@ -372,7 +372,19 @@ fn start_daemon(args: Vec<String>) -> Result<(), StartError> {
         })
         .transpose()
         .map_err(StartError::ReadyFd)?;
-    let config = explicit_config_with_worker(options.data_directory, options.session_worker_bin)?;
+    let mut config =
+        explicit_config_with_worker(options.data_directory, options.session_worker_bin)?;
+    // The source root is fixed here by the local user and validated before
+    // the daemon serves, so a bad root fails at start, not at an update.
+    if let Some(source_root) = options.update_source_root {
+        if let Some(refusal) = botster_hub::source_update_refusal() {
+            return Err(StartError::UpdateSourceRoot(refusal.to_string()));
+        }
+        config.update_source_root = Some(
+            update::validate_update_source_root(&source_root)
+                .map_err(StartError::UpdateSourceRoot)?,
+        );
+    }
 
     // The lease is taken before the daemon binds anything and held for the
     // daemon's whole lifetime, so an installer can never switch generations
@@ -1038,6 +1050,7 @@ fn prepare_operator_console_runtime(
     let options = LocalRuntimeOptions {
         data_directory,
         session_worker_bin: None,
+        update_source_root: None,
     };
     let config = explicit_config(options.data_directory.clone())?;
     let daemon_ownership = ensure_local_runtime_daemon(&hub_bin, &options, &config)?;
@@ -3260,6 +3273,7 @@ struct StartOptions {
     data_directory: PathBuf,
     session_worker_bin: Option<PathBuf>,
     ready_fd: Option<std::os::fd::RawFd>,
+    update_source_root: Option<PathBuf>,
 }
 
 impl StartOptions {
@@ -3267,6 +3281,7 @@ impl StartOptions {
         let options = DataArgs::parse(args, "start")?;
         let mut session_worker_bin = None;
         let mut ready_fd = None;
+        let mut update_source_root = None;
         let mut arguments = options.arguments.into_iter();
         while let Some(flag) = arguments.next() {
             let value = arguments.next().ok_or(OperatorError::Usage("start"))?;
@@ -3277,6 +3292,9 @@ impl StartOptions {
                 "--ready-fd" if ready_fd.is_none() => {
                     ready_fd = Some(value.parse().map_err(|_| OperatorError::Usage("start"))?);
                 }
+                "--update-source-root" if update_source_root.is_none() => {
+                    update_source_root = Some(PathBuf::from(value));
+                }
                 _ => return Err(OperatorError::Usage("start")),
             }
         }
@@ -3285,6 +3303,7 @@ impl StartOptions {
             data_directory: options.data_directory,
             session_worker_bin,
             ready_fd,
+            update_source_root,
         })
     }
 }
@@ -3292,6 +3311,9 @@ impl StartOptions {
 struct LocalRuntimeOptions {
     data_directory: PathBuf,
     session_worker_bin: Option<PathBuf>,
+    /// Passed to the daemon as `--update-source-root`, so a replacement
+    /// daemon keeps the checkout its operator selected.
+    update_source_root: Option<PathBuf>,
 }
 
 impl LocalRuntimeOptions {
@@ -3317,6 +3339,7 @@ impl LocalRuntimeOptions {
         Ok(Self {
             data_directory: options.data_directory,
             session_worker_bin,
+            update_source_root: None,
         })
     }
 
@@ -4157,6 +4180,7 @@ enum StartError {
     InstallationLeaseHeld(PathBuf),
     InstallationLeaseUnavailable(botster_hub_installation::InstallationProblem),
     ReadyFd(io::Error),
+    UpdateSourceRoot(String),
 }
 
 #[derive(Debug)]
@@ -4303,6 +4327,9 @@ impl fmt::Display for StartError {
                 "the managed installation lease could not be taken: {problem}"
             ),
             Self::ReadyFd(error) => write!(formatter, "--ready-fd is not usable: {error}"),
+            Self::UpdateSourceRoot(error) => {
+                write!(formatter, "--update-source-root is not usable: {error}")
+            }
         }
     }
 }
@@ -4566,7 +4593,7 @@ Interactive operator console:
 
 Daily runtime commands:
   botster-hub up [--data-dir <path>] [...]
-  botster-hub update <core|all> [--data-dir <path>]
+  botster-hub update <core|all> [--source <path>] [--data-dir <path>]
   botster-hub down [--data-dir <path>]
   botster-hub status [--data-dir <path>]
   botster-hub check-update [--data-dir <path>]
@@ -4613,12 +4640,12 @@ Packages:
   botster-hub packages entrypoint-status [--data-dir <path>] <package> <entrypoint>"
         }
         "start" => {
-            "usage: botster-hub start [--data-dir <path>] [--session-worker-bin <path>] [--ready-fd <fd>]"
+            "usage: botster-hub start [--data-dir <path>] [--session-worker-bin <path>] [--ready-fd <fd>] [--update-source-root <path>]"
         }
         "up" => {
             "usage: botster-hub up [--data-dir <path>] [--session-worker-bin <path>]"
         }
-        "update" => "usage: botster-hub update <core|all> [--data-dir <path>]",
+        "update" => "usage: botster-hub update <core|all> [--source <path>] [--data-dir <path>]",
         "down" => "usage: botster-hub down [--data-dir <path>]",
         "doctor" => "usage: botster-hub doctor [--data-dir <path>]",
         "smoke" => {

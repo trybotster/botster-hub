@@ -17,6 +17,7 @@ use crate::daemon::owner_loop::{
 };
 use crate::maintenance::{
     HubUpdateCheckPlan, execute_managed_update_check, plan_hub_update_check, software_identity,
+    source_update_refusal,
 };
 use crate::source_update::{current_update_execution, mark_update_failed, start_update_handoff};
 
@@ -101,8 +102,24 @@ fn start_hub_update(
     reply_tx: ControlReplySender,
     response_delivery_rx: Option<mpsc::Receiver<()>>,
 ) -> bool {
-    let data_directory = match daemon.runtime() {
-        Some(runtime) => runtime.config().data_directory.clone(),
+    // A bounded read of the installation receipt, as CheckHubUpdate does; no
+    // source validation runs here. The handoff child validates the root.
+    if let Some(refusal) = source_update_refusal() {
+        return send_control_response(
+            reply_tx,
+            Ok(hub_update_execution_error(
+                "hub_update_unavailable",
+                "start_hub_update",
+                &refusal.to_string(),
+            )),
+            response_delivery_rx,
+        );
+    }
+    let (data_directory, source_root) = match daemon.runtime() {
+        Some(runtime) => (
+            runtime.config().data_directory.clone(),
+            runtime.config().update_source_root.clone(),
+        ),
         None => {
             return send_control_response(
                 reply_tx,
@@ -115,7 +132,7 @@ fn start_hub_update(
             );
         }
     };
-    match start_update_handoff(&data_directory, scope) {
+    match start_update_handoff(&data_directory, scope, source_root.as_deref()) {
         Ok((execution, handoff)) => {
             let update_id = execution.update_id.clone();
             let response_received = reply_tx
