@@ -18,10 +18,10 @@ node packages/hub-test-support/scripts/sync-assets.mjs
 
 ## Usage
 
-Use this command for version 0.1.45:
+Use this command for version 0.1.46:
 
 ```sh
-npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.45
+npm install --save-dev @trybotster/ui-contract@0.3.3 @trybotster/hub-test-support@0.1.46
 ```
 
 ```js
@@ -81,21 +81,21 @@ Use this exact package spec in npm-based client repos:
 ```json
 {
   "devDependencies": {
-    "@trybotster/hub-test-support": "0.1.45"
+    "@trybotster/hub-test-support": "0.1.46"
   }
 }
 ```
 
-`@trybotster/hub-test-support@0.1.45` carries host-control protocol 9
+`@trybotster/hub-test-support@0.1.46` carries host-control protocol 10
 (`ClientFrame` / `ServerFrame` with `request_id` correlation, length-prefixed
 Unix containers, binary AES-GCM WebRTC terminal chunks) and authentic dual
 GHOSTSNP late-attach fixtures as Core scheme 2 terminal frames (conformance
-revision 49). History attach delivers `attach_state`, `modes`,
+revision 50). History attach delivers `attach_state`, `modes`,
 `snapshot_ready`, `snapshot_history` pages, `snapshot_finish`, `output`, and
 `process_exit`. No-history attach delivers `snapshot_ready` then the GHOSTSNP
 finish record as one `snapshot_history` page. Import-visible state matches
 the ReadScreen oracles; do not dual-use a history-bearing golden as
-no-history. Protocol version is 9. The package includes paged snapshot
+no-history. Protocol version is 10. The package includes paged snapshot
 readback (`capture_snapshot`, `read_snapshot_page`), typed
 `HistoryUnavailableReason` values, explicit session-type execution modes,
 spawn-point session-type listing (`list_session_types_for_target`), and the
@@ -117,7 +117,7 @@ terminal text. Version 0.1.6 / conformance revision 13 uses superseded JSON
 number arrays, while version 0.1.5 / revision 12 exposes lossy string
 history. Neither is current binary-history contract authority.
 
-Version 0.1.45 carries protocol version 9 / conformance revision 49 with
+Version 0.1.46 carries protocol version 10 / conformance revision 50 with
 advertised optional `unix_terminal_adapter`,
 `terminal_subscription_closed`, `webrtc_terminal_adapter`,
 `attach_occupancy`,

@@ -1726,36 +1726,28 @@ fn local_webrtc_attach_to_a_flooding_session_binds_after_a_slow_channel_open() {
             )
             .await
             .expect("input through the bound route");
-        let mut route_output = String::new();
-        let mut screen = String::new();
+        // The bound route carries the session's live output, including the
+        // echo of the input sent through it.
+        let mut frames = 0usize;
+        let mut echoed = false;
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            let read = offer_peer
-                .encrypted_request(
-                    &stream_key,
-                    &botster_hub_client::DaemonRequest::ReadScreen {
-                        session_id: session_id.to_string(),
-                    },
-                )
-                .await
-                .expect("read screen");
-            if let Some(body) = read.read_screen {
-                screen = body.text;
-            }
-            while let Some((_, bytes)) = offer_peer.pending_terminal_frames.pop_front() {
-                if let Some(output) = terminal_body_output(&bytes) {
-                    route_output.push_str(&live_output_utf8(&output));
+            if let Ok(Ok(bytes)) = timeout(
+                Duration::from_millis(200),
+                offer_peer.next_terminal_frame(&stream_key),
+            )
+            .await
+            {
+                frames += 1;
+                if terminal_frame_contains(&bytes, "flood-echo:probe-after-flood") {
+                    echoed = true;
+                    break;
                 }
             }
-            if route_output.contains("flood-echo:probe-after-flood") {
-                break;
-            }
-            sleep(Duration::from_millis(50)).await;
         }
         assert!(
-            route_output.contains("flood-echo:probe-after-flood"),
-            "the bound route must carry live output for the input; route_output_tail={:?} screen={screen:?}",
-            route_output.chars().rev().take(400).collect::<String>().chars().rev().collect::<String>()
+            echoed,
+            "the bound route must carry the echo of its input; frames_received={frames}"
         );
 
         let _ = offer_peer
