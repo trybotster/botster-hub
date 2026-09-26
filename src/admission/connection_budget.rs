@@ -126,11 +126,12 @@ impl ConnectionAggregate {
     }
 
     /// Report released capacity to the waiting senders. A waiter resumes
-    /// only below the low mark, so a release above it wakes nobody. The
+    /// only below the low mark or on a quiescent aggregate (see
+    /// admits_refused), so a release that leaves neither wakes nobody. The
     /// waiters run after the list lock is dropped, so a caller may hold any
     /// Hub lock, and a waiter's strong handle is dropped after the lock too.
     pub(crate) fn capacity_released(&self) {
-        if !self.below_low_water() {
+        if !self.below_low_water() && !self.quiescent() {
             return;
         }
         let mut live = Vec::new();
@@ -239,11 +240,16 @@ impl ConnectionAggregate {
     /// authorized: below the low mark with room for it, or quiescent.
     #[must_use]
     pub(crate) fn admits_refused(&self, need: usize) -> bool {
-        let authorized = self.authorized.load(Ordering::Acquire);
         let buffered = self.buffered();
         (buffered < AGGREGATE_BUFFERED_LOW
             && buffered.saturating_add(need) <= AGGREGATE_BUFFERED_HIGH)
-            || (authorized == 0 && self.published_drained())
+            || self.quiescent()
+    }
+
+    /// No outstanding authorization, and every channel drained: a frame
+    /// of any size may be authorized.
+    fn quiescent(&self) -> bool {
+        self.authorized.load(Ordering::Acquire) == 0 && self.published_drained()
     }
 
     #[must_use]

@@ -986,6 +986,42 @@ mod tests {
         }
     }
 
+    /// A release that makes the aggregate quiescent wakes a refused writer
+    /// even when the drained residue keeps the aggregate above the low mark.
+    #[test]
+    fn a_release_to_a_quiescent_aggregate_above_the_low_mark_wakes_a_refused_writer() {
+        use crate::admission::connection_budget::{
+            AGGREGATE_BUFFERED_HIGH, AGGREGATE_BUFFERED_LOW, CHANNEL_DRAINED_BYTES, ChannelClass,
+            ConnectionBudget, MAX_SUBSCRIPTION_CHANNELS,
+        };
+        let mut budget = ConnectionBudget::default();
+        for index in 0..MAX_SUBSCRIPTION_CHANNELS {
+            budget
+                .reserve(format!("drained-{index}"), ChannelClass::Terminal)
+                .expect("channel budget")
+                .store(CHANNEL_DRAINED_BYTES, Ordering::Release);
+        }
+        assert!(budget.aggregate_buffered() >= AGGREGATE_BUFFERED_LOW);
+        let mux = WebRtcConnectionMux::new();
+        let (mut holder, holder_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        let (mut refused, refused_handle) = mux.create_adapter_with_aggregate(budget.aggregate());
+        let oversize = test_frame(&vec![b'o'; AGGREGATE_BUFFERED_HIGH + 1]);
+        assert_eq!(holder.try_write(&oversize), Ok(()), "quiescent aggregate");
+        assert_eq!(
+            refused.try_write(&oversize),
+            Err(TerminalAdapterWriteError::WouldBlock)
+        );
+        assert!(refused_handle.aggregate_blocked_for_test());
+        holder_handle.close();
+        assert!(budget.aggregate_buffered() >= AGGREGATE_BUFFERED_LOW);
+        assert!(
+            !refused_handle.aggregate_blocked_for_test(),
+            "the release to a quiescent aggregate woke the refused writer"
+        );
+        assert_eq!(refused.try_write(&oversize), Ok(()));
+        drop(holder);
+    }
+
     /// An oversize write refused beside a small buffered frame stays refused
     /// with no wake: it would be refused again until the aggregate empties.
     /// The release that empties the aggregate resumes it.
