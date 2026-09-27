@@ -243,7 +243,7 @@ impl HostPackageRuntime {
             .plugin_lifecycle
             .load_package(registry, package_name, bundle);
         if loaded.is_err() {
-            self.revoke_grants(package_name);
+            self.release_unloaded_package(package_name);
         }
         loaded
     }
@@ -289,8 +289,7 @@ impl HostPackageRuntime {
         ) {
             Ok(bundle) => bundle,
             Err(error) => {
-                self.revoke_grants(package_name);
-                self.release_unloaded_logs(package_name);
+                self.release_unloaded_package(package_name);
                 return Err(HubLuaPluginLoadError::Lua(error));
             }
         };
@@ -302,8 +301,7 @@ impl HostPackageRuntime {
         let plugin = match self.prepare_new_load(registry, package_name, bundle) {
             Ok(plugin) => plugin,
             Err(error) => {
-                self.revoke_grants(package_name);
-                self.release_unloaded_logs(package_name);
+                self.release_unloaded_package(package_name);
                 return Err(error);
             }
         };
@@ -354,11 +352,13 @@ impl HostPackageRuntime {
         Ok(plugin)
     }
 
-    /// After a failed load, release the package's log entry unless a live
-    /// generation still needs it. The failed attempt's records otherwise stay
-    /// next to the live ones: they explain the failure.
-    fn release_unloaded_logs(&self, package_name: &str) {
+    /// After a failed load or reload, release what the package holds unless a
+    /// live generation still needs it: its runtime grants and its log entry.
+    /// A live generation keeps both, and the failed attempt's records stay
+    /// beside its own, because they explain the failure.
+    fn release_unloaded_package(&self, package_name: &str) {
         if !self.plugin_lifecycle.is_loaded(package_name) {
+            self.revoke_grants(package_name);
             self.host_api.logs.remove(package_name);
         }
     }
@@ -467,7 +467,7 @@ impl HostPackageRuntime {
         ) {
             Ok(bundle) => bundle,
             Err(error) => {
-                self.release_unloaded_logs(package_name);
+                self.release_unloaded_package(package_name);
                 return Err(HubLuaPluginLoadError::Lua(error));
             }
         };
@@ -478,7 +478,7 @@ impl HostPackageRuntime {
         let plugin = match self.prepare_reload(registry, package_name, bundle) {
             Ok(plugin) => plugin,
             Err(error) => {
-                self.release_unloaded_logs(package_name);
+                self.release_unloaded_package(package_name);
                 return Err(error);
             }
         };

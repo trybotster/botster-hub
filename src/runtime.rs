@@ -8206,7 +8206,7 @@ pub(crate) mod tests {
             serde_json::json!({
                 "name": "producer", "version": "1.0.0", "kind": "plugin",
                 "botster": ">=0.1.0",
-                "capabilities": [],
+                "capabilities": [{ "surface": "timers", "scope": "callbacks" }],
                 "source": { "type": "path", "path": root.canonicalize().unwrap() },
                 "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
             })
@@ -8321,7 +8321,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_first_load_rejected_after_the_lua_load_revokes_the_package_grants() {
-        let (mut runtime, root, policy) = subscribed_provider_enabled("load-preflight-grants");
+        let (mut runtime, root, policy) = unloaded_logging_provider("load-preflight-grants", "");
         let key = PluginKey("producer".into());
         crate::lifecycle::inject_next_prepare_failure("producer");
         let error = runtime
@@ -8348,6 +8348,44 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .test_has_plugin_grants(&key)
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_load_over_a_live_generation_keeps_its_grants() {
+        // The runtime accepts a load of a package that is already loaded (the
+        // commit replaces the previous worker). If that load fails, the live
+        // generation keeps serving, so it keeps its grants.
+        let (mut runtime, root, policy) = unloaded_logging_provider("load-over-live-grants", "");
+        let key = PluginKey("producer".into());
+        let has_grants = |runtime: &HubRuntime| {
+            runtime
+                .capability_runtime
+                .lock()
+                .unwrap()
+                .test_has_plugin_grants(&key)
+        };
+        runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap();
+        assert!(has_grants(&runtime));
+        crate::lifecycle::inject_next_prepare_failure("producer");
+        let error = runtime
+            .load_lua_plugin_package(policy.registry(), "producer")
+            .unwrap_err();
+        assert!(
+            matches!(error, HubLuaPluginLoadError::Lifecycle(_)),
+            "{error:?}"
+        );
+        assert!(
+            runtime.plugin_lifecycle().is_loaded("producer"),
+            "the live generation still serves"
+        );
+        assert!(
+            has_grants(&runtime),
+            "a failed load over a live generation keeps the live grants"
         );
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
