@@ -157,6 +157,12 @@ impl StateDirectoryOwnership {
         )
         .map_err(|error| StateDirectoryError::DocumentRead(error.into()))?;
         let mut file = File::from(descriptor);
+        // The document must be one exclusively linked regular file; a hard
+        // link or another file type is refused before its bytes are trusted.
+        let metadata = file.metadata().map_err(StateDirectoryError::DocumentRead)?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(StateDirectoryError::InvalidTemporaryFile);
+        }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(StateDirectoryError::DocumentRead)?;

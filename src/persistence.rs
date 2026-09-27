@@ -1307,6 +1307,22 @@ mod tests {
     }
 
     #[test]
+    fn file_startup_refuses_a_multiply_linked_state_document() {
+        let config = test_config("startup-linked-document");
+        let store = FileHubStateStore::for_data_directory(&config.data_directory);
+        drop(store.load_retained(&config).unwrap());
+        let document = config.data_directory.join(HUB_STATE_FILE_NAME);
+        let alias = config.data_directory.with_extension("alias.json");
+        std::fs::hard_link(&document, &alias).unwrap();
+        assert!(matches!(
+            store.load_retained(&config),
+            Err(HubStateStoreError::InvalidTemporaryFile)
+        ));
+        std::fs::remove_file(&alias).unwrap();
+        assert!(store.load_retained(&config).is_ok());
+    }
+
+    #[test]
     fn file_startup_removes_a_retired_recovery_journal() {
         let config = test_config("startup-retired-journal");
         std::fs::create_dir_all(&config.data_directory).unwrap();
