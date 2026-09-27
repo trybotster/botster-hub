@@ -2156,6 +2156,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn event_invocations_use_the_production_timeout_by_default() {
+        assert_eq!(EVENT_INVOCATION_TIMEOUT_MS, 1_000);
+        assert_eq!(
+            MaintenanceState::default().event_invocation_timeout_ms(),
+            EVENT_INVOCATION_TIMEOUT_MS
+        );
+    }
+
+    #[test]
     fn source_stays_control_plane() {
         let source = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
