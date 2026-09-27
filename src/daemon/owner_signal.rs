@@ -25,15 +25,26 @@ pub(crate) enum SignalKey {
     PackageEvents,
     /// The package event router's lock was released while a waiter was armed.
     EventRouter,
+    /// The client event plane's connection table was released while armed.
+    EventConnections,
+    /// A client event connection's slot table was released while armed. One
+    /// key serves every connection: a release wakes each armed waiter at most
+    /// once, and a failed retry never raises it.
+    ConnectionSlots,
+    /// A client event connection's residency pool was released while armed.
+    ConnectionPool,
 }
 
 impl SignalKey {
-    const COUNT: usize = 2;
+    const COUNT: usize = 5;
 
     const fn index(self) -> usize {
         match self {
             Self::PackageEvents => 0,
             Self::EventRouter => 1,
+            Self::EventConnections => 2,
+            Self::ConnectionSlots => 3,
+            Self::ConnectionPool => 4,
         }
     }
 }
@@ -43,6 +54,30 @@ impl SignalKey {
 pub(crate) struct Seen {
     key: SignalKey,
     epoch: u64,
+}
+
+/// A registered owner wait that carries the signal its key belongs to, so the
+/// owner can re-check it without knowing which component raised it.
+#[derive(Debug, Clone)]
+pub(crate) struct Parked {
+    signal: Arc<OwnerSignal>,
+    seen: Seen,
+}
+
+impl Parked {
+    /// Whether the key was raised after this wait registered.
+    pub(crate) fn moved(&self) -> bool {
+        self.signal.moved(self.seen)
+    }
+}
+
+/// The owner's outcome for one attempt on a [`SignalingMutex`].
+pub(crate) enum OwnerLock<G> {
+    Locked(G),
+    /// Contention that survived an armed retry: wait on this.
+    Busy(Parked),
+    /// A fault: never wait on it.
+    Poisoned,
 }
 
 /// Epochs and the owner doorbell.
@@ -136,6 +171,31 @@ impl<T> SignalingMutex<T> {
 
     pub(crate) fn is_poisoned(&self) -> bool {
         self.mutex.is_poisoned()
+    }
+
+    /// The owner's attempt: try, and on contention arm and try once more. A
+    /// poisoned lock is reported as a fault at either attempt.
+    pub(crate) fn try_lock_or_arm(&self) -> OwnerLock<SignalingGuard<'_, T>> {
+        match self.try_lock() {
+            Ok(guard) => OwnerLock::Locked(guard),
+            Err(TryLock::Poisoned) => OwnerLock::Poisoned,
+            Err(TryLock::WouldBlock) => {
+                let parked = self.arm_parked();
+                match self.try_lock() {
+                    Ok(guard) => OwnerLock::Locked(guard),
+                    Err(TryLock::Poisoned) => OwnerLock::Poisoned,
+                    Err(TryLock::WouldBlock) => OwnerLock::Busy(parked),
+                }
+            }
+        }
+    }
+
+    /// [`Self::arm`], with the signal that the release raises.
+    pub(crate) fn arm_parked(&self) -> Parked {
+        Parked {
+            signal: Arc::clone(&self.signal),
+            seen: self.arm(),
+        }
     }
 
     /// Register an owner wait on this lock. Call it before the final attempt.
@@ -280,6 +340,28 @@ mod tests {
             "the unwinding holder wakes the armed waiter"
         );
         assert_eq!(mutex.try_lock().err(), Some(TryLock::Poisoned));
+    }
+
+    #[test]
+    fn the_owner_attempt_parks_on_contention_and_reports_poison_as_a_fault() {
+        let signal = Arc::new(OwnerSignal::default());
+        let mutex = SignalingMutex::new(0_u8, Arc::clone(&signal), SignalKey::ConnectionSlots);
+        assert!(matches!(mutex.try_lock_or_arm(), OwnerLock::Locked(_)));
+        let held = mutex.try_lock().expect("free lock");
+        let OwnerLock::Busy(parked) = mutex.try_lock_or_arm() else {
+            panic!("contention parks");
+        };
+        assert!(!parked.moved(), "the failed retry raised nothing");
+        drop(held);
+        assert!(
+            parked.moved(),
+            "the holder's release wakes the parked owner"
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.try_lock().expect("free lock");
+            panic!("poison the lock");
+        }));
+        assert!(matches!(mutex.try_lock_or_arm(), OwnerLock::Poisoned));
     }
 
     #[test]

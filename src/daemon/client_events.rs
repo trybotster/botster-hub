@@ -171,7 +171,7 @@ impl ClientEvents {
 pub(crate) fn admit_connection(
     state: &mut DaemonControlState,
     connection_id: &str,
-) -> Result<(), ClientEventAdmitError> {
+) -> Result<(), crate::subscription::package_events::AdmitRefusal> {
     let reader = state
         .pending_runtime
         .admission
