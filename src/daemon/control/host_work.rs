@@ -283,6 +283,10 @@ pub(crate) struct PackageRecoveryRequired {
     pub(crate) quarantined_at_ms: u64,
     _effect: PackageRuntimeEffect,
     _permit: HostWorkPermit,
+    /// A staged generation whose quarantine phase never ran. The operator
+    /// resolve's router unload discards the pending entry; the token is then
+    /// released with this record.
+    _staged: Option<crate::package_event_router::StagedGeneration>,
 }
 
 impl PackageRecoveryRequired {
@@ -307,6 +311,7 @@ impl PackageRecoveryRequired {
                 .collect(),
             _effect: effect,
             _permit: permit,
+            _staged: None,
         }
     }
 }
@@ -323,12 +328,14 @@ struct PackageQuarantineRow<'a> {
 
 /// Visit every quarantined package once: durable registry records first,
 /// then stranded packages that only this run's recovery records cover, then
-/// stranded packages with no record at all (their Host quarantine phase could
-/// not be submitted), whose failure text is empty.
+/// stranded packages with no record at all, whose failure text is empty.
+/// `stranded` is the set as read under its lock: a Host worker can add to
+/// it, so a count and the copy it admits must read one hold of that lock.
 fn for_each_package_quarantine(
     state: &DaemonControlState,
     registry: &crate::PackageRegistry,
     lifecycle: Option<&crate::HubPluginLifecycle>,
+    stranded: Option<&std::collections::BTreeSet<String>>,
     mut visit: impl FnMut(PackageQuarantineRow<'_>),
 ) {
     let loaded = |name: &str| lifecycle.is_some_and(|lifecycle| lifecycle.is_loaded(name));
@@ -375,21 +382,17 @@ fn for_each_package_quarantine(
             }
         }
     }
-    if let Some(lifecycle) = lifecycle {
-        lifecycle.with_stranded(|stranded| {
-            for package_name in stranded {
-                if !durable(package_name) && !covered_by_package_recovery(state, package_name) {
-                    visit(PackageQuarantineRow {
-                        package_name,
-                        original: "",
-                        compensation: "",
-                        durable: false,
-                        loaded: lifecycle.is_loaded(package_name),
-                        quarantined_at_ms: 0,
-                    });
-                }
-            }
-        });
+    for package_name in stranded.into_iter().flatten() {
+        if !durable(package_name) && !covered_by_package_recovery(state, package_name) {
+            visit(PackageQuarantineRow {
+                package_name,
+                original: "",
+                compensation: "",
+                durable: false,
+                loaded: loaded(package_name),
+                quarantined_at_ms: 0,
+            });
+        }
     }
 }
 
@@ -413,11 +416,12 @@ pub(crate) fn package_quarantine_rows_bytes(
     state: &DaemonControlState,
     registry: &crate::PackageRegistry,
     lifecycle: Option<&crate::HubPluginLifecycle>,
+    stranded: Option<&std::collections::BTreeSet<String>>,
     limit: usize,
 ) -> Option<(usize, usize)> {
     let mut rows = 0usize;
     let mut bytes = Some(0usize);
-    for_each_package_quarantine(state, registry, lifecycle, |row| {
+    for_each_package_quarantine(state, registry, lifecycle, stranded, |row| {
         rows += 1;
         bytes = bytes
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<DaemonQuarantine>()))
@@ -430,14 +434,15 @@ pub(crate) fn package_quarantine_rows_bytes(
 }
 
 /// Append the package Status rows. Call after `package_quarantine_rows_bytes`
-/// admitted them.
+/// admitted them, with the same `stranded` read.
 pub(crate) fn extend_package_quarantine_rows(
     state: &DaemonControlState,
     registry: &crate::PackageRegistry,
     lifecycle: Option<&crate::HubPluginLifecycle>,
+    stranded: Option<&std::collections::BTreeSet<String>>,
     rows: &mut Vec<DaemonQuarantine>,
 ) {
-    for_each_package_quarantine(state, registry, lifecycle, |row| {
+    for_each_package_quarantine(state, registry, lifecycle, stranded, |row| {
         rows.push(DaemonQuarantine::Package {
             package_name: row.package_name.to_string(),
             original: row.original.to_string(),
@@ -1550,7 +1555,7 @@ fn submit_package_quarantine(
     };
     let Some(runtime) = daemon.runtime() else {
         release_document(state, waiter_id);
-        return retain_package_recovery(
+        let poll = retain_package_recovery(
             daemon,
             state,
             waiter_id,
@@ -1561,6 +1566,8 @@ fn submit_package_quarantine(
             },
             permit,
         );
+        keep_staged_with_recovery(state, waiter_id, staged);
+        return poll;
     };
     let command = HostMutationCommand::RestorePackageRuntime(HostPackageRuntimeRestore {
         effect,
@@ -1570,22 +1577,105 @@ fn submit_package_quarantine(
         staged,
         quarantine: Some(failure),
     });
+    let identity = HostJobIdentity {
+        waiter_id,
+        phase: *next_phase,
+    };
+    let command = HostCommand::Mutation(command);
     #[cfg(test)]
-    if FAIL_NEXT_QUARANTINE_SUBMISSION.with(|fail| fail.replace(false)) {
-        return retain_submission(
-            state,
-            HostSubmissionFailure {
-                error: HostSubmitError::Full,
-                identity: HostJobIdentity {
-                    waiter_id,
-                    phase: *next_phase,
-                },
-                command: HostCommand::Mutation(command),
-                permit,
-            },
-        );
+    let refused_for_test = FAIL_NEXT_QUARANTINE_SUBMISSION.with(|fail| fail.replace(false));
+    #[cfg(not(test))]
+    let refused_for_test = false;
+    let submitted = match next_phase.checked_add(1) {
+        None => Err(HostSubmissionFailure {
+            error: HostSubmitError::PhaseExhausted,
+            identity,
+            command,
+            permit,
+        }),
+        Some(_) if refused_for_test => Err(HostSubmissionFailure {
+            error: HostSubmitError::Full,
+            identity,
+            command,
+            permit,
+        }),
+        Some(later_phase) => runtime
+            .host_executor()
+            .submit(identity, command, permit)
+            .map(|()| later_phase),
+    };
+    match submitted {
+        Ok(later_phase) => {
+            *next_phase = later_phase;
+            ControlPoll::Pending
+        }
+        Err(failure) => retain_unsubmitted_quarantine(daemon, state, waiter_id, failure),
     }
-    submit_phase(daemon, state, waiter_id, command, permit, next_phase)
+}
+
+/// The quarantine phase could not be submitted. The packages are already
+/// stranded, so they stay inert while loaded. The refused command's staged
+/// token and the permit go to a package recovery record, not a submission
+/// record: a submission record refuses all Host work, and the operator
+/// resolve must still reach these packages to unload them.
+fn retain_unsubmitted_quarantine(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    failure: HostSubmissionFailure,
+) -> ControlPoll {
+    let HostSubmissionFailure {
+        error,
+        command,
+        permit,
+        ..
+    } = failure;
+    let HostCommand::Mutation(HostMutationCommand::RestorePackageRuntime(restore)) = command else {
+        unreachable!("the quarantine phase submits a runtime restore");
+    };
+    let HostPackageRuntimeRestore {
+        effect,
+        original,
+        staged,
+        quarantine,
+        ..
+    } = restore;
+    crate::hub_log::hub_log!(
+        "package_quarantine_unsubmitted packages={} error={error:?}",
+        effect.package_names().join(",")
+    );
+    let mut rollbacks: Vec<PackageRollbackFailure> = quarantine.into_iter().collect();
+    rollbacks.push(PackageRollbackFailure {
+        step: "quarantine_submission",
+        package_name: None,
+        error: Box::new(DaemonTransportError::Protocol(
+            "the Host quarantine phase could not be submitted",
+        )),
+    });
+    release_document(state, waiter_id);
+    let poll = retain_package_recovery(
+        daemon,
+        state,
+        waiter_id,
+        PackageCompensationFailure {
+            effect,
+            original,
+            rollbacks,
+        },
+        permit,
+    );
+    keep_staged_with_recovery(state, waiter_id, staged);
+    poll
+}
+
+fn keep_staged_with_recovery(
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    staged: Option<crate::package_event_router::StagedGeneration>,
+) {
+    if let Some(HostRecoveryRequired::Package(record)) = state.host_recovery.get_mut(&waiter_id) {
+        record._staged = staged;
+    }
 }
 
 /// A failed compensation: the effect, its original failure, and every
