@@ -864,7 +864,7 @@ impl HostMutationContinuation {
                 }
                 super::host_family::Poll::Complete(result, permit) => {
                     *family_work = None;
-                    (result, permit)
+                    (*result, permit)
                 }
             }
         } else {

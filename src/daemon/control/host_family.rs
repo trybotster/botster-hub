@@ -14,7 +14,8 @@ use crate::runtime::family_cleanup::CleanupPhase;
 pub(crate) enum Poll {
     Pending,
     Again,
-    Complete(HostMutationResult, HostWorkPermit),
+    /// Boxed: a mutation result is several hundred bytes; the other states are empty.
+    Complete(Box<HostMutationResult>, HostWorkPermit),
     Fault,
 }
 
@@ -217,7 +218,7 @@ impl FamilyWork {
             drop(self.handle.take());
             let (_, _, permit) = self.completion.take().unwrap().into_parts();
             if next == CleanupPhase::Complete {
-                return Poll::Complete(self.result.take().unwrap(), permit);
+                return Poll::Complete(Box::new(self.result.take().unwrap()), permit);
             }
             self.permit = Some(permit);
             self.identity = None;

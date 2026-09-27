@@ -895,12 +895,8 @@ impl ManagedSpawnOperation {
     /// the sole release owner. A removal during launch settles here first.
     fn settle_undelivered_token(&mut self, runtime: &crate::HubRuntime) -> ControlPoll {
         let spawn = self.spawn.as_mut().expect("managed Core spawn exists");
-        let tracked = spawn
-            .reservation
-            .as_ref()
-            .is_some()
-            .then(|| runtime.created_worktree_cleanup_tracks(spawn.session_id()))
-            .unwrap_or(true);
+        let tracked = spawn.reservation.is_none()
+            || runtime.created_worktree_cleanup_tracks(spawn.session_id());
         if !tracked && !spawn.begin_handoff(runtime) {
             self.phase = Phase::Handoff;
             return ControlPoll::Pending;
