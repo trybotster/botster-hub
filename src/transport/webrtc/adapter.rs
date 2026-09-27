@@ -1703,4 +1703,43 @@ mod tests {
             }
         }
     }
+
+    /// S5: a close wakes a transport parked on a full ingress, and its retry
+    /// is refused `Closed`, so the route ends typed and never parks again.
+    /// The slot commits the close cause before `clear()` raises the permit.
+    #[test]
+    fn a_close_wakes_a_parked_input_retry_into_closed() {
+        use crate::transport::shared::ingress::IngressStore;
+        use botster_core::contract::terminal_adapter::MIN_ADAPTER_INGRESS_BUFFER_FRAMES;
+        use botster_terminal_protocol::{
+            INPUT_HEADER_BYTES, TERMINAL_INPUT_SCHEME_VERSION, TerminalInputKind,
+        };
+        fn input_frame(index: u64) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(INPUT_HEADER_BYTES + 1);
+            bytes.push(TERMINAL_INPUT_SCHEME_VERSION);
+            bytes.push(TerminalInputKind::RawBytes.as_byte());
+            bytes.extend_from_slice(&1_u16.to_be_bytes());
+            bytes.extend_from_slice(&(index + 1).to_be_bytes());
+            bytes.push(b'x');
+            bytes
+        }
+        let (_adapter, handle) = WebRtcTerminalAdapter::pair();
+        for index in 0..MIN_ADAPTER_INGRESS_BUFFER_FRAMES as u64 {
+            assert_eq!(
+                handle.try_push_ingress(input_frame(index)),
+                IngressStore::Stored
+            );
+        }
+        let IngressStore::Full(parked) = handle.try_push_ingress(input_frame(64)) else {
+            panic!("the 65th frame meets a full ingress");
+        };
+        handle.close();
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut room = std::pin::pin!(handle.ingress_room());
+        assert!(
+            room.as_mut().poll(&mut context).is_ready(),
+            "a close wakes the parked transport"
+        );
+        assert_eq!(handle.try_push_ingress(parked), IngressStore::Closed);
+    }
 }
