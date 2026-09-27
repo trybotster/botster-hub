@@ -4259,7 +4259,11 @@ mod tests {
             thread::yield_now();
         }
         let response = receive_test_control_reply(reply).expect("a typed response");
-        assert!(response.error.is_some(), "{response:?}");
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("PROBE"),
+            "{response:?}"
+        );
         drop(blocker);
         drop(blocker_permit);
         daemon.stop();
