@@ -50,7 +50,8 @@ pub(crate) fn validate_local_webrtc_bootstrap(
     package_name: &str,
     entrypoint_id: &str,
     origin: &str,
-) -> Result<String, DaemonResponse> {
+    // Boxed: DaemonResponse is about 6 KB.
+) -> Result<String, Box<DaemonResponse>> {
     if package_name != "botster-web" || entrypoint_id != "web-client" {
         return Err(local_webrtc_bootstrap_issue_error(
             "local_webrtc_bootstrap_unsupported_entrypoint",

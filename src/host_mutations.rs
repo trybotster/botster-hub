@@ -111,14 +111,14 @@ pub(crate) fn execute(
                         origin,
                     };
                 }
-                Err(response) => HostReply::try_new(response).map(HostMutationResult::ReadReady),
+                Err(response) => HostReply::try_new(*response).map(HostMutationResult::ReadReady),
             }
         }
         HostMutationCommand::Read(read) => {
-            execute_read(read, entrypoints).map(HostMutationResult::ReadReady)
+            execute_read(*read, entrypoints).map(HostMutationResult::ReadReady)
         }
         HostMutationCommand::Prepare(prepare) => {
-            execute_prepare(prepare, entrypoints).map(HostMutationResult::Prepared)
+            execute_prepare(*prepare, entrypoints).map(HostMutationResult::Prepared)
         }
         HostMutationCommand::Commit(commit) => return execute_commit(commit),
         HostMutationCommand::Recover(recover) => {
@@ -142,8 +142,9 @@ pub(crate) enum HostMutationCommand {
         base_revision: u64,
         packages: SharedView<PackageRegistry>,
     },
-    Read(HostRead),
-    Prepare(HostPrepare),
+    // Boxed: each carries a DaemonRequest and most carry a HubConfig inline.
+    Read(Box<HostRead>),
+    Prepare(Box<HostPrepare>),
     Commit(HostCommit),
     Recover(HostRecover),
     RestorePackage(HostPackageRestore),
@@ -152,14 +153,20 @@ pub(crate) enum HostMutationCommand {
 
 impl HostMutationCommand {
     pub(crate) fn uses_entrypoints(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::ApplyPackageEffect(_)
-                | Self::RestorePackageRuntime(_)
-                | Self::ValidateBootstrap { .. }
-                | Self::Read(HostRead::Package { .. } | HostRead::Entrypoint { .. })
-                | Self::Prepare(HostPrepare::Package { .. })
-        )
+            | Self::RestorePackageRuntime(_)
+            | Self::ValidateBootstrap { .. } => true,
+            Self::Read(read) => matches!(
+                **read,
+                HostRead::Package { .. } | HostRead::Entrypoint { .. }
+            ),
+            Self::Prepare(prepare) => matches!(**prepare, HostPrepare::Package { .. }),
+            Self::Commit(_)
+            | Self::Recover(_)
+            | Self::RestorePackage(_)
+            | Self::RecordPackageQuarantine(_) => false,
+        }
     }
 }
 
@@ -169,17 +176,19 @@ impl std::fmt::Debug for HostMutationCommand {
             Self::ApplyPackageEffect(_) => "ApplyPackageEffect",
             Self::RestorePackageRuntime(_) => "RestorePackageRuntime",
             Self::ValidateBootstrap { .. } => "ValidateBootstrap",
-            Self::Read(HostRead::Entrypoint { .. }) => "Entrypoint",
-            Self::Read(HostRead::Package { .. }) => "ReadPackage",
-            Self::Read(HostRead::SpawnTarget { .. }) => "ReadSpawnTarget",
-            Self::Read(HostRead::SessionType { .. }) => "ReadSessionType",
-            Self::Prepare(HostPrepare::Package { .. }) => "PreparePackage",
-            Self::Prepare(HostPrepare::SpawnTarget { .. }) => "PrepareSpawnTarget",
-            Self::Prepare(HostPrepare::SessionType { .. }) => "PrepareSessionType",
-            Self::Prepare(HostPrepare::ManagedWorktree { .. }) => "PrepareManagedWorktree",
-            Self::Prepare(HostPrepare::RemoveManagedWorktree { .. }) => {
-                "PrepareRemoveManagedWorktree"
-            }
+            Self::Read(read) => match **read {
+                HostRead::Entrypoint { .. } => "Entrypoint",
+                HostRead::Package { .. } => "ReadPackage",
+                HostRead::SpawnTarget { .. } => "ReadSpawnTarget",
+                HostRead::SessionType { .. } => "ReadSessionType",
+            },
+            Self::Prepare(prepare) => match **prepare {
+                HostPrepare::Package { .. } => "PreparePackage",
+                HostPrepare::SpawnTarget { .. } => "PrepareSpawnTarget",
+                HostPrepare::SessionType { .. } => "PrepareSessionType",
+                HostPrepare::ManagedWorktree { .. } => "PrepareManagedWorktree",
+                HostPrepare::RemoveManagedWorktree { .. } => "PrepareRemoveManagedWorktree",
+            },
             Self::Commit(_) => "Commit",
             Self::Recover(_) => "Recover",
             Self::RestorePackage(_) => "RestorePackage",
@@ -3428,10 +3437,10 @@ mod tests {
         };
         drop(target_id);
         let HostMutationResult::ReadReady(reply) =
-            execute(HostMutationCommand::Read(HostRead::SpawnTarget {
+            execute(HostMutationCommand::Read(Box::new(HostRead::SpawnTarget {
                 request,
                 state,
-            }))
+            })))
         else {
             panic!("spawn-target read must succeed");
         };
@@ -3460,11 +3469,11 @@ mod tests {
         let (_state, packages, directory, _authority) = inputs("package-read");
         let config = test_config(directory);
         let HostMutationResult::ReadReady(reply) =
-            execute(HostMutationCommand::Read(HostRead::Package {
+            execute(HostMutationCommand::Read(Box::new(HostRead::Package {
                 request: DaemonRequest::ListPackages,
                 config,
                 packages,
-            }))
+            })))
         else {
             panic!("package read must succeed");
         };
@@ -3507,11 +3516,11 @@ mod tests {
             },
         ];
         for request in requests {
-            let result = execute(HostMutationCommand::Read(HostRead::Package {
+            let result = execute(HostMutationCommand::Read(Box::new(HostRead::Package {
                 request,
                 config: config.clone(),
                 packages: packages.clone(),
-            }));
+            })));
             if let HostMutationResult::Failed(error) = result {
                 assert_ne!(error.code, "unsupported_host_mutation");
             }
@@ -3534,8 +3543,8 @@ mod tests {
             DaemonRequest::RefreshLocalPackages,
         ];
         for request in requests {
-            let HostMutationResult::Prepared(prepared) =
-                execute(HostMutationCommand::Prepare(HostPrepare::Package {
+            let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+                Box::new(HostPrepare::Package {
                     request,
                     base_revision: 3,
                     authority: authority.clone(),
@@ -3543,8 +3552,8 @@ mod tests {
                     packages: packages.clone(),
                     data_directory: data_directory.clone(),
                     stranded: Default::default(),
-                }))
-            else {
+                }),
+            )) else {
                 panic!("package preparation must succeed");
             };
             let PreparedChange::PackageConfiguration(change) = prepared.change else {
@@ -3707,15 +3716,17 @@ mod tests {
             DaemonRequest::EnablePackageLocalPath { path: missing_path },
         ];
         for request in requests {
-            let result = execute(HostMutationCommand::Prepare(HostPrepare::Package {
-                request,
-                base_revision: 3,
-                authority: authority.clone(),
-                state: state.clone(),
-                packages: packages.clone(),
-                data_directory: data_directory.clone(),
-                stranded: Default::default(),
-            }));
+            let result = execute(HostMutationCommand::Prepare(Box::new(
+                HostPrepare::Package {
+                    request,
+                    base_revision: 3,
+                    authority: authority.clone(),
+                    state: state.clone(),
+                    packages: packages.clone(),
+                    data_directory: data_directory.clone(),
+                    stranded: Default::default(),
+                },
+            )));
             if let HostMutationResult::Failed(error) = result {
                 assert_ne!(error.code, "unsupported_host_mutation");
             }
@@ -3727,12 +3738,12 @@ mod tests {
         let (config, state, packages, data_directory, _target_id, _authority) =
             session_type_inputs("session-type-read");
         let HostMutationResult::ReadReady(reply) =
-            execute(HostMutationCommand::Read(HostRead::SessionType {
+            execute(HostMutationCommand::Read(Box::new(HostRead::SessionType {
                 request: DaemonRequest::ListSessionTypes,
                 config,
                 state,
                 packages,
-            }))
+            })))
         else {
             panic!("session-type read must succeed");
         };
@@ -3748,8 +3759,8 @@ mod tests {
         let value = PackageConfigurationValue::String {
             value: "updated".to_string(),
         };
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::Package {
+        let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::Package {
                 request: DaemonRequest::SetPackageConfiguration {
                     package_name: "configured.plugin".to_string(),
                     values: BTreeMap::from([(
@@ -3763,8 +3774,8 @@ mod tests {
                 packages: packages.clone(),
                 data_directory,
                 stranded: Default::default(),
-            }))
-        else {
+            }),
+        )) else {
             panic!("package configuration prepare must succeed");
         };
         assert_eq!(prepared.base_revision, 9);
@@ -3784,16 +3795,16 @@ mod tests {
         let (state, packages, data_directory, authority) = inputs("prepare-only");
         let original = (*state).clone();
         let state_path = data_directory.join("hub-state.json");
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+        let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::SpawnTarget {
                 request: create_target_request("prepared-target".to_string()),
                 base_revision: 41,
                 authority,
                 state: state.clone(),
                 packages,
                 data_directory,
-            }))
-        else {
+            }),
+        )) else {
             panic!("spawn-target prepare must succeed");
         };
         assert_eq!(prepared.base_revision, 41);
@@ -3810,16 +3821,16 @@ mod tests {
     #[test]
     fn commit_publishes_the_candidate_and_advances_one_revision() {
         let (state, packages, data_directory, authority) = persisted_inputs("commit");
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+        let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::SpawnTarget {
                 request: create_target_request("committed-target".to_string()),
                 base_revision: 7,
                 authority,
                 state,
                 packages,
                 data_directory: data_directory.clone(),
-            }))
-        else {
+            }),
+        )) else {
             panic!("spawn-target prepare must succeed");
         };
         let HostMutationResult::Committed(committed) =
@@ -3846,16 +3857,16 @@ mod tests {
         let expected = (*state).clone();
         let prior_bytes =
             fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+        let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::SpawnTarget {
                 request: create_target_request("recovered-target".to_string()),
                 base_revision: 2,
                 authority,
                 state,
                 packages,
                 data_directory: data_directory.clone(),
-            }))
-        else {
+            }),
+        )) else {
             panic!("spawn-target prepare must succeed");
         };
         FileHubStateStore::inject_next_save_failure(&data_directory);
@@ -3877,16 +3888,16 @@ mod tests {
     fn uncertain_commit_keeps_both_views_and_does_not_run_recovery() {
         let (state, packages, data_directory, authority) = persisted_inputs("uncertain-commit");
         let expected = (*state).clone();
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+        let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::SpawnTarget {
                 request: create_target_request("uncertain-target".to_string()),
                 base_revision: 2,
                 authority,
                 state,
                 packages,
                 data_directory: data_directory.clone(),
-            }))
-        else {
+            }),
+        )) else {
             panic!("spawn-target preparation must succeed");
         };
         FileHubStateStore::inject_next_directory_sync_failure(&data_directory);
@@ -3923,8 +3934,8 @@ mod tests {
         let repo_file = data_directory.join("repo/.botster/session-types.json");
         let prior_state_bytes =
             fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
+        let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::SessionType {
                 request: session_type_create_request(target_id),
                 base_revision: 11,
                 authority,
@@ -3932,8 +3943,8 @@ mod tests {
                 state,
                 packages,
                 data_directory: data_directory.clone(),
-            }))
-        else {
+            }),
+        )) else {
             panic!("session-type prepare must succeed");
         };
         assert!(!repo_file.exists());
@@ -3960,8 +3971,8 @@ mod tests {
         let root = data_directory.join("repo");
         let prior_state_bytes =
             fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
+        let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::SessionType {
                 request: session_type_create_request(target_id),
                 base_revision: 4,
                 authority,
@@ -3969,8 +3980,8 @@ mod tests {
                 state,
                 packages,
                 data_directory: data_directory.clone(),
-            }))
-        else {
+            }),
+        )) else {
             panic!("session-type prepare must succeed");
         };
         // A file where the .botster directory belongs fails before any rename.
@@ -3995,8 +4006,8 @@ mod tests {
     fn uncertain_device_session_type_commit_retains_its_document_rollback() {
         let (config, state, packages, data_directory, _target_id, authority) =
             session_type_inputs("session-type-uncertain");
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
+        let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::SessionType {
                 request: device_session_type_create_request(),
                 base_revision: 4,
                 authority,
@@ -4004,8 +4015,8 @@ mod tests {
                 state,
                 packages,
                 data_directory: data_directory.clone(),
-            }))
-        else {
+            }),
+        )) else {
             panic!("session-type preparation must succeed");
         };
         FileHubStateStore::inject_next_directory_sync_failure(&data_directory);
@@ -4032,8 +4043,8 @@ mod tests {
         let repo_file = root.join(".botster/session-types.json");
         let prior_state_bytes =
             fs::read(data_directory.join("hub-state.json")).expect("read initial state fixture");
-        let HostMutationResult::Prepared(prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::SessionType {
+        let HostMutationResult::Prepared(prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::SessionType {
                 request: session_type_create_request(target_id),
                 base_revision: 4,
                 authority,
@@ -4041,8 +4052,8 @@ mod tests {
                 state,
                 packages,
                 data_directory: data_directory.clone(),
-            }))
-        else {
+            }),
+        )) else {
             panic!("session-type preparation must succeed");
         };
         crate::session_types::inject_next_repo_directory_sync_failure(&root);
@@ -4172,16 +4183,16 @@ mod tests {
     #[test]
     fn family_mismatch_is_rejected_before_commit() {
         let (state, packages, data_directory, authority) = inputs("family-mismatch");
-        let HostMutationResult::Prepared(mut prepared) =
-            execute(HostMutationCommand::Prepare(HostPrepare::SpawnTarget {
+        let HostMutationResult::Prepared(mut prepared) = execute(HostMutationCommand::Prepare(
+            Box::new(HostPrepare::SpawnTarget {
                 request: create_target_request("mismatch-target".to_string()),
                 base_revision: 1,
                 authority,
                 state: state.clone(),
                 packages,
                 data_directory,
-            }))
-        else {
+            }),
+        )) else {
             panic!("spawn-target prepare must succeed");
         };
         prepared.rollback = RollbackDescriptor::PackageConfiguration { previous: state };

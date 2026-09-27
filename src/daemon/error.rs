@@ -203,7 +203,7 @@ pub(crate) fn daemon_local_webrtc_error(error: crate::LocalWebrtcError) -> Daemo
 pub(crate) fn local_webrtc_bootstrap_issue_error(
     code: &str,
     message: impl Into<String>,
-) -> DaemonResponse {
+) -> Box<DaemonResponse> {
     let message = message.into();
     let diagnostic =
         DaemonDiagnostic::action_failure("issue_local_webrtc_bootstrap", message.clone());
@@ -216,7 +216,7 @@ pub(crate) fn local_webrtc_bootstrap_issue_error(
         diagnostics: vec![diagnostic.clone()],
     });
     response.diagnostics = vec![diagnostic];
-    response
+    Box::new(response)
 }
 
 pub(crate) fn daemon_app_launch_error(

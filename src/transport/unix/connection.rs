@@ -502,7 +502,7 @@ async fn deliver_completed_request(
             charge,
             delivery,
         } => {
-            let response = response?;
+            let response = (*response)?;
             cleanup.apply_subscription_change(
                 completed.projection.attached_subscription_change(&response),
             );

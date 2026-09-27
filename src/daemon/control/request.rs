@@ -307,7 +307,7 @@ fn finish(
     else {
         return send_control_reply(reply_tx, response, response_delivery_rx);
     };
-    let response = response.or_else(|error| match error {
+    let response = (*response).or_else(|error| match error {
         DaemonTransportError::Client(error) => Ok(daemon_operator_error(error)),
         DaemonTransportError::Package(error) => Ok(daemon_package_error(error)),
         DaemonTransportError::SpawnTarget(error) => Ok(daemon_spawn_target_error(error)),
@@ -447,7 +447,7 @@ fn finish(
     send_control_reply(
         reply_tx,
         ControlReply::Typed {
-            response,
+            response: Box::new(response),
             charge: plugin_result_charge,
             delivery,
         },
