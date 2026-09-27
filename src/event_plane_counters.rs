@@ -391,6 +391,12 @@ pub struct EventPlaneCounters {
     /// had already unloaded the previous generation. Hub-local until a
     /// protocol revision exposes it.
     replacements_stranded: AtomicU64,
+    /// Deliveries retired because the consumer generation they matched is no
+    /// longer installed, the plugin is unloaded, or the handler is absent.
+    /// Hub-local until a protocol revision exposes them.
+    deliveries_generation_unloaded: AtomicU64,
+    deliveries_package_unloaded: AtomicU64,
+    deliveries_handler_absent: AtomicU64,
     global_in_flight_bytes: AtomicU64,
     registry: RwLock<HashMap<AgeIdentity, AgeRegistryEntry>>,
 }
@@ -438,6 +444,9 @@ impl EventPlaneCounters {
             max_ready_operation_wait_us: AtomicU64::new(0),
             stalled_write_timeouts: AtomicU64::new(0),
             replacements_stranded: AtomicU64::new(0),
+            deliveries_generation_unloaded: AtomicU64::new(0),
+            deliveries_package_unloaded: AtomicU64::new(0),
+            deliveries_handler_absent: AtomicU64::new(0),
             global_in_flight_bytes: AtomicU64::new(0),
             registry: RwLock::new(HashMap::new()),
         }
@@ -556,6 +565,25 @@ impl EventPlaneCounters {
 
     pub(crate) fn replacements_stranded(&self) -> u64 {
         self.replacements_stranded.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_delivery_refusal(&self, reason: crate::lifecycle::EventDeliveryRefusal) {
+        self.delivery_refusal_counter(reason)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn delivery_refusals(&self, reason: crate::lifecycle::EventDeliveryRefusal) -> u64 {
+        self.delivery_refusal_counter(reason)
+            .load(Ordering::Relaxed)
+    }
+
+    fn delivery_refusal_counter(&self, reason: crate::lifecycle::EventDeliveryRefusal) -> &AtomicU64 {
+        use crate::lifecycle::EventDeliveryRefusal;
+        match reason {
+            EventDeliveryRefusal::GenerationUnloaded => &self.deliveries_generation_unloaded,
+            EventDeliveryRefusal::PackageUnloaded => &self.deliveries_package_unloaded,
+            EventDeliveryRefusal::HandlerAbsent => &self.deliveries_handler_absent,
+        }
     }
 
     /// Control-path insert. Event paths must not call this.

@@ -147,7 +147,42 @@ pub struct HubPluginLifecycle {
     load_failures: Arc<Mutex<BTreeMap<String, HubPluginLoadFailure>>>,
     descriptors: Arc<Mutex<BTreeMap<String, Vec<PluginOwnedDescriptor>>>>,
     entity_providers: EntityProviderRegistrations,
-    event_handlers: Arc<Mutex<BTreeMap<String, Vec<HubPluginEventHandler>>>>,
+    event_handlers: Arc<Mutex<BTreeMap<String, PluginEventInstall>>>,
+}
+
+/// One plugin's installed event handlers and the event generation they serve.
+///
+/// A delivery may reach these handlers only when it matched under exactly
+/// `generation`. While the plugin's Core worker is being replaced the entry
+/// is `swapping` with no handlers, so no lookup can return a handler whose
+/// worker Core is replacing.
+///
+/// Uncharged by ruling: at most one entry per live Lua VM, and loading
+/// reserves `per_vm_bytes` of `total_vm_bytes` (config.rs `lua_memory_limits`;
+/// lua_runtime.rs `new_named` → `reserve_vm`), so at most 8 entries exist.
+/// The generation and swap marker add 16 bytes to each: 8 × 16 = 128 bytes.
+#[derive(Default)]
+pub(crate) struct PluginEventInstall {
+    handlers: Vec<HubPluginEventHandler>,
+    generation: u64,
+    swapping: bool,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<PluginEventInstall>()
+        == std::mem::size_of::<Vec<HubPluginEventHandler>>() + 16
+);
+
+/// Why an event delivery was refused a handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventDeliveryRefusal {
+    /// The delivery matched under a generation that is no longer installed,
+    /// or the plugin's worker is being replaced.
+    GenerationUnloaded,
+    /// No install exists for the plugin: it was disabled or removed.
+    PackageUnloaded,
+    /// The installed generation matches but it has no such handler.
+    HandlerAbsent,
 }
 
 impl HubPluginLifecycle {
@@ -213,6 +248,7 @@ impl HubPluginLifecycle {
             event_handlers,
             entity_providers,
             registration,
+            event_generation: 0,
         })
     }
 
@@ -229,7 +265,19 @@ impl HubPluginLifecycle {
             event_handlers,
             entity_providers,
             registration,
+            event_generation,
         } = prepared;
+        // Swap begin: no lookup may return the previous handlers once Core
+        // starts replacing their worker.
+        {
+            let mut installs = self
+                .event_handlers
+                .lock()
+                .expect("hub plugin lifecycle event handlers lock");
+            let install = installs.entry(plugin_key.0.clone()).or_default();
+            install.handlers.clear();
+            install.swapping = true;
+        }
         // Core must stop the previous worker before its registrations change.
         // The registration index remains unlocked while Core joins workers.
         let cleanup = self.engine.unload_plugin(PluginUnloadSpec {
@@ -247,10 +295,19 @@ impl HubPluginLifecycle {
             .lock()
             .expect("hub plugin lifecycle descriptors lock")
             .insert(plugin_key.0.clone(), descriptors);
+        // Swap end: the new worker is loaded, so its handlers and generation
+        // become visible together.
         self.event_handlers
             .lock()
             .expect("hub plugin lifecycle event handlers lock")
-            .insert(plugin_key.0.clone(), event_handlers);
+            .insert(
+                plugin_key.0.clone(),
+                PluginEventInstall {
+                    handlers: event_handlers,
+                    generation: event_generation,
+                    swapping: false,
+                },
+            );
         self.load_failures
             .lock()
             .expect("hub plugin lifecycle load failures lock")
@@ -426,27 +483,59 @@ impl HubPluginLifecycle {
         self.event_handlers_for_page(event_name, None, usize::MAX).0
     }
 
-    /// Return the handler for one exact owner+name subscription on a plugin.
-    #[must_use]
+    /// Return the handler for one delivery, only under the event generation
+    /// the delivery matched.
     pub fn event_handler_for(
         &self,
         plugin_key: &str,
+        plugin_generation: u64,
         owner: &str,
         event_name: &str,
         handler_id: &str,
-    ) -> Option<HubPluginEventHandler> {
-        self.event_handlers
+    ) -> Result<HubPluginEventHandler, EventDeliveryRefusal> {
+        let installs = self
+            .event_handlers
             .lock()
-            .expect("hub plugin lifecycle event handlers lock")
-            .get(plugin_key)
-            .into_iter()
-            .flatten()
-            .find(|handler| {
-                handler.event_owner == owner
-                    && handler.event_name == event_name
-                    && handler.handler.handler_id == handler_id
-            })
-            .cloned()
+            .expect("hub plugin lifecycle event handlers lock");
+        installed_event_handler(
+            &installs,
+            plugin_key,
+            plugin_generation,
+            owner,
+            event_name,
+            handler_id,
+        )
+        .cloned()
+    }
+
+    /// Admit one event delivery while its matched generation stays installed.
+    ///
+    /// The generation check and Core's admission run under one lock, and a
+    /// swap marks the plugin before Core replaces its worker, so an admitted
+    /// delivery always reaches the worker of the generation it matched.
+    /// Core's admission does not block, so the lock is never held across a
+    /// worker join.
+    pub fn try_admit_event(
+        &self,
+        plugin_generation: u64,
+        owner: &str,
+        event_name: &str,
+        class: PluginInvocationClass,
+        request: PluginInvocationRequest,
+    ) -> Result<PluginAdmissionResult, EventDeliveryRefusal> {
+        let installs = self
+            .event_handlers
+            .lock()
+            .expect("hub plugin lifecycle event handlers lock");
+        installed_event_handler(
+            &installs,
+            &request.handler.plugin_key.0,
+            plugin_generation,
+            owner,
+            event_name,
+            &request.handler.handler_id,
+        )?;
+        Ok(self.try_admit(class, request))
     }
 
     /// Return one bounded page of Event-kind handlers for an exact event name.
@@ -472,7 +561,7 @@ impl HubPluginLifecycle {
         let mut last_key = after_plugin_key.map(str::to_string);
         let mut visited = 0;
         let mut more = false;
-        for (key, handlers) in lock.range::<str, _>((start, std::ops::Bound::Unbounded)) {
+        for (key, install) in lock.range::<str, _>((start, std::ops::Bound::Unbounded)) {
             if visited >= max_items {
                 more = true;
                 break;
@@ -480,7 +569,8 @@ impl HubPluginLifecycle {
             last_key = Some(key.clone());
             visited += 1;
             page.extend(
-                handlers
+                install
+                    .handlers
                     .iter()
                     .filter(|handler| handler.event_name == event_name)
                     .cloned(),
@@ -498,6 +588,7 @@ impl HubPluginLifecycle {
             .expect("hub plugin lifecycle event handlers lock")
             .entry(plugin_key.to_string())
             .or_default()
+            .handlers
             .push(HubPluginEventHandler {
                 event_owner: "hub".to_string(),
                 event_name: event_name.to_string(),
@@ -606,6 +697,32 @@ pub enum HubLifecycleError {
     MissingEntrypoint { package_name: String },
 }
 
+/// The installed handler a delivery matched, or why it has none.
+fn installed_event_handler<'a>(
+    installs: &'a BTreeMap<String, PluginEventInstall>,
+    plugin_key: &str,
+    plugin_generation: u64,
+    owner: &str,
+    event_name: &str,
+    handler_id: &str,
+) -> Result<&'a HubPluginEventHandler, EventDeliveryRefusal> {
+    let install = installs
+        .get(plugin_key)
+        .ok_or(EventDeliveryRefusal::PackageUnloaded)?;
+    if install.swapping || install.generation != plugin_generation {
+        return Err(EventDeliveryRefusal::GenerationUnloaded);
+    }
+    install
+        .handlers
+        .iter()
+        .find(|handler| {
+            handler.event_owner == owner
+                && handler.event_name == event_name
+                && handler.handler.handler_id == handler_id
+        })
+        .ok_or(EventDeliveryRefusal::HandlerAbsent)
+}
+
 /// Result alias for hub lifecycle operations that can fail before core load.
 pub type HubLifecycleResult<T> = Result<T, HubLifecycleError>;
 
@@ -619,12 +736,19 @@ pub struct PreparedPluginLoad {
     event_handlers: Vec<HubPluginEventHandler>,
     entity_providers: entity_providers::PreparedEntityProviders,
     registration: PluginWorkerRegistration,
+    event_generation: u64,
 }
 
 impl PreparedPluginLoad {
     #[must_use]
     pub fn package_name(&self) -> &str {
         &self.plugin_key.0
+    }
+
+    /// The package event generation this install's subscriptions are staged
+    /// under. Deliveries matched under any other generation are refused.
+    pub(crate) fn set_event_generation(&mut self, generation: u64) {
+        self.event_generation = generation;
     }
 }
 

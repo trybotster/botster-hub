@@ -3891,12 +3891,7 @@ impl HubRuntime {
             }
 
             for delivery in pulled {
-                let Some(handler) = self.package_event_handler(
-                    &delivery.holder.plugin_key,
-                    &delivery.owner,
-                    &delivery.name,
-                    &delivery.holder.handler_id,
-                ) else {
+                let Ok(handler) = self.package_event_handler(&delivery) else {
                     pending.push(PendingTestEvent::Complete {
                         delivery,
                         scope: None,
@@ -4041,17 +4036,49 @@ impl HubRuntime {
             .unwrap_or(0)
     }
 
-    /// Look up one exact package-event handler.
-    #[must_use]
+    /// Look up the handler for one delivery, only under the consumer plugin
+    /// generation its subscription was admitted with.
     pub fn package_event_handler(
         &self,
-        plugin_key: &str,
-        owner: &str,
-        event_name: &str,
-        handler_id: &str,
-    ) -> Option<crate::lifecycle::HubPluginEventHandler> {
-        self.plugin_lifecycle()
-            .event_handler_for(plugin_key, owner, event_name, handler_id)
+        delivery: &crate::package_event_router::ReadyDelivery,
+    ) -> Result<crate::lifecycle::HubPluginEventHandler, crate::lifecycle::EventDeliveryRefusal>
+    {
+        self.plugin_lifecycle().event_handler_for(
+            &delivery.holder.plugin_key,
+            delivery.holder.plugin_generation,
+            &delivery.owner,
+            &delivery.name,
+            &delivery.holder.handler_id,
+        )
+    }
+
+    /// Admit one package-event delivery while the generation it matched is
+    /// still installed.
+    pub fn try_admit_package_event(
+        &self,
+        delivery: &crate::package_event_router::ReadyDelivery,
+        class: PluginInvocationClass,
+        request: PluginInvocationRequest,
+    ) -> Result<PluginAdmissionResult, crate::lifecycle::EventDeliveryRefusal> {
+        if std::env::var("BOTSTER_ENV").as_deref() == Ok("test")
+            && self
+                .force_plugin_admit_backpressure
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(PluginAdmissionResult::Backpressured {
+                request_id: request.request_id,
+                class,
+                reason: "test-forced plugin admission backpressure".to_string(),
+                backpressure: None,
+            });
+        }
+        self.plugin_lifecycle().try_admit_event(
+            delivery.holder.plugin_generation,
+            &delivery.owner,
+            &delivery.name,
+            class,
+            request,
+        )
     }
 
     /// Admit one plugin invocation without waiting.
