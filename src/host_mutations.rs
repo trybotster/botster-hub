@@ -2050,7 +2050,8 @@ fn prepare_session_type(
         pretty_encoded_len(&candidate, "host_prepared_state_encode_failed")?
     };
     // The retained repository change: its root, the exact encoded file bytes,
-    // and the evidence the owner copies (root, target path, and id again).
+    // and the evidence (its root, its target path, which is the root joined
+    // with one separator to the target, and the id).
     let repo_write_bytes = repo_write
         .as_ref()
         .map(|(root, definitions)| {
@@ -2066,6 +2067,7 @@ fn prepare_session_type(
                 std::mem::size_of::<RepoWriteEvidence>(),
                 root_len,
                 root_len,
+                1,
                 REPO_SESSION_TYPES_TARGET.len(),
                 session_type_id.len(),
             ])
@@ -3707,12 +3709,14 @@ mod tests {
             }
             _ => panic!("a repository prepare carries its file bytes"),
         };
+        // Measure what is actually retained, not the formula under test.
         assert!(
             prepared.logical_bytes
-                >= file_len
+                >= root_len
+                    + file_len
                     + std::mem::size_of::<RepoWriteEvidence>()
-                    + 3 * root_len
-                    + REPO_SESSION_TYPES_TARGET.len()
+                    + evidence.root.as_os_str().len()
+                    + evidence.target_path.as_os_str().len()
                     + evidence.session_type_id.len(),
             "the Host bound counts the retained file bytes and the copied evidence"
         );
