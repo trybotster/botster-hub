@@ -425,6 +425,19 @@ fn capture_seed(
         occupancy: Vec::new(),
         terminal_records: Vec::new(),
         quarantines: Vec::new(),
+        reservation_faults: {
+            let executor = daemon
+                .runtime()
+                .expect("the admitted daemon is running")
+                .host_executor();
+            crate::status_response::ReservationFaults {
+                staging_funding: executor.outstanding_holder_faults(
+                    crate::host_executor::ReservationHolder::StagingFunding,
+                ),
+                entity_work: executor
+                    .outstanding_holder_faults(crate::host_executor::ReservationHolder::EntityWork),
+            }
+        },
     });
     input
 }

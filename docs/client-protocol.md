@@ -125,7 +125,7 @@ The current descriptor includes:
 - supported features: sessions, session and plugin entity subscriptions, terminal streaming, resize, terminal readback,
   plugin surface render, plugin surface action dispatch, package navigation
   discovery, and hub-owned spawn targets;
-- conformance fixture revision 51.
+- conformance fixture revision 52.
 
 Conformance fixture revision 51 changes the plugin contract matrix fixture: it
 reads the result shape of `botster.capabilities.config.get()`
@@ -1678,6 +1678,22 @@ clients that need incremental READY-then-history use
 success path a real opaque FINISH Snapshot precedes `attached`. A production
 socket adapter receives READY before later PAGE/FINISH frames. There is no
 host `Drain` JSON request.
+
+## Host-control protocol 12
+
+`PROTOCOL_VERSION` is 12 and `CONFORMANCE_FIXTURE_REVISION` is 52. This is a
+cold cut: a protocol-11 client fails closed at `ensure_compatible()`, with no
+negotiation and no fallback path. Protocol 12 adds:
+- the `ReadPluginLogs` request and its `PluginLogs` response (see "Plugin
+  Logs"); each record carries its load's `generation` and its fields as
+  `fields_json` text;
+- two `DaemonObservabilityCounters` fields, omitted when zero:
+  `retained_reservation_outstanding_staging_funding` and
+  `retained_reservation_outstanding_entity_work`. Each counts the times new
+  work of that kind was refused while a reservation of the same kind was still
+  outstanding (a retained-reservation invariant fault).
+
+Everything described under the earlier protocols below still applies.
 
 ## Host-control protocol 10
 
