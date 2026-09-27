@@ -158,11 +158,13 @@ pub(crate) fn unique_test_dir(name: &str) -> PathBuf {
         .expect("system time after epoch")
         .as_nanos();
     let mixed = nanos ^ (u128::from(std::process::id()) << 48);
-    PathBuf::from("target")
+    let path = PathBuf::from("target")
         .join("botster-hub-test-data")
         .join("daemon")
         .join(name)
-        .join(mixed.to_string())
+        .join(mixed.to_string());
+    register_test_owned_dir(&path);
+    path
 }
 
 pub(crate) fn unique_short_test_dir(name: &str) -> PathBuf {
@@ -170,7 +172,9 @@ pub(crate) fn unique_short_test_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    PathBuf::from("/tmp").join(format!("bh-{name}-{}-{nanos}", std::process::id()))
+    let path = PathBuf::from("/tmp").join(format!("bh-{name}-{}-{nanos}", std::process::id()));
+    register_test_owned_dir(&path);
+    path
 }
 
 pub(crate) fn explicit_config(data_directory: impl Into<PathBuf>) -> botster_hub::HubConfig {
@@ -597,6 +601,104 @@ pub(crate) struct DaemonTestGuard {
 impl Drop for DaemonTestGuard {
     fn drop(&mut self) {
         DAEMON_GUARD_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        // The outermost guard drops last in the test body, after every other
+        // fixture's own cleanup, and also while unwinding from a panic.
+        if self._inner.is_some() {
+            sweep_test_owned_processes();
+        }
+    }
+}
+
+thread_local! {
+    /// Unique directory tokens this test created. libtest runs each test on
+    /// its own thread, so the registry is per test.
+    static TEST_OWNED_DIR_TOKENS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How long a process that names a test-owned directory may take to exit on
+/// its own after the test body ends, before the sweep treats it as leaked.
+const TEST_OWNED_PROCESS_SETTLE: Duration = Duration::from_secs(2);
+const TEST_OWNED_PROCESS_TERM_GRACE: Duration = Duration::from_secs(2);
+
+fn register_test_owned_dir(path: &Path) {
+    // The final component is unique per call, and it survives both a relative
+    // `--data-dir` argument and /tmp → /private/tmp canonicalization.
+    if let Some(token) = path.file_name().and_then(|name| name.to_str()) {
+        TEST_OWNED_DIR_TOKENS.with(|tokens| tokens.borrow_mut().push(token.to_string()));
+    }
+}
+
+/// Processes whose command line names a directory this test created.
+pub(crate) fn test_owned_process_rows(tokens: &[String]) -> Vec<(u32, u32, String)> {
+    let Ok(output) = Command::new("ps")
+        .args(["-axo", "pid=,pgid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let own_pid = std::process::id();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid: u32 = parts.next()?.parse().ok()?;
+            let pgid: u32 = parts.next()?.parse().ok()?;
+            let command = parts.collect::<Vec<_>>().join(" ");
+            (pid != own_pid && tokens.iter().any(|token| command.contains(token.as_str())))
+                .then_some((pid, pgid, command))
+        })
+        .collect()
+}
+
+fn wait_for_test_owned_rows_absent(tokens: &[String], grace: Duration) -> Vec<(u32, u32, String)> {
+    let deadline = Instant::now() + grace;
+    loop {
+        let rows = test_owned_process_rows(tokens);
+        if rows.is_empty() || Instant::now() >= deadline {
+            return rows;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Stops every process left behind that names a directory this test created.
+/// It signals only recorded PIDs, or the process groups they lead, never by
+/// name. On the success path a leftover process is a test defect and fails
+/// the test; while unwinding it is cleaned up and reported.
+fn sweep_test_owned_processes() {
+    let tokens = TEST_OWNED_DIR_TOKENS.with(|tokens| std::mem::take(&mut *tokens.borrow_mut()));
+    if tokens.is_empty() {
+        return;
+    }
+    let leaked = wait_for_test_owned_rows_absent(&tokens, TEST_OWNED_PROCESS_SETTLE);
+    if leaked.is_empty() {
+        return;
+    }
+    let own_pgid = unsafe { libc::getpgrp() } as u32;
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        for (pid, pgid, _) in test_owned_process_rows(&tokens) {
+            if pgid == pid && pgid != own_pgid {
+                let _ = signal_test_group_or_child(pid, signal);
+            } else {
+                unsafe { libc::kill(pid as libc::pid_t, signal) };
+            }
+        }
+        if wait_for_test_owned_rows_absent(&tokens, TEST_OWNED_PROCESS_TERM_GRACE).is_empty() {
+            break;
+        }
+    }
+    let survivors = test_owned_process_rows(&tokens);
+    let report = format!(
+        "test-owned processes outlived the test: leaked={leaked:?} survivors_after_sigkill={survivors:?}"
+    );
+    if !survivors.is_empty() {
+        record_harness_taint(report.clone());
+    }
+    if std::thread::panicking() {
+        eprintln!("{report}");
+    } else {
+        panic!("{report}");
     }
 }
 
