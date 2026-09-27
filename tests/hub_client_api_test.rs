@@ -3477,6 +3477,37 @@ fn guarded_notification_write_is_hub_admitted_and_core_delivered() {
     .wait(&runtime)
     .expect("spawn through client api");
     logical_clock += 1;
+
+    // Before this client attaches, Core refuses its write typed (NotSubscribed);
+    // the client sees "not attached", never an Ok that lost the bytes.
+    let unattached = api
+        .handle_request(
+            &mut runtime,
+            &packages,
+            HubClientRequest::GuardedNotificationWrite {
+                request_id: request_id("guarded-unattached"),
+                session_id: session_id.clone(),
+                package_name: "workflow.plugin".to_string(),
+                data: b"unattached\n".to_vec(),
+                readiness: ReadinessEvidence::ready(ModeFlags {
+                    cursor_visible: true,
+                    ..ModeFlags::default()
+                }),
+                now_seconds: logical_clock,
+            },
+        )
+        .wait(&runtime)
+        .expect_err("an unattached client's guarded write must be refused");
+    logical_clock += 1;
+    assert_eq!(
+        unattached,
+        HubClientError::Runtime {
+            request_id: request_id("guarded-unattached"),
+            operation: HubClientOperation::GuardedNotificationWrite,
+            kind: botster_hub::HubClientRuntimeErrorKind::NotAttached,
+        }
+    );
+
     attach_bound_subscription(
         &mut runtime,
         &api,

@@ -809,6 +809,21 @@ impl PluginCapabilityRuntime for HubCapabilityRuntime {
             removed_resources,
         })
     }
+
+    fn set_event_notifier(&mut self, notifier: botster_core::CapabilityEventNotifier) {
+        self.http.set_event_notifier(notifier.clone());
+        self.websocket.set_event_notifier(notifier);
+    }
+
+    /// Covers the Core HTTP and WebSocket runtimes. Hub timers run on the
+    /// caller's logical millisecond clock (`drain_events_at`), so they have
+    /// no `Instant` deadline and are not reported here.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        [self.http.next_deadline(), self.websocket.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
 }
 
 #[derive(Clone)]

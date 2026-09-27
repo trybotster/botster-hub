@@ -8,11 +8,11 @@ use botster_core::contract::terminal_adapter::{
 use botster_core::contract::terminal_wake::{TerminalWakeKind, TerminalWakeSink};
 use botster_terminal_protocol::RoutedTerminalFrame;
 
-use super::close_reason::CloseCause;
+use super::close_reason::{CloseCause, CloseReport};
 use super::ingress::IngressBuffer;
 use super::wake::WakeSink;
 
-type CloseHook = Arc<dyn Fn(bool) + Send + Sync>;
+type CloseHook = Arc<dyn Fn(CloseReport) + Send + Sync>;
 
 /// One in-flight write slot shared by production terminal adapters.
 ///
@@ -62,7 +62,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         self.emit_writable();
     }
 
-    pub(crate) fn attach_close_hook(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+    pub(crate) fn attach_close_hook(&self, hook: impl Fn(CloseReport) + Send + Sync + 'static) {
         if let Ok(mut slot) = self.close_hook.lock() {
             *slot = Some(Arc::new(hook));
         }
@@ -79,6 +79,21 @@ impl<W: WakeSink> AdapterSlot<W> {
     pub(crate) fn close_from_host(&self) {
         self.cause.mark_host_if_open();
         self.close();
+    }
+
+    /// Core's `TerminalAdapter::close`: record its reason, then close.
+    pub(crate) fn close_from_core(
+        &self,
+        reason: botster_core::contract::terminal_adapter::TerminalRouteCloseReason,
+    ) {
+        self.cause.mark_core_if_open(reason);
+        self.close();
+    }
+
+    pub(crate) fn core_close_reason(
+        &self,
+    ) -> Option<botster_core::contract::terminal_adapter::TerminalRouteCloseReason> {
+        self.cause.core_reason()
     }
 
     pub(crate) fn close(&self) {
@@ -100,7 +115,7 @@ impl<W: WakeSink> AdapterSlot<W> {
         if let Ok(hook) = self.close_hook.lock()
             && let Some(hook) = hook.as_ref()
         {
-            hook(self.host_closed());
+            hook(self.cause.report());
         }
         self.wake.wake();
     }

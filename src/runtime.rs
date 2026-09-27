@@ -5753,6 +5753,9 @@ fn managed_session_core_error_class(error: &CoreDaemonError) -> &'static str {
         CoreDaemonError::Engine(ManagedSessionRuntimeError::TerminalBackendOperation {
             ..
         }) => "engine.terminal_backend_operation",
+        CoreDaemonError::Engine(ManagedSessionRuntimeError::NotSubscribed { .. }) => {
+            "engine.not_subscribed"
+        }
         CoreDaemonError::Registry(_) => "registry",
         CoreDaemonError::UnknownSession(_) => "unknown_session",
         CoreDaemonError::SessionNotReadable(_) => "session_not_readable",
@@ -6820,7 +6823,9 @@ pub(crate) fn attach_and_bind_on_core(
     ) {
         Ok(generation) => generation,
         Err(error) => {
-            adapter.close();
+            adapter.close(
+                botster_core::contract::terminal_adapter::TerminalRouteCloseReason::BindRejected,
+            );
             return Err(error);
         }
     };
