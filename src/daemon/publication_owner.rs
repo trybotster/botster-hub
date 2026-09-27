@@ -130,7 +130,7 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
             .as_ref()
             .expect("the completion retains its model record")
             .clone();
-        let status = match completion.result {
+        let status = match *completion.result {
             HostResult::EntityModelComplete(kind) => {
                 runtime.observe_entity_model(completion.identity, kind)
             }
@@ -671,7 +671,7 @@ mod tests {
             recovery._failure.identity,
             state.publication_owner.pending.as_ref().unwrap().identity
         );
-        let HostCommand::EntityModel(work) = &recovery._failure.command else {
+        let HostCommand::EntityModel(work) = &*recovery._failure.command else {
             panic!("recovery retains the original mutation")
         };
         work.test_pending_publication(|pending| {

@@ -142,7 +142,7 @@ pub(crate) fn drive(daemon: &HubDaemon, state: &mut DaemonControlState) -> bool 
             .pending
             .take()
             .expect("an accepted completion has a pending dispatch");
-        match &completion.result {
+        match &*completion.result {
             HostResult::EventOwner(Ok(done)) if done.identity() == &pending.event_identity => {}
             HostResult::Failed { error, .. } if error.code == "host_worker_panicked" => {
                 let Some(work) = runtime.restart_event_plane_owner_op(&pending.event_identity)
@@ -238,7 +238,7 @@ fn submit(
         let failure = HostSubmissionFailure {
             error: HostSubmitError::PhaseExhausted,
             identity: pending.identity,
-            command,
+            command: Box::new(command),
             permit,
         };
         state.event_owner.recovery = Some(Recovery::Submission {

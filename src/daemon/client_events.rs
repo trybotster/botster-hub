@@ -326,7 +326,7 @@ pub(crate) fn drive_ready(
         return true;
     };
     if let Some(completion) = connection.completion.take() {
-        match &completion.result {
+        match &*completion.result {
             HostResult::ClientEventCleanup(Ok(done))
                 if Arc::ptr_eq(&done.connection, &connection.record) =>
             {
@@ -378,7 +378,7 @@ pub(crate) fn drive_ready(
                 connection.recovery = Some(Recovery::Submission(HostSubmissionFailure {
                     error: HostSubmitError::PhaseExhausted,
                     identity: connection.identity,
-                    command,
+                    command: Box::new(command),
                     permit,
                 }));
             }
@@ -530,7 +530,7 @@ mod tests {
                 panic!("the exact additional receipt must remain in terminal recovery");
             };
             assert_eq!(additional.identity, identity);
-            let HostResult::StatusResponsePrepared(prepared) = &additional.result else {
+            let HostResult::StatusResponsePrepared(prepared) = &*additional.result else {
                 panic!("the additional receipt must retain its payload");
             };
             let bytes = prepared.encoded_frame.as_ref().unwrap();

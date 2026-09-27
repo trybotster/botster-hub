@@ -673,7 +673,7 @@ pub(crate) fn submit_host_job(
         None => Err(HostSubmissionFailure {
             error: crate::host_executor::HostSubmitError::Stopped,
             identity,
-            command,
+            command: Box::new(command),
             permit,
         }),
     };

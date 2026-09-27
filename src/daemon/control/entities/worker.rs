@@ -280,7 +280,7 @@ impl EntityWork {
             return None;
         };
         let expected = matches!(
-            (&completion.result, self.stage),
+            (&*completion.result, self.stage),
             (
                 HostResult::PluginEntity(Completion::ProviderPrepared(_)),
                 Stage::PrepareProvider
@@ -316,11 +316,11 @@ impl EntityWork {
             return None;
         }
         let admitted = matches!(
-            completion.result,
+            *completion.result,
             HostResult::PluginEntity(Completion::ProviderAdmitted(None))
         );
         let terminal = matches!(
-            completion.result,
+            *completion.result,
             HostResult::PluginEntity(Completion::Finished { .. })
         ) || (self.stage == Stage::Release && self.finish.is_none());
         let next = completion.identity.next_phase();
@@ -430,7 +430,7 @@ impl EntityWork {
         let Phase::Rejected(failure) = std::mem::replace(&mut self.phase, Phase::Terminal) else {
             unreachable!()
         };
-        self.submit_reserved(executor, failure.identity, failure.command, failure.permit)
+        self.submit_reserved(executor, failure.identity, *failure.command, failure.permit)
     }
 }
 
@@ -967,7 +967,7 @@ fn drive_model(
     let Phase::Completed(completion) = &entry.work.phase else {
         return Some(Step::Waiting);
     };
-    let status = match completion.result {
+    let status = match *completion.result {
         HostResult::EntityModelComplete(kind) => {
             runtime.observe_entity_model(completion.identity, kind)
         }
@@ -1259,7 +1259,7 @@ pub(super) fn step(
     }
     if entry.work.deferred_completion.is_none()
         && matches!(&entry.work.phase, Phase::Completed(completion)
-            if matches!(completion.result, HostResult::PluginEntity(Completion::Delivered { .. })))
+            if matches!(*completion.result, HostResult::PluginEntity(Completion::Delivered { .. })))
     {
         entry.work.deferred_completion = entry.work.take_completion();
     }

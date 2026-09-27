@@ -117,7 +117,7 @@ impl Job {
         if let Some(failure) = self.failure.take() {
             self.failure = failure
                 .permit
-                .dispose(failure.identity, failure.command)
+                .dispose(failure.identity, *failure.command)
                 .err();
         }
         self.work.poll()

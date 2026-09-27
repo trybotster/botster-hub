@@ -206,7 +206,7 @@ impl CoordinationContinuation {
         }
         if let Some(completion) = state.host_completions.remove(&self.waiter_id) {
             if !matches!(
-                &completion.result,
+                &*completion.result,
                 HostResult::CoordinationResponseDelivered | HostResult::Failed { .. }
             ) {
                 state.host_completions.insert(self.waiter_id, completion);
@@ -266,7 +266,7 @@ impl CoordinationContinuation {
         let mut retained_completion = None;
         let mut retained_command = None;
         let (identity, permit) = if let Some(failure) = self.delivery_failure.take() {
-            retained_command = Some(failure.command);
+            retained_command = Some(*failure.command);
             (failure.identity, failure.permit)
         } else if self.response.is_some() {
             (identity, runtime.host_executor().try_reserve()?)

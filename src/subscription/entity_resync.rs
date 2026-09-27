@@ -183,7 +183,7 @@ impl PackageEntityResyncScan {
             let identity = self.identity.expect("the scan retains its identity");
             let status = if completion.identity != identity {
                 CausalTransitionStatus::Fault
-            } else if let HostResult::EntityModelComplete(kind) = completion.result {
+            } else if let HostResult::EntityModelComplete(kind) = *completion.result {
                 runtime.observe_entity_model(identity, kind)
             } else {
                 CausalTransitionStatus::Fault
@@ -770,7 +770,7 @@ mod tests {
             assert!(Instant::now() < limit);
         };
         assert!(matches!(
-            completion.result,
+            *completion.result,
             HostResult::EntityModelComplete(Kind::FinishFanout)
         ));
         assert_eq!(

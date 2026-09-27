@@ -574,7 +574,7 @@ fn submit(
             HostSubmissionFailure {
                 error: crate::host_executor::HostSubmitError::Stopped,
                 identity,
-                command,
+                command: Box::new(command),
                 permit,
             },
         );
@@ -601,7 +601,7 @@ fn retain_completion(
         HostSubmissionFailure {
             error: crate::host_executor::HostSubmitError::Stopped,
             identity,
-            command: HostCommand::DiscardCompletion(Box::new(result)),
+            command: Box::new(HostCommand::DiscardCompletion(Box::new(result))),
             permit,
         },
     )
@@ -638,12 +638,12 @@ pub(crate) fn submit_delivery(
         None => Err(HostSubmissionFailure {
             error: crate::host_executor::HostSubmitError::Stopped,
             identity,
-            command,
+            command: Box::new(command),
             permit,
         }),
     };
     if let Err(mut failure) = result {
-        let HostCommand::DeliverStatusResponse { reply_tx, .. } = &mut failure.command else {
+        let HostCommand::DeliverStatusResponse { reply_tx, .. } = &mut *failure.command else {
             unreachable!("delivery refusal returns its command");
         };
         entry.reply_tx = reply_tx.take();
@@ -1827,11 +1827,11 @@ mod tests {
             };
             assert_eq!(failure.identity.phase, 3);
             assert!(
-                matches!(&failure.command, HostCommand::DeliverStatusResponse { prepared, reply_tx } if prepared.shutdown && prepared.encoded_frame.is_some() && reply_tx.is_closed())
+                matches!(&*failure.command, HostCommand::DeliverStatusResponse { prepared, reply_tx } if prepared.shutdown && prepared.encoded_frame.is_some() && reply_tx.is_closed())
             );
             failure
                 .permit
-                .dispose(failure.identity, failure.command)
+                .dispose(failure.identity, *failure.command)
                 .expect("test disposes retained failure on Host");
             while executor.outstanding() != HOST_OPERATION_CAPACITY - 1
                 || executor.prepared_bytes()

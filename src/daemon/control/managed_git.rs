@@ -1248,13 +1248,13 @@ impl ManagedSpawnOperation {
             (_, None) => Err(HostSubmissionFailure {
                 error: HostSubmitError::PhaseExhausted,
                 identity,
-                command,
+                command: Box::new(command),
                 permit,
             }),
             (None, _) => Err(HostSubmissionFailure {
                 error: HostSubmitError::Stopped,
                 identity,
-                command,
+                command: Box::new(command),
                 permit,
             }),
             (Some(runtime), Some(_)) => runtime.host_executor().submit(identity, command, permit),

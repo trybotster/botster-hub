@@ -75,13 +75,13 @@ pub(crate) fn execute(
     let result = match command {
         HostMutationCommand::ApplyPackageEffect(effect) => {
             return execute_package_effect(
-                effect,
+                *effect,
                 entrypoints.expect("package effect has the host supervisor"),
             );
         }
         HostMutationCommand::RestorePackageRuntime(restore) => {
             return execute_package_runtime_restore(
-                restore,
+                *restore,
                 entrypoints.expect("package restore has the host supervisor"),
             );
         }
@@ -126,7 +126,7 @@ pub(crate) fn execute(
         }
         HostMutationCommand::RestorePackage(restore) => return execute_package_restore(restore),
         HostMutationCommand::RecordPackageQuarantine(record) => {
-            return execute_package_quarantine_record(record);
+            return execute_package_quarantine_record(*record);
         }
     };
     result.unwrap_or_else(HostMutationResult::Failed)
@@ -134,8 +134,9 @@ pub(crate) fn execute(
 
 /// One family-specific host command.
 pub(crate) enum HostMutationCommand {
-    ApplyPackageEffect(HostPackageEffect),
-    RestorePackageRuntime(HostPackageRuntimeRestore),
+    // Boxed: each carries a Host package runtime and a HubConfig inline.
+    ApplyPackageEffect(Box<HostPackageEffect>),
+    RestorePackageRuntime(Box<HostPackageRuntimeRestore>),
     ValidateBootstrap {
         request: DaemonRequest,
         base_revision: u64,
@@ -146,7 +147,7 @@ pub(crate) enum HostMutationCommand {
     Commit(HostCommit),
     Recover(HostRecover),
     RestorePackage(HostPackageRestore),
-    RecordPackageQuarantine(HostPackageQuarantineRecord),
+    RecordPackageQuarantine(Box<HostPackageQuarantineRecord>),
 }
 
 impl HostMutationCommand {
