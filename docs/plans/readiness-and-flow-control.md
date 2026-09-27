@@ -1,6 +1,6 @@
 # Readiness and flow control
 
-Status: draft 3, 2026-09-27. Design only. No production code changes in this phase.
+Status: draft 4, 2026-09-27. Design only. No production code changes in this phase.
 Scope: botster-hub at `1ec61b94`, and botster-core at `origin/main` `19edeb1`. Hub pins Core `549b3f62`. The unlanded roll branch `delivery/core-roll-85b3507-20260927` moves the pin to `85b3507`.
 
 ## 0. Summary
@@ -13,11 +13,11 @@ One defect class keeps coming back: a lost wake, a spin, or a "work exists" pred
 
 Each side channel needs every writer to remember to wake the right party. The design removes that duty:
 1. **One readiness contract.** Every owner work source answers `readiness() -> Ready | Wait(Wake)`. The function derives the answer from state. `Wait` must name the event that makes the source ready. The type does not allow a wait without a named event.
-2. **One wake primitive.** Every cross-thread producer uses one `OwnerSignal` type. The owner re-evaluates owner-local waits after every step, so owner-local state needs no signal at all.
+2. **One wake primitive, with arm-then-check registration.** Every cross-thread producer raises one `OwnerSignal` key epoch. A source reads the epoch before its final attempt, so a release cannot fall between the attempt and the wait. The owner re-evaluates every source predicate after every owner step, so owner state needs no signal at all.
 3. **One refusal rule.** Contention (a busy lock) never becomes a refusal, a drop, or a gap. It becomes `Wait` on the release event. Capacity may refuse, and the refusal is typed and names its retry event.
 4. **End-to-end terminal backpressure.** This follows the orchestrator ruling of 2026-09-27, and the Core writer is building it. When the slowest progressing bound reader has no egress room, the worker stops draining the PTY. A reader with no progress for `READER_PROGRESS_DEADLINE` (10 s) is ended with `Stalled`. This ends the flood resync storm without a new limit.
 
-The design deletes `MaintenanceWakes`, `mark_all`/`try_wake` (29 + 11 production sites), about nine doorbell message variants, the hand flags, and the causal sweep. It adds one small type and one Core notifier edge.
+The design deletes `MaintenanceWakes`, `mark_all`/`try_wake` (29 + 11 production sites), about nine doorbell message variants, the hand flags, and the causal sweep. It adds one small set of types (`Readiness`, `Outcome`, `OwnerSignal`), one Core notifier edge, and a cause field on Core `Backpressured`.
 
 ## 1. Flow-control map
 
@@ -44,6 +44,8 @@ Legend for "at the bound": **BP** = the producer stalls (lossless); **REF** = ty
 | Unix read / WebRTC SCTP | frame size; SCTP window | protocol close; real BP to the WebRTC peer |
 | transport → adapter ingress | 64 frames (`MIN_ADAPTER_INGRESS_BUFFER_FRAMES`) | **DROP + `Lost` latch; Core ends the route.** The transport keeps reading. **Backpressure ends here.** |
 | intake lanes | 32 ops / 2 MiB per session; 128 / 8 MiB per client | REF (`RejectedLaneFull`) |
+| paste assembly | 1 assembling paste per route; paste size capped by the lane bytes; `PASTE_ASSEMBLY_TIMEOUT` 5 s (`client_worker.rs:98, 1845-1880`) | REF on size; `timer: deadline` expiry fails the paste typed |
+| input rejection results | 16 unreserved rejection results queued per route (`MAX_QUEUED_REJECTIONS_PER_ROUTE`, `client_worker.rs:101, 1295-1314`) | the route closes `Overflowed`. A client that keeps sending into a full lane loses its route. S5 input backpressure makes this rare, because the transport stops reading first. |
 | apply → control queue | 32 frames (2 reserved); 30 pending resizes | BP (park for capacity, woken by the writer's `freed_capacity`) |
 | control writer → worker | **process**; 2 s write deadline | control plane sealed → `WorkerLinkFailed` |
 | worker control reader → main loop | **UNB** `mpsc::channel()` (`botster-session-worker.rs:236`); bounded upstream only by the 32-frame queue | — |
@@ -56,11 +58,26 @@ Coupling: while the worker main loop is blocked on a full egress lane, it applie
 | Path | Bound | At the bound |
 | --- | --- | --- |
 | host call (coordination) | Lua callback account | REF (`Capacity`); Lua parks `recv_timeout(1 s)` |
+| Core plugin class queues | request-response and Background, 256 / 1 MiB each per plugin (`plugin_worker.rs:194-207`) | REF (`Backpressured`, class cause); no retry event until C2 |
+| Core completion store | 256 entries; 1 MiB reservations; 1 MiB queue bytes (`plugin_worker.rs:194-207`) | REF (`Backpressured`, completion cause). It frees only through the host's own drain (`Local` wait, 2.3). |
+| Hub retained plugin results | 8 MiB, global (`RETAINED_PLUGIN_RESULT_BYTE_CAPACITY`, `reply.rs:10-18`) | the completion drain stops. The charge drop raises `PluginResultCapacityReleased` (`reply.rs:147-171`). |
 | async capabilities (fs, store) | 128 ops / 256 events per plugin | REF (`Backpressured`). Results go to an **UNB** mpsc with **no production consumer** (`drain_capability_events` has test callers only) |
 | entity publication | one shared bridge: 256 entries / 8 MiB / 1 MiB each (`entity_publish.rs:16-18`) | REF (`NeverQueued`). One plugin can exhaust it for all (plan §4.5.1 moves this to per-plugin pools) |
 | fanout → subscriber | Unix 256, WebRTC 64 per subscriber; 64 MiB `SharedViewBudget` | DROP+RS (`subscriber_overflow`), paced by `PACKAGE_ENTITY_*` |
-| Unix entity/event write queue | `MuxWriteState.queued_events` **UNB** (`mux_write.rs:35`) | — |
+| Unix entity/event write queue | `MuxWriteState.queued_events` **UNB** (`mux_write.rs:35`). The connection task moves each frame from the 256-deep entity channel into it, and it publishes the capacity wake at once (`connection.rs:264-267`). So the 256 bound does not hold while the socket is slow. | — (S6) |
 | plugin logs | none on main (planned ring: 256 records / 512 KiB, pull-only) | planned: evict oldest, counted |
+
+**Process host (Core, built but not wired into Hub).** Every number here is supplied by the Hub; the values are the approved plugin-platform §5.0 numbers.
+
+| Hop | Bound | At the bound | Wake |
+| --- | --- | --- | --- |
+| child host call → parent ingress | `ingress_bytes` (request-body credit 512 KiB) plus one delivery-pool unit (128 slots / 512 KiB) | the child's sender refuses locally with `backpressured`, or a publication waits for credit (§4.5.4). An overdraw is a protocol violation, and the worker is killed. | `install_ingress_notifier` → `PluginIngress` |
+| child reply → parent | `reply_credits` 2 × 1 MiB | the same as the row above | `PluginIngress`; the credit returns at `release_reply` |
+| child log → parent | `log_credits` (256 records / 512 KiB) | the child drops the line and counts it in `dropped_since_last` | `PluginIngress` |
+| parent → child (the writer thread) | 4 lanes: Startup, Invoke (`max_in_flight_invokes`), Cancel (at most 1 per invoke), Shutdown (`outbound.rs:1-60`) | `Refused::Full` is a caller bug for the derived lanes; `Closed` means the process is gone | credit frames coalesce and are never refused |
+| result → child | `admit_result` from the pool, never refused for capacity | — | `install_unit_returned` → `PluginCredit` |
+| frame size | `max_frame_bytes` | protocol violation, and the worker is killed | — |
+| lifecycle | startup, shutdown, and cancel-grace deadlines | `timer: deadline`: the process group is killed | `install_exit_notifier` → `PluginExit` |
 
 ### 1.4 Hub events → plugins and clients
 
@@ -77,7 +94,7 @@ Coupling: while the worker main loop is blocked on a full egress lane, it applie
 2. **Terminal input drops at adapter ingress.** A paste burst faster than the data plane ends the route. The transport should stop reading instead. The kernel socket buffer and the SCTP window then carry the backpressure to the client.
 3. **Contention becomes loss.** `LockBusy` on a package event drops the event. On a session-family frame it opens a gap and starts a full baseline resync (`daemon_maintenance.rs:1247-1250`). On a plugin control request it refuses the client (`plugins.rs:550-563`). `SubscribeEvents` returns `shed_busy` when the owner loses a try-lock race with the connection's own reader (`package_events.rs:687-707`).
 4. **Core plugin `Backpressured` has no retry event.** Class-queue space frees when a worker dequeues, and nothing notifies the host (`contract/actor.rs:1326-1330`).
-5. **Unbounded queues:** the WebRTC rtc send buffer, the Unix `queued_events`, the worker control mpsc, keyless PTY input, and the async capability result mpsc.
+5. **Unbounded queues:** the WebRTC rtc send buffer and SCTP pending queue, the Unix `queued_events`, the worker control mpsc, keyless input inside the worker, and the async capability result mpsc.
 6. **Silent drops:** the worker egress after a socket error, and the event retire on `LockBusy`.
 7. **Refused maintenance reads stall (live defect).** When the bounded Core request queue is full (`CoreTicketPoll::Refused`), the Observe, journal-pull, and baseline slices clear their read and return without marking themselves again (`daemon_maintenance.rs:955, 1004, 1111`). A freed queue slot publishes no owner wake. The read then waits for an unrelated wake. This is confirmed by code reading, and no test proves it yet. Step S4 fixes it: the slice becomes `Wait(Signal(DataPlaneCapacity))`, and a test that fills the request queue proves the fix.
 
@@ -99,50 +116,78 @@ Follow-up: each duplicate is a user decision about a number, so this plan only l
 enum Readiness { Ready, Wait(Wake) }
 
 enum Wake {
-    Local,              // owner-local state; re-evaluated after every owner step
-    Signal(SignalKey),  // a cross-thread producer raises this key
+    Local,              // owner state; re-evaluated after every owner step
+    Signal(Armed),      // cross-thread; see 2.2
     Deadline(Instant),  // only with an approved `timer:` marker at the source
 }
 
+struct Armed { key: SignalKey, epoch: u64 } // key epoch read before the final attempt
+
+enum Outcome { Progress, Blocked(Armed) }
+
 trait OwnerSource {
     fn readiness(&self, owner: &OwnerView) -> Readiness;
-    fn run(&mut self, owner: &mut OwnerCtx, budget: &mut OwnerTurnBudget) -> Progress;
+    fn run(&mut self, owner: &mut OwnerCtx, budget: &mut OwnerTurnBudget) -> Outcome;
 }
 ```
 
 Rules:
-1. `readiness` is a function of state. A source may keep an internal index, for example "subscribers with a pending frame and capacity". Only the mutators of the underlying state may change that index. A debug check recomputes the index from scratch after each `run` in tests.
-2. **No spin.** If `readiness` returned `Ready`, `run` must return `Progress::Made`. `Progress::None` after `Ready` is a fault. Debug builds assert it, and a counter records it in release builds. The owner-loop tests assert that the counter is zero. A source that stops at the turn budget has made progress. It returns `Ready` again, which is a legal continuation.
-3. **Every wait names its event.** `Wait` cannot be built without a `Wake`. A refusal that crosses a boundary (Core, Host executor, transport) carries the `Wake` that ends it.
-4. **Capacity waits use FIFO.** A source that waits for a shared capacity (causal slots, Host permits, plugin credit) is queued per capacity. The release of one unit re-checks the head only. This rule replaces the causal sweep, which walks every waiter.
-5. **Cursors do not decide readiness.** A round-robin or paged cursor only chooses the order of work. Readiness comes from a maintained ready set, for example "consumers with a pending frame, not in flight, and with a handler". A pass that reaches the end of a page must wrap within the pass or leave the source `Ready`. A pass that returns "nothing" at a page end while the ready set is not empty is the lost-wake shape of b870bca3. Session-family admission needs such a ready set. The family gap pass and prune already keep flags that suffice.
-6. **A refusal that cannot change is a fault, not a retry.** If a unit of work can never fit its bound (for example Observe `BudgetTooSmall` for one row at the constant `OBSERVE_SLICE_BUDGET`, `daemon_maintenance.rs:989`), the source fails that unit with a typed error. It does not stay `Ready`. Today the site calls `mark_all` and resubmits every turn, which is a permanent spin if Core can return that result for a single row.
+1. **Readiness is derived.** `readiness` is a function of state. A source may keep an internal index, for example "subscribers with a pending frame and capacity". Only the mutators of the underlying state change that index, and a debug check recomputes it from scratch after each `run` in tests.
+2. **Every owner step is followed by re-evaluation.** "Owner step" means the dispatch of a control message, the run of a ready item, and the processing before a sleep. The scheduler re-evaluates every parked source after each step, and once more immediately before it blocks. This is the only path by which a source becomes ready, so no transition can skip it.
+3. **`Ready` from owner state promises progress.** When `readiness` says `Ready` and every input it read is owner state, `run` returns `Progress`. `Outcome` has no "no progress" value. A source that needs a cross-thread resource (a lock, a Core queue slot, a connection slot) cannot promise it, because another thread can take it between `readiness` and `run`. That source returns `Blocked(Armed)` with a registered wait (2.2), which is legal. A `Blocked` return whose readiness depended only on owner state is a bug: debug builds assert, and release builds fault the source with a typed error, counted and logged. It does not stay ready, so release builds cannot spin either.
+4. **Every wait names its event.** `Wait` cannot be built without a `Wake`, and a cross-thread wait cannot be built without an `Armed` registration. A refusal that crosses a boundary carries its cause, so the caller can pick the right `Wake` (2.3).
+5. **Three kinds of wait; each has one mechanism.**
 
-### 2.2 Why no wake is lost, by construction
+   | Kind | Examples | Mechanism |
+   | --- | --- | --- |
+   | Source predicate | the maintenance slices; publication and event owners; admission sources | re-evaluated after every owner step (rule 2); about 20 coarse sources, each O(1) |
+   | Keyed completion | a Host job by job id; a Core ticket by ticket id; a causal transition waiting for its own receipt | the completion router marks exactly its waiter (today's routing). It is never swept. |
+   | FIFO capacity (interchangeable units) | Host permits; owner permits; causal table slots; the exclusive entity model; plugin credit waiters (plugin-platform §4.5.4) | a FIFO per capacity. Its head is a source predicate. Rule 2 then gives, with no extra code: a check at registration, the next head after a head cancels, and continuation while a coalesced release still leaves room. |
 
-- **Owner-local state.** The owner is the only mutator, so the scheduler re-evaluates every `Wake::Local` waiter after every `run`. A mutation cannot happen without a following re-evaluation. The cost is one O(1) predicate per local waiter per step. About 20 sources exist, so the cost is small. The b870bca3 class of bug (a cursor reset with no wake) cannot occur: no wake exists to forget.
-- **Cross-thread state.** A producer mutates, then calls `OwnerSignal::raise(key)`. `raise` sets the key's bit and sends at most one doorbell per owner sleep. The owner takes all raised bits before it evaluates, and it blocks only on the doorbell channel, which returns at once if a doorbell is pending. So a raise either comes before the take (the owner sees it) or after it (the doorbell wakes the owner). This is the ordering the Hub bit-plus-doorbell pairs already use. The design makes it one type, with one test, instead of about nine copies.
-- **Deadlines** come from the existing `DeadlineIndex`.
+   A wait belongs to exactly one kind. A FIFO holds only waiters for the same interchangeable unit, so a blocked head can never hide a waiter that waits for something else. A fault (for example the entity model faulting) makes every waiter of that resource `Ready`, and each one then fails typed.
+6. **Cursors do not decide readiness.** A round-robin or paged cursor only chooses the order of work. Readiness comes from a maintained ready set, for example "consumers with a pending frame, not in flight, and with a handler". A pass that reaches the end of a page must wrap within the pass or leave the source `Ready`. A pass that returns "nothing" at a page end while the ready set is not empty is the lost-wake shape of b870bca3. Session-family admission needs such a ready set. The family gap pass and prune already keep flags that suffice.
+7. **A refusal that cannot change is a fault, not a retry.** If a unit of work can never fit its bound (for example Observe `BudgetTooSmall` for one row at the constant `OBSERVE_SLICE_BUDGET`, `daemon_maintenance.rs:989`), the source fails that unit with a typed error. It does not stay `Ready`. Today the site calls `mark_all` and resubmits every turn, which is a permanent spin if Core can return that result for a single row.
 
-The owner's existing invariant stays: it never blocks while a ready row exists. Rule 2 makes that invariant safe, because a ready row always makes progress.
+### 2.2 Why no wake is lost and nothing spins
 
-This is the `Future::poll` contract ("`Pending` must have registered a waker"), made explicit in a return type and without async. The owner's budgeted, synchronous turn stays as it is.
+**One primitive: `OwnerSignal`.** It holds one epoch counter per `SignalKey` and one doorbell, which is a `tokio::sync::Notify`.
+- **Producer.** The producer mutates the shared state first. It then calls `raise(key)`, which increments the key's epoch (release ordering) and calls `notify_one()`. `Notify` stores at most one permit, so the doorbell can never be full and never loses a raise.
+- **Registration (arm, then check).** A source reads `epoch(key)` **before** its final attempt on the cross-thread resource. If that attempt is refused, it returns `Blocked(Armed { key, epoch })`. The source's readiness stays `Wait` while `epoch(key) == armed.epoch`, and becomes `Ready` once the epoch moves.
+- **The owner's sleep.** The owner blocks on its control channel, the doorbell, and the next deadline. It blocks only after the rule-2 re-evaluation finds nothing ready.
+
+Proof sketch:
+- **A release after the epoch read** increments the epoch. The source then re-evaluates to `Ready`. If the owner is already asleep, the stored `Notify` permit wakes it.
+- **A release before the epoch read** is visible to the final attempt, so that attempt does not refuse for that reason.
+- **No spin.** A blocked source retries at most once per epoch increment, and the epoch moves only on a real release. If another thread takes the unit first, one retry is wasted. The number of retries is bounded by the number of releases, not by owner turns.
+- **Owner state** cannot change without an owner step, and rule 2 re-evaluates after every step.
+
+**Producer duty.** A producer of a cross-thread key must raise on **every** release that can turn a refusal into success. Alternatively, it can follow Core's `try_admit` pattern (`plugin_worker.rs:920-950`): arm inside the refusing call before its last retry, and fire on the next release while armed. Each key names its producer in 2.3. A key with no producer cannot be registered.
+
+**Tests (per key, deterministic).** A test hook runs between the source's epoch read and its final attempt, and another runs between the refusal and the `Blocked` return. At each hook the test performs the release. The source must then run with no other wake. An ablation that removes the producer's raise must fail. The idle and flood tests in section 4 measure cost; these interleaving tests prove correctness.
+
+This is the `Future::poll` contract ("`Pending` must have registered a waker"), carried by a return type and without async. The owner's budgeted, synchronous turn stays as it is.
 
 ### 2.3 The refusal rule, per boundary
 
-| Refusal | Meaning | Caller does |
-| --- | --- | --- |
-| Core `LockBusy` | contention | `Wait(Signal(PluginEngine))` |
-| Core `Backpressured` (class or completion store) | capacity | internal work: `Wait(Signal(PluginEngine))`; client request: typed refusal (unchanged) |
-| Core `ControlQueueFull` / `PendingLimit` | capacity | park on the session wake (already correct for input) |
-| Core `CoreTicketPoll::Refused` (request channel full) | capacity | `Wait(Signal(DataPlaneCapacity))`. Today pump and reconcile return `Runnable` and spin (`owner_loop.rs:1726, 1812`), and maintenance reads return with no wake (`daemon_maintenance.rs:955, 1004, 1111`) |
-| Host permit refused | capacity | `Wait(Signal(HostCapacity))`, FIFO |
-| Router `ShedBusy` / slot try-lock lost | contention | `Wait(Signal(ConnectionSlots(conn)))`, raised by the guard drop |
-| subscriber queue full | capacity | DROP+RS (unchanged: entity state resyncs from the model) |
+Contention never becomes a refusal to a client, a drop, or a gap. Capacity may refuse, and that refusal is typed.
+
+| Refusal | Cause | Caller's wait | Producer of the release |
+| --- | --- | --- | --- |
+| Core `LockBusy` | contention | `Signal(PluginEngine)` | Core fires the notifier on an armed lock release (today) |
+| Core `Backpressured`, class queue | capacity | `Signal(PluginEngine)`; a client request instead gets a typed refusal (unchanged) | Core fires on an armed class-slot free (C2, new) |
+| Core `Backpressured`, completion reservation | capacity | `Local`: "the completion store has room" | the owner's own `drain_completions` step (Core `plugin_worker.rs:1365-1401` fires no notifier there, so a `Signal` wait would be lost) |
+| Core `ControlQueueFull` / `PendingLimit` | capacity | park on the session wake (today, correct for input) | the control writer's `freed_capacity` |
+| Hub `CoreTicketPoll::Refused` (request channel full) | capacity | `Signal(DataPlaneCapacity)` | the data-plane thread raises after it dequeues requests (`data_plane/driver.rs:1598, 1609`), in S4a |
+| Host permit refused | capacity | FIFO (`HostCapacity`) | the permit drop raises `HostCapacity` (today's `capacity_pending`) |
+| Retained plugin-result bytes (8 MiB) | capacity | `Signal(PluginResultCapacity)` | the charge drop (today's `PluginResultCapacityReleased`, `reply.rs:147-171`) |
+| Router `ShedBusy` / slot try-lock lost | contention | `Signal(ConnectionSlots(conn))` | the slots guard drop raises unconditionally (S3) |
+| Subscriber queue full | capacity | DROP+RS (unchanged: entity state resyncs from the model) | — |
+
+C2 makes `Backpressured` carry its cause (class queue or completion reservation). That is a typed mechanism change, not policy.
 
 ### 2.4 Core contract changes (mechanism only; no policy moves into Core)
 
-1. **One plugin-engine notifier meaning.** "Plugin engine state changed. A completion may be ready, or a refused admission may now succeed." Core fires it on: a completion published (today); an armed lock release (today, `admission_retry_armed`); and **a class-queue slot freed while a `Backpressured` admission is armed (new)**. Completion-store space frees only through the host's own drain, so it is owner-local. A conformance test in Core pins these edges, so a later Core commit cannot move the contract silently (defect: 1c2e526 changed the notifier's meaning).
+1. **One plugin-engine notifier meaning.** "Plugin engine state changed. A completion may be ready, or a refused admission may now succeed." Core fires it on: a completion published (today); an armed lock release (today, `admission_retry_armed`); and **a class-queue slot freed while a `Backpressured` admission is armed (new)**. The class slot frees where a worker dequeues a job (`take_dispatchable`) and where a job is unqueued. `Backpressured` carries its cause. Completion-store space frees only through the host's own drain, so that cause maps to a `Local` wait (2.3). A conformance test in Core pins these edges, so a later Core commit cannot move the contract silently (defect: 1c2e526 changed the notifier's meaning).
 2. **Source backpressure for terminal output.** This is the orchestrator ruling of 2026-09-27, and the Core writer is building it.
    - **Mechanism, with no new signal.** When the slowest progressing bound reader has no egress room, Core holds the session's runtime output (`ManagedSessionRuntime.held_runtime_output`) and stops calling `drain_output`. The chain then fills and stalls, one existing stage at a time:
      1. the parent's bounded worker channel fills;
@@ -160,7 +205,7 @@ This is the `Future::poll` contract ("`Pending` must have registered a waker"), 
      2. **`WRITE_ATTEMPT_BUDGET` stall.** Repeated adapter wakes that the adapter then refuses end in a stall resync.
    - For path 1, the preferred fix is that Core does not poll the snapshot boundary while the session holds output. The boundary result stays intact until the existing routes have room. The fallback, for any overflow that remains, asks for the recovery capture only after the route queue drains, and not while the queue is still full (`client_worker.rs:1354`).
    - **The PTY tail must survive backpressure (macOS).** A macOS PTY discards output that is still queued when the last slave descriptor closes. Under backpressure, a program that writes a lot and then exits therefore loses the end of its output. The worker keeps its own slave descriptor open until it has drained the master. This belongs to C1, because backpressure is what exposes it.
-3. **`journal_advanced` becomes a wake, not a polled bit** (`daemon.rs:1004, 4329`). The data plane includes it in its signal. Today the host must remember to poll it.
+3. **`journal_advanced` is returned, not polled** (`daemon.rs:1004, 4329`). Until S10, the data-plane thread reads `take_journal_advanced_wake()` after every pump and every request batch, as it does today. It is the only thread that can set the bit, so no set is missed. It raises `Signal(JournalAdvanced)` when the bit was set. S4 depends on this and keeps it, and it deletes only the `progressed` wake. S10 moves the bit into Core's pump result, so no host has to remember to read it.
 4. **`exit_hold` derives from capture state** (`engine/botster.rs:1934`). Today 9 call sites mirror it by hand with `sync_exit_hold`.
 5. **The worker egress reports a lost socket.** It does not discard silently (`botster-session-worker.rs:1693-1705`).
 6. **Bound-queue wakes are delivered, not discarded.** `pump_woken` (`daemon.rs:1389`) and the managed `pump_woken_phase_three` discard `take_bound_queue_wake_sessions`. But `start_resync_captures` runs for the resync requests of every session, not only the sessions in the batch. It can queue route frames for a session outside the batch, and the discard then drops that session's queue wake. This is a suspected lost wake. The Core writer is chasing a stall that may be it. The fix calls `notify_session` for each taken session.
@@ -170,25 +215,33 @@ This is the `Future::poll` contract ("`Pending` must have registered a waker"), 
 | Mechanism | Fate |
 | --- | --- |
 | `ReadyQueues` / `ReadyClass` round-robin | **Kept.** It is the run queue. Classes become sources. |
-| `MaintenanceWakes` (9 bits), `mark_all` (29 sites), `try_wake` (11 sites), dead `needs_work` | **Deleted.** Each slice becomes an `OwnerSource`. Budget continuation is `Ready` after `Progress::Made`. |
-| Doorbell `ControlMessage` variants: `CoreCompletionPublished`, `HostProgressPublished`, `PluginCompletionPublished`, `CausalProgressPublished`, `EntityPublishProgress`, `CoordinationProgress`, `EntitySubscriptionCapacityReleased`, the data-plane progress wake | **Replaced** by `OwnerSignal` keys. The control channel carries client requests and cleanup only. |
+| `MaintenanceWakes` (9 bits), `mark_all` (29 sites), `try_wake` (11 sites), dead `needs_work` | **Deleted.** Each slice becomes an `OwnerSource`. A source that stops at the turn budget returns `Outcome::Progress` and stays `Ready`, which is a legal continuation. |
+| Doorbell `ControlMessage` variants: `CoreCompletionPublished`, `HostProgressPublished`, `PluginCompletionPublished`, `PluginResultCapacityReleased`, `CausalProgressPublished`, `EntityPublishProgress`, `CoordinationProgress`, `EntitySubscriptionCapacityReleased`, the data-plane progress wake | **Replaced** by `OwnerSignal` keys, with the same producers. The control channel carries client requests and cleanup only. |
 | `DataPlaneProgress.progressed` (an owner wake after every pump batch) | **Deleted.** Terminal output costs no owner wake. `journal_advanced` and `inventory_changed` stay as keys. |
-| Owner flags `host_completion_drain_pending`, `host_capacity_wake_pending`; `publication_owner` `waiting_for_host/owner/progress`; `event_owner` equivalents; the event-plane `Cell`; spawner pending bits | **Deleted.** Readiness derives from queue state and the named waits. `publication_owner.recovery` is never cleared today (publication stops for good after one submit failure); its readiness becomes explicit. |
+| Owner flags `host_completion_drain_pending`, `host_capacity_wake_pending`; `publication_owner` `waiting_for_host/owner/progress`; `event_owner` equivalents; the event-plane `Cell`; spawner pending bits | **Deleted.** Readiness derives from queue state and the named waits. |
+| `publication_owner.recovery` | **Live hang.** It is set on a submit failure and is never cleared outside terminal dispose (`publication_owner.rs:109-117`). Publication then stops for good. S4a makes recovery a source with a defined exit: it retries the failed submission as a keyed completion, or it faults the plugin's publications with a typed error. |
 | Package-event `delivery_wake` (atomic, no doorbell) | **Replaced** by `OwnerSignal(PackageEvents)`. This fixes the lost wake after an off-owner emit. |
 | Core completion notifier | **Kept** as Core mechanism, with the meaning in 2.4.1. Hub installs `raise(PluginEngine)`. |
 | `admission_retry_armed` (Core) | **Kept** inside Core as the arming detail of 2.4.1. Hub never sees it. |
 | Capability event notifier and `next_deadline` (Core `2cda9e9`) | **This plan owns the wake plumbing (step S4; orchestrator decision, 2026-09-27).** Hub installs `set_event_notifier` as `raise(CapabilityEvents)`, and it adds `next_deadline` to the owner's `DeadlineIndex`. The orchestrator paused this wiring in plugin-platform slice 3 because this redesign rewrites the plumbing. The plugin platform keeps the consumer: draining the events and resuming handlers (its §4.2). Today the results have no production consumer (`drain_capability_events` has test callers only). |
 | Host executor `HostWake` (`completion_pending`, `capacity_pending`) | **Kept** as the producer side. It raises `HostCompletion` and `HostCapacity`. |
 | Publication sweep (`publication_owner.ready` every iteration) | **Deleted.** It is a source with derived readiness. |
-| Causal sweep (`causal_wake_through` walks every waiter) | **Deleted.** FIFO capacity waits (rule 2.1.4). |
+| Causal sweep (`causal_wake_through` walks every family-cleanup, causal, and model waiter; `owner_loop.rs:875-929`) | **Deleted.** Each waiter moves to its own kind (rule 2.1.5):
+- **Model waiters** wait for the exclusive entity model: a FIFO on the model, released when the active `Work` ends. A model fault makes every waiter `Ready`, and each then fails typed.
+- **Causal waiters** (`CausalTransitionStatus::Waiting`, `entities/worker.rs:895-960`): S4b types `Waiting` with its cause. A wait for table capacity joins the causal-slot FIFO. A wait for a specific receipt is a keyed completion on that receipt.
+- **Family-cleanup waiters**: keyed completions on their cleanup phase.
+Tests: completion out of order, where a later receipt completes first and runs with no other wake; cancellation of a FIFO head; a model fault with waiters parked. |
 | Owner-permit `budget.released` harvest | **Kept** as a `Local` wait: the permit table is owner state. |
 | Core terminal wake pump (targeted, CAS-coalesced, lossless overflow) | **Kept.** It already meets this contract. |
+| Process host (Core, not yet wired into Hub): `install_ingress_notifier`, `install_exit_notifier` (`plugin_process/host.rs:285-300`), `DeliveryPool::install_unit_returned` (`plugin_delivery_pool.rs:319`) | Hub installs `raise(PluginIngress(plugin))`, `raise(PluginExit(plugin))`, and `raise(PluginCredit(plugin))`. `DeliveryPool::close()` clears units without firing (`:245-250`). That is correct only because generation retirement retires every credit waiter of that generation at once (plugin-platform §4.5.4). A test proves it: a waiter parked at unload is answered `cancelled`. |
 
 ## 3. Thread and process boundaries
 
 ### 3.1 Terminal output frame (PTY read → client socket write)
 
-Today (Core main): **Unix 5 crossings, WebRTC 6.**
+These are logical handoffs, where work moves from one thread or task to another. They are not necessarily OS thread switches: two tokio tasks can share a worker thread.
+
+Today (Core main): **Unix 5 handoffs, WebRTC 6.**
 1. PTY reader thread → worker main thread.
 2. worker main thread → worker egress writer thread.
 3. worker process → Hub process (socket).
@@ -200,7 +253,7 @@ The Hub owner is not on the byte path. It is woken once per pump batch, and step
 
 **Remove 1 and 2 (step S9).** The session worker becomes one thread with one `poll` over the PTY fd, the control socket, and the egress socket. This also removes the unbounded control mpsc: reads stop when the main loop cannot accept. It also removes the coupling where blocked output stops input. And it deletes two of the three 64-deep stages.
 
-**Remove 4 later (step S11).** The data-plane thread polls worker sockets directly instead of one reader thread per session. Plugin process readers can use the same reactor.
+**Remove 4 later (step S11).** The data-plane thread polls worker sockets directly instead of one reader thread per session. It reads and pumps on the same thread, so handoff 4 disappears. The reactor moves bytes only and carries no Hub policy.
 
 **Keep 3, 5, and 6.** Step 3 is the process boundary. Step 5 keeps socket ownership with the task that multiplexes the connection. Step 6 is inside the rtc library.
 
@@ -208,7 +261,9 @@ After: **Unix 3 (2 after S11), WebRTC 4 (3 after S11).**
 
 ### 3.2 Plugin entity publication (Lua call → client socket write)
 
-Today (in-process Lua): **11 to 13 serialized wakes**, not 8. Plan §4.5 counts only to the Lua reply. The path:
+Scope of the count: one publication, one Unix recipient, and `Advance` running once. `Advance` can repeat, and `Deliver` runs once per recipient. WebRTC adds its channel → rtc handoff (+1). The Host → owner completion after the final `Deliver` is off the path to the socket write.
+
+Today (in-process Lua), under that scope: **11 to 13 serialized handoffs**, not 8. Plan §4.5 counts only to the Lua reply. The path:
 - Lua → owner.
 - owner ↔ Host for `Admit`, `Advance`, and `Reply`.
 - owner ↔ Host for `TakeFanout`, `PrepareMutation`, and `Deliver`.
@@ -222,7 +277,7 @@ Retirement adds about 8 wakes off the critical path. Only one fanout runs at a t
 - **Progress and budget.** Each activation applies at least one publication, and a partial batch marks itself ready again (§4.5.2). The job keeps to the owner turn budget. Delivery stays nonblocking per client: a full client queue is a per-client outcome (resync), never a stall for the batch.
 - **Failure mapping.** An apply failure maps to its `publication_seq` for a held `Reply`. The job skips the failed publication's fanout, and the rest of the batch continues.
 
-After, in-process: **3** on the path (Lua → owner → Host → connection). After, on the process host: **5** (child Lua → child writer → parent reader → owner → Host → connection, where the process crossing is one of them), and **4** after S11. Credit return (`release_call`) stays off the path.
+After S8, in-process: **3** on the path (Lua → owner → Host → connection). On the process host: **5** (child Lua → child writer → parent reader → owner → Host → connection, with one of these the process crossing). S11 does not reduce this count: it replaces the parent reader thread with the data-plane reactor, but the reactor → owner handoff remains. This plan claims no further reduction. Credit return (`release_call`) stays off the path.
 
 ### 3.3 Other boundaries
 
@@ -243,13 +298,13 @@ Every step lands alone, keeps the strict gates green (fmt, clippy `-D warnings` 
 | **C1** | Core | 2.4.2 source backpressure, the capture-boundary hold, and the PTY tail hold (the Core writer's step, in progress); 2.4.5 egress reports a lost socket | flood storm; resync at a capture boundary; lost output tail at exit on macOS; silent egress drop | the Core probe (0 resyncs under flood); "attach while held" gives 0 resyncs (today 1); a program that floods and exits delivers its whole tail; a reader with no progress ends `Stalled` at the deadline; flood lane | in progress (+0.25 d for 2.4.5) |
 | **C2** | Core | 2.4.1 notifier edge: arm on `Backpressured` as for `LockBusy`, and fire `wake_armed_admission` where `take_dispatchable` frees a class slot and where a job is unqueued; the notifier conformance test; 2.4.6 `notify_session` instead of the discard | `Backpressured` has no retry event; suspected lost bound-queue wake | armed `Backpressured` admission is notified when a worker dequeues (ablation: no fire); a resync capture for a session outside the batch is pumped with no other wake (ablation: discard) | 0.75 d |
 | **S0** | Hub | Land the roll branch (b870bca3, stale close, NotSubscribed), rolled to a Core that holds C1 and C2 | cursor lost wake; silent close on Stale | existing branch tests; full lifecycle target | existing work |
-| **S1** | Hub | `Readiness`, `Wake`, `OwnerSignal`, the progress fault counter; convert package-event delivery | `mark_all` spin on Backpressured; emit lost wake; `LockBusy` drop | owner-loop test: Backpressured parks with zero turns until the notifier fires (ablation: `mark_all`); emit from a request handler is delivered; `LockBusy` event is delivered, not retired | 1 d |
-| **S2** | Hub | Session-family admission as a source with a maintained ready set (rule 2.1.5); `LockBusy` waits | gap and baseline on contention; b870bca3 class removed | contention on a session-family frame gives no gap (ablation: old arm); a frame queued before the cursor is admitted with no other wake (the b870bca3 test); the debug recompute of the ready set; Web workspaces-lifecycle lane | 0.5 d |
+| **S1** | Hub | `Readiness`, `Wake`, `Armed`, `Outcome`, and `OwnerSignal` (with its per-key interleaving test harness, 2.2); convert package-event delivery | `mark_all` spin on Backpressured; emit lost wake; `LockBusy` drop | interleaving tests for `PluginEngine` (release before the final attempt, release between refusal and return) and `PackageEvents` (emit from a request-response handler, with no other wake); `Backpressured` parks with zero owner turns until C2's edge fires (ablation: `mark_all`); a `LockBusy` event is delivered, not retired; the completion-store ordering of 2.3 (store full, completion signal consumed, admission parks, the drain frees the store, and the admission runs with no other wake) | 1.25 d |
+| **S2** | Hub | Session-family admission as a source with a maintained ready set (rule 2.1.6); `LockBusy` waits | gap and baseline on contention; b870bca3 class removed | contention on a session-family frame gives no gap (ablation: old arm); a frame queued before the cursor is admitted with no other wake (the b870bca3 test); the debug recompute of the ready set; Web workspaces-lifecycle lane | 0.5 d |
 | **S3** | Hub | `SubscribeEvents` waits on `ConnectionSlots`; `bind_reader` stops signalling a bound reader | `shed_busy` on first subscribe | the three lifecycle tests named in the triage report; a forced try-lock loss is served | 0.5 d |
-| **S4** | Hub | Convert the other maintenance slices, publication and event owners, and causal waits; delete `MaintenanceWakes`, `mark_all`, `try_wake`, the doorbell variants, the hand flags, the sweeps, and `DataPlaneProgress.progressed`. Install the capability event notifier and `next_deadline` (2.5). Two commits: lifecycle slices, then entity, causal, and capability | `Refused` spin, and the `Refused` maintenance-read stall (confirmed by code reading, `daemon_maintenance.rs:955, 1004, 1111`); the Observe `BudgetTooSmall` spin (rule 2.1.6); permanent `recovery`; causal herd; owner wake per pump batch | owner-loop idle test: zero turns while idle; flood lane with an owner-turn count (`measurement-window`); progress fault counter stays zero across the full lifecycle target | 2 d |
+| **S4a** | Hub | Convert the lifecycle slices (Observe, journal pull, projection apply, baseline, HostBridge) and the pump and reconcile; add the `DataPlaneCapacity` producer at request dequeue; publication `recovery` with a defined exit; delete `DataPlaneProgress.progressed` (keeping `journal_advanced`, 2.4.3) and the `mark_all` sites of these slices | the `Refused` maintenance-read stall; the `Refused` pump spin; the permanent publication `recovery` hang; the Observe `BudgetTooSmall` spin (rule 2.1.7); one owner wake per pump batch | full Core request queue with no incidental wake: the read runs after one dequeue (ablation: no raise); interleaving tests for `DataPlaneCapacity`; a submit failure followed by recovery (ablation: today's flag); owner-loop idle test with zero turns while idle | 1.25 d |
+| **S4b** | Hub | Convert subscriber delivery, the publication and event owners, the causal and model waits (the 2.5 mapping), and the capability-event plumbing; delete `MaintenanceWakes`, the remaining `mark_all` and `try_wake`, the doorbell variants, the hand flags, and both sweeps | causal herd; incidental wakes; capability-event wake (plugin-platform consumer) | out-of-order receipt completion; FIFO head cancellation; model fault with parked waiters; interleaving tests for `HostCapacity`, `PluginResultCapacity`, and `CapabilityEvents`; flood lane with an owner-turn count (`measurement-window`); zero progress faults across the full lifecycle target | 1.25 d |
 | **S5** | Hub | Input backpressure: the Unix connection stops reading while adapter ingress is full; the WebRTC channel stops draining, so the SCTP window closes | route ended by a paste burst | paste burst larger than 64 frames on a stalled data plane is delivered whole on both transports (ablation: drop + `Lost`) | 1 d |
-| **S6** | Hub | WebRTC: check the watermark per chunk; bound `queued_events` with the existing mailbox bound | two unbounded queues | an oversize frame on a stalled peer stays under the aggregate plus one chunk; queued events stop at the mailbox bound | 0.5 d |
-| **S7** | Hub | Map `CoreTicketPoll::Refused` and Host permits to FIFO capacity waits (if S4 did not already cover them) | — | covered by S4 tests | 0 to 0.5 d |
+| **S6** | Hub | WebRTC: check the watermark before each 12 KiB chunk. This bounds what the Hub submits, so the rtc send buffer and SCTP queue stay at most the high watermark plus one chunk; the rtc types stay unbounded, but the Hub no longer feeds them past that. Unix: take from the entity channel only when `queued_events` is empty, and publish the capacity wake at that dequeue; the 256-frame channel is then the real bound | two unbounded queues | an oversize frame on a stalled peer stays under the aggregate plus one chunk; with the socket stalled, the 257th entity frame gets the channel's existing outcome (subscriber DROP+RS, `subscriber_overflow`) and `queued_events` holds at most 1 frame | 0.5 d |
 | **S8** | Hub | Fused Host job: apply batch, fanout, prepare, deliver | 11-13 → 3 wakes per publication | 512-publication test by gates, not by clock (plan §4.5.8); wake count assertion; a stalled client socket does not delay credit return or a held `Reply` (ablation: release after delivery) | 1 d |
 | **S9** | Core | Single-threaded session worker `poll` loop. The Core writer sees no blocker, but it is a rewrite: the reader thread carries the mode barrier and the snapshot-barrier fence (reader pause, residual drain); egress needs nonblocking writes with `POLLOUT`; Ghostty model work shares the thread, which adds latency under a flood | 2 crossings; unbounded control mpsc; input blocked behind output | existing worker process tests; the barrier tests; input applied while egress is full; flood-lane input latency | 2 to 3 d |
 | **S10** | Core + Hub | Derive `exit_hold` (2.4.4); `journal_advanced` as a wake (2.4.3) | hand-mirrored flags | post-exit capture tests; journal pull with no host poll | 0.5 d |
@@ -258,29 +313,29 @@ Every step lands alone, keeps the strict gates green (fmt, clippy `-D warnings` 
 
 ### 4.1 Cutover split
 
-The total is about 12.5 to 15 writer-days of new work. That exceeds the 3-day guide, so the steps split as follows.
+The total is about 13.25 to 15.25 writer-days of new work. That exceeds the 3-day guide, so the steps split as follows.
 
-**Must land before cutover: about 6 writer-days of new work.** These steps fix every live defect in the catalogue.
+**Must land before cutover: about 6.75 writer-days of new work.** These steps fix every live defect in the catalogue.
 
 | Step | New work | Why before cutover |
 | --- | --- | --- |
 | C1 | in progress, plus 0.25 d | flood storm; resync at a capture boundary; lost output tail at exit (macOS); silent egress drop |
 | C2 | 0.75 d | `Backpressured` has no retry event; suspected lost bound-queue wake (2.4.6) |
 | S0 | existing branch | lost cursor wake; silent close on Stale |
-| S1 | 1 d | event spin; lost emit wake; `LockBusy` drops an event |
+| S1 | 1.25 d | event spin; lost emit wake; `LockBusy` drops an event |
 | S2 | 0.5 d | contention opens a gap and a full baseline |
 | S3 | 0.5 d | `shed_busy` on the first subscribe |
-| S4 | 2 d | fixes the live `Refused` maintenance-read stall (1.5 item 7) and the `Refused` pump spin; deletes the incidental wakes that hid the cursor defect; fixes the permanent `recovery` flag and the capability-event wake |
+| S4a | 1.25 d | the live `Refused` maintenance-read stall (1.5 item 7); the permanent publication `recovery` hang; the `Refused` pump spin; the owner wake per pump batch |
+| S4b | 1.25 d | deletes the incidental wakes that hid the cursor defect; causal herd; capability-event wake |
 | S5 | 1 d | a paste burst ends the route |
 
-Every step in this list fixes a live defect, so no step can move after cutover without leaving a known defect. If time forces a cut, the first commit of S4 (the lifecycle slices, which include the `Refused` stall) stays before cutover, and its second commit (entity, causal, capability) can follow. That second commit fixes spins and the causal herd. They waste CPU, but they do not hang.
+Every step in this list fixes a live defect. If time forces a cut, only S4b can move after cutover without leaving a known hang: its defects waste CPU (the causal herd and incidental wakes), and the capability-event wake has no production consumer until plugin-platform slice 3. S4a stays before cutover, because it fixes two hangs.
 
-**Can follow cutover: about 6.5 to 9 writer-days.**
+**Can follow cutover: about 6.5 to 8.5 writer-days.**
 
 | Step | Size | Note |
 | --- | --- | --- |
 | S6 | 0.5 d | two unbounded queues (WebRTC chunks, Unix `queued_events`) |
-| S7 | 0 to 0.5 d | only if S4 left capacity waits uncovered |
 | S8 | 1 d | aligns with plugin-platform slice 3 |
 | S9 | 2 to 3 d | single-threaded session worker; a rewrite (see the table) |
 | S10 | 0.5 d | derived `exit_hold`; `journal_advanced` as a wake |
@@ -290,10 +345,10 @@ Every step in this list fixes a live defect, so no step can move after cutover w
 ### 4.2 Order constraints
 
 - **C1 must reach Hub in the same roll as Core `2845aec`.** The roll branch (`85b3507`) already contains `2845aec`. Landing S0 without C1 brings the flood storm into the Hub build. The orchestrator confirms that the roll already waits on C1.
-- **S1 requires C2** for the `Backpressured` wake. Until C2 lands, S1 can wait on the completion notifier alone. That gives the same behavior as today's incidental wake, but without the spin.
-- **S4 requires S1** (the type) and should follow S2 and S3, so that it only deletes.
+- **S1 requires C2.** The `PluginEngine` wait needs C2's class-slot edge. The incidental completion notification is not a retry edge, so S1 does not land before C2.
+- **S4a and S4b require S1** (the types and the test harness). S4b follows S2 and S3, so that it only deletes.
 
 ## 5. Open questions for review
 
 1. **Client `Backpressured` on plugin control.** This plan keeps the typed refusal for capacity. The alternative is to park the request under its existing deadline.
-2. **Local-waiter cost.** Re-evaluating every `Local` waiter after every step assumes about 20 sources with O(1) predicates. A source with many rows (for example per subscriber) must keep an internal ready index (rule 2.1.1).
+2. **Source-predicate cost.** Rule 2.1.2 re-evaluates about 20 coarse source predicates after every owner step. A source with many rows (for example per subscriber) must keep an internal ready index (rule 2.1.1). Keyed completions are never swept.
