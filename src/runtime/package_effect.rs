@@ -273,10 +273,32 @@ impl HostPackageRuntime {
                 return Err(HubLuaPluginLoadError::Lua(error));
             }
         };
-        let event_handlers = bundle.event_handlers.clone();
         // Every fallible step runs before anything changes: prepare the
         // plugin, then stage its event generation. The install cannot fail,
-        // and activation publishes the subscriptions only after it.
+        // and activation publishes the subscriptions only after it. Nothing
+        // is installed if a step fails, so the grants go too.
+        let plugin = match self.prepare_new_load(registry, package_name, bundle) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                self.revoke_grants(package_name);
+                return Err(error);
+            }
+        };
+        let (key, _) = self
+            .plugin_lifecycle
+            .commit_package(RequestId("hub-load-registration".into()), plugin);
+        self.activate_event_generation()?;
+        Ok(key)
+    }
+
+    /// Prepare a first load's plugin and stage its event generation.
+    fn prepare_new_load(
+        &mut self,
+        registry: &PackageRegistry,
+        package_name: &str,
+        bundle: HubPluginRuntimeBundle,
+    ) -> Result<crate::lifecycle::PreparedPluginLoad, HubLuaPluginLoadError> {
+        let event_handlers = bundle.event_handlers.clone();
         let mut plugin = self
             .plugin_lifecycle
             .prepare_package(registry, package_name, bundle)
@@ -286,11 +308,7 @@ impl HostPackageRuntime {
             .map_err(HubLuaPluginLoadError::EventPlane)?;
         let generation = self.stage_event_generation(package_name, staged_plane)?;
         plugin.set_event_generation(generation);
-        let (key, _) = self
-            .plugin_lifecycle
-            .commit_package(RequestId("hub-load-registration".into()), plugin);
-        self.activate_event_generation()?;
-        Ok(key)
+        Ok(plugin)
     }
 
     /// Stage this package's next event generation, funded by the attempt.
