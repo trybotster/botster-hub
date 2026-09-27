@@ -368,10 +368,16 @@ pub(crate) fn arm_package_entity_delivery(
     }
     let applied = subscription.package_last_applied_seq;
     if snapshot {
+        // A floor above an in-sync subscriber's applied sequence means admitted
+        // deltas are queued for it, not that it needs a snapshot. It takes one
+        // only when the snapshot brings it to the floor; a stale resync
+        // snapshot from a provider behind the floor would otherwise mark it
+        // catching up and drop every queued delta.
+        let in_sync = !subscription.package_catching_up && subscription.resync_reason.is_none();
         if applied.is_some_and(|applied| sequence < applied)
-            || !(subscription.package_catching_up
-                || subscription.resync_reason.is_some()
-                || applied.is_none_or(|applied| applied < family_floor))
+            || (in_sync
+                && applied
+                    .is_some_and(|applied| applied >= family_floor || sequence < family_floor))
         {
             return None;
         }
