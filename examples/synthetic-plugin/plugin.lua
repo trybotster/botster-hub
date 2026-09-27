@@ -1,5 +1,5 @@
 -- Local-only synthetic package fixture for the botster-hub runtime proof.
-events.on("hub", "worktree_created", function(event)
+botster.events.on({ owner = "hub", name = "worktree_created" }, function(event)
   return {
     observed = "worktree_created",
     worktree_id = event.worktree_id,
@@ -22,10 +22,10 @@ return botster.register({
       handler = "echo",
       call = function(args)
         local timer = botster.capabilities.timer_once(1)
-        local config = botster.capabilities.config.get()
-        local cross_package_ok, cross_package_value = pcall(function()
-          return botster.capabilities.config.get("other.package")
-        end)
+        local config = botster.capabilities.config.get().value
+        local cross_package = botster.capabilities.config.get("other.package")
+        local cross_package_ok = cross_package.ok
+        local cross_package_value = cross_package.error and cross_package.error.kind
         return {
           message = args.message or "empty",
           capability = timer,
