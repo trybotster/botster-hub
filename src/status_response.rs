@@ -42,6 +42,16 @@ pub(crate) struct StatusResponseSeed {
     pub(crate) occupancy: Vec<DaemonAttachOccupancy>,
     pub(crate) terminal_records: Vec<DaemonLocalWebrtcTerminalRecord>,
     pub(crate) quarantines: Vec<DaemonQuarantine>,
+    /// Retained-reservation invariant faults, read from the Host executor.
+    pub(crate) reservation_faults: ReservationFaults,
+}
+
+/// Invariant faults: a holder of this kind was still outstanding when new
+/// work of the kind was refused. Status never faults, so it has no count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReservationFaults {
+    pub(crate) staging_funding: u64,
+    pub(crate) entity_work: u64,
 }
 
 /// The reservation remains after inventory in field destruction order.
@@ -334,10 +344,13 @@ fn try_prepare(
         ],
     )
     .ok_or_else(too_large)?;
-    let (counters, counter_bytes) = seed
+    let (mut counters, counter_bytes) = seed
         .counters
         .bounded_snapshot(limit.checked_sub(typed).ok_or_else(too_large)?)
         .ok_or_else(too_large)?;
+    counters.retained_reservation_outstanding_staging_funding =
+        seed.reservation_faults.staging_funding;
+    counters.retained_reservation_outstanding_entity_work = seed.reservation_faults.entity_work;
     let typed = checked_live_bytes(limit, [typed, counter_bytes]).ok_or_else(too_large)?;
     let seed = input.seed.expect("the admitted input has a seed");
     let kind = if input.shutdown {
@@ -432,6 +445,7 @@ pub(crate) fn test_input(shutdown: bool) -> StatusResponseInput {
             occupancy: Vec::new(),
             terminal_records: Vec::new(),
             quarantines: Vec::new(),
+            reservation_faults: ReservationFaults::default(),
         }),
         core: None,
         request_id: "41".to_string(),
@@ -514,6 +528,25 @@ mod tests {
         };
         assert_eq!(request_id, "41");
         assert_eq!(response.error.unwrap().code, "host_result_too_large");
+    }
+
+    #[test]
+    fn status_reports_retained_reservation_faults_by_kind() {
+        let mut input = test_input(false);
+        input.seed.as_mut().unwrap().reservation_faults = ReservationFaults {
+            staging_funding: 2,
+            entity_work: 5,
+        };
+        let prepared = prepare(input, crate::host_executor::HOST_PREPARED_BYTE_CAPACITY);
+        let frame: botster_hub_client::ServerFrame =
+            serde_json::from_slice(prepared.encoded_frame.as_ref().expect("encoded response"))
+                .expect("decode response frame");
+        let botster_hub_client::ServerFrame::Response { response, .. } = frame else {
+            panic!("response frame");
+        };
+        let counters = response.status.expect("status is present").observability;
+        assert_eq!(counters.retained_reservation_outstanding_staging_funding, 2);
+        assert_eq!(counters.retained_reservation_outstanding_entity_work, 5);
     }
 
     #[test]
