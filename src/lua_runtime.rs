@@ -874,6 +874,8 @@ pub struct LuaPluginHostApi {
 /// Real Lua runtime for one loaded plugin package.
 pub struct LuaPluginRuntime {
     plugin_key: PluginKey,
+    /// This VM's log generation (see `plugin_logs`).
+    log_generation: u64,
     lua: Mutex<LuaState>,
     instruction_budget: Arc<AtomicU64>,
     stopped: AtomicBool,
@@ -1415,6 +1417,7 @@ mod state_owner_tests {
         let state = LuaState::new(memory.reserve_vm().unwrap()).unwrap();
         Arc::new(LuaPluginRuntime {
             plugin_key: PluginKey("state-owner-test".into()),
+            log_generation: 0,
             lua: Mutex::new(state),
             instruction_budget: Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET)),
             stopped: AtomicBool::new(false),
@@ -1615,6 +1618,7 @@ impl LuaPluginRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(std::sync::Arc::downgrade(&runtime));
         Ok(HubPluginRuntimeBundle {
+            log_generation: Some(runtime.log_generation),
             runtime,
             handlers: loaded.handlers,
             event_handlers: loaded.event_handlers,
@@ -1648,7 +1652,36 @@ impl LuaPluginRuntime {
         )
     }
 
+    /// Load one VM under a new log generation. A failed load removes the
+    /// records its entrypoint wrote, so they never outlive the attempt.
     fn new_named(
+        plugin_key: PluginKey,
+        entrypoint: &Path,
+        source_name: &str,
+        package_root: Option<&Path>,
+        host_api: LuaHostApi,
+        memory: Arc<LuaMemoryAccount>,
+    ) -> Result<(Self, LuaRegistration), LuaPluginRuntimeError> {
+        let log_generation = crate::plugin_logs::next_generation();
+        let logs = Arc::clone(&host_api.logs);
+        let plugin = plugin_key.0.clone();
+        let loaded = Self::load_generation(
+            log_generation,
+            plugin_key,
+            entrypoint,
+            source_name,
+            package_root,
+            host_api,
+            memory,
+        );
+        if loaded.is_err() {
+            logs.remove_generation(&plugin, log_generation);
+        }
+        loaded
+    }
+
+    fn load_generation(
+        log_generation: u64,
         plugin_key: PluginKey,
         entrypoint: &Path,
         source_name: &str,
@@ -1689,7 +1722,8 @@ impl LuaPluginRuntime {
                 },
             )?;
             sandbox::install(lua, Arc::clone(&budget), Arc::clone(&instruction_error))?;
-            let capacity_string = install_botster_api(lua, plugin_key.clone(), host_api)?;
+            let capacity_string =
+                install_botster_api(lua, plugin_key.clone(), log_generation, host_api)?;
             if let Some(package_root) = package_root {
                 let staged = modules::stage(package_root, &memory).map_err(|message| {
                     LuaPluginRuntimeError::Load(format!("cannot stage Lua modules: {message}"))
@@ -1713,6 +1747,7 @@ impl LuaPluginRuntime {
         Ok((
             Self {
                 plugin_key,
+                log_generation,
                 lua: Mutex::new(state),
                 instruction_budget: budget,
                 stopped: AtomicBool::new(false),
@@ -2136,6 +2171,7 @@ fn empty_object() -> serde_json::Value {
 fn install_botster_api(
     lua: &Lua,
     plugin_key: PluginKey,
+    log_generation: u64,
     host_api: LuaHostApi,
 ) -> Result<LuaCallbackCharge, LuaPluginRuntimeError> {
     let globals = lua.globals();
@@ -2178,8 +2214,11 @@ fn install_botster_api(
         lua,
         &botster,
         Arc::clone(&host_api.memory),
-        &plugin_key.0,
-        Arc::clone(&host_api.logs),
+        basics::LogSink {
+            book: Arc::clone(&host_api.logs),
+            plugin: plugin_key.0.clone(),
+            generation: log_generation,
+        },
     )?;
 
     let capabilities_table = lua.create_table()?;
@@ -4187,6 +4226,7 @@ mod completion_tests {
         let plugin_key = PluginKey("completion-test".to_string());
         let runtime = LuaPluginRuntime {
             plugin_key: plugin_key.clone(),
+            log_generation: 0,
             lua: Mutex::new(state),
             instruction_budget: Arc::new(AtomicU64::new(DEFAULT_INSTRUCTION_BUDGET)),
             stopped: AtomicBool::new(false),

@@ -2463,13 +2463,17 @@ pub struct DaemonPluginLogs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonPluginLogRecord {
     pub seq: u64,
+    /// The plugin load (VM generation) that wrote the record.
+    pub generation: u64,
     /// Unix epoch milliseconds.
     pub at_ms: u64,
     /// `debug`, `info`, `warn`, or `error`.
     pub level: String,
     pub message: String,
+    /// The record's fields as JSON object text, exactly as the plugin
+    /// encoded them. The daemon does not parse it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fields: Option<Value>,
+    pub fields_json: Option<String>,
     /// Records refused by the plugin's rate limit just before this one.
     pub dropped_before: u64,
 }
@@ -8010,10 +8014,11 @@ mod tests {
                 package_name: "workflow.plugin".to_string(),
                 records: vec![DaemonPluginLogRecord {
                     seq: 3,
+                    generation: 1,
                     at_ms: 1_790_000_000_000,
                     level: "info".to_string(),
                     message: "ticket advanced".to_string(),
-                    fields: Some(serde_json::json!({ "ticket_id": "t1" })),
+                    fields_json: Some(r#"{"ticket_id":"t1"}"#.to_string()),
                     dropped_before: 0,
                 }],
                 next_seq: 4,
