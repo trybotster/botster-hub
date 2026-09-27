@@ -2111,12 +2111,12 @@ fn install_botster_api(
     let (event_on, register): (Function, Function) = lua
         .load(include_str!("lua_runtime/registration.lua"))
         .call((lua.globals(), lua.null()))?;
-    let events = lua.create_table()?;
-    events.set("on", event_on)?;
+    let raw_events = lua.create_table()?;
+    raw_events.set("on", event_on)?;
     let emit_router = host_api.package_event_router.clone();
     let emit_plugin = plugin_key.clone();
     let emit_scopes = host_api.causal_scopes.clone();
-    events.set(
+    raw_events.set(
         "emit",
         callback::create(lua, move |lua, (name, payload): (EventName, Value)| {
             if let Some(scope_id) = current_causal_scope()
@@ -2133,10 +2133,14 @@ fn install_botster_api(
         })?,
     )?;
     globals.set("__botster_registration", lua.create_table()?)?;
-    globals.set("events", events)?;
+    let events: Table = lua
+        .load(include_str!("lua_runtime/events.lua"))
+        .set_name("@hub/events")
+        .call(raw_events)?;
 
     let botster = lua.create_table()?;
     botster.set("register", register)?;
+    botster.set("events", events)?;
     basics::install(
         lua,
         &botster,
@@ -2248,40 +2252,58 @@ fn entity_publish_function(
     })
 }
 
+/// Read a required string field from a table-first argument.
+fn string_argument(args: &Value, field: &str) -> Option<String> {
+    let Value::Table(args) = args else {
+        return None;
+    };
+    match args.raw_get::<Value>(field).ok()? {
+        Value::String(value) => value.to_str().ok().map(|value| value.to_string()),
+        _ => None,
+    }
+}
+
+fn state_unavailable(lua: &Lua) -> mlua::Result<Table> {
+    result::err(
+        lua,
+        result::ErrorKind::Unavailable,
+        "the hub state is unavailable",
+    )
+}
+
 fn spawn_targets_table(lua: &Lua, spawn_targets: SharedSpawnTargets) -> Result<Table, mlua::Error> {
     let table = lua.create_table()?;
     let list_targets = spawn_targets.clone();
     table.set(
         "list",
-        callback::create(lua, move |lua, ()| {
-            let (_, state) = list_targets
-                .try_snapshot()
-                .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
-            lua.to_value(&crate::spawn_targets::list_spawn_targets(
+        lua.create_function(move |lua, _: Value| {
+            let Ok((_, state)) = list_targets.try_snapshot() else {
+                return state_unavailable(lua);
+            };
+            let rows = lua.to_value(&crate::spawn_targets::list_spawn_targets(
                 &state.spawn_targets,
-            ))
+            ))?;
+            result::ok(lua, rows)
         })?,
     )?;
     table.set(
         "validate",
-        callback::create(lua, move |lua, args: Value| {
-            let value = lua.from_value::<serde_json::Value>(args)?;
-            let target_id = value
-                .get("target_id")
-                .or_else(|| value.get("id"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    mlua::Error::RuntimeError(
-                        "spawn_targets.validate requires target_id".to_string(),
-                    )
-                })?;
-            let (_, state) = spawn_targets
-                .try_snapshot()
-                .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
-            lua.to_value(&crate::spawn_targets::validate_spawn_target(
+        lua.create_function(move |lua, args: Value| {
+            let Some(target_id) = string_argument(&args, "target_id") else {
+                return result::err(
+                    lua,
+                    result::ErrorKind::InvalidRequest,
+                    "spawn_targets.validate takes { target_id = <string> }",
+                );
+            };
+            let Ok((_, state)) = spawn_targets.try_snapshot() else {
+                return state_unavailable(lua);
+            };
+            let validation = lua.to_value(&crate::spawn_targets::validate_spawn_target(
                 &state.spawn_targets,
-                target_id,
-            ))
+                &target_id,
+            ))?;
+            result::ok(lua, validation)
         })?,
     )?;
     Ok(table)
@@ -2297,51 +2319,45 @@ fn worktrees_table(
     let list_targets = spawn_targets.clone();
     table.set(
         "list",
-        callback::create(lua, move |lua, ()| {
-            let (_, state) = list_targets
-                .try_snapshot()
-                .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
+        lua.create_function(move |lua, _: Value| {
+            let Ok((_, state)) = list_targets.try_snapshot() else {
+                return state_unavailable(lua);
+            };
             debug_assert!(Arc::ptr_eq(&list_targets, &list_worktrees));
-            lua.to_value(&crate::worktrees::list_worktrees(
+            let rows = lua.to_value(&crate::worktrees::list_worktrees(
                 &state.worktrees,
                 &state.spawn_targets,
-            ))
+            ))?;
+            result::ok(lua, rows)
         })?,
     )?;
     table.set(
         "show",
-        callback::create(lua, move |lua, args: Value| {
-            let value = lua.from_value::<serde_json::Value>(args)?;
-            let worktree_id = value
-                .get("worktree_id")
-                .or_else(|| value.get("id"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    mlua::Error::RuntimeError("worktrees.show requires worktree_id".to_string())
-                })?;
-            let (_, state) = spawn_targets
-                .try_snapshot()
-                .map_err(|()| mlua::Error::RuntimeError("hub state lock poisoned".to_string()))?;
+        lua.create_function(move |lua, args: Value| {
+            let Some(worktree_id) = string_argument(&args, "worktree_id") else {
+                return result::err(
+                    lua,
+                    result::ErrorKind::InvalidRequest,
+                    "worktrees.show takes { worktree_id = <string> }",
+                );
+            };
+            let Ok((_, state)) = spawn_targets.try_snapshot() else {
+                return state_unavailable(lua);
+            };
             debug_assert!(Arc::ptr_eq(&spawn_targets, &worktrees));
             match crate::worktrees::show_worktree(
                 &state.worktrees,
                 &state.spawn_targets,
-                worktree_id,
+                &worktree_id,
             ) {
-                Ok(worktree) => lua.to_value(&json!({
-                    "ok": true,
-                    "status": worktree.status,
-                    "worktree": worktree,
-                })),
-                Err(error) if error.kind == "not_found" => lua.to_value(&json!({
-                    "ok": false,
-                    "status": error.kind,
-                    "worktree_id": worktree_id,
-                    "message": error.message,
-                })),
-                Err(error) => Err(mlua::Error::RuntimeError(format!(
-                    "worktrees.show failed: {error}"
-                ))),
+                Ok(worktree) => {
+                    let worktree = lua.to_value(&worktree)?;
+                    result::ok(lua, worktree)
+                }
+                Err(error) if error.kind == "not_found" => {
+                    result::err(lua, result::ErrorKind::NotFound, &error.message)
+                }
+                Err(error) => result::err(lua, result::ErrorKind::Failed, &error.to_string()),
             }
         })?,
     )?;
@@ -2357,14 +2373,21 @@ fn config_table(lua: &Lua, configuration: PackageConfigurationView) -> Result<Ta
     });
     config.set(
         "get",
-        callback::create(lua, move |lua, package_name: Value| {
-            if !matches!(package_name, Value::Nil) {
-                return Err(mlua::Error::RuntimeError(
-                    "config.get reads only the loaded plugin configuration and accepts no package name"
-                        .to_string(),
-                ));
+        lua.create_function(move |lua, args: Value| {
+            let empty = match &args {
+                Value::Nil => true,
+                Value::Table(table) => table.clone().pairs::<Value, Value>().next().is_none(),
+                _ => false,
+            };
+            if !empty {
+                return result::err(
+                    lua,
+                    result::ErrorKind::InvalidRequest,
+                    "config.get reads only the loaded plugin's configuration and takes no fields",
+                );
             }
-            lua.to_value(&payload)
+            let value = lua.to_value(&payload)?;
+            result::ok(lua, value)
         })?,
     )?;
     Ok(config)
