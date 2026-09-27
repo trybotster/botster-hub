@@ -163,8 +163,12 @@ pub(crate) fn apply_committed_runtime_effect(
     effect: &PackageRuntimeEffect,
 ) -> DaemonTransportResult<()> {
     match effect {
+        // An explicit operator enable or reload resolves a stranded package:
+        // once it succeeds the package starts clean.
         PackageRuntimeEffect::Enable { package_name, .. } => {
-            load_package_after_enable(runtime, registry, package_name)
+            load_package_after_enable(runtime, registry, package_name)?;
+            runtime.clear_stranded(package_name);
+            Ok(())
         }
         PackageRuntimeEffect::Disable { package_name }
         | PackageRuntimeEffect::Remove { package_name } => {
@@ -196,7 +200,9 @@ pub(crate) fn apply_committed_runtime_effect(
                 registry,
                 package_name,
                 running_entrypoints,
-            )
+            )?;
+            runtime.clear_stranded(package_name);
+            Ok(())
         }
         PackageRuntimeEffect::Refresh { packages, .. } => {
             for package in packages {

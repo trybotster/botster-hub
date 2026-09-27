@@ -286,6 +286,10 @@ impl HubPluginLifecycle {
             cleanup: PluginCleanupScope::DescriptorsAndResources,
         });
         self.entity_providers.replace(entity_providers);
+        #[cfg(test)]
+        if let Some(hook) = SWAP_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
         self.engine.load_plugin(registration);
         self.loaded
             .lock()
@@ -765,6 +769,19 @@ pub(crate) fn inject_next_prepare_failure(package_name: &str) {
     INJECTED_PREPARE_FAILURES.with(|failures| {
         failures.borrow_mut().insert(package_name.to_string());
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    static SWAP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` inside this thread's next plugin swap, after Core unloaded the
+/// previous worker and before it loads the new one.
+#[cfg(test)]
+pub(crate) fn on_next_swap(hook: impl FnOnce() + 'static) {
+    SWAP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(test)]

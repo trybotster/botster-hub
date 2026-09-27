@@ -29,26 +29,58 @@ pub(crate) struct HostPackageCleanup {
     pub(crate) staged: Option<StagedGeneration>,
 }
 
-/// Funding for staging one package event generation: a handle that keeps the
-/// attempt's prepared-byte reservation alive, and that reservation's size.
-/// The router holds the handle with the pending entry, so the charge lives
-/// exactly as long as the entry.
+/// Funding for staging package event generations: a shared handle on the
+/// attempt's prepared-byte reservation, and the bytes of it the attempt does
+/// not otherwise hold. Each stage gives the router its own clone of the
+/// handle, held with the pending entry, so the charge lives exactly as long as
+/// that entry. Stages are sequential and the router admits one pending entry
+/// at a time, so the same available bytes never fund two pending entries.
 pub(crate) struct StagingFunding {
-    pub(crate) retained: Box<dyn Send>,
-    pub(crate) reserved_bytes: usize,
+    source: Arc<dyn Send + Sync>,
+    reserved_bytes: usize,
 }
 
 impl StagingFunding {
-    /// Funding for a load outside any Host attempt: daemon startup, before the
-    /// owner loop serves, and direct test loads. The pending entry lives only
-    /// inside that one synchronous load, and the Host prepared-byte capacity
-    /// bounds it as it bounds every attempt.
-    pub(crate) fn outside_attempt() -> Self {
+    pub(crate) fn new(source: Arc<dyn Send + Sync>, reserved_bytes: usize) -> Self {
         Self {
-            retained: Box::new(()),
-            reserved_bytes: crate::host_executor::HOST_PREPARED_BYTE_CAPACITY,
+            source,
+            reserved_bytes,
         }
     }
+
+    /// No reservation: every stage with any retained storage is refused.
+    pub(crate) fn none() -> Self {
+        Self::new(Arc::new(()), 0)
+    }
+
+    fn handle(&self) -> Box<dyn Send> {
+        Box::new(Arc::clone(&self.source))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PANIC_AFTER_STAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static ACTIVATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` on this thread's next load after the plugin install and before
+/// the staged event generation is activated.
+#[cfg(test)]
+pub(crate) fn on_next_activation(hook: impl FnOnce() + 'static) {
+    ACTIVATION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Make this thread's next plugin load panic right after it stages its event
+/// generation, before the plugin install.
+#[cfg(test)]
+pub(crate) fn panic_next_load_after_stage() {
+    PANIC_AFTER_STAGE.with(|armed| armed.set(true));
 }
 
 pub(crate) struct HostPackageRuntime {
@@ -64,6 +96,7 @@ pub(crate) struct HostPackageRuntime {
         crate::package_event_router::EventOwnerWorkError,
     )>,
     staging_funding: Option<StagingFunding>,
+    stranded: Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Held here, outside the effect's `catch_unwind`, so an unwind between
     /// stage and activation still hands it to the restore.
     staged: Option<StagedGeneration>,
@@ -80,15 +113,13 @@ impl HostPackageRuntime {
         self.staged.take()
     }
 
-    /// Count a quarantined package's queued events as stranded before its
-    /// unload retires them. Host workers only; the lock is taken blocking.
+    /// Quarantine a package: automatic reloads refuse it until an operator
+    /// enables or reloads it, and its next router unload counts the copies it
+    /// retires as stranded. Host workers only; the router lock is blocking.
     pub(crate) fn record_package_stranded(&self, package_name: &str) {
-        let queued = self
-            .package_event_router
-            .queued_copies_blocking(package_name);
+        self.mark_stranded(package_name);
         self.package_event_router
-            .counters()
-            .record_events_stranded(queued);
+            .mark_stranded_blocking(package_name);
     }
 
     /// Discard a generation a failed attempt staged but never activated.
@@ -97,7 +128,11 @@ impl HostPackageRuntime {
         self.package_event_router.abort_staged_generation(staged);
     }
 
-    pub(crate) fn new(plugin_lifecycle: HubPluginLifecycle, host_api: LuaPluginHostApi) -> Self {
+    pub(crate) fn new(
+        plugin_lifecycle: HubPluginLifecycle,
+        host_api: LuaPluginHostApi,
+        stranded: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    ) -> Self {
         Self {
             plugin_lifecycle,
             capability_runtime: host_api.capabilities.clone(),
@@ -109,7 +144,25 @@ impl HostPackageRuntime {
             event_plane_faults: Vec::new(),
             staging_funding: None,
             staged: None,
+            stranded,
         }
+    }
+
+    /// Mark a package stranded after its compensation failed.
+    pub(crate) fn mark_stranded(&self, package_name: &str) {
+        self.stranded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(package_name.to_string());
+    }
+
+    /// An explicit operator enable or reload succeeded: the package starts
+    /// clean and automatic reloads may load it again.
+    pub(crate) fn clear_stranded(&self, package_name: &str) {
+        self.stranded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(package_name);
     }
 
     pub(crate) fn into_cleanup(self) -> HostPackageCleanup {
@@ -191,18 +244,20 @@ impl HostPackageRuntime {
         package_name: &str,
         staged_plane: PendingEventPlaneReplace,
     ) -> Result<u64, HubLuaPluginLoadError> {
-        let funding = self
-            .staging_funding
-            .take()
-            .unwrap_or_else(StagingFunding::outside_attempt);
+        // An unfunded runtime stages with no reservation, so any retained
+        // storage is refused, typed, before the router changes.
+        let (handle, reserved_bytes) = match &self.staging_funding {
+            Some(funding) => (funding.handle(), funding.reserved_bytes),
+            None => (StagingFunding::none().handle(), 0),
+        };
         let staged = self
             .package_event_router
             .stage_package_generation(
                 package_name,
                 staged_plane.contracts,
                 staged_plane.subscriptions,
-                funding.retained,
-                funding.reserved_bytes,
+                handle,
+                reserved_bytes,
             )
             .map_err(|error| match error {
                 StageError::Rejected(status) => HubLuaPluginLoadError::EventPlane(status),
@@ -213,12 +268,20 @@ impl HostPackageRuntime {
             })?;
         let generation = staged.generation();
         self.staged = Some(staged);
+        #[cfg(test)]
+        if PANIC_AFTER_STAGE.with(|armed| armed.replace(false)) {
+            panic!("injected panic between the event plane stage and the plugin install");
+        }
         Ok(generation)
     }
 
     /// Publish the staged generation after the plugin that serves it is
     /// installed. Only an invariant break fails here, after the swap.
     fn activate_event_generation(&mut self) -> Result<(), HubLuaPluginLoadError> {
+        #[cfg(test)]
+        if let Some(hook) = ACTIVATION_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
         let staged = self
             .staged
             .take()

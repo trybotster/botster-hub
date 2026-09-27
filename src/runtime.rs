@@ -178,6 +178,9 @@ pub struct HubRuntime {
     session_contexts: SharedSessionContexts,
     package_event_router: Arc<crate::package_event_router::PackageEventRouter>,
     event_plane_counters: Arc<crate::event_plane_counters::EventPlaneCounters>,
+    /// Packages whose compensation failed. Automatic reloads refuse them; an
+    /// explicit operator enable or reload clears the marker. In memory only.
+    stranded_packages: Arc<std::sync::Mutex<BTreeSet<String>>>,
     causal_scopes: Arc<crate::package_event_router::CausalScopeTable>,
     causal_queue: CausalOwnerQueue,
     direct_family_cleanup: std::cell::RefCell<Option<HostPackageCleanup>>,
@@ -736,6 +739,7 @@ impl HubRuntime {
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
             event_plane_counters,
+            stranded_packages: Arc::default(),
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             causal_queue: CausalOwnerQueue::default(),
             direct_family_cleanup: std::cell::RefCell::new(None),
@@ -930,6 +934,7 @@ impl HubRuntime {
             session_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             package_event_router,
             event_plane_counters,
+            stranded_packages: Arc::default(),
             causal_scopes: Arc::new(crate::package_event_router::CausalScopeTable::new()),
             causal_queue: CausalOwnerQueue::default(),
             direct_family_cleanup: std::cell::RefCell::new(None),
@@ -1555,7 +1560,38 @@ impl HubRuntime {
 
     /// Capture shared runtime handles for one admitted host operation.
     pub(crate) fn host_package_runtime(&self) -> HostPackageRuntime {
-        HostPackageRuntime::new(self.plugin_lifecycle().clone(), self.lua_plugin_host_api())
+        HostPackageRuntime::new(
+            self.plugin_lifecycle().clone(),
+            self.lua_plugin_host_api(),
+            Arc::clone(&self.stranded_packages),
+        )
+    }
+
+    /// A Host runtime whose staging is funded by a fresh Host permit's
+    /// prepared-byte reservation, for loads outside a Host attempt (daemon
+    /// startup and direct calls). The permit's operation slot is released at
+    /// once; the retained reservation stays with the funding. Without a permit
+    /// the runtime is unfunded and any stage is refused, typed.
+    fn funded_host_package_runtime(&self) -> HostPackageRuntime {
+        let mut context = self.host_package_runtime();
+        if let Some(permit) = self.host_executor.try_reserve() {
+            let reserved = permit.reserved_prepared_bytes();
+            if reserved > 0 {
+                context.fund_staging(package_effect::StagingFunding::new(
+                    Arc::new(permit.retain_prepared_reservation()),
+                    reserved,
+                ));
+            }
+        }
+        context
+    }
+
+    /// Packages automatic reloads must refuse until an operator resolves them.
+    pub(crate) fn stranded_packages(&self) -> BTreeSet<String> {
+        self.stranded_packages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Apply cleanup identities after host execution completes.
@@ -1663,7 +1699,7 @@ impl HubRuntime {
         let next_epoch = self
             .next_package_entity_epoch()
             .map_err(HubLuaPluginLoadError::EntityFamilyCleanup)?;
-        let mut context = self.host_package_runtime();
+        let mut context = self.funded_host_package_runtime();
         let result = context.load_lua_plugin_package(registry, package_name);
         self.apply_direct_package_cleanup(context.into_cleanup(), next_epoch);
         result
@@ -1676,7 +1712,7 @@ impl HubRuntime {
         registry: &PackageRegistry,
         package_name: &str,
     ) -> Result<PluginCleanupResult, HubLuaPluginLoadError> {
-        let mut context = self.host_package_runtime();
+        let mut context = self.funded_host_package_runtime();
         let result = context.reload_lua_plugin_package(request_id, registry, package_name);
         self.apply_host_package_cleanup(context.into_cleanup());
         result
@@ -8140,6 +8176,359 @@ pub(crate) mod tests {
             .package_event_router
             .complete_pulled_delivery(fresh)
             .expect("retire the fresh delivery");
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Counts released staging funding.
+    struct ReleasedFunding(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for ReleasedFunding {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A panic between the stage and the install leaves the plugin and the
+    /// live generation untouched; the unwound runtime hands the staged
+    /// generation to cleanup, and aborting it releases its funding and lets a
+    /// later stage in.
+    #[test]
+    fn a_panic_after_the_stage_hands_the_staged_generation_to_the_restore() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (runtime, root, policy) = subscribed_provider_runtime("panic-after-stage");
+        let registration = runtime
+            .plugin_lifecycle()
+            .entity_provider_registrations()
+            .select("producer", "producer.item")
+            .unwrap();
+        let generation = runtime
+            .package_event_router
+            .current_package_generation("producer");
+        let released = Arc::new(AtomicUsize::new(0));
+        let mut host = runtime.host_package_runtime();
+        host.fund_staging(package_effect::StagingFunding::new(
+            Arc::new(ReleasedFunding(Arc::clone(&released))),
+            crate::host_executor::HOST_PREPARED_BYTE_CAPACITY,
+        ));
+
+        package_effect::panic_next_load_after_stage();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.reload_lua_plugin_package(
+                RequestId("panic-after-stage".into()),
+                policy.registry(),
+                "producer",
+            )
+        }));
+        assert!(unwound.is_err(), "the injected panic unwinds the effect");
+        assert!(registration.is_live(), "the plugin was never replaced");
+        assert_eq!(
+            runtime
+                .package_event_router
+                .current_package_generation("producer"),
+            generation
+        );
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            0,
+            "the pending entry keeps its funding"
+        );
+
+        let staged = host
+            .into_cleanup()
+            .staged
+            .expect("cleanup carries the staged generation");
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            0,
+            "with the runtime gone, the pending entry alone keeps the funding"
+        );
+        let mut restore = runtime.host_package_runtime();
+        restore.abort_staged(staged);
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "abort releases the funding"
+        );
+
+        // Nothing is pending any more, so the next reload stages and commits.
+        let mut retry = runtime.host_package_runtime();
+        retry.fund_staging(package_effect::StagingFunding::new(
+            Arc::new(()),
+            crate::host_executor::HOST_PREPARED_BYTE_CAPACITY,
+        ));
+        retry
+            .reload_lua_plugin_package(
+                RequestId("after-abort".into()),
+                policy.registry(),
+                "producer",
+            )
+            .expect("a reload after the abort");
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A failed compensation unloads the package: its queued events are
+    /// counted as stranded and retired by the unload, and no handler of any
+    /// generation remains for them.
+    #[test]
+    fn a_failed_compensation_quarantines_the_package() {
+        use crate::lifecycle::EventDeliveryRefusal;
+        use crate::package_event_router::{HUB_EVENT_OWNER, OwnerApplyResult};
+
+        let (mut runtime, root, _policy) = subscribed_provider_runtime("quarantine");
+        assert_eq!(
+            runtime.package_event_router.try_ingress(
+                HUB_EVENT_OWNER,
+                "worktree_created",
+                &serde_json::json!({ "event": "worktree_created" }),
+                Instant::now(),
+            ),
+            crate::package_event_router::EventPlaneStatus::Accepted
+        );
+        let queued = |runtime: &HubRuntime| {
+            runtime
+                .package_event_router
+                .snapshot()
+                .expect("router snapshot")
+                .queued_holders
+        };
+        assert_eq!(queued(&runtime), 1);
+
+        let mut host = runtime.host_package_runtime();
+        let mut supervisor = crate::entrypoint_supervisor::EntrypointSupervisor::default();
+        crate::daemon::control::packages::mutations::quarantine_after_failed_compensation(
+            &mut host,
+            &mut supervisor,
+            &crate::host_mutations::PackageRuntimeEffect::Disable {
+                package_name: "producer".to_string(),
+            },
+        );
+        assert!(runtime.stranded_packages().contains("producer"));
+        assert_eq!(
+            runtime.event_plane_counters().events_stranded(),
+            0,
+            "stranded events are counted when the unload retires them"
+        );
+        let mut cleanup = host.into_cleanup();
+        let unload = cleanup
+            .event_plane_unloads
+            .pop_front()
+            .expect("the quarantine records the router unload");
+        assert_eq!(unload.owner, "producer");
+        let OwnerApplyResult::Work(work) = runtime.package_event_router.try_apply(&unload) else {
+            panic!("a package unload is owner work");
+        };
+        work.run(&runtime.package_event_router)
+            .expect("the unload runs");
+        assert_eq!(queued(&runtime), 0);
+        assert_eq!(runtime.event_plane_counters().events_stranded(), 1);
+        assert!(
+            runtime
+                .plugin_lifecycle()
+                .event_handler_for("producer", 1, "hub", "worktree_created", "worktree_created")
+                .is_err_and(|refusal| refusal == EventDeliveryRefusal::PackageUnloaded),
+            "no handler remains for the quarantined package"
+        );
+        drop(cleanup);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Ingress one hub event and pull its single delivery.
+    fn pull_one(
+        router: &crate::package_event_router::PackageEventRouter,
+    ) -> crate::package_event_router::ReadyDelivery {
+        assert_eq!(
+            router.try_ingress(
+                crate::package_event_router::HUB_EVENT_OWNER,
+                "worktree_created",
+                &serde_json::json!({ "event": "worktree_created" }),
+                Instant::now(),
+            ),
+            crate::package_event_router::EventPlaneStatus::Accepted
+        );
+        let mut batch = router
+            .pull_ready_batch(8, 64 * 1024, Instant::now(), Duration::from_millis(8))
+            .expect("pull");
+        assert_eq!(batch.len(), 1);
+        batch.remove(0)
+    }
+
+    fn event_request(
+        delivery: &crate::package_event_router::ReadyDelivery,
+    ) -> PluginInvocationRequest {
+        PluginInvocationRequest {
+            request_id: RequestId(format!("seam-{}", delivery.envelope_id)),
+            handler: botster_core::PluginHandlerRef {
+                plugin_key: PluginKey(delivery.holder.plugin_key.clone()),
+                kind: botster_core::PluginHandlerKind::Event,
+                handler_id: delivery.holder.handler_id.clone(),
+            },
+            timeout_ms: 1_000,
+            context: botster_core::PluginInvocationContext {
+                client_id: None,
+                session_id: None,
+                subscription_id: None,
+                surface_id: None,
+                origin: None,
+                metadata: None,
+            },
+            payload: BoundaryJson(delivery.payload_json.clone()),
+        }
+    }
+
+    /// While Core replaces the worker, no delivery is admitted: the plugin is
+    /// swapping, so even a delivery matched under the previous generation is
+    /// refused rather than handed to whichever worker Core holds.
+    #[test]
+    fn no_delivery_is_admitted_while_the_worker_is_swapping() {
+        use crate::lifecycle::EventDeliveryRefusal;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut runtime, root, policy) = subscribed_provider_runtime("swap-seam");
+        let router = Arc::clone(&runtime.package_event_router);
+        let pulled = pull_one(&router);
+        let lifecycle = runtime.plugin_lifecycle().clone();
+        let ran = Arc::new(AtomicBool::new(false));
+        let hook_ran = Arc::clone(&ran);
+        let (generation, owner, name) = (
+            pulled.holder.plugin_generation,
+            pulled.owner.clone(),
+            pulled.name.clone(),
+        );
+        let request = event_request(&pulled);
+        crate::lifecycle::on_next_swap(move || {
+            let admission = lifecycle.try_admit_event(
+                generation,
+                &owner,
+                &name,
+                PluginInvocationClass::Background,
+                request,
+            );
+            assert_eq!(
+                admission.err(),
+                Some(EventDeliveryRefusal::GenerationUnloaded)
+            );
+            hook_ran.store(true, Ordering::SeqCst);
+        });
+        runtime
+            .reload_lua_plugin_package(RequestId("swap-seam".into()), policy.registry(), "producer")
+            .expect("reload");
+        assert!(ran.load(Ordering::SeqCst), "the swap hook ran");
+        router
+            .complete_pulled_delivery(pulled)
+            .expect("retire the refused delivery");
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Between the install and the activation, ingress still matches the
+    /// previous generation's live subscriptions; those deliveries are refused
+    /// against the installed generation. After activation a new event reaches
+    /// the installed generation.
+    #[test]
+    fn deliveries_matched_before_activation_never_reach_the_installed_plugin() {
+        use crate::lifecycle::EventDeliveryRefusal;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut runtime, root, policy) = subscribed_provider_runtime("activation-seam");
+        let router = Arc::clone(&runtime.package_event_router);
+        let lifecycle = runtime.plugin_lifecycle().clone();
+        let ran = Arc::new(AtomicBool::new(false));
+        let hook_ran = Arc::clone(&ran);
+        let hook_router = Arc::clone(&router);
+        crate::runtime::package_effect::on_next_activation(move || {
+            let delivery = pull_one(&hook_router);
+            assert_eq!(
+                lifecycle
+                    .event_handler_for(
+                        &delivery.holder.plugin_key,
+                        delivery.holder.plugin_generation,
+                        &delivery.owner,
+                        &delivery.name,
+                        &delivery.holder.handler_id,
+                    )
+                    .err(),
+                Some(EventDeliveryRefusal::GenerationUnloaded),
+                "the installed plugin serves only the staged generation"
+            );
+            assert_eq!(
+                lifecycle
+                    .try_admit_event(
+                        delivery.holder.plugin_generation,
+                        &delivery.owner,
+                        &delivery.name,
+                        PluginInvocationClass::Background,
+                        event_request(&delivery),
+                    )
+                    .err(),
+                Some(EventDeliveryRefusal::GenerationUnloaded)
+            );
+            hook_router
+                .complete_pulled_delivery(delivery)
+                .expect("retire the refused delivery");
+            hook_ran.store(true, Ordering::SeqCst);
+        });
+        runtime
+            .reload_lua_plugin_package(
+                RequestId("activation-seam".into()),
+                policy.registry(),
+                "producer",
+            )
+            .expect("reload");
+        assert!(ran.load(Ordering::SeqCst), "the activation hook ran");
+        let fresh = pull_one(&router);
+        assert!(runtime.package_event_handler(&fresh).is_ok());
+        router
+            .complete_pulled_delivery(fresh)
+            .expect("retire the fresh delivery");
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An explicit operator reload resolves a stranded package: it succeeds
+    /// and clears the marker, so automatic reloads may load it again.
+    #[test]
+    fn an_explicit_reload_clears_the_stranded_marker() {
+        let (runtime, root, policy) = subscribed_provider_runtime("explicit-reload-clears");
+        let mut host = runtime.host_package_runtime();
+        host.fund_staging(package_effect::StagingFunding::new(
+            Arc::new(()),
+            crate::host_executor::HOST_PREPARED_BYTE_CAPACITY,
+        ));
+        host.mark_stranded("producer");
+        assert!(runtime.stranded_packages().contains("producer"));
+        let budget = crate::shared_view::SharedViewBudget::new();
+        let effect = crate::host_mutations::PackageRuntimeEffect::Reload {
+            package_name: "producer".to_string(),
+            reload_plugin: true,
+            previous_state: crate::shared_view::SharedView::try_new(
+                &budget,
+                crate::persistence::HubState::from_config(runtime.config()),
+                0,
+            )
+            .expect("state view"),
+            previous_packages: crate::shared_view::SharedView::try_new(
+                &budget,
+                policy.registry().clone(),
+                0,
+            )
+            .expect("registry view"),
+            running_entrypoints: Vec::new(),
+        };
+        let mut supervisor = crate::entrypoint_supervisor::EntrypointSupervisor::default();
+        crate::daemon::control::packages::mutations::apply_committed_runtime_effect(
+            &mut host,
+            &mut supervisor,
+            runtime.config(),
+            policy.registry(),
+            &effect,
+        )
+        .expect("the explicit reload succeeds");
+        assert!(!runtime.stranded_packages().contains("producer"));
+        drop(host);
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }

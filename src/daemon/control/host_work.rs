@@ -352,6 +352,10 @@ pub(crate) fn handle(
             state: state_view,
             packages,
             data_directory,
+            stranded: daemon
+                .runtime()
+                .map(crate::HubRuntime::stranded_packages)
+                .unwrap_or_default(),
         })
     } else if is_spawn_target_read(&request) {
         HostMutationCommand::Read(HostRead::SpawnTarget {
@@ -892,6 +896,7 @@ impl HostMutationContinuation {
                         runtime: host_runtime,
                         config: runtime.config().clone(),
                         staged,
+                        quarantine: None,
                     });
                 submit_phase(daemon, state, waiter_id, command, permit, next_phase)
             }
@@ -950,8 +955,8 @@ impl HostMutationContinuation {
                         failed_package_effect,
                     )
                 } else {
-                    release_document(state, waiter_id);
-                    retain_package_recovery(
+                    submit_package_quarantine(
+                        daemon,
                         state,
                         waiter_id,
                         effect,
@@ -964,6 +969,7 @@ impl HostMutationContinuation {
                             )),
                         },
                         permit,
+                        next_phase,
                     )
                 }
             }
@@ -1016,8 +1022,9 @@ impl HostMutationContinuation {
                 let (effect, original) = failed_package_effect
                     .take()
                     .expect("a package restore failure follows one failed runtime effect");
-                release_document(state, waiter_id);
-                retain_package_recovery(state, waiter_id, effect, original, failure, permit)
+                submit_package_quarantine(
+                    daemon, state, waiter_id, effect, original, failure, permit, next_phase,
+                )
             }
             HostMutationResult::Recovered(outcome) => match outcome {
                 RecoveryOutcome::PackageConfiguration { failure, .. }
@@ -1180,6 +1187,43 @@ fn submit_package_restore(
         state.release_uncertain_reservation(waiter_id);
     }
     poll
+}
+
+/// No runtime restore is possible for a failed package effect: quarantine its
+/// packages on a Host worker (abort the attempt's staged generation, unload,
+/// mark them stranded), then answer as a failed compensation. Document
+/// ownership is released when that phase completes.
+#[allow(clippy::too_many_arguments)]
+fn submit_package_quarantine(
+    daemon: &HubDaemon,
+    state: &mut DaemonControlState,
+    waiter_id: WaiterId,
+    effect: PackageRuntimeEffect,
+    original: DaemonTransportError,
+    failure: PackageRollbackFailure,
+    permit: HostWorkPermit,
+    next_phase: &mut u64,
+) -> ControlPoll {
+    let staged = match state.staged_package_generation.take() {
+        Some((owner, staged)) if owner == waiter_id => Some(staged),
+        other => {
+            state.staged_package_generation = other;
+            None
+        }
+    };
+    let Some(runtime) = daemon.runtime() else {
+        release_document(state, waiter_id);
+        return retain_package_recovery(state, waiter_id, effect, original, failure, permit);
+    };
+    let command = HostMutationCommand::RestorePackageRuntime(HostPackageRuntimeRestore {
+        effect,
+        original,
+        runtime: runtime.host_package_runtime(),
+        config: runtime.config().clone(),
+        staged,
+        quarantine: Some(failure),
+    });
+    submit_phase(daemon, state, waiter_id, command, permit, next_phase)
 }
 
 fn retain_package_recovery(
@@ -1496,15 +1540,12 @@ fn staging_funding(
 ) -> crate::runtime::package_effect::StagingFunding {
     let reserved = permit.reserved_prepared_bytes();
     if reserved == 0 {
-        return crate::runtime::package_effect::StagingFunding {
-            retained: Box::new(()),
-            reserved_bytes: 0,
-        };
+        return crate::runtime::package_effect::StagingFunding::none();
     }
-    crate::runtime::package_effect::StagingFunding {
-        retained: Box::new(permit.retain_prepared_reservation()),
-        reserved_bytes: reserved.saturating_sub(held_bytes),
-    }
+    crate::runtime::package_effect::StagingFunding::new(
+        std::sync::Arc::new(permit.retain_prepared_reservation()),
+        reserved.saturating_sub(held_bytes),
+    )
 }
 
 fn submit_phase(
@@ -2289,6 +2330,7 @@ mod tests {
                 state,
                 packages,
                 data_directory: directory.clone(),
+                stranded: Default::default(),
             }),
             Some(&mut entrypoints),
         ) else {

@@ -516,6 +516,9 @@ struct RouterInner {
     producer_age_lists: HashMap<(String, u64), ProducerAgeList>,
     /// The one staged package generation that is admitted but not live.
     pending: Option<PendingGeneration>,
+    /// Packages quarantined after a failed compensation whose unload has not
+    /// run yet. That unload counts the package's retired copies as stranded.
+    stranded_owners: HashSet<String>,
 }
 
 /// A package event generation that passed admission and reserved its
@@ -686,6 +689,7 @@ impl PackageEventRouter {
                 package_generation: HashMap::new(),
                 producer_age_lists,
                 pending: None,
+                stranded_owners: HashSet::new(),
             }),
             counters,
             delivery_wake: AtomicBool::new(false),
@@ -898,9 +902,15 @@ impl PackageEventRouter {
         subscriptions.shrink_to_fit();
         plugin_reserve.shrink_to_fit();
         event_reserve.shrink_to_fit();
-        let required =
-            pending_retained_bytes(&contracts, &subscriptions, &plugin_reserve, &event_reserve)
-                .unwrap_or(usize::MAX);
+        let pending_owner = owner.to_string();
+        let required = pending_retained_bytes(
+            &pending_owner,
+            &contracts,
+            &subscriptions,
+            &plugin_reserve,
+            &event_reserve,
+        )
+        .unwrap_or(usize::MAX);
         if required > reserved_bytes {
             return Err(StageError::Unfunded {
                 required,
@@ -916,7 +926,7 @@ impl PackageEventRouter {
             current.saturating_add(1)
         };
         inner.pending = Some(PendingGeneration {
-            owner: owner.to_string(),
+            owner: pending_owner,
             generation,
             contracts,
             subscriptions,
@@ -1004,16 +1014,14 @@ impl PackageEventRouter {
         })
     }
 
-    /// Queued event copies for one consumer plugin. Host workers only.
-    pub fn queued_copies_blocking(&self, plugin_key: &str) -> u64 {
-        let inner = self
-            .inner
+    /// Mark a quarantined package so its next unload counts the copies it
+    /// retires as stranded. Host workers only; the lock is taken blocking.
+    pub fn mark_stranded_blocking(&self, owner: &str) {
+        self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner
-            .consumers
-            .get(plugin_key)
-            .map_or(0, |queue| queue.copies.len() as u64)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stranded_owners
+            .insert(owner.to_string());
     }
 
     /// Discard a staged generation and release its capacity and funding.
@@ -2017,32 +2025,37 @@ fn take_staged(inner: &mut RouterInner, staged: &StagedGeneration) -> Option<Pen
     }
 }
 
-/// Heap and inline bytes a pending generation retains, by capacity.
+/// Heap and inline bytes a pending generation retains: each vector by its
+/// allocated capacity, each string by its capacity, the owner key included.
+// Capacity is the measured quantity; a slice cannot report it.
+#[allow(clippy::ptr_arg)]
 fn pending_retained_bytes(
-    contracts: &[EmittedContract],
-    subscriptions: &[EventSubscription],
-    plugin_reserve: &[(String, usize)],
-    event_reserve: &[((String, String), usize)],
+    owner: &String,
+    contracts: &Vec<EmittedContract>,
+    subscriptions: &Vec<EventSubscription>,
+    plugin_reserve: &Vec<(String, usize)>,
+    event_reserve: &Vec<((String, String), usize)>,
 ) -> Option<usize> {
     let mut bytes = std::mem::size_of::<PendingGeneration>()
+        .checked_add(owner.capacity())?
         .checked_add(
             contracts
-                .len()
+                .capacity()
                 .checked_mul(std::mem::size_of::<EmittedContract>())?,
         )?
         .checked_add(
             subscriptions
-                .len()
+                .capacity()
                 .checked_mul(std::mem::size_of::<EventSubscription>())?,
         )?
         .checked_add(
             plugin_reserve
-                .len()
+                .capacity()
                 .checked_mul(std::mem::size_of::<(String, usize)>())?,
         )?
         .checked_add(
             event_reserve
-                .len()
+                .capacity()
                 .checked_mul(std::mem::size_of::<((String, String), usize)>())?,
         )?;
     for contract in contracts {
@@ -2573,6 +2586,7 @@ fn drop_queued_for_owner(
     }
     let mut dropped = Vec::new();
     let mut changed_consumers = Vec::new();
+    let stranded = inner.stranded_owners.remove(owner);
     for plugin_key in consumers {
         let queue = inner
             .consumers
@@ -2606,6 +2620,14 @@ fn drop_queued_for_owner(
                 .expect("each queued copy releases one consumer event");
             changed_consumers.push(plugin_key);
         }
+    }
+    if stranded {
+        // The quarantined package's own queued events, retired by this unload.
+        let retired = dropped
+            .iter()
+            .filter(|copy| copy.holder.plugin_key == owner)
+            .count();
+        counters.record_events_stranded(retired as u64);
     }
     let mut retired_payloads = Vec::new();
     for copy in dropped {
