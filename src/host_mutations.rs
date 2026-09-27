@@ -3709,16 +3709,21 @@ mod tests {
             }
             _ => panic!("a repository prepare carries its file bytes"),
         };
-        // Measure what is actually retained, not the formula under test.
-        assert!(
-            prepared.logical_bytes
-                >= root_len
-                    + file_len
-                    + std::mem::size_of::<RepoWriteEvidence>()
-                    + evidence.root.as_os_str().len()
-                    + evidence.target_path.as_os_str().len()
-                    + evidence.session_type_id.len(),
-            "the Host bound counts the retained file bytes and the copied evidence"
+        // Measure what is actually retained, not the formula under test. A
+        // repository prepare encodes no state document, and the missing prior
+        // file leaves the rollback holding only its root.
+        assert_eq!(
+            prepared.logical_bytes,
+            rollback_descriptor_bytes()
+                + root_len
+                + root_len
+                + file_len
+                + std::mem::size_of::<RepoWriteEvidence>()
+                + evidence.root.as_os_str().len()
+                + evidence.target_path.as_os_str().len()
+                + evidence.session_type_id.len(),
+            "the Host bound counts exactly the rollback root, the retained file bytes, \
+             and the copied evidence"
         );
         let HostMutationResult::ExternalEffectUncertain {
             cause:
