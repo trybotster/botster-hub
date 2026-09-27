@@ -17,6 +17,12 @@ use crate::lua_memory::{LuaCallbackCharge, LuaMemoryAccount};
 const ENCODE_USAGE: &str = "json.encode takes { value = <any>, arrays = nil | \"empty\" }";
 const DECODE_USAGE: &str = "json.decode takes { text = <string> }";
 
+#[cfg(test)]
+thread_local! {
+    /// The callback account's usage while the built JSON value exists.
+    static ENCODE_BUILT_USAGE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 pub(super) fn install(
     lua: &Lua,
     botster: &Table,
@@ -115,6 +121,8 @@ fn encode(
     let mut json = admission
         .build_scoped(lua, value, &mut charge)
         .map_err(|error| (ErrorKind::InvalidRequest, error.to_string()))?;
+    #[cfg(test)]
+    ENCODE_BUILT_USAGE.with(|usage| usage.set(Some(memory.usage().1)));
     if empty_as_array {
         empty_objects_to_arrays(&mut json);
     }
@@ -364,6 +372,33 @@ mod tests {
         )
         .exec()
         .unwrap();
+    }
+
+    #[test]
+    fn json_encode_funds_the_built_value_while_it_exists() {
+        let (lua, memory) = vm(64 * 1024);
+        ENCODE_BUILT_USAGE.with(|usage| usage.set(None));
+        let encoded: String = lua
+            .load(
+                r#"
+                local result = botster.json.encode({ value = { text = string.rep("x", 2048), n = { 1, 2, 3 } } })
+                assert(result.ok, result.error and result.error.message)
+                return result.value
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let built = ENCODE_BUILT_USAGE
+            .with(std::cell::Cell::get)
+            .expect("encode built a value");
+        // The built value is funded before the output writer charges any
+        // byte, so the account covers at least the encoded text then.
+        assert!(
+            built >= encoded.len(),
+            "built value charged {built} bytes, encoded text is {} bytes",
+            encoded.len()
+        );
+        assert_eq!(memory.usage().1, 0, "the charge is released after encode");
     }
 
     #[test]
