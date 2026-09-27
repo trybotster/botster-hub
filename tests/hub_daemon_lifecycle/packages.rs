@@ -2330,7 +2330,7 @@ local seen = {}
 for _, name in ipairs({
   "worktree_created", "worktree_create_failed", "worktree_deleted", "worktree_delete_failed",
 }) do
-  events.on("hub", name, function(event)
+  botster.events.on({ owner = "hub", name = name }, function(event)
     seen[#seen + 1] = event
   end)
 end
