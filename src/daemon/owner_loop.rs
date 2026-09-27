@@ -10203,6 +10203,13 @@ return botster.register({tools = {{
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A plugin entrypoint that does not parse. The unbalanced brace is built
+    /// from its code point so this source keeps balanced braces for the
+    /// production source scanners.
+    fn unparsable_lua() -> String {
+        format!("return botster.register({}\n", char::from(0x7b_u8))
+    }
+
     /// Resolving one stranded package never reloads another. A failed refresh
     /// strands A and B; an explicit reload of A that fails before its install
     /// compensates A only, and B stays unloaded, stranded, and covered.
@@ -10270,11 +10277,7 @@ return botster.register({tools = {{
 
         // An explicit reload of A whose plugin no longer parses is refused
         // before its install. Its compensation must not touch B.
-        std::fs::write(
-            package_dirs[0].join("plugin.lua"),
-            "return botster.register({\n",
-        )
-        .expect("break A");
+        std::fs::write(package_dirs[0].join("plugin.lua"), unparsable_lua()).expect("break A");
         let refused = drive_package_request_with_state(
             &mut daemon,
             &mut state,
@@ -10379,7 +10382,7 @@ return botster.register({tools = {{
 
         // A's explicit reload is refused before its install; its compensation
         // restores A only.
-        std::fs::write(a_dir.join("plugin.lua"), "return botster.register({\n").expect("break A");
+        std::fs::write(a_dir.join("plugin.lua"), unparsable_lua()).expect("break A");
         let refused = drive_package_request_with_state(
             &mut daemon,
             &mut state,

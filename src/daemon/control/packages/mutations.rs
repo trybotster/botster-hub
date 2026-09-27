@@ -312,6 +312,7 @@ pub(crate) fn restore_runtime_after_failed_effect(
     rollbacks
 }
 
+#[allow(clippy::too_many_arguments)]
 fn restore_registry_runtime(
     runtime: &mut HostPackageRuntime,
     supervisor: &mut EntrypointSupervisor,
