@@ -457,7 +457,10 @@ fn capture_current_sources(
     let registry = daemon.package_registry_view();
     let (package_rows, package_bytes) =
         crate::daemon::control::host_work::package_quarantine_rows_bytes(
-            state, &registry, remaining,
+            state,
+            &registry,
+            daemon.runtime().map(crate::HubRuntime::plugin_lifecycle),
+            remaining,
         )?;
     let quarantine_bound = checked_live_bytes(
         remaining,
@@ -497,6 +500,7 @@ fn capture_current_sources(
     crate::daemon::control::host_work::extend_package_quarantine_rows(
         state,
         &registry,
+        daemon.runtime().map(crate::HubRuntime::plugin_lifecycle),
         &mut quarantines,
     );
     seed.quarantines = quarantines;
@@ -1368,6 +1372,7 @@ mod tests {
             crate::daemon::control::host_work::package_quarantine_rows_bytes(
                 &state,
                 daemon.package_registry(),
+                daemon.runtime().map(crate::HubRuntime::plugin_lifecycle),
                 usize::MAX,
             )
             .unwrap();

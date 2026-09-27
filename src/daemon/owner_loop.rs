@@ -10284,6 +10284,7 @@ return botster.register({tools = {{
         crate::daemon::control::host_work::extend_package_quarantine_rows(
             state,
             daemon.package_registry(),
+            daemon.runtime().map(crate::HubRuntime::plugin_lifecycle),
             &mut rows,
         );
         rows
@@ -10417,6 +10418,296 @@ return botster.register({tools = {{
         )
         .expect("refresh after resolve");
         assert!(refreshed.error.is_none(), "{refreshed:?}");
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Startup never reads a quarantined package's files: with its root gone,
+    /// the daemon still starts, Status lists the quarantine, and the resolve
+    /// commits it Disabled.
+    #[test]
+    fn a_quarantined_package_with_a_missing_root_does_not_block_startup() {
+        let name = "missing.quarantine";
+        let (root, config, mut daemon, state) =
+            quarantine_by_failed_compensation(name, crate::persistence::InjectedCommit::Succeed);
+        daemon.stop();
+        drop(state);
+        std::fs::remove_dir_all(root.join(name)).expect("remove the package root");
+
+        let mut daemon = HubDaemon::start(config.clone())
+            .expect("startup skips the quarantined package before reading its files");
+        let mut state = DaemonControlState::default();
+        assert_eq!(
+            durable_quarantine(&package_quarantine_rows(&daemon, &state), name),
+            Some(true)
+        );
+        assert!(daemon.runtime().unwrap().stranded_packages().contains(name));
+        let resolved = resolve_package_quarantine(&mut daemon, &mut state, name);
+        assert_eq!(
+            resolved.kind,
+            botster_hub_client::DaemonResponseKind::QuarantineResolved,
+            "{resolved:?}"
+        );
+        assert_eq!(package_state(&daemon, name), PackageState::Disabled);
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn install_and_enable_lua_package(
+        root: &Path,
+        daemon: &mut HubDaemon,
+        state: &mut DaemonControlState,
+        name: &str,
+    ) {
+        let package_dir = root.join(name);
+        write_package_control_manifest(
+            &package_dir,
+            name,
+            serde_json::json!({
+                "capabilities": [{ "surface": "surfaces" }],
+                "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+            }),
+        );
+        std::fs::write(
+            package_dir.join("plugin.lua"),
+            "return botster.register({})\n",
+        )
+        .expect("write lua");
+        drive_package_request_with_state(
+            daemon,
+            state,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        )
+        .expect("install");
+        let enabled = drive_package_request_with_state(
+            daemon,
+            state,
+            DaemonRequest::EnablePackage {
+                package_name: name.to_string(),
+            },
+        )
+        .expect("enable");
+        assert!(enabled.error.is_none(), "{enabled:?}");
+        assert!(plugin_is_loaded(daemon, name));
+    }
+
+    fn event_delivery_refusal(
+        daemon: &HubDaemon,
+        name: &str,
+    ) -> Option<crate::lifecycle::EventDeliveryRefusal> {
+        let request = botster_core::PluginInvocationRequest {
+            request_id: botster_core::RequestId("stranded-delivery".to_string()),
+            handler: botster_core::PluginHandlerRef {
+                plugin_key: botster_core::PluginKey(name.to_string()),
+                kind: botster_core::PluginHandlerKind::Event,
+                handler_id: "any".to_string(),
+            },
+            timeout_ms: 1_000,
+            context: botster_core::PluginInvocationContext {
+                client_id: None,
+                session_id: None,
+                subscription_id: None,
+                surface_id: None,
+                origin: None,
+                metadata: None,
+            },
+            payload: botster_core::BoundaryJson(serde_json::Value::Null),
+        };
+        daemon
+            .runtime()
+            .unwrap()
+            .plugin_lifecycle()
+            .try_admit_event(
+                0,
+                "owner",
+                "any.event",
+                botster_core::PluginInvocationClass::Background,
+                request,
+            )
+            .err()
+    }
+
+    /// Losing the document reservation before the durable restore is a failed
+    /// compensation: the package is stranded at once, receives no delivery,
+    /// and is unloaded; the quarantine is not durable. Resolve commits it
+    /// Disabled.
+    #[test]
+    fn a_lost_restore_reservation_quarantines_the_package() {
+        let name = "lost.reservation";
+        let root = unique_package_control_dir(name);
+        let config = package_control_config(root.join("data"));
+        let mut daemon = HubDaemon::start(config.clone()).expect("start daemon");
+        let mut state = DaemonControlState::default();
+        install_and_enable_lua_package(&root, &mut daemon, &mut state, name);
+
+        crate::runtime::package_effect::panic_after_stage_for(name);
+        crate::daemon::control::host_work::lose_document_before_next_restore();
+        let error = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ReloadPackage {
+                package_name: name.to_string(),
+            },
+        )
+        .expect_err("effect panic plus lost restore reservation");
+        assert!(
+            matches!(error, DaemonTransportError::PackageCompensation { .. }),
+            "{error:?}"
+        );
+        assert!(daemon.runtime().unwrap().stranded_packages().contains(name));
+        assert!(
+            !plugin_is_loaded(&daemon, name),
+            "the quarantine unloads it"
+        );
+        assert_eq!(
+            event_delivery_refusal(&daemon, name),
+            Some(crate::lifecycle::EventDeliveryRefusal::PackageStranded),
+            "no delivery reaches a stranded package"
+        );
+        let rows = package_quarantine_rows(&daemon, &state);
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                botster_hub_client::DaemonQuarantine::Package {
+                    package_name,
+                    durable: false,
+                    loaded: false,
+                    ..
+                } if package_name == name
+            )),
+            "{rows:?}"
+        );
+        assert_eq!(quarantines_not_durable(&daemon), 1);
+
+        let resolved = resolve_package_quarantine(&mut daemon, &mut state, name);
+        assert_eq!(
+            resolved.kind,
+            botster_hub_client::DaemonResponseKind::QuarantineResolved,
+            "{resolved:?}"
+        );
+        assert_eq!(package_state(&daemon, name), PackageState::Disabled);
+        assert!(!daemon.runtime().unwrap().stranded_packages().contains(name));
+        assert!(
+            !state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Package(_)
+            )),
+            "the resolve releases the recovery record"
+        );
+        let (live, durable) = live_and_durable_registries(&daemon, &config);
+        assert_eq!(live, durable);
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// When the quarantine phase cannot be submitted, the package is already
+    /// stranded: it stays loaded but inert, and Status lists it loaded.
+    #[test]
+    fn an_unsubmitted_quarantine_leaves_the_package_loaded_and_inert() {
+        let name = "unsubmitted.quarantine";
+        let root = unique_package_control_dir(name);
+        let config = package_control_config(root.join("data"));
+        let mut daemon = HubDaemon::start(config).expect("start daemon");
+        let mut state = DaemonControlState::default();
+        install_and_enable_lua_package(&root, &mut daemon, &mut state, name);
+
+        crate::runtime::package_effect::panic_after_stage_for(name);
+        crate::daemon::control::host_work::lose_document_before_next_restore();
+        crate::daemon::control::host_work::fail_next_quarantine_submission();
+        let _ = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ReloadPackage {
+                package_name: name.to_string(),
+            },
+        );
+        assert!(daemon.runtime().unwrap().stranded_packages().contains(name));
+        assert!(plugin_is_loaded(&daemon, name), "no unload ran");
+        assert_eq!(
+            event_delivery_refusal(&daemon, name),
+            Some(crate::lifecycle::EventDeliveryRefusal::PackageStranded),
+            "the loaded package receives nothing"
+        );
+        let rows = package_quarantine_rows(&daemon, &state);
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                botster_hub_client::DaemonQuarantine::Package {
+                    package_name,
+                    durable: false,
+                    loaded: true,
+                    ..
+                } if package_name == name
+            )),
+            "{rows:?}"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A stranded package that no record covers (its quarantine phase could
+    /// not be submitted) is still listed, loaded and inert, with empty
+    /// failure text; resolve unloads it and commits it Disabled.
+    #[test]
+    fn a_stranded_loaded_package_is_listed_and_resolve_unloads_it() {
+        let name = "loaded.stranded";
+        let root = unique_package_control_dir(name);
+        let config = package_control_config(root.join("data"));
+        let mut daemon = HubDaemon::start(config.clone()).expect("start daemon");
+        let mut state = DaemonControlState::default();
+        install_and_enable_lua_package(&root, &mut daemon, &mut state, name);
+        daemon.runtime().unwrap().mark_package_stranded(name);
+
+        let rows = package_quarantine_rows(&daemon, &state);
+        assert_eq!(
+            rows,
+            vec![botster_hub_client::DaemonQuarantine::Package {
+                package_name: name.to_string(),
+                original: String::new(),
+                compensation: String::new(),
+                durable: false,
+                loaded: true,
+                quarantined_at_ms: 0,
+            }]
+        );
+        assert_eq!(
+            event_delivery_refusal(&daemon, name),
+            Some(crate::lifecycle::EventDeliveryRefusal::PackageStranded)
+        );
+        // With a durable record the package is listed once, from the record,
+        // still loaded.
+        let mut registry = daemon.package_registry().clone();
+        assert!(registry.set_quarantine(
+            name,
+            Some(crate::PackageQuarantine {
+                original: "original".to_string(),
+                compensation: "compensation".to_string(),
+                quarantined_at_ms: 7,
+            }),
+        ));
+        daemon.replace_package_registry(registry).unwrap();
+        assert_eq!(
+            package_quarantine_rows(&daemon, &state),
+            vec![botster_hub_client::DaemonQuarantine::Package {
+                package_name: name.to_string(),
+                original: "original".to_string(),
+                compensation: "compensation".to_string(),
+                durable: true,
+                loaded: true,
+                quarantined_at_ms: 7,
+            }]
+        );
+        let resolved = resolve_package_quarantine(&mut daemon, &mut state, name);
+        assert_eq!(
+            resolved.kind,
+            botster_hub_client::DaemonResponseKind::QuarantineResolved,
+            "{resolved:?}"
+        );
+        assert!(!plugin_is_loaded(&daemon, name), "resolve unloads it");
+        assert_eq!(package_state(&daemon, name), PackageState::Disabled);
+        assert!(package_quarantine_rows(&daemon, &state).is_empty());
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }

@@ -621,11 +621,30 @@ impl PackageRegistry {
         &self,
         audit_reason: impl Into<String>,
     ) -> PackageRegistryResult<(Self, Vec<PackageDecision>)> {
-        let audit_reason = audit_reason.into();
+        self.refreshed_local_packages_where(audit_reason.into(), |_| true)
+    }
+
+    /// Startup refresh: a quarantined package keeps its record unchanged and
+    /// its files are not read, so a missing root cannot fail startup. Only an
+    /// operator resolve, enable, or reload changes it.
+    pub(crate) fn refreshed_unquarantined_local_packages(
+        &self,
+        audit_reason: impl Into<String>,
+    ) -> PackageRegistryResult<(Self, Vec<PackageDecision>)> {
+        self.refreshed_local_packages_where(audit_reason.into(), |record| {
+            record.quarantine.is_none()
+        })
+    }
+
+    fn refreshed_local_packages_where(
+        &self,
+        audit_reason: String,
+        selected: impl Fn(&PackageRecord) -> bool,
+    ) -> PackageRegistryResult<(Self, Vec<PackageDecision>)> {
         let package_names = self
             .records
             .values()
-            .filter(|record| is_direct_local_path_package(record))
+            .filter(|record| is_direct_local_path_package(record) && selected(record))
             .map(|record| record.manifest.name.clone())
             .collect::<Vec<_>>();
         let mut candidate = self.clone();
@@ -1238,7 +1257,7 @@ impl PackageRegistry {
         })
     }
 
-    /// Prepare enabled local packages for core lifecycle wiring.
+    /// Prepare enabled, unquarantined local packages for core lifecycle wiring.
     pub fn prepare_enabled_local_packages(
         &self,
         audit_reason: impl Into<String>,
@@ -1248,6 +1267,9 @@ impl PackageRegistry {
             .values()
             .filter(|record| record.is_enabled())
             .filter(|record| matches!(record.manifest.source, Some(PackageSource::Path { .. })))
+            // A quarantined package is never loaded, so its files are not
+            // read: a missing root or entrypoint cannot fail startup.
+            .filter(|record| record.quarantine.is_none())
             .map(|record| PreparedLocalPackage::from_record(record, audit_reason.clone()))
             .collect()
     }

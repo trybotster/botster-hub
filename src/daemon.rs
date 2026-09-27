@@ -116,7 +116,9 @@ impl HubDaemon {
         let mut state = runtime.state();
         let package_registry = PackageRegistry::from_snapshot(state.package_registry.clone())?;
         let (package_registry, decisions) = package_registry
-            .refreshed_local_packages("daemon startup refresh local package registrations")?;
+            .refreshed_unquarantined_local_packages(
+                "daemon startup refresh local package registrations",
+            )?;
         let package_registry =
             reserve_package_registry(&runtime.shared_view_budget(), package_registry)?;
         if !decisions.is_empty() {
@@ -387,10 +389,11 @@ pub(crate) fn load_enabled_local_plugins(
     runtime: &mut HubRuntime,
     package_registry: &PackageRegistry,
 ) -> HubDaemonResult<()> {
+    // A durably quarantined package stays unloaded and stranded, so automatic
+    // reloads keep refusing it, until an operator resolves it. Preparation
+    // skips it before touching its files.
     let prepared = package_registry
         .prepare_enabled_local_packages("daemon startup load enabled local plugin packages")?;
-    // A durably quarantined package stays unloaded and stranded, so automatic
-    // reloads keep refusing it, until an operator resolves it.
     for record in package_registry.package_records() {
         if record.quarantine.is_some() {
             runtime.mark_package_stranded(&record.manifest.name);
@@ -401,12 +404,6 @@ pub(crate) fn load_enabled_local_plugins(
         }
     }
     for package in prepared {
-        if package_registry
-            .package(&package.package_name)
-            .is_some_and(|record| record.quarantine.is_some())
-        {
-            continue;
-        }
         if package.selected_lua_entrypoint().is_some()
             && let Err(error) =
                 runtime.load_lua_plugin_package(package_registry, &package.package_name)

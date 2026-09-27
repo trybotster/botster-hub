@@ -954,7 +954,7 @@ export interface DaemonRetentionAccounting {
 
 export type DaemonQuarantine =
   | { kind: "repository_session_types"; root: string; cause: string; detail: string; quarantined_at_ms: number }
-  | { kind: "package"; package_name: string; original: string; compensation: string; durable: boolean; quarantined_at_ms: number };
+  | { kind: "package"; package_name: string; original: string; compensation: string; durable: boolean; loaded: boolean; quarantined_at_ms: number };
 
 export type DaemonQuarantineTarget =
   | { kind: "package"; package_name: string }

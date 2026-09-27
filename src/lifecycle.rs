@@ -148,6 +148,10 @@ pub struct HubPluginLifecycle {
     descriptors: Arc<Mutex<BTreeMap<String, Vec<PluginOwnedDescriptor>>>>,
     entity_providers: EntityProviderRegistrations,
     event_handlers: Arc<Mutex<BTreeMap<String, PluginEventInstall>>>,
+    /// Packages stranded by a failed compensation. Automatic reloads refuse
+    /// them, and no event or invocation reaches them, loaded or not, until an
+    /// operator resolves them. Bounded by installed packages.
+    stranded: Arc<Mutex<BTreeSet<String>>>,
 }
 
 /// One plugin's installed event handlers and the event generation they serve.
@@ -173,6 +177,10 @@ const _: () = assert!(
         == std::mem::size_of::<Vec<HubPluginEventHandler>>() + 16
 );
 
+/// The refusal reason a stranded package's invocations report.
+pub(crate) const PACKAGE_STRANDED_REASON: &str =
+    "package_stranded: the package is quarantined after a failed compensation";
+
 /// Why an event delivery was refused a handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventDeliveryRefusal {
@@ -183,6 +191,8 @@ pub enum EventDeliveryRefusal {
     PackageUnloaded,
     /// The installed generation matches but it has no such handler.
     HandlerAbsent,
+    /// The package is quarantined: it receives nothing until resolved.
+    PackageStranded,
 }
 
 impl HubPluginLifecycle {
@@ -196,7 +206,52 @@ impl HubPluginLifecycle {
             descriptors: Arc::new(Mutex::new(BTreeMap::new())),
             entity_providers: EntityProviderRegistrations::default(),
             event_handlers: Arc::new(Mutex::new(BTreeMap::new())),
+            stranded: Arc::new(Mutex::new(BTreeSet::new())),
         }
+    }
+
+    /// The shared stranded set, for Host package runtimes.
+    pub(crate) fn stranded_handle(&self) -> Arc<Mutex<BTreeSet<String>>> {
+        Arc::clone(&self.stranded)
+    }
+
+    pub(crate) fn mark_stranded(&self, package_name: &str) {
+        self.stranded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(package_name.to_string());
+    }
+
+    pub(crate) fn stranded_packages(&self) -> BTreeSet<String> {
+        self.stranded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Read the stranded set under its lock without copying it.
+    pub(crate) fn with_stranded<R>(&self, read: impl FnOnce(&BTreeSet<String>) -> R) -> R {
+        read(
+            &self
+                .stranded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    fn is_stranded(&self, package_name: &str) -> bool {
+        self.stranded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(package_name)
+    }
+
+    /// Whether the package's plugin worker is loaded.
+    pub(crate) fn is_loaded(&self, package_name: &str) -> bool {
+        self.loaded
+            .lock()
+            .expect("hub plugin lifecycle loaded set lock")
+            .contains(package_name)
     }
 
     pub(crate) fn entity_provider_registrations(&self) -> EntityProviderRegistrations {
@@ -323,6 +378,20 @@ impl HubPluginLifecycle {
     /// Invoke a plugin handler through core worker dispatch and capability checks.
     #[must_use]
     pub fn invoke(&self, request: PluginInvocationRequest) -> PluginInvocationOutcome {
+        if self.is_stranded(&request.handler.plugin_key.0) {
+            return PluginInvocationOutcome {
+                result: botster_core::PluginInvocationResult::Failed(
+                    botster_core::PluginInvocationFailure {
+                        request_id: request.request_id,
+                        handler: request.handler,
+                        kind: botster_core::PluginInvocationFailureKind::WorkerStopped,
+                        timeout_ms: Some(request.timeout_ms),
+                        reason: PACKAGE_STRANDED_REASON.to_string(),
+                    },
+                ),
+                events: Vec::new(),
+            };
+        }
         self.engine.invoke(request)
     }
 
@@ -333,6 +402,14 @@ impl HubPluginLifecycle {
         class: PluginInvocationClass,
         request: PluginInvocationRequest,
     ) -> PluginAdmissionResult {
+        // A stranded package is inert even while its worker is loaded.
+        if self.is_stranded(&request.handler.plugin_key.0) {
+            return PluginAdmissionResult::WorkerStopped {
+                request_id: request.request_id,
+                class,
+                reason: PACKAGE_STRANDED_REASON.to_string(),
+            };
+        }
         let allowance = match class {
             PluginInvocationClass::RequestResponse => REQUEST_RESPONSE_COMPLETION_ALLOWANCE,
             PluginInvocationClass::Background => BACKGROUND_COMPLETION_ALLOWANCE,
@@ -527,6 +604,9 @@ impl HubPluginLifecycle {
         class: PluginInvocationClass,
         request: PluginInvocationRequest,
     ) -> Result<PluginAdmissionResult, EventDeliveryRefusal> {
+        if self.is_stranded(&request.handler.plugin_key.0) {
+            return Err(EventDeliveryRefusal::PackageStranded);
+        }
         let installs = self
             .event_handlers
             .lock()
@@ -1079,6 +1159,50 @@ mod completion_tests {
             },
             payload: BoundaryJson(serde_json::json!("x".repeat(bytes))),
         }
+    }
+
+    /// A stranded plugin is inert while its worker stays loaded: no
+    /// invocation and no event delivery is admitted. A sibling is unaffected.
+    #[test]
+    fn a_stranded_plugin_admits_nothing_while_loaded() {
+        let lifecycle = lifecycle(1);
+        lifecycle.mark_stranded("first");
+        assert!(matches!(
+            admit(
+                &lifecycle,
+                PluginInvocationClass::RequestResponse,
+                request("stranded-admit", handler("first", "run"), 1),
+            ),
+            PluginAdmissionResult::WorkerStopped { ref reason, .. }
+                if reason == PACKAGE_STRANDED_REASON
+        ));
+        let outcome = lifecycle.invoke(request("stranded-invoke", handler("first", "run"), 1));
+        assert!(matches!(
+            outcome.result,
+            PluginInvocationResult::Failed(ref failure)
+                if failure.kind == PluginInvocationFailureKind::WorkerStopped
+                    && failure.reason == PACKAGE_STRANDED_REASON
+        ));
+        assert_eq!(
+            lifecycle
+                .try_admit_event(
+                    0,
+                    "owner",
+                    "stranded.event",
+                    PluginInvocationClass::Background,
+                    request("stranded-event", handler("first", "run"), 1),
+                )
+                .err(),
+            Some(EventDeliveryRefusal::PackageStranded)
+        );
+        assert!(matches!(
+            admit(
+                &lifecycle,
+                PluginInvocationClass::RequestResponse,
+                request("sibling-admit", handler("second", "run"), 1),
+            ),
+            PluginAdmissionResult::Queued { .. }
+        ));
     }
 
     fn admit(
