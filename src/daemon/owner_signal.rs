@@ -45,6 +45,12 @@ pub(crate) struct Seen {
     epoch: u64,
 }
 
+impl Seen {
+    pub(crate) const fn key(self) -> SignalKey {
+        self.key
+    }
+}
+
 /// Epochs and the owner doorbell.
 #[derive(Debug, Default)]
 pub(crate) struct OwnerSignal {
