@@ -1,6 +1,6 @@
 # Readiness and flow control
 
-Status: draft 1, 2026-09-27. Design only. No production code changes in this phase.
+Status: draft 2, 2026-09-27. Design only. No production code changes in this phase.
 Scope: botster-hub at `1ec61b94`, and botster-core at `origin/main` `19edeb1`. Hub pins Core `549b3f62`. The unlanded roll branch `delivery/core-roll-85b3507-20260927` moves the pin to `85b3507`.
 
 ## 0. Summary
@@ -15,7 +15,7 @@ Each side channel needs every writer to remember to wake the right party. The de
 1. **One readiness contract.** Every owner work source answers `readiness() -> Ready | Wait(Wake)`. The function derives the answer from state. `Wait` must name the event that makes the source ready. The type does not allow a wait without a named event.
 2. **One wake primitive.** Every cross-thread producer uses one `OwnerSignal` type. The owner re-evaluates owner-local waits after every step, so owner-local state needs no signal at all.
 3. **One refusal rule.** Contention (a busy lock) never becomes a refusal, a drop, or a gap. It becomes `Wait` on the release event. Capacity may refuse, and the refusal is typed and names its retry event.
-4. **Self-clocked terminal recovery.** A slow terminal route asks for its recovery capture only when its queue has drained. It no longer asks when the queue overflows. This ends the flood resync storm without a new limit.
+4. **End-to-end terminal backpressure.** This follows the orchestrator ruling of 2026-09-27, and the Core writer is building it. When the slowest progressing bound reader has no egress room, the worker stops draining the PTY. A reader with no progress for `READER_PROGRESS_DEADLINE` (10 s) is ended with `Stalled`. This ends the flood resync storm without a new limit.
 
 The design deletes `MaintenanceWakes`, `mark_all`/`try_wake` (29 + 11 production sites), about nine doorbell message variants, the hand flags, and the causal sweep. It adds one small type and one Core notifier edge.
 
@@ -73,7 +73,7 @@ Coupling: while the worker main loop is blocked on a full egress lane, it applie
 
 ### 1.5 Missing links
 
-1. **Terminal output recovery is not self-clocked.** Overflow requests a capture at once, while the route queue is still full. The capture and the next deltas overflow again. With the 1 ms reader sleep gone (Core `2845aec`), this is the flood storm: 3-15 resyncs in 3 s and about 50 times the byte rate (`botster-evidence/core-residual-waits-20260927/flood-bisect-log.txt`).
+1. **Terminal output has no backpressure from the client to the PTY.** The lossless chain stops at the route queue. That queue drops and resyncs instead of stalling its producer. Before Core `2845aec`, the 1 ms reader sleep hid the gap by capping output near 1 MB/s. Without the sleep, the result is the flood storm: 3-15 resyncs in 3 s and about 50 times the byte rate (`botster-evidence/core-residual-waits-20260927/flood-bisect-log.txt`). Overflow also asks for a capture at once, while the queue is still full, so recovery can overflow again.
 2. **Terminal input drops at adapter ingress.** A paste burst faster than the data plane ends the route. The transport should stop reading instead. The kernel socket buffer and the SCTP window then carry the backpressure to the client.
 3. **Contention becomes loss.** `LockBusy` on a package event drops the event. On a session-family frame it opens a gap and starts a full baseline resync (`daemon_maintenance.rs:1247-1250`). On a plugin control request it refuses the client (`plugins.rs:550-563`). `SubscribeEvents` returns `shed_busy` when the owner loses a try-lock race with the connection's own reader (`package_events.rs:687-707`).
 4. **Core plugin `Backpressured` has no retry event.** Class-queue space frees when a worker dequeues, and nothing notifies the host (`contract/actor.rs:1326-1330`).
@@ -140,7 +140,13 @@ This is the `Future::poll` contract ("`Pending` must have registered a waker"), 
 ### 2.4 Core contract changes (mechanism only; no policy moves into Core)
 
 1. **One plugin-engine notifier meaning.** "Plugin engine state changed. A completion may be ready, or a refused admission may now succeed." Core fires it on: a completion published (today); an armed lock release (today, `admission_retry_armed`); and **a class-queue slot freed while a `Backpressured` admission is armed (new)**. Completion-store space frees only through the host's own drain, so it is owner-local. A conformance test in Core pins these edges, so a later Core commit cannot move the contract silently (defect: 1c2e526 changed the notifier's meaning).
-2. **Self-clocked route recovery (`client_worker.rs:1354`).** Overflow still drops unsent visual frames and enters the next epoch. The route then waits in `awaiting_capture`. Core asks for the capture only when the route queue holds nothing but its in-flight head (a Writable-driven edge). It no longer asks at overflow time. The route therefore takes at most one capture per drain of its queue. Recovery runs at the reader's rate, and no new number is added. `Overflowed` teardown stays for preserved frames that alone exceed the ceiling.
+2. **Source backpressure for terminal output.** This is the orchestrator ruling of 2026-09-27, and the Core writer is building it.
+   - When the slowest progressing bound reader has no egress room, the worker stops draining the PTY. The kernel PTY buffer then blocks the child.
+   - A reader with no progress for `READER_PROGRESS_DEADLINE` (10 s, an existing bound) is ended with `Stalled`. A stalled reader therefore cannot hold the session for longer than that.
+   - A route at a capture boundary is exempt, so a capture always completes.
+   - A Core probe of this fix shows 0 resyncs under flood.
+   - In the readiness terms of this plan, the session's PTY drain is `Wait(route egress room)`. Its negative state names its event, and the deadline is the existing `timer: deadline`.
+   - **Possible second part (pending the Core writer):** if a bound, progressing route can still overflow, overflow recovery should ask for its capture only after the route queue drains, and not while the queue is still full (`client_worker.rs:1354`). The step includes this part only if the Core writer confirms that the overflow path is still reachable.
 3. **`journal_advanced` becomes a wake, not a polled bit** (`daemon.rs:1004, 4329`). The data plane includes it in its signal. Today the host must remember to poll it.
 4. **`exit_hold` derives from capture state** (`engine/botster.rs:1934`). Today 9 call sites mirror it by hand with `sync_exit_hold`.
 5. **The worker egress reports a lost socket.** It does not discard silently (`botster-session-worker.rs:1693-1705`).
@@ -216,7 +222,7 @@ Every step lands alone, keeps the strict gates green (fmt, clippy `-D warnings` 
 
 | Step | Repo | Content | Fixes | Test | Size |
 | --- | --- | --- | --- | --- | --- |
-| **C1** | Core | 2.4.2 self-clocked route recovery; 2.4.5 egress reports a lost socket | flood storm; silent egress drop | ClientWorker test: slow adapter under a flood takes at most one capture per queue drain (ablation: capture at overflow); flood lane resync count | 0.5 d |
+| **C1** | Core | 2.4.2 source backpressure (the Core writer's step, in progress); 2.4.5 egress reports a lost socket | flood storm; silent egress drop | the Core probe (0 resyncs under flood); a slow progressing reader paces the PTY; a reader with no progress ends `Stalled` at the deadline; flood lane | in progress (+0.25 d for 2.4.5) |
 | **C2** | Core | 2.4.1 notifier edge for freed class slots, plus the notifier conformance test | Backpressured with no retry event | armed `Backpressured` admission is notified when a worker dequeues (ablation: no fire) | 0.5 d |
 | **S0** | Hub | Land the roll branch (b870bca3, stale close, NotSubscribed), rolled to a Core that holds C1 and C2 | cursor lost wake; silent close on Stale | existing branch tests; full lifecycle target | existing work |
 | **S1** | Hub | `Readiness`, `Wake`, `OwnerSignal`, the progress fault counter; convert package-event delivery | `mark_all` spin on Backpressured; emit lost wake; `LockBusy` drop | owner-loop test: Backpressured parks with zero turns until the notifier fires (ablation: `mark_all`); emit from a request handler is delivered; `LockBusy` event is delivered, not retired | 1 d |
@@ -233,23 +239,42 @@ Every step lands alone, keeps the strict gates green (fmt, clippy `-D warnings` 
 
 ### 4.1 Cutover split
 
-The total is about 12 writer-days, which exceeds the 3-day guide.
+The total is about 11 to 13 writer-days of new work. That exceeds the 3-day guide, so the steps split as follows.
 
-**Before cutover (about 6 days):** C1, C2, S0, S1, S2, S3, S4, S5.
-- They fix every live defect in the catalogue.
-- They make the readiness model the only wake path in the Hub owner.
-- S4 is the step that removes the incidental wakes that hid #1. Recommendation: keep S4 before cutover. If time forces a cut, S4 is the one step that can move after cutover without leaving a known live defect. The spin sites that it fixes are CPU waste, not hangs.
+**Must land before cutover: about 5.75 writer-days of new work.** These steps fix every live defect in the catalogue.
 
-**After cutover:** S6 to S11. S8 aligns with plugin-platform slice 3. S11 follows the process host.
+| Step | New work | Why before cutover |
+| --- | --- | --- |
+| C1 | in progress, plus 0.25 d | flood storm; silent egress drop |
+| C2 | 0.5 d | `Backpressured` has no retry event |
+| S0 | existing branch | lost cursor wake; silent close on Stale |
+| S1 | 1 d | event spin; lost emit wake; `LockBusy` drops an event |
+| S2 | 0.5 d | contention opens a gap and a full baseline |
+| S3 | 0.5 d | `shed_busy` on the first subscribe |
+| S4 | 2 d | deletes the incidental wakes that hid the cursor defect; fixes the `Refused` spin and lost wake, and the permanent `recovery` flag |
+| S5 | 1 d | a paste burst ends the route |
+
+If time forces a cut, S4 is the only step that can move after cutover without leaving a known hang. The spins it fixes waste CPU; they do not hang. The recommendation is to keep S4 before cutover, because it makes the readiness model the only wake path in the Hub owner.
+
+**Can follow cutover: about 5.5 to 7 writer-days.**
+
+| Step | Size | Note |
+| --- | --- | --- |
+| S6 | 0.5 d | two unbounded queues (WebRTC chunks, Unix `queued_events`) |
+| S7 | 0 to 0.5 d | only if S4 left capacity waits uncovered |
+| S8 | 1 d | aligns with plugin-platform slice 3 |
+| S9 | 1.5 d | single-threaded session worker |
+| S10 | 0.5 d | derived `exit_hold`; `journal_advanced` as a wake |
+| S11 | 2 to 3 d | follows the process host |
 
 ### 4.2 Order constraints
 
-- **C1 must reach Hub in the same roll as Core `2845aec`.** The roll branch (`85b3507`) already contains `2845aec`. Landing S0 without C1 brings the flood storm into the Hub build.
+- **C1 must reach Hub in the same roll as Core `2845aec`.** The roll branch (`85b3507`) already contains `2845aec`. Landing S0 without C1 brings the flood storm into the Hub build. The orchestrator confirms that the roll already waits on C1.
 - **S1 requires C2** for the `Backpressured` wake. Until C2 lands, S1 can wait on the completion notifier alone. That gives the same behavior as today's incidental wake, but without the spin.
 - **S4 requires S1** (the type) and should follow S2 and S3, so that it only deletes.
 
 ## 5. Open questions for review
 
-1. **Terminal pacing.** After C1, the PTY still runs at data-plane speed when every route is slow (about 150 MB per 3 s in the bisect). One option paces the worker by the fastest attached route: it stops draining a session when no route can accept. That is a policy choice. This plan proposes to measure after C1 and decide then.
+1. **Deferred capture.** Can a bound, progressing route still overflow after C1? If it can, C1 also defers the recovery capture until the queue drains (2.4.2). This question is with the Core writer.
 2. **Client `Backpressured` on plugin control.** This plan keeps the typed refusal for capacity. The alternative is to park the request under its existing deadline.
 3. **Local-waiter cost.** Re-evaluating every `Local` waiter after every step assumes about 20 sources with O(1) predicates. A source with many rows (for example per subscriber) must keep an internal ready index (rule 2.1.1).
