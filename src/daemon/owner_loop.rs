@@ -2425,37 +2425,6 @@ pub(crate) fn should_mark_pump_after_control(request: &DaemonRequest, succeeded:
 }
 
 #[cfg(test)]
-fn receive_test_control_message(
-    receiver: &mut tokio_mpsc::Receiver<ControlMessage>,
-) -> ControlMessage {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build bounded test receive runtime");
-    runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
-            .await
-            .expect("timed out waiting for daemon control message")
-            .expect("daemon control sender remains live")
-    })
-}
-
-#[cfg(test)]
-fn receive_test_control_request(
-    receiver: &mut tokio_mpsc::Receiver<ControlMessage>,
-) -> ControlMessage {
-    loop {
-        match receive_test_control_message(receiver) {
-            ControlMessage::RegisterUnixAdmission { reply_tx, .. } => {
-                let _ = reply_tx.send(());
-            }
-            ControlMessage::RegisterWebrtcAdmission { .. } => {}
-            message => return message,
-        }
-    }
-}
-
-#[cfg(test)]
 fn receive_test_control_reply(
     receiver: crate::daemon::control::message::ControlReplyReceiver,
 ) -> DaemonTransportResult<DaemonResponse> {
@@ -2490,12 +2459,16 @@ mod tests {
     use crate::daemon::error::daemon_operator_error;
     use crate::daemon::error::{DaemonTransportError, DaemonTransportResult};
     use crate::transport::unix::connection::handle_connection;
+    use crate::transport::unix::test_harness::{
+        read_hello_ack, read_response, read_terminal, receive_test_control_message,
+        receive_test_control_request, write_hello, write_request,
+    };
     use botster_core::RequestId;
     use botster_core::contract::terminal_adapter::TerminalAdapter;
     use botster_hub_client::{
-        ClientFrame, DaemonCompatibilityRequirement, DaemonHello, DaemonHelloAck, DaemonRequest,
-        DaemonResponse, DaemonResponseKind, DaemonUnixFrameReader, DaemonUnixMuxFrame,
-        DaemonUnixTerminalFrame, PROTOCOL, ServerFrame, encode_client_frame, write_client_frame,
+        ClientFrame, DaemonCompatibilityRequirement, DaemonHello, DaemonRequest, DaemonResponse,
+        DaemonResponseKind, DaemonUnixFrameReader, DaemonUnixMuxFrame, PROTOCOL, ServerFrame,
+        encode_client_frame, write_client_frame,
     };
     use botster_terminal_protocol::{RouteId, RoutedTerminalFrame, encode_output};
     use std::io::Write;
@@ -5453,68 +5426,6 @@ mod tests {
         }
         daemon.stop();
         std::fs::remove_dir_all(root).expect("remove event owner test directory");
-    }
-
-    fn write_hello(client: &mut UnixStream) {
-        write_client_frame(
-            client,
-            &ClientFrame::Hello {
-                hello: DaemonHello {
-                    protocol: PROTOCOL.to_string(),
-                    compatibility: DaemonCompatibilityRequirement::current(),
-                    terminal_compatibility: None,
-                },
-            },
-        )
-        .expect("write daemon hello");
-    }
-
-    fn write_request(client: &mut UnixStream, request_id: u64, request: DaemonRequest) {
-        write_client_frame(
-            client,
-            &ClientFrame::Request {
-                request_id: request_id.to_string(),
-                request,
-            },
-        )
-        .expect("write client request");
-    }
-
-    fn read_hello_ack(
-        client: &mut UnixStream,
-        reader: &mut DaemonUnixFrameReader,
-    ) -> DaemonHelloAck {
-        match reader.read_frame(client).expect("read daemon hello ack") {
-            DaemonUnixMuxFrame::Server(ServerFrame::HelloAck { ack }) => ack,
-            other => panic!("expected hello ack, got {other:?}"),
-        }
-    }
-
-    fn read_response(
-        client: &mut UnixStream,
-        reader: &mut DaemonUnixFrameReader,
-        expected_request_id: u64,
-    ) -> DaemonResponse {
-        match reader.read_frame(client).expect("read daemon response") {
-            DaemonUnixMuxFrame::Server(ServerFrame::Response {
-                request_id,
-                response,
-            }) => {
-                assert_eq!(request_id, expected_request_id.to_string());
-                response
-            }
-            other => panic!("expected correlated response, got {other:?}"),
-        }
-    }
-
-    fn read_terminal(
-        client: &mut UnixStream,
-        reader: &mut DaemonUnixFrameReader,
-    ) -> DaemonUnixTerminalFrame {
-        match reader.read_frame(client).expect("read terminal frame") {
-            DaemonUnixMuxFrame::Terminal(frame) => frame,
-            other => panic!("expected terminal container, got {other:?}"),
-        }
     }
 
     #[test]
