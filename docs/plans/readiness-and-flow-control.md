@@ -334,7 +334,7 @@ Every step lands alone, keeps the strict gates green (fmt, clippy `-D warnings` 
 
 **User decision (2026-09-27): every step, S6 to S12 included, lands before cutover, without lowering quality.** The split below remains the priority order: the first table fixes live defects.
 
-The total is about 15.75 to 17.75 writer-days of new work.
+The total is about 16.25 to 18.25 writer-days of new work.
 
 **First priority: about 7.25 writer-days of new work.** These steps fix every live defect in the catalogue.
 
@@ -352,7 +352,7 @@ The total is about 15.75 to 17.75 writer-days of new work.
 
 Every step in this list fixes a live defect.
 
-**Second priority, also before cutover: about 8.5 to 10.5 writer-days.**
+**Second priority, also before cutover: about 9 to 11 writer-days.**
 
 | Step | Size | Note |
 | --- | --- | --- |
@@ -362,7 +362,7 @@ Every step in this list fixes a live defect.
 | S10 | 0.5 d | derived `exit_hold`; `journal_advanced` as a wake |
 | S11 | 2 to 3 d | follows the process host |
 | S12 | 0.5 d | coalesce small `Output` frames |
-| S13 | 2 d | per-route credit in both directions on the Unix connection |
+| S13 | 2.5 d | per-route demand, grant, and fenced close in both directions on the Unix connection |
 
 ### 4.2 Order constraints
 
@@ -374,14 +374,14 @@ Every step in this list fixes a live defect.
 
 Credit flows in both directions, so neither side ever has to stop reading the socket. Control frames therefore always flow.
 
-**Output credit (Hub → client, terminal frames).**
-- **One shared budget.** The client already has one terminal budget, `WakeBudget` (items and bytes, shared by every route and by retained frames; TUI `hub_io.rs:193-255`). Every grant is carved from that budget. At all times, the outstanding grants plus the in-flight, queued, and retained terminal frames of every route fit the budget. The client reserves budget when it grants, and gets it back when a granted frame is consumed or disposed, or when the route closes. No quota is multiplied per route.
-- **Allocation.** At bind (attach or reattach), the client grants the new route an equal share of the free budget. As frames are consumed, the returned budget goes to routes with pending demand in round-robin order. The same rule applies at attach and at reattach.
-- **Initial grant and debit.** A route starts at zero credit. The client's first grant follows the attach acknowledgement. The Hub debits one item plus the frame's bytes when a write is committed. A write needs credit for the whole frame: with nonzero but insufficient credit, the adapter refuses with `WouldBlock`. The client's budget (8 MiB) is at least the largest route frame (`MAX_ROUTE_EGRESS_BYTES`, 4 MiB), so every frame can eventually fit. A refused write debits nothing, so there is nothing to roll back.
-- **Wake.** The adapter arms the route's credit wake before its final write attempt (2.2). A grant arriving before that attempt is visible to it, and a grant arriving between the refusal and the park moves the armed epoch.
-- **Fencing and close.** A grant names the route's subscription id and generation. A grant for a retired generation is ignored. On close, `PROCESS_EXIT`, or teardown, both sides drop the route's credit, and the client returns the reserved budget.
-- **Representation.** A grant is one small frame: route id, generation, and an item and byte increment. The client coalesces the grants of several consumed frames into one. Grants are control frames, so they are never behind credit themselves.
-- **Stalled client.** A client that grants nothing is a reader with no progress, and it ends `Stalled` at `READER_PROGRESS_DEADLINE`.
+**Output credit (Hub → client, terminal frames): demand, then whole-frame grants.**
+- **One shared budget.** The client has one terminal budget, `WakeBudget` (items and bytes, shared by every route and by retained frames; TUI `hub_io.rs:193-255`). At all times, the grants that are not yet spent plus the in-flight, queued, and retained terminal frames of every route fit that budget. No quota is multiplied per route.
+- **Demand makes need visible.** A route holds no credit until it has output. When the Hub's adapter has queued frames that its credit does not cover, it sends one `DEMAND(route, generation, items, bytes)` control frame for them. The demand covers at most the route queue's existing bound (`MAX_ROUTE_EGRESS_FRAMES` 64 / `MAX_ROUTE_EGRESS_BYTES` 4 MiB), so no new number is added. A route has at most one outstanding demand. The next one goes out only after a grant arrives, so demands are bounded and coalesced.
+- **Grants are whole frames, in demand order.** The client serves demands first come, first served. It grants the largest prefix of the demanded frames that the free budget covers, and never part of a frame. A demand that the free budget cannot yet cover waits at the head until consumption returns enough budget; demands behind it wait too, so a large frame is never starved by small ones. Every frame is at most 4 MiB and the budget is 8 MiB, so the head demand is always coverable once enough earlier frames are consumed.
+- **No idle stranding.** A grant covers only frames that the Hub has already queued, so an idle route holds no credit. If the Hub drops queued frames that a grant covered (overflow recovery, teardown), it sends that credit back in a `RETURN(route, generation, items, bytes)` frame. `RETURN` is ordered on the same socket after every frame written with that credit, so the client never counts the same budget twice.
+- **Debit and refusal.** The Hub debits one item plus the frame's `body.len()` (its 8-byte header included, the unit that `WakeBudget` charges) when it commits a write. A write needs credit for the whole frame. Otherwise the adapter refuses with `WouldBlock`, which debits nothing. The adapter records the refused frame's need, arms its credit wake, and checks credit under one lock. A grant raises the wake only when the credit covers the recorded need (the S13 premise's rule).
+- **Close is fenced by the Hub.** Whichever side closes a route, the Hub ends it with `CLOSED(route, generation, unspent)`. The Hub sends it after the route's last frame, including any `PROCESS_EXIT` sequence, on the same ordered socket. It carries the route's unspent credit. The client keeps the route's grants reserved and its received frames charged until it reads `CLOSED`. It then returns the unspent credit to the free budget, and frames already received stay charged until they are consumed or disposed. A client that detaches locally sends `DETACH` and still waits for `CLOSED`. A grant or demand for a retired generation is ignored.
+- **Stalled client.** A client that grants nothing while it has free budget, or consumes nothing, is a reader with no progress, and it ends `Stalled` at `READER_PROGRESS_DEADLINE`.
 
 **Input credit (client → Hub, terminal input frames).**
 - **Window.** The Hub grants each route input credit equal to its adapter ingress capacity (the existing `MIN_ADAPTER_INGRESS_BUFFER_FRAMES`, 64 frames). It returns one unit as Core removes each frame (the S5 room wake). The client never sends input beyond its credit.
@@ -389,13 +389,15 @@ Credit flows in both directions, so neither side ever has to stop reading the so
 - **Coupling before S9.** While the worker's main loop is blocked on full output, it applies no input (1.2). The route's input credit is then not returned, so the client stops sending input on that route only. Control frames and output grants still flow. When the client consumes output and grants credit, output drains and the worker applies input again. If the client never consumes output, the route ends `Stalled` at the deadline. No path waits on an incidental wake or buffers without bound.
 
 **Tests.**
-1. Two routes flood while a pre-attach frame is retained. The aggregate budget is fully allocated, and a control request is still answered. Budget is conserved throughout (ablation: grant each route the whole budget).
-2. Input and output saturate on one route at once. A credit grant queued behind pending input reaches the Hub, input and output both resume, and a control request completes with no resync and no route loss.
-3. A route with nonzero but insufficient credit gets `WouldBlock`.
-4. A late grant for a retired generation is ignored.
-5. A grant before the final write attempt is used, and a grant between the refusal and the park wakes the adapter (ablation: raise after the park check).
-6. A client that sends input beyond its credit is closed typed.
-7. A client that never grants credit ends `Stalled`.
+1. An idle first route stays open while a second route floods: the second route's output completes, with no `Stalled` and no route loss (ablation: grant ahead of demand, and the second route stalls).
+2. Two routes flood with frames near 4 MiB while one frame is retained. Every transition conserves the budget, and both routes finish with whole-frame grants (ablation: partial-frame grants).
+3. Close race: the Hub commits a frame on A under an old grant, the client detaches A locally, and B demands. The budget is conserved after every transition, and A's budget returns only at `CLOSED` (ablation: return on local detach, and the invariant is exceeded).
+4. Frames that a grant covered are dropped by overflow recovery, and the `RETURN` restores exactly that credit after the last written frame.
+5. Input and output saturate on one route at once: a credit grant queued behind pending input reaches the Hub, input and output both resume, and a control request completes with no resync and no route loss.
+6. A late grant or demand for a retired generation is ignored.
+7. A grant before the adapter's final credit check is used. A grant between the refusal and the park wakes the adapter exactly once, and a short grant raises nothing (ablation: raise on every grant).
+8. A client that sends input beyond its credit is closed typed, and input sent before the attach acknowledgement is a violation.
+9. A client that never grants credit, or never consumes, ends `Stalled`.
 
 ### 4.4 Execution (orchestrator assignment, 2026-09-27)
 
