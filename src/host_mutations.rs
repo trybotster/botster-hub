@@ -1605,6 +1605,7 @@ fn prepare_managed_worktree_record(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_package(
     request: DaemonRequest,
     base_revision: u64,
