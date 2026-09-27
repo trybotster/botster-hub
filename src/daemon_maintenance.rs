@@ -539,6 +539,9 @@ pub struct MaintenanceState {
     pub pending_retirements: VecDeque<EventDeliveryFlight>,
     pub event_causal_blocked: bool,
     pub event_causal_faulted: bool,
+    /// A panicking holder poisoned the package event router: event delivery
+    /// has stopped for good. It is a fault, never a wait.
+    pub(crate) event_router_faulted: bool,
     /// Core reported a lifecycle-journal advance since the last consumer read it.
     pub journal_wake_pending: bool,
     /// Test-only replacement for `EVENT_INVOCATION_TIMEOUT_MS`, so a test can
@@ -1402,7 +1405,7 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         .signal_waits
         .remove(&MaintenanceSliceKind::PackageEventDelivery);
     // Causal capacity progress marks this slice again.
-    if state.event_causal_blocked || state.event_causal_faulted {
+    if state.event_causal_blocked || state.event_causal_faulted || state.event_router_faulted {
         return;
     }
     // Register before the pull: a copy that becomes ready after this read
@@ -1421,12 +1424,16 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
     };
     // A busy router lock is contention: arm on that lock and retry once. If the
     // retry also fails, park until the holder's release raises the lock key.
+    // A poisoned lock is a fault, checked before arming and after the retry
+    // because a holder can poison it between the two attempts.
     let batch = match pull() {
         Ok(batch) => batch,
+        Err(_) if router.lock_poisoned() => return fault_event_delivery(state),
         Err(_) => {
             let lock_seen = router.arm_lock();
             match pull() {
                 Ok(batch) => batch,
+                Err(_) if router.lock_poisoned() => return fault_event_delivery(state),
                 Err(_) => {
                     state
                         .signal_waits
@@ -1580,6 +1587,17 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
     // The batch made progress, so the slice runs again; an empty pull parks it.
     if !state.event_causal_blocked && !state.event_causal_faulted {
         state.wakes.mark(MaintenanceSliceKind::PackageEventDelivery);
+    }
+}
+
+/// Stop event delivery for good after the router lock was poisoned.
+fn fault_event_delivery(state: &mut MaintenanceState) {
+    state
+        .signal_waits
+        .remove(&MaintenanceSliceKind::PackageEventDelivery);
+    if !state.event_router_faulted {
+        state.event_router_faulted = true;
+        eprintln!("package event router lock is poisoned; event delivery stopped");
     }
 }
 
@@ -4401,6 +4419,38 @@ return botster.register({})
         assert!(
             !state.wakes.has_any(),
             "the holder's release wakes nothing that was not armed"
+        );
+        let _ = std::fs::remove_dir_all(data_directory);
+    }
+
+    #[test]
+    fn a_poisoned_router_faults_delivery_without_waking_itself() {
+        let (runtime, data_directory) = event_delivery_runtime("delivery-router-poisoned");
+        subscribe_worktree_consumer(&runtime, "consumer");
+        runtime.insert_test_event_handler("consumer", "worktree_created");
+        ingress_worktree_created(&runtime);
+        let router = runtime.package_event_router().clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            router.test_with_inner_held(|| panic!("poison the router"))
+        }));
+        let lock_epoch = runtime
+            .owner_signal()
+            .seen(crate::daemon::owner_signal::SignalKey::EventRouter);
+        let mut state = MaintenanceState::default();
+        for _ in 0..3 {
+            state.wakes = MaintenanceWakes(0);
+            run_package_event_delivery_slice(&runtime, &mut state);
+            state.mark_signaled_waits(runtime.owner_signal());
+            assert!(
+                state.event_router_faulted,
+                "poison is a typed terminal fault"
+            );
+            assert!(state.signal_waits.is_empty(), "a fault parks on nothing");
+            assert!(!state.wakes.has_any(), "a fault marks nothing: {state:?}");
+        }
+        assert!(
+            !runtime.owner_signal().moved(lock_epoch),
+            "no attempt on the poisoned router raised its own key"
         );
         let _ = std::fs::remove_dir_all(data_directory);
     }
