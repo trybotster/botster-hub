@@ -368,10 +368,16 @@ pub(crate) fn arm_package_entity_delivery(
     }
     let applied = subscription.package_last_applied_seq;
     if snapshot {
+        // A floor above an in-sync subscriber's applied sequence means admitted
+        // deltas are queued for it, not that it needs a snapshot. It takes one
+        // only when the snapshot brings it to the floor; a stale resync
+        // snapshot from a provider behind the floor would otherwise mark it
+        // catching up and drop every queued delta.
+        let in_sync = !subscription.package_catching_up && subscription.resync_reason.is_none();
         if applied.is_some_and(|applied| sequence < applied)
-            || !(subscription.package_catching_up
-                || subscription.resync_reason.is_some()
-                || applied.is_none_or(|applied| applied < family_floor))
+            || (in_sync
+                && applied
+                    .is_some_and(|applied| applied >= family_floor || sequence < family_floor))
         {
             return None;
         }
@@ -2893,6 +2899,95 @@ mod tests {
             crate::entity_delivery::EntityDelivery::Typed(DaemonEntityFrame::Error { code, .. })
                 if code == "entity_provider_unloaded"
         ));
+    }
+
+    /// An in-sync subscriber takes a resync snapshot only when the snapshot
+    /// brings it to the family floor. A floor above the applied sequence means
+    /// admitted deltas are queued for it, not that it needs a snapshot.
+    #[test]
+    fn in_sync_subscriber_refuses_a_snapshot_below_the_family_floor() {
+        use std::sync::Arc;
+
+        let mut state = DaemonControlState::default();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let target = Arc::new(crate::plugin_entity::Target {
+            subscription_id: "gate".to_string(),
+            entity_type: "gate.family".to_string(),
+            sender: EntityFrameSender::Async(sender),
+        });
+        install_package_entity_subscription(
+            &mut state,
+            crate::plugin_entity::Registration {
+                subscription_id: "gate".to_string(),
+                target_key: "gate".to_string(),
+                entity_type: "gate.family".to_string(),
+                reservation: crate::admission::reservations::PreparedSubscriptionIdentity::new(
+                    "gate".to_string(),
+                ),
+            },
+            Arc::clone(&target),
+            None,
+        )
+        .expect("install provider subscription");
+        let identity = |waiter| {
+            crate::owner_identity::OwnerWorkIdentity::first(crate::owner_identity::WaiterId(waiter))
+        };
+        let deliver = |state: &mut DaemonControlState, waiter, sequence, snapshot, floor| {
+            arm_package_entity_delivery(
+                state,
+                &target,
+                identity(waiter),
+                sequence,
+                snapshot,
+                floor,
+            )
+            .unwrap_or_else(|| panic!("arm seq {sequence} snapshot {snapshot} floor {floor}"));
+            // The return value reports whether the subscriber is still
+            // catching up; the test asserts that state directly.
+            let _ = complete_package_entity_delivery(
+                state,
+                &target,
+                identity(waiter),
+                sequence,
+                snapshot,
+                floor,
+                crate::plugin_entity::DeliveryStatus::Sent,
+            );
+        };
+
+        // The initial snapshot brings the subscriber in sync at 0.
+        assert!(exact_package_entity_target_catching_up(&state, &target));
+        deliver(&mut state, 1, 0, true, 0);
+        assert!(!exact_package_entity_target_catching_up(&state, &target));
+
+        // A gap fill raised the floor to 3, and a provider still behind answers
+        // its resync with seq 0 (stale) or seq 1 (partly behind).
+        for (waiter, stale) in [(2, 0), (3, 1)] {
+            assert!(
+                arm_package_entity_delivery(&mut state, &target, identity(waiter), stale, true, 3)
+                    .is_none(),
+                "an in-sync subscriber must refuse snapshot {stale} below floor 3"
+            );
+        }
+        assert!(!exact_package_entity_target_catching_up(&state, &target));
+
+        // The queued deltas then reach it in order.
+        for sequence in 1..=3 {
+            deliver(&mut state, 10 + sequence, sequence, false, 3);
+        }
+        assert_eq!(
+            state.entity_subscriptions["gate"].package_last_applied_seq,
+            Some(3)
+        );
+        assert!(!exact_package_entity_target_catching_up(&state, &target));
+
+        // A snapshot that reaches a raised floor is still taken.
+        deliver(&mut state, 20, 5, true, 5);
+        assert_eq!(
+            state.entity_subscriptions["gate"].package_last_applied_seq,
+            Some(5)
+        );
+        assert!(!exact_package_entity_target_catching_up(&state, &target));
     }
 
     #[test]

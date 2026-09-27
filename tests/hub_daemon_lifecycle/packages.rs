@@ -7903,6 +7903,26 @@ fn assert_publish_status(response: &botster_hub_client::DaemonResponse, expected
     assert_eq!(status, Some(expected), "{response:?}");
 }
 
+/// Wait for the Upsert at `sequence`. After accepted publishes an in-sync
+/// subscriber expects deltas only, so a Snapshot fails the test, and every
+/// other frame skipped on the way is printed.
+fn wait_for_ordered_upsert(held: &mut botster_hub_client::DaemonEntitySubscription, sequence: u64) {
+    let _ = wait_for_entity_frame(held, Duration::from_secs(5), |frame| match frame {
+        botster_hub_client::DaemonEntityFrame::Upsert { snapshot_seq, .. }
+            if *snapshot_seq == sequence =>
+        {
+            true
+        }
+        botster_hub_client::DaemonEntityFrame::Snapshot { .. } => {
+            panic!("unexpected snapshot while waiting for upsert {sequence}: {frame:?}")
+        }
+        other => {
+            eprintln!("skipped entity frame while waiting for upsert {sequence}: {other:?}");
+            false
+        }
+    });
+}
+
 #[test]
 fn daemon_package_entity_publish_out_of_order_with_behind_provider_converges_all_subscribers() {
     let _guard = daemon_test_guard();
@@ -7951,24 +7971,8 @@ fn daemon_package_entity_publish_out_of_order_with_behind_provider_converges_all
         serde_json::json!({ "seq": 1, "id": "n1" }),
     );
     assert_publish_status(&fill, "accepted");
-    let _ = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
-        matches!(
-            frame,
-            botster_hub_client::DaemonEntityFrame::Upsert {
-                snapshot_seq: 1,
-                ..
-            }
-        )
-    });
-    let _ = wait_for_entity_frame(&mut held, Duration::from_secs(5), |frame| {
-        matches!(
-            frame,
-            botster_hub_client::DaemonEntityFrame::Upsert {
-                snapshot_seq: 2,
-                ..
-            }
-        )
-    });
+    wait_for_ordered_upsert(&mut held, 1);
+    wait_for_ordered_upsert(&mut held, 2);
 
     held.unsubscribe().expect("unsubscribe");
     shutdown_cli_daemon(&data_dir, child);
@@ -8032,10 +8036,17 @@ fn daemon_package_entity_publish_concurrent_out_of_order_preserves_family_order(
     while seen.len() < 3 && Instant::now() < deadline {
         held.set_read_timeout(Some(Duration::from_millis(200)))
             .expect("timeout");
-        if let Ok(botster_hub_client::DaemonEntityFrame::Upsert { snapshot_seq, .. }) =
-            held.next_frame()
-        {
-            seen.push(snapshot_seq);
+        match held.next_frame() {
+            Ok(botster_hub_client::DaemonEntityFrame::Upsert { snapshot_seq, .. }) => {
+                seen.push(snapshot_seq);
+            }
+            // After accepted publishes an in-sync subscriber expects deltas only.
+            Ok(frame @ botster_hub_client::DaemonEntityFrame::Snapshot { .. }) => {
+                panic!("unexpected snapshot after accepted publishes: {frame:?}; upserts so far: {seen:?}")
+            }
+            Ok(frame) => eprintln!("skipped entity frame: {frame:?}"),
+            // A read timeout; keep polling until the deadline.
+            Err(_) => {}
         }
     }
     assert_eq!(
