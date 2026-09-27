@@ -226,7 +226,18 @@ struct WorkerRecoveryIdentity {
 }
 
 struct UpdateLock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for UpdateLock {
+    // A forked child can hold a copy of the locked open file description
+    // until it execs; release the lock explicitly instead of on close.
+    fn drop(&mut self) {
+        // SAFETY: `flock` takes a valid open descriptor and an integer flag.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 impl UpdateLock {
@@ -250,7 +261,7 @@ impl UpdateLock {
             }
             return Err(format!("acquire {label} lock {}: {error}", path.display()));
         }
-        Ok(Self { _file: file })
+        Ok(Self { file })
     }
 }
 
@@ -1272,6 +1283,29 @@ fn usage() -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_released_update_lock_does_not_block_while_a_descriptor_copy_survives() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "botster-update-lock-{}-{unique}.lock",
+            std::process::id()
+        ));
+        let owner = UpdateLock::acquire(&path, "test").expect("owner");
+        // The same open file description a forked child inherits.
+        let inherited = owner
+            .file
+            .try_clone()
+            .expect("copy of the locked description");
+        drop(owner);
+        let reopened = UpdateLock::acquire(&path, "test");
+        drop(inherited);
+        assert!(reopened.is_ok(), "{:?}", reopened.err());
+        let _ = fs::remove_file(&path);
+    }
 
     #[test]
     fn manifest_package_name_reads_the_package_table_with_a_parser() {
