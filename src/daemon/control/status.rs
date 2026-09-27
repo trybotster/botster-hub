@@ -455,30 +455,25 @@ fn capture_current_sources(
     )?;
     let terminal_bound = daemon.local_webrtc().terminal_records_bytes(remaining)?;
     let registry = daemon.package_registry_view();
-    let (package_rows, package_bytes) =
-        crate::daemon::control::host_work::package_quarantine_rows_bytes(
-            state,
-            &registry,
-            daemon.runtime().map(crate::HubRuntime::plugin_lifecycle),
-            remaining,
-        )?;
-    let quarantine_bound = checked_live_bytes(
-        remaining,
-        [
-            state
-                .repo_session_type_quarantine
-                .status_rows_bytes(remaining)?,
-            package_bytes,
-        ],
-    )?;
-    let quarantine_rows = state
+    let repo_bytes = state
         .repo_session_type_quarantine
-        .len()
-        .checked_add(package_rows)?;
+        .status_rows_bytes(remaining)?;
+    // Early refusal only: the copy below recounts under the lock it copies from.
+    let (_, package_bytes) = with_stranded_read(daemon, |lifecycle, stranded| {
+        crate::daemon::control::host_work::package_quarantine_rows_bytes(
+            state, &registry, lifecycle, stranded, remaining,
+        )
+    })?;
     // Every construction bound overlaps the retained seed and returned Core inventory.
     checked_live_bytes(
         limit,
-        [live, occupancy_bound, terminal_bound, quarantine_bound],
+        [
+            live,
+            occupancy_bound,
+            terminal_bound,
+            repo_bytes,
+            package_bytes,
+        ],
     )?;
     let (occupancy, _) = crate::subscription::attach_routes::try_live_attach_occupancy_rows(
         &state.pending_runtime.live_attach_routes,
@@ -490,21 +485,78 @@ fn capture_current_sources(
         .local_webrtc()
         .bounded_terminal_records(terminal_bound)
         .expect("the preflighted terminal records are unchanged in this Owner slice");
+    #[cfg(test)]
+    BEFORE_QUARANTINE_COPY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    // A Host worker can strand another package at any time. The package rows
+    // are recounted and admitted under the same hold of the stranded set they
+    // are copied from, so the copy never exceeds what was admitted.
+    let quarantines = with_stranded_read(daemon, |lifecycle, stranded| {
+        let (package_rows, package_bytes) =
+            crate::daemon::control::host_work::package_quarantine_rows_bytes(
+                state, &registry, lifecycle, stranded, remaining,
+            )?;
+        checked_live_bytes(
+            limit,
+            [
+                live,
+                occupancy_bound,
+                terminal_bound,
+                repo_bytes,
+                package_bytes,
+            ],
+        )?;
+        // Exact capacity: the admitted bound counts one row size per row.
+        let mut rows = Vec::with_capacity(
+            state
+                .repo_session_type_quarantine
+                .len()
+                .checked_add(package_rows)?,
+        );
+        rows.extend(state.repo_session_type_quarantine.status_rows());
+        crate::daemon::control::host_work::extend_package_quarantine_rows(
+            state, &registry, lifecycle, stranded, &mut rows,
+        );
+        Some(rows)
+    })?;
     let seed = input.seed.as_mut()?;
     seed.session_count = state.maintenance.projection.rows.len();
     seed.occupancy = occupancy;
     seed.terminal_records = terminal_records;
-    // Exact capacity: the admitted bound counts one row size per row.
-    let mut quarantines = Vec::with_capacity(quarantine_rows);
-    quarantines.extend(state.repo_session_type_quarantine.status_rows());
-    crate::daemon::control::host_work::extend_package_quarantine_rows(
-        state,
-        &registry,
-        daemon.runtime().map(crate::HubRuntime::plugin_lifecycle),
-        &mut quarantines,
-    );
     seed.quarantines = quarantines;
     Some(())
+}
+
+/// Run `read` with the plugin lifecycle and one hold of its stranded set.
+fn with_stranded_read<R>(
+    daemon: &HubDaemon,
+    read: impl FnOnce(
+        Option<&crate::HubPluginLifecycle>,
+        Option<&std::collections::BTreeSet<String>>,
+    ) -> R,
+) -> R {
+    match daemon.runtime().map(crate::HubRuntime::plugin_lifecycle) {
+        Some(lifecycle) => {
+            lifecycle.with_stranded(|stranded| read(Some(lifecycle), Some(stranded)))
+        }
+        None => read(None, None),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_QUARANTINE_COPY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` on this thread between the Status preflight and the
+/// quarantine copy.
+#[cfg(test)]
+fn before_next_quarantine_copy(hook: impl FnOnce() + 'static) {
+    BEFORE_QUARANTINE_COPY.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 fn submit(
@@ -1368,14 +1420,16 @@ mod tests {
             .repo_session_type_quarantine
             .status_rows_bytes(usize::MAX)
             .unwrap();
-        let (package_rows, package_bytes) =
+        let (package_rows, package_bytes) = with_stranded_read(&daemon, |lifecycle, stranded| {
             crate::daemon::control::host_work::package_quarantine_rows_bytes(
                 &state,
                 daemon.package_registry(),
-                daemon.runtime().map(crate::HubRuntime::plugin_lifecycle),
+                lifecycle,
+                stranded,
                 usize::MAX,
             )
-            .unwrap();
+        })
+        .unwrap();
         assert_eq!(package_rows, 1);
         let exact = live + occupancy + terminal + rows + package_bytes;
         assert!(capture_current_sources(&mut daemon, &state, &mut input, exact - 1).is_none());
@@ -1399,6 +1453,103 @@ mod tests {
         assert_eq!(quarantines.capacity(), 2, "the row vector is sized exactly");
         drop(input);
         drop(permit);
+        daemon.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A package stranded between the preflight and the copy is recounted
+    /// under the lock the copy reads: at the old exact fit the capture is
+    /// refused, and with room the new row is copied at exact capacity.
+    #[test]
+    fn a_package_stranded_during_capture_is_recounted_before_copy() {
+        let (mut daemon, directory) = test_daemon("status-stranded-race");
+        let state = DaemonControlState::default();
+        let lifecycle = daemon.runtime().unwrap().plugin_lifecycle().clone();
+        lifecycle.mark_stranded("first.stranded");
+        let capture = |daemon: &mut HubDaemon, limit: usize| {
+            let mut input = capture_seed(daemon, &state, "44".into(), false, usize::MAX);
+            let permit = daemon
+                .runtime()
+                .unwrap()
+                .host_executor()
+                .try_reserve()
+                .unwrap();
+            input.core = Some(StatusCoreSnapshot::new(
+                Default::default(),
+                Ok(Some(botster_core::TerminalSubscriptionInventory {
+                    logical_bytes: size_of::<botster_core::TerminalSubscriptionInventory>(),
+                    records: Vec::new(),
+                })),
+                permit.retain_prepared_reservation(),
+            ));
+            let captured = capture_current_sources(daemon, &state, &mut input, limit);
+            let rows = input.seed.as_ref().unwrap().quarantines.clone();
+            let capacity = input.seed.as_ref().unwrap().quarantines.capacity();
+            drop(input);
+            drop(permit);
+            (captured, rows, capacity)
+        };
+        // The exact fit for one stranded row, measured as the preflight does.
+        let exact = {
+            let mut input = capture_seed(&daemon, &state, "44".into(), false, usize::MAX);
+            let permit = daemon
+                .runtime()
+                .unwrap()
+                .host_executor()
+                .try_reserve()
+                .unwrap();
+            input.core = Some(StatusCoreSnapshot::new(
+                Default::default(),
+                Ok(Some(botster_core::TerminalSubscriptionInventory {
+                    logical_bytes: size_of::<botster_core::TerminalSubscriptionInventory>(),
+                    records: Vec::new(),
+                })),
+                permit.retain_prepared_reservation(),
+            ));
+            let live = input.logical_bytes(usize::MAX).unwrap();
+            drop(input);
+            drop(permit);
+            let occupancy =
+                crate::subscription::attach_routes::live_attach_occupancy_prepared_bytes(
+                    &state.pending_runtime.live_attach_routes,
+                    &[],
+                    usize::MAX,
+                )
+                .unwrap();
+            let terminal = daemon
+                .local_webrtc()
+                .terminal_records_bytes(usize::MAX)
+                .unwrap();
+            let (rows, package_bytes) = with_stranded_read(&daemon, |lifecycle, stranded| {
+                crate::daemon::control::host_work::package_quarantine_rows_bytes(
+                    &state,
+                    daemon.package_registry(),
+                    lifecycle,
+                    stranded,
+                    usize::MAX,
+                )
+            })
+            .unwrap();
+            assert_eq!(rows, 1);
+            live + occupancy + terminal + package_bytes
+        };
+        let (captured, rows, _) = capture(&mut daemon, exact);
+        assert!(captured.is_some(), "one stranded row fits exactly");
+        assert_eq!(rows.len(), 1);
+
+        let racing = lifecycle.clone();
+        before_next_quarantine_copy(move || racing.mark_stranded("second.stranded"));
+        let (captured, rows, _) = capture(&mut daemon, exact);
+        assert!(
+            captured.is_none(),
+            "the row stranded after the preflight is recounted"
+        );
+        assert!(rows.is_empty(), "nothing is copied past the admitted count");
+
+        let (captured, rows, capacity) = capture(&mut daemon, usize::MAX);
+        assert!(captured.is_some());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(capacity, 2, "the row vector is sized exactly");
         daemon.stop();
         std::fs::remove_dir_all(directory).unwrap();
     }
