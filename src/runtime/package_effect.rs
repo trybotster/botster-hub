@@ -163,6 +163,14 @@ impl HostPackageRuntime {
         }
     }
 
+    /// Whether a package is stranded and not yet resolved by an operator.
+    pub(crate) fn is_stranded(&self, package_name: &str) -> bool {
+        self.stranded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(package_name)
+    }
+
     /// Mark a package stranded after its compensation failed.
     pub(crate) fn mark_stranded(&self, package_name: &str) {
         self.stranded

@@ -10203,6 +10203,107 @@ return botster.register({tools = {{
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Resolving one stranded package never reloads another. A failed refresh
+    /// strands A and B; an explicit reload of A that fails before its install
+    /// compensates A only, and B stays unloaded, stranded, and covered.
+    #[test]
+    fn a_failed_explicit_reload_never_reloads_another_stranded_package() {
+        let root = unique_package_control_dir("requarantine");
+        let data_directory = root.join("data");
+        let config = package_control_config(data_directory);
+        let mut daemon = HubDaemon::start(config.clone()).expect("start requarantine daemon");
+        let mut state = DaemonControlState::default();
+        let mut package_dirs = Vec::new();
+        for name in ["a.requarantine", "b.requarantine"] {
+            let package_dir = root.join(name);
+            write_package_control_manifest(
+                &package_dir,
+                name,
+                serde_json::json!({
+                    "capabilities": [{ "surface": "surfaces" }],
+                    "entrypoints": [{ "runtime": "lua", "path": "plugin.lua", "bootstrap": false }]
+                }),
+            );
+            std::fs::write(
+                package_dir.join("plugin.lua"),
+                "return botster.register({})\n",
+            )
+            .expect("write lua");
+            drive_package_request_with_state(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::InstallPackageLocalPath {
+                    path: package_dir.clone(),
+                },
+            )
+            .expect("install");
+            let enabled = drive_package_request_with_state(
+                &mut daemon,
+                &mut state,
+                DaemonRequest::EnablePackage {
+                    package_name: name.to_string(),
+                },
+            )
+            .expect("enable");
+            assert!(enabled.error.is_none(), "{enabled:?}");
+            package_dirs.push(package_dir);
+        }
+        assert!(plugin_is_loaded(&daemon, "b.requarantine"));
+
+        // The refresh panics after staging A and its durable restore fails:
+        // both refreshed packages are quarantined and stranded.
+        crate::runtime::package_effect::panic_after_stage_for("a.requarantine");
+        FileHubStateStore::inject_save_failure_after(&config.data_directory, 1);
+        let error = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::RefreshLocalPackages,
+        )
+        .expect_err("refresh panic plus failed durable restore");
+        assert!(
+            matches!(error, DaemonTransportError::PackageCompensation { .. }),
+            "{error:?}"
+        );
+        let stranded = daemon.runtime().unwrap().stranded_packages();
+        assert!(stranded.contains("a.requarantine") && stranded.contains("b.requarantine"));
+        assert!(!plugin_is_loaded(&daemon, "b.requarantine"));
+
+        // An explicit reload of A whose plugin no longer parses is refused
+        // before its install. Its compensation must not touch B.
+        std::fs::write(
+            package_dirs[0].join("plugin.lua"),
+            "return botster.register({\n",
+        )
+        .expect("break A");
+        let refused = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::ReloadPackage {
+                package_name: "a.requarantine".to_string(),
+            },
+        );
+        assert!(
+            !matches!(refused, Ok(ref response) if response.error.is_none()),
+            "the broken reload of A is refused: {refused:?}"
+        );
+        assert!(
+            !plugin_is_loaded(&daemon, "b.requarantine"),
+            "B was never resolved, so nothing may reload it"
+        );
+        let stranded = daemon.runtime().unwrap().stranded_packages();
+        assert!(stranded.contains("a.requarantine") && stranded.contains("b.requarantine"));
+        assert!(
+            state.host_recovery.values().any(|recovery| matches!(
+                recovery,
+                crate::daemon::control::host_work::HostRecoveryRequired::Package(record)
+                    if record.packages.contains("b.requarantine")
+            )),
+            "B stays covered by its recovery record"
+        );
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A failed effect's staged generation travels from the Host effect,
     /// through the owner, to the runtime restore job, which aborts it. Nothing
     /// else clears it on this path (an enable restore records no router

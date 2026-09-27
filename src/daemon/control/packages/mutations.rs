@@ -286,6 +286,7 @@ pub(crate) fn restore_runtime_after_failed_effect(
                 config,
                 previous_packages,
                 &BTreeMap::from([(package_name.clone(), running_entrypoints.clone())]),
+                &effect.package_names(),
                 unswapped,
                 &mut rollbacks,
             );
@@ -301,6 +302,7 @@ pub(crate) fn restore_runtime_after_failed_effect(
                 config,
                 previous_packages,
                 running_entrypoints,
+                &effect.package_names(),
                 unswapped,
                 &mut rollbacks,
             );
@@ -316,14 +318,32 @@ fn restore_registry_runtime(
     config: &HubConfig,
     previous: &PackageRegistry,
     running_entrypoints: &BTreeMap<String, Vec<String>>,
+    targets: &[&str],
     unswapped: Option<&str>,
     rollbacks: &mut Vec<PackageRollbackFailure>,
 ) {
     for record in previous.packages() {
         let package_name = record.manifest.name.as_str();
+        // Restore only the packages this effect changed; every other
+        // package, stranded ones included, keeps its current runtime.
+        if !targets.contains(&package_name) {
+            continue;
+        }
         // The failed load precedes this package's entrypoint restarts, so
         // neither its plugin nor its entrypoints changed.
         if unswapped == Some(package_name) {
+            continue;
+        }
+        // A stranded package's previous runtime is its quarantine. This
+        // effect may have loaded it; return it to quarantine, never reload
+        // it from disk. Only a successful explicit enable or reload resolves it.
+        if runtime.is_stranded(package_name) {
+            supervisor.stop_package(package_name);
+            let _ = runtime.unload_plugin_package(
+                request_id(&format!("daemon-requarantine-{package_name}")),
+                package_name,
+            );
+            runtime.record_event_plane_unload(package_name);
             continue;
         }
         if record.state == PackageState::Enabled
