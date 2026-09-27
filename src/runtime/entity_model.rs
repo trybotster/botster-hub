@@ -3,7 +3,9 @@
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::host_executor::{HostCommand, HostJobIdentity, HostRetainedPrepared, HostWorkPermit};
+use crate::host_executor::{
+    HostCommand, HostJobIdentity, HostRetainedPrepared, HostWorkPermit, ReservationHolder,
+};
 use crate::package_entity_fanout::{FamilySnapshotWork, LeasedFanoutMutation};
 use crate::package_event_router::{CausalOp, LeaseIdentity};
 
@@ -88,6 +90,54 @@ mod tests {
         family.high_water_seq = 20;
         family.resync.rearm(Instant::now());
         model
+    }
+
+    /// Only gating holders make entity work wait. A Status holder never does;
+    /// an entity-work holder waits; a staging holder with no pending
+    /// generation to release it is an orphan and faults.
+    #[test]
+    fn retained_holders_gate_entity_work_by_kind() {
+        use crate::host_executor::ReservationHolder;
+
+        let runtime = super::super::tests::family_runtime("retained-holder-gates");
+        let permit = runtime.host_executor().try_reserve().unwrap();
+        assert_eq!(runtime.retained_holder_status(&permit), None);
+
+        let status = permit.retain_prepared_reservation(ReservationHolder::Status);
+        assert_eq!(
+            runtime.retained_holder_status(&permit),
+            None,
+            "a Status holder never gates"
+        );
+
+        let work = permit.retain_prepared_reservation(ReservationHolder::EntityWork);
+        assert_eq!(
+            runtime.retained_holder_status(&permit),
+            Some(CausalTransitionStatus::Waiting)
+        );
+        drop(work);
+
+        let funding = permit.retain_prepared_reservation(ReservationHolder::StagingFunding);
+        assert_eq!(
+            runtime.package_event_router.try_has_pending_generation(),
+            Some(false)
+        );
+        assert_eq!(
+            runtime.retained_holder_status(&permit),
+            Some(CausalTransitionStatus::Fault),
+            "no pending generation can release the funding"
+        );
+        assert!(matches!(
+            runtime.begin_entity_model(
+                identity(),
+                Operation::TakeFanout { retained: None },
+                &permit,
+            ),
+            Err((CausalTransitionStatus::Fault, _))
+        ));
+        drop(funding);
+        assert_eq!(runtime.retained_holder_status(&permit), None);
+        drop(status);
     }
 
     #[test]
@@ -1440,8 +1490,8 @@ impl super::HubRuntime {
         {
             return Err((CausalTransitionStatus::Fault, operation));
         }
-        if permit.has_retained_prepared_reservation() {
-            return Err((CausalTransitionStatus::Waiting, operation));
+        if let Some(status) = self.retained_holder_status(permit) {
+            return Err((status, operation));
         }
         let reservation = match self.reserve_causal_transition() {
             Ok(reservation) => reservation,
@@ -1566,6 +1616,30 @@ impl super::HubRuntime {
         work.completed(work.0.identity, work.kind())
     }
 
+    /// Wait while a gating holder of this permit's reservation is
+    /// outstanding: every release publishes a retained-release wake, so the
+    /// request is re-polled. A Status holder never gates. Staging funding is
+    /// released only through the router's pending generation (this waiter's
+    /// own Host phase has completed when it reaches here), so a counted
+    /// funding holder with no pending generation can never be released: that
+    /// is a typed Fault, not a wait.
+    fn retained_holder_status(&self, permit: &HostWorkPermit) -> Option<CausalTransitionStatus> {
+        if permit.gating_holders() == 0 {
+            return None;
+        }
+        if permit.holders(ReservationHolder::StagingFunding) > 0
+            && permit.holders(ReservationHolder::EntityWork) == 0
+            && self.package_event_router.try_has_pending_generation() == Some(false)
+        {
+            crate::hub_log::hub_log!(
+                "retained_reservation_orphaned holder=staging_funding count={}",
+                permit.holders(ReservationHolder::StagingFunding)
+            );
+            return Some(CausalTransitionStatus::Fault);
+        }
+        Some(CausalTransitionStatus::Waiting)
+    }
+
     pub(crate) fn begin_entity_model(
         &self,
         identity: HostJobIdentity,
@@ -1578,10 +1652,10 @@ impl super::HubRuntime {
         if operation.input_bytes() > permit.reserved_prepared_bytes() {
             return Err((CausalTransitionStatus::Fault, operation));
         }
-        if self.entity_model_owner.active.borrow().is_some()
-            || !self.causal_queue.is_empty()
-            || permit.has_retained_prepared_reservation()
-        {
+        if let Some(status) = self.retained_holder_status(permit) {
+            return Err((status, operation));
+        }
+        if self.entity_model_owner.active.borrow().is_some() || !self.causal_queue.is_empty() {
             return Err((CausalTransitionStatus::Waiting, operation));
         }
         let reservation = match self.reserve_causal_transition() {
@@ -1774,7 +1848,7 @@ impl Work {
                 #[cfg(test)]
                 fail_after_operation: false,
             }),
-            _prepared: permit.retain_prepared_reservation(),
+            _prepared: permit.retain_prepared_reservation(ReservationHolder::EntityWork),
             terminal_disposed: std::sync::atomic::AtomicBool::new(false),
         }))
     }

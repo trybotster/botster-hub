@@ -729,6 +729,14 @@ impl PackageEventRouter {
         Ok(bump_package_generation(&mut inner, owner))
     }
 
+    /// Whether a staged generation is pending, without blocking. `None` when
+    /// the router lock is busy.
+    pub(crate) fn try_has_pending_generation(&self) -> Option<bool> {
+        lock_inner(&self.inner)
+            .ok()
+            .map(|inner| inner.pending.is_some())
+    }
+
     pub fn try_register_contracts(
         &self,
         contracts: Vec<EmittedContract>,

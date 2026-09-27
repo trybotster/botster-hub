@@ -480,7 +480,11 @@ pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonCon
             crate::daemon::control::pending::wake_shutdown_waiter(state);
         }
         let causal_progress = table_progress | capacity_progress;
-        let model_progress = runtime.take_entity_model_notification();
+        // A released reservation holder can unblock a request parked on its
+        // permit's holders: re-poll every entity-model waiter, as for model
+        // progress.
+        let model_progress = runtime.take_entity_model_notification()
+            | runtime.host_executor().take_retained_release_notification();
         if causal_progress || model_progress {
             state.publication_owner.note_progress();
             state.package_entity_resync_scan.note_progress();
@@ -6319,6 +6323,25 @@ mod tests {
                             break completion;
                         }
                         crate::host_executor::HostCompletionPoll::Empty => {
+                            // A Pending request with no Host job in flight
+                            // can only be parked: waiting here would spin.
+                            if runtime.host_executor().jobs_in_flight() == 0 {
+                                panic!(
+                                    "Pending with nothing in flight: waiter {:?}; family cleanup waiter: {}; entity causal waiter: {}; entity model waiter: {}",
+                                    state.current_waiter_id,
+                                    state.current_waiter_id.is_some_and(|waiter| state
+                                        .family_cleanup_waiters
+                                        .contains_key(&waiter)),
+                                    state.current_waiter_id.is_some_and(|waiter| state
+                                        .plugin_entities
+                                        .causal_waiters
+                                        .contains(&waiter)),
+                                    state.current_waiter_id.is_some_and(|waiter| state
+                                        .plugin_entities
+                                        .model_waiters
+                                        .contains(&waiter)),
+                                );
+                            }
                             std::thread::yield_now();
                         }
                         crate::host_executor::HostCompletionPoll::Stopped => {
@@ -10791,6 +10814,57 @@ return botster.register({tools = {{
         assert!(!plugin_is_loaded(&daemon, name), "resolve unloads it");
         assert_eq!(package_state(&daemon, name), PackageState::Disabled);
         assert!(package_quarantine_rows(&daemon, &state).is_empty());
+        daemon.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The package driver reports a request parked with no Host job in
+    /// flight instead of spinning: here the commit waits on another writer's
+    /// document reservation.
+    #[test]
+    #[should_panic(expected = "Pending with nothing in flight")]
+    fn the_package_driver_diagnoses_a_parked_request() {
+        let root = unique_package_control_dir("parked-driver");
+        let package_dir = root.join("parked.package");
+        write_package_control_manifest(&package_dir, "parked.package", serde_json::json!({}));
+        let config = package_control_config(root.join("data"));
+        let mut daemon = HubDaemon::start(config).expect("start daemon");
+        let mut state = DaemonControlState::default();
+        state.document_owner = Some(crate::owner_identity::WaiterId(u64::MAX));
+        let _ = drive_package_request_with_state(
+            &mut daemon,
+            &mut state,
+            DaemonRequest::InstallPackageLocalPath { path: package_dir },
+        );
+    }
+
+    /// A released reservation holder starts the causal sweep that re-polls
+    /// parked entity-model waiters, as model progress does.
+    #[test]
+    fn a_released_reservation_holder_starts_the_causal_sweep() {
+        let root = unique_package_control_dir("retained-release-sweep");
+        let config = package_control_config(root.join("data"));
+        let daemon = HubDaemon::start(config).expect("start daemon");
+        let mut state = DaemonControlState::default();
+        let permit = daemon
+            .runtime()
+            .unwrap()
+            .host_executor()
+            .try_reserve()
+            .expect("reserve");
+        drop(
+            permit.retain_prepared_reservation(
+                crate::host_executor::ReservationHolder::StagingFunding,
+            ),
+        );
+        assert!(!state.causal_wake_active);
+        publish_completion_wakes(&daemon, &mut state);
+        assert!(
+            state.causal_wake_active,
+            "the release re-polls parked entity-model waiters"
+        );
+        drop(permit);
+        let mut daemon = daemon;
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }

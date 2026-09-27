@@ -450,6 +450,7 @@ pub(crate) enum HostCompletionPoll {
 struct HostWake {
     completion_pending: AtomicBool,
     capacity_pending: AtomicBool,
+    retained_release_pending: AtomicBool,
     owner: Mutex<Option<ControlSender>>,
     terminal_owner: Mutex<Option<std::thread::Thread>>,
 }
@@ -459,6 +460,7 @@ impl HostWake {
         Self {
             completion_pending: AtomicBool::new(false),
             capacity_pending: AtomicBool::new(false),
+            retained_release_pending: AtomicBool::new(false),
             owner: Mutex::new(None),
             terminal_owner: Mutex::new(None),
         }
@@ -489,6 +491,14 @@ impl HostWake {
         }
     }
 
+    /// A retained reservation holder was released: a request waiting for
+    /// its permit's holders may proceed.
+    fn publish_retained_release(&self) {
+        if !self.retained_release_pending.swap(true, Ordering::AcqRel) {
+            self.wake_owner();
+        }
+    }
+
     fn wake_owner(&self) {
         if let Some(owner) = self
             .terminal_owner
@@ -515,6 +525,10 @@ struct HostPermitPool {
     status_stops: AtomicUsize,
     #[cfg(test)]
     refuse_status_delivery: AtomicBool,
+    /// Submitted jobs that publish a completion, not yet polled. Test
+    /// diagnostics only; it never gates work.
+    #[cfg(test)]
+    jobs_in_flight: AtomicUsize,
     outstanding: AtomicUsize,
     wake: Arc<HostWake>,
 }
@@ -529,6 +543,34 @@ struct HostPreparedPool {
 struct HostPreparedReservation {
     pool: Arc<HostPreparedPool>,
     logical_bytes: usize,
+    /// Outstanding retained holders, by `ReservationHolder` kind.
+    holders: [AtomicUsize; RESERVATION_HOLDER_KINDS],
+}
+
+/// Who retains a permit's prepared reservation beyond its phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservationHolder {
+    /// Staged package event storage. Released when the generation is
+    /// activated, aborted, or discarded by an unload.
+    StagingFunding = 0,
+    /// An entity-model work item. Released when the work is retired.
+    EntityWork = 1,
+    /// A Status Core snapshot. It holds bytes only and never gates work.
+    Status = 2,
+}
+
+const RESERVATION_HOLDER_KINDS: usize = 3;
+
+impl ReservationHolder {
+    const ALL: [Self; RESERVATION_HOLDER_KINDS] =
+        [Self::StagingFunding, Self::EntityWork, Self::Status];
+
+    /// Whether a request must wait for this holder: its release is an
+    /// event the owner is woken for, and the work it holds precedes the
+    /// request's own.
+    pub(crate) const fn gates_entity_work(self) -> bool {
+        matches!(self, Self::StagingFunding | Self::EntityWork)
+    }
 }
 
 impl HostPreparedReservation {
@@ -565,10 +607,52 @@ pub(crate) struct HostPreparedCharge {
     _retained: Option<Arc<HostPreparedReservation>>,
 }
 
-/// A retained record shares the original reservation until its last handle drops.
-#[derive(Debug, Clone)]
+/// A typed holder of a permit's prepared reservation. It shares the
+/// reservation's bytes until it drops. Dropping it first retires its holder
+/// count and then publishes the retained-release wake, so a request re-polled
+/// by that wake always sees the count already lowered.
+#[derive(Debug)]
 pub(crate) struct HostRetainedPrepared {
-    _reservation: Arc<HostPreparedReservation>,
+    reservation: Option<Arc<HostPreparedReservation>>,
+    holder: ReservationHolder,
+}
+
+impl Drop for HostRetainedPrepared {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let wake = Arc::clone(&reservation.pool.wake);
+        let previous = reservation.holders[self.holder as usize].fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "reservation holder underflow");
+        // The last handle also releases the bytes here.
+        drop(reservation);
+        #[cfg(test)]
+        run_before_retained_release_wake();
+        wake.publish_retained_release();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_RETAINED_RELEASE_WAKE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_retained_release_wake() {
+    BEFORE_RETAINED_RELEASE_WAKE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+/// Run `hook` on this thread after the next holder release retires its count
+/// and before it publishes the wake.
+#[cfg(test)]
+pub(crate) fn before_next_retained_release_wake(hook: impl FnOnce() + 'static) {
+    BEFORE_RETAINED_RELEASE_WAKE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 impl Drop for HostPreparedCharge {
@@ -628,19 +712,39 @@ impl HostWorkPermit {
         }
     }
 
-    pub(crate) fn has_retained_prepared_reservation(&self) -> bool {
-        self.prepared
-            .as_ref()
-            .is_some_and(|reservation| Arc::strong_count(reservation) > 1)
+    /// Outstanding holders of this permit's reservation that gate entity
+    /// work. A request waits only while this is nonzero, and every release
+    /// publishes a wake.
+    pub(crate) fn gating_holders(&self) -> usize {
+        self.prepared.as_ref().map_or(0, |reservation| {
+            ReservationHolder::ALL
+                .into_iter()
+                .filter(|holder| holder.gates_entity_work())
+                .map(|holder| reservation.holders[holder as usize].load(Ordering::Acquire))
+                .sum()
+        })
     }
 
-    pub(crate) fn retain_prepared_reservation(&self) -> HostRetainedPrepared {
+    /// Outstanding holders of one kind.
+    pub(crate) fn holders(&self, holder: ReservationHolder) -> usize {
+        self.prepared.as_ref().map_or(0, |reservation| {
+            reservation.holders[holder as usize].load(Ordering::Acquire)
+        })
+    }
+
+    pub(crate) fn retain_prepared_reservation(
+        &self,
+        holder: ReservationHolder,
+    ) -> HostRetainedPrepared {
+        let reservation = Arc::clone(
+            self.prepared
+                .as_ref()
+                .expect("the phase retains its reservation"),
+        );
+        reservation.holders[holder as usize].fetch_add(1, Ordering::AcqRel);
         HostRetainedPrepared {
-            _reservation: Arc::clone(
-                self.prepared
-                    .as_ref()
-                    .expect("the phase retains its reservation"),
-            ),
+            reservation: Some(reservation),
+            holder,
         }
     }
 
@@ -715,6 +819,8 @@ impl HostExecutor {
             status_stops: AtomicUsize::new(0),
             #[cfg(test)]
             refuse_status_delivery: AtomicBool::new(false),
+            #[cfg(test)]
+            jobs_in_flight: AtomicUsize::new(0),
             outstanding: AtomicUsize::new(0),
             wake: Arc::clone(&wake),
         });
@@ -820,6 +926,7 @@ impl HostExecutor {
                         prepared: Some(Arc::new(HostPreparedReservation {
                             pool: Arc::clone(&self.prepared),
                             logical_bytes: HOST_PREPARED_BYTE_CAPACITY,
+                            holders: std::array::from_fn(|_| AtomicUsize::new(0)),
                         })),
                     });
                 }
@@ -866,6 +973,13 @@ impl HostExecutor {
                 permit,
             });
         }
+        #[cfg(test)]
+        let publishes_completion = !matches!(
+            command,
+            HostCommand::DiscardCompletion(_)
+                | HostCommand::Dispose(_)
+                | HostCommand::TerminalDispose(_)
+        );
         let job = HostJob {
             identity,
             command,
@@ -873,7 +987,13 @@ impl HostExecutor {
         };
         let failure = match self.jobs.as_ref() {
             Some(jobs) => match jobs.try_send(job) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    #[cfg(test)]
+                    if publishes_completion {
+                        self.permits.jobs_in_flight.fetch_add(1, Ordering::AcqRel);
+                    }
+                    return Ok(());
+                }
                 // Each queued command owns a permit. The queue and permit pool
                 // both hold eight operations, so a reserved command has space.
                 // Preserve the command if this invariant fails.
@@ -899,7 +1019,23 @@ impl HostExecutor {
     }
 
     pub(crate) fn poll_completion(&self) -> HostCompletionPoll {
-        poll_completion_mailbox(&self.completions)
+        let poll = poll_completion_mailbox(&self.completions);
+        // Saturating: a completion can come from a job this count never saw.
+        #[cfg(test)]
+        if matches!(poll, HostCompletionPoll::Ready(_)) {
+            let _ = self.permits.jobs_in_flight.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |count| count.checked_sub(1),
+            );
+        }
+        poll
+    }
+
+    /// Submitted jobs that publish a completion, not yet polled.
+    #[cfg(test)]
+    pub(crate) fn jobs_in_flight(&self) -> usize {
+        self.permits.jobs_in_flight.load(Ordering::Acquire)
     }
 
     /// Close publication under its existing mutex, then transfer buffered results to Host.
@@ -928,6 +1064,12 @@ impl HostExecutor {
 
     pub(crate) fn take_capacity_notification(&self) -> bool {
         self.wake.capacity_pending.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_retained_release_notification(&self) -> bool {
+        self.wake
+            .retained_release_pending
+            .swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn outstanding(&self) -> usize {
@@ -2236,6 +2378,49 @@ mod tests {
             .expect("released retained bytes restore capacity");
         drop(final_permit);
         drop(permits);
+    }
+
+    /// A holder released on another thread retires its count first and then
+    /// wakes the owner, so a request re-polled by that wake sees the count
+    /// already lowered.
+    #[test]
+    fn a_released_holder_retires_its_count_before_the_wake() {
+        let executor = HostExecutor::new();
+        let (owner, mut owner_rx) = tokio::sync::mpsc::channel(4);
+        executor.bind_owner_wake(owner);
+        let permit = executor.try_reserve().expect("reserve");
+        let holder = permit.retain_prepared_reservation(ReservationHolder::StagingFunding);
+        assert_eq!(permit.gating_holders(), 1);
+        assert!(!executor.take_retained_release_notification());
+        let reservation = Arc::clone(permit.prepared.as_ref().expect("reservation"));
+        let wake = Arc::clone(&executor.wake);
+        let (seen_tx, seen_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            before_next_retained_release_wake(move || {
+                let _ = seen_tx.send((
+                    reservation.holders[ReservationHolder::StagingFunding as usize]
+                        .load(Ordering::Acquire),
+                    wake.retained_release_pending.load(Ordering::Acquire),
+                ));
+            });
+            drop(holder);
+        })
+        .join()
+        .expect("release thread");
+        assert_eq!(
+            seen_rx
+                .recv()
+                .expect("the hook ran between retire and wake"),
+            (0, false),
+            "the count is retired before the wake is published"
+        );
+        assert_eq!(permit.gating_holders(), 0);
+        assert!(executor.take_retained_release_notification());
+        assert!(matches!(
+            owner_rx.try_recv(),
+            Ok(ControlMessage::HostProgressPublished)
+        ));
+        drop(permit);
     }
 
     #[test]
