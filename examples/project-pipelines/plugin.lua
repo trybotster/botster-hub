@@ -401,7 +401,7 @@ local function start(arguments)
   if not worktree_lookup.ok then
     return not_found("worktree", worktree_id)
   end
-  local worktree = worktree_lookup.worktree
+  local worktree = worktree_lookup.value
   if worktree.status ~= "present" then
     return worktree_unavailable(worktree_id, worktree.status)
   end
