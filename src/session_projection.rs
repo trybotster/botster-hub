@@ -228,12 +228,22 @@ impl SessionProjection {
     }
 }
 
+/// Core's lifecycle failure reason for a session whose worker was lost.
+pub(crate) const WORKER_LOST_REASON: &str = "worker_lost";
+
 fn session_lifecycle_class(
     registry_state: &RegistrySessionState,
     lifecycle: Option<&SessionLifecycleState>,
 ) -> &'static str {
     if registry_state == &RegistrySessionState::Stale {
-        "indeterminate"
+        // Stale is usually unknown (a row Hub could not adopt). A worker Core
+        // saw die is known to be gone, so that session has ended.
+        match lifecycle {
+            Some(SessionLifecycleState::Failed { reason }) if reason == WORKER_LOST_REASON => {
+                "ended"
+            }
+            _ => "indeterminate",
+        }
     } else {
         match lifecycle {
             Some(
@@ -406,6 +416,29 @@ mod tests {
             )],
         );
         assert!(baseline.is_ended("baseline-ended"));
+    }
+
+    #[test]
+    fn a_stale_session_is_ended_only_when_core_saw_its_worker_lost() {
+        let class = |lifecycle| {
+            SessionProjection::project_entity(&record("s", RegistrySessionState::Stale, lifecycle))
+                .lifecycle_class
+        };
+        assert_eq!(
+            class(Some(SessionLifecycleState::Failed {
+                reason: WORKER_LOST_REASON.to_string(),
+            })),
+            "ended"
+        );
+        // A row Hub could not adopt at startup stays unknown.
+        assert_eq!(
+            class(Some(SessionLifecycleState::Failed {
+                reason: "stale daemon session".to_string(),
+            })),
+            "indeterminate"
+        );
+        assert_eq!(class(None), "indeterminate");
+        assert_eq!(class(Some(SessionLifecycleState::Running)), "indeterminate");
     }
 
     #[test]

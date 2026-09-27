@@ -556,11 +556,13 @@ mod unix_route_smokes {
         let entity_deadline = Instant::now() + ROUTE_DEADLINE;
         while !(entity.get("lifecycle").and_then(serde_json::Value::as_str) == Some("failed")
             && entity.get("failure_reason").and_then(serde_json::Value::as_str)
-                == Some("worker_lost"))
+                == Some("worker_lost")
+            && entity.get("lifecycle_class").and_then(serde_json::Value::as_str)
+                == Some("ended"))
         {
             assert!(
                 Instant::now() < entity_deadline,
-                "H-S7 session entity must report failed/worker_lost: {entity:?}"
+                "H-S7 session entity must report failed/worker_lost, class ended: {entity:?}"
             );
             match entities.next_frame() {
                 Ok(frame) => apply_session_entity_frame(frame, session_id, &mut entity),
