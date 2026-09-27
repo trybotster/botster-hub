@@ -8083,7 +8083,11 @@ return botster.register({{ handlers = {{{{
     /// completion clears the consumer's in-flight slot, driven only by owner
     /// wakes (the plugin completion notifier). With `install_notifier` false
     /// nothing else wakes the owner, so the drive stops at its hang guard.
-    fn drive_session_family_snapshot(install_notifier: bool, hang_guard: Duration) {
+    fn drive_session_family_snapshot(
+        install_notifier: bool,
+        then_delta: bool,
+        hang_guard: Duration,
+    ) {
         let root = unique_package_control_dir("session-family-wake");
         let package_dir = root.join("family-probe");
         write_package_control_manifest(
@@ -8149,19 +8153,64 @@ return botster.register({ handlers = {} })
                 )
             },
         );
+        if then_delta {
+            // The round-robin cursor now points at family-probe, as it did
+            // when the live Workspaces "ended" frame was lost.
+            state
+                .maintenance
+                .test_queue_family_delta(serde_json::json!({
+                    "type": "entity_upsert",
+                    "family": "/session",
+                    "snapshot_sequence": 1,
+                    "id": "ended-session",
+                }));
+            drive_owner_until(
+                &mut daemon,
+                &mut state,
+                &mut wakes,
+                hang_guard,
+                |_, state| {
+                    state
+                        .maintenance
+                        .session_family
+                        .test_consumer_settled("family-probe")
+                        == Some(true)
+                        && state.maintenance.session_family.test_fanout_empty()
+                },
+                |_, state| {
+                    format!(
+                        "after delta: consumer={}",
+                        state
+                            .maintenance
+                            .session_family
+                            .test_consumer_debug("family-probe")
+                    )
+                },
+            );
+        }
         daemon.stop();
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_session_family_snapshot_completes_on_the_completion_wake_alone() {
-        drive_session_family_snapshot(true, TEST_HANG_GUARD);
+        drive_session_family_snapshot(true, false, TEST_HANG_GUARD);
+    }
+
+    /// The live loss, through the owner driver: a delta queued after the
+    /// snapshot, behind the round-robin cursor, is admitted and completed on
+    /// owner wakes alone.
+    #[test]
+    fn a_delta_after_the_snapshot_is_admitted_on_owner_wakes_alone() {
+        drive_session_family_snapshot(true, true, TEST_HANG_GUARD);
     }
 
     #[test]
     fn without_the_completion_notifier_the_session_family_drive_stops_at_its_guard() {
+        // timer: deadline — the ablation expects the drive to stall; a short
+        // guard bounds that expected stall.
         let stuck = std::panic::catch_unwind(|| {
-            drive_session_family_snapshot(false, Duration::from_secs(3))
+            drive_session_family_snapshot(false, false, Duration::from_secs(3))
         });
         let message = stuck
             .expect_err("no completion notifier must leave the consumer unsettled")
