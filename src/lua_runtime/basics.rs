@@ -30,6 +30,20 @@ pub(super) struct LogSink {
     pub(super) plugin: String,
     /// The VM's log generation (see `plugin_logs`).
     pub(super) generation: u64,
+    /// Monotonic milliseconds for the rate limit. Production always uses
+    /// the Hub's monotonic clock; tests freeze it to prove refusal.
+    rate_clock: fn() -> u64,
+}
+
+impl LogSink {
+    pub(super) fn new(book: Arc<PluginLogBook>, plugin: String, generation: u64) -> Self {
+        Self {
+            book,
+            plugin,
+            generation,
+            rate_clock: monotonic_ms,
+        }
+    }
 }
 
 pub(super) fn install(
@@ -58,6 +72,7 @@ fn log_table(lua: &Lua, memory: Arc<LuaMemoryAccount>, sink: LogSink) -> mlua::R
         let logs = Arc::clone(&sink.book);
         let plugin = sink.plugin.clone();
         let generation = sink.generation;
+        let rate_clock = sink.rate_clock;
         log.set(
             level.as_str(),
             lua.create_function(move |lua, args: Value| {
@@ -90,7 +105,7 @@ fn log_table(lua: &Lua, memory: Arc<LuaMemoryAccount>, sink: LogSink) -> mlua::R
                     level,
                     &message,
                     fields_text,
-                    monotonic_ms(),
+                    rate_clock(),
                     wall_ms(),
                 );
                 drop(fields);
@@ -413,6 +428,13 @@ mod tests {
     use mlua::{LuaOptions, StdLib};
 
     fn vm(callback_bytes: usize) -> (Lua, Arc<LuaMemoryAccount>) {
+        vm_with_rate_clock(callback_bytes, monotonic_ms)
+    }
+
+    fn vm_with_rate_clock(
+        callback_bytes: usize,
+        rate_clock: fn() -> u64,
+    ) -> (Lua, Arc<LuaMemoryAccount>) {
         let lua = Lua::new_with(
             StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
             LuaOptions::default(),
@@ -435,6 +457,7 @@ mod tests {
                 book: logs,
                 plugin: "test.plugin".to_string(),
                 generation: 1,
+                rate_clock,
             },
         )
         .unwrap();
@@ -559,6 +582,47 @@ mod tests {
         .exec()
         .unwrap();
         assert!(memory.usage().1 > 0, "the ring's records stay charged");
+    }
+
+    #[test]
+    fn production_log_sinks_rate_limit_on_the_monotonic_clock() {
+        let memory = LuaMemoryAccount::new(LuaMemoryLimits {
+            per_vm_bytes: 1024,
+            total_vm_bytes: 1024,
+            per_callback_bytes: 1024,
+            total_callback_bytes: 1024,
+        })
+        .unwrap();
+        let sink = LogSink::new(Arc::new(PluginLogBook::new(memory)), "p".to_string(), 1);
+        assert!(std::ptr::fn_addr_eq(
+            sink.rate_clock,
+            monotonic_ms as fn() -> u64
+        ));
+    }
+
+    #[test]
+    fn log_refuses_past_the_burst_with_a_typed_drop_count_while_time_stands_still() {
+        // With the rate clock frozen no tokens refill: exactly the burst is
+        // accepted, and every later record is refused and counted.
+        let (lua, _memory) = vm_with_rate_clock(1024 * 1024, || 0);
+        lua.load(
+            r#"
+            local log = botster.log
+            for index = 1, 200 do
+              local accepted = log.info({ message = "record " .. index })
+              assert(accepted.ok and accepted.value == index, "record " .. index .. " is accepted")
+            end
+            local first = log.info({ message = "over" })
+            assert(not first.ok, "the record after the burst is refused")
+            assert(first.error.kind == "backpressured")
+            assert(first.error.retryable == true)
+            assert(first.error.detail.dropped == 1)
+            local second = log.info({ message = "over again" })
+            assert(second.error.detail.dropped == 2, "refusals are counted")
+            "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[test]
