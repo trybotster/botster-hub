@@ -8683,7 +8683,10 @@ return botster.register({tools = {{
             let request_id = request_id.parse::<usize>().expect("numeric request id");
             assert!(
                 [core_refused_id, transport_refused_id].contains(&request_id),
-                "unexpected refusal request ID {request_id}"
+                "unexpected refusal request ID {request_id}: code={:?} message={:?} diagnostics={:?}",
+                response.error.as_ref().map(|error| error.code.as_str()),
+                response.error.as_ref().map(|error| error.message.as_str()),
+                response.error.as_ref().map(|error| &error.diagnostics),
             );
             assert!(
                 refusals.insert(request_id, response).is_none(),
