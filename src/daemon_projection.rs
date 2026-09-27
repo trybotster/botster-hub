@@ -1025,6 +1025,7 @@ fn runtime_error_code(
             crate::HubClientRuntimeErrorKind::Runtime,
         ) => "spawn_failed",
         (_, crate::HubClientRuntimeErrorKind::ModeReadFailed) => "mode_read_failed",
+        (_, crate::HubClientRuntimeErrorKind::NotAttached) => "not_attached",
         (_, crate::HubClientRuntimeErrorKind::Runtime) => "runtime_error",
         (_, crate::HubClientRuntimeErrorKind::State) => "state_error",
     }
@@ -1055,6 +1056,10 @@ fn runtime_error_message(
             .to_string(),
         (crate::HubClientOperation::ReadModeFlags, crate::HubClientRuntimeErrorKind::ModeReadFailed) => {
             "session worker failed the authoritative mode read; replace or terminate the incompatible worker"
+                .to_string()
+        }
+        (_, crate::HubClientRuntimeErrorKind::NotAttached) => {
+            "the client is not attached to the session, so its input or resize was refused"
                 .to_string()
         }
         _ => format!("runtime failed while handling {operation:?}: {kind:?}"),
@@ -1669,6 +1674,15 @@ mod tests {
                 },
                 "unknown_session",
                 "attach",
+            ),
+            (
+                crate::HubClientError::Runtime {
+                    request_id: request_id.clone(),
+                    operation: crate::HubClientOperation::GuardedNotificationWrite,
+                    kind: crate::HubClientRuntimeErrorKind::NotAttached,
+                },
+                "not_attached",
+                "guarded_notification_write",
             ),
             (
                 crate::HubClientError::PackageCapabilityDenied {

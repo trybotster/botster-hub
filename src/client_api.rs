@@ -2356,6 +2356,9 @@ pub enum HubClientRuntimeErrorKind {
     SessionAlreadyExists,
     SpawnFailed,
     ModeReadFailed,
+    /// Core refused terminal input or resize: this client has no active
+    /// subscription on the session, so nothing reached it.
+    NotAttached,
     Runtime,
     State,
 }
@@ -2397,6 +2400,9 @@ pub(crate) fn runtime_error(
         )) if error.kind == SessionRuntimeErrorKind::SpawnFailed => {
             HubClientRuntimeErrorKind::SpawnFailed
         }
+        HubRuntimeError::CoreDaemon(botster_core_daemon::CoreDaemonError::Engine(
+            botster_core::DefaultBotsterEngineError::NotSubscribed { .. },
+        )) => HubClientRuntimeErrorKind::NotAttached,
         HubRuntimeError::CoreDaemon(_) if operation == HubClientOperation::ReadModeFlags => {
             HubClientRuntimeErrorKind::ModeReadFailed
         }

@@ -448,4 +448,143 @@ mod unix_route_smokes {
         drop(client);
         hub.shutdown().expect("shutdown H-S6 hub");
     }
+
+    /// Merge one session entity frame into `entity` when it names `id`.
+    fn apply_session_entity_frame(
+        frame: botster_hub_client::DaemonEntityFrame,
+        id: &str,
+        entity: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        match frame {
+            botster_hub_client::DaemonEntityFrame::Snapshot { items, .. } => {
+                if let Some(serde_json::Value::Object(row)) = items.into_iter().find(|item| {
+                    item.get("session_uuid").and_then(serde_json::Value::as_str) == Some(id)
+                }) {
+                    *entity = row;
+                }
+            }
+            botster_hub_client::DaemonEntityFrame::Upsert {
+                id: row_id,
+                entity: serde_json::Value::Object(row),
+                ..
+            } if row_id == id => *entity = row,
+            botster_hub_client::DaemonEntityFrame::Patch {
+                id: row_id,
+                patch: serde_json::Value::Object(fields),
+                ..
+            } if row_id == id => entity.extend(fields),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn h_s7_killed_worker_ends_the_route_and_reports_worker_lost() {
+        let _guard = daemon_test_guard();
+        let hub = start_isolated_candidate_hub("h-s7");
+        let session_id = "h-s7-session";
+        let subscription_id = "h-s7-subscription";
+        let mut entities =
+            botster_hub_client::subscribe_session_entities(hub.endpoint(), "h-s7-entities")
+                .expect("subscribe H-S7 session entities");
+        entities
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("bound H-S7 entity reads");
+        let mut entity = serde_json::Map::new();
+        let mut client = UnixRouteClient::connect(hub.endpoint()).expect("connect H-S7 client");
+        let spawned = client
+            .request(&DaemonRequest::Spawn {
+                session_id: session_id.to_string(),
+                command: "printf 'h-s7-ready\\n'; sleep 60".to_string(),
+            })
+            .expect("spawn H-S7 long-lived session");
+        assert_eq!(spawned.kind, DaemonResponseKind::Spawned, "{spawned:?}");
+        attach_ready(&mut client, session_id, subscription_id);
+
+        // timer: deadline — no event reports a worker launch to the test; the
+        // census of this hub's own workers is bounded like H-S6.
+        let worker_deadline = Instant::now() + Duration::from_secs(1);
+        let mut workers = hub.owned_session_worker_pids();
+        while workers.is_empty() && Instant::now() < worker_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            workers = hub.owned_session_worker_pids();
+        }
+        assert_eq!(
+            workers.len(),
+            1,
+            "H-S7 must observe exactly this hub's one session worker: {workers:?}"
+        );
+        // The pid is a worker this test's hub started (census filtered by its pid).
+        let worker = i32::try_from(workers[0]).expect("worker pid fits pid_t");
+        assert_eq!(
+            unsafe { libc::kill(worker, libc::SIGKILL) },
+            0,
+            "SIGKILL H-S7 worker {worker}: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Core tears an adapter route of a lost worker down (WorkerLinkFailed).
+        // The client learns it from an explicit subscription-closed event on
+        // its control connection, not from a transport disconnect.
+        let closed_deadline = Instant::now() + ROUTE_DEADLINE;
+        let closed_reason = loop {
+            client.poll_route_events(Duration::from_millis(25));
+            if let Some(reason) = client.take_skipped_events().into_iter().find_map(|event| {
+                match event {
+                    botster_hub_client::DaemonEvent::TerminalSubscriptionClosed {
+                        subscription_id: closed,
+                        reason,
+                        ..
+                    } if closed == subscription_id => Some(reason),
+                    _ => None,
+                }
+            }) {
+                break reason;
+            }
+            assert!(
+                Instant::now() < closed_deadline,
+                "H-S7 did not receive TerminalSubscriptionClosed: {:?}",
+                client.observer(subscription_id)
+            );
+        };
+        assert_eq!(
+            closed_reason,
+            botster_hub_client::TERMINAL_SUBSCRIPTION_CLOSED_WORKER_LOST,
+            "H-S7 close event must name the lost worker"
+        );
+
+        // The typed outcome is the session entity's lifecycle.
+        let entity_deadline = Instant::now() + ROUTE_DEADLINE;
+        while !(entity.get("lifecycle").and_then(serde_json::Value::as_str) == Some("failed")
+            && entity.get("failure_reason").and_then(serde_json::Value::as_str)
+                == Some("worker_lost"))
+        {
+            assert!(
+                Instant::now() < entity_deadline,
+                "H-S7 session entity must report failed/worker_lost: {entity:?}"
+            );
+            match entities.next_frame() {
+                Ok(frame) => apply_session_entity_frame(frame, session_id, &mut entity),
+                Err(botster_hub_client::DaemonTransportError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => panic!("H-S7 entity stream failed: {error}"),
+            }
+        }
+
+        // timer: deadline — the reap is observed by census, as in H-S6.
+        let reap_deadline = Instant::now() + Duration::from_secs(5);
+        while !hub.owned_session_worker_pids().is_empty() && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            hub.owned_session_worker_pids().is_empty(),
+            "H-S7 killed worker remained: {:?}",
+            hub.owned_session_worker_pids()
+        );
+        drop(entities);
+        drop(client);
+        hub.shutdown().expect("shutdown H-S7 hub");
+    }
 }
