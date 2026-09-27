@@ -8047,6 +8047,14 @@ pub(crate) mod tests {
                 .test_subscription_count("producer"),
             1
         );
+        // The refusal staged nothing, so the next reload is admitted.
+        runtime
+            .reload_lua_plugin_package(
+                RequestId("reload-preflight-retry".into()),
+                policy.registry(),
+                "producer",
+            )
+            .expect("a refused reload leaves no staged generation behind");
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
