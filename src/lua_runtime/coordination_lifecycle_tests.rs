@@ -1,5 +1,7 @@
 use super::*;
-use crate::daemon::owner_loop::{DaemonControlState, drive_ready_test_turn};
+use crate::daemon::owner_loop::{
+    DaemonControlState, TEST_HANG_GUARD, TestOwnerWakes, drive_owner_until, drive_ready_test_turn,
+};
 use crate::host_executor::HOST_OPERATION_CAPACITY;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -132,21 +134,47 @@ fn entry_charge_survives_owner_accept_until_reply_retirement() {
     let memory = runtime.test_lua_memory();
     let before = memory.usage().1;
     let bridge = runtime.coordination_bridge();
-    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut wakes = TestOwnerWakes::bind(&daemon, &state);
     let caller = request(bridge.clone());
-    drive_until(&mut daemon, &mut state, deadline, |_| {
-        bridge.test_pending_count() == 1
-    });
-    let queued = memory.usage().1;
+    // One driver call observes every stage: the driver checks the condition
+    // before each owner turn, so each state that exists between turns is
+    // seen before the next turn can advance it. A single call has no gap
+    // between stages in which the owner could advance unobserved.
+    let mut queued = None;
+    let mut accepted = None;
+    drive_owner_until(
+        &mut daemon,
+        &mut state,
+        &mut wakes,
+        Duration::from_millis(500),
+        |_, state| {
+            let admitted = !bridge.test_admitted_waiters().is_empty();
+            // One owner turn can both see the caller's enqueue and accept it,
+            // so the queued state may never be observed; the charge is the
+            // same in both.
+            if queued.is_none() && (bridge.test_pending_count() == 1 || admitted) {
+                queued = Some(memory.usage().1);
+            }
+            if admitted && state.pending_requests.len() == 1 && accepted.is_none() {
+                accepted = Some((memory.usage().1, bridge.test_pending_count()));
+            }
+            admitted && state.pending_requests.is_empty()
+        },
+        |_, state| {
+            format!(
+                "pending_count={} admitted={} pending_requests={}",
+                bridge.test_pending_count(),
+                bridge.test_admitted_waiters().len(),
+                state.pending_requests.len()
+            )
+        },
+    );
+    let queued = queued.expect("the request was observed queued or accepted");
     assert!(queued > before);
-    drive_until(&mut daemon, &mut state, deadline, |state| {
-        !bridge.test_admitted_waiters().is_empty() && state.pending_requests.len() == 1
-    });
-    assert_eq!(memory.usage().1, queued);
-    assert_eq!(bridge.test_pending_count(), 0);
-    drive_until(&mut daemon, &mut state, deadline, |state| {
-        !bridge.test_admitted_waiters().is_empty() && state.pending_requests.is_empty()
-    });
+    let (accepted_usage, pending_after_accept) =
+        accepted.expect("the accepted request was observed before its reply retired");
+    assert_eq!(accepted_usage, queued, "accept moves the entry charge");
+    assert_eq!(pending_after_accept, 0);
     assert!(matches!(
         caller.join().unwrap(),
         Ok(HubCoordinationResponse::Drain(_))
@@ -157,6 +185,51 @@ fn entry_charge_survives_owner_accept_until_reply_retirement() {
         before + std::mem::size_of::<PendingCoordinationRequest>(),
         "entry drops at reply retirement; pending collection capacity remains"
     );
+    daemon.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn one_owner_turn_accepts_a_queued_coordination_request_with_its_charge() {
+    let (mut daemon, mut state, root) = fixture("entry-one-turn");
+    let mut wakes = TestOwnerWakes::bind(&daemon, &state);
+    let runtime = daemon.runtime().unwrap();
+    let memory = runtime.test_lua_memory();
+    let bridge = runtime.coordination_bridge();
+    drive_owner_until(
+        &mut daemon,
+        &mut state,
+        &mut wakes,
+        TEST_HANG_GUARD,
+        |_, state| state.owner_ready.is_empty(),
+        |_, state| format!("ready_items={}", state.owner_ready.len()),
+    );
+    let caller = request(bridge.clone());
+    // The owner is not driven here: the test waits for the caller's enqueue
+    // wake, so the request stays queued.
+    let deadline = Instant::now() + TEST_HANG_GUARD;
+    while bridge.test_pending_count() == 0 {
+        assert!(wakes.wait(deadline), "the caller must enqueue");
+    }
+    assert!(bridge.test_admitted_waiters().is_empty());
+    let queued = memory.usage().1;
+    assert!(!drive_ready_test_turn(&mut daemon, &mut state));
+    assert_eq!(bridge.test_pending_count(), 0);
+    assert!(!bridge.test_admitted_waiters().is_empty());
+    assert_eq!(memory.usage().1, queued, "accept moves the entry charge");
+    drive_owner_until(
+        &mut daemon,
+        &mut state,
+        &mut wakes,
+        TEST_HANG_GUARD,
+        |_, state| state.pending_requests.is_empty(),
+        |_, state| format!("pending_requests={}", state.pending_requests.len()),
+    );
+    assert!(matches!(
+        caller.join().unwrap(),
+        Ok(HubCoordinationResponse::Drain(_))
+    ));
+    assert_retired(&daemon, &state, &bridge);
     daemon.stop();
     std::fs::remove_dir_all(root).unwrap();
 }
