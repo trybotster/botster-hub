@@ -261,7 +261,7 @@ The total is about 11 to 13 writer-days of new work. That exceeds the 3-day guid
 | S4 | 2 d | fixes the live `Refused` maintenance-read stall (1.5 item 7) and the `Refused` pump spin; deletes the incidental wakes that hid the cursor defect; fixes the permanent `recovery` flag and the capability-event wake |
 | S5 | 1 d | a paste burst ends the route |
 
-If time forces a cut, S4 is the only step that can move after cutover without leaving a known hang. The spins it fixes waste CPU; they do not hang. The recommendation is to keep S4 before cutover, because it makes the readiness model the only wake path in the Hub owner.
+Every step in this list fixes a live defect, so no step can move after cutover without leaving a known defect. If time forces a cut, the first commit of S4 (the lifecycle slices, which include the `Refused` stall) stays before cutover, and its second commit (entity, causal, capability) can follow. That second commit fixes spins and the causal herd. They waste CPU, but they do not hang.
 
 **Can follow cutover: about 5.5 to 7 writer-days.**
 
