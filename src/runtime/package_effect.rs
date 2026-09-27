@@ -296,11 +296,14 @@ impl HostPackageRuntime {
         // Every fallible step runs before anything changes: prepare the
         // plugin, then stage its event generation. The install cannot fail,
         // and activation publishes the subscriptions only after it. Nothing
-        // is installed if a step fails, so the grants go too.
+        // is installed if a step fails, so the grants and the records the
+        // entrypoint logged go too.
+        let log_generation = bundle.log_generation;
         let plugin = match self.prepare_new_load(registry, package_name, bundle) {
             Ok(plugin) => plugin,
             Err(error) => {
                 self.revoke_grants(package_name);
+                self.remove_log_generation(package_name, log_generation);
                 return Err(error);
             }
         };
@@ -329,6 +332,32 @@ impl HostPackageRuntime {
         let generation = self.stage_event_generation(package_name, staged_plane)?;
         plugin.set_event_generation(generation);
         Ok(plugin)
+    }
+
+    /// Prepare a reload's plugin and stage its event generation.
+    fn prepare_reload(
+        &mut self,
+        registry: &PackageRegistry,
+        package_name: &str,
+        bundle: HubPluginRuntimeBundle,
+    ) -> Result<crate::lifecycle::PreparedPluginLoad, HubLuaPluginLoadError> {
+        let event_handlers = bundle.event_handlers.clone();
+        let staged_plane = self
+            .staged_package_event_plane(package_name, registry, &event_handlers)
+            .map_err(HubLuaPluginLoadError::EventPlane)?;
+        let mut plugin = self
+            .plugin_lifecycle
+            .prepare_package(registry, package_name, bundle)
+            .map_err(HubLuaPluginLoadError::Lifecycle)?;
+        let generation = self.stage_event_generation(package_name, staged_plane)?;
+        plugin.set_event_generation(generation);
+        Ok(plugin)
+    }
+
+    fn remove_log_generation(&self, package_name: &str, generation: Option<u64>) {
+        if let Some(generation) = generation {
+            self.host_api.logs.remove_generation(package_name, generation);
+        }
     }
 
     /// Stage this package's next event generation, funded by the attempt.
@@ -434,18 +463,17 @@ impl HostPackageRuntime {
             self.host_api.clone(),
         )
         .map_err(HubLuaPluginLoadError::Lua)?;
-        let event_handlers = bundle.event_handlers.clone();
-        let staged_plane = self
-            .staged_package_event_plane(package_name, registry, &event_handlers)
-            .map_err(HubLuaPluginLoadError::EventPlane)?;
         // Every fallible step runs before anything changes. The previous
         // generation stays live until activation, which follows the install.
-        let mut plugin = self
-            .plugin_lifecycle
-            .prepare_package(registry, package_name, bundle)
-            .map_err(HubLuaPluginLoadError::Lifecycle)?;
-        let generation = self.stage_event_generation(package_name, staged_plane)?;
-        plugin.set_event_generation(generation);
+        // A refusal here removes only the records the candidate logged.
+        let log_generation = bundle.log_generation;
+        let plugin = match self.prepare_reload(registry, package_name, bundle) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                self.remove_log_generation(package_name, log_generation);
+                return Err(error);
+            }
+        };
         let cleanup = self.commit_reloaded_plugin(request_id, plugin);
         self.activate_event_generation()?;
         Ok(cleanup)

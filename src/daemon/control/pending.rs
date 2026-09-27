@@ -63,6 +63,11 @@ pub(crate) enum ControlPoll {
         DaemonTransportResult<DaemonResponse>,
         crate::host_executor::HostPreparedCharge,
     ),
+    /// The response owns a callback-account charge until the reply retires.
+    ReadyCallback(
+        DaemonTransportResult<DaemonResponse>,
+        crate::lua_memory::LuaCallbackCharge,
+    ),
     /// The owner keeps a session-type stage until local delivery is known.
     DeliverSessionType(ControlReply),
 }
@@ -919,6 +924,9 @@ pub(crate) fn poll_ready_request_item(
                 None
             }
             ControlPoll::ReadyHost(response, charge) => Some(ControlReply::host(response, charge)),
+            ControlPoll::ReadyCallback(response, charge) => {
+                Some(ControlReply::callback(response, charge))
+            }
             ControlPoll::DeliverSessionType(reply) => {
                 let sent = entry.reply_tx.take().send_reply(reply);
                 // A refused reply drops its receipt and wakes this retained row.

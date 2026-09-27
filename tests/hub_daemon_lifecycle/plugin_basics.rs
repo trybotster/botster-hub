@@ -246,7 +246,10 @@ return botster.register({
     assert_eq!(logs.records.len(), 2, "{logs:?}");
     assert_eq!(logs.records[0].level, "info");
     assert_eq!(logs.records[0].message, "ticket advanced");
-    assert_eq!(logs.records[0].fields, Some(serde_json::json!({ "ticket_id": "t1" })));
+    assert_eq!(
+        logs.records[0].fields_json.as_deref(),
+        Some(r#"{"ticket_id":"t1"}"#)
+    );
     assert_eq!(logs.records[1].level, "warn");
     assert_eq!((logs.next_seq, logs.first_available_seq), (3, 1));
     let later = read(1).plugin_logs.expect("paged plugin logs");

@@ -239,8 +239,10 @@ bad input.
   charged to the callback account), and 100 records per second with a burst of
   200. Beyond the rate the call returns `backpressured` and the next accepted
   record reports the count in `dropped_before`. Operators read records with
-  the `read_plugin_logs` daemon request (docs/client-protocol.md). Records are
-  dropped when the package unloads.
+  the `read_plugin_logs` daemon request (docs/client-protocol.md). Each record
+  carries its load's generation. Records are dropped when the package unloads,
+  and a failed load or reload drops the records it wrote. Accepted records are
+  also written to the Hub log (the daemon's standard error).
 - `botster.clock.now()` returns Unix epoch milliseconds.
 - `botster.clock.monotonic()` returns milliseconds since the Hub process
   started; it never goes backward.
