@@ -3680,6 +3680,11 @@ pub struct DaemonLifecycleCounters {
     /// Package entity mutations accepted for fanout.
     #[serde(default)]
     pub package_entity_publish_accepted: u64,
+    /// Session-worker `--probe` warm-ups at daemon start that failed (spawn
+    /// error, nonzero exit, wrong identity line, or deadline). A failure
+    /// never withholds readiness.
+    #[serde(default)]
+    pub worker_warm_up_failures: u64,
 }
 
 impl DaemonLifecycleCounters {
