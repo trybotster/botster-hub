@@ -304,6 +304,7 @@ pub(crate) fn handle_runtime_control_request(
             messaging::handle_runtime(daemon, state, observability, request)
         }
         DaemonRequest::PluginMcpListTools
+        | DaemonRequest::ReadPluginLogs { .. }
         | DaemonRequest::PluginMcpCallTool { .. }
         | DaemonRequest::PluginSurfaceRender { .. }
         | DaemonRequest::PluginSurfaceAction { .. } => {

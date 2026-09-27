@@ -1194,6 +1194,27 @@ which proves socket-loss cleanup, fresh-subscription reattach, byte-exact opaque
 payload projection and ordering before later live output, `ReadScreen` marker
 fidelity, and the no-history case.
 
+## Plugin Logs
+
+`read_plugin_logs` returns one package's structured log records, written by
+the plugin through `botster.log.{debug,info,warn,error}`.
+
+```json
+{ "type": "read_plugin_logs", "package_name": "project-pipelines", "after_seq": 0 }
+```
+
+The response kind is `plugin_logs`, with `plugin_logs = { package_name,
+records, next_seq, first_available_seq }`. Each record has `seq`, `at_ms`
+(Unix epoch milliseconds), `level` (`debug`, `info`, `warn`, `error`),
+`message`, optional `fields` (a JSON value), and `dropped_before` (records the
+plugin's rate limit refused just before this one). `after_seq` pages forward:
+pass the last `seq` you read. Records whose `seq` is below
+`first_available_seq` were evicted from the plugin's ring (256 records, 512 KiB
+per plugin, oldest first). An unknown package returns an empty page. If the
+plugin is writing a record at that instant, the daemon answers the retryable
+operator error `plugin_logs_busy` instead of waiting. Records are dropped when
+the package unloads.
+
 ## Many-PTY client attach proof
 
 `botster_hub_test_support::run_many_pty_client_attach_conformance` composes the
