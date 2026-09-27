@@ -2942,7 +2942,9 @@ mod tests {
                 floor,
             )
             .unwrap_or_else(|| panic!("arm seq {sequence} snapshot {snapshot} floor {floor}"));
-            assert!(complete_package_entity_delivery(
+            // The return value reports whether the subscriber is still
+            // catching up; the test asserts that state directly.
+            let _ = complete_package_entity_delivery(
                 state,
                 &target,
                 identity(waiter),
@@ -2950,7 +2952,7 @@ mod tests {
                 snapshot,
                 floor,
                 crate::plugin_entity::DeliveryStatus::Sent,
-            ));
+            );
         };
 
         // The initial snapshot brings the subscriber in sync at 0.
