@@ -83,7 +83,9 @@ impl HostPackageRuntime {
     /// Count a quarantined package's queued events as stranded before its
     /// unload retires them. Host workers only; the lock is taken blocking.
     pub(crate) fn record_package_stranded(&self, package_name: &str) {
-        let queued = self.package_event_router.queued_copies_blocking(package_name);
+        let queued = self
+            .package_event_router
+            .queued_copies_blocking(package_name);
         self.package_event_router
             .counters()
             .record_events_stranded(queued);
@@ -334,20 +336,6 @@ impl HostPackageRuntime {
             contracts,
             subscriptions,
         })
-    }
-
-    fn commit_loaded_package_event_plane(
-        &self,
-        package_name: &str,
-        registry: &PackageRegistry,
-        event_handlers: &[crate::lifecycle::HubPluginEventHandler],
-    ) -> Result<u64, EventPlaneStatus> {
-        let staged = self.staged_package_event_plane(package_name, registry, event_handlers)?;
-        self.package_event_router.try_commit_package_generation(
-            package_name,
-            staged.contracts,
-            staged.subscriptions,
-        )
     }
 
     pub fn reload_plugin_package(

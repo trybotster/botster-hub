@@ -577,6 +577,8 @@ impl EventPlaneCounters {
         self.stage_overlaps.fetch_add(1, Ordering::Relaxed);
     }
 
+    // Read by tests until the C3 protocol revision exposes these counters.
+    #[cfg(test)]
     pub(crate) fn stage_overlaps(&self) -> u64 {
         self.stage_overlaps.load(Ordering::Relaxed)
     }
@@ -586,6 +588,7 @@ impl EventPlaneCounters {
         self.events_stranded.fetch_add(events, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn events_stranded(&self) -> u64 {
         self.events_stranded.load(Ordering::Relaxed)
     }
@@ -595,12 +598,16 @@ impl EventPlaneCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn delivery_refusals(&self, reason: crate::lifecycle::EventDeliveryRefusal) -> u64 {
         self.delivery_refusal_counter(reason)
             .load(Ordering::Relaxed)
     }
 
-    fn delivery_refusal_counter(&self, reason: crate::lifecycle::EventDeliveryRefusal) -> &AtomicU64 {
+    fn delivery_refusal_counter(
+        &self,
+        reason: crate::lifecycle::EventDeliveryRefusal,
+    ) -> &AtomicU64 {
         use crate::lifecycle::EventDeliveryRefusal;
         match reason {
             EventDeliveryRefusal::GenerationUnloaded => &self.deliveries_generation_unloaded,

@@ -1345,7 +1345,9 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
         let handler = match runtime.package_event_handler(&delivery) {
             Ok(handler) => handler,
             Err(refusal) => {
-                runtime.event_plane_counters().record_delivery_refusal(refusal);
+                runtime
+                    .event_plane_counters()
+                    .record_delivery_refusal(refusal);
                 let mut flight = event_flight(&delivery, None, request_id.0);
                 if !retire_event_holder(runtime, &mut flight) {
                     queue_event_retirement(runtime, state, flight);
@@ -1408,7 +1410,9 @@ fn run_package_event_delivery_slice(runtime: &HubRuntime, state: &mut Maintenanc
                     scope_id,
                     identity: crate::package_event_router::LeaseIdentity::EventInFlight,
                 });
-                runtime.event_plane_counters().record_delivery_refusal(refusal);
+                runtime
+                    .event_plane_counters()
+                    .record_delivery_refusal(refusal);
                 let mut flight = event_flight(&delivery, None, request_id.0);
                 if !retire_event_holder(runtime, &mut flight) {
                     queue_event_retirement(runtime, state, flight);

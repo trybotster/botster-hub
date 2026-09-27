@@ -579,7 +579,10 @@ pub enum StageError {
     /// package mutations are serialized.
     AlreadyStaged,
     /// The retained staging storage exceeds the attempt's reservation.
-    Unfunded { required: usize, reserved: usize },
+    Unfunded {
+        required: usize,
+        reserved: usize,
+    },
 }
 
 /// Why activation failed: only a poisoned router lock or an invariant break.
@@ -872,7 +875,7 @@ impl PackageEventRouter {
         }
         preview_package_replacement(&mut inner, owner, &contracts, &subscriptions)
             .map_err(StageError::Rejected)?;
-        let (removed_plugins, removed_events) = replacement_removals(&inner, owner);
+        let (removed_plugins, removed_events) = replacement_removals(&mut inner, owner);
         let mut plugin_reserve: Vec<(String, usize)> = Vec::new();
         let mut event_reserve: Vec<((String, String), usize)> = Vec::new();
         for subscription in &subscriptions {
@@ -904,12 +907,14 @@ impl PackageEventRouter {
                 reserved: reserved_bytes,
             });
         }
-        let generation = inner
-            .package_generation
-            .get(owner)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
+        // Predict exactly what the commit will do: it bumps the generation
+        // only when the replacement declares contracts or subscriptions.
+        let current = inner.package_generation.get(owner).copied().unwrap_or(0);
+        let generation = if contracts.is_empty() && subscriptions.is_empty() {
+            current
+        } else {
+            current.saturating_add(1)
+        };
         inner.pending = Some(PendingGeneration {
             owner: owner.to_string(),
             generation,
@@ -1009,11 +1014,6 @@ impl PackageEventRouter {
             .consumers
             .get(plugin_key)
             .map_or(0, |queue| queue.copies.len() as u64)
-    }
-
-    #[must_use]
-    pub(crate) fn counters(&self) -> &EventPlaneCounters {
-        &self.counters
     }
 
     /// Discard a staged generation and release its capacity and funding.
@@ -2008,11 +2008,9 @@ fn add_reserve<K: PartialEq + Clone>(reserves: &mut Vec<(K, usize)>, key: &K) {
 
 /// Remove the pending generation only if it is this staged one.
 fn take_staged(inner: &mut RouterInner, staged: &StagedGeneration) -> Option<PendingGeneration> {
-    if inner
-        .pending
-        .as_ref()
-        .is_some_and(|pending| pending.owner == staged.owner && pending.generation == staged.generation)
-    {
+    if inner.pending.as_ref().is_some_and(|pending| {
+        pending.owner == staged.owner && pending.generation == staged.generation
+    }) {
         inner.pending.take()
     } else {
         None
@@ -2027,7 +2025,11 @@ fn pending_retained_bytes(
     event_reserve: &[((String, String), usize)],
 ) -> Option<usize> {
     let mut bytes = std::mem::size_of::<PendingGeneration>()
-        .checked_add(contracts.len().checked_mul(std::mem::size_of::<EmittedContract>())?)?
+        .checked_add(
+            contracts
+                .len()
+                .checked_mul(std::mem::size_of::<EmittedContract>())?,
+        )?
         .checked_add(
             subscriptions
                 .len()
@@ -2047,9 +2049,10 @@ fn pending_retained_bytes(
         bytes = bytes
             .checked_add(contract.owner.capacity())?
             .checked_add(contract.name.capacity())?
-            .checked_add(crate::lua_memory::layout::btree_nodes_checked::<EventAudience, ()>(
-                contract.audience.len(),
-            )?)?
+            .checked_add(crate::lua_memory::layout::btree_nodes_checked::<
+                EventAudience,
+                (),
+            >(contract.audience.len())?)?
             .checked_add(contract.schema.retained_bytes()?)?;
     }
     for subscription in subscriptions {
@@ -5141,6 +5144,19 @@ mod tests {
             &owner_apis[..cleanup_start],
             &owner_apis[cleanup_end..]
         );
+        // Host-only staging methods: activation, the stranded count, and abort
+        // take the lock blocking, exactly once each.
+        let host_start = owner_apis
+            .find("    pub fn activate_staged_generation(")
+            .expect("Host activation method");
+        let host_end = owner_apis[host_start..]
+            .find("\n    pub fn try_subscribe(")
+            .map(|end| host_start + end)
+            .expect("Host staging methods end before subscribe");
+        let host = &owner_apis[host_start..host_end];
+        assert_eq!(host.matches(".lock()").count(), 3);
+        assert_eq!(host.matches("fn ").count(), 3);
+        let owner_apis = format!("{}{}", &owner_apis[..host_start], &owner_apis[host_end..]);
         let without_try = owner_apis.replace("try_lock", "TRY");
         assert!(
             !without_try.contains("Mutex::lock"),
@@ -7662,14 +7678,28 @@ mod tests {
         let released = Arc::new(AtomicU64::new(0));
         let first = stage_self_subscribed(&router, &released).expect("stage v1");
         assert_eq!(first.generation(), 1);
-        assert_eq!(router.activate_staged_generation(first).expect("activate v1"), 1);
-        assert_eq!(released.load(Ordering::SeqCst), 1, "activation releases funding");
+        assert_eq!(
+            router
+                .activate_staged_generation(first)
+                .expect("activate v1"),
+            1
+        );
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "activation releases funding"
+        );
 
         let second = stage_self_subscribed(&router, &released).expect("stage v2");
         assert_eq!(second.generation(), 2);
         assert_eq!(router.current_package_generation("pkg"), Ok(1));
         assert_eq!(
-            router.try_ingress("pkg", "pkg.ready", &serde_json::json!({"ok": true}), Instant::now()),
+            router.try_ingress(
+                "pkg",
+                "pkg.ready",
+                &serde_json::json!({"ok": true}),
+                Instant::now()
+            ),
             EventPlaneStatus::Accepted
         );
         let batch = router
@@ -7680,8 +7710,17 @@ mod tests {
             batch[0].holder.plugin_generation, 1,
             "ingress matches only the live generation while v2 is staged"
         );
-        assert_eq!(released.load(Ordering::SeqCst), 1, "the pending entry holds its funding");
-        assert_eq!(router.activate_staged_generation(second).expect("activate v2"), 2);
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "the pending entry holds its funding"
+        );
+        assert_eq!(
+            router
+                .activate_staged_generation(second)
+                .expect("activate v2"),
+            2
+        );
         assert_eq!(router.current_package_generation("pkg"), Ok(2));
         assert_eq!(released.load(Ordering::SeqCst), 2);
     }
@@ -7703,7 +7742,10 @@ mod tests {
             Box::new(CountedFunding(Arc::clone(&released))),
             16,
         );
-        assert!(matches!(unfunded, Err(StageError::Unfunded { reserved: 16, .. })), "{unfunded:?}");
+        assert!(
+            matches!(unfunded, Err(StageError::Unfunded { reserved: 16, .. })),
+            "{unfunded:?}"
+        );
         assert_eq!(released.load(Ordering::SeqCst), 2);
         assert_eq!(router.current_package_generation("pkg"), Ok(0));
         // Nothing is pending, so a new stage is admitted.
@@ -7717,11 +7759,22 @@ mod tests {
         let released = Arc::new(AtomicU64::new(0));
         let staged = stage_self_subscribed(&router, &released).expect("stage");
         let overlap = stage_self_subscribed(&router, &released);
-        assert!(matches!(overlap, Err(StageError::AlreadyStaged)), "{overlap:?}");
+        assert!(
+            matches!(overlap, Err(StageError::AlreadyStaged)),
+            "{overlap:?}"
+        );
         assert_eq!(router.counters.stage_overlaps(), 1);
-        assert_eq!(released.load(Ordering::SeqCst), 1, "the refused stage's funding");
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "the refused stage's funding"
+        );
         assert!(router.abort_staged_generation(staged));
-        assert_eq!(released.load(Ordering::SeqCst), 2, "abort releases the pending funding");
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            2,
+            "abort releases the pending funding"
+        );
         assert_eq!(router.current_package_generation("pkg"), Ok(0));
     }
 
@@ -7732,7 +7785,10 @@ mod tests {
         let staged = stage_self_subscribed(&router, &released).expect("stage");
         run_unload(&router, "pkg", 0);
         assert_eq!(released.load(Ordering::SeqCst), 1);
-        assert!(!router.abort_staged_generation(staged), "the unload already cleared it");
+        assert!(
+            !router.abort_staged_generation(staged),
+            "the unload already cleared it"
+        );
     }
 
     #[test]
@@ -7759,7 +7815,10 @@ mod tests {
             EventPlaneStatus::RejectedOverFanout,
             "the staged growth is reserved"
         );
-        assert_eq!(router.activate_staged_generation(staged).expect("activate"), 1);
+        assert_eq!(
+            router.activate_staged_generation(staged).expect("activate"),
+            1
+        );
         assert_eq!(released.load(Ordering::SeqCst), 1);
     }
 
@@ -7769,12 +7828,16 @@ mod tests {
         let router = capped_router(8, 2);
         let released = Arc::new(AtomicU64::new(0));
         let first = stage_self_subscribed(&router, &released).expect("stage v1");
-        router.activate_staged_generation(first).expect("activate v1");
+        router
+            .activate_staged_generation(first)
+            .expect("activate v1");
         subscribe(&router, "other", "pkg", "pkg.ready");
         // The unload predicate frees both holders, so the same-size
         // replacement needs no reservation and is admitted.
         let second = stage_self_subscribed(&router, &released).expect("stage v2 on a full bucket");
-        router.activate_staged_generation(second).expect("activate v2");
+        router
+            .activate_staged_generation(second)
+            .expect("activate v2");
         assert_eq!(router.current_package_generation("pkg"), Ok(2));
     }
 }

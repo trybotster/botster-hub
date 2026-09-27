@@ -5928,7 +5928,10 @@ pub enum HubLuaPluginLoadError {
     EventPlaneStageOverlap,
     /// The staged generation's retained storage exceeds the attempt's
     /// prepared-byte reservation. Nothing changed.
-    EventPlaneUnfunded { required: usize, reserved: usize },
+    EventPlaneUnfunded {
+        required: usize,
+        reserved: usize,
+    },
     /// Activation found the router lock poisoned, or its staged generation
     /// gone, after the plugin was installed.
     EventPlaneActivationFaulted,
@@ -8101,11 +8104,21 @@ pub(crate) mod tests {
                 request_id: RequestId("pulled-before-reload-admit".into()),
                 handler: handler_ref,
                 timeout_ms: 1_000,
-                context: PluginInvocationContext::default(),
+                context: botster_core::PluginInvocationContext {
+                    client_id: None,
+                    session_id: None,
+                    subscription_id: None,
+                    surface_id: None,
+                    origin: None,
+                    metadata: None,
+                },
                 payload: BoundaryJson(pulled.payload_json.clone()),
             },
         );
-        assert_eq!(admission.err(), Some(EventDeliveryRefusal::GenerationUnloaded));
+        assert_eq!(
+            admission.err(),
+            Some(EventDeliveryRefusal::GenerationUnloaded)
+        );
         runtime
             .package_event_router
             .complete_pulled_delivery(pulled)
