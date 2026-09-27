@@ -98,11 +98,19 @@ fn log_table(lua: &Lua, memory: Arc<LuaMemoryAccount>, sink: LogSink) -> mlua::R
                     AppendOutcome::Accepted { seq } => {
                         result::ok(lua, Value::Integer(i64::try_from(seq).unwrap_or(i64::MAX)))
                     }
-                    AppendOutcome::RateLimited => result::err(
-                        lua,
-                        ErrorKind::Backpressured,
-                        "the plugin's log rate limit (100 records per second, burst 200) is reached",
-                    ),
+                    AppendOutcome::RateLimited { dropped } => {
+                        let refused = result::err(
+                            lua,
+                            ErrorKind::Backpressured,
+                            "the plugin's log rate limit (100 records per second, burst 200) is reached",
+                        )?;
+                        // The running count of dropped records; the next
+                        // accepted record reports it as `dropped_before`.
+                        let detail = lua.create_table()?;
+                        detail.raw_set("dropped", dropped)?;
+                        refused.raw_get::<Table>("error")?.raw_set("detail", detail)?;
+                        Ok(refused)
+                    }
                     AppendOutcome::TooLarge => result::err(
                         lua,
                         ErrorKind::InvalidRequest,

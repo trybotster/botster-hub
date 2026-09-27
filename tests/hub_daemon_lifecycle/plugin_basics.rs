@@ -257,3 +257,196 @@ return botster.register({
     assert_eq!(later.records[0].seq, 2);
     daemon.shutdown();
 }
+
+fn read_plugin_logs(data_dir: &Path, package_name: &str) -> botster_hub_client::DaemonPluginLogs {
+    let response = botster_hub::daemon_transport_request(
+        &explicit_config(data_dir),
+        botster_hub::DaemonRequest::ReadPluginLogs {
+            package_name: package_name.to_string(),
+            after_seq: 0,
+        },
+    )
+    .expect("read plugin logs");
+    assert_eq!(
+        response.kind,
+        botster_hub::DaemonResponseKind::PluginLogs,
+        "{response:?}"
+    );
+    response.plugin_logs.expect("plugin logs page")
+}
+
+/// A plugin that floods its log in one call is refused past the burst with a
+/// typed, retryable `backpressured` that counts every dropped record, and the
+/// call returns without waiting for the rate to refill.
+#[test]
+fn live_daemon_log_flood_is_refused_with_a_dropped_count_and_never_blocks() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("logs-flood-data");
+    let package_dir = unique_short_test_dir("logs-flood-package");
+    fs::create_dir_all(&package_dir).expect("create flood package root");
+    fs::write(
+        package_dir.join("plugin.lua"),
+        r#"
+return botster.register({
+  tools = {{
+    name = "logs.flood.write",
+    description = "Write 250 log records in one call.",
+    handler = "write",
+    call = function()
+      local accepted, refused, last = 0, 0, nil
+      for index = 1, 250 do
+        local result = botster.log.info({ message = "record " .. index })
+        if result.ok then
+          accepted = accepted + 1
+        else
+          refused = refused + 1
+          last = result.error
+        end
+      end
+      return {
+        accepted = accepted,
+        refused = refused,
+        kind = last.kind,
+        retryable = last.retryable,
+        dropped = last.detail.dropped,
+      }
+    end,
+  }},
+})
+"#,
+    )
+    .expect("write flood plugin");
+    write_manifest(&package_dir, "logs.flood", "1.0.0");
+    let daemon = PanicSafeCliDaemon::start(&data_dir, "plugin log flood daemon cleanup");
+    let enabled = botster_hub::daemon_transport_request(
+        &explicit_config(&data_dir),
+        botster_hub::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        },
+    )
+    .expect("enable flood package");
+    assert_eq!(
+        enabled.kind,
+        botster_hub::DaemonResponseKind::PackageDecision,
+        "{enabled:?}"
+    );
+    let flooded = call_plugin_tool(&data_dir, "logs.flood.write", serde_json::json!({}));
+    assert_eq!(flooded["accepted"], 200, "the burst is accepted: {flooded}");
+    assert_eq!(flooded["refused"], 50, "{flooded}");
+    assert_eq!(flooded["kind"], "backpressured", "{flooded}");
+    assert_eq!(flooded["retryable"], true, "{flooded}");
+    assert_eq!(flooded["dropped"], 50, "every refusal is counted: {flooded}");
+    let logs = read_plugin_logs(&data_dir, "logs.flood");
+    assert_eq!(logs.records.len(), 200, "only accepted records are kept");
+    daemon.shutdown();
+}
+
+/// A first load whose entrypoint logs and then fails leaves no records.
+#[test]
+fn a_failed_first_load_removes_the_records_its_entrypoint_wrote() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("logs-failed-load");
+    let package_dir = unique_test_dir("logs-failed-load-package");
+    write_versioned_package_with(
+        &package_dir,
+        "logs.failed",
+        "1.0.0",
+        "botster.log.info({ message = 'loading' })\nerror('this version refuses to load')",
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        UnixRouteClient::connect(&socket_endpoint(&data_dir)).expect("external connect");
+    let refused = connection
+        .request(&botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        })
+        .expect("the refusal arrives on the connection");
+    assert_eq!(
+        refused.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "{refused:?}"
+    );
+    let logs = read_plugin_logs(&data_dir, "logs.failed");
+    assert!(logs.records.is_empty(), "{logs:?}");
+    drop(connection);
+    shutdown_cli_daemon(&data_dir, child);
+}
+
+/// A reload whose entrypoint logs and then fails removes exactly its own
+/// records; the serving version's records stay, and a later good reload's
+/// records carry a different generation.
+#[test]
+fn a_failed_reload_removes_only_the_records_its_entrypoint_wrote() {
+    let _guard = daemon_test_guard();
+    let data_dir = unique_short_test_dir("logs-failed-reload");
+    let package_dir = unique_test_dir("logs-failed-reload-package");
+    write_versioned_package_with(
+        &package_dir,
+        "logs.reload",
+        "1.0.0",
+        "botster.log.info({ message = 'v1 loaded' })",
+    );
+    let child = start_cli_daemon(&data_dir);
+    let mut connection =
+        UnixRouteClient::connect(&socket_endpoint(&data_dir)).expect("external connect");
+    let enabled = connection
+        .request(&botster_hub_client::DaemonRequest::EnablePackageLocalPath {
+            path: package_dir.clone(),
+        })
+        .expect("enable v1");
+    assert_eq!(
+        enabled.kind,
+        botster_hub_client::DaemonResponseKind::PackageDecision,
+        "{enabled:?}"
+    );
+    let reload = |connection: &mut UnixRouteClient| {
+        connection
+            .request(&botster_hub_client::DaemonRequest::ReloadPackage {
+                package_name: "logs.reload".to_string(),
+            })
+            .expect("reload answer")
+    };
+    write_versioned_package_with(
+        &package_dir,
+        "logs.reload",
+        "2.0.0",
+        "botster.log.info({ message = 'v2 loading' })\nerror('v2 refuses to load')",
+    );
+    let refused = reload(&mut connection);
+    assert_eq!(
+        refused.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "{refused:?}"
+    );
+    let after_failure = read_plugin_logs(&data_dir, "logs.reload");
+    let messages: Vec<&str> = after_failure
+        .records
+        .iter()
+        .map(|record| record.message.as_str())
+        .collect();
+    assert_eq!(messages, ["v1 loaded"], "{after_failure:?}");
+
+    write_versioned_package_with(
+        &package_dir,
+        "logs.reload",
+        "3.0.0",
+        "botster.log.info({ message = 'v3 loaded' })",
+    );
+    let reloaded = reload(&mut connection);
+    assert_ne!(
+        reloaded.kind,
+        botster_hub_client::DaemonResponseKind::OperatorError,
+        "{reloaded:?}"
+    );
+    let after_success = read_plugin_logs(&data_dir, "logs.reload");
+    let records: Vec<(&str, u64)> = after_success
+        .records
+        .iter()
+        .map(|record| (record.message.as_str(), record.generation))
+        .collect();
+    assert_eq!(records.len(), 2, "{after_success:?}");
+    assert_eq!((records[0].0, records[1].0), ("v1 loaded", "v3 loaded"));
+    assert_ne!(records[0].1, records[1].1, "each load has its own generation");
+    drop(connection);
+    shutdown_cli_daemon(&data_dir, child);
+}
