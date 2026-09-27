@@ -1847,14 +1847,11 @@ mod tests {
             botster_hub_client::DaemonResponseKind::EventUnsubscribed
         );
         harness.wait_for_reserved_close(&mut peer, &reservation_label);
-        assert_eq!(
-            harness
-                .state
-                .pending_runtime
-                .admission
-                .reservations
-                .lookup_label(&reservation_label, reservation.peer_generation, u64::MAX),
-            crate::admission::reservations::ReservationLookup::Unknown
+        harness.wait_until_reservation_lookup(
+            &reservation_label,
+            reservation.peer_generation,
+            || u64::MAX,
+            crate::admission::reservations::ReservationLookup::Unknown,
         );
         assert!(
             harness
