@@ -1573,7 +1573,9 @@ impl HubRuntime {
             let reserved = permit.reserved_prepared_bytes();
             if reserved > 0 {
                 context.fund_staging(package_effect::StagingFunding::new(
-                    Arc::new(permit.retain_prepared_reservation()),
+                    Arc::new(permit.retain_prepared_reservation(
+                        crate::host_executor::ReservationHolder::StagingFunding,
+                    )),
                     reserved,
                 ));
             }

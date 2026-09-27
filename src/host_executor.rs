@@ -1,7 +1,7 @@
 //! Fixed, bounded execution for Hub work that must not run on the owner thread.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::Instant;
@@ -515,6 +515,13 @@ struct HostPermitPool {
     status_stops: AtomicUsize,
     #[cfg(test)]
     refuse_status_delivery: AtomicBool,
+    /// Submitted jobs that publish a completion, not yet polled. Test
+    /// diagnostics only; it never gates work.
+    #[cfg(test)]
+    jobs_in_flight: AtomicUsize,
+    /// Entity work refused because a holder of its permit's reservation was
+    /// still outstanding, by holder kind. Hub-local.
+    outstanding_holder_faults: [AtomicU64; RESERVATION_HOLDER_KINDS],
     outstanding: AtomicUsize,
     wake: Arc<HostWake>,
 }
@@ -529,6 +536,33 @@ struct HostPreparedPool {
 struct HostPreparedReservation {
     pool: Arc<HostPreparedPool>,
     logical_bytes: usize,
+    /// Outstanding retained holders, by `ReservationHolder` kind.
+    holders: [AtomicUsize; RESERVATION_HOLDER_KINDS],
+}
+
+/// Who retains a permit's prepared reservation beyond its phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservationHolder {
+    /// Staged package event storage. Released when the generation is
+    /// activated, aborted, or discarded by an unload.
+    StagingFunding = 0,
+    /// An entity-model work item. Released when the work is retired.
+    EntityWork = 1,
+    /// A Status Core snapshot. It holds bytes only and never gates work.
+    Status = 2,
+}
+
+const RESERVATION_HOLDER_KINDS: usize = 3;
+
+impl ReservationHolder {
+    pub(crate) const ALL: [Self; RESERVATION_HOLDER_KINDS] =
+        [Self::StagingFunding, Self::EntityWork, Self::Status];
+
+    /// Whether entity work must not overlap this holder. A Status snapshot
+    /// holds bytes only and never does.
+    pub(crate) const fn gates_entity_work(self) -> bool {
+        matches!(self, Self::StagingFunding | Self::EntityWork)
+    }
 }
 
 impl HostPreparedReservation {
@@ -565,10 +599,21 @@ pub(crate) struct HostPreparedCharge {
     _retained: Option<Arc<HostPreparedReservation>>,
 }
 
-/// A retained record shares the original reservation until its last handle drops.
-#[derive(Debug, Clone)]
+/// A typed holder of a permit's prepared reservation. It shares the
+/// reservation's bytes until it drops, and its holder count lets the owner
+/// check that no holder outlives the phase that took it.
+#[derive(Debug)]
 pub(crate) struct HostRetainedPrepared {
-    _reservation: Arc<HostPreparedReservation>,
+    reservation: Arc<HostPreparedReservation>,
+    holder: ReservationHolder,
+}
+
+impl Drop for HostRetainedPrepared {
+    fn drop(&mut self) {
+        let previous =
+            self.reservation.holders[self.holder as usize].fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "reservation holder underflow");
+    }
 }
 
 impl Drop for HostPreparedCharge {
@@ -628,19 +673,31 @@ impl HostWorkPermit {
         }
     }
 
-    pub(crate) fn has_retained_prepared_reservation(&self) -> bool {
-        self.prepared
-            .as_ref()
-            .is_some_and(|reservation| Arc::strong_count(reservation) > 1)
+    /// Count one entity-work refusal for an outstanding holder of `holder`.
+    pub(crate) fn record_outstanding_holder_fault(&self, holder: ReservationHolder) {
+        self.pool.outstanding_holder_faults[holder as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn retain_prepared_reservation(&self) -> HostRetainedPrepared {
+    /// Outstanding holders of one kind.
+    pub(crate) fn holders(&self, holder: ReservationHolder) -> usize {
+        self.prepared.as_ref().map_or(0, |reservation| {
+            reservation.holders[holder as usize].load(Ordering::Acquire)
+        })
+    }
+
+    pub(crate) fn retain_prepared_reservation(
+        &self,
+        holder: ReservationHolder,
+    ) -> HostRetainedPrepared {
+        let reservation = Arc::clone(
+            self.prepared
+                .as_ref()
+                .expect("the phase retains its reservation"),
+        );
+        reservation.holders[holder as usize].fetch_add(1, Ordering::AcqRel);
         HostRetainedPrepared {
-            _reservation: Arc::clone(
-                self.prepared
-                    .as_ref()
-                    .expect("the phase retains its reservation"),
-            ),
+            reservation,
+            holder,
         }
     }
 
@@ -715,6 +772,9 @@ impl HostExecutor {
             status_stops: AtomicUsize::new(0),
             #[cfg(test)]
             refuse_status_delivery: AtomicBool::new(false),
+            #[cfg(test)]
+            jobs_in_flight: AtomicUsize::new(0),
+            outstanding_holder_faults: std::array::from_fn(|_| AtomicU64::new(0)),
             outstanding: AtomicUsize::new(0),
             wake: Arc::clone(&wake),
         });
@@ -820,6 +880,7 @@ impl HostExecutor {
                         prepared: Some(Arc::new(HostPreparedReservation {
                             pool: Arc::clone(&self.prepared),
                             logical_bytes: HOST_PREPARED_BYTE_CAPACITY,
+                            holders: std::array::from_fn(|_| AtomicUsize::new(0)),
                         })),
                     });
                 }
@@ -866,6 +927,13 @@ impl HostExecutor {
                 permit,
             });
         }
+        #[cfg(test)]
+        let publishes_completion = !matches!(
+            command,
+            HostCommand::DiscardCompletion(_)
+                | HostCommand::Dispose(_)
+                | HostCommand::TerminalDispose(_)
+        );
         let job = HostJob {
             identity,
             command,
@@ -873,7 +941,13 @@ impl HostExecutor {
         };
         let failure = match self.jobs.as_ref() {
             Some(jobs) => match jobs.try_send(job) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    #[cfg(test)]
+                    if publishes_completion {
+                        self.permits.jobs_in_flight.fetch_add(1, Ordering::AcqRel);
+                    }
+                    return Ok(());
+                }
                 // Each queued command owns a permit. The queue and permit pool
                 // both hold eight operations, so a reserved command has space.
                 // Preserve the command if this invariant fails.
@@ -899,7 +973,23 @@ impl HostExecutor {
     }
 
     pub(crate) fn poll_completion(&self) -> HostCompletionPoll {
-        poll_completion_mailbox(&self.completions)
+        let poll = poll_completion_mailbox(&self.completions);
+        // Saturating: a completion can come from a job this count never saw.
+        #[cfg(test)]
+        if matches!(poll, HostCompletionPoll::Ready(_)) {
+            let _ = self.permits.jobs_in_flight.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |count| count.checked_sub(1),
+            );
+        }
+        poll
+    }
+
+    /// Submitted jobs that publish a completion, not yet polled.
+    #[cfg(test)]
+    pub(crate) fn jobs_in_flight(&self) -> usize {
+        self.permits.jobs_in_flight.load(Ordering::Acquire)
     }
 
     /// Close publication under its existing mutex, then transfer buffered results to Host.
@@ -928,6 +1018,13 @@ impl HostExecutor {
 
     pub(crate) fn take_capacity_notification(&self) -> bool {
         self.wake.capacity_pending.swap(false, Ordering::AcqRel)
+    }
+
+    /// Entity-work refusals for an outstanding holder of `holder`. Read by
+    /// tests; production reports each refusal in the Hub log.
+    #[cfg(test)]
+    pub(crate) fn outstanding_holder_faults(&self, holder: ReservationHolder) -> u64 {
+        self.permits.outstanding_holder_faults[holder as usize].load(Ordering::Relaxed)
     }
 
     pub(crate) fn outstanding(&self) -> usize {
@@ -2236,6 +2333,29 @@ mod tests {
             .expect("released retained bytes restore capacity");
         drop(final_permit);
         drop(permits);
+    }
+
+    /// A holder's count follows its lifetime, per kind, including across
+    /// threads.
+    #[test]
+    fn a_holder_count_follows_its_lifetime() {
+        let executor = HostExecutor::new();
+        let permit = executor.try_reserve().expect("reserve");
+        let funding = permit.retain_prepared_reservation(ReservationHolder::StagingFunding);
+        let status = permit.retain_prepared_reservation(ReservationHolder::Status);
+        assert_eq!(permit.holders(ReservationHolder::StagingFunding), 1);
+        assert_eq!(permit.holders(ReservationHolder::Status), 1);
+        assert!(
+            !ReservationHolder::Status.gates_entity_work(),
+            "a Status holder never gates"
+        );
+        std::thread::spawn(move || drop(funding))
+            .join()
+            .expect("release thread");
+        assert_eq!(permit.holders(ReservationHolder::StagingFunding), 0);
+        drop(status);
+        assert_eq!(permit.holders(ReservationHolder::Status), 0);
+        drop(permit);
     }
 
     #[test]
