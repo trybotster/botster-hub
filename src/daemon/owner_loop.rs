@@ -3228,6 +3228,61 @@ mod tests {
     }
 
     #[test]
+    fn a_parked_subscribe_is_retired_when_its_connection_closes() {
+        let root = unique_package_control_dir("client-event-parked-close");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let permit = state.budget.reserve_connection().unwrap();
+        let transport = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (control_tx, _control_rx) = tokio_mpsc::channel(8);
+        state.event_plane.bind_owner_wake(control_tx.clone());
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        state.pending_runtime.admission.host_compatibility.insert(
+            "cleanup-connection".into(),
+            crate::admission::unix_hello::HostCompatibilityRecord {
+                event_reader: None,
+                required_features: vec![
+                    botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.into(),
+                ],
+            },
+        );
+        let (message, mut reply_rx) = subscribe_request("parked-then-closed");
+        state
+            .event_plane
+            .clone()
+            .test_with_connection_slots_held("cleanup-connection", || {
+                crate::daemon::control::dispatch_control_message(
+                    &mut daemon,
+                    &mut state,
+                    transport.handle(),
+                    control_tx.clone(),
+                    message,
+                );
+            });
+        assert_eq!(state.client_events.parked_request_count(), 1);
+
+        close_cleanup_test_connection(&mut daemon, &mut state, permit);
+        assert_eq!(
+            state.client_events.parked_request_count(),
+            0,
+            "a closed connection's parked request must not wait for a release"
+        );
+        assert!(
+            matches!(
+                reply_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "the retired request's reply sender is dropped"
+        );
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_subscribe_that_meets_its_readers_slots_lock_parks_and_completes_on_release() {
         let root = unique_package_control_dir("client-event-slots-held");
         let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();

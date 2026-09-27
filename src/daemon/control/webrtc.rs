@@ -159,6 +159,7 @@ pub(crate) fn handle_peer_closed(
     else {
         unreachable!("webrtc peer-closed owner received a non-peer-closed control message");
     };
+    state.client_events.retire_parked_requests_for(&grant_id);
     // A duplicate close (the grant's permit was already taken by an earlier
     // close) has no effect: no counters, no route cleanup.
     let first_close = state.budget.peer_holds_permit(&grant_id);

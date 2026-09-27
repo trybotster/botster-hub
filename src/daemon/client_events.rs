@@ -75,6 +75,30 @@ impl ClientEvents {
         self.parked_requests.push_back(message);
     }
 
+    /// Retires the parked event requests of a closed connection. Dropping a
+    /// request drops its reply sender; the connection that would read the
+    /// reply is gone. Returns how many were retired.
+    pub(crate) fn retire_parked_requests_for(&mut self, connection_id: &str) -> usize {
+        let before = self.parked_requests.len();
+        self.parked_requests.retain(|message| {
+            let crate::daemon::control::message::ControlMessage::Request {
+                grant_id,
+                client_id,
+                ..
+            } = message
+            else {
+                return true;
+            };
+            grant_id.as_deref().or(client_id.as_deref()) != Some(connection_id)
+        });
+        before - self.parked_requests.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parked_request_count(&self) -> usize {
+        self.parked_requests.len()
+    }
+
     pub(crate) fn take_parked_requests(
         &mut self,
     ) -> std::collections::VecDeque<crate::daemon::control::message::ControlMessage> {

@@ -744,6 +744,9 @@ pub(crate) fn handle_connection_cleanup(
     _control_tx: ControlSender,
     cleanup: ConnectionCleanup,
 ) {
+    state
+        .client_events
+        .retire_parked_requests_for(&cleanup.client_id);
     state.lifecycle_counters.live_connections =
         state.lifecycle_counters.live_connections.saturating_sub(1);
     *state
