@@ -720,6 +720,9 @@ fn spawn_with_launch_record(command: &mut Command) -> std::io::Result<(Child, La
     use std::os::fd::AsRawFd;
 
     let (record_reader, record_writer) = std::io::pipe()?;
+    // Every fallible reader resource exists before the child does, so a setup
+    // failure can never drop a spawned child without stopping and reaping it.
+    let cancel = launch_record_cancel_pipe()?;
     let writer_fd = record_writer.as_raw_fd();
     command.env(READY_FD_ENV, READY_FD.to_string());
     unsafe {
@@ -731,7 +734,21 @@ fn spawn_with_launch_record(command: &mut Command) -> std::io::Result<(Child, La
     // Only the child may hold the write end, so its exit can close the pipe.
     drop(record_writer);
     let child = child?;
-    Ok((child, start_launch_record_reader(record_reader)?))
+    Ok((child, start_reader_with_cancel(record_reader, cancel)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: makes the next cancel-pipe creation on this thread fail.
+    static FAIL_CANCEL_PIPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn launch_record_cancel_pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
+    #[cfg(test)]
+    if FAIL_CANCEL_PIPE.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other("test-injected cancel pipe failure"));
+    }
+    std::io::pipe()
 }
 
 /// Places `writer_fd` at READY_FD without close-on-exec. Runs in the child
@@ -753,8 +770,16 @@ fn place_ready_fd(writer_fd: libc::c_int) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn start_launch_record_reader(record: std::io::PipeReader) -> std::io::Result<LaunchRecordReader> {
-    let (cancel_reader, cancel_writer) = std::io::pipe()?;
+    Ok(start_reader_with_cancel(record, std::io::pipe()?))
+}
+
+/// Starts the reader thread. Infallible: the pipes already exist.
+fn start_reader_with_cancel(
+    record: std::io::PipeReader,
+    (cancel_reader, cancel_writer): (std::io::PipeReader, std::io::PipeWriter),
+) -> LaunchRecordReader {
     let (events_tx, events) = mpsc::sync_channel(1);
     #[cfg(test)]
     let (retired_tx, retired) = mpsc::sync_channel(1);
@@ -770,12 +795,12 @@ fn start_launch_record_reader(record: std::io::PipeReader) -> std::io::Result<La
         #[cfg(test)]
         let _ = retired_tx.send(());
     });
-    Ok(LaunchRecordReader {
+    LaunchRecordReader {
         events,
         _cancel: cancel_writer,
         #[cfg(test)]
         retired,
-    })
+    }
 }
 
 /// Reads until the first newline or EOF. It waits on poll() for either the
@@ -786,7 +811,7 @@ fn start_launch_record_reader(record: std::io::PipeReader) -> std::io::Result<La
 fn read_launch_record(
     mut record: std::io::PipeReader,
     cancel: std::io::PipeReader,
-    #[cfg(test)] partial: Option<mpsc::Sender<usize>>,
+    #[cfg(test)] mut partial: Option<Box<dyn FnMut(usize) + Send>>,
 ) -> Option<LaunchRecordEvent> {
     use std::os::fd::AsRawFd;
 
@@ -825,25 +850,28 @@ fn read_launch_record(
         if polls[1].revents != 0 {
             return None;
         }
-        loop {
-            match record.read(&mut chunk) {
-                Ok(0) => return Some(LaunchRecordEvent::Eof),
-                Ok(read) => {
-                    let start = line.len();
-                    line.extend_from_slice(&chunk[..read]);
-                    if let Some(end) = line[start..].iter().position(|byte| *byte == b'\n') {
-                        line.truncate(start + end);
-                        return Some(LaunchRecordEvent::Record(line));
-                    }
-                    #[cfg(test)]
-                    if let Some(partial) = &partial {
-                        let _ = partial.send(line.len());
-                    }
+        // One finite read per poll: the next poll rechecks cancellation, so a
+        // producer that never stops writing cannot hold the reader past it.
+        match record.read(&mut chunk) {
+            Ok(0) => return Some(LaunchRecordEvent::Eof),
+            Ok(read) => {
+                let start = line.len();
+                line.extend_from_slice(&chunk[..read]);
+                if let Some(end) = line[start..].iter().position(|byte| *byte == b'\n') {
+                    line.truncate(start + end);
+                    return Some(LaunchRecordEvent::Record(line));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Some(LaunchRecordEvent::ReadError(error.to_string())),
+                #[cfg(test)]
+                if let Some(partial) = partial.as_mut() {
+                    partial(line.len());
+                }
             }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Some(LaunchRecordEvent::ReadError(error.to_string())),
         }
     }
 }
@@ -1398,11 +1426,69 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_reader_setup_spawns_no_child() {
+        let (mut started, stdout) = std::io::pipe().expect("stdout pipe");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf started"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::null());
+        FAIL_CANCEL_PIPE.with(|fail| fail.set(true));
+        let result = spawn_with_launch_record(&mut command);
+        assert!(result.is_err(), "the injected setup failure is reported");
+        // Once the Command is dropped, only a spawned child could still hold
+        // the stdout write end; with no child the read ends at once, empty.
+        drop(command);
+        let mut output = String::new();
+        std::io::Read::read_to_string(&mut started, &mut output).unwrap();
+        assert_eq!(output, "", "no child may run when reader setup fails");
+    }
+
+    #[test]
+    fn continuous_partial_input_cannot_delay_cancellation() {
+        let (record, mut writer) = std::io::pipe().expect("record pipe");
+        let (cancel, cancel_writer) = std::io::pipe().expect("cancel pipe");
+        std::io::Write::write_all(&mut writer, b"xxxx").unwrap();
+        let mut cancel_writer = Some(cancel_writer);
+        let mut reads = 0;
+        // Refill the pipe inside each read, so data is always ready; cancel
+        // after the third read.
+        let refill = Box::new(move |_length: usize| {
+            reads += 1;
+            if reads == 3 {
+                drop(cancel_writer.take());
+            }
+            let _ = std::io::Write::write_all(&mut writer, b"xxxx");
+        });
+        let (done_tx, done) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = done_tx.send(read_launch_record(record, cancel, Some(refill)));
+        });
+        // timer: deadline — bounds a reader that never rechecks cancellation; expiry fails the test.
+        let outcome = done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation ends the reader under continuous input");
+        assert!(
+            outcome.is_none(),
+            "a cancelled reader reports nothing: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn a_fragmented_record_is_assembled() {
         let (record, mut writer) = std::io::pipe().expect("record pipe");
         let (cancel, _cancel_writer) = std::io::pipe().expect("cancel pipe");
         let (partial_tx, partial) = mpsc::channel();
-        let reading = thread::spawn(move || read_launch_record(record, cancel, Some(partial_tx)));
+        let reading = thread::spawn(move || {
+            read_launch_record(
+                record,
+                cancel,
+                Some(Box::new(move |length| {
+                    let _ = partial_tx.send(length);
+                })),
+            )
+        });
         let (head, tail) = READY_RECORD.split_at(20);
 
         std::io::Write::write_all(&mut writer, head.as_bytes()).expect("write the first fragment");
