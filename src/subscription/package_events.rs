@@ -46,6 +46,10 @@ pub(crate) enum ClientEventAdmitError {
     NotNegotiated,
     ConnectionCapacity,
     Router(EventPlaneStatus),
+    /// The owner met the connection's slots lock held by another thread (the
+    /// connection's own reader). The owner parks the request; the lock's
+    /// release wakes it. Clients never see this refusal.
+    SlotsBusy,
 }
 
 impl ClientEventAdmitError {
@@ -64,6 +68,8 @@ impl ClientEventAdmitError {
             Self::NotNegotiated => "package_event_subscriptions_not_negotiated",
             Self::ConnectionCapacity => "package_event_connection_capacity",
             Self::Router(status) => status.as_str(),
+            // Only a direct caller that does not park (a test) can surface it.
+            Self::SlotsBusy => EventPlaneStatus::ShedBusy.as_str(),
         }
     }
 
@@ -89,6 +95,7 @@ impl ClientEventAdmitError {
             Self::ConnectionCapacity => {
                 "the connection cannot reserve package-event mailbox capacity"
             }
+            Self::SlotsBusy => "the connection's event slots are held by its reader",
             Self::Router(status) => match status {
                 EventPlaneStatus::RejectedUndeclared => "event is not an admitted contract",
                 EventPlaneStatus::RejectedForeign => "event owner does not match the caller",
@@ -554,6 +561,9 @@ pub(crate) struct ClientEventConnection {
     slots: Mutex<BTreeMap<Arc<str>, Arc<ClientEventSlot>>>,
     reader: OnceLock<Weak<ClientEventReader>>,
     reader_waiting: AtomicBool,
+    /// The owner was refused the slots lock; the next release wakes it.
+    owner_waiting: AtomicBool,
+    owner_wake: Arc<ClientEventOwnerWake>,
     closing: AtomicBool,
     fully_reclaimed: AtomicBool,
     requested: AtomicBool,
@@ -668,14 +678,79 @@ impl Drop for ClientSlotsGuard<'_> {
         if self.connection.reader_waiting.swap(false, Ordering::AcqRel) {
             self.connection.wake_reader();
         }
+        if self.connection.owner_waiting.swap(false, Ordering::AcqRel) {
+            self.connection.owner_wake.notify();
+        }
+    }
+}
+
+/// Which side waits for the slots lock after a refused try.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotsWaiter {
+    Reader,
+    Owner,
+}
+
+/// Coalesced owner wake for a released slots lock. The pending flag survives
+/// a full control channel: the owner takes it on every turn.
+#[derive(Default)]
+pub(crate) struct ClientEventOwnerWake {
+    pending: AtomicBool,
+    owner: Mutex<Option<crate::daemon::control::message::ControlSender>>,
+}
+
+impl std::fmt::Debug for ClientEventOwnerWake {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClientEventOwnerWake")
+            .field("pending", &self.pending)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientEventOwnerWake {
+    pub(crate) fn bind(&self, sender: crate::daemon::control::message::ControlSender) {
+        *self.owner.lock().unwrap_or_else(|error| error.into_inner()) = Some(sender);
+        if self.pending.load(Ordering::Acquire) {
+            self.send();
+        }
+    }
+
+    fn notify(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            self.send();
+        }
+    }
+
+    /// Takes the pending release notification.
+    pub(crate) fn take(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+
+    fn send(&self) {
+        if let Some(owner) = self
+            .owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            let _ = owner.try_send(
+                crate::daemon::control::message::ControlMessage::ClientEventSlotsReleased,
+            );
+        }
     }
 }
 
 impl ClientEventConnection {
     pub(crate) fn bind_reader(self: &Arc<Self>, reader: &Arc<ClientEventReader>) {
-        let _ = self.reader.set(Arc::downgrade(reader));
+        let newly_bound = self.reader.set(Arc::downgrade(reader)).is_ok();
         let _ = reader.connection.set(Arc::clone(self));
-        reader.signal();
+        // Every subscribe re-binds; only the first bind has anything to tell the
+        // reader. A repeated signal would wake the reader into the slots lock
+        // just before the owner takes it.
+        if newly_bound {
+            reader.signal();
+        }
     }
 
     fn wake_reader(&self) {
@@ -685,6 +760,19 @@ impl ClientEventConnection {
     }
 
     fn try_slots(&self) -> Result<ClientSlotsGuard<'_>, EventPlaneStatus> {
+        self.try_slots_for(SlotsWaiter::Reader)
+    }
+
+    /// The owner's try: a refusal arms the owner wake instead of the reader's.
+    fn try_slots_for_owner(&self) -> Result<ClientSlotsGuard<'_>, ClientEventAdmitError> {
+        self.try_slots_for(SlotsWaiter::Owner)
+            .map_err(|status| match status {
+                EventPlaneStatus::ShedBusy => ClientEventAdmitError::SlotsBusy,
+                other => ClientEventAdmitError::Router(other),
+            })
+    }
+
+    fn try_slots_for(&self, waiter: SlotsWaiter) -> Result<ClientSlotsGuard<'_>, EventPlaneStatus> {
         match self.slots.try_lock() {
             Ok(guard) => Ok(ClientSlotsGuard {
                 connection: self,
@@ -692,7 +780,10 @@ impl ClientEventConnection {
             }),
             Err(TryLockError::Poisoned(_)) => Err(EventPlaneStatus::RejectedInvalid),
             Err(TryLockError::WouldBlock) => {
-                self.reader_waiting.store(true, Ordering::Release);
+                match waiter {
+                    SlotsWaiter::Reader => self.reader_waiting.store(true, Ordering::Release),
+                    SlotsWaiter::Owner => self.owner_waiting.store(true, Ordering::Release),
+                }
                 // Recheck after arming so a concurrent unlock cannot lose the wake.
                 self.slots
                     .try_lock()
@@ -794,6 +885,7 @@ impl ClientEventConnection {
 #[derive(Clone, Default)]
 pub(crate) struct ClientEventPlane {
     connections: Arc<Mutex<HashMap<Arc<str>, Arc<ClientEventConnection>>>>,
+    owner_wake: Arc<ClientEventOwnerWake>,
 }
 
 impl std::fmt::Debug for ClientEventPlane {
@@ -924,6 +1016,15 @@ impl ClientCleanupWork {
 }
 
 impl ClientEventPlane {
+    /// Binds the owner's control channel for slots-release wakes.
+    pub(crate) fn bind_owner_wake(&self, sender: crate::daemon::control::message::ControlSender) {
+        self.owner_wake.bind(sender);
+    }
+
+    pub(crate) fn owner_wake(&self) -> &ClientEventOwnerWake {
+        &self.owner_wake
+    }
+
     pub(crate) fn admit_connection(
         &self,
         connection_id: &str,
@@ -942,6 +1043,8 @@ impl ClientEventPlane {
             slots: Mutex::new(BTreeMap::new()),
             reader: OnceLock::new(),
             reader_waiting: AtomicBool::new(false),
+            owner_waiting: AtomicBool::new(false),
+            owner_wake: Arc::clone(&self.owner_wake),
             closing: AtomicBool::new(false),
             fully_reclaimed: AtomicBool::new(false),
             requested: AtomicBool::new(false),
@@ -953,6 +1056,23 @@ impl ClientEventPlane {
         });
         connections.insert(identity, Arc::clone(&connection));
         Ok(connection)
+    }
+
+    /// Test-only: runs `body` while another thread holds `connection_id`'s slots
+    /// lock, as the connection's reader does.
+    #[cfg(test)]
+    pub(crate) fn test_with_connection_slots_held<R>(
+        &self,
+        connection_id: &str,
+        body: impl FnOnce() -> R,
+    ) -> R {
+        let connection = self.connection(connection_id).expect("admitted connection");
+        let guard = connection
+            .lock_slots()
+            .expect("test hold must acquire slots");
+        let result = body();
+        drop(guard);
+        result
     }
 
     fn connection(&self, connection_id: &str) -> Option<Arc<ClientEventConnection>> {
@@ -1018,9 +1138,7 @@ impl ClientEventPlane {
     ) -> Result<Arc<ClientEventMailbox>, ClientEventAdmitError> {
         let compiled = compile_subjects(&subjects)?;
         let connection = self.admit_connection(connection_id)?;
-        let mut slots = connection
-            .try_slots()
-            .map_err(ClientEventAdmitError::Router)?;
+        let mut slots = connection.try_slots_for_owner()?;
         if connection.closing.load(Ordering::Acquire) || connection.faulted.load(Ordering::Acquire)
         {
             return Err(ClientEventAdmitError::Router(
@@ -1112,9 +1230,7 @@ impl ClientEventPlane {
             .get(connection_id)
             .cloned()
             .ok_or(ClientEventAdmitError::UnknownSubscription)?;
-        let slots = connection
-            .try_slots()
-            .map_err(ClientEventAdmitError::Router)?;
+        let slots = connection.try_slots_for_owner()?;
         let slot = slots
             .get(subscription_id)
             .filter(|slot| slot.active.load(Ordering::Acquire) && !slot.mailbox.is_retired())
@@ -1196,6 +1312,22 @@ pub(crate) fn unsubscribe_events_response() -> DaemonResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_reader_signals_the_reader_only_on_its_first_bind() {
+        let plane = ClientEventPlane::default();
+        let connection = plane.admit_connection("bind-once").unwrap();
+        let reader = Arc::new(ClientEventReader::default());
+        connection.bind_reader(&reader);
+        assert!(
+            reader.wake_bit.swap(false, Ordering::AcqRel),
+            "the first bind tells the reader"
+        );
+        // Every later subscribe re-binds the same reader. A signal here would
+        // wake the reader into the slots lock just before the owner takes it.
+        connection.bind_reader(&reader);
+        assert!(!reader.wake_bit.load(Ordering::Acquire));
+    }
     use crate::config::PackageEventPlanePolicy;
     use crate::package_event_router::{EmittedContract, EventAudience};
     use crate::package_event_schema::CompiledEventSchema;

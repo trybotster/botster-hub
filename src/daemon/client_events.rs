@@ -43,9 +43,44 @@ pub(crate) struct ClientEvents {
     by_connection: HashMap<Arc<str>, WaiterId>,
     connections: BTreeMap<WaiterId, Connection>,
     capacity_waiters: BTreeSet<WaiterId>,
+    /// Set by the request handler when an event request met the connection's
+    /// slots lock held by its reader; the request path parks the request.
+    slots_busy: bool,
+    /// Event requests parked on a held slots lock, retried in arrival order
+    /// when the lock's release wakes the owner.
+    parked_requests: std::collections::VecDeque<crate::daemon::control::message::ControlMessage>,
 }
 
 impl ClientEvents {
+    pub(crate) fn note_slots_busy(
+        &mut self,
+        error: crate::subscription::package_events::ClientEventAdmitError,
+    ) {
+        if matches!(
+            error,
+            crate::subscription::package_events::ClientEventAdmitError::SlotsBusy
+        ) {
+            self.slots_busy = true;
+        }
+    }
+
+    pub(crate) fn take_slots_busy(&mut self) -> bool {
+        std::mem::take(&mut self.slots_busy)
+    }
+
+    pub(crate) fn park_request(
+        &mut self,
+        message: crate::daemon::control::message::ControlMessage,
+    ) {
+        self.parked_requests.push_back(message);
+    }
+
+    pub(crate) fn take_parked_requests(
+        &mut self,
+    ) -> std::collections::VecDeque<crate::daemon::control::message::ControlMessage> {
+        std::mem::take(&mut self.parked_requests)
+    }
+
     pub(crate) fn dispose_terminal(
         &mut self,
         runtime: &crate::HubRuntime,

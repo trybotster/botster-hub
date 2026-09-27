@@ -428,6 +428,10 @@ fn publish_maintenance_wakes(state: &mut DaemonControlState) {
 /// Read persistent notification bits before the owner can block.
 /// Collectors process their payloads through the shared ready queues.
 pub(crate) fn publish_completion_wakes(daemon: &HubDaemon, state: &mut DaemonControlState) {
+    // A slots release whose control message was refused by a full channel.
+    if state.event_plane.owner_wake().take() {
+        let _ = enqueue_control_message(state, ControlMessage::ClientEventSlotsReleased);
+    }
     if state.entity_capacity_wake.take() {
         state
             .maintenance
@@ -1203,6 +1207,9 @@ fn serve_daemon_inner(
         .plugin_result_budget
         .bind_owner_wake(control_tx.clone());
     control_state.entity_capacity_wake.bind(control_tx.clone());
+    control_state
+        .event_plane
+        .bind_owner_wake(control_tx.clone());
     daemon
         .local_webrtc()
         .bind_entity_capacity_wake(control_state.entity_capacity_wake.clone());
@@ -3174,6 +3181,113 @@ mod tests {
             );
             thread::yield_now();
         }
+        daemon.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn subscribe_request(
+        subscription_id: &str,
+    ) -> (
+        ControlMessage,
+        crate::daemon::control::message::ControlReplyReceiver,
+    ) {
+        let (reply_tx, reply_rx) = crate::daemon::control::message::control_reply_channel();
+        (
+            ControlMessage::Request {
+                request: Box::new(DaemonRequest::SubscribeEvents {
+                    subscription_id: subscription_id.into(),
+                    owner: "cleanup-owner".into(),
+                    name: "ready".into(),
+                    subjects: Vec::new(),
+                }),
+                transport_request_id: None,
+                reply_tx,
+                response_delivery_rx: None,
+                grant_id: None,
+                client_id: Some("cleanup-connection".into()),
+                enqueued_at: Instant::now(),
+            },
+            reply_rx,
+        )
+    }
+
+    fn reply_kind(
+        reply_rx: &mut crate::daemon::control::message::ControlReplyReceiver,
+    ) -> Option<Result<DaemonResponseKind, String>> {
+        match reply_rx.try_recv() {
+            Ok(crate::daemon::control::reply::ControlReply::Typed {
+                response: Ok(response),
+                ..
+            }) => Some(match response.error {
+                None => Ok(response.kind),
+                Some(error) => Err(error.code),
+            }),
+            Ok(_) => panic!("unexpected reply shape"),
+            Err(_) => None,
+        }
+    }
+
+    #[test]
+    fn a_subscribe_that_meets_its_readers_slots_lock_parks_and_completes_on_release() {
+        let root = unique_package_control_dir("client-event-slots-held");
+        let mut daemon = HubDaemon::start(package_control_config(root.join("data"))).unwrap();
+        let mut state = DaemonControlState::default();
+        let transport = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (control_tx, mut control_rx) = tokio_mpsc::channel(8);
+        state.event_plane.bind_owner_wake(control_tx.clone());
+        admit_cleanup_test_subscription(&daemon, &mut state);
+        settle_cleanup_test_owner(&mut daemon, &mut state);
+        state.pending_runtime.admission.host_compatibility.insert(
+            "cleanup-connection".into(),
+            crate::admission::unix_hello::HostCompatibilityRecord {
+                event_reader: None,
+                required_features: vec![
+                    botster_hub_client::FEATURE_PACKAGE_EVENT_SUBSCRIPTIONS.into(),
+                ],
+            },
+        );
+
+        let (message, mut reply_rx) = subscribe_request("parked");
+        state
+            .event_plane
+            .clone()
+            .test_with_connection_slots_held("cleanup-connection", || {
+                assert!(!crate::daemon::control::dispatch_control_message(
+                    &mut daemon,
+                    &mut state,
+                    transport.handle(),
+                    control_tx.clone(),
+                    message,
+                ));
+                assert_eq!(
+                    reply_kind(&mut reply_rx),
+                    None,
+                    "a subscribe that meets the reader's lock must not be answered shed_busy"
+                );
+                assert!(
+                    control_rx.try_recv().is_err(),
+                    "no wake while the lock is held"
+                );
+            });
+
+        // Releasing the lock wakes the owner, which re-dispatches the parked subscribe.
+        let released = control_rx.try_recv().expect("the release wakes the owner");
+        assert!(matches!(released, ControlMessage::ClientEventSlotsReleased));
+        assert!(!crate::daemon::control::dispatch_control_message(
+            &mut daemon,
+            &mut state,
+            transport.handle(),
+            control_tx.clone(),
+            released,
+        ));
+        assert_eq!(
+            reply_kind(&mut reply_rx),
+            Some(Ok(DaemonResponseKind::EventSubscribed))
+        );
+        assert!(state.client_events.take_parked_requests().is_empty());
         daemon.stop();
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -590,7 +590,9 @@ fn isolated_hub_unix_client_receives_unsolicited_package_event() {
         .expect("subscribe");
     assert_eq!(
         subscribed.kind,
-        botster_hub_client::DaemonResponseKind::EventSubscribed
+        botster_hub_client::DaemonResponseKind::EventSubscribed,
+        "subscribe error: {:?}",
+        subscribed.error
     );
     emit_sample_ready(hub.endpoint(), "client-live");
     connection
@@ -685,7 +687,9 @@ fn isolated_hub_rejected_terminal_hello_still_subscribes_to_package_events() {
         .expect("subscribe after rejected terminal");
     assert_eq!(
         subscribed.kind,
-        botster_hub_client::DaemonResponseKind::EventSubscribed
+        botster_hub_client::DaemonResponseKind::EventSubscribed,
+        "subscribe error: {:?}",
+        subscribed.error
     );
     emit_sample_ready(hub.endpoint(), "after-reject");
     connection

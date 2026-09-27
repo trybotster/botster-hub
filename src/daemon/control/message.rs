@@ -151,6 +151,9 @@ pub(crate) enum ControlMessage {
     PluginCompletionPublished,
     /// A host job completed or released bounded executor capacity.
     HostProgressPublished,
+    /// A client-event connection's slots lock, refused to the owner, was
+    /// released; parked event requests are retried.
+    ClientEventSlotsReleased,
     /// The causal table published queue capacity or a mutex release.
     CausalProgressPublished,
     /// A Lua publication or bridge unlock requires owner attention.

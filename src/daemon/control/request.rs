@@ -97,6 +97,21 @@ pub(crate) fn handle(
             &connection_id,
             request.as_ref().clone(),
         );
+        if state.client_events.take_slots_busy() {
+            // The connection's own reader held the slots lock. Park the request
+            // unanswered; the lock's release wakes the owner, which re-dispatches
+            // it (ControlMessage::ClientEventSlotsReleased).
+            state.client_events.park_request(ControlMessage::Request {
+                request,
+                transport_request_id,
+                reply_tx,
+                response_delivery_rx,
+                grant_id,
+                client_id,
+                enqueued_at,
+            });
+            return false;
+        }
         return send_control_response(reply_tx, Ok(response), response_delivery_rx);
     }
     if matches!(

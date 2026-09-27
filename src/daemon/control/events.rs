@@ -62,6 +62,7 @@ pub(crate) fn handle_client_event_request(
             }
             if let Err(error) = crate::daemon::client_events::admit_connection(state, connection_id)
             {
+                state.client_events.note_slots_busy(error);
                 return client_event_operator_error(error, &subscription_id, "subscribe_events");
             }
             match state.event_plane.subscribe_mailbox(
@@ -171,6 +172,18 @@ pub(crate) fn handle_client_event_request(
                     }
                     response
                 }
+                // The slots lock was held before any subscription effect, so
+                // there is nothing to clean up; the request is parked and retried.
+                Err(ClientEventAdmitError::SlotsBusy) => {
+                    state
+                        .client_events
+                        .note_slots_busy(ClientEventAdmitError::SlotsBusy);
+                    client_event_operator_error(
+                        ClientEventAdmitError::SlotsBusy,
+                        &subscription_id,
+                        "subscribe_events",
+                    )
+                }
                 Err(error) => {
                     crate::daemon::client_events::note_cleanup(state, connection_id);
                     client_event_operator_error(error, &subscription_id, "subscribe_events")
@@ -234,6 +247,7 @@ pub(crate) fn handle_client_event_request(
                     unsubscribe_events_response()
                 }
                 Err(error) => {
+                    state.client_events.note_slots_busy(error);
                     client_event_operator_error(error, &subscription_id, "unsubscribe_events")
                 }
             }

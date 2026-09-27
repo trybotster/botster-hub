@@ -113,6 +113,15 @@ pub(crate) fn dispatch_control_message(
         message @ ControlMessage::Request { .. } => {
             request::handle(daemon, state, transport_handle, control_tx, message)
         }
+        ControlMessage::ClientEventSlotsReleased => {
+            state.event_plane.owner_wake().take();
+            // Retry every parked event request in arrival order. A request that
+            // meets a held lock again parks again and arms the next release wake.
+            for message in state.client_events.take_parked_requests() {
+                request::handle(daemon, state, transport_handle, control_tx.clone(), message);
+            }
+            false
+        }
         ControlMessage::HubUpdateCheckCompleted { update } => {
             host::hub_update_check_completed(state, update)
         }
