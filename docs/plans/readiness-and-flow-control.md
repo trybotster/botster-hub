@@ -98,6 +98,7 @@ Coupling: while the worker main loop is blocked on a full egress lane, it applie
 5. **Unbounded queues:** the WebRTC rtc send buffer and SCTP pending queue, the Unix `queued_events`, the worker control mpsc, keyless input inside the worker, and the async capability result mpsc.
 6. **Silent drops:** the worker egress after a socket error, and the event retire on `LockBusy`.
 7. **Refused maintenance reads stall (live defect).** When the bounded Core request queue is full (`CoreTicketPoll::Refused`), the Observe, journal-pull, and baseline slices clear their read and return without marking themselves again (`daemon_maintenance.rs:955, 1004, 1111`). A freed queue slot publishes no owner wake. The read then waits for an unrelated wake. This is confirmed by code reading, and no test proves it yet. Step S4 fixes it: the slice becomes `Wait(Signal(DataPlaneCapacity))`, and a test that fills the request queue proves the fix.
+8. **The Unix client connection has no per-route flow control.** One Unix socket carries every terminal route plus the control frames (responses, events, entities). With C1's source backpressure, a client whose terminal budget is full can only stop reading the whole socket. Control frames then wait head-of-line behind a flooding route. WebRTC avoids this with one data channel per route. Step S13 adds a per-route credit window.
 
 ### 1.6 Duplicate bounds (recorded; no value changes in this plan)
 
@@ -326,12 +327,13 @@ Every step lands alone, keeps the strict gates green (fmt, clippy `-D warnings` 
 | **S10** | Core + Hub | Derive `exit_hold` (2.4.4); `journal_advanced` as a wake (2.4.3) | hand-mirrored flags | post-exit capture tests; journal pull with no host poll | 0.5 d |
 | **S11** | Core | Data-plane fd reactor for worker and plugin-process sockets | 1 crossing per session; one reader thread per worker | worker process and plugin process suites | 2 to 3 d |
 | **S12** | Core | Coalesce adjacent `Output` frames in route egress | a line-buffered flood (`seq` to a tty) makes 7-byte frames, so the 64-frame route bound limits throughput, not the 4 MiB byte bound | a line-buffered flood fills the route by bytes, not by frame count; frame order and input-result order are kept | 0.5 d |
+| **S13** | Hub + client | Per-terminal-route credit on the Unix connection. The client grants credit for a route as it consumes that route's frames. The window is the client's existing terminal budget (256 wakes / 8 MiB), so no new number. At zero credit the Hub adapter refuses the route's write (`WouldBlock`). The frames then wait in Core's route egress, which drives C1's source backpressure, while control frames keep flowing. A credit grant raises the adapter's Writable wake, registered before the adapter's final write attempt (2.2). A client that grants nothing is a reader with no progress and ends `Stalled` at `READER_PROGRESS_DEADLINE`. This is a protocol change, a cold cut: the Hub client crate and the TUI change together. It replaces the TUI's interim whole-socket blocking reader | a flooding route blocks control frames head-of-line | with one route flooding and zero credit, a control request is answered while that route is held; a grant between the refused write and the park is not lost (ablation: raise after the park check); zero credit drives Core source backpressure, with 0 resyncs; a client that never grants ends `Stalled` | 1.5 d |
 
 ### 4.1 Cutover split
 
 **User decision (2026-09-27): every step, S6 to S12 included, lands before cutover, without lowering quality.** The split below remains the priority order: the first table fixes live defects.
 
-The total is about 13.75 to 15.75 writer-days of new work.
+The total is about 15.25 to 17.25 writer-days of new work.
 
 **Must land before cutover: about 7.25 writer-days of new work.** These steps fix every live defect in the catalogue.
 
@@ -349,7 +351,7 @@ The total is about 13.75 to 15.75 writer-days of new work.
 
 Every step in this list fixes a live defect. If time forces a cut, only S4b can move after cutover without leaving a known hang: its defects waste CPU (the causal herd and incidental wakes), and the capability-event wake has no production consumer until plugin-platform slice 3. S4a stays before cutover, because it fixes two hangs.
 
-**Second priority: about 6.5 to 8.5 writer-days.**
+**Second priority: about 8 to 10 writer-days.**
 
 | Step | Size | Note |
 | --- | --- | --- |
@@ -359,6 +361,7 @@ Every step in this list fixes a live defect. If time forces a cut, only S4b can 
 | S10 | 0.5 d | derived `exit_hold`; `journal_advanced` as a wake |
 | S11 | 2 to 3 d | follows the process host |
 | S12 | 0.5 d | coalesce small `Output` frames |
+| S13 | 1.5 d | per-route credit on the Unix connection |
 
 ### 4.2 Order constraints
 
@@ -383,6 +386,7 @@ Each writer lands their own steps on main once their reviewer accepts and the la
 | S4b | owner-loop lead | S2 | Hub main |
 | S5 | Foundation writer | S0 | Hub main |
 | S6 | Foundation writer | S5 | Hub main |
+| S13 | Foundation writer (with the TUI owner for the client side) | S5 and C1 | Hub main; the TUI lands its client side in the same cold cut |
 | S8 | Plugin platform writer (0079) | S4b | Hub main |
 | S9, S12, S10 (Core half) | Core writer | C1 and C2 | a Core pin roll by the Foundation writer |
 | S11 | Core writer | S9 | a Core pin roll by the Foundation writer |
