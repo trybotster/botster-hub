@@ -11471,7 +11471,7 @@ return botster.register({tools = {{
         );
         std::fs::write(
             b_dir.join("plugin.lua"),
-            "events.on('hub', 'worktree_created', function() return {} end)\nreturn botster.register({})\n",
+            "botster.events.on({ owner = 'hub', name = 'worktree_created' }, function() return {} end)\nreturn botster.register({})\n",
         )
         .expect("write B");
         for dir in [&a_dir, &b_dir] {
