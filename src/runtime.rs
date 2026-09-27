@@ -7163,7 +7163,7 @@ fn default_terminal_color_profile() -> TerminalColorProfile {
     TerminalColorProfile { colors }
 }
 
-fn session_worker_path(config: &HubConfig) -> PathBuf {
+pub(crate) fn session_worker_path(config: &HubConfig) -> PathBuf {
     if let Some(path) = &config.core_engine.session_worker_path {
         return path.clone();
     }

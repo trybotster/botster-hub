@@ -1273,6 +1273,7 @@ fn serve_daemon_inner(
         let _runtime = transport_runtime.enter();
         TokioUnixListener::from_std(listener).map_err(DaemonTransportError::Io)?
     };
+    let session_worker = crate::runtime::session_worker_path(&config);
     let mut daemon = HubDaemon::start(config)?;
     if let Some(runtime) = daemon.runtime() {
         runtime.bind_data_plane_owner_wake(control_tx.clone());
@@ -1319,6 +1320,14 @@ fn serve_daemon_inner(
         }
         None => (None, None),
     };
+    // Pay the session worker's first-exec cost before reporting ready. A
+    // failed warm-up is logged and counted; it never withholds readiness.
+    if crate::daemon::worker_warm_up::warm_up_and_log(&session_worker) {
+        control_state.lifecycle_counters.worker_warm_up_failures = control_state
+            .lifecycle_counters
+            .worker_warm_up_failures
+            .saturating_add(1);
+    }
     // The accept task is running and every request it admits waits on the
     // control channel that the owner loop below serves.
     if let Some(readiness) = readiness {
