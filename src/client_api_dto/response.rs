@@ -67,6 +67,7 @@ pub(crate) fn daemon_response_base(kind: DaemonResponseKind) -> DaemonResponse {
         plugin_tools: Vec::new(),
         plugin_tool_result: Value::Null,
         plugin_surface: None,
+        plugin_logs: None,
         plugin_action_result: None,
         local_webrtc_bootstrap: None,
         local_webrtc_answer: None,
@@ -325,6 +326,33 @@ pub(crate) fn daemon_plugin_tools(plugin_tools: Vec<McpToolDescriptor>) -> Daemo
         .into_iter()
         .map(|tool| serde_json::to_value(tool).unwrap_or(Value::Null))
         .collect();
+    response
+}
+
+pub(crate) fn daemon_plugin_logs(
+    package_name: String,
+    page: crate::plugin_logs::LogPage,
+) -> DaemonResponse {
+    let mut response = daemon_response_base(DaemonResponseKind::PluginLogs);
+    response.plugin_logs = Some(botster_hub_client::DaemonPluginLogs {
+        package_name,
+        records: page
+            .records
+            .into_iter()
+            .map(|record| botster_hub_client::DaemonPluginLogRecord {
+                seq: record.seq,
+                at_ms: record.at_ms,
+                level: record.level.as_str().to_string(),
+                message: record.message,
+                fields: record
+                    .fields
+                    .and_then(|fields| serde_json::from_str(&fields).ok()),
+                dropped_before: record.dropped_before,
+            })
+            .collect(),
+        next_seq: page.next_seq,
+        first_available_seq: page.first_available_seq,
+    });
     response
 }
 
