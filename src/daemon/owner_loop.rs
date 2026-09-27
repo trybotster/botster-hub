@@ -7873,10 +7873,28 @@ return botster.register({ handlers = {{
                 {
                     break;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "event and publication work must retire"
-                );
+                if Instant::now() >= deadline {
+                    let counters = runtime.event_plane_counters().snapshot();
+                    panic!(
+                        "event and publication work must retire: completed_ok={} failed={} \
+                         timed_out={} cancelled={} backpressured={} worker_stopped={} \
+                         causal_operations={} publish_retirement_pending={} \
+                         event_in_flight={} pending_retirements={} budget_outstanding={} \
+                         family_seq={}",
+                        counters.event_handler_completed_ok,
+                        counters.event_handler_failed,
+                        counters.event_handler_timed_out,
+                        counters.event_handler_cancelled,
+                        counters.event_handler_backpressured,
+                        counters.event_handler_worker_stopped,
+                        runtime.causal_operation_count(),
+                        runtime.entity_publish_retirement_pending(),
+                        state.maintenance.event_in_flight.len(),
+                        state.maintenance.pending_retirements.len(),
+                        state.budget.outstanding(),
+                        runtime.test_family_seq("resync-probe.item"),
+                    );
+                }
                 std::thread::yield_now();
             }
             let runtime = daemon.runtime().unwrap();
