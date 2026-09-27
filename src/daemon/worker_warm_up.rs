@@ -357,17 +357,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_running_warm_up_holds_readiness_and_a_failed_one_is_counted() {
-        // The probe signals it started, then blocks until the test releases it.
-        let (directory, worker) = fake_worker(
-            "held",
-            r#"dir="$(dirname "$0")"
+    /// A probe that signals `started`, then blocks until the test writes
+    /// `release`. Its first act publishes its pid and then checks `abort`,
+    /// the probe's half of the handshake with [`HeldProbe`].
+    const HELD_PROBE: &str = r#"dir="$(dirname "$0")"
 [ "$1" = "--probe" ] || exit 9
+echo $$ > "$dir/pid.tmp" && mv "$dir/pid.tmp" "$dir/pid"
+[ -e "$dir/abort" ] && exit 0
 echo started > "$dir/started"
 read _ < "$dir/release"
-echo "botster-session-worker 0.1.0 protocol 3""#,
-        );
+echo "botster-session-worker 0.1.0 protocol 3""#;
+
+    fn held_probe(name: &str) -> (PathBuf, PathBuf, HeldProbe) {
+        let (directory, worker) = fake_worker(name, HELD_PROBE);
         for fifo in ["started", "release"] {
             assert!(
                 Command::new("mkfifo")
@@ -377,24 +379,136 @@ echo "botster-session-worker 0.1.0 protocol 3""#,
                     .success()
             );
         }
-        // A failed assertion before the release below must not leave the
-        // probe blocked on the FIFO forever (it outlives the test process).
-        struct ReleaseOnDrop(PathBuf);
-        impl Drop for ReleaseOnDrop {
-            fn drop(&mut self) {
-                use std::os::unix::fs::OpenOptionsExt;
-                // Non-blocking: with no probe reading, the open fails (ENXIO)
-                // and there is nothing to release.
-                if let Ok(mut release) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(&self.0)
-                {
-                    let _ = std::io::Write::write_all(&mut release, b"go\n");
-                }
+        let guard = HeldProbe {
+            directory: directory.clone(),
+            worker: worker.clone(),
+            armed: true,
+        };
+        (directory, worker, guard)
+    }
+
+    /// Ends a held probe when its test fails before releasing it, so the probe
+    /// never outlives the test process blocked on a FIFO.
+    ///
+    /// The guard creates `abort`, then reads `pid`; the probe writes `pid`,
+    /// then checks `abort`. Either the probe published its pid before the
+    /// guard read it (the guard kills it, whatever FIFO it is blocked on or
+    /// between), or it publishes it after, and its check then sees `abort`
+    /// and it exits before touching a FIFO.
+    struct HeldProbe {
+        directory: PathBuf,
+        worker: PathBuf,
+        armed: bool,
+    }
+
+    impl HeldProbe {
+        /// The probe was released and has exited; its pid may be reused.
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for HeldProbe {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let _ = std::fs::write(self.directory.join("abort"), b"");
+            let Some(pid) = std::fs::read_to_string(self.directory.join("pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            else {
+                return;
+            };
+            // Kill only our own child running this probe script.
+            let owned = Command::new("ps")
+                .args(["-o", "ppid=,command=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .is_some_and(|row| {
+                    let mut fields = row.trim().splitn(2, ' ');
+                    fields
+                        .next()
+                        .and_then(|ppid| ppid.trim().parse::<u32>().ok())
+                        == Some(std::process::id())
+                        && fields.next().is_some_and(|command| {
+                            command.contains(&*self.worker.to_string_lossy())
+                        })
+                });
+            if owned {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         }
-        let _release_on_drop = ReleaseOnDrop(directory.join("release"));
+    }
+
+    fn spawn_probe(worker: &Path) -> std::process::Child {
+        Command::new(worker)
+            .arg("--probe")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn assert_probe_exits(child: &mut std::process::Child) -> ExitStatus {
+        // timer: deadline — bounds a probe the guard failed to end.
+        let exited = crate::process_exit::wait_for_pid_exit(
+            child.id(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the held probe outlived its guard");
+        }
+        child.wait().unwrap()
+    }
+
+    #[test]
+    fn a_held_probe_that_starts_after_the_guard_exits_before_any_fifo() {
+        let (directory, worker, guard) = held_probe("late");
+        drop(guard);
+        let mut child = spawn_probe(&worker);
+        assert!(assert_probe_exits(&mut child).success());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_held_probe_past_its_started_signal_is_killed_by_the_guard() {
+        use std::os::unix::process::ExitStatusExt;
+        let (directory, worker, guard) = held_probe("window");
+        let mut child = spawn_probe(&worker);
+        // EOF on `started`: the probe is between its two FIFO commands or
+        // blocked opening `release`, the window a FIFO write cannot reach.
+        let mut started = String::new();
+        std::fs::File::open(directory.join("started"))
+            .unwrap()
+            .read_to_string(&mut started)
+            .unwrap();
+        assert_eq!(started, "started\n");
+        drop(guard);
+        assert_eq!(assert_probe_exits(&mut child).signal(), Some(libc::SIGKILL));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_held_probe_blocked_before_its_started_signal_is_ended_by_the_guard() {
+        let (directory, worker, guard) = held_probe("unread");
+        let mut child = spawn_probe(&worker);
+        // Nobody opens `started`: whether the probe published its pid yet or
+        // not, the guard ends it (a kill, or the abort check).
+        drop(guard);
+        assert_probe_exits(&mut child);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_running_warm_up_holds_readiness_and_a_failed_one_is_counted() {
+        // The probe signals it started, then blocks until the test releases it.
+        let (directory, worker, mut held) = held_probe("held");
         let mut daemon = serve_with_worker(short_root("held"), &worker);
         // Opening the FIFO for reading blocks until the probe opens it: the
         // probe is running inside the warm-up.
@@ -433,6 +547,7 @@ echo "botster-session-worker 0.1.0 protocol 3""#,
         };
         std::fs::write(directory.join("release"), "go\n").unwrap();
         daemon.wait_ready();
+        held.disarm();
         assert_eq!(daemon.warm_up_failures(), 0);
         daemon.stop();
         std::fs::remove_dir_all(directory).unwrap();
