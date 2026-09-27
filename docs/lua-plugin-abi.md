@@ -232,6 +232,15 @@ bad input.
   `invalid_request`. The decoder builds Lua values directly (under the VM
   memory limit) and charges the input length for its parser scratch.
 - `botster.json.null` is the value that encodes as `null`.
+- `botster.log.debug|info|warn|error({ message = <string>, fields = <table or
+  nil> })` appends one structured record and returns its sequence number.
+  Limits (user decisions): 64 KiB per record (message plus encoded fields),
+  256 records and 512 KiB per plugin (oldest records are evicted first,
+  charged to the callback account), and 100 records per second with a burst of
+  200. Beyond the rate the call returns `backpressured` and the next accepted
+  record reports the count in `dropped_before`. Operators read records with
+  the `read_plugin_logs` daemon request (docs/client-protocol.md). Records are
+  dropped when the package unloads.
 - `botster.clock.now()` returns Unix epoch milliseconds.
 - `botster.clock.monotonic()` returns milliseconds since the Hub process
   started; it never goes backward.
