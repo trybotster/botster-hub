@@ -341,15 +341,30 @@ pub(crate) fn handle_runtime(
                 return ControlStep::Ready(Err(DaemonTransportError::DaemonNotRunning));
             };
             // The owner never waits: a plugin appending right now yields a
-            // retryable refusal instead of a lock wait.
-            match runtime.plugin_logs().read(&package_name, after_seq) {
-                Ok(page) => ControlStep::ready(
-                    crate::client_api_dto::response::daemon_plugin_logs(package_name, page),
-                ),
+            // retryable refusal instead of a lock wait. The page is copied
+            // under a charge that the reply carries until it retires.
+            let page = match runtime.plugin_logs().read(&package_name, after_seq) {
+                Ok(page) => page,
                 Err(crate::plugin_logs::ReadError::Busy) => {
-                    ControlStep::ready(daemon_plugin_logs_busy())
+                    return ControlStep::ready(daemon_plugin_logs_busy());
                 }
-            }
+                Err(crate::plugin_logs::ReadError::Capacity) => {
+                    return ControlStep::ready(daemon_plugin_logs_capacity());
+                }
+            };
+            let Some((response, charge)) =
+                crate::client_api_dto::response::daemon_plugin_logs(package_name, page)
+            else {
+                return ControlStep::ready(daemon_plugin_logs_capacity());
+            };
+            let Some(charge) = charge else {
+                return ControlStep::ready(response);
+            };
+            let mut reply = Some((response, charge));
+            ControlStep::pending(move |_, _| {
+                let (response, charge) = reply.take().expect("the logs reply is sent once");
+                crate::daemon::control::pending::ControlPoll::ReadyCallback(Ok(response), charge)
+            })
         }
         DaemonRequest::PluginMcpCallTool { name, arguments } => {
             let Some(request_id) = state.plugin_controls.next_request_id() else {
@@ -720,6 +735,20 @@ fn daemon_plugin_logs_busy() -> botster_hub_client::DaemonResponse {
         request_id: "daemon-read-plugin-logs".to_string(),
         operation: "read_plugin_logs".to_string(),
         message: "the plugin is writing a log record; retry the read".to_string(),
+        diagnostics: Vec::new(),
+    });
+    response
+}
+
+fn daemon_plugin_logs_capacity() -> botster_hub_client::DaemonResponse {
+    let mut response = crate::client_api_dto::response::daemon_response_base(
+        botster_hub_client::DaemonResponseKind::OperatorError,
+    );
+    response.error = Some(botster_hub_client::DaemonOperatorError {
+        code: "plugin_logs_capacity".to_string(),
+        request_id: "daemon-read-plugin-logs".to_string(),
+        operation: "read_plugin_logs".to_string(),
+        message: "the Lua callback memory cannot fund the log page; retry the read".to_string(),
         diagnostics: Vec::new(),
     });
     response

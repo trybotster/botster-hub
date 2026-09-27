@@ -329,31 +329,45 @@ pub(crate) fn daemon_plugin_tools(plugin_tools: Vec<McpToolDescriptor>) -> Daemo
     response
 }
 
+/// Build the logs reply from a funded page. The page's text moves into the
+/// reply without a copy or a parse; the reply's own record vector and level
+/// strings are funded first. The returned charge covers the reply until it
+/// retires. `None` when the callback account cannot fund the reply.
 pub(crate) fn daemon_plugin_logs(
     package_name: String,
     page: crate::plugin_logs::LogPage,
-) -> DaemonResponse {
+) -> Option<(DaemonResponse, Option<crate::lua_memory::LuaCallbackCharge>)> {
+    let crate::plugin_logs::LogPage {
+        records,
+        next_seq,
+        first_available_seq,
+        mut charge,
+    } = page;
+    if let Some(charge) = charge.as_mut() {
+        let levels: usize = records.iter().map(|record| record.level.as_str().len()).sum();
+        let reply_records =
+            records.len() * std::mem::size_of::<botster_hub_client::DaemonPluginLogRecord>();
+        charge.grow(reply_records + levels).ok()?;
+    }
     let mut response = daemon_response_base(DaemonResponseKind::PluginLogs);
     response.plugin_logs = Some(botster_hub_client::DaemonPluginLogs {
         package_name,
-        records: page
-            .records
+        records: records
             .into_iter()
             .map(|record| botster_hub_client::DaemonPluginLogRecord {
                 seq: record.seq,
+                generation: record.generation,
                 at_ms: record.at_ms,
                 level: record.level.as_str().to_string(),
                 message: record.message,
-                fields: record
-                    .fields
-                    .and_then(|fields| serde_json::from_str(&fields).ok()),
+                fields_json: record.fields,
                 dropped_before: record.dropped_before,
             })
             .collect(),
-        next_seq: page.next_seq,
-        first_available_seq: page.first_available_seq,
+        next_seq,
+        first_available_seq,
     });
-    response
+    Some((response, charge))
 }
 
 pub(crate) fn daemon_plugin_tool_result(plugin_tool_result: Value) -> DaemonResponse {

@@ -796,10 +796,11 @@ pub(crate) fn daemon_protocol_typescript() -> String {
         "DaemonPluginLogRecord",
         &[
             ("seq", "number"),
+            ("generation", "number"),
             ("at_ms", "number"),
             ("level", "string"),
             ("message", "string"),
-            ("fields?", "JsonValue"),
+            ("fields_json?", "string"),
             ("dropped_before", "number"),
         ],
     );

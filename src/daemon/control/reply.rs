@@ -202,6 +202,9 @@ pub(crate) enum RetainedControlCharge {
     Host {
         _charge: crate::host_executor::HostPreparedCharge,
     },
+    Callback {
+        _charge: crate::lua_memory::LuaCallbackCharge,
+    },
 }
 
 impl ControlReply {
@@ -231,6 +234,18 @@ impl ControlReply {
         Self::Typed {
             response,
             charge: Some(RetainedControlCharge::Host { _charge: charge }),
+            delivery: None,
+        }
+    }
+
+    /// A response whose values the callback account funds until they drop.
+    pub(crate) fn callback(
+        response: DaemonTransportResult<DaemonResponse>,
+        charge: crate::lua_memory::LuaCallbackCharge,
+    ) -> Self {
+        Self::Typed {
+            response,
+            charge: Some(RetainedControlCharge::Callback { _charge: charge }),
             delivery: None,
         }
     }
