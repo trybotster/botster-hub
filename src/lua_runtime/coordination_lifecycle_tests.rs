@@ -146,7 +146,7 @@ fn entry_charge_survives_owner_accept_until_reply_retirement() {
         &mut daemon,
         &mut state,
         &mut wakes,
-        Duration::from_millis(500),
+        TEST_HANG_GUARD,
         |_, state| {
             let admitted = !bridge.test_admitted_waiters().is_empty();
             // One owner turn can both see the caller's enqueue and accept it,
